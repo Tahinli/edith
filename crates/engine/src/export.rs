@@ -131,7 +131,14 @@ fn run(
     // ponytail: this holds the whole exported AAC track in memory (~3 kB per
     // 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
     // `copy_segments` that yields packets instead of collecting them.
-    let audio = AudioSession::copy_segments(source, &project.segments_from(0, meta.frame_rate))?;
+    // Source indexes dropped: every clip is still source 0 until multi-source
+    // export lands, and `copy_segments` takes the one path above.
+    let segs: Vec<(f64, f64)> = project
+        .segments_from(0, meta.frame_rate)
+        .into_iter()
+        .map(|(_, start, end)| (start, end))
+        .collect();
+    let audio = AudioSession::copy_segments(source, &segs)?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
