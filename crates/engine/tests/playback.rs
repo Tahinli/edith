@@ -7,12 +7,11 @@
 //! cargo test -p engine --release --test playback -- --nocapture
 //! ```
 
-use std::path::PathBuf;
-use std::sync::mpsc::TryRecvError;
+use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use engine::PlaybackSession;
+use engine::{DecodeSession, Frame, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -25,24 +24,19 @@ fn asset(name: &str) -> PathBuf {
 fn pump(session: &mut PlaybackSession, last_index: &mut Option<u32>) {
     session.tick();
     let target = session.now() * session.meta().frame_rate;
-    loop {
-        match session.frames().try_recv() {
-            Ok(frame) => {
-                if let Some(previous) = *last_index {
-                    assert_eq!(
-                        frame.index,
-                        previous + 1,
-                        "frames must arrive in index order"
-                    );
-                }
-                *last_index = Some(frame.index);
-                // Stop at the first frame past the clock; the real app holds it
-                // for the next tick, we simply stop draining.
-                if f64::from(frame.index) > target {
-                    return;
-                }
-            }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
+    while let Some(frame) = session.try_frame() {
+        if let Some(previous) = *last_index {
+            assert_eq!(
+                frame.index,
+                previous + 1,
+                "frames must arrive in index order"
+            );
+        }
+        *last_index = Some(frame.index);
+        // Stop at the first frame past the clock; the real app holds it for the
+        // next tick, we simply stop draining.
+        if f64::from(frame.index) > target {
+            return;
         }
     }
 }
@@ -108,33 +102,50 @@ fn audio_video_plays_at_real_speed() {
 }
 
 /// The next frame off the (post-seek, freshly opened) channel.
-fn next_index(session: &PlaybackSession, what: &str) -> u32 {
-    match session.frames().recv_timeout(Duration::from_secs(10)) {
-        Ok(frame) => frame.index,
-        Err(e) => panic!("no frame after {what}: {e:?}"),
+fn next_frame(session: &mut PlaybackSession, what: &str) -> Frame {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(frame) = session.try_frame() {
+            return frame;
+        }
+        assert!(Instant::now() < deadline, "no frame after {what}");
+        sleep(Duration::from_millis(4));
     }
 }
 
+fn next_index(session: &mut PlaybackSession, what: &str) -> u32 {
+    next_frame(session, what).index
+}
+
 /// Ticks like a front-end but takes every frame as fast as the decoder makes
-/// them, until the worker exits. Returns how many arrived and the last index.
+/// them, until the timeline is played out. Returns how many arrived and the
+/// last index.
 fn drain_to_eof(session: &mut PlaybackSession) -> (u32, Option<u32>) {
     let deadline = Instant::now() + Duration::from_secs(20);
     let (mut count, mut last) = (0, None);
     loop {
         session.tick();
-        loop {
-            match session.frames().try_recv() {
-                Ok(frame) => {
-                    count += 1;
-                    last = Some(frame.index);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return (count, last),
-            }
+        while let Some(frame) = session.try_frame() {
+            count += 1;
+            last = Some(frame.index);
+        }
+        if session.is_eos() {
+            return (count, last);
         }
         assert!(Instant::now() < deadline, "still draining after 20 s");
         sleep(Duration::from_millis(4));
     }
+}
+
+/// The pixels of one source frame, decoded on its own -- the reference a
+/// timeline frame is checked against.
+fn source_frame(path: &Path, index: u32) -> Vec<u8> {
+    let (_, rx, _cancel) = DecodeSession::open_range(path, index, index + 1).expect("open_range");
+    let frame = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("reference frame");
+    assert_eq!(frame.index, index, "open_range starts where it is told");
+    frame.bgra
 }
 
 fn threads() -> usize {
@@ -163,7 +174,7 @@ fn seek_repositions_video_and_clock() {
         session.now()
     );
     assert_eq!(
-        next_index(&session, "seek(3.0)"),
+        next_index(&mut session, "seek(3.0)"),
         (3.0 * fps) as u32,
         "the first frame after a seek is the target frame"
     );
@@ -174,7 +185,7 @@ fn seek_repositions_video_and_clock() {
     let last_frame = session.meta().frame_count - 1;
     assert_eq!(drain_to_eof(&mut session).1, Some(last_frame));
     session.seek(0.0);
-    assert_eq!(next_index(&session, "seek(0.0) after EOF"), 0);
+    assert_eq!(next_index(&mut session, "seek(0.0) after EOF"), 0);
     assert!(session.now() < 0.2, "clock at {}", session.now());
 }
 
@@ -194,7 +205,10 @@ fn seek_past_the_end_clamps() {
         "clock at {} for a {duration}s file",
         session.now()
     );
-    assert_eq!(next_index(&session, "seek(999.0)"), meta.frame_count - 1);
+    assert_eq!(
+        next_index(&mut session, "seek(999.0)"),
+        meta.frame_count - 1
+    );
 
     let landed = session.now();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -220,7 +234,10 @@ fn rapid_seeks_settle_on_the_last_one() {
     for t in [4.0, 1.0, 3.5, 0.5, 2.0] {
         session.seek(t);
     }
-    assert_eq!(next_index(&session, "5 rapid seeks"), (2.0 * fps) as u32);
+    assert_eq!(
+        next_index(&mut session, "5 rapid seeks"),
+        (2.0 * fps) as u32
+    );
 
     sleep(Duration::from_millis(500)); // abandoned workers exit within an AU
     let after = threads();
@@ -249,7 +266,7 @@ fn seek_keeps_the_audio_clock() {
         "clock at {}",
         session.now()
     );
-    let first = next_index(&session, "seek(3.0)");
+    let first = next_index(&mut session, "seek(3.0)");
     assert_eq!(first, (3.0 * meta.frame_rate) as u32);
     let mut after_seek = None;
     run_for(&mut session, &mut after_seek, Duration::from_millis(600));
@@ -282,5 +299,163 @@ fn seek_keeps_the_audio_clock() {
         drain_to_eof(&mut session).1.or(second),
         Some(meta.frame_count - 1),
         "second run did not finish"
+    );
+}
+
+/// The edit list end to end: two cuts, drop the middle clip, play the result.
+/// What comes out is one contiguous timeline whose *pictures* skip the hole --
+/// no audio needed, so this runs anywhere.
+#[test]
+fn edits_traverse_cuts() {
+    let path = asset("test_baseline.mp4");
+    let mut session = PlaybackSession::open(&path).expect("open");
+    let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
+    let whole = f64::from(total) / fps;
+    assert!((session.timeline_duration() - whole).abs() < 1e-9);
+    assert_eq!(session.clip_spans(), vec![(0.0, whole)]);
+
+    assert!(session.cut_at(2.0), "cut at 2 s");
+    assert!(session.cut_at(3.5), "cut at 3.5 s");
+    assert!(
+        !session.cut_at(2.0),
+        "the same frame twice: already a boundary"
+    );
+    assert!(!session.cut_at(0.0), "nothing before the first frame");
+    assert_eq!(session.clip_spans().len(), 3);
+    // Cuts are metadata: the timeline is the same length as before.
+    assert!((session.timeline_duration() - whole).abs() < 1e-9);
+
+    let (cut, hole_end) = ((2.0 * fps) as u32, (3.5 * fps) as u32);
+    assert!(session.delete_clip(1), "drop the middle clip");
+    let kept = total - (hole_end - cut);
+    assert_eq!(session.clip_spans().len(), 2);
+    assert!(
+        (session.timeline_duration() - f64::from(kept) / fps).abs() < 1e-9,
+        "duration after the delete: {}",
+        session.timeline_duration()
+    );
+
+    // Play the whole edited timeline from the top.
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut expect, mut boundary) = (0, None);
+    loop {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            assert_eq!(frame.index, expect, "timeline indices must be contiguous");
+            if frame.index == cut {
+                boundary = Some(frame.bgra);
+            }
+            expect += 1;
+        }
+        if session.is_eos() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still draining after 20 s");
+        sleep(Duration::from_millis(4));
+    }
+    assert_eq!(expect, kept, "the edited timeline, whole and nothing but");
+    // From here the playhead has to stand still: an edit reseeks to *now*, so a
+    // running clock would move the frame these assertions expect.
+    session.pause();
+
+    // The frames behind those indices skipped the deleted range: the picture at
+    // the boundary is source `hole_end`, not the source frame with that number.
+    let boundary = boundary.expect("no frame at the cut");
+    assert!(
+        boundary == source_frame(&path, hole_end),
+        "the boundary frame is not source {hole_end}"
+    );
+    assert!(
+        boundary != source_frame(&path, cut),
+        "the deleted range is still being decoded"
+    );
+
+    // Seek into the surviving second clip: timeline 3.0 s is source 3.0 s + the
+    // 1.5 s hole.
+    session.seek(3.0);
+    let landed = next_frame(&mut session, "seek(3.0) after edits");
+    assert_eq!(landed.index, (3.0 * fps) as u32);
+    assert!(
+        landed.bgra == source_frame(&path, (4.5 * fps) as u32),
+        "the seek landed on the wrong source frame"
+    );
+    assert!(!session.is_eos(), "a seek revives a played-out session");
+
+    assert!(session.undo(), "undo the delete");
+    assert_eq!(session.clip_spans().len(), 3);
+    assert!(
+        (session.timeline_duration() - whole).abs() < 1e-9,
+        "undo did not restore the duration: {}",
+        session.timeline_duration()
+    );
+    // The undo reseeks to the (still paused) playhead, and on the restored
+    // timeline 3.0 s is source 3.0 s again -- the hole is back.
+    let restored = next_frame(&mut session, "undo");
+    assert_eq!(restored.index, (3.0 * fps) as u32);
+    assert!(
+        restored.bgra == source_frame(&path, (3.0 * fps) as u32),
+        "undo did not restore the mapping"
+    );
+}
+
+/// Editing while the device is running. A cut must not disturb playback at all
+/// and a delete reseeks under it -- in both cases the audio keeps coming, which
+/// is what stops `tick` from handing the timeline back to wall time.
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn edits_keep_the_audio_clock() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let fps = session.meta().frame_rate;
+    let mut last_index = None;
+
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(700));
+    let before = session.now();
+    assert!(before > 0.3, "clock stalled at {before:.3}s");
+
+    // Metadata only: no worker is touched, so the indices stay contiguous
+    // across the boundary `run_for` is about to cross.
+    assert!(session.cut_at(1.5), "cut at 1.5 s");
+    run_for(&mut session, &mut last_index, Duration::from_millis(900));
+    let after_cut = session.now();
+    assert!(
+        after_cut > before + 0.6,
+        "the clock stopped across the cut: {before:.3}s -> {after_cut:.3}s"
+    );
+    assert!(
+        last_index.map(|i| f64::from(i) > 1.5 * fps) == Some(true),
+        "playback never reached the cut: {last_index:?}"
+    );
+
+    // Deleting the head clip moves everything after it, so the session reseeks
+    // under the playhead: same timeline position, new source frame, and the
+    // frame numbering restarts at the landing frame.
+    assert!(session.delete_clip(0), "drop the head clip");
+    let landed = session.now();
+    assert!(
+        (landed - after_cut).abs() < 0.2,
+        "the delete moved the playhead: {after_cut:.3}s -> {landed:.3}s"
+    );
+    let first = next_frame(&mut session, "the delete reseek").index;
+    assert!(
+        first.abs_diff((landed * fps) as u32) <= 1,
+        "the delete landed at {first} instead of the playhead ({landed:.3}s)"
+    );
+    // No EOS assertion here: `run_for` drains a frame per 8 ms call, far faster
+    // than real time (ledger), so how much timeline is left after it is a race.
+    let mut after_delete = Some(first);
+    run_for(&mut session, &mut after_delete, Duration::from_millis(500));
+    assert!(after_delete > Some(first), "no frames after the delete");
+    assert!(
+        session.now() > landed + 0.3,
+        "the clock stopped after the delete: {landed:.3}s -> {:.3}s",
+        session.now()
+    );
+    eprintln!(
+        "edits: {before:.3}s -> cut -> {after_cut:.3}s -> delete -> {:.3}s of a {:.3}s timeline",
+        session.now(),
+        session.timeline_duration()
     );
 }

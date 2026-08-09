@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame};
 use crate::demux::VideoMeta;
+use crate::project::{Clip, Project};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -89,6 +90,17 @@ pub struct PlaybackSession {
     cancel: Arc<AtomicBool>,
     clock: PlaybackClock,
     audio: Option<Audio>,
+    /// The edit list. Everything a caller says in seconds is a *timeline*
+    /// position; only this maps it onto the file.
+    project: Project,
+    /// Source range the current decode worker was opened for, and where that
+    /// range starts on the timeline -- together they rewrite a source frame
+    /// index into a timeline one. Not a clip index: a `cut` splits the clip
+    /// under a running worker, and only the mapping survives that.
+    range: Clip,
+    timeline_start: u32,
+    /// The last clip has been played out; see [`PlaybackSession::is_eos`].
+    eos: bool,
 }
 
 impl PlaybackSession {
@@ -104,6 +116,10 @@ impl PlaybackSession {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
         };
+        // One clip covering the file, so timeline == source until the first
+        // edit -- and `open_at(_, 0)` is exactly that clip's range.
+        let project = Project::single(meta.frame_count);
+        let range = project.clips()[0];
         Ok(Self {
             path,
             meta,
@@ -111,6 +127,10 @@ impl PlaybackSession {
             cancel,
             clock: PlaybackClock::new(source),
             audio,
+            project,
+            range,
+            timeline_start: 0,
+            eos: false,
         })
     }
 
@@ -122,6 +142,118 @@ impl PlaybackSession {
     /// alone is what pauses the decoder.
     pub fn frames(&self) -> &Receiver<Frame> {
         &self.frames
+    }
+
+    /// The next decoded frame, its `index` rewritten from a source frame to a
+    /// *timeline* frame -- the only frame space that leaves the engine, and the
+    /// one [`PlaybackSession::now`] is in.
+    ///
+    /// `None` means "nothing right now": the decoder is behind, or a clip
+    /// boundary is being reopened (~80 ms, during which the caller simply keeps
+    /// showing its last frame). End of stream is [`PlaybackSession::is_eos`].
+    pub fn try_frame(&mut self) -> Option<Frame> {
+        loop {
+            match self.frames.try_recv() {
+                Ok(mut frame) => {
+                    frame.index =
+                        self.timeline_start + frame.index.saturating_sub(self.range.in_frame);
+                    return Some(frame);
+                }
+                Err(TryRecvError::Empty) => return None,
+                // The worker stopped: at the end of its range, or on a decode
+                // error -- which is why this skips the rest of a broken clip
+                // rather than stalling on it.
+                Err(TryRecvError::Disconnected) => {
+                    if !self.next_clip() {
+                        self.eos = true;
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the timeline has been played out. Any seek clears it, so an edit
+    /// after the end (which reseeks) revives the session.
+    pub fn is_eos(&self) -> bool {
+        self.eos
+    }
+
+    /// Starts decoding whatever follows the current range on the timeline;
+    /// `false` past the end. The next timeline frame is derived rather than
+    /// remembered as a clip index, because a `cut` while playing splits the
+    /// clip under the running worker and only the mapping stays true.
+    fn next_clip(&mut self) -> bool {
+        let next = self.timeline_start + self.range.len();
+        let Some((idx, source)) = self.project.map_timeline(next) else {
+            return false;
+        };
+        let out = self.project.clips()[idx].out_frame;
+        match DecodeSession::open_range(&self.path, source, out) {
+            Ok((_, frames, cancel)) => {
+                self.frames = frames;
+                self.cancel = cancel;
+            }
+            // Disappearing-file case, as in `seek`. The old receiver is still
+            // disconnected, so the next pass moves on to the clip after this.
+            Err(e) => eprintln!("clip at timeline frame {next}: video open failed: {e}"),
+        }
+        self.range = Clip {
+            in_frame: source,
+            out_frame: out,
+        };
+        self.timeline_start = next;
+        true
+    }
+
+    /// Length of the edited timeline in seconds -- what a ruler shows, and it
+    /// shrinks with every delete.
+    pub fn timeline_duration(&self) -> f64 {
+        f64::from(self.project.timeline_frames()) / self.meta.frame_rate
+    }
+
+    /// `(start, len)` per clip in timeline seconds, in order: what a clips lane
+    /// needs to lay itself out. Selection is the caller's business.
+    pub fn clip_spans(&self) -> Vec<(f64, f64)> {
+        let fps = self.meta.frame_rate;
+        self.project
+            .clip_spans()
+            .iter()
+            .map(|&(start, len)| (f64::from(start) / fps, f64::from(len) / fps))
+            .collect()
+    }
+
+    /// Splits the clip under `timeline_secs` in two. Metadata only: a cut never
+    /// changes the timeline->source mapping, so the running decoder stays
+    /// correct and playback does not blink. `false` at a clip start or past the
+    /// end, where there would be nothing to split off.
+    pub fn cut_at(&mut self, timeline_secs: f64) -> bool {
+        self.project
+            .cut((timeline_secs * self.meta.frame_rate) as u32)
+    }
+
+    /// Removes a clip and closes the gap. Unlike a cut this *does* move every
+    /// following frame, so the session reseeks to wherever the playhead now
+    /// points. `false` for a bad index or the last remaining clip.
+    pub fn delete_clip(&mut self, idx: usize) -> bool {
+        self.edit(|p| p.delete(idx))
+    }
+
+    /// Undoes the last successful cut or delete, and reseeks like a delete.
+    pub fn undo(&mut self) -> bool {
+        self.edit(Project::undo)
+    }
+
+    /// Applies an edit and, if it took, reseeks onto the new mapping. `seek`
+    /// clamps to the new duration and keeps playing playing, so a delete that
+    /// shortens the timeline past the playhead lands on the last frame.
+    fn edit(&mut self, f: impl FnOnce(&mut Project) -> bool) -> bool {
+        if !f(&mut self.project) {
+            return false;
+        }
+        let now = self.now();
+        self.seek(now);
+        true
     }
 
     /// Current timeline position in seconds.
@@ -164,7 +296,7 @@ impl PlaybackSession {
         }
     }
 
-    /// Repositions the timeline to `secs`, clamped to the file. Both decode
+    /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
     /// have already exited.
@@ -173,8 +305,9 @@ impl PlaybackSession {
     /// decodes, so the caller can show the frame it landed on.
     pub fn seek(&mut self, secs: f64) {
         let fps = self.meta.frame_rate;
-        let t = secs.clamp(0.0, f64::from(self.meta.frame_count) / fps);
-        let target = ((t * fps) as u32).min(self.meta.frame_count.saturating_sub(1));
+        let total = self.project.timeline_frames();
+        let t = secs.clamp(0.0, f64::from(total) / fps);
+        let target = ((t * fps) as u32).min(total.saturating_sub(1));
         let was_playing = self.clock.is_playing();
 
         if let Some(audio) = &self.audio {
@@ -191,15 +324,27 @@ impl PlaybackSession {
         // the bounded channel, where only the disconnect wakes it -- and it
         // then finds the flag already set.
         self.cancel.store(true, Ordering::Release);
-        match DecodeSession::open_at(&self.path, target) {
-            Ok((_, frames, cancel)) => {
-                self.frames = frames;
-                self.cancel = cancel;
+        // `target` is inside the timeline (never empty), so this always maps;
+        // the range runs from there to the end of the clip it landed in.
+        if let Some((idx, source)) = self.project.map_timeline(target) {
+            let out = self.project.clips()[idx].out_frame;
+            match DecodeSession::open_range(&self.path, source, out) {
+                Ok((_, frames, cancel)) => {
+                    self.frames = frames;
+                    self.cancel = cancel;
+                }
+                // The file opened once already, so this is a disappearing-file
+                // case: the timeline still moves, there are simply no more
+                // pictures.
+                Err(e) => eprintln!("seek: video reopen failed: {e}"),
             }
-            // The file opened once already, so this is a disappearing-file case:
-            // the timeline still moves, there are simply no more pictures.
-            Err(e) => eprintln!("seek: video reopen failed: {e}"),
+            self.range = Clip {
+                in_frame: source,
+                out_frame: out,
+            };
+            self.timeline_start = target;
         }
+        self.eos = false;
 
         let mut audio_running = false;
         if let Some(audio) = &self.audio
@@ -210,7 +355,11 @@ impl PlaybackSession {
             let played = audio.ao.lock().unwrap().position().unwrap_or(0).max(0) as u64;
             audio.fed.store(played * audio.channels, Ordering::Relaxed);
             audio.fed_all.store(false, Ordering::Release);
-            audio_running = match AudioSession::open_at(&self.path, t) {
+            // One worker for the whole rest of the timeline, so the joins
+            // between clips are gapless: the video reopens at a boundary, the
+            // ear never hears it.
+            let segs = self.project.segments_from(target, fps);
+            audio_running = match AudioSession::open_segments(&self.path, &segs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };
