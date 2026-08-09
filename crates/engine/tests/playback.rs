@@ -735,6 +735,70 @@ fn a_vanished_source_is_skipped() {
     assert!(session.is_eos(), "the timeline still ends");
 }
 
+/// Importing while the device is running: the import reseeks under the
+/// playhead, so what must not happen is a stall -- the joined timeline still
+/// plays out whole. No audio needed, so this runs anywhere.
+#[test]
+fn import_during_play_does_not_stall() {
+    let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
+    let mut session = PlaybackSession::open(&av).expect("open");
+    let first = session.meta().frame_count;
+    let mut last_index = None;
+
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+    assert!(last_index.is_some(), "no frames before the import");
+
+    session.import(&av2).expect("import while playing");
+    assert_eq!(session.clip_spans().len(), 2);
+    assert!(session.is_playing(), "the import stopped the clock");
+
+    // From here on the indices go *backwards* once: `run_for` decodes far ahead
+    // of the clock (ledger), and the import reseeks to `now()` -- which is why
+    // this drains with `drain_to_eof` instead of the order-checking `pump`.
+    let (count, last) = drain_to_eof(&mut session);
+    eprintln!("import while playing: {count} more frames, last {last:?}");
+    assert_eq!(
+        last,
+        Some(first + frame_count(&av2) - 1),
+        "the joined timeline did not play out"
+    );
+}
+
+/// An import is *one* undo step: the appended clip goes, the source entry stays
+/// behind (documented, harmless -- source indexes are forever), and the session
+/// is still playable on the restored timeline.
+#[test]
+fn undo_after_import_is_one_step() {
+    let av2 = asset("test_av2.mp4");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    session.import(&av2).expect("import");
+    assert_eq!(session.clip_spans().len(), 2);
+    assert!((session.timeline_duration() - 9.0).abs() < 1e-9);
+
+    assert!(session.undo(), "undo the import");
+    assert_eq!(session.clip_spans().len(), 1, "one step, back to one clip");
+    assert!(
+        (session.timeline_duration() - 5.0).abs() < 1e-9,
+        "undo did not restore the duration: {}",
+        session.timeline_duration()
+    );
+
+    // The orphan source is only observable on the project -- `PlaybackSession`
+    // exposes sources through `clip_spans_by_source`, and the undone clip is
+    // exactly the one that named it.
+    let mut project = engine::Project::single(asset("test_av.mp4"), 150);
+    let source = project.import(&av2);
+    assert!(project.append_clip(source, 120));
+    assert!(project.undo());
+    assert_eq!(project.clips().len(), 1);
+    assert_eq!(project.sources().len(), 2, "the source entry stays behind");
+
+    // Still playable: the undo reseeked to the (paused) playhead at zero.
+    session.play();
+    assert_eq!(next_index(&mut session, "undo of an import"), 0);
+}
+
 /// The audio path across a source join: one worker spans both files, so the
 /// clock must keep running at real speed through the boundary. (Whether it is
 /// still the *audio* clock is not observable from outside -- a device that ran
