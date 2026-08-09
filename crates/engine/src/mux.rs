@@ -13,7 +13,12 @@ use mp4::{
 /// 90 kHz is the H.264 convention; frame durations round to well under a
 /// microsecond of error at every fps we care about.
 const VIDEO_TIMESCALE: u32 = 90_000;
-const MOVIE_TIMESCALE: u32 = 1_000;
+/// The same as the video's, deliberately: `mp4` converts every sample duration
+/// into the movie timescale with an integer division of its own (track.rs:752),
+/// so a coarser movie clock loses a fraction of a millisecond *per frame* --
+/// 1 kHz makes a 4.000 s export announce itself as 3.960 s. Equal timescales
+/// make the video conversion exact.
+const MOVIE_TIMESCALE: u32 = VIDEO_TIMESCALE;
 /// An AAC-LC packet is always 1024 samples, so with timescale == sample rate the
 /// per-packet duration is this constant.
 const AAC_PACKET_SAMPLES: u32 = 1024;
@@ -171,6 +176,16 @@ pub fn parameter_sets(annex_b: &[u8]) -> Option<(&[u8], &[u8])> {
     let sps = nals.iter().find(|n| nal_type(n) == NAL_SPS)?;
     let pps = nals.iter().find(|n| nal_type(n) == NAL_PPS)?;
     Some((sps, pps))
+}
+
+/// Whether the unit carries a coded picture (NAL types 1..=5). An encoder that
+/// buffered instead of coding hands back an empty buffer, and one that emitted
+/// only parameter sets has no sample to write -- both are for the caller to skip
+/// rather than for [`Mp4Muxer::write_video_au`] to reject.
+pub(crate) fn has_coded_slice(annex_b: &[u8]) -> bool {
+    split_annex_b(annex_b)
+        .iter()
+        .any(|nal| (1..=NAL_IDR).contains(&nal_type(nal)))
 }
 
 /// Exact inverse of `demux::append_annex_b`: 4-byte length prefixes (the only
