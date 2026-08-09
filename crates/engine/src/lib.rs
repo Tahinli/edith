@@ -12,6 +12,7 @@ pub mod hw;
 pub mod mux;
 pub mod playback;
 pub mod project;
+pub mod waveform;
 
 pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession};
 pub use clock::PlaybackClock;
