@@ -11,7 +11,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -132,8 +132,96 @@ impl PlaybackSession {
         })
     }
 
+    /// Opens a project file written by [`save_project`](Self::save_project):
+    /// the whole timeline, restored to where its playhead stood, paused like
+    /// [`open`](Self::open).
+    ///
+    /// A *new* session rather than a reload of this one, so a load that fails
+    /// leaves the caller's current session untouched -- atomic by
+    /// construction. Every named file is opened and checked here: source 0
+    /// defines the timeline exactly as `open` does, every other source has to
+    /// match it the way [`import`](Self::import) demands, and every clip has to
+    /// still be inside the file it plays from. A source that vanished or
+    /// shrank since the save is a refusal naming it, not a silently shorter
+    /// timeline -- the disappearing-file tolerance elsewhere in this type
+    /// applies only *after* a project has loaded.
+    ///
+    /// The undo history is not saved: `undo` is `false` on a fresh load.
+    pub fn open_project(path: &Path) -> crate::Result<Self> {
+        let doc = crate::veproj::load(path)?;
+        let first = doc.sources.first().ok_or("the project names no sources")?;
+        // Source 0 both scaffolds the session and defines the timeline, so it
+        // is opened for playback rather than merely probed.
+        let (meta, frames, cancel) = DecodeSession::open_at(first, 0)
+            .map_err(|e| format!("source {}: {e}", first.display()))?;
+        let audio = open_audio(first);
+        let first_audio = AudioSession::probe(first)?;
+
+        let mut counts = vec![meta.frame_count];
+        for source in &doc.sources[1..] {
+            let (other, _) =
+                Demuxer::open(source).map_err(|e| format!("source {}: {e}", source.display()))?;
+            matches_timeline(source, &other, &meta, &first_audio)
+                .map_err(|e| format!("source {}: {e}", source.display()))?;
+            counts.push(other.frame_count);
+        }
+        for (i, clip) in doc.clips.iter().enumerate() {
+            if clip.out_frame > counts[clip.source] {
+                return Err(format!(
+                    "clip {i} ends at frame {} but {} has {} frames",
+                    clip.out_frame,
+                    doc.sources[clip.source].display(),
+                    counts[clip.source]
+                )
+                .into());
+            }
+        }
+
+        let playhead = doc.playhead;
+        let project = Project::from_parts(doc.sources, doc.clips)
+            .ok_or("the project's clips do not fit its sources")?;
+        let range = project.clips()[0];
+        let mut session = Self {
+            meta,
+            frames,
+            cancel,
+            clock: PlaybackClock::new(match audio {
+                Some(_) => ClockSource::Audio,
+                None => ClockSource::Wall,
+            }),
+            audio,
+            project,
+            range,
+            timeline_start: 0,
+            eos: false,
+        };
+        // The scaffolding above opened source 0 from its first frame and the
+        // whole of its audio; this puts both onto the clip the playhead is
+        // actually in -- a seek replaces the decoder and supersedes the audio
+        // worker by epoch, exactly as it does after an edit. It also clamps,
+        // so a playhead past a hand-shortened timeline lands on the last frame.
+        session.seek(f64::from(playhead) / meta.frame_rate);
+        Ok(session)
+    }
+
     pub fn meta(&self) -> &VideoMeta {
         &self.meta
+    }
+
+    /// The files this timeline plays from, index 0 first -- a caller needs it
+    /// to name an export or a window after the media rather than the project.
+    pub fn sources(&self) -> &[PathBuf] {
+        self.project.sources()
+    }
+
+    /// Writes the timeline to `path` as a `.veproj`, atomically (see
+    /// [`crate::veproj`]). Sources no clip plays from are left out, and the
+    /// playhead is saved with it so a reopened project resumes where it stood.
+    pub fn save_project(&self, path: &Path) -> crate::Result<()> {
+        let (sources, clips) = self.project.without_orphan_sources();
+        let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
+            .min(self.project.timeline_frames().saturating_sub(1));
+        crate::veproj::save(path, &sources, &clips, playhead)
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a
@@ -274,36 +362,8 @@ impl PlaybackSession {
     /// a refusal.
     pub fn import(&mut self, path: &Path) -> crate::Result<()> {
         let (meta, _) = Demuxer::open(path)?;
-        if (meta.width, meta.height) != (self.meta.width, self.meta.height) {
-            return Err(format!(
-                "{}x{} does not match the timeline's {}x{}",
-                meta.width, meta.height, self.meta.width, self.meta.height
-            )
-            .into());
-        }
-        // Container frame rates are computed from timescales, so never `==`.
-        if (meta.frame_rate - self.meta.frame_rate).abs() > 0.01 {
-            return Err(format!(
-                "{:.3} fps does not match the timeline's {:.3} fps",
-                meta.frame_rate, self.meta.frame_rate
-            )
-            .into());
-        }
-        // Whole-probe equality: rate, layout and the esds fields, which the
-        // audio worker holds every source to anyway. Both silent is a match.
-        let probe = AudioSession::probe(path)?;
         let first = AudioSession::probe(&self.project.sources()[0])?;
-        if probe != first {
-            return Err(match (probe, first) {
-                (None, _) => "the file is silent, the timeline has audio".to_string(),
-                (_, None) => "the file has audio, the timeline is silent".to_string(),
-                (Some(a), Some(b)) => format!(
-                    "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
-                    a.params.sample_rate, a.channels, b.params.sample_rate, b.channels
-                ),
-            }
-            .into());
-        }
+        matches_timeline(path, &meta, &self.meta, &first)?;
 
         let old_end = self.timeline_duration();
         let source = self.project.import(path);
@@ -500,6 +560,53 @@ impl PlaybackSession {
                 .set_audio_position(position as u64, audio.sample_rate);
         }
     }
+}
+
+/// Whether `path`, already demuxed to `meta`, may join a timeline whose
+/// parameters are `timeline` and whose audio probes as `first`: same
+/// dimensions, same frame rate, same audio parameters or both silent -- one
+/// timeline this slice means one set of encoder/device parameters.
+///
+/// The `Err` names the property that disagrees, and those strings are what a
+/// front-end shows verbatim; [`PlaybackSession::import`] and
+/// [`PlaybackSession::open_project`] share them so a file refused at import is
+/// refused in the same words at load.
+fn matches_timeline(
+    path: &Path,
+    meta: &VideoMeta,
+    timeline: &VideoMeta,
+    first: &Option<crate::AudioProbe>,
+) -> crate::Result<()> {
+    if (meta.width, meta.height) != (timeline.width, timeline.height) {
+        return Err(format!(
+            "{}x{} does not match the timeline's {}x{}",
+            meta.width, meta.height, timeline.width, timeline.height
+        )
+        .into());
+    }
+    // Container frame rates are computed from timescales, so never `==`.
+    if (meta.frame_rate - timeline.frame_rate).abs() > 0.01 {
+        return Err(format!(
+            "{:.3} fps does not match the timeline's {:.3} fps",
+            meta.frame_rate, timeline.frame_rate
+        )
+        .into());
+    }
+    // Whole-probe equality: rate, layout and the esds fields, which the audio
+    // worker holds every source to anyway. Both silent is a match.
+    let probe = AudioSession::probe(path)?;
+    if probe != *first {
+        return Err(match (probe, first) {
+            (None, _) => "the file is silent, the timeline has audio".to_string(),
+            (_, None) => "the file has audio, the timeline is silent".to_string(),
+            (Some(a), Some(b)) => format!(
+                "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
+                a.params.sample_rate, a.channels, b.params.sample_rate, b.channels
+            ),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// `None` for a silent session -- no audio track, no plugin, no daemon, or a
