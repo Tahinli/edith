@@ -1,7 +1,7 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! veproj 1
+//! edith 1
 //! playhead 90
 //! source test_av.mp4
 //! source /elsewhere/test_av2.mp4
@@ -14,7 +14,7 @@
 //! So the path field is byte-escaped (`%` -> `%25`, newline -> `%0A`, which is
 //! everything a line-based format cannot carry) and survives round-trip
 //! exactly. Paths under the project file's own directory are written relative
-//! to it, so a folder holding the media and the `.veproj` can be moved or
+//! to it, so a folder holding the media and the `.edith` can be moved or
 //! copied anywhere and still open; anything else is absolute.
 //!
 //! The parser is strict and every refusal names its 1-based line: a project
@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use crate::project::Clip;
 
 /// First line, exactly. The version is part of it: a v2 reader will accept a
-/// `veproj 1` file, and a v1 reader refuses a `veproj 2` one by name.
-const MAGIC: &[u8] = b"veproj 1";
+/// `edith 1` file, and a v1 reader refuses a `edith 2` one by name.
+const MAGIC: &[u8] = b"edith 1";
 
 /// What a project file says: an edit list plus where the playhead stood.
 /// Structurally valid by construction -- see [`parse`].
@@ -94,9 +94,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     let mut lines = body.split(|&b| b == b'\n').enumerate();
     let (_, first) = lines.next().unwrap_or((0, &[]));
     if first != MAGIC {
-        return Err(match first.strip_prefix(b"veproj ") {
+        return Err(match first.strip_prefix(b"edith ") {
             Some(v) => format!("line 1: unsupported version {}", String::from_utf8_lossy(v)),
-            None => "line 1: not a veproj file".to_string(),
+            None => "line 1: not a edith file".to_string(),
         }
         .into());
     }
@@ -262,7 +262,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &clips, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "veproj 1\nplayhead 12\nsource a.mp4\nsource /elsewhere/b.mp4\nclip 0 30 0\nclip 10 20 1\n",
+            "edith 1\nplayhead 12\nsource a.mp4\nsource /elsewhere/b.mp4\nclip 0 30 0\nclip 10 20 1\n",
             "the file under the project directory is written relative to it"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -291,14 +291,14 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"veproj 2\nsource a.mp4\nclip 0 5 0\n", &dir)
+        let err = parse(b"edith 2\nsource a.mp4\nclip 0 5 0\n", &dir)
             .unwrap_err()
             .to_string();
         assert_eq!(err, "line 1: unsupported version 2");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
-                "line 1: not a veproj file"
+                "line 1: not a edith file"
             );
         }
     }
@@ -308,35 +308,35 @@ mod tests {
         let dir = PathBuf::from("/proj");
         let cases: [(&[u8], &str); 8] = [
             (
-                b"veproj 1\nsource a.mp4\nclip 0 5\n",
+                b"edith 1\nsource a.mp4\nclip 0 5\n",
                 "line 3: clip wants 3 fields, found 2",
             ),
             (
-                b"veproj 1\nsource a.mp4\nclip 0 five 0\n",
+                b"edith 1\nsource a.mp4\nclip 0 five 0\n",
                 "line 3: \"five\" is not a number",
             ),
             (
-                b"veproj 1\nsource a.mp4\nclip 5 5 0\n",
+                b"edith 1\nsource a.mp4\nclip 5 5 0\n",
                 "line 3: clip [5, 5) is empty",
             ),
             (
-                b"veproj 1\nsource a.mp4\nclip 7 5 0\n",
+                b"edith 1\nsource a.mp4\nclip 7 5 0\n",
                 "line 3: clip [7, 5) is empty",
             ),
             (
-                b"veproj 1\nsource a.mp4\nclip 0 5 1\n",
+                b"edith 1\nsource a.mp4\nclip 0 5 1\n",
                 "line 3: clip names source 1 of 1",
             ),
             (
-                b"veproj 1\nsource a.mp4\nclip 0 5 0\nsource b.mp4\n",
+                b"edith 1\nsource a.mp4\nclip 0 5 0\nsource b.mp4\n",
                 "line 4: source after a clip",
             ),
             (
-                b"veproj 1\nsource a.mp4\n\nclip 0 5 0\n",
+                b"edith 1\nsource a.mp4\n\nclip 0 5 0\n",
                 "line 3: unknown keyword \"\"",
             ),
             (
-                b"veproj 1\nsource a.mp4\nplayhead 3\nclip 0 5 0\n",
+                b"edith 1\nsource a.mp4\nplayhead 3\nclip 0 5 0\n",
                 "line 3: playhead belongs once, before the sources",
             ),
         ];
@@ -349,13 +349,13 @@ mod tests {
     fn a_project_without_clips_is_not_a_project() {
         let dir = PathBuf::from("/proj");
         assert_eq!(
-            parse(b"veproj 1\nsource a.mp4\n", &dir)
+            parse(b"edith 1\nsource a.mp4\n", &dir)
                 .unwrap_err()
                 .to_string(),
             "no clips: an empty timeline is not a project"
         );
         assert_eq!(
-            parse(b"veproj 1\n", &dir).unwrap_err().to_string(),
+            parse(b"edith 1\n", &dir).unwrap_err().to_string(),
             "no clips: an empty timeline is not a project"
         );
     }
@@ -373,7 +373,7 @@ mod tests {
         }
         // A % escape at the very end of a line has nothing to consume.
         assert_eq!(
-            parse(b"veproj 1\nsource a%\nclip 0 5 0\n", &dir)
+            parse(b"edith 1\nsource a%\nclip 0 5 0\n", &dir)
                 .unwrap_err()
                 .to_string(),
             "line 2: truncated % escape in the path"

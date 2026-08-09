@@ -68,7 +68,7 @@ impl Project {
     }
 
     /// A project rebuilt from a saved edit list -- the load half of
-    /// [`crate::veproj`]. History is *not* saved, so [`Project::undo`] is
+    /// [`crate::edith`]. History is *not* saved, so [`Project::undo`] is
     /// `false` until the first edit of the new session. `None` when the parts
     /// would break an invariant every other constructor keeps: no clips, an
     /// empty clip, or a clip naming a source that is not there.

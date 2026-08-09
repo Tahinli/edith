@@ -1,5 +1,5 @@
 //! Saving a project and opening it again: the timeline that comes back is the
-//! one that went in, a folder of media plus its `.veproj` can be moved
+//! one that went in, a folder of media plus its `.edith` can be moved
 //! anywhere, and every way the files on disk can have changed underneath is a
 //! refusal that says which file and why.
 //!
@@ -60,7 +60,7 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<PathBuf>, f6
 fn a_saved_project_reopens_as_the_same_timeline() {
     let dir = scratch("round_trip");
     let saved = edited(&dir);
-    let path = dir.join("edit.veproj");
+    let path = dir.join("edit.edith");
     saved.save_project(&path).expect("save");
 
     let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
@@ -76,7 +76,7 @@ fn a_saved_project_reopens_as_the_same_timeline() {
 
     // Saving what was loaded reproduces the file byte for byte -- the format
     // has no state the round trip drops.
-    let again = dir.join("again.veproj");
+    let again = dir.join("again.edith");
     loaded
         .save_project(&again)
         .expect("save the loaded project");
@@ -85,24 +85,24 @@ fn a_saved_project_reopens_as_the_same_timeline() {
         std::fs::read(&again).unwrap(),
         "save -> load -> save is not a fixed point"
     );
-    assert!(!path.with_extension("veproj.part").exists(), "left a .part");
+    assert!(!path.with_extension("edith.part").exists(), "left a .part");
 }
 
 #[test]
 fn a_folder_of_media_and_its_project_can_be_moved() {
     let from = scratch("relocate_from");
     let saved = edited(&from);
-    saved.save_project(&from.join("edit.veproj")).expect("save");
+    saved.save_project(&from.join("edit.edith")).expect("save");
     drop(saved);
 
     let to = scratch("relocate_to");
-    for name in ["test_av.mp4", "test_av2.mp4", "edit.veproj"] {
+    for name in ["test_av.mp4", "test_av2.mp4", "edit.edith"] {
         std::fs::copy(from.join(name), to.join(name)).expect("copy");
     }
     // The originals go away entirely: nothing absolute can be resolving here.
     std::fs::remove_dir_all(&from).expect("remove the original folder");
 
-    let moved = PlaybackSession::open_project(&to.join("edit.veproj")).expect("open the copy");
+    let moved = PlaybackSession::open_project(&to.join("edit.edith")).expect("open the copy");
     assert_eq!(moved.timeline_duration(), 6.0);
     assert!(
         moved.sources().iter().all(|s| s.starts_with(&to)),
@@ -125,7 +125,7 @@ fn orphan_sources_are_not_written() {
         "the orphan entry stays in-session"
     );
 
-    let path = dir.join("orphan.veproj");
+    let path = dir.join("orphan.edith");
     session.save_project(&path).expect("save");
     let text = std::fs::read_to_string(&path).expect("read back");
     assert_eq!(
@@ -146,7 +146,7 @@ fn orphan_sources_are_not_written() {
 fn a_source_that_vanished_is_refused_by_name() {
     let dir = scratch("missing");
     let session = edited(&dir);
-    let path = dir.join("edit.veproj");
+    let path = dir.join("edit.edith");
     session.save_project(&path).expect("save");
     drop(session);
 
@@ -174,12 +174,12 @@ fn a_source_that_vanished_is_refused_by_name() {
 fn a_source_that_shrank_is_refused_by_clip() {
     let dir = scratch("shrunk");
     copy_in(&dir, "test_av.mp4");
-    let path = dir.join("shrunk.veproj");
+    let path = dir.join("shrunk.edith");
     // Hand-written: a clip that ran to frame 10000 of a 150-frame file, which
     // is what re-encoding a source shorter leaves behind.
     std::fs::write(
         &path,
-        "veproj 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\nclip 30 10000 0\n",
+        "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\nclip 30 10000 0\n",
     )
     .expect("write");
     let err = PlaybackSession::open_project(&path)
@@ -194,7 +194,7 @@ fn a_source_that_shrank_is_refused_by_clip() {
     // One frame short of the end is still inside the file.
     std::fs::write(
         &path,
-        "veproj 1\nplayhead 0\nsource test_av.mp4\nclip 0 150 0\n",
+        "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 150 0\n",
     )
     .expect("write");
     let whole = PlaybackSession::open_project(&path).expect("the exact length is legal");
@@ -204,34 +204,34 @@ fn a_source_that_shrank_is_refused_by_clip() {
 #[test]
 fn a_project_that_names_itself_is_refused() {
     let dir = scratch("self_reference");
-    let path = dir.join("ouroboros.veproj");
+    let path = dir.join("ouroboros.edith");
     std::fs::write(
         &path,
-        "veproj 1\nplayhead 0\nsource ouroboros.veproj\nclip 0 30 0\n",
+        "edith 1\nplayhead 0\nsource ouroboros.edith\nclip 0 30 0\n",
     )
     .expect("write");
     let err = PlaybackSession::open_project(&path)
         .err()
         .expect("a project is not a video")
         .to_string();
-    assert!(err.contains("ouroboros.veproj"), "{err}");
+    assert!(err.contains("ouroboros.edith"), "{err}");
 }
 
 #[test]
 fn malformed_files_are_numbered_errors_and_never_panics() {
     let dir = scratch("malformed");
     copy_in(&dir, "test_av.mp4");
-    let path = dir.join("bad.veproj");
-    let good = "veproj 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\n";
+    let path = dir.join("bad.edith");
+    let good = "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\n";
 
     for (text, want) in [
-        ("veproj 2\nsource test_av.mp4\nclip 0 30 0\n", "line 1"),
+        ("edith 2\nsource test_av.mp4\nclip 0 30 0\n", "line 1"),
         ("not a project at all\n", "line 1"),
-        ("veproj 1\nsource test_av.mp4\nclip 0 30\n", "line 3"),
-        ("veproj 1\nsource test_av.mp4\nclip 0 30 4\n", "line 3"),
-        ("veproj 1\nsource test_av.mp4\nclip 30 30 0\n", "line 3"),
-        ("veproj 1\nsource test_av.mp4\n\nclip 0 30 0\n", "line 3"),
-        ("veproj 1\nsource test_av.mp4\nwhat 1\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nclip 0 30\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nclip 0 30 4\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nclip 30 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\n\nclip 0 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nwhat 1\n", "line 3"),
     ] {
         std::fs::write(&path, text).expect("write");
         let err = PlaybackSession::open_project(&path)
@@ -257,10 +257,10 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
     let dir = scratch("mismatch");
     copy_in(&dir, "test_av.mp4");
     std::fs::copy(asset("test_mismatch.mp4"), dir.join("test_av2.mp4")).expect("substitute");
-    let path = dir.join("swapped.veproj");
+    let path = dir.join("swapped.edith");
     std::fs::write(
         &path,
-        "veproj 1\nplayhead 0\nsource test_av.mp4\nsource test_av2.mp4\nclip 0 30 0\nclip 0 30 1\n",
+        "edith 1\nplayhead 0\nsource test_av.mp4\nsource test_av2.mp4\nclip 0 30 0\nclip 0 30 1\n",
     )
     .expect("write");
     let err = PlaybackSession::open_project(&path)
