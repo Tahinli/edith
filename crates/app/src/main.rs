@@ -1,9 +1,10 @@
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::{Clip, Frame, PlaybackSession};
+use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage, SharedString, TitlebarOptions,
@@ -62,6 +63,19 @@ struct Player {
     last_target: u32,
     /// Playback was started once, on the first render. Space owns it after that.
     launched: bool,
+    /// The running export. While it owns the UI the editor is read-only.
+    export: Option<ExportHandle>,
+    /// The export above was cancelled and is only winding down. The editor is
+    /// already free -- the worker took its own copy of the edit list -- but the
+    /// handle is held until the worker settles, because its last act is to
+    /// delete the output file and a second export must not be what it deletes.
+    cancelling: bool,
+    /// Where an export writes. Built once from the source path, which is not
+    /// otherwise kept.
+    export_path: PathBuf,
+    /// What the last export left in the timecode slot, and when. Cleared by
+    /// `NOTICE` passing or by the next key, whichever comes first.
+    notice: Option<(SharedString, Instant)>,
     displayed: u32,
     dropped: u32,
     /// Wall clock of the first displayed frame -- the real-speed measurement.
@@ -144,6 +158,9 @@ impl Player {
 
     /// Jumps the timeline.
     fn seek(&mut self, t: f64, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
         self.session.seek(t);
         self.reset_after_reseek();
         cx.notify();
@@ -152,6 +169,9 @@ impl Player {
     /// Splits the clip under the playhead. Metadata only: the timeline->source
     /// mapping is unchanged, so nothing reseeks and no flag is touched.
     fn cut(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
         self.session.cut_at(self.session.now());
         self.selected = None;
         cx.notify();
@@ -160,6 +180,9 @@ impl Player {
     /// Drops the selected clip. The engine reseeks itself, so all this owes is
     /// the flag reset.
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
         if self
             .selected
             .take()
@@ -214,6 +237,9 @@ impl Player {
     /// Space and the transport button share it: once the timeline is finished
     /// the only sensible "play" is from the top.
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
         if self.done {
             self.seek(0., cx);
             self.session.play();
@@ -222,6 +248,55 @@ impl Player {
             // Past EOF nothing else asks for a repaint.
             cx.notify();
         }
+    }
+
+    /// The export that owns the UI, if any. A cancelled one does not: it has
+    /// its own copy of the edit list and owes only its own cleanup.
+    fn exporting(&self) -> Option<&ExportHandle> {
+        self.export.as_ref().filter(|_| !self.cancelling)
+    }
+
+    /// Writes the edit list out beside the source. Playback stops first: the
+    /// exporter opens its own decoder -- and, on the hardware path, an encoder --
+    /// so a running player would only compete with it for the GPU. A cancelled
+    /// export still winding down holds this off for the frame it takes to
+    /// notice, which is what keeps its `remove_file` off the new output.
+    fn start_export(&mut self, cx: &mut Context<Self>) {
+        if self.export.is_some() {
+            return;
+        }
+        self.session.pause();
+        self.export = Some(self.session.export_to(&self.export_path));
+        cx.notify();
+    }
+
+    /// Gives the editor back at once and leaves the worker to stop at its next
+    /// frame and delete what it has written.
+    fn cancel_export(&mut self) {
+        if let Some(export) = &self.export {
+            export.cancel();
+            self.cancelling = true;
+        }
+    }
+
+    /// Takes the export's verdict once it has one. The only place the app
+    /// touches the handle's completion side.
+    fn poll_export(&mut self) {
+        let Some(result) = self.export.as_ref().and_then(ExportHandle::result) else {
+            return;
+        };
+        self.export = None;
+        // A cancellation is reported as an error, and the one who asked for it
+        // has had the editor back since the keystroke. Nothing to say.
+        if std::mem::take(&mut self.cancelling) {
+            return;
+        }
+        let text = match result {
+            Ok(()) => format!("EXPORT DONE → {}", file_name(&self.export_path)),
+            Err(e) => format!("EXPORT FAILED: {e}"),
+        };
+        eprintln!("{text}");
+        self.notice = Some((text.into(), Instant::now()));
     }
 }
 
@@ -235,12 +310,26 @@ impl Render for Player {
         }
         self.session.tick();
         self.pump(window);
+        self.poll_export();
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= NOTICE)
+        {
+            self.notice = None;
+        }
         // No shadow flag: the clock is the only truth about play state.
         let playing = self.session.is_playing();
         // A paused timeline has nothing to animate; the toggle handlers notify,
         // which is what starts the loop again. A paused seek keeps the loop
-        // running by itself until `pump` has the frame it asked for.
-        if (playing && !self.done) || self.pending_seek {
+        // running by itself until `pump` has the frame it asked for. An export
+        // pauses playback and still needs the loop: its progress, and the
+        // message it leaves behind, only reach the screen on a repaint.
+        if (playing && !self.done)
+            || self.pending_seek
+            || self.export.is_some()
+            || self.notice.is_some()
+        {
             window.request_animation_frame();
         }
 
@@ -264,6 +353,18 @@ impl Render for Player {
                 if event.is_held {
                     return;
                 }
+                // Any key retires the last export's message, whatever it was.
+                this.notice = None;
+                // An export is reading the edit list every other key here would
+                // change, so escape is the only one that means anything until
+                // it is over.
+                if this.exporting().is_some() {
+                    if event.keystroke.key.as_str() == "escape" {
+                        this.cancel_export();
+                    }
+                    cx.notify();
+                    return;
+                }
                 // On linux gpui reports ctrl-c as key "c" with the control
                 // modifier set (the control code is mapped back), so the plain
                 // and modified bindings are told apart here and nowhere else.
@@ -272,6 +373,7 @@ impl Render for Player {
                     event.keystroke.modifiers.control,
                 ) {
                     ("space", _) => this.toggle_or_restart(cx),
+                    ("e", false) => this.start_export(cx),
                     ("c", true) => this.copy_selected(),
                     ("v", true) => this.paste(cx),
                     ("c", false) => this.cut(cx),
@@ -352,6 +454,27 @@ impl Player {
         } else {
             0.
         };
+        // An export owns the timecode slot and the ruler while it runs: the
+        // percentage and the accent bar are the same number, so the playhead
+        // fill doubles as the progress bar for free.
+        let (label, filled) = if let Some(export) = self.exporting() {
+            let progress = export.progress();
+            (
+                format!("EXPORT {}% — esc cancels", (progress * 100.) as u32),
+                progress,
+            )
+        } else if let Some((notice, _)) = &self.notice {
+            (notice.to_string(), filled)
+        } else {
+            (
+                format!(
+                    "{} / {}",
+                    timecode(position, self.fps),
+                    timecode(duration, self.fps)
+                ),
+                filled,
+            )
+        };
         div()
             .flex_none()
             .h(px(PANEL_H))
@@ -380,11 +503,14 @@ impl Player {
                         delete_glyph(),
                         cx.listener(|this, _: &MouseDownEvent, _, cx| this.delete_selected(cx)),
                     ))
-                    .child(div().flex_none().w(px(TIME_W)).child(format!(
-                        "{} / {}",
-                        timecode(position, self.fps),
-                        timecode(duration, self.fps)
-                    ))),
+                    // Fixed width and one line whatever it says: an export
+                    // label is longer than a timecode and must not push the
+                    // row around, nor wrap and change its height.
+                    //
+                    // ponytail: a long file name is ellipsized at TIME_W --
+                    // the whole path is on stderr. Upgrade path is a status
+                    // line of its own under the ruler, not a wider slot.
+                    .child(div().flex_none().w(px(TIME_W)).truncate().child(label)),
             )
             // Press to seek, drag to scrub: the move and release halves live on
             // the root, since the pointer leaves this 6 px strip immediately.
@@ -460,6 +586,26 @@ const SCRUB_GAP: Duration = Duration::from_millis(100);
 
 fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
+}
+
+/// How long a finished export's message holds the timecode slot.
+const NOTICE: Duration = Duration::from_secs(2);
+
+/// Where an export goes: the source path with `.export.mp4` for an extension,
+/// so it lands beside the original and can never be the original.
+fn export_path(source: &str) -> PathBuf {
+    let mut path = PathBuf::from(source);
+    path.set_extension("export.mp4");
+    path
+}
+
+/// The tail of a path, for showing. A path that is all root has none, and reads
+/// as itself.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into(),
+    )
 }
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width
@@ -586,7 +732,7 @@ fn timecode(t: f64, fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{frac_along, scrub_due, timecode, width_frac};
+    use super::{export_path, frac_along, scrub_due, timecode, width_frac};
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
 
@@ -633,6 +779,26 @@ mod tests {
     }
 
     #[test]
+    fn export_lands_beside_the_source_and_never_on_it() {
+        // The whole point: the export of an .mp4 is never that .mp4.
+        assert_eq!(
+            export_path("assets/test_baseline.mp4"),
+            std::path::Path::new("assets/test_baseline.export.mp4")
+        );
+        // A second export of an export is still not its own source.
+        assert_eq!(
+            export_path("a.export.mp4"),
+            std::path::Path::new("a.export.export.mp4")
+        );
+        // Extensionless and dotted-directory names keep the directory intact.
+        assert_eq!(export_path("clip"), std::path::Path::new("clip.export.mp4"));
+        assert_eq!(
+            export_path("/v.1/clip.MP4"),
+            std::path::Path::new("/v.1/clip.export.mp4")
+        );
+    }
+
+    #[test]
     fn clip_boxes_split_the_lane_by_duration() {
         // 1 s + 3 s of a 4 s timeline: a quarter and three quarters.
         assert_eq!(width_frac(1., 4.), 0.25);
@@ -656,6 +822,7 @@ fn main() {
         }
     };
     let meta = *session.meta();
+    let out = export_path(&path);
     let name: SharedString = std::path::Path::new(&path)
         .file_name()
         .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())
@@ -697,6 +864,10 @@ fn main() {
                     last_scrub: Instant::now(),
                     last_target: 0,
                     launched: false,
+                    export: None,
+                    cancelling: false,
+                    export_path: out.clone(),
+                    notice: None,
                     displayed: 0,
                     dropped: 0,
                     started: None,
