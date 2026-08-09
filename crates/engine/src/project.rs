@@ -15,12 +15,23 @@
 //! across a cut; [`Project::delete`] does change the mapping and the caller
 //! must reseek. Every successful edit snapshots the clip list, so
 //! [`Project::undo`] is an exact restore.
+//!
+//! A clip names its file by *index* into [`Project::sources`], which is
+//! append-only: an index handed out once stays valid forever, so a clip on the
+//! clipboard or inside an undo snapshot can never dangle. An index -- not an
+//! `Arc<Path>` -- because [`Clip`] is `Copy`, which is what makes copy/paste a
+//! plain assignment.
 
-/// A half-open `[in_frame, out_frame)` range of source frames. Never empty.
+use std::path::{Path, PathBuf};
+
+/// A half-open `[in_frame, out_frame)` range of frames of source
+/// [`source`](Clip::source). Never empty.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Clip {
     pub in_frame: u32,
     pub out_frame: u32,
+    /// Index into [`Project::sources`].
+    pub source: usize,
 }
 
 impl Clip {
@@ -33,20 +44,24 @@ impl Clip {
 /// The edit list plus its undo history.
 #[derive(Clone, Debug)]
 pub struct Project {
+    /// Append-only: never popped, never reordered. See the module docs.
+    sources: Vec<PathBuf>,
     clips: Vec<Clip>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one.
     history: Vec<Vec<Clip>>,
 }
 
 impl Project {
-    /// One clip covering the whole file -- the state of a freshly opened video,
-    /// where the timeline is the source. `frame_count` of 0 would break the
-    /// never-empty invariant, so it is clamped to one frame.
-    pub fn single(frame_count: u32) -> Self {
+    /// One clip covering the whole of `path` -- the state of a freshly opened
+    /// video, where the timeline is the source. `frame_count` of 0 would break
+    /// the never-empty invariant, so it is clamped to one frame.
+    pub fn single(path: impl AsRef<Path>, frame_count: u32) -> Self {
         Self {
+            sources: vec![canonical(path.as_ref())],
             clips: vec![Clip {
                 in_frame: 0,
                 out_frame: frame_count.max(1),
+                source: 0,
             }],
             history: Vec::new(),
         }
@@ -54,6 +69,44 @@ impl Project {
 
     pub fn clips(&self) -> &[Clip] {
         &self.clips
+    }
+
+    /// The files the clips index into, in import order; index 0 is the file the
+    /// project was opened with.
+    pub fn sources(&self) -> &[PathBuf] {
+        &self.sources
+    }
+
+    /// Index for `path`, appending it if it is new. Deduped by
+    /// `fs::canonicalize`, so the same file reached by two paths imports once.
+    /// The clip list is untouched -- see [`Project::append_clip`] -- so this
+    /// pushes no history: a source entry alone changes nothing playable.
+    pub fn import(&mut self, path: impl AsRef<Path>) -> usize {
+        let path = canonical(path.as_ref());
+        match self.sources.iter().position(|s| *s == path) {
+            Some(idx) => idx,
+            None => {
+                self.sources.push(path);
+                self.sources.len() - 1
+            }
+        }
+    }
+
+    /// Append a whole-file clip of `source` to the end of the timeline. One
+    /// history snapshot, so an import is one undo step -- and undoing it leaves
+    /// the (harmless) source entry behind, because indexes are forever.
+    /// Refused for an unknown source index.
+    pub fn append_clip(&mut self, source: usize, frame_count: u32) -> bool {
+        if source >= self.sources.len() {
+            return false;
+        }
+        self.history.push(self.clips.clone());
+        self.clips.push(Clip {
+            in_frame: 0,
+            out_frame: frame_count.max(1),
+            source,
+        });
+        true
     }
 
     /// Length of the timeline in frames.
@@ -106,6 +159,7 @@ impl Project {
             Clip {
                 in_frame: source,
                 out_frame: out,
+                ..self.clips[idx]
             },
         );
         true
@@ -138,6 +192,7 @@ impl Project {
                         Clip {
                             in_frame: source,
                             out_frame: out,
+                            ..self.clips[idx]
                         },
                     ],
                 );
@@ -172,25 +227,37 @@ impl Project {
         }
     }
 
-    /// Half-open `(start, end)` segments in *source* seconds, from
+    /// Half-open `(source, start, end)` segments in *source* seconds, from
     /// `timeline_frame` to the end of the timeline -- the play list for the
     /// audio worker. The first entry is partial when the position is mid-clip.
     /// Empty when the position is past the end or `fps` is not usable.
-    pub fn segments_from(&self, timeline_frame: u32, fps: f64) -> Vec<(f64, f64)> {
+    pub fn segments_from(&self, timeline_frame: u32, fps: f64) -> Vec<(usize, f64, f64)> {
         if !(fps.is_finite() && fps > 0.0) {
             return Vec::new();
         }
         let Some((idx, source)) = self.map_timeline(timeline_frame) else {
             return Vec::new();
         };
-        let mut segs = vec![(source as f64 / fps, self.clips[idx].out_frame as f64 / fps)];
+        let head = self.clips[idx];
+        let mut segs = vec![(
+            head.source,
+            source as f64 / fps,
+            head.out_frame as f64 / fps,
+        )];
         segs.extend(
             self.clips[idx + 1..]
                 .iter()
-                .map(|c| (c.in_frame as f64 / fps, c.out_frame as f64 / fps)),
+                .map(|c| (c.source, c.in_frame as f64 / fps, c.out_frame as f64 / fps)),
         );
         segs
     }
+}
+
+/// Absolute, symlink-resolved when the file is reachable; the path as given
+/// when it is not -- an unreadable path still deserves an index, it simply
+/// dedups by spelling.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -198,25 +265,32 @@ mod tests {
     use super::*;
 
     const FPS: f64 = 30.0;
+    /// Never opened -- `Project` is pure data, so a path that does not exist is
+    /// simply a path that dedups by spelling.
+    const FILE: &str = "/nonexistent/a.mp4";
+    const FILE2: &str = "/nonexistent/b.mp4";
 
     /// Source clips [0,3) [3,5) [5,9) -- the ledger's off-by-one fixture. Built
     /// through `cut` so the constructor path is exercised too.
     fn three() -> Project {
-        let mut p = Project::single(9);
+        let mut p = Project::single(FILE, 9);
         assert!(p.cut(3));
         assert!(p.cut(5));
         assert_eq!(
             p.clips(),
             [
                 Clip {
+                    source: 0,
                     in_frame: 0,
                     out_frame: 3
                 },
                 Clip {
+                    source: 0,
                     in_frame: 3,
                     out_frame: 5
                 },
                 Clip {
+                    source: 0,
                     in_frame: 5,
                     out_frame: 9
                 },
@@ -227,7 +301,7 @@ mod tests {
 
     #[test]
     fn single_is_the_whole_file() {
-        let p = Project::single(150);
+        let p = Project::single(FILE, 150);
         assert_eq!(p.clips().len(), 1);
         assert_eq!(p.timeline_frames(), 150);
         assert_eq!(p.clip_spans(), vec![(0, 150)]);
@@ -236,21 +310,23 @@ mod tests {
         assert_eq!(p.map_timeline(149), Some((0, 149)));
         assert_eq!(p.map_timeline(150), None);
         // never-empty invariant survives a bogus frame count
-        assert_eq!(Project::single(0).timeline_frames(), 1);
+        assert_eq!(Project::single(FILE, 0).timeline_frames(), 1);
     }
 
     #[test]
     fn cut_mid_clip_splits() {
-        let mut p = Project::single(9);
+        let mut p = Project::single(FILE, 9);
         assert!(p.cut(4));
         assert_eq!(
             p.clips(),
             [
                 Clip {
+                    source: 0,
                     in_frame: 0,
                     out_frame: 4
                 },
                 Clip {
+                    source: 0,
                     in_frame: 4,
                     out_frame: 9
                 },
@@ -310,6 +386,7 @@ mod tests {
     /// The clip a copy would hand back: source `[100, 102)`, unrelated to
     /// anything in `three()` so it is recognisable wherever it lands.
     const PASTED: Clip = Clip {
+        source: 0,
         in_frame: 100,
         out_frame: 102,
     };
@@ -323,19 +400,23 @@ mod tests {
             p.clips(),
             [
                 Clip {
+                    source: 0,
                     in_frame: 0,
                     out_frame: 3
                 },
                 Clip {
+                    source: 0,
                     in_frame: 3,
                     out_frame: 5
                 },
                 Clip {
+                    source: 0,
                     in_frame: 5,
                     out_frame: 6
                 },
                 PASTED,
                 Clip {
+                    source: 0,
                     in_frame: 6,
                     out_frame: 9
                 },
@@ -372,6 +453,7 @@ mod tests {
         assert!(!p.paste(
             4,
             Clip {
+                source: 0,
                 in_frame: 7,
                 out_frame: 7
             }
@@ -444,6 +526,7 @@ mod tests {
         assert_eq!(
             p.clips(),
             [Clip {
+                source: 0,
                 in_frame: 0,
                 out_frame: 9
             }]
@@ -452,6 +535,7 @@ mod tests {
         assert_eq!(
             p.clips(),
             [Clip {
+                source: 0,
                 in_frame: 0,
                 out_frame: 9
             }]
@@ -464,21 +548,128 @@ mod tests {
         // mid-clip: partial first segment, whole clips after it
         assert_eq!(
             p.segments_from(4, FPS),
-            vec![(4.0 / 30.0, 5.0 / 30.0), (5.0 / 30.0, 9.0 / 30.0)]
+            vec![(0, 4.0 / 30.0, 5.0 / 30.0), (0, 5.0 / 30.0, 9.0 / 30.0)]
         );
         // on a boundary: nothing partial
         assert_eq!(
             p.segments_from(3, FPS),
-            vec![(3.0 / 30.0, 5.0 / 30.0), (5.0 / 30.0, 9.0 / 30.0)]
+            vec![(0, 3.0 / 30.0, 5.0 / 30.0), (0, 5.0 / 30.0, 9.0 / 30.0)]
         );
         // from the top: one entry per clip
         assert_eq!(p.segments_from(0, FPS).len(), 3);
         // last clip only
-        assert_eq!(p.segments_from(8, FPS), vec![(8.0 / 30.0, 0.3)]);
+        assert_eq!(p.segments_from(8, FPS), vec![(0, 8.0 / 30.0, 0.3)]);
         // past the end / unusable fps
         assert!(p.segments_from(9, FPS).is_empty());
         assert!(p.segments_from(0, 0.0).is_empty());
         assert!(p.segments_from(0, f64::NAN).is_empty());
+    }
+
+    /// `three()` plus a whole second source appended: clips [0,3) [3,5) [5,9)
+    /// of source 0 then [0,4) of source 1.
+    fn two_sources() -> Project {
+        let mut p = three();
+        let s = p.import(FILE2);
+        assert_eq!(s, 1);
+        assert!(p.append_clip(s, 4));
+        p
+    }
+
+    #[test]
+    fn import_dedups_and_appends() {
+        let mut p = Project::single(FILE, 9);
+        assert_eq!(p.sources().len(), 1, "the opened file is source 0");
+        assert_eq!(p.import(FILE), 0, "reimporting the open file reuses 0");
+        assert_eq!(p.import(FILE2), 1);
+        assert_eq!(p.import(FILE2), 1, "second import of the same path");
+        assert_eq!(p.sources().len(), 2);
+        assert!(!p.append_clip(2, 5), "unknown source index");
+        assert_eq!(p.clips().len(), 1, "a refusal changes nothing");
+
+        // Two spellings of one real file are one source: this is the case the
+        // raw-path comparison above would get wrong.
+        let here = concat!(env!("CARGO_MANIFEST_DIR"), "/src/project.rs");
+        let detour = concat!(env!("CARGO_MANIFEST_DIR"), "/src/../src/project.rs");
+        let mut p = Project::single(here, 9);
+        assert_eq!(p.import(detour), 0);
+        assert_eq!(p.sources().len(), 1);
+    }
+
+    #[test]
+    fn append_clip_is_one_undo_step() {
+        let mut p = two_sources();
+        assert_eq!(p.timeline_frames(), 13);
+        assert_eq!(
+            p.clips()[3],
+            Clip {
+                in_frame: 0,
+                out_frame: 4,
+                source: 1
+            }
+        );
+        assert_eq!(p.map_timeline(9), Some((3, 0)), "source 1 starts at 9");
+        assert!(p.undo());
+        assert_eq!(p.clips(), three().clips(), "one step back to one source");
+        assert_eq!(
+            p.sources().len(),
+            2,
+            "the orphan source entry stays -- indexes are forever"
+        );
+        // ...and it is still usable, so a redo-by-hand costs no reimport.
+        assert!(p.append_clip(1, 0));
+        assert_eq!(p.clips()[3].len(), 1, "clamped like `single`");
+    }
+
+    #[test]
+    fn edits_carry_the_source_along() {
+        let mut p = two_sources();
+        // A cut inside the second source splits into two source-1 clips.
+        assert!(p.cut(11));
+        assert_eq!(
+            p.clips()[3],
+            Clip {
+                in_frame: 0,
+                out_frame: 2,
+                source: 1
+            }
+        );
+        assert_eq!(
+            p.clips()[4],
+            Clip {
+                in_frame: 2,
+                out_frame: 4,
+                source: 1
+            }
+        );
+
+        // A source-1 clip pasted into source-0 territory keeps its file, and so
+        // does the source-0 half that got split off around it.
+        let copied = p.clips()[4];
+        assert!(p.paste(1, copied));
+        assert_eq!(p.clips()[1], copied);
+        assert_eq!(p.clips()[2].source, 0);
+        assert!(p.undo());
+        assert_eq!(p.clips()[1].source, 0, "undo restores sources too");
+    }
+
+    #[test]
+    fn segments_from_names_the_source() {
+        let p = two_sources();
+        // Mid-clip in source 0, then the rest of source 0, then source 1 whole.
+        assert_eq!(
+            p.segments_from(4, FPS),
+            vec![
+                (0, 4.0 / 30.0, 5.0 / 30.0),
+                (0, 5.0 / 30.0, 9.0 / 30.0),
+                (1, 0.0, 4.0 / 30.0),
+            ]
+        );
+        // Mid-clip in source 1: only that source is left.
+        assert_eq!(p.segments_from(10, FPS), vec![(1, 1.0 / 30.0, 4.0 / 30.0)]);
+        assert!(p.segments_from(13, FPS).is_empty());
+        // Segments still cover exactly the timeline across the join.
+        let played: f64 = p.segments_from(0, FPS).iter().map(|(_, a, b)| b - a).sum();
+        assert!((played - f64::from(p.timeline_frames()) / FPS).abs() < 1e-9);
     }
 
     #[test]
@@ -487,8 +678,8 @@ mod tests {
         assert!(p.delete(0));
         // source seconds, not timeline: deleting the head does not shift them
         let segs = p.segments_from(0, 25.0);
-        assert_eq!(segs, vec![(3.0 / 25.0, 0.2), (0.2, 9.0 / 25.0)]);
-        let played: f64 = segs.iter().map(|(a, b)| b - a).sum();
+        assert_eq!(segs, vec![(0, 3.0 / 25.0, 0.2), (0, 0.2, 9.0 / 25.0)]);
+        let played: f64 = segs.iter().map(|(_, a, b)| b - a).sum();
         assert!(
             (played - p.timeline_frames() as f64 / 25.0).abs() < 1e-9,
             "segments must cover exactly the timeline: {played}"
