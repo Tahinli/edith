@@ -21,6 +21,11 @@ const INK: u32 = 0xc8c8c8;
 const ACCENT: u32 = 0x4a9eff;
 /// The accent at surface brightness: a selected clip is tinted, not lit up.
 const SELECTED: u32 = 0x2a4a6b;
+/// One per source, so a clip that came from an imported file reads as coming
+/// from somewhere else. Same brightness as `SURFACE` and only the hue moves:
+/// the lane stays in the dark family the rest of the chrome lives in
+/// (ledger:187), and the first source keeps `SURFACE` exactly.
+const SOURCE_TINTS: [u32; 4] = [SURFACE, 0x3b3329, 0x293b33, 0x33293b];
 
 /// Fixed so the video region takes every pixel the window gains and the controls
 /// never clip at 640x360.
@@ -213,6 +218,26 @@ impl Player {
         cx.notify();
     }
 
+    /// Appends a file to the end of the timeline. A drop is not a key press, so
+    /// the export guard on the key handler does not cover it and this checks for
+    /// itself. The engine reseeks, so like a delete it owes the flag reset; a
+    /// refusal is shown as the engine worded it and changes nothing.
+    fn import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let text = match self.session.import(path) {
+            Ok(()) => {
+                self.reset_after_reseek();
+                format!("IMPORTED {}", file_name(path))
+            }
+            Err(e) => format!("IMPORT FAILED: {e}"),
+        };
+        eprintln!("{text}");
+        self.notice = Some((text.into(), Instant::now()));
+        cx.notify();
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.undo() {
             self.reset_after_reseek();
@@ -380,6 +405,15 @@ impl Render for Player {
                     ("x", _) | ("delete", _) => this.delete_selected(cx),
                     ("z", _) => this.undo(cx),
                     _ => {}
+                }
+            }))
+            // The whole window is the drop target: gpui turns an external file
+            // drop into an `ExternalPaths` drag (window.rs:3626) delivered as a
+            // mouse-up to every hovered hitbox, and the root's is the only one
+            // that covers the picture as well as the panel.
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                for path in paths.paths() {
+                    this.import(path, cx);
                 }
             }))
             // Scrubbing is tracked on the root because the pointer leaves the
@@ -554,18 +588,19 @@ impl Player {
             .overflow_hidden()
             .children(
                 self.session
-                    .clip_spans()
+                    .clip_spans_by_source()
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (_, len))| {
+                    .map(|(i, (_, len, source))| {
                         let selected = self.selected == Some(i);
+                        let tint = source_tint(source);
                         div()
                             .h_full()
                             .w(relative(width_frac(len, duration)))
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(rgb(if selected { ACCENT } else { SURFACE }))
-                            .bg(rgb(if selected { SELECTED } else { SURFACE }))
+                            .border_color(rgb(if selected { ACCENT } else { tint }))
+                            .bg(rgb(if selected { SELECTED } else { tint }))
                             .cursor_pointer()
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -606,6 +641,13 @@ fn file_name(path: &std::path::Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into(),
     )
+}
+
+/// The tint a clip from source `n` wears. Cycled rather than extended: past the
+/// palette two sources share a colour, which is a smaller lie than a fifth tint
+/// bright enough to leave the family.
+fn source_tint(source: usize) -> u32 {
+    SOURCE_TINTS[source % SOURCE_TINTS.len()]
 }
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width
@@ -732,7 +774,10 @@ fn timecode(t: f64, fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{export_path, frac_along, scrub_due, timecode, width_frac};
+    use super::{
+        SOURCE_TINTS, SURFACE, export_path, frac_along, scrub_due, source_tint, timecode,
+        width_frac,
+    };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
 
@@ -807,20 +852,45 @@ mod tests {
         // A timeline with no length must not hand gpui a NaN width.
         assert_eq!(width_frac(0., 0.), 1.);
     }
+
+    #[test]
+    fn source_tints_differ_per_source_and_cycle() {
+        // The file the session opened with is the unchanged lane colour.
+        assert_eq!(source_tint(0), SURFACE);
+        // Neighbouring sources must not share one, or an import is invisible.
+        assert_ne!(source_tint(0), source_tint(1));
+        assert_ne!(source_tint(1), source_tint(2));
+        assert_ne!(source_tint(2), source_tint(3));
+        // Past the palette it wraps -- never an index panic.
+        assert_eq!(source_tint(4), source_tint(0));
+        assert_eq!(source_tint(9), source_tint(1));
+        assert_eq!(source_tint(usize::MAX), SOURCE_TINTS[usize::MAX % 4]);
+    }
 }
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: app <video.mp4>");
+        eprintln!("usage: app <video.mp4> [more.mp4 ...]");
         std::process::exit(2);
     };
-    let session = match PlaybackSession::open(&path) {
+    let mut session = match PlaybackSession::open(&path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("cannot open {path}: {e}");
             std::process::exit(1);
         }
     };
+    // The first file makes the timeline, the rest are appended to it. A refusal
+    // is not fatal -- the others still load -- but the window must not open
+    // silently pretending the file was taken, so the first one seeds the notice.
+    let mut notice = None;
+    for arg in std::env::args().skip(2) {
+        if let Err(e) = session.import(std::path::Path::new(&arg)) {
+            let text = format!("IMPORT FAILED: {e}");
+            eprintln!("{arg}: {text}");
+            notice.get_or_insert(text);
+        }
+    }
     let meta = *session.meta();
     let out = export_path(&path);
     let name: SharedString = std::path::Path::new(&path)
@@ -867,7 +937,7 @@ fn main() {
                     export: None,
                     cancelling: false,
                     export_path: out.clone(),
-                    notice: None,
+                    notice: notice.clone().map(|text| (text.into(), Instant::now())),
                     displayed: 0,
                     dropped: 0,
                     started: None,
