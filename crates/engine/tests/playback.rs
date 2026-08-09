@@ -474,6 +474,74 @@ fn paste_duplicates_a_clip_at_the_playhead() {
     );
 }
 
+/// Pasting at the playhead while it is running: like a delete this moves every
+/// following frame, so the session reseeks under itself -- what must not happen
+/// is a stall, and the grown timeline still plays out whole. No audio needed.
+#[test]
+fn paste_while_playing_does_not_stall() {
+    let path = asset("test_baseline.mp4");
+    let mut session = PlaybackSession::open(&path).expect("open");
+    let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
+    let mut last_index = None;
+
+    assert!(session.cut_at(2.0), "cut at 2 s");
+    let copied = session.clip_at(0).expect("clip 0");
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+    assert!(last_index.is_some(), "no frames before the paste");
+
+    // Into the clip under the running playhead: the paste splits it in two and
+    // lands between the halves.
+    assert!(session.paste_at(session.now(), copied), "paste at the playhead");
+    assert!(session.is_playing(), "the paste stopped the clock");
+    assert_eq!(session.clip_spans().len(), 4);
+    let grown = total + copied.len();
+    assert!(
+        (session.timeline_duration() - f64::from(grown) / fps).abs() < 1e-9,
+        "duration after the paste: {}",
+        session.timeline_duration()
+    );
+
+    // As after a mid-play import: the reseek makes the indices step backwards
+    // once, so this drains without `pump`'s index-order check.
+    let (count, last) = drain_to_eof(&mut session);
+    eprintln!("paste while playing: {count} more frames, last {last:?}");
+    assert_eq!(
+        last,
+        Some(grown - 1),
+        "the grown timeline did not play out"
+    );
+}
+
+/// Pasting past the end of a played-out timeline appends, and the reseek every
+/// edit does clears `eos` -- so the session plays on into the pasted clip
+/// instead of staying dead.
+#[test]
+fn paste_at_eos_revives_the_session() {
+    let path = asset("test_baseline.mp4");
+    let mut session = PlaybackSession::open(&path).expect("open");
+    let total = session.meta().frame_count;
+
+    assert!(session.cut_at(2.0), "cut at 2 s");
+    let copied = session.clip_at(0).expect("clip 0");
+    session.play();
+    assert_eq!(drain_to_eof(&mut session).1, Some(total - 1));
+    assert!(session.is_eos());
+
+    assert!(session.paste_at(999.0, copied), "paste past the end appends");
+    assert!(!session.is_eos(), "the paste did not revive the session");
+    assert_eq!(session.clip_spans().len(), 3, "two clips plus the pasted one");
+    // No assertion on *where* it resumes: an edit reseeks to `now()`, and at EOS
+    // that is wherever the wall clock got to while draining -- a race. What is
+    // fixed is that frames come again and the whole grown timeline plays out.
+    next_frame(&mut session, "paste at EOS");
+    assert_eq!(
+        drain_to_eof(&mut session).1,
+        Some(total + copied.len() - 1),
+        "the pasted clip did not play out"
+    );
+}
+
 /// Editing while the device is running. A cut must not disturb playback at all
 /// and a delete reseeks under it -- in both cases the audio keeps coming, which
 /// is what stops `tick` from handing the timeline back to wall time.
