@@ -562,8 +562,22 @@ impl PlaybackSession {
     ///
     /// Later edits do not reach a running export: it works from a snapshot of
     /// the edit list taken here.
+    ///
+    /// ponytail: this defaults the settings; the app still calls it that way,
+    /// and the export options card replaces the call with
+    /// [`export_to_with`](PlaybackSession::export_to_with).
     pub fn export_to(&self, out: &Path) -> crate::ExportHandle {
-        crate::export::start(self.project.clone(), self.meta, out)
+        self.export_to_with(out, &crate::export::ExportSettings::default())
+    }
+
+    /// [`export_to`](PlaybackSession::export_to) with the output settings spelled
+    /// out rather than defaulted.
+    pub fn export_to_with(
+        &self,
+        out: &Path,
+        settings: &crate::export::ExportSettings,
+    ) -> crate::ExportHandle {
+        crate::export::start(self.project.clone(), self.meta, out, settings)
     }
 
     /// Moves the clock forward; the caller runs this once per rendered frame.
