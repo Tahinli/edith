@@ -40,6 +40,10 @@ struct Audio {
     fed: Arc<AtomicU64>,
     /// The decoder ran out and `fed` is final.
     fed_all: Arc<AtomicBool>,
+    /// The output plugin failed mid-stream. Its position is frozen from here on,
+    /// so it can never satisfy [`Audio::played_out`] -- the flag is what lets
+    /// [`PlaybackSession::tick`] hand the timeline to wall time instead.
+    died: Arc<AtomicBool>,
 }
 
 impl Audio {
@@ -137,6 +141,13 @@ impl PlaybackSession {
         if self.clock.source() != ClockSource::Audio {
             return;
         }
+        if audio.died.load(Ordering::Acquire) {
+            // Output died mid-stream: its position will never reach `fed`, so
+            // the EOF comparison below is unreachable. Wall time takes over
+            // from wherever the clock last stood.
+            self.clock.switch_to_wall();
+            return;
+        }
         // `None` until the device's first callback: the clock holds at its
         // anchor rather than guessing, which is why playback starts on time
         // instead of a quantum early.
@@ -176,16 +187,18 @@ fn open_audio(path: &Path) -> Option<Audio> {
         channels: u64::from(meta.channels),
         fed: Arc::new(AtomicU64::new(0)),
         fed_all: Arc::new(AtomicBool::new(false)),
+        died: Arc::new(AtomicBool::new(false)),
     };
-    let (ao, fed, fed_all) = (
+    let (ao, fed, fed_all, died) = (
         audio.ao.clone(),
         audio.fed.clone(),
         audio.fed_all.clone(),
+        audio.died.clone(),
     );
     thread::Builder::new()
         .name("audio-feed".into())
         .spawn(move || {
-            feed(rx, &ao, &fed);
+            feed(rx, &ao, &fed, &died);
             fed_all.store(true, Ordering::Release);
         })
         .ok()?;
@@ -194,7 +207,7 @@ fn open_audio(path: &Path) -> Option<Audio> {
 
 /// Pours decoded chunks into the device, keeping whatever the ring would not
 /// take. Ends when the decoder is done or the output dies.
-fn feed(rx: Receiver<AudioChunk>, ao: &Mutex<AoSession>, fed: &AtomicU64) {
+fn feed(rx: Receiver<AudioChunk>, ao: &Mutex<AoSession>, fed: &AtomicU64, died: &AtomicBool) {
     let mut pending: Vec<f32> = Vec::new();
     loop {
         if pending.is_empty() {
@@ -205,7 +218,11 @@ fn feed(rx: Receiver<AudioChunk>, ao: &Mutex<AoSession>, fed: &AtomicU64) {
         }
         let accepted = match ao.lock().unwrap().write(&pending) {
             Some(n) => n,
-            None => return, // output died; the clock switches to wall
+            None => {
+                // Output died; flag it so `tick` moves the clock to wall time.
+                died.store(true, Ordering::Release);
+                return;
+            }
         };
         fed.fetch_add(accepted as u64, Ordering::Relaxed);
         pending.drain(..accepted);
