@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage, SharedString, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb,
-    size,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point,
+    prelude::*, px, relative, rgb, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -26,15 +26,36 @@ const SELECTED: u32 = 0x2a4a6b;
 /// the lane stays in the dark family the rest of the chrome lives in
 /// (ledger:187), and the first source keeps `SURFACE` exactly.
 const SOURCE_TINTS: [u32; 4] = [SURFACE, 0x3b3329, 0x293b33, 0x33293b];
+/// One step lighter than whatever it sits on: the pointer's answer that this is
+/// clickable. Two of them, because buttons stand on `SURFACE` and the scrub
+/// strip stands on `CHROME`.
+const HOVER: u32 = 0x3f3f3f;
+const HOVER_DIM: u32 = 0x2c2c2c;
+/// Secondary text -- shortcuts, dismissal hints. Dimmer than `INK` and still
+/// past 4.5:1 on both `SURFACE` and `CHROME`.
+const INK_DIM: u32 = 0xa0a0a0;
 
 /// Fixed so the video region takes every pixel the window gains and the controls
 /// never clip at 640x360.
 const HEADER_H: f32 = 32.;
-const PANEL_H: f32 = 180.;
+// 28 button row + 24 scrub strip + two 48 lanes + the timecode line + the gaps
+// between them, with a few px of slack so a taller text line cannot push a lane
+// off the bottom.
+const PANEL_H: f32 = 220.;
 const LANE_H: f32 = 48.;
+/// WCAG 2.5.8: nothing clickable is smaller than this. The scrub bar stays 6 px
+/// to look at -- `RULER_HIT_H` is the strip that has to be hit.
+const HIT_MIN: f32 = 24.;
+const CONTROL_H: f32 = 28.;
+const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
 /// cannot push the layout around.
 const TIME_W: f32 = 200.;
+/// The shortcuts no button carries; the rest ride on the buttons' tooltips.
+/// Keys first: at a 640 px window the tail is what a truncation eats, and the
+/// two hints at the end are also on the ruler's and Import's tooltips.
+const KEY_HINTS: &str =
+    "ctrl+c copy · ctrl+v paste · z undo · click the bar to seek · drop a file to import";
 
 struct Player {
     session: PlaybackSession,
@@ -82,9 +103,10 @@ struct Player {
     /// one derived beside the media it started as. Saving twice overwrites the
     /// same file rather than making a second one.
     project_path: PathBuf,
-    /// What the last export left in the timecode slot, and when. Cleared by
-    /// `NOTICE` passing or by the next key, whichever comes first.
-    notice: Option<(SharedString, Instant)>,
+    /// What the last file action had to say. Holds its own bar above the panel
+    /// until it is answered -- any key retires it, so does a click on it -- so a
+    /// failure is read in full instead of blinking past.
+    notice: Option<SharedString>,
     displayed: u32,
     dropped: u32,
     /// Wall clock of the first displayed frame -- the real-speed measurement.
@@ -238,8 +260,37 @@ impl Player {
             Err(e) => format!("IMPORT FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some((text.into(), Instant::now()));
+        self.notice = Some(text.into());
         cx.notify();
+    }
+
+    /// The Import button: asks the desktop for a path and takes it the same way
+    /// a drop would. The chooser is another process and the user may sit in it,
+    /// so it runs on a background thread -- blocking here would freeze the
+    /// window behind the dialog.
+    fn pick_and_import(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let picked = cx.background_executor().spawn(async { pick_file() });
+        cx.spawn(async move |this, cx| {
+            let picked = picked.await;
+            this.update(cx, |this, cx| match picked {
+                // The same fork the drop handler makes: a project replaces the
+                // timeline, media is appended to it.
+                Ok(Some(path)) if is_project(&path) => this.load_project(&path, cx),
+                Ok(Some(path)) => this.import(&path, cx),
+                // Cancelled: the user already knows what happened.
+                Ok(None) => {}
+                Err(text) => {
+                    eprintln!("{text}");
+                    this.notice = Some(text.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Swaps the whole timeline for one restored from a `.edith`. Like an
@@ -277,7 +328,7 @@ impl Player {
             Err(e) => format!("OPEN FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some((text.into(), Instant::now()));
+        self.notice = Some(text.into());
         cx.notify();
     }
 
@@ -289,7 +340,7 @@ impl Player {
             Err(e) => format!("SAVE FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some((text.into(), Instant::now()));
+        self.notice = Some(text.into());
         cx.notify();
     }
 
@@ -376,7 +427,7 @@ impl Player {
             Err(e) => format!("EXPORT FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some((text.into(), Instant::now()));
+        self.notice = Some(text.into());
     }
 }
 
@@ -391,25 +442,16 @@ impl Render for Player {
         self.session.tick();
         self.pump(window);
         self.poll_export();
-        if self
-            .notice
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() >= NOTICE)
-        {
-            self.notice = None;
-        }
         // No shadow flag: the clock is the only truth about play state.
         let playing = self.session.is_playing();
         // A paused timeline has nothing to animate; the toggle handlers notify,
         // which is what starts the loop again. A paused seek keeps the loop
         // running by itself until `pump` has the frame it asked for. An export
-        // pauses playback and still needs the loop: its progress, and the
-        // message it leaves behind, only reach the screen on a repaint.
-        if (playing && !self.done)
-            || self.pending_seek
-            || self.export.is_some()
-            || self.notice.is_some()
-        {
+        // pauses playback and still needs the loop: its progress only reaches
+        // the screen on a repaint. A notice does not: it waits to be dismissed
+        // rather than for a clock, so keeping the loop alive for it would spin
+        // the GPU until someone answered it.
+        if (playing && !self.done) || self.pending_seek || self.export.is_some() {
             window.request_animation_frame();
         }
 
@@ -433,8 +475,13 @@ impl Render for Player {
                 if event.is_held {
                     return;
                 }
-                // Any key retires the last export's message, whatever it was.
-                this.notice = None;
+                // Any key retires the last message, whatever it was -- and owes
+                // the repaint itself: a notice no longer keeps the render loop
+                // alive, and the arms below that do notify are not all of them
+                // (an unbound key, or ctrl+c, changes nothing else).
+                if this.notice.take().is_some() {
+                    cx.notify();
+                }
                 // An export is reading the edit list every other key here would
                 // change, so escape is the only one that means anything until
                 // it is over.
@@ -531,12 +578,15 @@ impl Render for Player {
                             .map(|i| img(i).size_full().object_fit(gpui::ObjectFit::Contain)),
                     ),
             )
+            // Above the panel and only when there is one to show, so it costs
+            // the picture nothing the rest of the time.
+            .children(self.notice_bar(cx))
             .child(self.panel(position, duration, playing, cx))
     }
 }
 
 impl Player {
-    /// Transport, timecode, playhead, clips lane.
+    /// Transport, edit and file buttons, timecode, playhead, clips lane.
     fn panel(
         &self,
         position: f64,
@@ -549,26 +599,18 @@ impl Player {
         } else {
             0.
         };
-        // An export owns the timecode slot and the ruler while it runs: the
+        // An export owns the hint slot and the ruler while it runs: the
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
-        let (label, filled) = if let Some(export) = self.exporting() {
+        let exporting = self.exporting().is_some();
+        let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
             (
-                format!("EXPORT {}% — esc cancels", (progress * 100.) as u32),
+                format!("EXPORTING {}% — esc cancels", (progress * 100.) as u32),
                 progress,
             )
-        } else if let Some((notice, _)) = &self.notice {
-            (notice.to_string(), filled)
         } else {
-            (
-                format!(
-                    "{} / {}",
-                    timecode(position, self.fps),
-                    timecode(duration, self.fps)
-                ),
-                filled,
-            )
+            (KEY_HINTS.to_string(), filled)
         };
         div()
             .flex_none()
@@ -579,43 +621,110 @@ impl Player {
             .px(px(12.))
             .py(px(8.))
             .bg(rgb(CHROME))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(control(
-                        transport_glyph(playing),
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            this.toggle_or_restart(cx);
-                        }),
-                    ))
-                    .child(control(
-                        cut_glyph(),
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.cut(cx)),
-                    ))
-                    .child(control(
-                        delete_glyph(),
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.delete_selected(cx)),
-                    ))
-                    // Fixed width and one line whatever it says: an export
-                    // label is longer than a timecode and must not push the
-                    // row around, nor wrap and change its height.
-                    //
-                    // ponytail: a long file name is ellipsized at TIME_W --
-                    // the whole path is on stderr. Upgrade path is a status
-                    // line of its own under the ruler, not a wider slot.
-                    .child(div().flex_none().w(px(TIME_W)).truncate().child(label)),
-            )
-            // Press to seek, drag to scrub: the move and release halves live on
-            // the root, since the pointer leaves this 6 px strip immediately.
+            // Transport | edit | file: three groups, so the eye can skip two of
+            // them. Every button says what it does; the tooltip adds its key.
             .child(
                 div()
                     .flex_none()
-                    .h(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(control(
+                        "transport",
+                        Some(transport_glyph(playing).into_any_element()),
+                        if playing { "Pause" } else { "Play" },
+                        "space",
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
+                    ))
+                    .child(separator())
+                    .child(control(
+                        "cut",
+                        Some(cut_glyph().into_any_element()),
+                        "Cut",
+                        "c — splits the clip under the playhead",
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
+                    ))
+                    .child(control(
+                        "delete",
+                        Some(delete_glyph().into_any_element()),
+                        "Delete",
+                        if self.selected.is_some() {
+                            "x or delete"
+                        } else {
+                            "x or delete — click a clip below first"
+                        },
+                        !exporting && self.selected.is_some(),
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    .child(separator())
+                    .child(control(
+                        "import",
+                        None,
+                        "Import",
+                        "opens a file chooser — or drop a file on the window",
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
+                    ))
+                    .child(control(
+                        "export",
+                        None,
+                        "Export",
+                        "e — writes the timeline out beside the source",
+                        self.export.is_none(),
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.start_export(cx)),
+                    ))
+                    .child(control(
+                        "save",
+                        None,
+                        "Save",
+                        "ctrl+s — writes the project file",
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    // Fixed width and one line: changing digits must not push
+                    // the row around, nor wrap and change its height.
+                    .child(div().flex_none().w(px(TIME_W)).truncate().child(format!(
+                        "{} / {}",
+                        timecode(position, self.fps),
+                        timecode(duration, self.fps)
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child(hint),
+                    ),
+            )
+            // Press to seek, drag to scrub: the move and release halves live on
+            // the root, since the pointer leaves the bar immediately. The bar
+            // stays 6 px to look at; the strip that takes the click is 24, so
+            // it can be hit without aiming (WCAG 2.5.8).
+            .child(
+                div()
+                    .id("ruler")
+                    .flex_none()
+                    .h(px(RULER_HIT_H))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
                     .rounded(px(3.))
-                    .bg(rgb(SURFACE))
                     .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER_DIM)))
+                    // The strip carries no text, so the tooltip is the only
+                    // place it can say what it is.
+                    .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -623,23 +732,64 @@ impl Player {
                             this.scrub_to(event.position.x, true, cx);
                         }),
                     )
-                    .child(bounds_probe(self.ruler.clone()))
                     .child(
                         div()
-                            .h_full()
-                            .w(relative(filled))
+                            .w_full()
+                            .h(px(6.))
                             .rounded(px(3.))
-                            .bg(rgb(ACCENT)),
+                            .bg(rgb(SURFACE))
+                            .child(bounds_probe(self.ruler.clone()))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(filled))
+                                    .rounded(px(3.))
+                                    .bg(rgb(ACCENT)),
+                            ),
                     ),
             )
             .child(self.clips_lane(duration, cx))
             .child(track_lane())
     }
 
+    /// A notice holds its own bar, full width, until it is answered: any key
+    /// retires it (the key handler) and so does a click on it. Its own surface
+    /// because the message is the point -- a failure cut to the timecode's slot
+    /// is a failure nobody read.
+    fn notice_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let notice = self.notice.clone()?;
+        Some(
+            div()
+                .id("notice")
+                .flex_none()
+                .flex()
+                .items_start()
+                .gap(px(12.))
+                .px(px(12.))
+                .py(px(6.))
+                .bg(rgb(SURFACE))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.notice = None;
+                    cx.notify();
+                }))
+                .child(div().flex_1().min_w(px(0.)).child(notice))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.))
+                        .text_color(rgb(INK_DIM))
+                        .child("click or press any key to dismiss"),
+                ),
+        )
+    }
+
     /// The edit list made visible: one box per clip, sized by its share of the
     /// timeline. A cut adds a box without moving anything, a delete closes the
-    /// gap. Plain divs, so the root keeps focus and space still works after a
-    /// click (ledger:182).
+    /// gap. A box has no room for a label at four clips, so the tooltip is where
+    /// it says what clicking it does. Never focusable, so the root keeps focus
+    /// and space still works after a click (ledger:182).
     fn clips_lane(&self, duration: f64, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
@@ -656,6 +806,7 @@ impl Player {
                         let selected = self.selected == Some(i);
                         let tint = source_tint(source);
                         div()
+                            .id(("clip", i))
                             .h_full()
                             .w(relative(width_frac(len, duration)))
                             .rounded(px(3.))
@@ -663,6 +814,11 @@ impl Player {
                             .border_color(rgb(if selected { ACCENT } else { tint }))
                             .bg(rgb(if selected { SELECTED } else { tint }))
                             .cursor_pointer()
+                            .hover(|s| s.border_color(rgb(ACCENT)))
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tip("Select clip — Delete removes it".into()))
+                                    .into()
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -684,8 +840,30 @@ fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
 }
 
-/// How long a finished export's message holds the timecode slot.
-const NOTICE: Duration = Duration::from_secs(2);
+/// The desktop's own file choosers, best first. Asked for by name because gpui
+/// 0.2 has no file dialog of its own and none of these is worth a dependency.
+const PICKERS: [(&str, &[&str]); 2] = [
+    ("zenity", &["--file-selection", "--title=edith — import"]),
+    ("kdialog", &["--getopenfilename"]),
+];
+
+/// Runs the first chooser that is installed. `Ok(None)` is a cancelled dialog;
+/// the error is for a machine with no chooser at all, which still has the drop
+/// target -- the import path that never depended on another program.
+fn pick_file() -> Result<Option<PathBuf>, &'static str> {
+    for (bin, args) in PICKERS {
+        // Not installed: try the next one. Anything else (a cancel, a refusal)
+        // is that chooser's answer and is taken as final.
+        let Ok(out) = std::process::Command::new(bin).args(args).output() else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+    }
+    Err(
+        "NO FILE CHOOSER — install zenity or kdialog, or drag the file onto this window to import it",
+    )
+}
 
 /// Where an export goes: the source path with `.export.mp4` for an extension,
 /// so it lands beside the original and can never be the original.
@@ -734,34 +912,92 @@ fn width_frac(len: f64, total: f64) -> f32 {
     if total > 0. { (len / total) as f32 } else { 1. }
 }
 
-/// The 32x28 control shape shared by transport, cut and delete. A plain div:
-/// nothing here tracks focus, so the root's own key listener keeps working
-/// after a press.
+/// A toolbar button: its glyph, its name, and its key on hover. `id` only buys
+/// `on_click` and the tooltip -- it is still not focusable, so the root's own
+/// key listener keeps working after a press, and the click lands on mouse-up
+/// inside the button (a press that slides off does nothing).
+///
+/// A button that would do nothing says so: dimmed, no pointer, no listener.
 fn control(
-    glyph: impl IntoElement,
-    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    id: &'static str,
+    glyph: Option<AnyElement>,
+    label: &'static str,
+    shortcut: &'static str,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let tip: SharedString = format!("{label} — {shortcut}").into();
     div()
-        .w(px(32.))
-        .h(px(28.))
+        .id(id)
+        .flex_none()
+        .h(px(CONTROL_H))
         .flex()
-        .justify_center()
         .items_center()
+        .gap(px(6.))
+        .px(px(8.))
         .rounded(px(3.))
         .bg(rgb(SURFACE))
-        .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, on_press)
-        .child(glyph)
+        .children(glyph)
+        .child(label)
+        .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(on_click)
+        })
 }
 
-/// A clip split in two -- the gap is the cut. Drawn, like every glyph here.
-fn cut_glyph() -> impl IntoElement {
+/// The line between two groups of buttons.
+fn separator() -> impl IntoElement {
     div()
-        .flex()
-        .items_center()
-        .gap(px(3.))
-        .child(div().w(px(5.)).h(px(13.)).bg(rgb(INK)))
-        .child(div().w(px(5.)).h(px(13.)).bg(rgb(INK)))
+        .flex_none()
+        .mx(px(4.))
+        .w(px(1.))
+        .h(px(18.))
+        .bg(rgb(HOVER))
+}
+
+/// A tooltip is a view in gpui and nothing smaller, so this is the smallest one
+/// that carries a line of text. It paints outside the window's element tree and
+/// therefore owns its colours.
+struct Tip(SharedString);
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(6.))
+            .py(px(3.))
+            .rounded(px(3.))
+            .border_1()
+            .border_color(rgb(SURFACE))
+            .bg(rgb(CHROME))
+            .text_color(rgb(INK))
+            .text_size(px(12.))
+            .child(self.0.clone())
+    }
+}
+
+/// Scissors: two blades crossed. Drawn this way and not as a split clip because
+/// two bars is what the transport wears when it is playing -- the one glyph a
+/// cut must never be mistaken for.
+fn cut_glyph() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let mut path = PathBuilder::stroke(px(1.5));
+            path.move_to(point(o.x + s.width * 0.15, o.y + s.height));
+            path.line_to(point(o.x + s.width * 0.9, o.y + s.height * 0.1));
+            path.move_to(point(o.x + s.width * 0.85, o.y + s.height));
+            path.line_to(point(o.x + s.width * 0.1, o.y + s.height * 0.1));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(INK));
+            }
+        },
+    )
+    .w(px(13.))
+    .h(px(13.))
 }
 
 /// A lid over a bin.
@@ -853,8 +1089,8 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SOURCE_TINTS, SURFACE, export_path, frac_along, is_project, project_path, scrub_due,
-        source_tint, timecode, width_frac,
+        CONTROL_H, HIT_MIN, LANE_H, RULER_HIT_H, SOURCE_TINTS, SURFACE, export_path, frac_along,
+        is_project, project_path, scrub_due, source_tint, timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
@@ -964,6 +1200,15 @@ mod tests {
     }
 
     #[test]
+    fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
+        // Every hit target in the panel, including the scrub strip -- whose bar
+        // is 6 px to look at and whose click area must not be.
+        assert!(CONTROL_H >= HIT_MIN);
+        assert!(RULER_HIT_H >= HIT_MIN);
+        assert!(LANE_H >= HIT_MIN);
+    }
+
+    #[test]
     fn source_tints_differ_per_source_and_cycle() {
         // The file the session opened with is the unchanged lane colour.
         assert_eq!(source_tint(0), SURFACE);
@@ -1036,7 +1281,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("video_editor".into()),
+                    title: Some("edith".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1062,7 +1307,7 @@ fn main() {
                     cancelling: false,
                     export_path: out.clone(),
                     project_path: project.clone(),
-                    notice: notice.clone().map(|text| (text.into(), Instant::now())),
+                    notice: notice.clone().map(SharedString::from),
                     displayed: 0,
                     dropped: 0,
                     started: None,
