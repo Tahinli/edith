@@ -1,3 +1,7 @@
+mod keymap;
+
+use keymap::{ActionId, Keymap};
+
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,7 +13,7 @@ use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage,
     SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point,
-    prelude::*, px, relative, rgb, size,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -51,11 +55,15 @@ const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
 /// cannot push the layout around.
 const TIME_W: f32 = 200.;
-/// The shortcuts no button carries; the rest ride on the buttons' tooltips.
-/// Keys first: at a 640 px window the tail is what a truncation eats, and the
-/// two hints at the end are also on the ruler's and Import's tooltips.
-const KEY_HINTS: &str =
-    "ctrl+c copy · ctrl+v paste · z undo · click the bar to seek · drop a file to import";
+/// The keybindings card: 11 rows and a title inside a 360 px tall window.
+const KEYS_W: f32 = 300.;
+const KEYS_ROW_H: f32 = 20.;
+
+/// The one key name this file still spells out, and gpui's spelling of it: it
+/// is the way out of a capture and out of the overlay, and both have to work
+/// while the keymap itself is what is being changed -- so neither can go
+/// through the keymap to find it.
+const ESCAPE: &str = "escape";
 
 struct Player {
     session: PlaybackSession,
@@ -87,7 +95,7 @@ struct Player {
     scrubbing: bool,
     last_scrub: Instant,
     last_target: u32,
-    /// Playback was started once, on the first render. Space owns it after that.
+    /// Playback was started once, on the first render. The play binding owns it after that.
     launched: bool,
     /// The running export. While it owns the UI the editor is read-only.
     export: Option<ExportHandle>,
@@ -99,10 +107,20 @@ struct Player {
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
-    /// Where ctrl+s writes: the project this timeline was loaded from, or the
-    /// one derived beside the media it started as. Saving twice overwrites the
-    /// same file rather than making a second one.
+    /// Where the save action writes: the project this timeline was loaded from,
+    /// or the one derived beside the media it started as. Saving twice
+    /// overwrites the same file rather than making a second one.
     project_path: PathBuf,
+    /// Which stroke means what, and what every shortcut on screen is called.
+    /// The one place either question is answered.
+    keymap: Keymap,
+    /// The keybindings overlay is up. While it is, it owns the keyboard and the
+    /// pointer: a stroke or a click meant for a row must not also cut the
+    /// timeline.
+    keys_open: bool,
+    /// The row waiting for a stroke, as an index into `keymap.entries()`. The
+    /// next key that is neither escape nor a lone modifier *is* that binding.
+    rebinding: Option<usize>,
     /// What the last file action had to say. Holds its own bar above the panel
     /// until it is answered -- any key retires it, so does a click on it -- so a
     /// failure is read in full instead of blinking past.
@@ -352,6 +370,33 @@ impl Player {
         cx.notify();
     }
 
+    /// The stroke a waiting row was after. A chord another action already holds
+    /// is refused by the keymap and the row keeps waiting, so the next stroke is
+    /// another try rather than a lost one. A binding that took holds either way:
+    /// what a failed write costs is only the next run, which is what the notice
+    /// is for.
+    fn capture(&mut self, index: usize, key: &str, ctrl: bool) {
+        let chord = keymap::Chord {
+            key: key.to_string(),
+            ctrl,
+        };
+        let text = match self.keymap.rebind(index, chord.clone()) {
+            Ok(()) => {
+                self.rebinding = None;
+                match self.keymap.save() {
+                    Ok(()) => return,
+                    Err(e) => format!(
+                        "KEYBINDINGS NOT SAVED — {}: {e}",
+                        Keymap::config_path().display()
+                    ),
+                }
+            }
+            Err(holder) => format!("ALREADY BOUND — {} is {}", chord.pretty(), holder.label()),
+        };
+        eprintln!("{text}");
+        self.notice = Some(text.into());
+    }
+
     /// Seeks to where the pointer sits along the ruler. `commit` is the press
     /// and the release, which must land exactly even when the throttle below
     /// would have skipped them.
@@ -365,7 +410,7 @@ impl Player {
         }
     }
 
-    /// Space and the transport button share it: once the timeline is finished
+    /// The play binding and the transport button share it: once the timeline is finished
     /// the only sensible "play" is from the top.
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
@@ -478,36 +523,60 @@ impl Render for Player {
                 // Any key retires the last message, whatever it was -- and owes
                 // the repaint itself: a notice no longer keeps the render loop
                 // alive, and the arms below that do notify are not all of them
-                // (an unbound key, or ctrl+c, changes nothing else).
+                // (an unbound key, or the copy chord, changes nothing else).
                 if this.notice.take().is_some() {
                     cx.notify();
                 }
-                // An export is reading the edit list every other key here would
-                // change, so escape is the only one that means anything until
-                // it is over.
+                let key = event.keystroke.key.as_str();
+                // A row is waiting for a stroke, and while it is, that stroke is
+                // data: it means the binding and nothing else, which is why this
+                // answers before the export guard and before the keymap is
+                // consulted at all.
+                if let Some(index) = this.rebinding {
+                    if key == ESCAPE {
+                        this.rebinding = None;
+                    } else if !is_bare_modifier(key) {
+                        this.capture(index, key, event.keystroke.modifiers.control);
+                    }
+                    cx.notify();
+                    return;
+                }
+                // On linux gpui reports the copy chord as key "c" with the
+                // control modifier set (the control code is mapped back), which
+                // is why the keymap is keyed on the pair and never on the key
+                // alone.
+                let action = this.keymap.lookup(key, event.keystroke.modifiers.control);
+                // An export is reading the edit list every other action here
+                // would change, so cancelling is the only one that means
+                // anything until it is over.
                 if this.exporting().is_some() {
-                    if event.keystroke.key.as_str() == "escape" {
+                    if cancels_export(key, action) {
                         this.cancel_export();
                     }
                     cx.notify();
                     return;
                 }
-                // On linux gpui reports ctrl-c as key "c" with the control
-                // modifier set (the control code is mapped back), so the plain
-                // and modified bindings are told apart here and nowhere else.
-                match (
-                    event.keystroke.key.as_str(),
-                    event.keystroke.modifiers.control,
-                ) {
-                    ("space", _) => this.toggle_or_restart(cx),
-                    ("e", false) => this.start_export(cx),
-                    ("s", true) => this.save_project(cx),
-                    ("c", true) => this.copy_selected(),
-                    ("v", true) => this.paste(cx),
-                    ("c", false) => this.cut(cx),
-                    ("x", _) | ("delete", _) => this.delete_selected(cx),
-                    ("z", _) => this.undo(cx),
-                    _ => {}
+                // The overlay owns the keyboard while it is up: a stroke aimed
+                // at a row must not also cut the timeline, and the way out of it
+                // is the same key that gets out of a capture.
+                if this.keys_open {
+                    if key == ESCAPE {
+                        this.keys_open = false;
+                        cx.notify();
+                    }
+                    return;
+                }
+                match action {
+                    Some(ActionId::Play) => this.toggle_or_restart(cx),
+                    Some(ActionId::Export) => this.start_export(cx),
+                    Some(ActionId::Save) => this.save_project(cx),
+                    Some(ActionId::Copy) => this.copy_selected(),
+                    Some(ActionId::Paste) => this.paste(cx),
+                    Some(ActionId::Cut) => this.cut(cx),
+                    Some(ActionId::Delete) => this.delete_selected(cx),
+                    Some(ActionId::Undo) => this.undo(cx),
+                    // Nothing to cancel while nothing is exporting.
+                    Some(ActionId::CancelExport) | None => {}
                 }
             }))
             // The whole window is the drop target: gpui turns an external file
@@ -515,6 +584,13 @@ impl Render for Player {
             // mouse-up to every hovered hitbox, and the root's is the only one
             // that covers the picture as well as the panel.
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                // The overlay owns the pointer as well as the keyboard, and a
+                // drop is a click the scrim cannot swallow: gpui delivers it to
+                // the root's hitbox, which is under the scrim but is not a
+                // sibling it can stop.
+                if this.keys_open {
+                    return;
+                }
                 for path in paths.paths() {
                     // A project replaces the timeline, media is appended to it.
                     if is_project(path) {
@@ -582,6 +658,8 @@ impl Render for Player {
             // the picture nothing the rest of the time.
             .children(self.notice_bar(cx))
             .child(self.panel(position, duration, playing, cx))
+            // Last, so it is over everything -- it takes no room in the column.
+            .children(self.keys_overlay(cx))
     }
 }
 
@@ -603,14 +681,31 @@ impl Player {
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
         let exporting = self.exporting().is_some();
+        let key = |action| self.keymap.display(action);
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
             (
-                format!("EXPORTING {}% — esc cancels", (progress * 100.) as u32),
+                format!(
+                    "EXPORTING {}% — {} cancels",
+                    (progress * 100.) as u32,
+                    key(ActionId::CancelExport)
+                ),
                 progress,
             )
         } else {
-            (KEY_HINTS.to_string(), filled)
+            // The strokes no button carries; the rest ride on the buttons'
+            // tooltips. Keys first: at a 640 px window the tail is what a
+            // truncation eats, and the two hints at the end are also on the
+            // ruler's and Import's tooltips.
+            (
+                format!(
+                    "{} copy · {} paste · {} undo · click the bar to seek · drop a file to import",
+                    key(ActionId::Copy),
+                    key(ActionId::Paste),
+                    key(ActionId::Undo)
+                ),
+                filled,
+            )
         };
         div()
             .flex_none()
@@ -633,7 +728,7 @@ impl Player {
                         "transport",
                         Some(transport_glyph(playing).into_any_element()),
                         if playing { "Pause" } else { "Play" },
-                        "space",
+                        key(ActionId::Play),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
@@ -642,7 +737,10 @@ impl Player {
                         "cut",
                         Some(cut_glyph().into_any_element()),
                         "Cut",
-                        "c — splits the clip under the playhead",
+                        format!(
+                            "{} — splits the clip under the playhead",
+                            key(ActionId::Cut)
+                        ),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
                     ))
@@ -651,9 +749,9 @@ impl Player {
                         Some(delete_glyph().into_any_element()),
                         "Delete",
                         if self.selected.is_some() {
-                            "x or delete"
+                            key(ActionId::Delete)
                         } else {
-                            "x or delete — click a clip below first"
+                            format!("{} — click a clip below first", key(ActionId::Delete))
                         },
                         !exporting && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
@@ -663,7 +761,7 @@ impl Player {
                         "import",
                         None,
                         "Import",
-                        "opens a file chooser — or drop a file on the window",
+                        "opens a file chooser — or drop a file on the window".to_string(),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
                     ))
@@ -671,7 +769,10 @@ impl Player {
                         "export",
                         None,
                         "Export",
-                        "e — writes the timeline out beside the source",
+                        format!(
+                            "{} — writes the timeline out beside the source",
+                            key(ActionId::Export)
+                        ),
                         self.export.is_none(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.start_export(cx)),
                     ))
@@ -679,9 +780,24 @@ impl Player {
                         "save",
                         None,
                         "Save",
-                        "ctrl+s — writes the project file",
+                        format!("{} — writes the project file", key(ActionId::Save)),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
+                    ))
+                    // No shortcut of its own -- and closed while an export runs,
+                    // which is what keeps a waiting row from swallowing the
+                    // escape the progress line promises cancels the export.
+                    .child(control(
+                        "keys",
+                        None,
+                        "Keys",
+                        "show and change the keybindings".to_string(),
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.keys_open = !this.keys_open;
+                            this.rebinding = None;
+                            cx.notify();
+                        }),
                     )),
             )
             .child(
@@ -785,11 +901,106 @@ impl Player {
         )
     }
 
+    /// Every binding, and the way to change one: a row per entry, click it and
+    /// the next stroke becomes its chord. Over the whole window, because while
+    /// it is up nothing under it may answer -- the scrim stops the clicks
+    /// (gpui dispatches mouse listeners topmost-first, window.rs:3705) and the
+    /// key handler's own branch stops the strokes.
+    ///
+    /// Plain divs, like every control here: nothing in it takes focus, so the
+    /// root is still the one reading the keyboard -- which is exactly what a
+    /// waiting row depends on.
+    fn keys_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.keys_open {
+            return None;
+        }
+        // The way out, spelled the way the rows spell a chord.
+        let out = keymap::Chord {
+            key: ESCAPE.to_string(),
+            ctrl: false,
+        }
+        .pretty();
+        let rows: Vec<_> = self
+            .keymap
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(i, binding)| {
+                let capturing = self.rebinding == Some(i);
+                let out = out.clone();
+                div()
+                    .id(("bind", i))
+                    .flex()
+                    .h(px(KEYS_ROW_H))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .when(capturing, |d| d.bg(rgb(SELECTED)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.rebinding = Some(i);
+                        cx.notify();
+                    }))
+                    .child(binding.action.label())
+                    .child(if capturing {
+                        div()
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("press a key — {out} cancels"))
+                    } else {
+                        div().child(binding.chord.pretty())
+                    })
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                // The picture behind is out of reach, and looks it. The press is
+                // swallowed here so a button under the scrim cannot take it.
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(KEYS_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(
+                            div()
+                                .h(px(KEYS_ROW_H))
+                                .px(px(6.))
+                                .child("Keybindings — click a row, then press a key"),
+                        )
+                        .children(rows)
+                        // A refusal belongs where the click was: the notice bar
+                        // itself is under the scrim.
+                        .children(self.notice.clone().map(|notice| {
+                            div()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(notice)
+                        })),
+                ),
+        )
+    }
+
     /// The edit list made visible: one box per clip, sized by its share of the
     /// timeline. A cut adds a box without moving anything, a delete closes the
     /// gap. A box has no room for a label at four clips, so the tooltip is where
     /// it says what clicking it does. Never focusable, so the root keeps focus
-    /// and space still works after a click (ledger:182).
+    /// and the play binding still works after a click (ledger:182).
     fn clips_lane(&self, duration: f64, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
@@ -873,7 +1084,7 @@ fn export_path(source: impl Into<PathBuf>) -> PathBuf {
     path
 }
 
-/// Where ctrl+s goes when the timeline did not come from a project file: the
+/// Where a save goes when the timeline did not come from a project file: the
 /// media path with `.edith` for an extension, beside it like an export. A
 /// project loaded from disk keeps its own path instead, so saving it twice
 /// writes the same file.
@@ -906,6 +1117,27 @@ fn source_tint(source: usize) -> u32 {
     SOURCE_TINTS[source % SOURCE_TINTS.len()]
 }
 
+/// Whether a stroke gets out of a running export. Escape does, whatever
+/// modifiers are held with it, for the same reason it gets out of a capture and
+/// out of the overlay: it is this window's way out, and a way out that only
+/// works with the right modifiers is not one. Whatever the keymap has on cancel
+/// works too, so rebinding it adds a way rather than replacing the one that
+/// always worked -- and that binding is still what the progress line shows.
+fn cancels_export(key: &str, action: Option<ActionId>) -> bool {
+    key == ESCAPE || action == Some(ActionId::CancelExport)
+}
+
+/// The keys that are only ever half a chord. gpui delivers a lone modifier
+/// press as a keystroke of its own, and taking one as a binding would leave an
+/// action that fires the moment the user reaches for any chord that uses it --
+/// so a capture waits through them instead.
+fn is_bare_modifier(key: &str) -> bool {
+    matches!(
+        key,
+        "control" | "shift" | "alt" | "super" | "platform" | "function" | "fn" | "meta" | "command"
+    )
+}
+
 /// A clip's share of the lane. A timeline with no length reads as one full-width
 /// box rather than as NaN, which gpui would carry into layout.
 fn width_frac(len: f64, total: f64) -> f32 {
@@ -922,7 +1154,7 @@ fn control(
     id: &'static str,
     glyph: Option<AnyElement>,
     label: &'static str,
-    shortcut: &'static str,
+    shortcut: String,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -1089,8 +1321,9 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_H, HIT_MIN, LANE_H, RULER_HIT_H, SOURCE_TINTS, SURFACE, export_path, frac_along,
-        is_project, project_path, scrub_due, source_tint, timecode, width_frac,
+        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_W, LANE_H, RULER_HIT_H, SOURCE_TINTS, SURFACE,
+        cancels_export, export_path, frac_along, is_bare_modifier, is_project, keymap,
+        project_path, scrub_due, source_tint, timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
@@ -1200,6 +1433,49 @@ mod tests {
     }
 
     #[test]
+    fn escape_gets_out_of_an_export_whatever_is_held_with_it() {
+        use keymap::ActionId;
+        // The regression this guards: looking the stroke up in the keymap made
+        // ctrl+escape mean nothing, and an export that a modifier could trap
+        // the user inside of is worse than an unbound chord.
+        assert!(cancels_export("escape", None));
+        assert!(cancels_export("escape", Some(ActionId::CancelExport)));
+        // A rebound cancel works as well -- it adds a way out, never replaces
+        // the one that always worked.
+        assert!(cancels_export("q", Some(ActionId::CancelExport)));
+        // Nothing else does, whatever it means outside an export.
+        assert!(!cancels_export("e", Some(ActionId::Export)));
+        assert!(!cancels_export("space", Some(ActionId::Play)));
+        assert!(!cancels_export("q", None));
+    }
+
+    #[test]
+    fn a_capture_waits_through_a_lone_modifier() {
+        // gpui delivers these on their own; taking one as a binding would make
+        // the action fire on the way to every chord that uses it.
+        for key in [
+            "control", "shift", "alt", "super", "platform", "function", "fn", "meta", "command",
+        ] {
+            assert!(is_bare_modifier(key), "{key}");
+        }
+        // Everything a binding is actually made of, escape included -- the
+        // capture branch turns that one away itself.
+        for key in ["c", "x", "space", "escape", "delete", "f1", "z"] {
+            assert!(!is_bare_modifier(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn the_keybindings_card_fits_the_smallest_window() {
+        // A title line plus a row per default binding, inside the 640x360 the
+        // rest of the layout is already sized for.
+        let lines = keymap::Keymap::defaults().entries().len() as f32 + 1.;
+        // Rows, their 2 px gaps, the card's 12 px padding top and bottom.
+        assert!(lines * (KEYS_ROW_H + 2.) + 24. <= 360., "card too tall");
+        assert!(KEYS_W <= 640., "card too wide");
+    }
+
+    #[test]
     fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
         // Every hit target in the panel, including the scrub strip -- whose bar
         // is 6 px to look at and whose click area must not be.
@@ -1245,10 +1521,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // A keymap file that cannot be read leaves the defaults in force, and takes
+    // the notice slot ahead of an import refusal below: it is about every key
+    // the window has, and the import refusal is on stderr either way.
+    let (keymap, mut notice) = Keymap::load();
+    if let Some(text) = &notice {
+        eprintln!("{text}");
+    }
     // The first file makes the timeline, the rest are appended to it. A refusal
     // is not fatal -- the others still load -- but the window must not open
     // silently pretending the file was taken, so the first one seeds the notice.
-    let mut notice = None;
     for arg in std::env::args().skip(2) {
         if let Err(e) = session.import(std::path::Path::new(&arg)) {
             let text = format!("IMPORT FAILED: {e}");
@@ -1307,6 +1589,9 @@ fn main() {
                     cancelling: false,
                     export_path: out.clone(),
                     project_path: project.clone(),
+                    keymap: keymap.clone(),
+                    keys_open: false,
+                    rebinding: None,
                     notice: notice.clone().map(SharedString::from),
                     displayed: 0,
                     dropped: 0,
