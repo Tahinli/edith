@@ -16,4 +16,17 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=5 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av.mp4
+# Second A/V fixture for multi-file import: same properties as test_av.mp4
+# (1280x720@30 baseline, AAC-LC 44.1k stereo) but plainly different content —
+# testsrc pattern, 4 s, an octave up (660/1320 Hz) with the same 1 Hz pulse.
+ffmpeg -y -f lavfi -i testsrc=size=1280x720:rate=30:duration=4 \
+    -f lavfi -i "sine=frequency=660:duration=4" \
+    -f lavfi -i "sine=frequency=1320:duration=4" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_av2.mp4
+# Mismatch fixture: different resolution and no audio track at all, so import
+# has something concrete to refuse.
+ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
+    -an -c:v libx264 -profile:v baseline -pix_fmt yuv420p assets/test_mismatch.mp4
 echo "fixtures written to assets/"
