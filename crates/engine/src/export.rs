@@ -36,6 +36,20 @@ const BITS_PER_PIXEL: f64 = 0.1;
 const MIN_BITRATE: u64 = 1_000_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
+/// What the caller gets to decide about the output. The codec and container are
+/// not among it: H.264 in mp4 is the only pair with both an encoder and a
+/// decoder under this project's no-install rule, so offering a choice would be
+/// offering files we cannot read back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExportSettings {
+    /// Bits per second, clamped to the same sane range the automatic value uses.
+    /// `None` picks it from the picture size and frame rate.
+    pub bitrate: Option<u64>,
+    /// Skip the hardware encoder even where it is available -- an escape hatch
+    /// for a driver that encodes badly, matching the `VE_SW_ENC` env pin.
+    pub force_sw: bool,
+}
+
 struct Shared {
     progress: AtomicU32,
     cancel: AtomicBool,
@@ -80,7 +94,13 @@ impl ExportHandle {
 /// returned, so a caller has exactly one place to look. The files to read are
 /// the project's own [`sources`](Project::sources) -- every clip names one --
 /// so nothing but the edit list decides what is decoded.
-pub fn start(project: Project, meta: VideoMeta, out: &Path) -> ExportHandle {
+pub fn start(
+    project: Project,
+    meta: VideoMeta,
+    out: &Path,
+    settings: &ExportSettings,
+) -> ExportHandle {
+    let settings = *settings;
     let shared = Arc::new(Shared {
         progress: AtomicU32::new(0),
         cancel: AtomicBool::new(false),
@@ -98,7 +118,7 @@ pub fn start(project: Project, meta: VideoMeta, out: &Path) -> ExportHandle {
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
-        let result = run(&project, &meta, &part, &worker)
+        let result = run(&project, &meta, &part, &worker, &settings)
             .and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
             // The muxer -- and with it the file handle -- died with `run`.
@@ -118,7 +138,13 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
     shared.finished.store(true, Ordering::Release);
 }
 
-fn run(project: &Project, meta: &VideoMeta, out: &Path, shared: &Shared) -> crate::Result<()> {
+fn run(
+    project: &Project,
+    meta: &VideoMeta,
+    out: &Path,
+    shared: &Shared,
+    settings: &ExportSettings,
+) -> crate::Result<()> {
     let total = project.timeline_frames();
     let sources = project.sources();
     // Audio first: a track has to be declared when the muxer is created, which
@@ -140,7 +166,7 @@ fn run(project: &Project, meta: &VideoMeta, out: &Path, shared: &Shared) -> crat
         chan_conf: track.chan_conf,
     });
 
-    let mut encoder = Enc::open(meta)?;
+    let mut encoder = Enc::open(meta, settings)?;
     let mut muxer = None;
     let mut done = 0u32;
     for clip in project.clips() {
@@ -255,12 +281,18 @@ enum Enc {
 }
 
 impl Enc {
-    fn open(meta: &VideoMeta) -> crate::Result<Self> {
-        let bitrate = bitrate_for(meta);
+    fn open(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
+        // A caller's number goes through the same clamp as the computed one: a
+        // zero bitrate switches the software encoder's lookahead on, which would
+        // break the one-picture-per-call contract `encode` documents below.
+        let bitrate = settings
+            .bitrate
+            .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE));
         // The plugin wants an exact rational; a thousandth of a frame per second
         // is finer than any container fps we can read back.
         let fps_num = (meta.frame_rate * 1_000.0).round().max(1.0) as u32;
-        if !forced("VE_SW_ENC")
+        if !settings.force_sw
+            && !forced("VE_SW_ENC")
             && let Some(hw) = HwEncoder::open(meta.width, meta.height, fps_num, 1_000, bitrate)
         {
             eprintln!("export encoder: hardware (VA-API plugin)");

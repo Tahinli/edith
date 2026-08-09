@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
@@ -202,7 +203,7 @@ fn multi_source_round_trip(name: &str, limit: Duration) {
     let out = out_path(name);
 
     let started = Instant::now();
-    let handle = engine::export::start(project.clone(), meta, &out);
+    let handle = engine::export::start(project.clone(), meta, &out, &ExportSettings::default());
     wait(&handle, limit).expect("export");
     println!(
         "{name}: {total} frames of two sources in {:.2} s",
@@ -274,6 +275,35 @@ fn exports_two_sources_as_one_timeline_in_hardware() {
     multi_source_round_trip("multi_hw", Duration::from_secs(60));
 }
 
+/// The bitrate setting is the one knob a user turns for quality, so it has to
+/// reach the encoder: the same 120-frame timeline at 1, 4 and 8 Mbps has to come
+/// back as three strictly growing files. `force_sw` pins the software encoder,
+/// whose rate control is the one every machine has.
+#[test]
+fn a_higher_bitrate_writes_a_bigger_file() {
+    pin_software();
+    let mut sizes = Vec::new();
+    for bitrate in [1_000_000u64, 4_000_000, 8_000_000] {
+        let mut session = edited(&asset("test_baseline.mp4"));
+        session.pause();
+        let out = out_path(&format!("bitrate_{bitrate}"));
+        let settings = ExportSettings {
+            bitrate: Some(bitrate),
+            force_sw: true,
+        };
+        let handle = session.export_to_with(&out, &settings);
+        wait(&handle, Duration::from_secs(180)).expect("export");
+        let size = std::fs::metadata(&out).expect("export exists").len();
+        println!("{} Mbps: {size} bytes", bitrate / 1_000_000);
+        sizes.push(size);
+        std::fs::remove_file(&out).unwrap();
+    }
+    assert!(
+        sizes[0] < sizes[1] && sizes[1] < sizes[2],
+        "file sizes {sizes:?} are not strictly growing with the bitrate"
+    );
+}
+
 /// A source that disappears between the edit and the export fails the export
 /// rather than silently writing a shorter file -- and leaves neither an output
 /// nor a `.part`. Both sources are silent, so the failure is the per-clip open
@@ -298,7 +328,7 @@ fn a_vanished_source_fails_the_export() {
 
     std::fs::remove_file(&doomed).expect("unlink the second source");
     let out = out_path("vanished");
-    let handle = engine::export::start(project, meta, &out);
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let result = wait(&handle, Duration::from_secs(60));
     let error = result.expect_err("an export of a missing file cannot succeed");
     println!("vanished source: {error}");
