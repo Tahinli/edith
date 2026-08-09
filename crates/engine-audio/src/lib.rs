@@ -170,7 +170,14 @@ fn run(
         properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::MEDIA_ROLE => "Movie",
+            // Deliberately no MEDIA_ROLE: the session manager keys saved stream
+            // volume/mute by media.role before anything else, so declaring
+            // "Movie" put us in one bucket with every other video player on the
+            // box -- a mute somebody set on one of them last month came back as
+            // "edith has no sound", with nothing in the app to undo it. Without
+            // a role we get our own bucket, keyed by name, and start audible.
+            // Restoring stays ON: it is also what initialises the channel
+            // volumes, and a stream that opts out of it comes up at -inf dB.
             *pw::keys::AUDIO_CHANNELS => channels.to_string(),
             // Asks the graph to schedule us at our own quantum, which is what
             // keeps the fill below from under-delivering on a lazy sink.
