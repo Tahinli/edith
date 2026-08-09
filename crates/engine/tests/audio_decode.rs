@@ -48,7 +48,11 @@ fn decodes_av_mp4_audio() {
         // d. no gaps, no overlaps.
         assert_eq!(chunk.start_sample, next_sample, "chunk {chunks} start");
         assert!(!chunk.samples.is_empty(), "empty chunk {chunks}");
-        assert_eq!(chunk.samples.len() % 2, 0, "partial frame in chunk {chunks}");
+        assert_eq!(
+            chunk.samples.len() % 2,
+            0,
+            "partial frame in chunk {chunks}"
+        );
         next_sample += (chunk.samples.len() / 2) as u64;
         left.extend(chunk.samples.iter().step_by(2));
         right.extend(chunk.samples[1..].iter().step_by(2));
@@ -81,9 +85,15 @@ fn decodes_av_mp4_audio() {
 
     // Priming trimmed: the sine starts at a rising zero crossing, and audio is
     // present immediately rather than after a silent or garbage run-in.
-    assert!(left[0].abs() < 0.05, "first sample {} not near zero", left[0]);
+    assert!(
+        left[0].abs() < 0.05,
+        "first sample {} not near zero",
+        left[0]
+    );
     assert!(left[1] > 0.0, "first sine quarter is not rising");
-    let head_peak = left[..FRAME as usize].iter().fold(0f32, |m, s| m.max(s.abs()));
+    let head_peak = left[..FRAME as usize]
+        .iter()
+        .fold(0f32, |m, s| m.max(s.abs()));
     assert!(head_peak > 0.01, "first frame is silent: peak {head_peak}");
 
     eprintln!(

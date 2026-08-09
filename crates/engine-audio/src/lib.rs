@@ -91,6 +91,19 @@ impl Ring {
     }
 }
 
+/// The consumer half of a flush: drops everything queued, then pops as usual.
+/// Doing it here rather than in `ao_flush` keeps the ring single-consumer --
+/// only the RT thread ever moves `read` -- and means a flush asked for while
+/// paused (no callbacks running) still lands before the next pop, so the stale
+/// samples can never be heard.
+fn consume(flush: &AtomicBool, ring: &Ring, dst: &mut [u8], want: usize) -> usize {
+    if flush.swap(false, Ordering::Acquire) {
+        ring.read
+            .store(ring.write.load(Ordering::Acquire), Ordering::Release);
+    }
+    ring.pop(dst, want)
+}
+
 /// Everything the RT thread and the caller's thread both touch.
 struct Shared {
     ring: Ring,
@@ -100,6 +113,8 @@ struct Shared {
     ready: AtomicBool,
     /// Stream died (daemon gone, node removed); every later write fails.
     dead: AtomicBool,
+    /// Asked for by `ao_flush`, honoured by the next process callback.
+    flush: AtomicBool,
     underruns: AtomicU64,
 }
 
@@ -178,7 +193,7 @@ fn run(
                         // the pause and a future seek all have to wait out.
                         let frames = (slice.len() / stride).min(QUANTUM as usize);
                         let want = frames * channels;
-                        let got = shared.ring.pop(slice, want);
+                        let got = consume(&shared.flush, &shared.ring, slice, want);
                         if got < want {
                             // Underrun: silence rather than stale samples, and
                             // the clock below keeps running -- the device plays
@@ -323,6 +338,7 @@ pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
             position: AtomicI64::new(-1),
             ready: AtomicBool::new(false),
             dead: AtomicBool::new(false),
+            flush: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -414,6 +430,28 @@ pub unsafe extern "C" fn ao_set_active(session: *mut c_void, active: u32) -> i32
     .unwrap_or(-1)
 }
 
+/// Drops every queued sample, so playback resumes from whatever is written
+/// next: what a seek needs. Takes effect on the next process callback (or the
+/// first one after a resume), and leaves the played position alone -- the
+/// device keeps counting, the caller re-bases against it.
+/// 0 on success, negative on failure.
+///
+/// # Safety
+/// `session` must come from [`ao_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_flush(session: *mut c_void) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        session.shared.flush.store(true, Ordering::Release);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
 /// Stops playback and releases the session. Safe to call with null.
 ///
 /// # Safety
@@ -430,7 +468,7 @@ pub unsafe extern "C" fn ao_close(session: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::Ring;
+    use super::{AtomicBool, Ordering, Ring, consume};
 
     #[test]
     fn ring_wraps_fills_and_starves() {
@@ -451,5 +489,29 @@ mod tests {
 
         // Empty ring starves instead of replaying stale samples.
         assert_eq!(ring.pop(&mut out, 4), 0);
+    }
+
+    #[test]
+    fn flush_drops_queued_samples() {
+        let ring = Ring::new(4);
+        let flush = AtomicBool::new(false);
+        let mut out = [0u8; 16];
+
+        // No flush pending: an ordinary pop.
+        assert_eq!(ring.push(&[1.0, 2.0]), 2);
+        assert_eq!(consume(&flush, &ring, &mut out, 2), 2);
+
+        // Flushed: the queued samples are gone, so the callback gets nothing
+        // and fills silence, and the flag is one-shot.
+        assert_eq!(ring.push(&[3.0, 4.0]), 2);
+        flush.store(true, Ordering::Release);
+        assert_eq!(consume(&flush, &ring, &mut out, 2), 0);
+        assert!(!flush.load(Ordering::Acquire));
+
+        // Ring is empty, not corrupt: the next write plays as usual.
+        assert_eq!(ring.push(&[5.0, 6.0, 7.0, 8.0]), 4);
+        assert_eq!(consume(&flush, &ring, &mut out, 4), 4);
+        assert_eq!(&out[..4], &5.0f32.to_le_bytes());
+        assert_eq!(&out[12..16], &8.0f32.to_le_bytes());
     }
 }
