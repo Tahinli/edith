@@ -1,12 +1,16 @@
-//! Runtime-optional hardware decode plugin (`libengine_hw.so`).
+//! Runtime-optional hardware decode/encode plugin (`libengine_hw.so`).
 //!
 //! The plugin links libva/gbm/drm; this crate and the app binary must not, so
 //! the only coupling is this C ABI plus a `dlopen`. Anything that goes wrong --
 //! plugin missing, no VA-API runtime, no render node, unsupported stream --
-//! leaves us with `None` and the caller falls back to the software decoder.
+//! leaves us with `None` and the caller falls back to the software codec.
+//!
+//! Decode and encode resolve their symbols into *separate* tables on purpose: a
+//! plugin built before the encode entry points existed must still decode, so a
+//! missing `vh_enc_*` may only cost us [`HwEncoder`], never [`HwSession`].
 
 use std::ffi::{CString, c_char, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use libloading::Library;
@@ -66,18 +70,18 @@ fn plugin() -> Option<&'static Plugin> {
     PLUGIN.get_or_init(load).as_ref()
 }
 
-fn load() -> Option<Plugin> {
-    // Next to the executable first (cargo puts both in target/<profile>), then
-    // whatever the dynamic linker's search path turns up.
-    let beside_exe = std::env::current_exe()
+/// Where the plugin may live: next to the executable first (cargo puts both in
+/// target/<profile>), then whatever the dynamic linker's search path turns up.
+fn candidates() -> impl Iterator<Item = PathBuf> {
+    std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(LIB_NAME)));
-    let candidates = beside_exe
-        .as_deref()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(LIB_NAME)))
         .into_iter()
-        .chain(std::iter::once(Path::new(LIB_NAME)));
+        .chain(std::iter::once(PathBuf::from(LIB_NAME)))
+}
 
-    for candidate in candidates {
+fn load() -> Option<Plugin> {
+    for candidate in candidates() {
         // SAFETY: loading a shared object runs its initialisers; we only ever
         // name our own plugin, and every symbol below is type-checked against
         // the definitions this crate shares with it.
@@ -187,3 +191,139 @@ impl Drop for HwSession {
 // The plugin session is used from one thread at a time (the decode worker) and
 // never shared; VA-API state inside it is not `Sync`.
 unsafe impl Send for HwSession {}
+
+struct EncPlugin {
+    open: extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void,
+    frame:
+        unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
+    drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
+    close: unsafe extern "C" fn(*mut c_void),
+    // Never dropped (lives in a static), so the fn pointers above stay valid.
+    _lib: Library,
+}
+
+fn enc_plugin() -> Option<&'static EncPlugin> {
+    static PLUGIN: OnceLock<Option<EncPlugin>> = OnceLock::new();
+    PLUGIN.get_or_init(load_enc).as_ref()
+}
+
+fn load_enc() -> Option<EncPlugin> {
+    for candidate in candidates() {
+        // SAFETY: as in `load` -- our own plugin, symbols type-checked against
+        // the definitions this crate shares with it.
+        let lib = match unsafe { Library::new(candidate) } {
+            Ok(lib) => lib,
+            Err(_) => continue,
+        };
+        let plugin = unsafe {
+            (|| {
+                Some(EncPlugin {
+                    open: *lib.get(b"vh_enc_open\0").ok()?,
+                    frame: *lib.get(b"vh_enc_frame\0").ok()?,
+                    drain: *lib.get(b"vh_enc_drain\0").ok()?,
+                    close: *lib.get(b"vh_enc_close\0").ok()?,
+                    _lib: lib,
+                })
+            })()
+        };
+        if plugin.is_some() {
+            return plugin;
+        }
+    }
+    None
+}
+
+/// An open hardware encode session. Dropping it closes the plugin session.
+pub struct HwEncoder {
+    plugin: &'static EncPlugin,
+    handle: *mut c_void,
+}
+
+impl HwEncoder {
+    /// H.264 at `width`x`height`, `fps_num / fps_den` frames per second, coded
+    /// at a constant `bitrate` bits per second. `None` whenever hardware encode
+    /// is unavailable -- plugin missing, plugin too old to export the encode
+    /// entry points, no driver, dimensions the driver refuses -- and the caller
+    /// falls back to the software encoder.
+    pub fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
+        let plugin = enc_plugin()?;
+        let handle = (plugin.open)(width, height, fps_num, fps_den, bitrate);
+        if handle.is_null() {
+            return None;
+        }
+        Some(Self { plugin, handle })
+    }
+
+    /// Feeds one tightly packed I420 picture. `Ok(None)` means the encoder has
+    /// not finished an access unit yet; the returned bytes are Annex-B and stay
+    /// valid until the next call on this session.
+    pub fn encode(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: u32,
+        height: u32,
+        force_key: bool,
+    ) -> crate::Result<Option<&[u8]>> {
+        let (w, h) = (width as usize, height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
+            return Err("encode input is not a packed I420 frame".into());
+        }
+        let frame = VhFrame {
+            y: y.as_ptr(),
+            u: u.as_ptr(),
+            v: v.as_ptr(),
+            y_stride: w,
+            u_stride: cw,
+            v_stride: cw,
+            width,
+            height,
+        };
+        // SAFETY: `handle` is live, the planes outlive the call and their sizes
+        // were just checked against the strides we declare.
+        self.take(|plugin, handle, out, out_len| unsafe {
+            (plugin.frame)(handle, &frame, force_key as i32, out, out_len)
+        })
+    }
+
+    /// Flushes the encoder; call until it returns `Ok(None)`. Same lifetime rule
+    /// as [`HwEncoder::encode`].
+    pub fn drain(&mut self) -> crate::Result<Option<&[u8]>> {
+        // SAFETY: `handle` is live.
+        self.take(|plugin, handle, out, out_len| unsafe { (plugin.drain)(handle, out, out_len) })
+    }
+
+    /// Shared tail of `encode`/`drain`: run the call, then turn the plugin's
+    /// (pointer, length) pair into a slice borrowed for as long as `&mut self`,
+    /// which is exactly the "valid until the next call" contract.
+    fn take(
+        &mut self,
+        call: impl FnOnce(&EncPlugin, *mut c_void, *mut *const u8, *mut usize) -> i32,
+    ) -> crate::Result<Option<&[u8]>> {
+        let mut ptr: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        match call(self.plugin, self.handle, &mut ptr, &mut len) {
+            0 => return Ok(None),
+            1 => {}
+            code => return Err(format!("hardware encode failed (code {code})").into()),
+        }
+        if ptr.is_null() || len == 0 {
+            return Err("hardware encoder returned an empty access unit".into());
+        }
+        // SAFETY: the plugin promises `len` readable bytes at `ptr` until its
+        // next call on this session, which `&mut self` prevents overlapping.
+        Ok(Some(unsafe { std::slice::from_raw_parts(ptr, len) }))
+    }
+}
+
+impl Drop for HwEncoder {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from `vh_enc_open` and is closed exactly once.
+        unsafe { (self.plugin.close)(self.handle) }
+    }
+}
+
+// As `HwSession`: used from one thread at a time (the export worker).
+unsafe impl Send for HwEncoder {}
