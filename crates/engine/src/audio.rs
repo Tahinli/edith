@@ -27,6 +27,9 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 /// overlap-add that reconstructs the target packet, one to warm the decoder.
 const PRE_ROLL: u32 = 2;
 
+/// Frames per channel one AAC-LC packet carries. Fixed by the codec.
+const SAMPLES_PER_PACKET: u32 = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioMeta {
     pub sample_rate: u32,
@@ -43,6 +46,23 @@ pub struct AudioChunk {
     pub start_sample: u64,
     /// Interleaved, `AudioMeta::channels` values per frame.
     pub samples: Vec<f32>,
+}
+
+/// What a writer needs to declare an AAC track that plays copied packets: the
+/// esds fields verbatim from the source, no re-derivation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AacTrackParams {
+    pub freq_index: u8,
+    pub chan_conf: u8,
+    pub sample_rate: u32,
+}
+
+/// One raw AAC access unit exactly as it sits in the source `mdat` — no ADTS
+/// header, which is the form an `mp4a` sample table wants.
+pub struct AacPacket {
+    pub bytes: Vec<u8>,
+    /// Frames per channel it decodes to, for the writer's stts.
+    pub samples: u32,
 }
 
 pub struct AudioSession;
@@ -138,19 +158,7 @@ impl AudioSession {
                 // previous packet to cancel aliasing, plus one more to warm the
                 // decoder up. Their output is discarded below, so this only
                 // costs decode time.
-                let (start_id, start_ts) = packet_at(
-                    track
-                        .trak
-                        .mdia
-                        .minf
-                        .stbl
-                        .stts
-                        .entries
-                        .iter()
-                        .map(|e| (e.sample_count, e.sample_delta)),
-                    target_ts,
-                    PRE_ROLL,
-                );
+                let (start_id, start_ts) = packet_at(stts_pairs(track), target_ts, PRE_ROLL);
                 Segment {
                     start_id,
                     start_pos: scale(start_ts, sample_rate, track.timescale()).unwrap_or(0),
@@ -187,12 +195,122 @@ impl AudioSession {
             })?;
         Ok(Some((meta, rx)))
     }
+
+    /// The raw AAC packets covering `segs` — the same half-open source-second
+    /// windows [`open_segments`](Self::open_segments) decodes — copied out
+    /// byte for byte. Nothing is decoded and nothing is re-encoded: the bytes go
+    /// straight into an mp4 writer, which is the only way to keep audio in an
+    /// export at all (no pure-Rust AAC encoder exists).
+    ///
+    /// Cut points do not land on 1024-sample boundaries, so each segment is
+    /// rounded to whole packets against an error carried across the joins (see
+    /// [`packet_run`]): the copy stays within half a packet (~12 ms) of the
+    /// asked-for length however many cuts there are, instead of drifting out of
+    /// lip sync one rounding at a time.
+    ///
+    /// The run starts one packet before the first audible one, which a reader
+    /// drops as encoder priming — for a segment list starting at 0.0 that is the
+    /// source's own priming packet, so the copy is the whole track from sample 1.
+    ///
+    /// `Ok(None)` for a file with no AAC track, and for an empty segment list.
+    ///
+    /// ponytail: the first packet after an *interior* join decodes without its
+    /// MDCT overlap predecessor, so up to 23 ms there can alias. Upgrade path is
+    /// re-encoding just the join packets, which needs an encoder we do not have.
+    pub fn copy_segments(
+        path: impl AsRef<Path>,
+        segs: &[(f64, f64)],
+    ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
+        if segs.is_empty() {
+            return Ok(None);
+        }
+        let file = File::open(path.as_ref())?;
+        let size = file.metadata()?.len();
+        let mut reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+
+        let Some(track) = reader
+            .tracks()
+            .values()
+            .find(|t| matches!(t.media_type(), Ok(MediaType::AAC)))
+        else {
+            return Ok(None);
+        };
+        // The copy carries no profile of its own: the writer rebuilds the
+        // AudioSpecificConfig from `freq_index`/`chan_conf` and calls it LC, so a
+        // non-LC source would be mislabelled rather than merely unplayable here.
+        match track.audio_profile()? {
+            AudioObjectType::AacLowComplexity => {}
+            other => return Err(format!("unsupported AAC profile: {other:?} (only AAC-LC)").into()),
+        }
+
+        let track_id = track.track_id();
+        let sample_rate = track.sample_freq_index()?.freq();
+        let timescale = track.timescale();
+        let priming = priming_samples(track, sample_rate);
+        let (_, freq_index, chan_conf) = asc_fields(track)?;
+        let sample_count = reader.sample_count(track_id)?;
+
+        // Resolve every packet id first: `read_sample` needs the reader mutably,
+        // which ends the borrow `track` holds.
+        let media = |secs: f64| ((secs * f64::from(sample_rate)) as u64).saturating_add(priming);
+        let mut err = 0i64;
+        let mut ids: Vec<u32> = Vec::new();
+        for (i, &(start_secs, end_secs)) in segs.iter().enumerate() {
+            let target_ts = unscale(media(start_secs), sample_rate, timescale);
+            let (start_id, _) = packet_at(stts_pairs(track), target_ts, 0);
+            let ideal = ((end_secs - start_secs).max(0.0) * f64::from(sample_rate)) as i64;
+            let available = sample_count.saturating_sub(start_id - 1);
+            if i == 0 && start_id > 1 {
+                ids.push(start_id - 1); // priming, see the doc comment
+            }
+            ids.extend(start_id..start_id + packet_run(&mut err, ideal, available));
+        }
+
+        let packets = ids
+            .into_iter()
+            .map(|id| match reader.read_sample(track_id, id)? {
+                Some(sample) => Ok(AacPacket {
+                    bytes: sample.bytes.to_vec(),
+                    samples: SAMPLES_PER_PACKET,
+                }),
+                None => Err(format!("audio sample {id} of {sample_count} is missing").into()),
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        Ok(Some((
+            AacTrackParams {
+                freq_index,
+                chan_conf,
+                sample_rate,
+            },
+            packets,
+        )))
+    }
 }
 
-/// The 2-byte AAC-LC AudioSpecificConfig, rebuilt from the esds fields; mp4 0.14
-/// parses those out and drops the raw bytes, so this is the exact inverse of its
-/// writer (`mp4box/mp4a.rs` `DecoderSpecificDescriptor::write_box`).
-fn audio_specific_config(track: &Mp4Track) -> crate::Result<Box<[u8]>> {
+/// How many whole packets to copy for a window of `ideal` samples per channel,
+/// capped at the `available` packets left in the track.
+///
+/// `err` is "samples copied so far minus samples asked for", carried across the
+/// segment joins: rounding to nearest *against the running debt* keeps the
+/// cumulative error inside half a packet forever, where independent per-segment
+/// rounding would random-walk away from sync (charter D1: < 1024 at every join).
+fn packet_run(err: &mut i64, ideal: i64, available: u32) -> u32 {
+    let packet = i64::from(SAMPLES_PER_PACKET);
+    // Never carry a debt the track cannot pay: a segment running past the end
+    // would otherwise inflate every later one. (Also tames `f64::INFINITY`,
+    // which saturates to `i64::MAX` on the cast above.)
+    let ideal = ideal.min(i64::from(available) * packet);
+    let want = (ideal - *err) as f64 / packet as f64;
+    let n = (want.round().max(0.0) as i64).min(i64::from(available)) as u32;
+    *err += i64::from(n) * packet - ideal;
+    n
+}
+
+/// `(profile, freq_index, chan_conf)` out of the esds descriptor. Returned as a
+/// tuple because mp4 0.14's `DecoderSpecificDescriptor` is unnameable outside
+/// the crate (same trap as `SttsEntry`, see [`packet_at`]).
+fn asc_fields(track: &Mp4Track) -> crate::Result<(u8, u8, u8)> {
     let esds = track
         .trak
         .mdia
@@ -204,10 +322,32 @@ fn audio_specific_config(track: &Mp4Track) -> crate::Result<Box<[u8]>> {
         .and_then(|mp4a| mp4a.esds.as_ref())
         .ok_or("AAC track has no esds descriptor")?;
     let cfg = &esds.es_desc.dec_config.dec_specific;
+    Ok((cfg.profile, cfg.freq_index, cfg.chan_conf))
+}
+
+/// The 2-byte AAC-LC AudioSpecificConfig, rebuilt from the esds fields; mp4 0.14
+/// parses those out and drops the raw bytes, so this is the exact inverse of its
+/// writer (`mp4box/mp4a.rs` `DecoderSpecificDescriptor::write_box`).
+fn audio_specific_config(track: &Mp4Track) -> crate::Result<Box<[u8]>> {
+    let (profile, freq_index, chan_conf) = asc_fields(track)?;
     Ok(Box::new([
-        (cfg.profile << 3) | (cfg.freq_index >> 1),
-        (cfg.freq_index << 7) | (cfg.chan_conf << 3),
+        (profile << 3) | (freq_index >> 1),
+        (freq_index << 7) | (chan_conf << 3),
     ]))
+}
+
+/// The stts entries as the `(sample_count, sample_delta)` pairs [`packet_at`]
+/// walks; the box's own entry type is `pub(crate)` in mp4 0.14.
+fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> + '_ {
+    track
+        .trak
+        .mdia
+        .minf
+        .stbl
+        .stts
+        .entries
+        .iter()
+        .map(|e| (e.sample_count, e.sample_delta))
 }
 
 /// Encoder delay in samples-per-channel: the edit list's first real entry says
@@ -396,7 +536,7 @@ fn run(mut w: Worker) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PRE_ROLL, packet_at};
+    use super::{PRE_ROLL, SAMPLES_PER_PACKET, packet_at, packet_run};
 
     /// A real AAC track: one stts entry, N packets of 1024.
     fn aac(count: u32) -> impl IntoIterator<Item = (u32, u32)> {
@@ -435,6 +575,66 @@ mod tests {
         // The ponytail clamp: on the first packet of the second entry the
         // walk-back stops there instead of stepping into the first entry.
         assert_eq!(packet_at(entries, 10_500, PRE_ROLL), (11, 10_240));
+    }
+
+    /// xorshift64: adversarial segment lists do not deserve a dependency.
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn packet_run_keeps_cumulative_error_under_a_packet() {
+        let packet = i64::from(SAMPLES_PER_PACKET);
+        let mut state = 0x5eed_1234_9876_abcd;
+        for rate in [44100i64, 48000] {
+            for list in 0..100 {
+                let (mut err, mut asked, mut copied) = (0i64, 0i64, 0i64);
+                // 3..43 joins of anything from one video frame to four seconds.
+                for join in 0..3 + rng(&mut state) % 40 {
+                    let ideal = rate / 30 + (rng(&mut state) % (4 * rate as u64)) as i64;
+                    copied += i64::from(packet_run(&mut err, ideal, u32::MAX));
+                    asked += ideal;
+                    assert!(
+                        err.abs() < packet,
+                        "rate {rate} list {list} join {join}: err {err}"
+                    );
+                }
+                // The accumulator is the whole story: what it says is the drift.
+                assert_eq!(copied * packet - asked, err);
+            }
+        }
+    }
+
+    #[test]
+    fn packet_run_rounds_against_the_running_debt() {
+        // One second at 44100 is 43.07 packets: copying 43 leaves 68 samples
+        // owed, and the debt is repaid by a 44-packet second once it crosses a
+        // half packet — never by letting each second round on its own.
+        let mut err = 0;
+        assert_eq!(packet_run(&mut err, 44100, u32::MAX), 43);
+        assert_eq!(err, -68);
+        let mut seconds = 1;
+        while packet_run(&mut err, 44100, u32::MAX) == 43 {
+            seconds += 1;
+            assert!(seconds < 20, "debt never repaid, err {err}");
+        }
+        assert_eq!(seconds, 7, "68 samples a second, half a packet is 512");
+        assert!(err > 0, "the repaying second overshoots, err {err}");
+    }
+
+    #[test]
+    fn packet_run_forgives_a_debt_the_track_cannot_pay() {
+        // Asking a second of a track with ten packets left: it delivers ten and
+        // does not make the next segment copy the shortfall from elsewhere.
+        let mut err = 0;
+        assert_eq!(packet_run(&mut err, 44100, 10), 10);
+        assert_eq!(err, 0);
+        // Degenerate windows are empty, not negative.
+        assert_eq!(packet_run(&mut err, 0, 10), 0);
+        assert_eq!(packet_run(&mut err, i64::MAX, 7), 7);
     }
 
     #[test]
