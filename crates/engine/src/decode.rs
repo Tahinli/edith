@@ -42,12 +42,33 @@ impl DecodeSession {
         path: impl AsRef<Path>,
         start_frame: u32,
     ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
+        // `u32::MAX` is clamped to the stream's frame count below, so this is
+        // "to the end of the file".
+        Self::open_range(path, start_frame, u32::MAX)
+    }
+
+    /// As [`DecodeSession::open_at`], but the worker also stops on its own
+    /// after sending `end_frame - 1`: the range is half-open `[start, end)` in
+    /// absolute source frames, which is what a clip of a longer file needs.
+    /// `end_frame` is capped at the stream's frame count, and an empty range
+    /// yields a receiver that is simply already disconnected.
+    pub fn open_range(
+        path: impl AsRef<Path>,
+        start_frame: u32,
+        end_frame: u32,
+    ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
+        let end_frame = end_frame.min(meta.frame_count);
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
         // decoder run ahead of the display without limit.
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
+        if end_frame <= start_frame {
+            // Nothing to decode: dropping `tx` here closes the channel cleanly,
+            // so the caller sees an immediate end of stream rather than an error.
+            return Ok((meta, rx, cancel));
+        }
         let worker_cancel = Arc::clone(&cancel);
         thread::Builder::new()
             .name("decode".into())
@@ -56,7 +77,7 @@ impl DecodeSession {
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
                     eprintln!("decode backend: hardware (VA-API plugin)");
-                    if run_hw(hw, &tx, start_frame, &worker_cancel) {
+                    if run_hw(hw, &tx, start_frame, end_frame, &worker_cancel) {
                         return;
                     }
                     // A driver that opens but cannot decode a single frame is
@@ -64,7 +85,7 @@ impl DecodeSession {
                     eprintln!("hardware decode failed before any frame, falling back to software");
                 }
                 eprintln!("decode backend: software (rusty_h264)");
-                run(demuxer, tx, start_frame, &worker_cancel)
+                run(demuxer, tx, start_frame, end_frame, &worker_cancel)
             })?;
         Ok((meta, rx, cancel))
     }
@@ -89,6 +110,7 @@ fn run_hw(
     mut hw: HwSession,
     tx: &SyncSender<Frame>,
     start_frame: u32,
+    end_frame: u32,
     cancel: &AtomicBool,
 ) -> bool {
     let mut index = start_frame;
@@ -108,6 +130,9 @@ fn run_hw(
                 if tx.send(frame).is_err() {
                     return true; // consumer went away
                 }
+                if index >= end_frame {
+                    return true; // end of the requested range
+                }
             }
             Ok(None) => return true,
             Err(e) => {
@@ -121,7 +146,13 @@ fn run_hw(
     }
 }
 
-fn run(mut demuxer: Demuxer, tx: SyncSender<Frame>, start_frame: u32, cancel: &AtomicBool) {
+fn run(
+    mut demuxer: Demuxer,
+    tx: SyncSender<Frame>,
+    start_frame: u32,
+    end_frame: u32,
+    cancel: &AtomicBool,
+) {
     let mut decoder = Decoder::new();
     // Sample ids are 1-based, frame indices 0-based. Decoding has to restart at
     // a sync sample, so pictures between it and `start_frame` are decoded (the
@@ -164,6 +195,9 @@ fn run(mut demuxer: Demuxer, tx: SyncSender<Frame>, start_frame: u32, cancel: &A
         index += 1;
         if tx.send(frame).is_err() {
             break; // consumer went away
+        }
+        if index >= end_frame {
+            break; // end of the requested range
         }
     }
 }

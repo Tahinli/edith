@@ -63,6 +63,24 @@ impl AudioSession {
         path: impl AsRef<Path>,
         start_secs: f64,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_segments(path, &[(start_secs, f64::INFINITY)])
+    }
+
+    /// Decodes `segs` — half-open `[start, end)` windows in *source* seconds —
+    /// back to back as one continuous stream: the chunks carry no gap at a join,
+    /// so pouring them into a ring is seamless. Each segment gets a fresh
+    /// decoder and its own pre-roll, which makes a seeked segment perceptually
+    /// but not bit-exactly equal to the same window of a full run (perceptual
+    /// noise substitution reseeds; measured below 1e-3).
+    ///
+    /// `start_sample` counts from the *first* segment's own audible start, so a
+    /// single segment reads as absolute media time (what [`open_at`](Self::open_at)
+    /// promises) and a list reads as one timeline. Segment ends past the track
+    /// are capped; an empty list is a valid session with no chunks.
+    pub fn open_segments(
+        path: impl AsRef<Path>,
+        segs: &[(f64, f64)],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
@@ -104,29 +122,44 @@ impl AudioSession {
             .for_codec(CODEC_ID_AAC)
             .with_sample_rate(sample_rate)
             .with_extra_data(audio_specific_config(track)?);
-        let decoder = AacDecoder::try_new(&params, &AudioDecoderOptions::default())?;
+        // Built here only so an undecodable stream is an `Err` from the opener
+        // rather than a silently empty channel; the worker makes its own.
+        AacDecoder::try_new(&params, &AudioDecoderOptions::default())?;
 
-        // Where to land, in media samples (priming included, so it is directly
-        // comparable to decoded position), and which packet holds it.
-        let media_target = (start_secs * f64::from(sample_rate)) as u64 + priming;
-        let target_ts = unscale(media_target, sample_rate, track.timescale());
-        // Two packets of pre-roll: AAC-LC's MDCT overlap-add needs the previous
-        // packet to cancel aliasing, plus one more to warm the decoder up. Their
-        // output is discarded below, so this only costs decode time.
-        let (start_id, start_ts) = packet_at(
-            track
-                .trak
-                .mdia
-                .minf
-                .stbl
-                .stts
-                .entries
-                .iter()
-                .map(|e| (e.sample_count, e.sample_delta)),
-            target_ts,
-            PRE_ROLL,
-        );
-        let start_pos = scale(start_ts, sample_rate, track.timescale()).unwrap_or(0);
+        // Segment bounds in media samples (priming included, so they compare
+        // directly against the decoded position). `f64::INFINITY` saturates.
+        let media = |secs: f64| ((secs * f64::from(sample_rate)) as u64).saturating_add(priming);
+        let segments: Vec<Segment> = segs
+            .iter()
+            .map(|&(start_secs, end_secs)| {
+                let media_target = media(start_secs);
+                let target_ts = unscale(media_target, sample_rate, track.timescale());
+                // Two packets of pre-roll: AAC-LC's MDCT overlap-add needs the
+                // previous packet to cancel aliasing, plus one more to warm the
+                // decoder up. Their output is discarded below, so this only
+                // costs decode time.
+                let (start_id, start_ts) = packet_at(
+                    track
+                        .trak
+                        .mdia
+                        .minf
+                        .stbl
+                        .stts
+                        .entries
+                        .iter()
+                        .map(|e| (e.sample_count, e.sample_delta)),
+                    target_ts,
+                    PRE_ROLL,
+                );
+                Segment {
+                    start_id,
+                    start_pos: scale(start_ts, sample_rate, track.timescale()).unwrap_or(0),
+                    media_target,
+                    // An inverted segment is an empty one, never a backwards run.
+                    media_end: media(end_secs).max(media_target),
+                }
+            })
+            .collect();
 
         let sample_count = reader.sample_count(track_id)?;
         let meta = AudioMeta {
@@ -143,14 +176,12 @@ impl AudioSession {
             .spawn(move || {
                 run(Worker {
                     reader,
-                    decoder,
+                    params,
                     track_id,
                     sample_count,
                     channels: channels as usize,
                     priming,
-                    start_id,
-                    start_pos,
-                    media_target,
+                    segments,
                     tx,
                 })
             })?;
@@ -258,13 +289,8 @@ fn packet_at(
     last
 }
 
-struct Worker {
-    reader: Mp4Reader<BufReader<File>>,
-    decoder: AacDecoder,
-    track_id: u32,
-    sample_count: u32,
-    channels: usize,
-    priming: u64,
+/// One window of the source to decode, resolved to media samples and packets.
+struct Segment {
     /// First packet to feed the decoder, 1-based; includes the pre-roll.
     start_id: u32,
     /// Media position of `start_id`'s first frame, in samples-per-channel.
@@ -272,56 +298,98 @@ struct Worker {
     /// Media position of the first frame to emit. Everything decoded before it
     /// is pre-roll, priming, or seek overshoot, and gets dropped.
     media_target: u64,
+    /// One past the last frame to emit; `u64::MAX` for "to the end of track".
+    media_end: u64,
+}
+
+struct Worker {
+    reader: Mp4Reader<BufReader<File>>,
+    /// A fresh decoder is built from these per segment: seeking mid-stream
+    /// leaves MDCT and PNS state that belongs to the packets we skipped.
+    params: AudioCodecParameters,
+    track_id: u32,
+    sample_count: u32,
+    channels: usize,
+    priming: u64,
+    segments: Vec<Segment>,
     tx: SyncSender<AudioChunk>,
 }
 
 fn run(mut w: Worker) {
     let mut interleaved = Vec::new();
-    let mut pos = w.start_pos;
+    // Chunk numbering is continuous across the segment joins, counted from the
+    // first segment's audible start (see `open_segments`).
+    let mut timeline = w
+        .segments
+        .first()
+        .map_or(0, |s| s.media_target.saturating_sub(w.priming));
 
-    for id in w.start_id..=w.sample_count {
-        let sample = match w.reader.read_sample(w.track_id, id) {
-            Ok(Some(sample)) => sample,
-            Ok(None) => break,
+    for seg in &w.segments {
+        let mut decoder = match AacDecoder::try_new(&w.params, &AudioDecoderOptions::default()) {
+            Ok(decoder) => decoder,
             Err(e) => {
-                eprintln!("audio demux error at sample {id}: {e}");
-                break;
+                eprintln!("audio decoder init failed: {e}");
+                return;
             }
         };
-        let packet = Packet::new(
-            w.track_id,
-            units::Timestamp::new(sample.start_time as i64),
-            units::Duration::new(u64::from(sample.duration)),
-            &sample.bytes[..],
-        );
-        let buf = match w.decoder.decode(&packet) {
-            Ok(buf) => buf,
-            Err(e) => {
-                eprintln!("audio decode error at sample {id}: {e}");
-                break;
-            }
-        };
-        buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
-        let next = pos + (interleaved.len() / w.channels) as u64;
+        let mut pos = seg.start_pos;
 
-        // Everything before the target is encoder priming and/or decoder
-        // pre-roll, not audio the caller asked for: drop it, splitting the
-        // packet that straddles the target.
-        if next <= w.media_target {
+        for id in seg.start_id..=w.sample_count {
+            if pos >= seg.media_end {
+                break; // segment done, on to the next one
+            }
+            let sample = match w.reader.read_sample(w.track_id, id) {
+                Ok(Some(sample)) => sample,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("audio demux error at sample {id}: {e}");
+                    break;
+                }
+            };
+            let packet = Packet::new(
+                w.track_id,
+                units::Timestamp::new(sample.start_time as i64),
+                units::Duration::new(u64::from(sample.duration)),
+                &sample.bytes[..],
+            );
+            let buf = match decoder.decode(&packet) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    eprintln!("audio decode error at sample {id}: {e}");
+                    break;
+                }
+            };
+            buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
+            let next = pos + (interleaved.len() / w.channels) as u64;
+
+            // Everything before the target is encoder priming and/or decoder
+            // pre-roll, not audio the caller asked for: drop it, splitting the
+            // packet that straddles the target.
+            if next <= seg.media_target {
+                pos = next;
+                continue;
+            }
+            if pos < seg.media_target {
+                interleaved.drain(..(seg.media_target - pos) as usize * w.channels);
+                pos = seg.media_target;
+            }
+            // And the tail past the segment end goes too — on a short segment
+            // that is this same buffer, trimmed at both ends.
+            if next > seg.media_end {
+                interleaved.truncate((seg.media_end - pos) as usize * w.channels);
+            }
             pos = next;
-            continue;
-        }
-        if pos < w.media_target {
-            interleaved.drain(..(w.media_target - pos) as usize * w.channels);
-            pos = w.media_target;
-        }
-        let chunk = AudioChunk {
-            start_sample: pos - w.priming,
-            samples: std::mem::take(&mut interleaved),
-        };
-        pos = next;
-        if w.tx.send(chunk).is_err() {
-            break; // consumer went away
+            if interleaved.is_empty() {
+                continue; // nothing left of it; the loop head ends the segment
+            }
+            let chunk = AudioChunk {
+                start_sample: timeline,
+                samples: std::mem::take(&mut interleaved),
+            };
+            timeline += (chunk.samples.len() / w.channels) as u64;
+            if w.tx.send(chunk).is_err() {
+                return; // consumer went away
+            }
         }
     }
 }

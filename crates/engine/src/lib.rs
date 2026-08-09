@@ -8,12 +8,14 @@ pub mod decode;
 pub mod demux;
 pub mod hw;
 pub mod playback;
+pub mod project;
 
 pub use audio::{AudioChunk, AudioMeta, AudioSession};
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
 pub use playback::PlaybackSession;
+pub use project::{Clip, Project};
 
 /// Boxed error; the engine has few failure modes and every one of them is fatal
 /// to the session, so a message is all a caller can act on.
