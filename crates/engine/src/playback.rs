@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
-use crate::decode::{DecodeSession, Frame};
+use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::project::{Clip, Project};
 
@@ -84,9 +84,10 @@ impl Audio {
 pub struct PlaybackSession {
     meta: VideoMeta,
     frames: Receiver<Frame>,
-    /// Stops the current decode worker, so an abandoned one cannot outlive a
-    /// seek by more than one access unit.
-    cancel: Arc<AtomicBool>,
+    /// The current decode worker. Replacing or dropping this field cancels and
+    /// joins the previous one, so no abandoned worker outlives the session --
+    /// which is what keeps a worker out of the driver's teardown at exit.
+    worker: Worker,
     clock: PlaybackClock,
     audio: Option<Audio>,
     /// The edit list. Everything a caller says in seconds is a *timeline*
@@ -107,22 +108,22 @@ impl PlaybackSession {
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        // `open_at(_, 0)` rather than `open` purely for the cancel handle: the
+        // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
-        let (meta, frames, cancel) = DecodeSession::open_at(&path, 0)?;
+        let (meta, frames, worker) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
         let audio = open_audio(&path);
         let source = match audio {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
         };
         // One clip covering the file, so timeline == source until the first
-        // edit -- and `open_at(_, 0)` is exactly that clip's range.
+        // edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
         let range = project.clips()[0];
         Ok(Self {
             meta,
             frames,
-            cancel,
+            worker,
             clock: PlaybackClock::new(source),
             audio,
             project,
@@ -152,7 +153,7 @@ impl PlaybackSession {
         let first = doc.sources.first().ok_or("the project names no sources")?;
         // Source 0 both scaffolds the session and defines the timeline, so it
         // is opened for playback rather than merely probed.
-        let (meta, frames, cancel) = DecodeSession::open_at(first, 0)
+        let (meta, frames, worker) = DecodeSession::open_worker(first, 0, u32::MAX)
             .map_err(|e| format!("source {}: {e}", first.display()))?;
         let audio = open_audio(first);
         let first_audio = AudioSession::probe(first)?;
@@ -184,7 +185,7 @@ impl PlaybackSession {
         let mut session = Self {
             meta,
             frames,
-            cancel,
+            worker,
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
                 None => ClockSource::Wall,
@@ -270,10 +271,16 @@ impl PlaybackSession {
         };
         let clip = self.project.clips()[idx];
         let out = clip.out_frame;
-        match DecodeSession::open_range(&self.project.sources()[clip.source], source, out) {
-            Ok((_, frames, cancel)) => {
+        // We only get here on a disconnect, so the old worker has already
+        // returned; cancel anyway, so the join below is unconditional in kind.
+        self.worker.cancel();
+        match DecodeSession::open_worker(&self.project.sources()[clip.source], source, out) {
+            Ok((_, frames, worker)) => {
+                // Receiver first, worker second: the drop of the old receiver
+                // is what would wake a worker parked in `send`, and only then
+                // can the old worker's `Drop` join without waiting on us.
                 self.frames = frames;
-                self.cancel = cancel;
+                self.worker = worker;
             }
             // Disappearing-file case, as in `seek`. The old receiver is still
             // disconnected, so the next pass moves on to the clip after this.
@@ -458,16 +465,24 @@ impl PlaybackSession {
         // Cancel first, drop second: the old worker may be parked in `send` on
         // the bounded channel, where only the disconnect wakes it -- and it
         // then finds the flag already set.
-        self.cancel.store(true, Ordering::Release);
+        //
+        // ponytail: replacing the worker below *joins* the outgoing one, so a
+        // seek can cost one VA-API init (98 ms measured worst case, 1.6 ms
+        // before this) and scrubbing is capped at ~10 seeks/s. If that shows in
+        // the UI: park cancelled workers in a retire list instead, drop the
+        // `is_finished` ones each seek and join whatever is left in `Drop` --
+        // same exit guarantee, no wait on the caller's thread.
+        self.worker.cancel();
         // `target` is inside the timeline (never empty), so this always maps;
         // the range runs from there to the end of the clip it landed in.
         if let Some((idx, source)) = self.project.map_timeline(target) {
             let clip = self.project.clips()[idx];
             let out = clip.out_frame;
-            match DecodeSession::open_range(&self.project.sources()[clip.source], source, out) {
-                Ok((_, frames, cancel)) => {
+            match DecodeSession::open_worker(&self.project.sources()[clip.source], source, out) {
+                Ok((_, frames, worker)) => {
+                    // Receiver first, worker second -- see `next_clip`.
                     self.frames = frames;
-                    self.cancel = cancel;
+                    self.worker = worker;
                 }
                 // The file opened once already, so this is a disappearing-file
                 // case: the timeline still moves, there are simply no more
@@ -558,6 +573,19 @@ impl PlaybackSession {
         } else {
             self.clock
                 .set_audio_position(position as u64, audio.sample_rate);
+        }
+    }
+}
+
+impl Drop for PlaybackSession {
+    /// The video worker cancels and joins itself when the `worker` field drops
+    /// right after this; that is what a session must not exit without. This is
+    /// the audio half: bumping the epoch retires the feeder at its next write,
+    /// which drops the decode receiver with it. Neither is waited for -- no
+    /// driver state is torn down on the audio side.
+    fn drop(&mut self) {
+        if let Some(audio) = &self.audio {
+            audio.epoch.fetch_add(1, Ordering::Release);
         }
     }
 }

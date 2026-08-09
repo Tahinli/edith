@@ -23,6 +23,44 @@ pub struct Frame {
     pub bgra: Vec<u8>,
 }
 
+/// A running decode worker: the flag that stops it, and the handle to wait on.
+///
+/// Dropping one cancels *and joins*. A worker abandoned mid-`vaInitialize`
+/// outlives the process otherwise, and Mesa's `atexit` handlers free the state
+/// it is still reading -- a SIGSEGV at exit, long after the last test passed.
+pub(crate) struct Worker {
+    cancel: Arc<AtomicBool>,
+    /// `None` once detached, and for a range with nothing to decode: either way
+    /// there is no thread left to wait for.
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Stops the worker at its next check without waiting. Callers that replace
+    /// a worker should do this first and drop the receiver second: a worker
+    /// parked in `send` only wakes on the disconnect, so the join below would
+    /// otherwise wait for a consumer that is never coming.
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    /// Lets the worker run on unwatched -- what the public API does, since it
+    /// hands out the flag alone.
+    fn detach(mut self) -> Arc<AtomicBool> {
+        self.handle = None;
+        Arc::clone(&self.cancel)
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel();
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct DecodeSession;
 
 impl DecodeSession {
@@ -57,6 +95,18 @@ impl DecodeSession {
         start_frame: u32,
         end_frame: u32,
     ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
+        let (meta, rx, worker) = Self::open_worker(path, start_frame, end_frame)?;
+        Ok((meta, rx, worker.detach()))
+    }
+
+    /// As [`DecodeSession::open_range`], but the caller gets the whole
+    /// [`Worker`] and can therefore *wait* for it. In-process only: a caller
+    /// that outlives its workers has to be able to join them at exit.
+    pub(crate) fn open_worker(
+        path: impl AsRef<Path>,
+        start_frame: u32,
+        end_frame: u32,
+    ) -> crate::Result<(VideoMeta, Receiver<Frame>, Worker)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
         let end_frame = end_frame.min(meta.frame_count);
@@ -67,15 +117,34 @@ impl DecodeSession {
         if end_frame <= start_frame {
             // Nothing to decode: dropping `tx` here closes the channel cleanly,
             // so the caller sees an immediate end of stream rather than an error.
-            return Ok((meta, rx, cancel));
+            return Ok((
+                meta,
+                rx,
+                Worker {
+                    cancel,
+                    handle: None,
+                },
+            ));
         }
         let worker_cancel = Arc::clone(&cancel);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
+                // Cancelled before this thread was even scheduled -- do not
+                // enter VA-API initialisation at all, because that is the one
+                // stretch a cancel cannot interrupt (~65-90 ms of driver setup
+                // that would then have to be torn down again).
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 // The plugin has to be opened on the thread that uses it: its
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
+                    // Cancelled *during* init: close the session (dropping `hw`
+                    // does it) and leave without decoding anything.
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
                     eprintln!("decode backend: hardware (VA-API plugin)");
                     if run_hw(hw, &tx, start_frame, end_frame, &worker_cancel) {
                         return;
@@ -87,7 +156,14 @@ impl DecodeSession {
                 eprintln!("decode backend: software (rusty_h264)");
                 run(demuxer, tx, start_frame, end_frame, &worker_cancel)
             })?;
-        Ok((meta, rx, cancel))
+        Ok((
+            meta,
+            rx,
+            Worker {
+                cancel,
+                handle: Some(handle),
+            },
+        ))
     }
 }
 
