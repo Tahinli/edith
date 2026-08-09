@@ -148,7 +148,7 @@ impl PlaybackSession {
     ///
     /// The undo history is not saved: `undo` is `false` on a fresh load.
     pub fn open_project(path: &Path) -> crate::Result<Self> {
-        let doc = crate::veproj::load(path)?;
+        let doc = crate::edith::load(path)?;
         let first = doc.sources.first().ok_or("the project names no sources")?;
         // Source 0 both scaffolds the session and defines the timeline, so it
         // is opened for playback rather than merely probed.
@@ -214,14 +214,14 @@ impl PlaybackSession {
         self.project.sources()
     }
 
-    /// Writes the timeline to `path` as a `.veproj`, atomically (see
-    /// [`crate::veproj`]). Sources no clip plays from are left out, and the
+    /// Writes the timeline to `path` as a `.edith`, atomically (see
+    /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
         let (sources, clips) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
-        crate::veproj::save(path, &sources, &clips, playhead)
+        crate::edith::save(path, &sources, &clips, playhead)
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a
