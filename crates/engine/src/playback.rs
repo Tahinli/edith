@@ -138,12 +138,6 @@ impl PlaybackSession {
         &self.meta
     }
 
-    /// Decoded frames, in decode order. The channel is bounded, so leaving it
-    /// alone is what pauses the decoder.
-    pub fn frames(&self) -> &Receiver<Frame> {
-        &self.frames
-    }
-
     /// The next decoded frame, its `index` rewritten from a source frame to a
     /// *timeline* frame -- the only frame space that leaves the engine, and the
     /// one [`PlaybackSession::now`] is in.
@@ -229,7 +223,7 @@ impl PlaybackSession {
     /// end, where there would be nothing to split off.
     pub fn cut_at(&mut self, timeline_secs: f64) -> bool {
         self.project
-            .cut((timeline_secs * self.meta.frame_rate) as u32)
+            .cut(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
     /// Removes a clip and closes the gap. Unlike a cut this *does* move every
@@ -307,7 +301,7 @@ impl PlaybackSession {
         let fps = self.meta.frame_rate;
         let total = self.project.timeline_frames();
         let t = secs.clamp(0.0, f64::from(total) / fps);
-        let target = ((t * fps) as u32).min(total.saturating_sub(1));
+        let target = secs_to_frame(t, fps).min(total.saturating_sub(1));
         let was_playing = self.clock.is_playing();
 
         if let Some(audio) = &self.audio {
@@ -477,5 +471,30 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             // Ring full: nothing to do but let the device drain it.
             thread::sleep(RING_FULL_WAIT);
         }
+    }
+}
+
+/// Timeline seconds to a 0-based frame index, floor semantics: position `t`
+/// shows the frame whose interval contains it. The epsilon absorbs float error
+/// at exact frame boundaries -- `123.0/30.0 * 30.0` is `122.999...`, and a
+/// bare truncation would land one frame early (S6 finding: 4 of every 300
+/// frames round-trip wrong through `clip_spans()` seconds without this).
+fn secs_to_frame(secs: f64, fps: f64) -> u32 {
+    (secs * fps + 1e-6).floor().max(0.0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secs_to_frame;
+
+    #[test]
+    fn boundary_seconds_round_trip_to_their_own_frame() {
+        for f in 0u32..300 {
+            let secs = f64::from(f) / 30.0;
+            assert_eq!(secs_to_frame(secs, 30.0), f, "frame {f}");
+        }
+        // Mid-frame positions still floor, and negatives clamp.
+        assert_eq!(secs_to_frame(10.5 / 30.0, 30.0), 10);
+        assert_eq!(secs_to_frame(-0.2, 30.0), 0);
     }
 }
