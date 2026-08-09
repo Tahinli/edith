@@ -84,10 +84,21 @@ impl Audio {
 pub struct PlaybackSession {
     meta: VideoMeta,
     frames: Receiver<Frame>,
-    /// The current decode worker. Replacing or dropping this field cancels and
-    /// joins the previous one, so no abandoned worker outlives the session --
-    /// which is what keeps a worker out of the driver's teardown at exit.
+    /// The current decode worker.
     worker: Worker,
+    /// Workers cancelled by a seek or a clip change, waiting to be reaped.
+    /// Joining one inline costs whatever VA-API init it is still inside (98 ms
+    /// measured worst case), which is a visible hitch on the caller's thread;
+    /// parking it here instead makes that free, and [`retire`] drops the ones
+    /// that have already returned every time it adds another.
+    ///
+    /// Never a leak, and that is the invariant: everything in here is joined
+    /// when the session drops (`Vec<Worker>`'s own drop does it, one
+    /// [`Worker::drop`] each), so no decode worker can outlive the session and
+    /// meet Mesa's `atexit` handlers from inside libva.
+    ///
+    /// [`retire`]: PlaybackSession::retire
+    retired: Vec<Worker>,
     clock: PlaybackClock,
     audio: Option<Audio>,
     /// The edit list. Everything a caller says in seconds is a *timeline*
@@ -124,6 +135,7 @@ impl PlaybackSession {
             meta,
             frames,
             worker,
+            retired: Vec::new(),
             clock: PlaybackClock::new(source),
             audio,
             project,
@@ -186,6 +198,7 @@ impl PlaybackSession {
             meta,
             frames,
             worker,
+            retired: Vec::new(),
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
                 None => ClockSource::Wall,
@@ -260,6 +273,20 @@ impl PlaybackSession {
         self.eos
     }
 
+    /// Installs `replacement` as the decode worker, parking the outgoing one in
+    /// [`retired`](Self::retired) rather than joining it here, and reaping the
+    /// parked ones that have already returned.
+    ///
+    /// The sweep is what bounds the list: every worker in it was cancelled
+    /// before this ran, and a cancelled worker is out within an access unit
+    /// (plus whatever VA-API init it was inside), so a scrub reaps last seek's
+    /// worker on this seek and the list stays a handful long. Nothing waits.
+    fn retire(&mut self, replacement: Worker) {
+        self.retired
+            .push(std::mem::replace(&mut self.worker, replacement));
+        self.retired.retain(|w| !w.is_finished());
+    }
+
     /// Starts decoding whatever follows the current range on the timeline;
     /// `false` past the end. The next timeline frame is derived rather than
     /// remembered as a clip index, because a `cut` while playing splits the
@@ -272,15 +299,15 @@ impl PlaybackSession {
         let clip = self.project.clips()[idx];
         let out = clip.out_frame;
         // We only get here on a disconnect, so the old worker has already
-        // returned; cancel anyway, so the join below is unconditional in kind.
+        // returned; cancel anyway, so `retire` treats every path alike.
         self.worker.cancel();
         match DecodeSession::open_worker(&self.project.sources()[clip.source], source, out) {
             Ok((_, frames, worker)) => {
                 // Receiver first, worker second: the drop of the old receiver
-                // is what would wake a worker parked in `send`, and only then
-                // can the old worker's `Drop` join without waiting on us.
+                // is what wakes a worker parked in `send`, and only then can it
+                // return and be reaped by a later sweep.
                 self.frames = frames;
-                self.worker = worker;
+                self.retire(worker);
             }
             // Disappearing-file case, as in `seek`. The old receiver is still
             // disconnected, so the next pass moves on to the clip after this.
@@ -464,14 +491,9 @@ impl PlaybackSession {
 
         // Cancel first, drop second: the old worker may be parked in `send` on
         // the bounded channel, where only the disconnect wakes it -- and it
-        // then finds the flag already set.
-        //
-        // ponytail: replacing the worker below *joins* the outgoing one, so a
-        // seek can cost one VA-API init (98 ms measured worst case, 1.6 ms
-        // before this) and scrubbing is capped at ~10 seeks/s. If that shows in
-        // the UI: park cancelled workers in a retire list instead, drop the
-        // `is_finished` ones each seek and join whatever is left in `Drop` --
-        // same exit guarantee, no wait on the caller's thread.
+        // then finds the flag already set. It is then parked, not joined; see
+        // [`retire`](Self::retire), which is what keeps a scrub off the price
+        // of a VA-API init.
         self.worker.cancel();
         // `target` is inside the timeline (never empty), so this always maps;
         // the range runs from there to the end of the clip it landed in.
@@ -482,7 +504,7 @@ impl PlaybackSession {
                 Ok((_, frames, worker)) => {
                     // Receiver first, worker second -- see `next_clip`.
                     self.frames = frames;
-                    self.worker = worker;
+                    self.retire(worker);
                 }
                 // The file opened once already, so this is a disappearing-file
                 // case: the timeline still moves, there are simply no more
@@ -578,9 +600,14 @@ impl PlaybackSession {
 }
 
 impl Drop for PlaybackSession {
-    /// The video worker cancels and joins itself when the `worker` field drops
-    /// right after this; that is what a session must not exit without. This is
-    /// the audio half: bumping the epoch retires the feeder at its next write,
+    /// The video workers -- the running one and every cancelled one still in
+    /// [`retired`](PlaybackSession::retired) -- cancel and join themselves when
+    /// those fields drop right after this, the running one behind its receiver
+    /// so a `send` cannot hold the join. *That* is what a session must not exit
+    /// without: no decode worker outlives it, so none can be inside libva when
+    /// Mesa's `atexit` handlers free the state under it.
+    ///
+    /// This is the audio half: bumping the epoch retires the feeder at its next write,
     /// which drops the decode receiver with it. Neither is waited for -- no
     /// driver state is torn down on the audio side.
     fn drop(&mut self) {
