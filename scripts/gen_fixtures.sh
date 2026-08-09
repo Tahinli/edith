@@ -8,4 +8,12 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=5 \
     -c:v libx264 -profile:v baseline -pix_fmt yuv420p assets/test_baseline.mp4
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=5 \
     -c:v libx264 -profile:v high -pix_fmt yuv420p assets/test_high.mp4
+# A/V fixture: video + stereo AAC. Left channel 440 Hz, right 880 Hz, so
+# channel mapping mistakes are audible; 1 Hz volume pulse makes drift visible.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=5 \
+    -f lavfi -i "sine=frequency=440:duration=5" \
+    -f lavfi -i "sine=frequency=880:duration=5" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_av.mp4
 echo "fixtures written to assets/"
