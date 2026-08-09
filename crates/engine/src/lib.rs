@@ -7,9 +7,11 @@ pub mod convert;
 pub mod decode;
 pub mod demux;
 pub mod hw;
+pub mod playback;
 
 pub use audio::{AudioChunk, AudioMeta, AudioSession};
 pub use clock::PlaybackClock;
+pub use playback::PlaybackSession;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
 
