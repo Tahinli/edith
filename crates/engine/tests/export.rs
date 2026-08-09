@@ -34,7 +34,14 @@ fn asset(name: &str) -> PathBuf {
 fn out_path(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("ve_export_{name}.mp4"));
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(part_path(&path));
     path
+}
+
+/// What the worker actually writes to until it succeeds; the engine appends the
+/// suffix rather than replacing the extension.
+fn part_path(out: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.part", out.display()))
 }
 
 /// Pins both paths to software for the whole test binary, so the default suite
@@ -189,6 +196,55 @@ fn cancelling_leaves_no_file() {
     let result = wait(&handle, Duration::from_secs(5));
     assert!(result.is_err(), "a cancelled export is an error");
     assert!(!out.exists(), "no partial file survives a cancel");
+    assert!(!part_path(&out).exists(), "the .part is cleaned up too");
+}
+
+/// The late window: cancel after the last frame, while the export is draining,
+/// writing audio and closing the file. Progress already reads 100% there, and
+/// before the cancel checkpoints outside the frame loop the export completed
+/// anyway and left a file the user never asked for.
+///
+/// Landing in that window is a race, so the attempt is repeated; whichever side
+/// of it an attempt lands on, the invariant is the same -- a finished file or no
+/// file, never a `.part`.
+#[test]
+fn cancelling_after_the_last_frame_leaves_no_file() {
+    pin_software();
+    let out = out_path("late");
+    let part = part_path(&out);
+    for attempt in 1..=5 {
+        let mut session = edited(&asset("test_baseline.mp4"));
+        session.pause();
+        let handle = session.export_to(&out);
+        // Sleep while there is time to sleep, then spin: the window is the few
+        // milliseconds between the last frame and `finish`.
+        let started = Instant::now();
+        while handle.progress() < 0.9 && !handle.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "export stalled"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while handle.progress() < 1.0 && !handle.is_finished() {
+            std::hint::spin_loop();
+        }
+        handle.cancel();
+
+        let result = wait(&handle, Duration::from_secs(30));
+        assert!(!part.exists(), "attempt {attempt} left a .part behind");
+        if result.is_err() {
+            assert!(!out.exists(), "a late cancel still wrote {}", out.display());
+            return;
+        }
+        // The export beat the cancel; then it must be a whole file, not a stump.
+        assert_eq!(
+            engine::demux::Demuxer::open(&out).unwrap().0.frame_count,
+            120
+        );
+        std::fs::remove_file(&out).unwrap();
+    }
+    panic!("cancel never landed in the drain/audio/finish window");
 }
 
 /// Audio: the copied AAC packets have to land in the export as a track a reader
