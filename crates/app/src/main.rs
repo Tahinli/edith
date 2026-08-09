@@ -67,7 +67,10 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 const ESCAPE: &str = "escape";
 
 struct Player {
-    session: PlaybackSession,
+    /// The timeline, once there is one. A run with no file opens without it and
+    /// waits: the first media import or project load is what fills it, and
+    /// until then every action that needs a timeline says so instead of acting.
+    session: Option<PlaybackSession>,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -96,8 +99,6 @@ struct Player {
     scrubbing: bool,
     last_scrub: Instant,
     last_target: u32,
-    /// Playback was started once, on the first render. The play binding owns it after that.
-    launched: bool,
     /// The running export. While it owns the UI the editor is read-only.
     export: Option<ExportHandle>,
     /// The export above was cancelled and is only winding down. The editor is
@@ -138,7 +139,12 @@ impl Player {
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`.
     fn pump(&mut self, window: &mut Window) {
-        let target = self.session.now() * self.fps;
+        // No timeline, nothing to catch up to: the window is showing its empty
+        // state and there is no decoder to drain.
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let target = session.now() * self.fps;
         let mut newest: Option<Frame> = None;
         loop {
             let frame = match self.held.take() {
@@ -146,10 +152,10 @@ impl Player {
                 // Nothing waiting means either a clip boundary being rebuilt or
                 // the real end of the timeline, and only the engine can tell
                 // them apart -- `frame.index` is already a timeline index.
-                None => match self.session.try_frame() {
+                None => match session.try_frame() {
                     Some(frame) => frame,
                     None => {
-                        self.eos = self.session.is_eos();
+                        self.eos = session.is_eos();
                         break;
                     }
                 },
@@ -190,7 +196,7 @@ impl Player {
                 "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
                 self.displayed,
                 self.dropped,
-                self.session.now()
+                session.now()
             );
         }
     }
@@ -211,7 +217,10 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.session.seek(t);
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        session.seek(t);
         self.reset_after_reseek();
         cx.notify();
     }
@@ -222,7 +231,9 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        self.session.cut_at(self.session.now());
+        if let Some(session) = &mut self.session {
+            session.cut_at(session.now());
+        }
         self.selected = None;
         cx.notify();
     }
@@ -233,11 +244,11 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        if self
-            .selected
-            .take()
-            .is_some_and(|i| self.session.delete_clip(i))
-        {
+        let deleted = match (&mut self.session, self.selected.take()) {
+            (Some(session), Some(i)) => session.delete_clip(i),
+            _ => false,
+        };
+        if deleted {
             self.reset_after_reseek();
         }
         cx.notify();
@@ -245,7 +256,8 @@ impl Player {
 
     /// Copies the selected clip. Nothing on screen changes, so no notify.
     fn copy_selected(&mut self) {
-        if let Some(clip) = self.selected.and_then(|i| self.session.clip_at(i)) {
+        let session = self.session.as_ref();
+        if let Some(clip) = self.selected.and_then(|i| session?.clip_at(i)) {
             self.clipboard = Some(clip);
         }
     }
@@ -254,9 +266,11 @@ impl Player {
     /// like a delete this owes the flag reset -- and the selection, whose index
     /// the insert has just moved.
     fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(clip) = self.clipboard
-            && self.session.paste_at(self.session.now(), clip)
-        {
+        let pasted = match (&mut self.session, self.clipboard) {
+            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
+            _ => false,
+        };
+        if pasted {
             self.selected = None;
             self.reset_after_reseek();
         }
@@ -271,16 +285,40 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let text = match self.session.import(path) {
-            Ok(()) => {
+        // An empty window has nothing to append to: there the first file *is*
+        // the timeline and is opened as one, which is the same fork a launch
+        // makes between its first argument and the rest.
+        let text = match self.session.as_mut().map(|session| session.import(path)) {
+            Some(Ok(())) => {
                 self.reset_after_reseek();
                 format!("IMPORTED {}", file_name(path))
             }
-            Err(e) => format!("IMPORT FAILED: {e}"),
+            Some(Err(e)) => format!("IMPORT FAILED: {e}"),
+            None => self.open_media(path),
         };
         eprintln!("{text}");
         self.notice = Some(text.into());
         cx.notify();
+    }
+
+    /// Takes a file as the whole timeline, which is what an empty window is
+    /// waiting for. Everything derived from the media -- the clock, the title,
+    /// where an export and a save go -- is set here, exactly as a launch with a
+    /// file argument sets it. Paused with its first frame showing, like every
+    /// other way a timeline arrives.
+    fn open_media(&mut self, path: &std::path::Path) -> String {
+        match PlaybackSession::open(path) {
+            Ok(session) => {
+                self.fps = session.meta().frame_rate;
+                self.session = Some(session);
+                self.export_path = export_path(path);
+                self.project_path = project_path(path);
+                self.name = file_name(path).into();
+                self.reset_after_reseek();
+                format!("OPENED {}", file_name(path))
+            }
+            Err(e) => format!("OPEN FAILED: {e}"),
+        }
     }
 
     /// The Import button: asks the desktop for a path and takes it the same way
@@ -322,11 +360,11 @@ impl Player {
         }
         let text = match PlaybackSession::open_project(path) {
             Ok(session) => {
-                self.session = session;
-                self.fps = self.session.meta().frame_rate;
+                self.fps = session.meta().frame_rate;
                 // A project is named after itself but still exports beside its
                 // media: that is the only place an export has ever landed.
-                self.export_path = export_path(&self.session.sources()[0]);
+                self.export_path = export_path(&session.sources()[0]);
+                self.session = Some(session);
                 self.project_path = path.to_path_buf();
                 self.name = file_name(path).into();
                 // A copied clip names its source by index, which means a
@@ -354,9 +392,14 @@ impl Player {
     /// Writes the timeline back to its project file. Overwrites silently, like
     /// an export: the path was chosen once and the notice is the confirmation.
     fn save_project(&mut self, cx: &mut Context<Self>) {
-        let text = match self.session.save_project(&self.project_path) {
-            Ok(()) => format!("SAVED {}", file_name(&self.project_path)),
-            Err(e) => format!("SAVE FAILED: {e}"),
+        let saved = self
+            .session
+            .as_ref()
+            .map(|session| session.save_project(&self.project_path));
+        let text = match saved {
+            Some(Ok(())) => format!("SAVED {}", file_name(&self.project_path)),
+            Some(Err(e)) => format!("SAVE FAILED: {e}"),
+            None => "NOTHING TO SAVE — open a file first".to_string(),
         };
         eprintln!("{text}");
         self.notice = Some(text.into());
@@ -364,7 +407,7 @@ impl Player {
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
-        if self.session.undo() {
+        if self.session.as_mut().is_some_and(PlaybackSession::undo) {
             self.reset_after_reseek();
         }
         self.selected = None;
@@ -404,7 +447,10 @@ impl Player {
     /// and the release, which must land exactly even when the throttle below
     /// would have skipped them.
     fn scrub_to(&mut self, x: Pixels, commit: bool, cx: &mut Context<Self>) {
-        let t = f64::from(frac_along(x, self.ruler.get())) * self.session.timeline_duration();
+        let Some(session) = &self.session else {
+            return;
+        };
+        let t = f64::from(frac_along(x, self.ruler.get())) * session.timeline_duration();
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
@@ -421,9 +467,11 @@ impl Player {
         }
         if self.done {
             self.seek(0., cx);
-            self.session.play();
-        } else {
-            self.session.toggle();
+            if let Some(session) = &mut self.session {
+                session.play();
+            }
+        } else if let Some(session) = &mut self.session {
+            session.toggle();
             // Past EOF nothing else asks for a repaint.
             cx.notify();
         }
@@ -444,8 +492,15 @@ impl Player {
         if self.export.is_some() {
             return;
         }
-        self.session.pause();
-        self.export = Some(self.session.export_to(&self.export_path));
+        // Nothing to write out, and a refusal rather than a silent button: the
+        // window is empty and the export path is not even chosen yet.
+        let Some(session) = &mut self.session else {
+            self.notice = Some("NOTHING TO EXPORT — open a file first".into());
+            cx.notify();
+            return;
+        };
+        session.pause();
+        self.export = Some(session.export_to(&self.export_path));
         cx.notify();
     }
 
@@ -481,17 +536,19 @@ impl Player {
 
 impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Starts on launch: the session opens paused so the clock begins with
-        // the first rendered frame rather than with the process (which would
-        // charge window setup to the timeline and drop the frames it covers).
-        if !std::mem::replace(&mut self.launched, true) {
-            self.session.play();
+        // A file that has just been opened sits on its first frame with the
+        // clock stopped: opening is not playing, whichever way the file
+        // arrived. The play binding and the transport button start it.
+        if let Some(session) = &mut self.session {
+            session.tick();
         }
-        self.session.tick();
         self.pump(window);
         self.poll_export();
         // No shadow flag: the clock is the only truth about play state.
-        let playing = self.session.is_playing();
+        let playing = self
+            .session
+            .as_ref()
+            .is_some_and(PlaybackSession::is_playing);
         // A paused timeline has nothing to animate; the toggle handlers notify,
         // which is what starts the loop again. A paused seek keeps the loop
         // running by itself until `pump` has the frame it asked for. An export
@@ -505,14 +562,20 @@ impl Render for Player {
 
         // Read per render, never cached: a delete shortens the timeline and the
         // timecode, the ruler and the clamp below all have to follow it.
-        let duration = self.session.timeline_duration();
+        let duration = self
+            .session
+            .as_ref()
+            .map_or(0., PlaybackSession::timeline_duration);
         // The clock keeps running after the last frame (wall time takes over at
         // audio EOF) while the picture is frozen, so the timeline the UI shows is
         // the clamped one, pinned to the out-point once playback is done.
         let position = if self.done {
             duration
         } else {
-            self.session.now().clamp(0., duration)
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::now)
+                .clamp(0., duration)
         };
 
         div()
@@ -654,7 +717,21 @@ impl Render for Player {
                     .children(
                         self.image
                             .clone()
-                            .map(|i| img(i).size_full().object_fit(gpui::ObjectFit::Contain)),
+                            .map(|i| {
+                                img(i)
+                                    .size_full()
+                                    .object_fit(gpui::ObjectFit::Contain)
+                                    .into_any_element()
+                            })
+                            // With no file open the letterbox is the whole
+                            // window, and a black rectangle says only that
+                            // something is broken -- so it says what it wants
+                            // instead. The window is already the drop target.
+                            .or_else(|| {
+                                self.session
+                                    .is_none()
+                                    .then(|| empty_hint().into_any_element())
+                            }),
                     ),
             )
             // Above the panel and only when there is one to show, so it costs
@@ -684,6 +761,9 @@ impl Player {
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
         let exporting = self.exporting().is_some();
+        // Everything but Import and Keys needs a timeline to act on: with none
+        // open they are dimmed rather than silently doing nothing.
+        let live = self.session.is_some() && !exporting;
         let key = |action| self.keymap.display(action);
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
@@ -732,7 +812,7 @@ impl Player {
                         Some(transport_glyph(playing).into_any_element()),
                         if playing { "Pause" } else { "Play" },
                         key(ActionId::Play),
-                        !exporting,
+                        live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
                     .child(separator())
@@ -744,7 +824,7 @@ impl Player {
                             "{} — splits the clip under the playhead",
                             key(ActionId::Cut)
                         ),
-                        !exporting,
+                        live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
                     ))
                     .child(control(
@@ -756,7 +836,7 @@ impl Player {
                         } else {
                             format!("{} — click a clip below first", key(ActionId::Delete))
                         },
-                        !exporting && self.selected.is_some(),
+                        live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
                     ))
                     .child(separator())
@@ -776,7 +856,7 @@ impl Player {
                             "{} — writes the timeline out beside the source",
                             key(ActionId::Export)
                         ),
-                        self.export.is_none(),
+                        live && self.export.is_none(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.start_export(cx)),
                     ))
                     .child(control(
@@ -784,7 +864,7 @@ impl Player {
                         None,
                         "Save",
                         format!("{} — writes the project file", key(ActionId::Save)),
-                        !exporting,
+                        live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
                     ))
                     // No shortcut of its own -- and closed while an export runs,
@@ -1024,7 +1104,9 @@ impl Player {
             .overflow_hidden()
             .children(
                 self.session
-                    .clip_spans_by_source()
+                    .as_ref()
+                    .map(PlaybackSession::clip_spans_by_source)
+                    .unwrap_or_default()
                     .into_iter()
                     .enumerate()
                     .map(|(i, (_, len, source))| {
@@ -1273,6 +1355,24 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
         return 0.;
     }
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
+}
+
+/// What a window with no file open is waiting for. Both ways in are already
+/// built -- the whole window is the drop target and the Import chooser takes a
+/// project as readily as media -- so this only has to say so.
+fn empty_hint() -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(6.))
+        .text_color(rgb(INK_DIM))
+        .child("Drop a video or an .edith project here")
+        .child(
+            div()
+                .text_size(px(11.))
+                .child("or click Import below to choose one"),
+        )
 }
 
 /// The second lane: still a placeholder, deliberately empty.
@@ -1524,26 +1624,31 @@ mod tests {
 }
 
 fn main() {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: app <video.mp4|project.edith> [more.mp4 ...]");
-        std::process::exit(2);
-    };
-    let arg = PathBuf::from(&path);
+    let arg = std::env::args().nth(1).map(PathBuf::from);
     // A `.edith` restores a whole timeline, anything else *is* the timeline.
-    // Either way the rest of argv is appended to what comes out.
-    let opened = if is_project(&arg) {
-        PlaybackSession::open_project(&arg)
-    } else {
-        PlaybackSession::open(&arg)
-    };
-    let mut session = match opened {
-        Ok(v) => v,
-        Err(e) => {
-            // A failed load by drop leaves the running session alone; here
-            // there is no session to leave, so the refusal is the whole run.
-            eprintln!("cannot open {path}: {e}");
-            std::process::exit(1);
+    // Either way the rest of argv is appended to what comes out. No argument at
+    // all opens the window empty -- the timeline then arrives by drop or by the
+    // Import button, and everything below is derived from it at that point
+    // instead.
+    let mut session = match &arg {
+        Some(arg) => {
+            let opened = if is_project(arg) {
+                PlaybackSession::open_project(arg)
+            } else {
+                PlaybackSession::open(arg)
+            };
+            match opened {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    // A failed load by drop leaves the running session alone;
+                    // here a file was named and could not be opened, so the
+                    // refusal is the whole run.
+                    eprintln!("cannot open {}: {e}", arg.display());
+                    std::process::exit(1);
+                }
+            }
         }
+        None => None,
     };
     // A keymap file that cannot be read leaves the defaults in force, and takes
     // the notice slot ahead of an import refusal below: it is about every key
@@ -1555,34 +1660,49 @@ fn main() {
     // The first file makes the timeline, the rest are appended to it. A refusal
     // is not fatal -- the others still load -- but the window must not open
     // silently pretending the file was taken, so the first one seeds the notice.
-    for arg in std::env::args().skip(2) {
-        if let Err(e) = session.import(std::path::Path::new(&arg)) {
+    for extra in std::env::args().skip(2) {
+        // Only reachable with a first argument, so there is a timeline.
+        if let Some(session) = &mut session
+            && let Err(e) = session.import(std::path::Path::new(&extra))
+        {
             let text = format!("IMPORT FAILED: {e}");
-            eprintln!("{arg}: {text}");
+            eprintln!("{extra}: {text}");
             notice.get_or_insert(text);
         }
     }
-    let meta = *session.meta();
+    let meta = session.as_ref().map(|session| *session.meta());
     // Beside the media even for a project: an export has never landed anywhere
     // but next to the picture it came from.
-    let out = export_path(&session.sources()[0]);
-    let project = if is_project(&arg) {
-        arg.clone()
-    } else {
-        project_path(&arg)
+    let out = session
+        .as_ref()
+        .map_or_else(PathBuf::new, |session| export_path(&session.sources()[0]));
+    let project = match &arg {
+        Some(arg) if is_project(arg) => arg.clone(),
+        Some(arg) => project_path(arg),
+        // Chosen with the file, once there is one to choose it from.
+        None => PathBuf::new(),
     };
-    let name: SharedString = file_name(&arg).into();
-    println!(
-        "{path}: {}x{} @ {:.2} fps, {} samples",
-        meta.width, meta.height, meta.frame_rate, meta.frame_count
-    );
+    let name: SharedString = arg
+        .as_deref()
+        .map_or_else(|| "no file open".into(), |arg| file_name(arg).into());
+    if let (Some(arg), Some(meta)) = (&arg, &meta) {
+        println!(
+            "{}: {}x{} @ {:.2} fps, {} samples",
+            arg.display(),
+            meta.width,
+            meta.height,
+            meta.frame_rate,
+            meta.frame_count
+        );
+    }
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(
-            None,
-            size(px(meta.width as f32), px(meta.height as f32)),
-            cx,
-        );
+        // The picture's own size, or 720p when there is no picture yet: the
+        // empty window is a landing pad, not a sliver.
+        let (w, h) = meta.map_or((1280., 720.), |meta| {
+            (meta.width as f32, meta.height as f32)
+        });
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1594,21 +1714,26 @@ fn main() {
             },
             |window, cx| {
                 let player = cx.new(|cx| Player {
+                    // A file named on the command line owes its first frame the
+                    // same repaint a seek's still owes: nothing plays by
+                    // itself, so this is what carries the poster frame to the
+                    // screen. An empty window has none to wait for.
+                    pending_seek: session.is_some(),
                     session,
-                    fps: meta.frame_rate,
+                    // Only ever used with a timeline; 30 keeps the empty
+                    // timecode reading in frames rather than in NaN.
+                    fps: meta.map_or(30., |meta| meta.frame_rate),
                     name: name.clone(),
                     image: None,
                     held: None,
                     eos: false,
                     done: false,
-                    pending_seek: false,
                     ruler: Rc::default(),
                     selected: None,
                     clipboard: None,
                     scrubbing: false,
                     last_scrub: Instant::now(),
                     last_target: 0,
-                    launched: false,
                     export: None,
                     cancelling: false,
                     export_path: out.clone(),
