@@ -128,6 +128,10 @@ struct Shared {
     dead: AtomicBool,
     /// Asked for by `ao_flush`, honoured by the next process callback.
     flush: AtomicBool,
+    /// Set by `ao_set_active(true)`, cleared by the next process callback: the
+    /// graph clock keeps ticking while the stream is inactive, and that time
+    /// was never played.
+    resumed: AtomicBool,
     underruns: AtomicU64,
 }
 
@@ -191,6 +195,9 @@ fn run(
         .process({
             let shared = shared.clone();
             let stride = 4 * channels;
+            // Graph ticks that elapsed while the stream was inactive, and the
+            // last raw reading they are measured against.
+            let (mut skew, mut last_raw) = (0i64, 0i64);
             move |stream, ()| {
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
@@ -234,7 +241,17 @@ fn run(
                     } else {
                         ticks
                     };
-                    shared.position.store(played.max(0), Ordering::Relaxed);
+                    // The graph clock runs whether or not this stream does, so a
+                    // pause shows up here as a step. Nothing was played during
+                    // it: fold it into the skew instead of the position, or the
+                    // pause leaks into the caller's timeline.
+                    if shared.resumed.swap(false, Ordering::Relaxed) {
+                        skew += played - last_raw;
+                    }
+                    last_raw = played;
+                    shared
+                        .position
+                        .store((played - skew).max(0), Ordering::Relaxed);
                 }
             }
         })
@@ -352,6 +369,7 @@ pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
             ready: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             flush: AtomicBool::new(false),
+            resumed: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -435,6 +453,9 @@ pub unsafe extern "C" fn ao_set_active(session: *mut c_void, active: u32) -> i32
         }
         // SAFETY: caller-guaranteed live session.
         let session = unsafe { &*(session as *const Session) };
+        if active != 0 {
+            session.shared.resumed.store(true, Ordering::Relaxed);
+        }
         match session.ctl.send(Ctl::Active(active != 0)) {
             Ok(()) => 0,
             Err(_) => -1,
