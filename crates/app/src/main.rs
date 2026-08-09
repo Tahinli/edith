@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::Instant;
@@ -5,8 +7,8 @@ use std::time::Instant;
 use engine::{Frame, PlaybackSession};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    PathBuilder, RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    canvas, div, img, point, prelude::*, px, relative, rgb, size,
+    PathBuilder, Pixels, RenderImage, SharedString, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -42,6 +44,12 @@ struct Player {
     eos: bool,
     /// Last frame shown; nothing left to animate.
     done: bool,
+    /// A seek is waiting for its frame. Keeps the repaint loop alive while
+    /// paused, which is the only way the new still ever reaches the screen.
+    pending_seek: bool,
+    /// The ruler's own box, recorded at prepaint: a mouse listener is handed
+    /// the window position and nothing else.
+    ruler: Rc<Cell<Bounds<Pixels>>>,
     /// Playback was started once, on the first render. Space owns it after that.
     launched: bool,
     displayed: u32,
@@ -81,6 +89,7 @@ impl Player {
 
         if let Some(frame) = newest {
             self.displayed += 1;
+            self.pending_seek = false;
             self.started.get_or_insert_with(|| {
                 eprintln!("first frame displayed (index {})", frame.index);
                 Instant::now()
@@ -97,6 +106,9 @@ impl Player {
 
         if self.eos && self.held.is_none() && !self.done {
             self.done = true;
+            // A seek whose worker never produced a frame (vanished file) would
+            // otherwise repaint at vsync forever.
+            self.pending_seek = false;
             let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
             eprintln!(
                 "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
@@ -104,6 +116,31 @@ impl Player {
                 self.dropped,
                 self.session.now()
             );
+        }
+    }
+
+    /// Jumps the timeline. Every end-of-stream flag is app state and the
+    /// engine knows nothing about it, so clearing them here is what stops the
+    /// picture from staying frozen on the old last frame.
+    fn seek(&mut self, t: f64, cx: &mut Context<Self>) {
+        self.session.seek(t);
+        self.held = None;
+        self.eos = false;
+        self.done = false;
+        self.pending_seek = true;
+        cx.notify();
+    }
+
+    /// Space and the transport button share it: once the timeline is finished
+    /// the only sensible "play" is from the top.
+    fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
+        if self.done {
+            self.seek(0., cx);
+            self.session.play();
+        } else {
+            self.session.toggle();
+            // Past EOF nothing else asks for a repaint.
+            cx.notify();
         }
     }
 }
@@ -121,8 +158,9 @@ impl Render for Player {
         // No shadow flag: the clock is the only truth about play state.
         let playing = self.session.is_playing();
         // A paused timeline has nothing to animate; the toggle handlers notify,
-        // which is what starts the loop again.
-        if playing && !self.done {
+        // which is what starts the loop again. A paused seek keeps the loop
+        // running by itself until `pump` has the frame it asked for.
+        if (playing && !self.done) || self.pending_seek {
             window.request_animation_frame();
         }
 
@@ -141,9 +179,7 @@ impl Render for Player {
                 // `is_held` filters auto-repeat, which would otherwise toggle
                 // playback many times a second.
                 if event.keystroke.key == "space" && !event.is_held {
-                    this.session.toggle();
-                    // Past EOF nothing else asks for a repaint.
-                    cx.notify();
+                    this.toggle_or_restart(cx);
                 }
             }))
             .size_full()
@@ -217,8 +253,7 @@ impl Player {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                    this.session.toggle();
-                                    cx.notify();
+                                    this.toggle_or_restart(cx);
                                 }),
                             )
                             .child(transport_glyph(playing)),
@@ -229,14 +264,22 @@ impl Player {
                         timecode(self.duration, self.fps)
                     ))),
             )
-            // Read-only: no cursor, no hover, no listener -- a clip slice turns
-            // this into a scrubber, today it only reports.
+            // Click to seek. Still not a scrubber: no drag, no hover preview.
             .child(
                 div()
                     .flex_none()
                     .h(px(6.))
                     .rounded(px(3.))
                     .bg(rgb(SURFACE))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            let frac = frac_along(event.position.x, this.ruler.get());
+                            this.seek(f64::from(frac) * this.duration, cx);
+                        }),
+                    )
+                    .child(bounds_probe(self.ruler.clone()))
                     .child(
                         div()
                             .h_full()
@@ -248,6 +291,24 @@ impl Player {
             .child(track_lane())
             .child(track_lane())
     }
+}
+
+/// Records its parent's laid-out box: gpui hands a mouse listener the window
+/// position only, and the ruler sits behind the panel's padding. Paints
+/// nothing and takes no hitbox of its own, so the click still reaches the bar.
+fn bounds_probe(into: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+    canvas(move |bounds, _, _| into.set(bounds), |_, _, _, _| ())
+        .absolute()
+        .size_full()
+}
+
+/// Where along an element a click landed, 0..1. An element that was never
+/// painted has no width, and reads as its start rather than as NaN.
+fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    if bounds.size.width <= px(0.) {
+        return 0.;
+    }
+    ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
 }
 
 /// Placeholder chrome for the clips slice: deliberately empty.
@@ -309,7 +370,25 @@ fn timecode(t: f64, fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::timecode;
+    use super::{frac_along, timecode};
+    use gpui::{Bounds, Pixels, point, px, size};
+
+    #[test]
+    fn frac_along_measures_from_the_elements_own_left_edge() {
+        // A ruler inset by the panel's 12 px padding: window x is not bar x.
+        let bar: Bounds<Pixels> = Bounds {
+            origin: point(px(12.), px(400.)),
+            size: size(px(200.), px(6.)),
+        };
+        assert_eq!(frac_along(px(12.), bar), 0.);
+        assert_eq!(frac_along(px(112.), bar), 0.5);
+        assert_eq!(frac_along(px(212.), bar), 1.);
+        // Outside the bar (a click that slid off) clamps, never extrapolates.
+        assert_eq!(frac_along(px(0.), bar), 0.);
+        assert_eq!(frac_along(px(9999.), bar), 1.);
+        // Never painted: no division by zero, no NaN reaching seek().
+        assert_eq!(frac_along(px(50.), Bounds::default()), 0.);
+    }
 
     #[test]
     fn timecode_counts_frames_inside_the_second() {
@@ -371,6 +450,8 @@ fn main() {
                     held: None,
                     eos: false,
                     done: false,
+                    pending_seek: false,
+                    ruler: Rc::default(),
                     launched: false,
                     displayed: 0,
                     dropped: 0,
