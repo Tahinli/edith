@@ -78,6 +78,10 @@ struct Player {
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
+    /// Where ctrl+s writes: the project this timeline was loaded from, or the
+    /// one derived beside the media it started as. Saving twice overwrites the
+    /// same file rather than making a second one.
+    project_path: PathBuf,
     /// What the last export left in the timecode slot, and when. Cleared by
     /// `NOTICE` passing or by the next key, whichever comes first.
     notice: Option<(SharedString, Instant)>,
@@ -232,6 +236,57 @@ impl Player {
                 format!("IMPORTED {}", file_name(path))
             }
             Err(e) => format!("IMPORT FAILED: {e}"),
+        };
+        eprintln!("{text}");
+        self.notice = Some((text.into(), Instant::now()));
+        cx.notify();
+    }
+
+    /// Swaps the whole timeline for one restored from a `.edith`. Like an
+    /// import this arrives by drop and so checks the export guard for itself.
+    /// The new session is built before anything is replaced, so a refusal is
+    /// shown as the engine worded it and leaves what is playing alone.
+    fn load_project(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let text = match PlaybackSession::open_project(path) {
+            Ok(session) => {
+                self.session = session;
+                self.fps = self.session.meta().frame_rate;
+                // A project is named after itself but still exports beside its
+                // media: that is the only place an export has ever landed.
+                self.export_path = export_path(&self.session.sources()[0]);
+                self.project_path = path.to_path_buf();
+                self.name = file_name(path).into();
+                // A copied clip names its source by index, which means a
+                // different file -- or none -- in another project.
+                self.clipboard = None;
+                self.selected = None;
+                // The counters describe one timeline; the eof line must not
+                // report the old one's frames against the new one.
+                self.displayed = 0;
+                self.dropped = 0;
+                self.started = None;
+                // Loaded paused at its saved playhead, so the still it owes
+                // reaches the screen the way a seek's does. The old picture is
+                // released by the swap in `pump`, as after any other seek.
+                self.reset_after_reseek();
+                format!("LOADED {}", file_name(path))
+            }
+            Err(e) => format!("OPEN FAILED: {e}"),
+        };
+        eprintln!("{text}");
+        self.notice = Some((text.into(), Instant::now()));
+        cx.notify();
+    }
+
+    /// Writes the timeline back to its project file. Overwrites silently, like
+    /// an export: the path was chosen once and the notice is the confirmation.
+    fn save_project(&mut self, cx: &mut Context<Self>) {
+        let text = match self.session.save_project(&self.project_path) {
+            Ok(()) => format!("SAVED {}", file_name(&self.project_path)),
+            Err(e) => format!("SAVE FAILED: {e}"),
         };
         eprintln!("{text}");
         self.notice = Some((text.into(), Instant::now()));
@@ -399,6 +454,7 @@ impl Render for Player {
                 ) {
                     ("space", _) => this.toggle_or_restart(cx),
                     ("e", false) => this.start_export(cx),
+                    ("s", true) => this.save_project(cx),
                     ("c", true) => this.copy_selected(),
                     ("v", true) => this.paste(cx),
                     ("c", false) => this.cut(cx),
@@ -413,7 +469,12 @@ impl Render for Player {
             // that covers the picture as well as the panel.
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 for path in paths.paths() {
-                    this.import(path, cx);
+                    // A project replaces the timeline, media is appended to it.
+                    if is_project(path) {
+                        this.load_project(path, cx);
+                    } else {
+                        this.import(path, cx);
+                    }
                 }
             }))
             // Scrubbing is tracked on the root because the pointer leaves the
@@ -628,10 +689,27 @@ const NOTICE: Duration = Duration::from_secs(2);
 
 /// Where an export goes: the source path with `.export.mp4` for an extension,
 /// so it lands beside the original and can never be the original.
-fn export_path(source: &str) -> PathBuf {
-    let mut path = PathBuf::from(source);
+fn export_path(source: impl Into<PathBuf>) -> PathBuf {
+    let mut path = source.into();
     path.set_extension("export.mp4");
     path
+}
+
+/// Where ctrl+s goes when the timeline did not come from a project file: the
+/// media path with `.edith` for an extension, beside it like an export. A
+/// project loaded from disk keeps its own path instead, so saving it twice
+/// writes the same file.
+fn project_path(source: impl Into<PathBuf>) -> PathBuf {
+    let mut path = source.into();
+    path.set_extension("edith");
+    path
+}
+
+/// Whether a dropped or named path is a project rather than media. Exactly the
+/// lowercase extension `save_project` writes -- anything else goes to the
+/// demuxer, which is the one that can say what it really is.
+fn is_project(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e == "edith")
 }
 
 /// The tail of a path, for showing. A path that is all root has none, and reads
@@ -775,8 +853,8 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SOURCE_TINTS, SURFACE, export_path, frac_along, scrub_due, source_tint, timecode,
-        width_frac,
+        SOURCE_TINTS, SURFACE, export_path, frac_along, is_project, project_path, scrub_due,
+        source_tint, timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
@@ -844,6 +922,38 @@ mod tests {
     }
 
     #[test]
+    fn the_first_save_lands_beside_the_media() {
+        assert_eq!(
+            project_path("assets/test_av.mp4"),
+            std::path::Path::new("assets/test_av.edith")
+        );
+        // The same rule an export follows: only the last extension moves.
+        assert_eq!(
+            project_path("a.export.mp4"),
+            std::path::Path::new("a.export.edith")
+        );
+        assert_eq!(project_path("clip"), std::path::Path::new("clip.edith"));
+        // Saving a loaded project writes the file it came from, not a second.
+        assert_eq!(project_path("a.edith"), std::path::Path::new("a.edith"));
+    }
+
+    #[test]
+    fn only_an_exact_edith_extension_is_a_project() {
+        let p = std::path::Path::new;
+        assert!(is_project(p("a.edith")));
+        // A dotted directory must not decide it -- the file name does.
+        assert!(is_project(p("/v.mp4/a.edith")));
+        assert!(!is_project(p("a.mp4")));
+        assert!(!is_project(p("/v.edith/a.mp4")));
+        // Exactly what `save_project` writes: a dropped `.EDITH` goes to the
+        // demuxer and is refused there, not parsed as a project.
+        assert!(!is_project(p("a.EDITH")));
+        // An extension, never a bare name.
+        assert!(!is_project(p("edith")));
+        assert!(!is_project(p("a.edith.mp4")));
+    }
+
+    #[test]
     fn clip_boxes_split_the_lane_by_duration() {
         // 1 s + 3 s of a 4 s timeline: a quarter and three quarters.
         assert_eq!(width_frac(1., 4.), 0.25);
@@ -870,12 +980,22 @@ mod tests {
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: app <video.mp4> [more.mp4 ...]");
+        eprintln!("usage: app <video.mp4|project.edith> [more.mp4 ...]");
         std::process::exit(2);
     };
-    let mut session = match PlaybackSession::open(&path) {
+    let arg = PathBuf::from(&path);
+    // A `.edith` restores a whole timeline, anything else *is* the timeline.
+    // Either way the rest of argv is appended to what comes out.
+    let opened = if is_project(&arg) {
+        PlaybackSession::open_project(&arg)
+    } else {
+        PlaybackSession::open(&arg)
+    };
+    let mut session = match opened {
         Ok(v) => v,
         Err(e) => {
+            // A failed load by drop leaves the running session alone; here
+            // there is no session to leave, so the refusal is the whole run.
             eprintln!("cannot open {path}: {e}");
             std::process::exit(1);
         }
@@ -892,11 +1012,15 @@ fn main() {
         }
     }
     let meta = *session.meta();
-    let out = export_path(&path);
-    let name: SharedString = std::path::Path::new(&path)
-        .file_name()
-        .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())
-        .into();
+    // Beside the media even for a project: an export has never landed anywhere
+    // but next to the picture it came from.
+    let out = export_path(&session.sources()[0]);
+    let project = if is_project(&arg) {
+        arg.clone()
+    } else {
+        project_path(&arg)
+    };
+    let name: SharedString = file_name(&arg).into();
     println!(
         "{path}: {}x{} @ {:.2} fps, {} samples",
         meta.width, meta.height, meta.frame_rate, meta.frame_count
@@ -937,6 +1061,7 @@ fn main() {
                     export: None,
                     cancelling: false,
                     export_path: out.clone(),
+                    project_path: project.clone(),
                     notice: notice.clone().map(|text| (text.into(), Instant::now())),
                     displayed: 0,
                     dropped: 0,
