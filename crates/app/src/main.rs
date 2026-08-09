@@ -55,9 +55,10 @@ const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
 /// cannot push the layout around.
 const TIME_W: f32 = 200.;
-/// The keybindings card: 11 rows and a title inside a 360 px tall window.
-const KEYS_W: f32 = 300.;
-const KEYS_ROW_H: f32 = 20.;
+/// The keybindings card: a row per action, a title and a status line, inside a
+/// 360 px tall window. The rows are click targets, so `HIT_MIN` binds them too.
+const KEYS_W: f32 = 320.;
+const KEYS_ROW_H: f32 = HIT_MIN;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -118,9 +119,9 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
-    /// The row waiting for a stroke, as an index into `keymap.entries()`. The
-    /// next key that is neither escape nor a lone modifier *is* that binding.
-    rebinding: Option<usize>,
+    /// The action whose row is waiting for a stroke. The next key that is
+    /// neither escape nor a lone modifier becomes the whole of what reaches it.
+    rebinding: Option<ActionId>,
     /// What the last file action had to say. Holds its own bar above the panel
     /// until it is answered -- any key retires it, so does a click on it -- so a
     /// failure is read in full instead of blinking past.
@@ -370,17 +371,19 @@ impl Player {
         cx.notify();
     }
 
-    /// The stroke a waiting row was after. A chord another action already holds
-    /// is refused by the keymap and the row keeps waiting, so the next stroke is
-    /// another try rather than a lost one. A binding that took holds either way:
+    /// The stroke a waiting row was after: it becomes the whole of what reaches
+    /// that action, which is what the row was showing. A chord another action
+    /// already holds is refused by the keymap and the row keeps waiting, so the
+    /// next stroke is another try rather than a lost one. A binding that took
+    /// holds either way:
     /// what a failed write costs is only the next run, which is what the notice
     /// is for.
-    fn capture(&mut self, index: usize, key: &str, ctrl: bool) {
+    fn capture(&mut self, action: ActionId, key: &str, ctrl: bool) {
         let chord = keymap::Chord {
             key: key.to_string(),
             ctrl,
         };
-        let text = match self.keymap.rebind(index, chord.clone()) {
+        let text = match self.keymap.rebind_action(action, chord.clone()) {
             Ok(()) => {
                 self.rebinding = None;
                 match self.keymap.save() {
@@ -532,11 +535,11 @@ impl Render for Player {
                 // data: it means the binding and nothing else, which is why this
                 // answers before the export guard and before the keymap is
                 // consulted at all.
-                if let Some(index) = this.rebinding {
+                if let Some(action) = this.rebinding {
                     if key == ESCAPE {
                         this.rebinding = None;
                     } else if !is_bare_modifier(key) {
-                        this.capture(index, key, event.keystroke.modifiers.control);
+                        this.capture(action, key, event.keystroke.modifiers.control);
                     }
                     cx.notify();
                     return;
@@ -920,18 +923,20 @@ impl Player {
             ctrl: false,
         }
         .pretty();
-        let rows: Vec<_> = self
-            .keymap
-            .entries()
-            .iter()
+        // One row per action, not per binding: an action with two strokes reads
+        // as one line ("x or delete"), and a rebind replaces that whole set.
+        let rows: Vec<_> = ActionId::ALL
+            .into_iter()
             .enumerate()
-            .map(|(i, binding)| {
-                let capturing = self.rebinding == Some(i);
+            .map(|(i, action)| {
+                let capturing = self.rebinding == Some(action);
                 let out = out.clone();
                 div()
                     .id(("bind", i))
                     .flex()
-                    .h(px(KEYS_ROW_H))
+                    // The floor, not the height: a row that needed two lines
+                    // would otherwise paint over the one under it.
+                    .min_h(px(KEYS_ROW_H))
                     .items_center()
                     .justify_between()
                     .gap(px(12.))
@@ -941,16 +946,16 @@ impl Player {
                     .hover(|s| s.bg(rgb(HOVER)))
                     .when(capturing, |d| d.bg(rgb(SELECTED)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.rebinding = Some(i);
+                        this.rebinding = Some(action);
                         cx.notify();
                     }))
-                    .child(binding.action.label())
+                    .child(action.label())
                     .child(if capturing {
                         div()
                             .text_color(rgb(INK_DIM))
                             .child(format!("press a key — {out} cancels"))
                     } else {
-                        div().child(binding.chord.pretty())
+                        div().child(self.keymap.display(action))
                     })
             })
             .collect();
@@ -976,22 +981,31 @@ impl Player {
                         .p(px(12.))
                         .rounded(px(6.))
                         .bg(rgb(SURFACE))
+                        // Title and instruction are two children, never one
+                        // wrapping line: a fixed-height slot whose text wrapped
+                        // painted its second line over the first row.
+                        .child(div().flex_none().px(px(6.)).child("Keybindings"))
+                        // One status line, under the title where the eye starts.
+                        // A refusal takes it over -- it is the more urgent of the
+                        // two, and the notice bar it would otherwise appear in is
+                        // under the scrim.
+                        //
+                        // ponytail: a refusal long enough to wrap to three lines
+                        // pushes the card past a 360 px tall window. The upgrade
+                        // path is a scrolling row list, not a shorter message.
                         .child(
                             div()
-                                .h(px(KEYS_ROW_H))
-                                .px(px(6.))
-                                .child("Keybindings — click a row, then press a key"),
-                        )
-                        .children(rows)
-                        // A refusal belongs where the click was: the notice bar
-                        // itself is under the scrim.
-                        .children(self.notice.clone().map(|notice| {
-                            div()
+                                .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(notice)
-                        })),
+                                .child(
+                                    self.notice
+                                        .clone()
+                                        .unwrap_or_else(|| "click a row, then press a key".into()),
+                                ),
+                        )
+                        .children(rows),
                 ),
         )
     }
@@ -1467,12 +1481,22 @@ mod tests {
 
     #[test]
     fn the_keybindings_card_fits_the_smallest_window() {
-        // A title line plus a row per default binding, inside the 640x360 the
-        // rest of the layout is already sized for.
-        let lines = keymap::Keymap::defaults().entries().len() as f32 + 1.;
-        // Rows, their 2 px gaps, the card's 12 px padding top and bottom.
-        assert!(lines * (KEYS_ROW_H + 2.) + 24. <= 360., "card too tall");
+        // A row per action -- not per binding, which is why the count is
+        // `ALL` -- under a title and a status line, inside the 640x360 the rest
+        // of the layout is already sized for.
+        let rows = keymap::ActionId::ALL.len() as f32;
+        let title = 17.; // 13 px text on its own line
+        let status = 28.; // 11 px text, two lines: a refusal wraps
+        let gaps = (rows + 1.) * 2.;
+        let padding = 24.;
+        assert!(
+            title + status + rows * KEYS_ROW_H + gaps + padding <= 360.,
+            "card too tall"
+        );
         assert!(KEYS_W <= 640., "card too wide");
+        // The rows are clickable, so WCAG 2.5.8 binds them like every other
+        // target in this window.
+        assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
     #[test]
