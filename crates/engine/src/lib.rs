@@ -6,12 +6,12 @@ pub mod clock;
 pub mod convert;
 pub mod decode;
 pub mod demux;
+pub mod edith;
 pub mod export;
 pub mod hw;
 pub mod mux;
 pub mod playback;
 pub mod project;
-pub mod veproj;
 
 pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession};
 pub use clock::PlaybackClock;

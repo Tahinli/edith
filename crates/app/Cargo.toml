@@ -1,10 +1,10 @@
 [package]
-name = "app"
+name = "edith"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "app"
+name = "edith"
 path = "src/main.rs"
 
 [dependencies]
