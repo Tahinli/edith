@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/engine-hw", "crates/app"]
+# Vendored third-party (see [patch.crates-io]); not ours to build or test.
+exclude = ["vendor/cros-libva", "vendor/cros-codecs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Two upstream crates vendored verbatim except for one clearly marked fix each,
+# both blockers on this machine and both still unfixed upstream as of 0.0.6/0.0.13:
+#   cros-libva  - fails to build against libva >= 1.23 headers
+#   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses
+# Drop `vendor/` entirely once released versions handle both.
+[patch.crates-io]
+cros-libva = { path = "vendor/cros-libva" }
+cros-codecs = { path = "vendor/cros-codecs" }

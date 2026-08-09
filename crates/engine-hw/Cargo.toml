@@ -1,0 +1,16 @@
+[package]
+name = "engine-hw"
+version.workspace = true
+edition.workspace = true
+
+# cdylib only: this is the one artifact allowed to link libva/gbm/drm. The app
+# dlopens it and keeps working when it is missing.
+[lib]
+name = "engine_hw"
+crate-type = ["cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }
+cros-codecs = { version = "0.0.6", features = ["vaapi"] }
+# Same version cros-codecs already pulls in; we allocate output frames ourselves.
+gbm = { version = "0.15", default-features = false, features = ["drm-support"] }

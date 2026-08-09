@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+gpui = "0.2.2"
+image = "0.25"

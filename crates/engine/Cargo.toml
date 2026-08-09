@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+# No UI dependency here, ever: the engine must stay reusable across front-ends.
+[dependencies]
+libloading = "0.8"
+mp4 = "0.14"
+rusty_h264 = { version = "0.8", default-features = false }
