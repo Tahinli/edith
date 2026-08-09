@@ -1,0 +1,15 @@
+[package]
+name = "engine-audio"
+version = "0.1.0"
+edition = "2024"
+
+# PipeWire audio output plugin. Dynamically loaded at runtime (dlopen) so the
+# main binary never gains a DT_NEEDED on libpipewire — PipeWire missing at
+# runtime means the app runs muted, never that it fails to start.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+engine = { path = "../engine" }
+pipewire = "0.10"
+libspa-sys = "0.10"

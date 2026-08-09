@@ -8,3 +8,5 @@ edition.workspace = true
 libloading = "0.8"
 mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
+symphonia-core = "0.6"
+symphonia-codec-aac = "0.6"

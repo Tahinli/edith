@@ -1,10 +1,15 @@
 //! Video engine: demux -> decode -> pixel convert. No UI dependencies.
 
+pub mod ao;
+pub mod audio;
+pub mod clock;
 pub mod convert;
 pub mod decode;
 pub mod demux;
 pub mod hw;
 
+pub use audio::{AudioChunk, AudioMeta, AudioSession};
+pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
 
