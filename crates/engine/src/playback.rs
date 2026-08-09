@@ -226,6 +226,21 @@ impl PlaybackSession {
             .cut(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// The clip at `idx` -- what a caller copies. It is a pair of source frame
+    /// numbers and nothing else, so a copy stays valid after the clip it came
+    /// from is deleted. `None` past the end.
+    pub fn clip_at(&self, idx: usize) -> Option<Clip> {
+        self.project.clips().get(idx).copied()
+    }
+
+    /// Inserts `clip` at the playhead, splitting the clip under it. Like a
+    /// delete this moves every following frame, so the session reseeks; past
+    /// the end of the timeline the clip is appended. One undo step.
+    pub fn paste_at(&mut self, timeline_secs: f64, clip: Clip) -> bool {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        self.edit(|p| p.paste(at, clip))
+    }
+
     /// Removes a clip and closes the gap. Unlike a cut this *does* move every
     /// following frame, so the session reseeks to wherever the playhead now
     /// points. `false` for a bad index or the last remaining clip.

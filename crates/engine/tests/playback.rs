@@ -400,6 +400,80 @@ fn edits_traverse_cuts() {
     );
 }
 
+/// Copy and paste. A clipboard clip is a pair of *source* frame numbers, so the
+/// pasted stretch has to decode its own range -- not the frames the timeline
+/// used to hold at that position.
+#[test]
+fn paste_duplicates_a_clip_at_the_playhead() {
+    let path = asset("test_baseline.mp4");
+    let mut session = PlaybackSession::open(&path).expect("open");
+    let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
+    let whole = f64::from(total) / fps;
+
+    assert!(session.cut_at(2.0), "cut at 2 s");
+    let copied = session.clip_at(0).expect("clip 0");
+    let copied_len = copied.len();
+    assert_eq!(copied_len, (2.0 * fps) as u32);
+    assert!(session.clip_at(2).is_none(), "only two clips so far");
+
+    // Mid-clip: the paste splits clip 1 and lands between the halves.
+    let at = (4.0 * fps) as u32;
+    assert!(session.paste_at(4.0, copied), "paste at 4 s");
+    assert_eq!(session.clip_spans().len(), 4);
+    let grown = total + copied_len;
+    assert!(
+        (session.timeline_duration() - f64::from(grown) / fps).abs() < 1e-9,
+        "duration after the paste: {}",
+        session.timeline_duration()
+    );
+
+    // Play the edited timeline from the top, keeping the two seam frames.
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut expect, mut pasted, mut resumed) = (0, None, None);
+    loop {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            assert_eq!(frame.index, expect, "timeline indices must be contiguous");
+            if frame.index == at {
+                pasted = Some(frame.bgra);
+            } else if frame.index == at + copied_len {
+                resumed = Some(frame.bgra);
+            }
+            expect += 1;
+        }
+        if session.is_eos() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still draining after 30 s");
+        sleep(Duration::from_millis(4));
+    }
+    assert_eq!(expect, grown, "the pasted timeline, whole and nothing but");
+    // As above: an edit reseeks to *now*, so stop the clock before asserting.
+    session.pause();
+
+    // At the paste position the picture is the copied clip's first frame, and
+    // the split-off remainder resumes exactly where it was interrupted.
+    assert!(
+        pasted.expect("no frame at the paste") == source_frame(&path, copied.in_frame),
+        "the paste is not showing source {}",
+        copied.in_frame
+    );
+    assert!(
+        resumed.expect("no frame after the paste") == source_frame(&path, at),
+        "the timeline did not resume at source {at}"
+    );
+
+    assert!(session.undo(), "undo the paste");
+    assert_eq!(session.clip_spans().len(), 2, "one step, back to the cut");
+    assert!(
+        (session.timeline_duration() - whole).abs() < 1e-9,
+        "undo did not restore the duration: {}",
+        session.timeline_duration()
+    );
+}
+
 /// Editing while the device is running. A cut must not disturb playback at all
 /// and a delete reseeks under it -- in both cases the audio keeps coming, which
 /// is what stops `tick` from handing the timeline back to wall time.

@@ -111,6 +111,43 @@ impl Project {
         true
     }
 
+    /// Insert `clip` so that it starts at `timeline_frame`. Mid-clip the
+    /// containing clip is split there and `clip` goes between the halves; at an
+    /// existing boundary (0 included) it goes in front of the clip that starts
+    /// there; at or past the end of the timeline it is appended -- a paste past
+    /// the end clamps rather than refuses, because there is nothing between the
+    /// end and it. Refused only for an empty `clip`, which the never-empty
+    /// invariant forbids but the public fields still allow a caller to build.
+    ///
+    /// Exactly one history snapshot, so one [`Project::undo`] takes it back --
+    /// hence the splice rather than a `cut` plus an insert. Changes the
+    /// timeline->source mapping: the caller must reseek.
+    pub fn paste(&mut self, timeline_frame: u32, clip: Clip) -> bool {
+        if clip.out_frame <= clip.in_frame {
+            return false;
+        }
+        self.history.push(self.clips.clone());
+        match self.map_timeline(timeline_frame) {
+            Some((idx, source)) if source > self.clips[idx].in_frame => {
+                let out = self.clips[idx].out_frame;
+                self.clips[idx].out_frame = source;
+                self.clips.splice(
+                    idx + 1..idx + 1,
+                    [
+                        clip,
+                        Clip {
+                            in_frame: source,
+                            out_frame: out,
+                        },
+                    ],
+                );
+            }
+            Some((idx, _)) => self.clips.insert(idx, clip),
+            None => self.clips.push(clip),
+        }
+        true
+    }
+
     /// Remove a clip and close the gap. Refused for an out-of-range index and
     /// for the last remaining clip (an empty timeline is undefined this slice).
     /// Changes the timeline->source mapping: the caller must reseek.
@@ -268,6 +305,98 @@ mod tests {
             assert_eq!(p.map_timeline(t), Some(want), "timeline frame {t}");
         }
         assert_eq!(p.map_timeline(9), None);
+    }
+
+    /// The clip a copy would hand back: source `[100, 102)`, unrelated to
+    /// anything in `three()` so it is recognisable wherever it lands.
+    const PASTED: Clip = Clip {
+        in_frame: 100,
+        out_frame: 102,
+    };
+
+    #[test]
+    fn paste_mid_clip_splits_around_it() {
+        let mut p = three();
+        assert!(p.paste(6, PASTED)); // inside [5,9), one frame in
+        assert_eq!(p.timeline_frames(), 11);
+        assert_eq!(
+            p.clips(),
+            [
+                Clip {
+                    in_frame: 0,
+                    out_frame: 3
+                },
+                Clip {
+                    in_frame: 3,
+                    out_frame: 5
+                },
+                Clip {
+                    in_frame: 5,
+                    out_frame: 6
+                },
+                PASTED,
+                Clip {
+                    in_frame: 6,
+                    out_frame: 9
+                },
+            ]
+        );
+        // The pasted frames are exactly where they were asked for, and the
+        // split-off remainder resumes after them.
+        assert_eq!(p.map_timeline(6), Some((3, 100)));
+        assert_eq!(p.map_timeline(7), Some((3, 101)));
+        assert_eq!(p.map_timeline(8), Some((4, 6)));
+    }
+
+    #[test]
+    fn paste_at_boundary_zero_and_end() {
+        let mut p = three();
+        assert!(p.paste(3, PASTED), "existing boundary: no split");
+        assert_eq!(p.clip_spans(), vec![(0, 3), (3, 2), (5, 2), (7, 4)]);
+        assert_eq!(p.map_timeline(3), Some((1, 100)));
+
+        let mut p = three();
+        assert!(p.paste(0, PASTED));
+        assert_eq!(p.map_timeline(0), Some((0, 100)));
+        assert_eq!(p.map_timeline(2), Some((1, 0)));
+
+        // At the end and past it both append -- there is nothing to sit before.
+        let mut p = three();
+        assert!(p.paste(9, PASTED));
+        assert_eq!(p.clip_spans(), vec![(0, 3), (3, 2), (5, 4), (9, 2)]);
+        assert!(p.paste(1_000, PASTED));
+        assert_eq!(p.timeline_frames(), 13);
+
+        // An empty clip is the one thing refused, and it pushes no history.
+        let mut p = three();
+        assert!(!p.paste(
+            4,
+            Clip {
+                in_frame: 7,
+                out_frame: 7
+            }
+        ));
+        assert_eq!(p.clips().len(), 3);
+    }
+
+    #[test]
+    fn paste_undoes_in_one_step() {
+        let mut p = three();
+        let before = p.clips().to_vec();
+        assert!(p.paste(6, PASTED));
+        assert!(p.undo());
+        assert_eq!(p.clips(), before.as_slice(), "a paste is one undo step");
+    }
+
+    #[test]
+    fn a_copy_outlives_the_clip_it_came_from() {
+        let mut p = three();
+        let copied = p.clips()[1]; // [3,5)
+        assert!(p.delete(1));
+        // Just a frame range: the source is still on disk either way.
+        assert!(p.paste(0, copied));
+        assert_eq!(p.map_timeline(0), Some((0, 3)));
+        assert_eq!(p.timeline_frames(), 9);
     }
 
     #[test]
