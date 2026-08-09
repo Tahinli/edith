@@ -123,6 +123,42 @@ fn seek_matches_linear() {
     );
 }
 
+/// Drains a bounded session, returning the indices it delivered. The loop ends
+/// only on `RecvError`, i.e. the worker closed the channel by itself.
+fn range_indices(path: &Path, start: u32, end: u32) -> Vec<u32> {
+    let (_, rx, _cancel) = DecodeSession::open_range(path, start, end).expect("open_range");
+    let mut got = Vec::new();
+    while let Ok(frame) = rx.recv() {
+        got.push(frame.index);
+    }
+    got
+}
+
+/// A bounded range must stop on its own — both backends — with `Frame::index`
+/// still the absolute source index, and then disconnect rather than hang.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn range_stops_at_end() {
+    const START: u32 = 30;
+    const END: u32 = 60;
+    let path = asset("test_baseline.mp4");
+    let want: Vec<u32> = (START..END).collect();
+
+    // Another test in this binary may already have pinned VE_SW; clear it so
+    // the hardware half really is hardware. SAFETY: --test-threads=1.
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(range_indices(&path, START, END), want, "hardware range");
+
+    unsafe { std::env::set_var("VE_SW", "1") };
+    assert_eq!(range_indices(&path, START, END), want, "software range");
+
+    // Degenerate ranges close cleanly instead of decoding to EOF.
+    assert!(range_indices(&path, 30, 30).is_empty(), "empty range");
+    assert!(range_indices(&path, 60, 30).is_empty(), "inverted range");
+    // Past the end is clamped to the frame count.
+    assert_eq!(range_indices(&path, 148, 999).len(), 2, "clamped range");
+}
+
 /// H.264 8-bit decode is bit-exact by conformance, so the two backends must
 /// agree. A mismatch means a driver deviation and is reported, not swallowed.
 #[test]
