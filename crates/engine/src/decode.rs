@@ -44,6 +44,15 @@ impl Worker {
         self.cancel.store(true, Ordering::Release);
     }
 
+    /// Whether the thread has already returned, i.e. dropping this would not
+    /// wait. `true` for a worker that never had a thread. What lets a caller
+    /// park cancelled workers and reap them without ever blocking.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
     /// Lets the worker run on unwatched -- what the public API does, since it
     /// hands out the flag alone.
     fn detach(mut self) -> Arc<AtomicBool> {
