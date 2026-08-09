@@ -118,7 +118,7 @@ impl PlaybackSession {
         };
         // One clip covering the file, so timeline == source until the first
         // edit -- and `open_at(_, 0)` is exactly that clip's range.
-        let project = Project::single(meta.frame_count);
+        let project = Project::single(&path, meta.frame_count);
         let range = project.clips()[0];
         Ok(Self {
             path,
@@ -182,7 +182,8 @@ impl PlaybackSession {
         let Some((idx, source)) = self.project.map_timeline(next) else {
             return false;
         };
-        let out = self.project.clips()[idx].out_frame;
+        let clip = self.project.clips()[idx];
+        let out = clip.out_frame;
         match DecodeSession::open_range(&self.path, source, out) {
             Ok((_, frames, cancel)) => {
                 self.frames = frames;
@@ -195,6 +196,7 @@ impl PlaybackSession {
         self.range = Clip {
             in_frame: source,
             out_frame: out,
+            ..clip
         };
         self.timeline_start = next;
         true
@@ -336,7 +338,8 @@ impl PlaybackSession {
         // `target` is inside the timeline (never empty), so this always maps;
         // the range runs from there to the end of the clip it landed in.
         if let Some((idx, source)) = self.project.map_timeline(target) {
-            let out = self.project.clips()[idx].out_frame;
+            let clip = self.project.clips()[idx];
+            let out = clip.out_frame;
             match DecodeSession::open_range(&self.path, source, out) {
                 Ok((_, frames, cancel)) => {
                     self.frames = frames;
@@ -350,6 +353,7 @@ impl PlaybackSession {
             self.range = Clip {
                 in_frame: source,
                 out_frame: out,
+                ..clip
             };
             self.timeline_start = target;
         }
@@ -367,7 +371,14 @@ impl PlaybackSession {
             // One worker for the whole rest of the timeline, so the joins
             // between clips are gapless: the video reopens at a boundary, the
             // ear never hears it.
-            let segs = self.project.segments_from(target, fps);
+            // Every source index is 0 until multi-source playback lands; the
+            // audio worker still takes one path plus bare `(start, end)`.
+            let segs: Vec<(f64, f64)> = self
+                .project
+                .segments_from(target, fps)
+                .into_iter()
+                .map(|(_, start, end)| (start, end))
+                .collect();
             audio_running = match AudioSession::open_segments(&self.path, &segs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
