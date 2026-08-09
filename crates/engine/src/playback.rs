@@ -1,5 +1,6 @@
-//! One file, one timeline: the decode workers, the audio output and the master
-//! clock wired together so a front-end only has to render and call [`tick`].
+//! One timeline over one or more files: the decode workers, the audio output
+//! and the master clock wired together so a front-end only has to render and
+//! call [`tick`].
 //!
 //! [`tick`]: PlaybackSession::tick
 //!
@@ -10,7 +11,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -21,7 +22,7 @@ use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame};
-use crate::demux::VideoMeta;
+use crate::demux::{Demuxer, VideoMeta};
 use crate::project::{Clip, Project};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -81,8 +82,6 @@ impl Audio {
 
 /// A file opened for playback. Starts paused at t=0; call [`PlaybackSession::play`].
 pub struct PlaybackSession {
-    /// Kept for [`PlaybackSession::seek`], which reopens both workers.
-    path: PathBuf,
     meta: VideoMeta,
     frames: Receiver<Frame>,
     /// Stops the current decode worker, so an abandoned one cannot outlive a
@@ -121,7 +120,6 @@ impl PlaybackSession {
         let project = Project::single(&path, meta.frame_count);
         let range = project.clips()[0];
         Ok(Self {
-            path,
             meta,
             frames,
             cancel,
@@ -184,7 +182,7 @@ impl PlaybackSession {
         };
         let clip = self.project.clips()[idx];
         let out = clip.out_frame;
-        match DecodeSession::open_range(&self.path, source, out) {
+        match DecodeSession::open_range(&self.project.sources()[clip.source], source, out) {
             Ok((_, frames, cancel)) => {
                 self.frames = frames;
                 self.cancel = cancel;
@@ -216,6 +214,17 @@ impl PlaybackSession {
             .clip_spans()
             .iter()
             .map(|&(start, len)| (f64::from(start) / fps, f64::from(len) / fps))
+            .collect()
+    }
+
+    /// [`clip_spans`](Self::clip_spans) plus the index into
+    /// [`Project::sources`] each clip plays from -- what a lane needs to colour
+    /// an imported clip differently from the file the session was opened with.
+    pub fn clip_spans_by_source(&self) -> Vec<(f64, f64, usize)> {
+        self.clip_spans()
+            .into_iter()
+            .zip(self.project.clips())
+            .map(|((start, len), clip)| (start, len, clip.source))
             .collect()
     }
 
@@ -253,6 +262,61 @@ impl PlaybackSession {
     /// Undoes the last successful cut or delete, and reseeks like a delete.
     pub fn undo(&mut self) -> bool {
         self.edit(Project::undo)
+    }
+
+    /// Appends the whole of `path` to the end of the timeline. One undo step,
+    /// and the file becomes a source only if it is not one already.
+    ///
+    /// Refused unless it matches the timeline exactly -- same dimensions, same
+    /// frame rate, same audio parameters or both silent -- because one timeline
+    /// this slice means one set of encoder/device parameters; the `Err` names
+    /// the property that disagrees, for a caller to show. Nothing is changed by
+    /// a refusal.
+    pub fn import(&mut self, path: &Path) -> crate::Result<()> {
+        let (meta, _) = Demuxer::open(path)?;
+        if (meta.width, meta.height) != (self.meta.width, self.meta.height) {
+            return Err(format!(
+                "{}x{} does not match the timeline's {}x{}",
+                meta.width, meta.height, self.meta.width, self.meta.height
+            )
+            .into());
+        }
+        // Container frame rates are computed from timescales, so never `==`.
+        if (meta.frame_rate - self.meta.frame_rate).abs() > 0.01 {
+            return Err(format!(
+                "{:.3} fps does not match the timeline's {:.3} fps",
+                meta.frame_rate, self.meta.frame_rate
+            )
+            .into());
+        }
+        // Whole-probe equality: rate, layout and the esds fields, which the
+        // audio worker holds every source to anyway. Both silent is a match.
+        let probe = AudioSession::probe(path)?;
+        let first = AudioSession::probe(&self.project.sources()[0])?;
+        if probe != first {
+            return Err(match (probe, first) {
+                (None, _) => "the file is silent, the timeline has audio".to_string(),
+                (_, None) => "the file has audio, the timeline is silent".to_string(),
+                (Some(a), Some(b)) => format!(
+                    "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
+                    a.params.sample_rate, a.channels, b.params.sample_rate, b.channels
+                ),
+            }
+            .into());
+        }
+
+        let old_end = self.timeline_duration();
+        let source = self.project.import(path);
+        // Refused only for an unknown index, and this one just came from `import`.
+        self.project.append_clip(source, meta.frame_count);
+        // Reseek like any other edit, even though nothing before the playhead
+        // moved: the running audio worker's segment list stops at the old end,
+        // so without this the appended clip would play silent. At EOS the wall
+        // clock has run on past the timeline, so resume from the join instead
+        // of wherever it got to -- and the seek is what clears `eos`.
+        let at = if self.eos { old_end } else { self.now() };
+        self.seek(at);
+        Ok(())
     }
 
     /// Applies an edit and, if it took, reseeks onto the new mapping. `seek`
@@ -340,7 +404,7 @@ impl PlaybackSession {
         if let Some((idx, source)) = self.project.map_timeline(target) {
             let clip = self.project.clips()[idx];
             let out = clip.out_frame;
-            match DecodeSession::open_range(&self.path, source, out) {
+            match DecodeSession::open_range(&self.project.sources()[clip.source], source, out) {
                 Ok((_, frames, cancel)) => {
                     self.frames = frames;
                     self.cancel = cancel;
@@ -370,16 +434,10 @@ impl PlaybackSession {
             audio.fed_all.store(false, Ordering::Release);
             // One worker for the whole rest of the timeline, so the joins
             // between clips are gapless: the video reopens at a boundary, the
-            // ear never hears it.
-            // Every source index is 0 until multi-source playback lands; the
-            // audio worker still takes one path plus bare `(start, end)`.
-            let segs: Vec<(f64, f64)> = self
-                .project
-                .segments_from(target, fps)
-                .into_iter()
-                .map(|(_, start, end)| (start, end))
-                .collect();
-            audio_running = match AudioSession::open_segments(&self.path, &segs) {
+            // ear never hears it -- and a join between two *files* is just
+            // another segment, because every segment names its own source.
+            let segs = self.project.segments_from(target, fps);
+            audio_running = match AudioSession::open_multi_segments(self.project.sources(), &segs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };
@@ -408,7 +466,7 @@ impl PlaybackSession {
     /// Later edits do not reach a running export: it works from a snapshot of
     /// the edit list taken here.
     pub fn export_to(&self, out: &Path) -> crate::ExportHandle {
-        crate::export::start(&self.path, self.project.clone(), self.meta, out)
+        crate::export::start(self.project.clone(), self.meta, out)
     }
 
     /// Moves the clock forward; the caller runs this once per rendered frame.

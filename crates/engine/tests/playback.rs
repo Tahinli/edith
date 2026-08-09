@@ -533,3 +533,235 @@ fn edits_keep_the_audio_clock() {
         session.timeline_duration()
     );
 }
+
+/// Frame count straight from the container, without decoding anything.
+fn frame_count(path: &Path) -> u32 {
+    engine::demux::Demuxer::open(path)
+        .expect("demux")
+        .0
+        .frame_count
+}
+
+/// Import: a second file appended to the timeline, played through as one
+/// stream. No audio needed for the pictures, so this runs anywhere.
+#[test]
+fn import_appends_a_second_source_and_plays_across_the_join() {
+    let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
+    let mut session = PlaybackSession::open(&av).expect("open");
+    let (fps, first) = (session.meta().frame_rate, session.meta().frame_count);
+    let second = frame_count(&av2);
+    assert_eq!((first, second), (150, 120), "fixtures changed");
+
+    session.import(&av2).expect("test_av2 matches test_av");
+    assert_eq!(session.clip_spans().len(), 2);
+    assert_eq!(
+        session
+            .clip_spans_by_source()
+            .iter()
+            .map(|&(.., s)| s)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the appended clip plays the imported file"
+    );
+    assert!(
+        (session.timeline_duration() - 9.0).abs() < 1e-9,
+        "5 s + 4 s: {}",
+        session.timeline_duration()
+    );
+
+    // Play the joined timeline whole, keeping the picture at the join.
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (mut expect, mut boundary) = (0, None);
+    loop {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            assert_eq!(
+                frame.index, expect,
+                "timeline indices must be contiguous across a source join"
+            );
+            if frame.index == first {
+                boundary = Some(frame.bgra);
+            }
+            expect += 1;
+        }
+        if session.is_eos() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still draining after 30 s");
+        sleep(Duration::from_millis(4));
+    }
+    assert_eq!(expect, first + second, "270 frames, whole and nothing but");
+    // As everywhere else: stop the clock before asserting on landing frames.
+    session.pause();
+    assert!(
+        boundary.expect("no frame at the join") == source_frame(&av2, 0),
+        "timeline frame {first} is not the imported file's frame 0"
+    );
+
+    // Edits across the join keep every clip pointing at its own file: cut one
+    // second into the imported clip, then drop the whole original.
+    assert!(session.cut_at(6.0), "cut 1 s into the imported clip");
+    assert_eq!(session.clip_spans().len(), 3);
+    assert!(session.delete_clip(0), "drop the first source");
+    assert_eq!(session.clip_spans_by_source()[0].2, 1);
+    assert!(
+        (session.timeline_duration() - f64::from(second) / fps).abs() < 1e-9,
+        "only the imported file is left: {}",
+        session.timeline_duration()
+    );
+    session.seek(0.0);
+    let landed = next_frame(&mut session, "seek(0.0) after the delete");
+    assert_eq!(landed.index, 0);
+    assert!(
+        landed.bgra == source_frame(&av2, 0),
+        "the delete lost the source mapping"
+    );
+
+    assert!(session.undo(), "undo the delete");
+    assert_eq!(session.clip_spans().len(), 3);
+    let restored = next_frame(&mut session, "undo");
+    assert_eq!(restored.index, 0);
+    assert!(
+        restored.bgra == source_frame(&av, 0),
+        "undo did not restore the first source"
+    );
+}
+
+/// One timeline, one set of parameters: everything else is refused by name and
+/// changes nothing.
+#[test]
+fn import_refuses_what_does_not_match() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+
+    let err = session
+        .import(&asset("test_mismatch.mp4"))
+        .expect_err("640x360 must be refused")
+        .to_string();
+    assert!(err.contains("640x360"), "refusal must name the size: {err}");
+
+    // Same size and rate, no audio track: the timeline has one.
+    let err = session
+        .import(&asset("test_baseline.mp4"))
+        .expect_err("a silent file must be refused")
+        .to_string();
+    assert!(err.contains("audio"), "refusal must name the audio: {err}");
+
+    assert!(
+        session.import(&asset("no_such_file.mp4")).is_err(),
+        "a missing file is an error, not a panic"
+    );
+    assert_eq!(session.clip_spans().len(), 1, "a refusal changes nothing");
+    assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
+
+    // The mirror: audio into a silent timeline is refused just as loudly.
+    let mut silent = PlaybackSession::open(asset("test_baseline.mp4")).expect("open");
+    let err = silent
+        .import(&asset("test_av.mp4"))
+        .expect_err("audio into a silent timeline")
+        .to_string();
+    assert!(err.contains("audio"), "refusal must name the audio: {err}");
+}
+
+/// The same file twice is two clips of one source -- a source index is handed
+/// out once and reused, which is what keeps clipboard clips valid forever.
+#[test]
+fn importing_one_file_twice_reuses_its_source() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let av2 = asset("test_av2.mp4");
+    session.import(&av2).expect("first import");
+    session.import(&av2).expect("second import");
+    assert_eq!(
+        session
+            .clip_spans_by_source()
+            .iter()
+            .map(|&(.., s)| s)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 1],
+        "one new source, two clips of it"
+    );
+    assert!(
+        (session.timeline_duration() - 13.0).abs() < 1e-9,
+        "5 s + 4 s + 4 s: {}",
+        session.timeline_duration()
+    );
+}
+
+/// Importing after the timeline has been played out revives the session at the
+/// join, not at wherever the free-running clock got to.
+#[test]
+fn import_at_eos_resumes_into_the_new_clip() {
+    let av2 = asset("test_av2.mp4");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let first = session.meta().frame_count;
+
+    session.play();
+    assert_eq!(drain_to_eof(&mut session).1, Some(first - 1));
+    assert!(session.is_eos());
+
+    session.import(&av2).expect("import at EOS");
+    assert!(!session.is_eos(), "the import did not revive the session");
+    let landed = next_frame(&mut session, "import at EOS");
+    assert_eq!(landed.index, first, "resumed at the join");
+    assert!(
+        landed.bgra == source_frame(&av2, 0),
+        "the resume is not showing the imported file"
+    );
+    assert_eq!(
+        drain_to_eof(&mut session).1,
+        Some(first + frame_count(&av2) - 1),
+        "the appended clip did not play out"
+    );
+}
+
+/// A source deleted mid-session: the clip that names it contributes no pictures
+/// and the timeline still ends, instead of stalling on the missing file.
+#[test]
+fn a_vanished_source_is_skipped() {
+    let scratch =
+        std::env::temp_dir().join(format!("video_editor_vanish_{}.mp4", std::process::id()));
+    std::fs::copy(asset("test_av2.mp4"), &scratch).expect("copy the fixture");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let first = session.meta().frame_count;
+    session.import(&scratch).expect("import the copy");
+    std::fs::remove_file(&scratch).expect("unlink");
+
+    session.seek(0.0);
+    session.play();
+    let (count, last) = drain_to_eof(&mut session);
+    assert_eq!(last, Some(first - 1), "the vanished clip made pictures");
+    assert_eq!(count, first, "the first source still played whole");
+    assert!(session.is_eos(), "the timeline still ends");
+}
+
+/// The audio path across a source join: one worker spans both files, so the
+/// clock must keep running at real speed through the boundary. (Whether it is
+/// still the *audio* clock is not observable from outside -- a device that ran
+/// dry would fall back to wall time at the same speed -- so this catches a
+/// stall, not a silent fallback.)
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn audio_runs_across_a_source_join() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    session.import(&asset("test_av2.mp4")).expect("import");
+    let first = session.meta().frame_count;
+
+    session.seek(4.5); // half a second before the join
+    session.play();
+    let mut last_index = None;
+    run_for(&mut session, &mut last_index, Duration::from_millis(1500));
+    let now = session.now();
+    eprintln!("join: clock {now:.3}s, frames ..={last_index:?}");
+    assert!(
+        (5.4..6.6).contains(&now),
+        "the clock did not run at real speed across the join: {now:.3}s"
+    );
+    assert!(
+        last_index.map(|i| i > first) == Some(true),
+        "playback never crossed the join: {last_index:?}"
+    );
+    // No EOS assertion: `run_for` takes a frame per 8 ms call, far faster than
+    // real time, so the decoder may well have reached 9 s while the clock is at
+    // 6 s (ledger; same reason `edits_keep_the_audio_clock` has none).
+}

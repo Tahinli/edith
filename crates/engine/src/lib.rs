@@ -12,7 +12,7 @@ pub mod mux;
 pub mod playback;
 pub mod project;
 
-pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioSession};
+pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession};
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
