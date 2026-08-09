@@ -492,7 +492,10 @@ fn paste_while_playing_does_not_stall() {
 
     // Into the clip under the running playhead: the paste splits it in two and
     // lands between the halves.
-    assert!(session.paste_at(session.now(), copied), "paste at the playhead");
+    assert!(
+        session.paste_at(session.now(), copied),
+        "paste at the playhead"
+    );
     assert!(session.is_playing(), "the paste stopped the clock");
     assert_eq!(session.clip_spans().len(), 4);
     let grown = total + copied.len();
@@ -506,11 +509,7 @@ fn paste_while_playing_does_not_stall() {
     // once, so this drains without `pump`'s index-order check.
     let (count, last) = drain_to_eof(&mut session);
     eprintln!("paste while playing: {count} more frames, last {last:?}");
-    assert_eq!(
-        last,
-        Some(grown - 1),
-        "the grown timeline did not play out"
-    );
+    assert_eq!(last, Some(grown - 1), "the grown timeline did not play out");
 }
 
 /// Pasting past the end of a played-out timeline appends, and the reseek every
@@ -528,9 +527,16 @@ fn paste_at_eos_revives_the_session() {
     assert_eq!(drain_to_eof(&mut session).1, Some(total - 1));
     assert!(session.is_eos());
 
-    assert!(session.paste_at(999.0, copied), "paste past the end appends");
+    assert!(
+        session.paste_at(999.0, copied),
+        "paste past the end appends"
+    );
     assert!(!session.is_eos(), "the paste did not revive the session");
-    assert_eq!(session.clip_spans().len(), 3, "two clips plus the pasted one");
+    assert_eq!(
+        session.clip_spans().len(),
+        3,
+        "two clips plus the pasted one"
+    );
     // No assertion on *where* it resumes: an edit reseeks to `now()`, and at EOS
     // that is wherever the wall clock got to while draining -- a race. What is
     // fixed is that frames come again and the whole grown timeline plays out.
