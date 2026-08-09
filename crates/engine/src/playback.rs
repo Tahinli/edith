@@ -10,7 +10,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,8 @@ use crate::demux::VideoMeta;
 const RING_FULL_WAIT: Duration = Duration::from_millis(10);
 
 /// The output half of a session: the device, plus what the feeder has handed it.
+/// Cloned into the feeder thread; every field that matters is shared.
+#[derive(Clone)]
 struct Audio {
     /// Shared because `write` runs on the feeder thread while `position` and
     /// `set_active` are called from the caller's. The plugin serialises those
@@ -44,6 +46,9 @@ struct Audio {
     /// so it can never satisfy [`Audio::played_out`] -- the flag is what lets
     /// [`PlaybackSession::tick`] hand the timeline to wall time instead.
     died: Arc<AtomicBool>,
+    /// Bumped by every seek. A feeder only owns the device while this still
+    /// matches the value it started with; see [`feed`].
+    epoch: Arc<AtomicU64>,
 }
 
 impl Audio {
@@ -53,12 +58,35 @@ impl Audio {
         self.fed_all.load(Ordering::Acquire)
             && position as u64 * self.channels >= self.fed.load(Ordering::Relaxed)
     }
+
+    /// Starts a feeder for the current epoch, draining `rx` into the device.
+    /// `false` if the thread would not start, i.e. nothing will ever be fed.
+    fn spawn_feeder(&self, rx: Receiver<AudioChunk>) -> bool {
+        let me = self.clone();
+        let epoch = self.epoch.load(Ordering::Acquire);
+        thread::Builder::new()
+            .name("audio-feed".into())
+            .spawn(move || {
+                feed(rx, &me, epoch);
+                // Only the current feeder gets to declare the end of the audio:
+                // a superseded one is finished, the stream is not.
+                if me.epoch.load(Ordering::Acquire) == epoch {
+                    me.fed_all.store(true, Ordering::Release);
+                }
+            })
+            .is_ok()
+    }
 }
 
 /// A file opened for playback. Starts paused at t=0; call [`PlaybackSession::play`].
 pub struct PlaybackSession {
+    /// Kept for [`PlaybackSession::seek`], which reopens both workers.
+    path: PathBuf,
     meta: VideoMeta,
     frames: Receiver<Frame>,
+    /// Stops the current decode worker, so an abandoned one cannot outlive a
+    /// seek by more than one access unit.
+    cancel: Arc<AtomicBool>,
     clock: PlaybackClock,
     audio: Option<Audio>,
 }
@@ -67,16 +95,20 @@ impl PlaybackSession {
     /// Opens `path` and starts both decode workers. Only video failure is fatal:
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
-        let path = path.as_ref();
-        let (meta, frames) = DecodeSession::open(path)?;
-        let audio = open_audio(path);
+        let path = path.as_ref().to_path_buf();
+        // `open_at(_, 0)` rather than `open` purely for the cancel handle: the
+        // field has to exist from the start for the first seek to use it.
+        let (meta, frames, cancel) = DecodeSession::open_at(&path, 0)?;
+        let audio = open_audio(&path);
         let source = match audio {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
         };
         Ok(Self {
+            path,
             meta,
             frames,
+            cancel,
             clock: PlaybackClock::new(source),
             audio,
         })
@@ -129,6 +161,73 @@ impl PlaybackSession {
             self.pause()
         } else {
             self.play()
+        }
+    }
+
+    /// Repositions the timeline to `secs`, clamped to the file. Both decode
+    /// workers are replaced rather than steered: a fresh channel cannot hold a
+    /// stale frame, and it works just as well after EOF, where the old workers
+    /// have already exited.
+    ///
+    /// Playing stays playing and paused stays paused -- but a paused seek still
+    /// decodes, so the caller can show the frame it landed on.
+    pub fn seek(&mut self, secs: f64) {
+        let fps = self.meta.frame_rate;
+        let t = secs.clamp(0.0, f64::from(self.meta.frame_count) / fps);
+        let target = ((t * fps) as u32).min(self.meta.frame_count.saturating_sub(1));
+        let was_playing = self.clock.is_playing();
+
+        if let Some(audio) = &self.audio {
+            let ao = audio.ao.lock().unwrap();
+            ao.set_active(false);
+            // Bumped and flushed while holding the device lock, because the
+            // feeder re-checks the epoch inside that same lock: whatever it is
+            // carrying can no longer reach the ring after this point.
+            audio.epoch.fetch_add(1, Ordering::Release);
+            ao.flush();
+        }
+
+        // Cancel first, drop second: the old worker may be parked in `send` on
+        // the bounded channel, where only the disconnect wakes it -- and it
+        // then finds the flag already set.
+        self.cancel.store(true, Ordering::Release);
+        match DecodeSession::open_at(&self.path, target) {
+            Ok((_, frames, cancel)) => {
+                self.frames = frames;
+                self.cancel = cancel;
+            }
+            // The file opened once already, so this is a disappearing-file case:
+            // the timeline still moves, there are simply no more pictures.
+            Err(e) => eprintln!("seek: video reopen failed: {e}"),
+        }
+
+        let mut audio_running = false;
+        if let Some(audio) = &self.audio
+            && !audio.died.load(Ordering::Acquire)
+        {
+            // The device position keeps counting across a flush, so re-basing
+            // `fed` on it is what keeps `played_out` exact for the new stream.
+            let played = audio.ao.lock().unwrap().position().unwrap_or(0).max(0) as u64;
+            audio.fed.store(played * audio.channels, Ordering::Relaxed);
+            audio.fed_all.store(false, Ordering::Release);
+            audio_running = match AudioSession::open_at(&self.path, t) {
+                Ok(Some((_, rx))) => audio.spawn_feeder(rx),
+                _ => false,
+            };
+            if !audio_running {
+                // Nothing will ever be fed again; let `tick` fall to wall time
+                // instead of waiting on a device that has no more work coming.
+                audio.fed_all.store(true, Ordering::Release);
+            }
+        }
+
+        // Same invariant as `play`: position the clock before audio restarts.
+        if audio_running && self.clock.source() != ClockSource::Audio {
+            self.clock.switch_to_audio();
+        }
+        self.clock.seek_to(t);
+        if was_playing && let Some(audio) = &self.audio {
+            audio.ao.lock().unwrap().set_active(true);
         }
     }
 
@@ -189,26 +288,15 @@ fn open_audio(path: &Path) -> Option<Audio> {
         fed: Arc::new(AtomicU64::new(0)),
         fed_all: Arc::new(AtomicBool::new(false)),
         died: Arc::new(AtomicBool::new(false)),
+        epoch: Arc::new(AtomicU64::new(0)),
     };
-    let (ao, fed, fed_all, died) = (
-        audio.ao.clone(),
-        audio.fed.clone(),
-        audio.fed_all.clone(),
-        audio.died.clone(),
-    );
-    thread::Builder::new()
-        .name("audio-feed".into())
-        .spawn(move || {
-            feed(rx, &ao, &fed, &died);
-            fed_all.store(true, Ordering::Release);
-        })
-        .ok()?;
-    Some(audio)
+    audio.spawn_feeder(rx).then_some(audio)
 }
 
 /// Pours decoded chunks into the device, keeping whatever the ring would not
-/// take. Ends when the decoder is done or the output dies.
-fn feed(rx: Receiver<AudioChunk>, ao: &Mutex<AoSession>, fed: &AtomicU64, died: &AtomicBool) {
+/// take. Ends when the decoder is done, the output dies, or a seek supersedes
+/// this feeder.
+fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
     let mut pending: Vec<f32> = Vec::new();
     loop {
         if pending.is_empty() {
@@ -217,15 +305,24 @@ fn feed(rx: Receiver<AudioChunk>, ao: &Mutex<AoSession>, fed: &AtomicU64, died: 
                 Err(_) => return, // decoder finished or went away
             }
         }
-        let accepted = match ao.lock().unwrap().write(&pending) {
-            Some(n) => n,
-            None => {
-                // Output died; flag it so `tick` moves the clock to wall time.
-                died.store(true, Ordering::Release);
+        let accepted = {
+            let mut ao = audio.ao.lock().unwrap();
+            // Under the lock, immediately before the write: `seek` bumps the
+            // epoch and flushes the ring holding this very lock, so past this
+            // check no stale sample can be queued behind the flush.
+            if audio.epoch.load(Ordering::Acquire) != epoch {
                 return;
             }
+            match ao.write(&pending) {
+                Some(n) => n,
+                None => {
+                    // Output died; flag it so `tick` moves the clock to wall time.
+                    audio.died.store(true, Ordering::Release);
+                    return;
+                }
+            }
         };
-        fed.fetch_add(accepted as u64, Ordering::Relaxed);
+        audio.fed.fetch_add(accepted as u64, Ordering::Relaxed);
         pending.drain(..accepted);
         if !pending.is_empty() {
             // Ring full: nothing to do but let the device drain it.
