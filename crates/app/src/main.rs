@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::{Frame, PlaybackSession};
+use engine::{Clip, Frame, PlaybackSession};
 use gpui::{
     App, Application, Bounds, Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage, SharedString, TitlebarOptions,
@@ -52,6 +52,9 @@ struct Player {
     /// Which clip the edit keys act on. Indices move under every edit, so this
     /// is cleared by all of them.
     selected: Option<usize>,
+    /// The copied clip. Frame ranges only, so it survives the clip it was taken
+    /// from being deleted -- and it outlives the selection.
+    clipboard: Option<Clip>,
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
@@ -167,6 +170,26 @@ impl Player {
         cx.notify();
     }
 
+    /// Copies the selected clip. Nothing on screen changes, so no notify.
+    fn copy_selected(&mut self) {
+        if let Some(clip) = self.selected.and_then(|i| self.session.clip_at(i)) {
+            self.clipboard = Some(clip);
+        }
+    }
+
+    /// Drops the copied clip in at the playhead. The engine reseeks itself, so
+    /// like a delete this owes the flag reset -- and the selection, whose index
+    /// the insert has just moved.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(clip) = self.clipboard
+            && self.session.paste_at(self.session.now(), clip)
+        {
+            self.selected = None;
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.undo() {
             self.reset_after_reseek();
@@ -241,11 +264,19 @@ impl Render for Player {
                 if event.is_held {
                     return;
                 }
-                match event.keystroke.key.as_str() {
-                    "space" => this.toggle_or_restart(cx),
-                    "c" => this.cut(cx),
-                    "x" | "delete" => this.delete_selected(cx),
-                    "z" => this.undo(cx),
+                // On linux gpui reports ctrl-c as key "c" with the control
+                // modifier set (the control code is mapped back), so the plain
+                // and modified bindings are told apart here and nowhere else.
+                match (
+                    event.keystroke.key.as_str(),
+                    event.keystroke.modifiers.control,
+                ) {
+                    ("space", _) => this.toggle_or_restart(cx),
+                    ("c", true) => this.copy_selected(),
+                    ("v", true) => this.paste(cx),
+                    ("c", false) => this.cut(cx),
+                    ("x", _) | ("delete", _) => this.delete_selected(cx),
+                    ("z", _) => this.undo(cx),
                     _ => {}
                 }
             }))
@@ -661,6 +692,7 @@ fn main() {
                     pending_seek: false,
                     ruler: Rc::default(),
                     selected: None,
+                    clipboard: None,
                     scrubbing: false,
                     last_scrub: Instant::now(),
                     last_target: 0,
