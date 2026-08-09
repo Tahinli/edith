@@ -77,8 +77,10 @@ impl ExportHandle {
 }
 
 /// Starts the worker. Failures are reported through the handle rather than
-/// returned, so a caller has exactly one place to look.
-pub(crate) fn start(source: &Path, project: Project, meta: VideoMeta, out: &Path) -> ExportHandle {
+/// returned, so a caller has exactly one place to look. The files to read are
+/// the project's own [`sources`](Project::sources) -- every clip names one --
+/// so nothing but the edit list decides what is decoded.
+pub fn start(project: Project, meta: VideoMeta, out: &Path) -> ExportHandle {
     let shared = Arc::new(Shared {
         progress: AtomicU32::new(0),
         cancel: AtomicBool::new(false),
@@ -86,7 +88,6 @@ pub(crate) fn start(source: &Path, project: Project, meta: VideoMeta, out: &Path
         outcome: Mutex::new(None),
     });
     let worker = Arc::clone(&shared);
-    let source = source.to_path_buf();
     let out = out.to_path_buf();
     // `<out>.part`, appended rather than substituted: the temporary of
     // `a.export.mp4` is `a.export.mp4.part`, which no other export claims.
@@ -97,7 +98,7 @@ pub(crate) fn start(source: &Path, project: Project, meta: VideoMeta, out: &Path
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
-        let result = run(&source, &project, &meta, &part, &worker)
+        let result = run(&project, &meta, &part, &worker)
             .and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
             // The muxer -- and with it the file handle -- died with `run`.
@@ -117,28 +118,23 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
     shared.finished.store(true, Ordering::Release);
 }
 
-fn run(
-    source: &Path,
-    project: &Project,
-    meta: &VideoMeta,
-    out: &Path,
-    shared: &Shared,
-) -> crate::Result<()> {
+fn run(project: &Project, meta: &VideoMeta, out: &Path, shared: &Shared) -> crate::Result<()> {
     let total = project.timeline_frames();
+    let sources = project.sources();
     // Audio first: a track has to be declared when the muxer is created, which
     // happens as soon as the first coded picture arrives.
     //
     // ponytail: this holds the whole exported AAC track in memory (~3 kB per
     // 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
     // `copy_segments` that yields packets instead of collecting them.
-    // Source indexes dropped: every clip is still source 0 until multi-source
-    // export lands, and `copy_segments` takes the one path above.
-    let segs: Vec<(f64, f64)> = project
-        .segments_from(0, meta.frame_rate)
-        .into_iter()
-        .map(|(_, start, end)| (start, end))
-        .collect();
-    let audio = AudioSession::copy_segments(source, &segs)?;
+    //
+    // The segments name their source, and the copy carries its packet-rounding
+    // debt across a source join exactly as across a cut, so a timeline spanning
+    // files stays in sync. A source whose AAC parameters disagree with the
+    // first one is an `Err` from there -- import refuses those up front, this
+    // is the backstop -- and the caller deletes the `.part`.
+    let audio =
+        AudioSession::copy_multi_segments(sources, &project.segments_from(0, meta.frame_rate))?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
@@ -148,9 +144,13 @@ fn run(
     let mut muxer = None;
     let mut done = 0u32;
     for clip in project.clips() {
-        // Every clip reopens the file at its own in point; the encoder is *not*
-        // reopened, so the export is one continuous stream whose GOP boundaries
-        // need not line up with the cuts.
+        // Every clip reopens its own source file at its own in point; the
+        // encoder is *not* reopened, so the export is one continuous stream
+        // whose GOP boundaries need not line up with the cuts -- nor with the
+        // file boundaries, which are just cuts that change the path.
+        let source = sources
+            .get(clip.source)
+            .ok_or_else(|| format!("clip names source {} of {}", clip.source, sources.len()))?;
         let mut pictures = ClipDecoder::open(source, clip.in_frame)?;
         for _ in 0..clip.len() {
             cancelled(shared)?;
