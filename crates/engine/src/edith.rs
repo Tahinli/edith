@@ -24,9 +24,12 @@
 //! timeline is [`crate::PlaybackSession::open_project`]'s business.
 //!
 //! Writing goes through `<path>.part` and a rename, as an export does, so an
-//! interrupted save cannot destroy the previous version of the project.
+//! interrupted save cannot destroy the previous version of the project. The
+//! bytes are fsynced before the rename and the directory after it, so what a
+//! power loss can lose is a whole save, never half of one under the real name.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -49,15 +52,21 @@ pub struct Document {
 /// Writes the project to `path`, atomically. `sources` should already be
 /// orphan-free ([`crate::Project::without_orphan_sources`]).
 pub fn save(path: &Path, sources: &[PathBuf], clips: &[Clip], playhead: u32) -> crate::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new(""));
+    let dir = project_dir(path);
     let mut part = path.to_path_buf().into_os_string();
     part.push(".part");
     let part = PathBuf::from(part);
     // The rename publishes the file under the caller's name in one step, on the
     // same directory; until it happens the old project file is still the whole
-    // truth.
-    let result = std::fs::write(&part, emit(dir, sources, clips, playhead))
-        .and_then(|()| std::fs::rename(&part, path));
+    // truth. `sync_all` puts the bytes on the disk before that name exists, and
+    // the second one puts the name itself there.
+    let result = std::fs::File::create(&part)
+        .and_then(|mut f| {
+            f.write_all(&emit(&dir, sources, clips, playhead))?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&part, path))
+        .and_then(|()| std::fs::File::open(&dir)?.sync_all());
     if result.is_err() {
         let _ = std::fs::remove_file(&part);
     }
@@ -67,6 +76,20 @@ pub fn save(path: &Path, sources: &[PathBuf], clips: &[Clip], playhead: u32) -> 
 pub fn load(path: &Path) -> crate::Result<Document> {
     let data = std::fs::read(path)?;
     parse(&data, path.parent().unwrap_or(Path::new("")))
+}
+
+/// The directory a project file's relative source lines are measured from, in
+/// the same canonical form [`crate::Project`] keeps its sources in -- without
+/// that the prefix simply never matches and every line comes out absolute,
+/// which is what `cd dir && edith clip.mp4` + save used to write (the parent of
+/// a bare filename is `""`). Canonicalizing fails only if the directory does
+/// not exist, and then the write is about to fail anyway.
+fn project_dir(path: &Path) -> PathBuf {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
 fn emit(dir: &Path, sources: &[PathBuf], clips: &[Clip], playhead: u32) -> Vec<u8> {
@@ -271,6 +294,41 @@ mod tests {
         assert_eq!(back.playhead, 12);
         // ...and emitting the parsed document reproduces the same bytes.
         assert_eq!(emit(&dir, &back.sources, &back.clips, back.playhead), bytes);
+    }
+
+    /// The relocatability promise, from the two directions a project path
+    /// reaches [`save`] non-canonical: a bare filename (`cd dir && edith
+    /// clip.mp4`, whose parent is `""`) and a directory reached through a
+    /// symlink. Both used to emit absolute source lines.
+    #[test]
+    fn a_non_canonical_project_path_still_writes_relative_sources() {
+        assert_eq!(
+            project_dir(Path::new("a.edith")),
+            std::env::current_dir().expect("cwd"),
+            "a bare filename is saved into the working directory"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ve_edith_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).expect("scratch dir");
+        let dir = std::fs::canonicalize(&dir).expect("canonical scratch dir");
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("symlink");
+        let source = dir.join("real/a.mp4");
+        let path = dir.join("link/p.edith");
+
+        save(&path, &[source], &[clip(0, 30, 0)], 0).expect("save");
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "edith 1\nplayhead 0\nsource a.mp4\nclip 0 30 0\n"
+        );
+        // Loading rejoins the *given* directory, so the file is reached by the
+        // way the project was opened -- the same file, through the link.
+        assert_eq!(
+            load(&path).expect("load").sources,
+            vec![dir.join("link/a.mp4")]
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
