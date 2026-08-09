@@ -6,15 +6,17 @@ pub mod clock;
 pub mod convert;
 pub mod decode;
 pub mod demux;
+pub mod export;
 pub mod hw;
 pub mod mux;
 pub mod playback;
 pub mod project;
 
-pub use audio::{AudioChunk, AudioMeta, AudioSession};
+pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioSession};
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
+pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
 pub use playback::PlaybackSession;
 pub use project::{Clip, Project};
