@@ -389,6 +389,17 @@ impl PlaybackSession {
         }
     }
 
+    /// Renders the edited timeline to `out` on a worker thread. The session is
+    /// untouched -- the export decodes the source file for itself -- but a
+    /// caller should still [`pause`](PlaybackSession::pause) first, because
+    /// playback and export otherwise fight over the same decoder hardware.
+    ///
+    /// Later edits do not reach a running export: it works from a snapshot of
+    /// the edit list taken here.
+    pub fn export_to(&self, out: &Path) -> crate::ExportHandle {
+        crate::export::start(&self.path, self.project.clone(), self.meta, out)
+    }
+
     /// Moves the clock forward; the caller runs this once per rendered frame.
     /// Costs an atomic load, and once per session a mode switch.
     pub fn tick(&mut self) {
