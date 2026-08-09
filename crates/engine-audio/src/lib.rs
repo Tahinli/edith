@@ -96,6 +96,19 @@ impl Ring {
 /// only the RT thread ever moves `read` -- and means a flush asked for while
 /// paused (no callbacks running) still lands before the next pop, so the stale
 /// samples can never be heard.
+/// The producer half of a flush: while the flag is pending, the ring still
+/// holds pre-flush audio waiting to be discarded, and anything accepted now
+/// would queue BEHIND that discard -- with no RT callbacks running (paused
+/// seek) the next callback would then drain the new stream's head along with
+/// the stale tail. Refuse instead; the writer's retry loop parks until the
+/// RT thread consumes the flag.
+fn accept(flush: &AtomicBool, ring: &Ring, samples: &[f32]) -> usize {
+    if flush.load(Ordering::Acquire) {
+        return 0;
+    }
+    ring.push(samples)
+}
+
 fn consume(flush: &AtomicBool, ring: &Ring, dst: &mut [u8], want: usize) -> usize {
     if flush.swap(false, Ordering::Acquire) {
         ring.read
@@ -387,7 +400,7 @@ pub unsafe extern "C" fn ao_write(session: *mut c_void, samples: *const f32, n: 
             return -1;
         }
         let samples = unsafe { std::slice::from_raw_parts(samples, n) };
-        session.shared.ring.push(samples) as isize
+        accept(&session.shared.flush, &session.shared.ring, samples) as isize
     }))
     .unwrap_or(-1)
 }
@@ -468,7 +481,33 @@ pub unsafe extern "C" fn ao_close(session: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicBool, Ordering, Ring, consume};
+    use super::{AtomicBool, Ordering, Ring, accept, consume};
+
+    /// The paused-seek ordering: a flush requested with no RT callbacks running
+    /// must not let the writer queue new audio behind the pending discard.
+    #[test]
+    fn pending_flush_refuses_writes_until_consumed() {
+        let ring = Ring::new(4);
+        let flush = AtomicBool::new(false);
+        let mut out = [0u8; 16];
+
+        // Stale pre-seek audio sits in the ring; a flush is requested while
+        // paused (no callback runs yet).
+        assert_eq!(accept(&flush, &ring, &[1.0, 2.0]), 2);
+        flush.store(true, Ordering::Release);
+
+        // The new stream's feeder tries to write: refused, ring untouched.
+        assert_eq!(accept(&flush, &ring, &[3.0, 4.0]), 0);
+
+        // First post-resume callback consumes the flag and drains the stale
+        // tail -- and ONLY the stale tail, because nothing was queued behind it.
+        assert_eq!(consume(&flush, &ring, &mut out, 2), 0);
+
+        // Writer unparks; the new audio flows intact.
+        assert_eq!(accept(&flush, &ring, &[3.0, 4.0]), 2);
+        assert_eq!(consume(&flush, &ring, &mut out, 2), 2);
+        assert_eq!(&out[..4], &3.0f32.to_le_bytes());
+    }
 
     #[test]
     fn ring_wraps_fills_and_starves() {
