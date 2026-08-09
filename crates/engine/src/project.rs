@@ -67,6 +67,26 @@ impl Project {
         }
     }
 
+    /// A project rebuilt from a saved edit list -- the load half of
+    /// [`crate::veproj`]. History is *not* saved, so [`Project::undo`] is
+    /// `false` until the first edit of the new session. `None` when the parts
+    /// would break an invariant every other constructor keeps: no clips, an
+    /// empty clip, or a clip naming a source that is not there.
+    pub fn from_parts(sources: Vec<PathBuf>, clips: Vec<Clip>) -> Option<Self> {
+        if clips.is_empty()
+            || clips
+                .iter()
+                .any(|c| c.source >= sources.len() || c.out_frame <= c.in_frame)
+        {
+            return None;
+        }
+        Some(Self {
+            sources: sources.iter().map(|s| canonical(s)).collect(),
+            clips,
+            history: Vec::new(),
+        })
+    }
+
     pub fn clips(&self) -> &[Clip] {
         &self.clips
     }
@@ -107,6 +127,30 @@ impl Project {
             source,
         });
         true
+    }
+
+    /// The sources a clip actually names, with the clips reindexed onto them
+    /// -- what a save writes. Indexes are forever *inside* a session (see
+    /// [`Project::append_clip`]), so an undone import leaves an orphan source
+    /// entry behind; writing that orphan to a project file would let a file
+    /// nothing plays refuse a future load. New indexes are assigned in order of
+    /// first use, so the same project always emits the same bytes.
+    pub fn without_orphan_sources(&self) -> (Vec<PathBuf>, Vec<Clip>) {
+        let mut moved = vec![None; self.sources.len()];
+        let mut sources = Vec::new();
+        let mut clips = self.clips.clone();
+        for c in &mut clips {
+            let old = c.source;
+            c.source = match moved[old] {
+                Some(new) => new,
+                None => {
+                    sources.push(self.sources[old].clone());
+                    moved[old] = Some(sources.len() - 1);
+                    sources.len() - 1
+                }
+            };
+        }
+        (sources, clips)
     }
 
     /// Length of the timeline in frames.
@@ -683,6 +727,69 @@ mod tests {
         assert!(
             (played - p.timeline_frames() as f64 / 25.0).abs() < 1e-9,
             "segments must cover exactly the timeline: {played}"
+        );
+    }
+
+    #[test]
+    fn orphan_sources_are_pruned_and_the_clips_reindexed() {
+        // Import a second file, undo it: source 1 is now an orphan.
+        let mut p = two_sources();
+        assert!(p.undo());
+        let (sources, clips) = p.without_orphan_sources();
+        assert_eq!(sources, vec![PathBuf::from(FILE)], "the orphan is gone");
+        assert_eq!(clips, three().clips(), "the clips are untouched");
+
+        // Three sources where only the middle one is orphaned: the survivors
+        // renumber, and the clips follow.
+        let mut p = Project::single(FILE, 9);
+        assert_eq!(p.import(FILE2), 1);
+        assert_eq!(p.import("/nonexistent/c.mp4"), 2);
+        assert!(p.append_clip(2, 4));
+        let (sources, clips) = p.without_orphan_sources();
+        assert_eq!(
+            sources,
+            vec![PathBuf::from(FILE), PathBuf::from("/nonexistent/c.mp4")]
+        );
+        assert_eq!(clips.iter().map(|c| c.source).collect::<Vec<_>>(), [0, 1]);
+        // ...and what comes out is loadable, with the same timeline.
+        let reloaded = Project::from_parts(sources, clips).expect("from_parts");
+        assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
+        assert_eq!(reloaded.sources().len(), 2);
+    }
+
+    #[test]
+    fn from_parts_has_no_history_and_checks_the_invariants() {
+        let (sources, clips) = three().without_orphan_sources();
+        let mut p = Project::from_parts(sources.clone(), clips.clone()).expect("valid parts");
+        assert_eq!(p.clips(), three().clips());
+        assert!(!p.undo(), "a loaded project has nothing to undo");
+        assert!(p.cut(4), "...and is editable from there");
+        assert!(p.undo());
+
+        assert!(Project::from_parts(sources.clone(), Vec::new()).is_none());
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                vec![Clip {
+                    source: 1,
+                    in_frame: 0,
+                    out_frame: 3
+                }]
+            )
+            .is_none(),
+            "clip names a source that is not there"
+        );
+        assert!(
+            Project::from_parts(
+                sources,
+                vec![Clip {
+                    source: 0,
+                    in_frame: 3,
+                    out_frame: 3
+                }]
+            )
+            .is_none(),
+            "empty clip"
         );
     }
 }
