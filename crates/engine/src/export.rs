@@ -5,11 +5,15 @@
 //! pure-Rust AAC encoder to re-encode with. The worker owns everything: the
 //! caller gets an [`ExportHandle`] and polls it from its render loop.
 //!
-//! Nothing partial survives a failure: cancel and every error path delete the
-//! output file. A killed *process* still leaves it — only in-process cleanup is
-//! promised.
+//! Nothing partial survives a failure: the worker writes to `<out>.part` and
+//! renames it onto `out` only once the file is closed and complete, so the
+//! output either does not exist or is finished — there is no window where a
+//! half-written `.export.mp4` is sitting there looking playable. Cancel and
+//! every error path delete the `.part`. A killed *process* leaves the `.part`
+//! behind (only in-process cleanup is promised), which is an orphan a user can
+//! delete rather than a file that plays for two seconds and stops.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -53,8 +57,10 @@ impl ExportHandle {
         self.shared.progress.load(Ordering::Relaxed) as f32 / PROGRESS_SCALE as f32
     }
 
-    /// Asks the worker to stop at its next frame and delete the partial file.
-    /// The outcome then reports the cancellation as an error.
+    /// Asks the worker to stop at its next checkpoint and delete the partial
+    /// file. The outcome then reports the cancellation as an error. Checkpoints
+    /// run to the last instant before the rename, so even a cancel at full
+    /// progress leaves no output.
     pub fn cancel(&self) {
         self.shared.cancel.store(true, Ordering::Relaxed);
     }
@@ -82,11 +88,20 @@ pub(crate) fn start(source: &Path, project: Project, meta: VideoMeta, out: &Path
     let worker = Arc::clone(&shared);
     let source = source.to_path_buf();
     let out = out.to_path_buf();
+    // `<out>.part`, appended rather than substituted: the temporary of
+    // `a.export.mp4` is `a.export.mp4.part`, which no other export claims.
+    let mut part = out.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
     let spawned = thread::Builder::new().name("export".into()).spawn(move || {
-        let result = run(&source, &project, &meta, &out, &worker);
+        // The rename is the last step and the only one that publishes a file
+        // under the name the caller asked for; it stays on the same directory,
+        // so it is atomic.
+        let result = run(&source, &project, &meta, &part, &worker)
+            .and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
             // The muxer -- and with it the file handle -- died with `run`.
-            let _ = std::fs::remove_file(&out);
+            let _ = std::fs::remove_file(&part);
         }
         settle(&worker, result);
     });
@@ -131,9 +146,7 @@ fn run(
         // need not line up with the cuts.
         let mut pictures = ClipDecoder::open(source, clip.in_frame)?;
         for _ in 0..clip.len() {
-            if shared.cancel.load(Ordering::Relaxed) {
-                return Err("export cancelled".into());
-            }
+            cancelled(shared)?;
             let Some((y, u, v, width, height)) = pictures.next()? else {
                 break; // source ran out early; the clip list outlives the file
             };
@@ -149,6 +162,9 @@ fn run(
     while let Some(au) = encoder.drain()? {
         write_video(&mut muxer, out, meta, audio_params.as_ref(), au)?;
     }
+    // Progress reads 100% from here on, but nothing is published yet: draining,
+    // the audio pass and `finish` are all still cancellable.
+    cancelled(shared)?;
 
     let Some(mut muxer) = muxer else {
         return Err("export produced no coded pictures".into());
@@ -158,8 +174,19 @@ fn run(
             muxer.write_audio_packet(&packet.bytes)?;
         }
     }
+    cancelled(shared)?;
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `Err` once a cancel has been asked for. Called at every point where the work
+/// left is more than an instant, so an `esc` at 99.9% still stops the export
+/// instead of quietly completing it.
+fn cancelled(shared: &Shared) -> crate::Result<()> {
+    if shared.cancel.load(Ordering::Relaxed) {
+        return Err("export cancelled".into());
+    }
     Ok(())
 }
 
