@@ -22,6 +22,9 @@ pub struct Demuxer {
     sample_count: u32,
     /// Annex-B SPS+PPS, re-injected ahead of every sync sample.
     parameter_sets: Vec<u8>,
+    /// `stss` entries, ascending 1-based sample ids. Empty means no `stss` box
+    /// at all, i.e. every sample is a sync sample.
+    sync_samples: Vec<u32>,
     next_sample: u32,
 }
 
@@ -49,6 +52,15 @@ impl Demuxer {
         parameter_sets.extend_from_slice(track.sequence_parameter_set()?);
         parameter_sets.extend_from_slice(&START_CODE);
         parameter_sets.extend_from_slice(track.picture_parameter_set()?);
+        let sync_samples = track
+            .trak
+            .mdia
+            .minf
+            .stbl
+            .stss
+            .as_ref()
+            .map(|stss| stss.entries.clone())
+            .unwrap_or_default();
 
         let sample_count = reader.sample_count(track_id)?;
         Ok((
@@ -61,6 +73,7 @@ impl Demuxer {
                 track_id,
                 sample_count,
                 parameter_sets,
+                sync_samples,
                 next_sample: 1, // sample ids are 1-based
             },
         ))
@@ -83,6 +96,29 @@ impl Demuxer {
         }
         append_annex_b(&sample.bytes, &mut au)?;
         Ok(Some(au))
+    }
+
+    /// Rewinds/forwards the read cursor to the latest sync sample at or before
+    /// `sample_id` (1-based), which is the earliest point a decoder can start
+    /// from and still reach `sample_id`. Returns the sample it landed on.
+    pub fn seek_to_sync_at_or_before(&mut self, sample_id: u32) -> u32 {
+        let target = sample_id.clamp(1, self.sample_count.max(1));
+        let chosen = sync_at_or_before(&self.sync_samples, target);
+        self.next_sample = chosen;
+        chosen
+    }
+}
+
+/// Largest entry of the ascending sync table that is `<= sample_id`. An empty
+/// table means every sample is a sync sample. When `sample_id` sits before the
+/// first sync sample there is nothing decodable earlier, so that one wins.
+fn sync_at_or_before(syncs: &[u32], sample_id: u32) -> u32 {
+    if syncs.is_empty() {
+        return sample_id;
+    }
+    match syncs.partition_point(|&s| s <= sample_id) {
+        0 => syncs[0],
+        i => syncs[i - 1],
     }
 }
 
@@ -121,6 +157,15 @@ mod tests {
         let mut out = Vec::new();
         append_annex_b(&[0, 0, 0, 2, 0x65, 0xAA, 0, 0, 0, 1, 0x41], &mut out).unwrap();
         assert_eq!(out, [0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 1, 0x41]);
+    }
+
+    #[test]
+    fn sync_lookup() {
+        assert_eq!(sync_at_or_before(&[], 7), 7, "no stss: every sample syncs");
+        assert_eq!(sync_at_or_before(&[1, 31, 61], 31), 31, "exact hit");
+        assert_eq!(sync_at_or_before(&[1, 31, 61], 45), 31, "between syncs");
+        assert_eq!(sync_at_or_before(&[5, 31], 2), 5, "before the first sync");
+        assert_eq!(sync_at_or_before(&[1, 31, 61], 900), 61, "past the last");
     }
 
     #[test]

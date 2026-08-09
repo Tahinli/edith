@@ -18,6 +18,7 @@ struct Plugin {
     write: unsafe extern "C" fn(*mut c_void, *const f32, usize) -> isize,
     position: unsafe extern "C" fn(*mut c_void) -> i64,
     set_active: unsafe extern "C" fn(*mut c_void, u32) -> i32,
+    flush: unsafe extern "C" fn(*mut c_void) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
@@ -54,6 +55,9 @@ fn load() -> Option<Plugin> {
                     write: *lib.get(b"ao_write\0").ok()?,
                     position: *lib.get(b"ao_position\0").ok()?,
                     set_active: *lib.get(b"ao_set_active\0").ok()?,
+                    // Required, so a plugin predating seek is rejected whole
+                    // and we play muted rather than half-working.
+                    flush: *lib.get(b"ao_flush\0").ok()?,
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
                 })
@@ -117,6 +121,13 @@ impl AoSession {
     pub fn set_active(&self, active: bool) -> bool {
         // SAFETY: `handle` came from `ao_open` and is still open.
         unsafe { (self.plugin.set_active)(self.handle, active as u32) == 0 }
+    }
+
+    /// Drops everything still queued, so the next samples written play right
+    /// away -- what a seek needs. The played position keeps counting.
+    pub fn flush(&self) -> bool {
+        // SAFETY: `handle` came from `ao_open` and is still open.
+        unsafe { (self.plugin.flush)(self.handle) == 0 }
     }
 }
 

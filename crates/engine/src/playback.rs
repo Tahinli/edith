@@ -159,7 +159,8 @@ impl PlaybackSession {
             // no jump, and this branch cannot be reached again.
             self.clock.switch_to_wall();
         } else {
-            self.clock.set_audio_position(position as u64, audio.sample_rate);
+            self.clock
+                .set_audio_position(position as u64, audio.sample_rate);
         }
     }
 }

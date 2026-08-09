@@ -63,7 +63,10 @@ fn decode_all_hw(name: &str) -> (usize, Vec<u8>) {
 #[ignore = "needs libengine_hw.so and a VA-API driver"]
 fn rejects_unopenable_files() {
     assert!(HwSession::open(Path::new("/definitely/not/here.mp4")).is_none());
-    assert!(HwSession::open(Path::new("/etc/hostname")).is_none(), "not an mp4");
+    assert!(
+        HwSession::open(Path::new("/etc/hostname")).is_none(),
+        "not an mp4"
+    );
 }
 
 #[test]
@@ -80,6 +83,44 @@ fn hardware_decodes_high_profile() {
     // cros-codecs), so a clean run to EOF is the check we can make headlessly.
     let (count, _) = decode_all_hw("test_high.mp4");
     assert_eq!(count, 150);
+}
+
+/// Seeking may only change *when* a picture arrives, never the picture: both
+/// backends must land on bytes identical to a linear decode of the same index.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn seek_matches_linear() {
+    const TARGET: u32 = 60;
+    let path = asset("test_baseline.mp4");
+
+    // Software side first, pinned like the test above. SAFETY: --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let (_, rx) = DecodeSession::open(&path).expect("software open");
+    let linear = rx
+        .into_iter()
+        .find(|f| f.index == TARGET)
+        .expect("software frame 60")
+        .bgra;
+
+    let start = Instant::now();
+    let (_, rx, _cancel) = DecodeSession::open_at(&path, TARGET).expect("software open_at");
+    let seeked = rx.into_iter().next().expect("no frame after software seek");
+    eprintln!("software seek to {TARGET} took {:?}", start.elapsed());
+    assert_eq!(seeked.index, TARGET, "first frame after seek is the target");
+    assert_eq!(seeked.bgra, linear, "software seek != software linear");
+
+    let start = Instant::now();
+    let mut hw = HwSession::open_at(&path, TARGET).expect("no plugin/driver available");
+    let (y, u, v, w, h) = hw
+        .next_frame()
+        .expect("hardware decode")
+        .expect("no frame after hardware seek");
+    eprintln!("hardware seek to {TARGET} took {:?}", start.elapsed());
+    assert_eq!(
+        i420_to_bgra(y, u, v, w as usize, h as usize),
+        linear,
+        "hardware seek != software linear"
+    );
 }
 
 /// H.264 8-bit decode is bit-exact by conformance, so the two backends must

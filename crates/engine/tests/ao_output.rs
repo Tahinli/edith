@@ -82,7 +82,10 @@ fn plays_and_tracks_position() {
     assert!(ao.set_active(true), "resume rejected");
     std::thread::sleep(Duration::from_millis(200));
     let resumed = ao.position().expect("position went unknown");
-    assert!(resumed > paused, "clock did not resume: {paused} -> {resumed}");
+    assert!(
+        resumed > paused,
+        "clock did not resume: {paused} -> {resumed}"
+    );
 }
 
 /// No reachable daemon must fail the open cleanly and quickly, never hang.

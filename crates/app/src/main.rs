@@ -223,13 +223,11 @@ impl Player {
                             )
                             .child(transport_glyph(playing)),
                     )
-                    .child(
-                        div().flex_none().w(px(TIME_W)).child(format!(
-                            "{} / {}",
-                            timecode(position, self.fps),
-                            timecode(self.duration, self.fps)
-                        )),
-                    ),
+                    .child(div().flex_none().w(px(TIME_W)).child(format!(
+                        "{} / {}",
+                        timecode(position, self.fps),
+                        timecode(self.duration, self.fps)
+                    ))),
             )
             // Read-only: no cursor, no hover, no listener -- a clip slice turns
             // this into a scrubber, today it only reports.

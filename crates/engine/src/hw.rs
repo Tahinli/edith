@@ -53,7 +53,7 @@ impl Default for VhFrame {
 }
 
 struct Plugin {
-    open: unsafe extern "C" fn(*const c_char) -> *mut c_void,
+    open_at: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
     meta: unsafe extern "C" fn(*mut c_void, *mut VhMeta) -> i32,
     next_frame: unsafe extern "C" fn(*mut c_void, *mut VhFrame) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
@@ -88,7 +88,7 @@ fn load() -> Option<Plugin> {
         let plugin = unsafe {
             (|| {
                 Some(Plugin {
-                    open: *lib.get(b"vh_open\0").ok()?,
+                    open_at: *lib.get(b"vh_open_at\0").ok()?,
                     meta: *lib.get(b"vh_meta\0").ok()?,
                     next_frame: *lib.get(b"vh_next_frame\0").ok()?,
                     close: *lib.get(b"vh_close\0").ok()?,
@@ -113,10 +113,19 @@ impl HwSession {
     /// Probes the plugin against this very file: success means the driver,
     /// the render node and the stream's profile are all usable.
     pub fn open(path: &Path) -> Option<Self> {
+        Self::open_at(path, 0)
+    }
+
+    /// As [`HwSession::open`], but the first [`HwSession::next_frame`] returns
+    /// display index `start_frame`; earlier pictures are decoded and dropped
+    /// inside the plugin, without the read-back copy.
+    pub fn open_at(path: &Path, start_frame: u32) -> Option<Self> {
         let plugin = plugin()?;
         let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+        // Sample ids are 1-based, frame indices 0-based.
+        let target_sample = start_frame.saturating_add(1);
         // SAFETY: `c_path` is a valid NUL-terminated string alive for the call.
-        let handle = unsafe { (plugin.open)(c_path.as_ptr()) };
+        let handle = unsafe { (plugin.open_at)(c_path.as_ptr(), target_sample) };
         if handle.is_null() {
             return None;
         }
@@ -125,7 +134,7 @@ impl HwSession {
 
     pub fn meta(&self) -> Option<VhMeta> {
         let mut meta = VhMeta::default();
-        // SAFETY: `handle` came from `vh_open` and is still open.
+        // SAFETY: `handle` came from `vh_open_at` and is still open.
         if unsafe { (self.plugin.meta)(self.handle, &mut meta) } < 0 {
             return None;
         }
@@ -170,7 +179,7 @@ impl HwSession {
 
 impl Drop for HwSession {
     fn drop(&mut self) {
-        // SAFETY: `handle` came from `vh_open` and is closed exactly once.
+        // SAFETY: `handle` came from `vh_open_at` and is closed exactly once.
         unsafe { (self.plugin.close)(self.handle) }
     }
 }

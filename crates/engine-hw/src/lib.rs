@@ -49,6 +49,8 @@ struct Session {
     pending: Vec<u8>,
     timestamp: u64,
     flushed: bool,
+    /// Pictures still to be decoded and thrown away to land on a seek target.
+    skip: u32,
     /// Tightly packed I420 handed out through [`VhFrame`]; reused every frame,
     /// which is exactly why the pointers are only valid until the next call.
     out: Vec<u8>,
@@ -148,10 +150,21 @@ impl Session {
             pending: Vec::new(),
             timestamp: 0,
             flushed: false,
+            skip: 0,
             out: Vec::new(),
             luma: 0,
             chroma: 0,
         })
+    }
+
+    /// As [`Session::open`], but positioned so the first picture handed out is
+    /// sample `target_sample` (1-based): decode restarts at the sync sample at
+    /// or before it and the pictures in between are dropped unread.
+    fn open_at(path: &Path, target_sample: u32) -> Option<Self> {
+        let mut session = Self::open(path)?;
+        let sync = session.demuxer.seek_to_sync_at_or_before(target_sample);
+        session.skip = target_sample.saturating_sub(sync);
+        Some(session)
     }
 
     /// Pumps the decoder until one picture is ready. `Ok(false)` is clean EOF.
@@ -175,6 +188,12 @@ impl Session {
                 }
             }
             if let Some(handle) = self.ready.pop_front() {
+                // Seek discards: dropping the handle skips the `vaGetImage`
+                // read-back (~1.2 ms/picture) and frees its pool buffer.
+                if self.skip > 0 {
+                    self.skip -= 1;
+                    continue;
+                }
                 self.emit(handle);
                 return Ok(true);
             }
@@ -283,13 +302,15 @@ impl Session {
     }
 }
 
-/// Opens `path` for hardware decode. Returns null on any failure at all: no
-/// libva runtime, no render node, unsupported profile, unreadable file.
+/// Opens `path` for hardware decode, positioned so the first
+/// [`vh_next_frame`] returns sample `target_sample` (1-based; 0 and 1 both mean
+/// the start of the stream). Returns null on any failure at all: no libva
+/// runtime, no render node, unsupported profile, unreadable file.
 ///
 /// # Safety
 /// `path` must be a valid NUL-terminated C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vh_open(path: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn vh_open_at(path: *const c_char, target_sample: u32) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
         if path.is_null() {
             return std::ptr::null_mut();
@@ -299,7 +320,7 @@ pub unsafe extern "C" fn vh_open(path: *const c_char) -> *mut c_void {
         let Ok(path) = path.to_str() else {
             return std::ptr::null_mut();
         };
-        match Session::open(Path::new(path)) {
+        match Session::open_at(Path::new(path), target_sample) {
             Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
             None => std::ptr::null_mut(),
         }
@@ -310,7 +331,7 @@ pub unsafe extern "C" fn vh_open(path: *const c_char) -> *mut c_void {
 /// Fills `out` with stream metadata. 0 on success, negative on failure.
 ///
 /// # Safety
-/// `session` must come from [`vh_open`] and `out` must be writable.
+/// `session` must come from [`vh_open_at`] and `out` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vh_meta(session: *mut c_void, out: *mut VhMeta) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -334,7 +355,7 @@ pub unsafe extern "C" fn vh_meta(session: *mut c_void, out: *mut VhMeta) -> i32 
 /// stream, negative on error. Plane pointers stay valid until the next call.
 ///
 /// # Safety
-/// `session` must come from [`vh_open`] and `out` must be writable.
+/// `session` must come from [`vh_open_at`] and `out` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vh_next_frame(session: *mut c_void, out: *mut VhFrame) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -362,12 +383,12 @@ pub unsafe extern "C" fn vh_next_frame(session: *mut c_void, out: *mut VhFrame) 
 /// Releases a session. Safe to call with null.
 ///
 /// # Safety
-/// `session` must come from [`vh_open`] and must not be used afterwards.
+/// `session` must come from [`vh_open_at`] and must not be used afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vh_close(session: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !session.is_null() {
-            // SAFETY: pointer came from `Box::into_raw` in `vh_open`.
+            // SAFETY: pointer came from `Box::into_raw` in `vh_open_at`.
             drop(unsafe { Box::from_raw(session as *mut Session) });
         }
     }));
