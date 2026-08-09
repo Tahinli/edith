@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
-use engine::{DecodeSession, ExportHandle, PlaybackSession};
+use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
 
@@ -168,6 +168,146 @@ fn exports_an_edited_timeline_in_software() {
 fn exports_an_edited_timeline_in_hardware() {
     pin_hardware();
     round_trip("hw", Duration::from_secs(60));
+}
+
+/// `test_av[0,120)` then the whole of `test_av2`: the last second of the first
+/// source is deleted, so timeline frame 120 is both a cut and a file change --
+/// the join the multi-source export exists for.
+fn two_sources() -> Project {
+    let (av, _) = engine::demux::Demuxer::open(&asset("test_av.mp4")).expect("open test_av");
+    let (av2, _) = engine::demux::Demuxer::open(&asset("test_av2.mp4")).expect("open test_av2");
+    assert_eq!((av.width, av.height), (av2.width, av2.height), "policy a");
+
+    let mut project = Project::single(asset("test_av.mp4"), av.frame_count);
+    let second = project.import(asset("test_av2.mp4"));
+    assert_eq!(second, 1, "a second file is a second source");
+    assert!(project.append_clip(second, av2.frame_count));
+    assert!(project.cut(120), "cut a second before the end of test_av");
+    assert!(project.delete(1), "drop test_av's tail");
+    assert_eq!(project.timeline_frames(), 120 + av2.frame_count);
+    assert_eq!(
+        project.clips().iter().map(|c| c.source).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    project
+}
+
+/// A timeline spanning two files exports as one: every clip is decoded from its
+/// own source, the audio is copied across the join, and the result reopens as a
+/// single stream whose frame at the join is the second file's first frame.
+fn multi_source_round_trip(name: &str, limit: Duration) {
+    let project = two_sources();
+    let total = project.timeline_frames();
+    let (meta, _) = engine::demux::Demuxer::open(&asset("test_av.mp4")).unwrap();
+    let out = out_path(name);
+
+    let started = Instant::now();
+    let handle = engine::export::start(project.clone(), meta, &out);
+    wait(&handle, limit).expect("export");
+    println!(
+        "{name}: {total} frames of two sources in {:.2} s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen export");
+    assert_eq!(written.frame_count, total, "timeline frames written");
+    assert_eq!((written.width, written.height), (1280, 720));
+
+    let frames = decode_all(&out);
+    assert_eq!(
+        frames.len() as u32,
+        total,
+        "every written frame decodes back"
+    );
+    // The join: timeline 120 is test_av2's frame 0, timeline 119 still test_av's.
+    for (timeline, source, source_frame) in [
+        (0u32, "test_av.mp4", 0u32),
+        (119, "test_av.mp4", 119),
+        (120, "test_av2.mp4", 0),
+        (total - 1, "test_av2.mp4", total - 121),
+    ] {
+        let diff = mean_abs_diff(
+            &frames[timeline as usize],
+            &frame_at(&asset(source), source_frame),
+        );
+        println!("timeline {timeline} vs {source} {source_frame}: mean abs diff {diff:.2}");
+        assert!(
+            diff < 6.0,
+            "timeline frame {timeline} drifted by {diff:.2} from {source} frame {source_frame}"
+        );
+    }
+
+    // Audio across the join: 1 + 172 + 173. Both segments ask for 4.0 s =
+    // 172.27 packets, and the head is test_av's own priming packet (the first
+    // segment's alone -- the join must not add a second one). The first segment
+    // copies 172 and owes 272 samples, and it is that *carried* debt that makes
+    // the second copy 173: rounding each source on its own would give 345, so
+    // this number is the proof the accumulator survives a source change.
+    let file = File::open(&out).unwrap();
+    let size = file.metadata().unwrap().len();
+    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+    let packets = reader.sample_count(2).expect("audio track");
+    assert_eq!(packets, 346, "packet total across the source join");
+    let wanted = f64::from(total) / FPS * 44_100.0;
+    assert!(
+        (f64::from(packets * 1024) - wanted).abs() < 3.0 * 1024.0,
+        "audio length {} samples drifted from {wanted}",
+        packets * 1024
+    );
+    let (audio, _) = engine::AudioSession::open(&out)
+        .expect("reopen export audio")
+        .expect("export has an audio track");
+    assert_eq!((audio.sample_rate, audio.channels), (44_100, 2));
+    std::fs::remove_file(&out).unwrap();
+}
+
+#[test]
+fn exports_two_sources_as_one_timeline_in_software() {
+    pin_software();
+    multi_source_round_trip("multi_sw", Duration::from_secs(180));
+}
+
+#[test]
+#[ignore]
+fn exports_two_sources_as_one_timeline_in_hardware() {
+    pin_hardware();
+    multi_source_round_trip("multi_hw", Duration::from_secs(60));
+}
+
+/// A source that disappears between the edit and the export fails the export
+/// rather than silently writing a shorter file -- and leaves neither an output
+/// nor a `.part`. Both sources are silent, so the failure is the per-clip open
+/// (the audio pass never touches the second file).
+#[test]
+fn a_vanished_source_fails_the_export() {
+    pin_software();
+    let baseline = asset("test_baseline.mp4");
+    let doomed = std::env::temp_dir().join("ve_export_vanished_source.mp4");
+    std::fs::copy(&baseline, &doomed).expect("copy a second source");
+    let (meta, _) = engine::demux::Demuxer::open(&baseline).unwrap();
+
+    // Five frames of each: the export has to get going and then fail.
+    let mut project = Project::single(&baseline, meta.frame_count);
+    assert!(project.cut(5));
+    assert!(project.delete(1));
+    let second = project.import(&doomed);
+    assert!(project.append_clip(second, meta.frame_count));
+    assert!(project.cut(10));
+    assert!(project.delete(2));
+    assert_eq!(project.timeline_frames(), 10);
+
+    std::fs::remove_file(&doomed).expect("unlink the second source");
+    let out = out_path("vanished");
+    let handle = engine::export::start(project, meta, &out);
+    let result = wait(&handle, Duration::from_secs(60));
+    let error = result.expect_err("an export of a missing file cannot succeed");
+    println!("vanished source: {error}");
+    assert!(
+        !out.exists(),
+        "a failed export still wrote {}",
+        out.display()
+    );
+    assert!(!part_path(&out).exists(), "the .part outlived the failure");
 }
 
 /// A cancelled export leaves nothing behind -- the half-written file is the
