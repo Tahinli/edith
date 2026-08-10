@@ -43,6 +43,8 @@ use symphonia_core::packet::Packet;
 use symphonia_core::units;
 use symphonia_core::units::{Time, TimeBase};
 
+use crate::eq::{EqParams, EqState};
+
 /// ffmpeg's AAC-LC encoder delay, used when the file carries no edit list.
 /// (HE-AAC/iTunes files use 2112, but those are rejected as unsupported here.)
 const DEFAULT_PRIMING: u64 = 1024;
@@ -212,6 +214,26 @@ impl AudioSession {
         sources: &[(PathBuf, usize)],
         segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_multi_streams_eq(sources, segs, &[])
+    }
+
+    /// [`open_multi_streams`](Self::open_multi_streams) with an equalizer per
+    /// segment: `eqs[i]` is what segment `i` plays through, `None` for one that
+    /// plays flat. Filtering happens **per segment**, inside the worker, before
+    /// anything is mixed -- two clips with different curves must not be blurred
+    /// into one another, and a segment's filter memory starts clean and dies
+    /// with it, which is also what makes a seek a reset for free.
+    ///
+    /// A parallel list, not a fourth tuple element: see
+    /// [`crate::Project::audio_eqs_from`], which is what builds it. A list
+    /// shorter than `segs` (the empty one every plain caller passes) means the
+    /// rest play flat, so a mismatch cannot panic and cannot silently shift a
+    /// curve onto the wrong clip.
+    pub fn open_multi_streams_eq(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+        eqs: &[Option<EqParams>],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let Some((path, stream)) = sources.first() else {
             return Ok(None);
         };
@@ -282,6 +304,20 @@ impl AudioSession {
         // One AAC packet decodes to 1024 frames; at stereo f32 that is 8 KB, so
         // this bound is ~0.75 s of lookahead — enough to ride out decode jitter
         // without making a pause take a second to bite.
+        // One filter per segment, built here where the rate and the layout are
+        // known and off the thread that will run it. An identity curve costs a
+        // branch and nothing else ([`EqState::process`]), and a segment with no
+        // curve at all is not even that.
+        let eqs: Vec<Option<EqState>> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                eqs.get(i)
+                    .and_then(Option::as_ref)
+                    .map(|p| EqState::new(p, meta.sample_rate, meta.channels))
+            })
+            .collect();
+
         let (tx, rx) = sync_channel(32);
         thread::Builder::new()
             .name("audio-decode".into())
@@ -290,6 +326,7 @@ impl AudioSession {
                     tracks,
                     channels: meta.channels as usize,
                     segments,
+                    eqs,
                     timeline,
                     tx,
                 })
@@ -318,18 +355,40 @@ impl AudioSession {
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_eq(sources, lanes, &[])
+    }
+
+    /// [`open_mixed_streams`](Self::open_mixed_streams) with
+    /// [`open_multi_streams_eq`](Self::open_multi_streams_eq)'s per-segment
+    /// equalizers, one list per lane -- [`crate::Project::audio_eqs_from`] is
+    /// what shapes them.
+    ///
+    /// Filtering is each lane's worker's own business and therefore happens
+    /// **before** the sum: a clip's curve reaches that clip's samples and stops
+    /// there, where filtering the mix would smear every lane's curve over
+    /// everything playing at the same instant. A missing or short list plays
+    /// flat, as it does one lane down.
+    pub fn open_mixed_streams_eq(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, rest @ ..] = lanes else {
             return Ok(None);
         };
         if rest.is_empty() {
-            return Self::open_multi_streams(sources, first);
+            let flat = Vec::new();
+            return Self::open_multi_streams_eq(sources, first, eqs.first().unwrap_or(&flat));
         }
         let mut meta = None;
         let mut rxs = Vec::with_capacity(lanes.len());
-        for segs in lanes {
+        for (i, segs) in lanes.iter().enumerate() {
             // Every lane probes the same source 0, so the metas agree by
             // construction; `None` from any of them is a silent timeline.
-            let Some((lane_meta, rx)) = Self::open_multi_streams(sources, segs)? else {
+            let flat = Vec::new();
+            let Some((lane_meta, rx)) =
+                Self::open_multi_streams_eq(sources, segs, eqs.get(i).unwrap_or(&flat))?
+            else {
                 return Ok(None);
             };
             meta = Some(lane_meta);
@@ -1240,6 +1299,11 @@ struct Worker {
     tracks: Vec<Option<Track>>,
     channels: usize,
     segments: Vec<Segment>,
+    /// One per entry of `segments`, in the same order: the filter that segment's
+    /// samples pass through on the way out, or `None` for one that plays flat.
+    /// Beside the segments rather than inside them so the emit path can hold the
+    /// window rules and the filter memory at once without splitting a borrow.
+    eqs: Vec<Option<EqState>>,
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
@@ -1317,8 +1381,12 @@ fn run(mut w: Worker) {
     // Chunk numbering is continuous across every join, source ones included.
     let mut timeline = w.timeline;
     let segments = std::mem::take(&mut w.segments);
+    let mut eqs = std::mem::take(&mut w.eqs);
+    // A short list is "flat from here on" (`open_multi_streams_eq`), which this
+    // pads out so the zip below still walks every segment.
+    eqs.resize_with(segments.len(), || None);
 
-    for seg in &segments {
+    for (seg, eq) in segments.iter().zip(eqs.iter_mut()) {
         let Some(source) = seg.source else {
             // A gap: hand the device real silence rather than nothing at all,
             // in the same packet-sized chunks decoding produces, so `fed` and
@@ -1343,7 +1411,7 @@ fn run(mut w: Worker) {
         };
         let track = match track {
             Track::Sym(track) => {
-                if !run_sym(track, seg, channels, &mut timeline, &w.tx) {
+                if !run_sym(track, seg, eq.as_mut(), channels, &mut timeline, &w.tx) {
                     return; // consumer went away
                 }
                 continue;
@@ -1391,6 +1459,7 @@ fn run(mut w: Worker) {
                 &mut interleaved,
                 channels,
                 seg,
+                eq.as_mut(),
                 pos,
                 next,
                 &mut timeline,
@@ -1412,10 +1481,18 @@ fn run(mut w: Worker) {
 /// audio the caller asked for: it is dropped, splitting the buffer that
 /// straddles the target. The tail past the segment end goes too — on a short
 /// segment that is this same buffer, trimmed at both ends.
+///
+/// The segment's equalizer runs here, on the trimmed buffer and nowhere else:
+/// this is the one place both readers hand their samples over, so playback and
+/// an audio export get the same filtered stream by construction rather than by
+/// two call sites agreeing. Trimmed first, so the pre-roll a listener never
+/// hears cannot ring the filter either. Nothing is allocated -- the device
+/// callback is two hand-offs downstream of here in any case.
 fn emit(
     interleaved: &mut Vec<f32>,
     channels: usize,
     seg: &Segment,
+    eq: Option<&mut EqState>,
     pos: u64,
     next: u64,
     timeline: &mut u64,
@@ -1434,6 +1511,9 @@ fn emit(
     }
     if interleaved.is_empty() {
         return true; // nothing left of it; the loop head ends the segment
+    }
+    if let Some(eq) = eq {
+        eq.process(interleaved);
     }
     let chunk = AudioChunk {
         start_sample: *timeline,
@@ -1455,6 +1535,7 @@ fn emit(
 fn run_sym(
     track: &mut SymTrack,
     seg: &Segment,
+    mut eq: Option<&mut EqState>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -1505,7 +1586,18 @@ fn run_sym(
         };
         buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
         let next = pos + (interleaved.len() / channels) as u64;
-        if !emit(&mut interleaved, channels, seg, pos, next, timeline, tx) {
+        // Reborrowed per packet: the filter memory has to carry across the
+        // packet boundary, so this is one `EqState` for the whole segment.
+        if !emit(
+            &mut interleaved,
+            channels,
+            seg,
+            eq.as_deref_mut(),
+            pos,
+            next,
+            timeline,
+            tx,
+        ) {
             return false;
         }
     }
