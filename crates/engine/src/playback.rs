@@ -764,6 +764,29 @@ impl PlaybackSession {
         })
     }
 
+    /// Takes `path` played on `stream` out of the library -- the door a library
+    /// row's own remove goes through, naming the row exactly as
+    /// [`place_stream_at`](Self::place_stream_at) does. Refused in
+    /// [`Project::remove_source`]'s words while a clip still plays from it, and
+    /// for a row this timeline does not have.
+    ///
+    /// Reseeks like an edit even though nothing playable changed: the clip
+    /// indexes into the source list have just moved, and the running workers
+    /// were opened against the old numbering.
+    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<()> {
+        let wanted = Source::new(path, stream);
+        let idx = self
+            .project
+            .sources()
+            .iter()
+            .position(|s| *s == wanted)
+            .ok_or_else(|| format!("{} is not on this timeline", path.display()))?;
+        self.project.remove_source(idx)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
+    }
+
     /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
     /// other source is held to it.
     fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
