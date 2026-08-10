@@ -5895,7 +5895,7 @@ impl Quality {
 /// that opens but never comes back out is exactly the gap a user would other-
 /// wise go looking for.
 const FORMATS: [(Option<Format>, &str, &str); 9] = [
-    (Some(Format::Mp4), "MP4", "H.264 picture + copied AAC"),
+    (Some(Format::Mp4), "MP4", "H.264 picture + AAC sound"),
     (
         Some(Format::Av1),
         "AV1",
@@ -5905,7 +5905,7 @@ const FORMATS: [(Option<Format>, &str, &str); 9] = [
     (Some(Format::Flac), "FLAC", "lossless — audio only"),
     (None, "MP3", "encoder is LGPL — licence decision pending"),
     (None, "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (None, "AAC", "no pure-Rust AAC encoder"),
+    (None, "AAC", "an MP4's sound here, not a file of its own"),
     (
         None,
         "HEVC",
