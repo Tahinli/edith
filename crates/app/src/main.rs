@@ -15,8 +15,8 @@ use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div,
-    img, point, prelude::*, px, relative, rgb, rgba, size,
+    RenderImage, SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas,
+    div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -98,6 +98,12 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 /// keeps the card inside the smallest window no matter how many actions the
 /// editor grows -- ten rows fit here, and the eleventh is a scroll away.
 const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
+/// The menu a right-click on a clip opens: wide enough for the longest label
+/// beside the stroke that does the same thing, with the click targets `HIT_MIN`
+/// binds like every other list here.
+const MENU_W: f32 = 260.;
+const MENU_ROW_H: f32 = HIT_MIN;
+const MENU_PAD: f32 = 6.;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -188,6 +194,30 @@ enum Wave {
 /// inserted.
 struct AssetDrag(usize);
 
+/// An open clip menu: which clip it was opened on, where it hangs, and whether
+/// it has been turned over to show what that clip *is* instead of what can be
+/// done to it. The lane and index are the ones the same click selected, so
+/// every item acts on exactly the box under the pointer.
+#[derive(Clone, Copy)]
+struct ContextMenu {
+    lane: Lane,
+    idx: usize,
+    at: Point<Pixels>,
+    details: bool,
+}
+
+/// What the menu offers, in the order it lists them. Every one of these is an
+/// action a stroke already reaches -- the menu is a second way *to* the actions
+/// and never a second version of them -- so both the label and the hint come
+/// out of the keymap registry and the two can never disagree.
+const MENU_ITEMS: [ActionId; 5] = [
+    ActionId::Cut,
+    ActionId::Delete,
+    ActionId::Lift,
+    ActionId::Regroup,
+    ActionId::ToggleMute,
+];
+
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
@@ -215,6 +245,10 @@ struct Player {
     /// screen, but Lift has to know which half it was aimed at. Indices move
     /// under every edit, so this is cleared by all of them.
     selected: Option<(Lane, usize)>,
+    /// The clip menu a right-click opened, if one is up. Holds an index like
+    /// `selected` does, so it is closed by anything that can move indices --
+    /// every stroke, and every item of its own.
+    context_menu: Option<ContextMenu>,
     /// Which library row is picked, as an index into the session's sources.
     /// Its own selection and not the timeline's: Delete keeps acting on the
     /// clip that was clicked in a lane, whatever the library is showing. Source
@@ -364,6 +398,37 @@ impl Player {
         self.eos = false;
         self.done = false;
         self.pending_seek = true;
+    }
+
+    /// What an action does, wherever it was asked for -- a stroke, or the clip
+    /// menu item that names the same action. One table, so the two can never
+    /// come to mean different things.
+    fn act(&mut self, action: ActionId, cx: &mut Context<Self>) {
+        match action {
+            ActionId::Play => self.toggle_or_restart(cx),
+            ActionId::Export => self.open_export(cx),
+            ActionId::Save => self.save_project(cx),
+            ActionId::Copy => self.copy_selected(),
+            ActionId::Paste => self.paste(cx),
+            ActionId::Cut => self.cut(cx),
+            ActionId::Regroup => self.regroup(cx),
+            ActionId::Delete => self.delete_selected(cx),
+            ActionId::Lift => self.lift_selected(cx),
+            ActionId::Undo => self.undo(cx),
+            ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
+            ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
+            ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
+            // Nothing to cancel while nothing is exporting; the export guard in
+            // the key handler is what answers this one while there is.
+            ActionId::CancelExport => {}
+        }
+    }
+
+    /// Whether a card owns the window. While one does the timeline under it is
+    /// out of reach, so a right-click there opens no menu -- the same rule the
+    /// key handler and the drop target already follow.
+    fn modal(&self) -> bool {
+        self.keys_open || self.export_open || self.exporting().is_some()
     }
 
     /// Jumps the timeline.
@@ -679,6 +744,10 @@ impl Player {
                 // different file -- or none -- in another project.
                 self.clipboard = None;
                 self.selected = None;
+                // A menu can be up while a project is dropped on the window --
+                // the scrim swallows clicks, never a drop -- and its index
+                // would name some other timeline's clip.
+                self.context_menu = None;
                 // A different set of sources: the row that was picked is not
                 // the file that index names any more.
                 self.selected_asset = None;
@@ -1051,24 +1120,18 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
-                match action {
-                    Some(ActionId::Play) => this.toggle_or_restart(cx),
-                    Some(ActionId::Export) => this.open_export(cx),
-                    Some(ActionId::Save) => this.save_project(cx),
-                    Some(ActionId::Copy) => this.copy_selected(),
-                    Some(ActionId::Paste) => this.paste(cx),
-                    Some(ActionId::Cut) => this.cut(cx),
-                    Some(ActionId::Regroup) => this.regroup(cx),
-                    Some(ActionId::Delete) => this.delete_selected(cx),
-                    Some(ActionId::Lift) => this.lift_selected(cx),
-                    Some(ActionId::Undo) => this.undo(cx),
-                    Some(ActionId::ToggleMute) => {
-                        this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                // A clip menu names an index, and every edit below moves
+                // indices -- so a stroke closes it before it acts. Escape means
+                // that and nothing else, which is the `esc` the keys menu
+                // already lists (keymap.rs `FIXED`).
+                if this.context_menu.take().is_some() {
+                    cx.notify();
+                    if key == ESCAPE {
+                        return;
                     }
-                    Some(ActionId::VolumeUp) => this.set_volume(|volume| volume.step(true), cx),
-                    Some(ActionId::VolumeDown) => this.set_volume(|volume| volume.step(false), cx),
-                    // Nothing to cancel while nothing is exporting.
-                    Some(ActionId::CancelExport) | None => {}
+                }
+                if let Some(action) = action {
+                    this.act(action, cx);
                 }
             }))
             // The whole window is the drop target: gpui turns an external file
@@ -1178,6 +1241,9 @@ impl Render for Player {
             // the picture nothing the rest of the time.
             .children(self.notice_bar(cx))
             .child(self.panel(position, duration, playing, cx))
+            // Over the panel it was opened on, and under the cards: it is only
+            // ever up while neither of them is (`modal`).
+            .children(self.context_card(window.viewport_size(), cx))
             // Last, so they are over everything -- they take no room in the
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
@@ -1906,6 +1972,188 @@ impl Player {
         )
     }
 
+    /// The menu a right-click on a clip opens: what that clip can be given,
+    /// each item beside the stroke that does the very same thing, and a
+    /// turn-over side that says what the clip *is*. An item that would do
+    /// nothing where the playhead is standing is dimmed and takes no click
+    /// rather than disappearing, so the menu reads the same every time.
+    ///
+    /// Every item goes through [`Player::act`], the table the key handler uses:
+    /// an item is its stroke, asked for with the mouse. Plain divs like the
+    /// rest of this window, so the root keeps the keyboard and escape still
+    /// reaches the handler that closes this.
+    fn context_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let menu = self.context_menu?;
+        let session = self.session.as_ref()?;
+        let clip = *session.lane_clips(menu.lane).get(menu.idx)?;
+        let playhead = frame_at(session.now(), self.fps);
+        let path = session.sources().get(clip.source).cloned()?;
+        let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
+        let row = |n: usize| {
+            div()
+                .id(("menu", n))
+                .flex()
+                // The floor, not the height: a long label wrapping must not
+                // paint over the item under it.
+                .min_h(px(MENU_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if menu.details {
+            // Read-only, so no ids and no hover: this side is a card, not a
+            // list of things to click. Each value is one truncated line, which
+            // is what keeps the height below the one the clamp was given.
+            for (label, value) in [
+                ("File", file_name(&path)),
+                ("Path", path.display().to_string()),
+                (
+                    "Source range",
+                    format!("{} – {}", secs(clip.in_frame), secs(clip.out_frame)),
+                ),
+                ("This clip", secs(clip.len())),
+                (
+                    "Source duration",
+                    secs(source_frames(lane_clips(session), clip.source)),
+                ),
+            ] {
+                rows.push(
+                    row(rows.len())
+                        .child(label)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                // A size smaller than the labels: a timecode
+                                // pair is 25 characters and has to fit beside
+                                // its label inside `MENU_W`.
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(value),
+                        )
+                        .into_any_element(),
+                );
+            }
+        } else {
+            for action in MENU_ITEMS {
+                let enabled = applicable(&clip, action, playhead);
+                // The one item that is not about this clip says so, and says it
+                // here rather than in the registry: the stroke is global too,
+                // but its row in the keys menu is not sitting on a clip.
+                let label = if action == ActionId::ToggleMute {
+                    format!("{} (global)", action.label())
+                } else {
+                    action.label().to_string()
+                };
+                rows.push(
+                    row(rows.len())
+                        .child(label)
+                        .child(
+                            div()
+                                .text_color(rgb(INK_DIM))
+                                .child(self.keymap.display(action)),
+                        )
+                        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+                        .when(enabled, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    // Closed first: the action moves the very
+                                    // indices this menu is holding.
+                                    this.context_menu = None;
+                                    this.act(action, cx);
+                                }))
+                        })
+                        .into_any_element(),
+                );
+            }
+            rows.push(
+                row(rows.len())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        if let Some(menu) = &mut this.context_menu {
+                            menu.details = true;
+                        }
+                        cx.notify();
+                    }))
+                    .child("Properties")
+                    // No stroke reaches this one, and a blank column would read
+                    // as one that was forgotten.
+                    .child(div().text_color(rgb(INK_DIM)).child("…"))
+                    .into_any_element(),
+            );
+        }
+        let (x, y) = menu_at(
+            menu.at,
+            viewport,
+            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+        );
+        let full: SharedString = path.display().to_string().into();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                // Click away closes it, either button, and the press is
+                // swallowed so nothing under the menu also takes it. No tint,
+                // unlike the modal cards: the timeline this menu is about has
+                // to stay readable behind it.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.context_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        // Only so the details side can carry a tooltip, which
+                        // gpui gives to identified elements alone.
+                        .id("menu-card")
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(MENU_W))
+                        .flex()
+                        .flex_col()
+                        .p(px(MENU_PAD))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        // Painted after the scrim, so this listener runs first
+                        // (gpui bubbles mouse events in reverse, window.rs:3705)
+                        // and a press meant for an item never closes the menu
+                        // out from under its own click.
+                        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        // The one value the details side has to truncate.
+                        .when(menu.details, |d| {
+                            d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
+                        })
+                        .children(rows),
+                ),
+        )
+    }
+
     /// One lane of the edit list made visible: a fixed header saying which lane
     /// it is, then a bed with a box per clip, placed and sized by its share of
     /// the timeline. A cut adds a box without moving anything, a delete closes
@@ -2038,6 +2286,26 @@ impl Player {
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                                     this.selected = Some((lane, i));
+                                    cx.notify();
+                                }),
+                            )
+                            // The right button selects exactly as the left one
+                            // does -- the menu acts on the clip it names, so
+                            // opening one has to pick it -- and then hangs the
+                            // menu at the pointer.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    if this.modal() {
+                                        return;
+                                    }
+                                    this.selected = Some((lane, i));
+                                    this.context_menu = Some(ContextMenu {
+                                        lane,
+                                        idx: i,
+                                        at: event.position,
+                                        details: false,
+                                    });
                                     cx.notify();
                                 }),
                             )
@@ -2231,6 +2499,43 @@ fn source_frames<'a>(clips: impl Iterator<Item = &'a Clip>, source: usize) -> u3
         .map(|clip| clip.out_frame)
         .max()
         .unwrap_or(0)
+}
+
+/// Which timeline frame the playhead is on, by the rule the engine's own edits
+/// use (playback.rs `secs_to_frame`): the frame that has started, with the
+/// epsilon that keeps a clock sitting exactly on a boundary from reading as the
+/// frame before it. Only ever a hint here -- what an edit does is still the
+/// engine's answer, taken from the same seconds.
+fn frame_at(secs: f64, fps: f64) -> u32 {
+    (secs * fps + 1e-6).floor().max(0.) as u32
+}
+
+/// Whether the clip menu offers `action` on the clip it was opened on. Two of
+/// the items act on the *playhead* rather than on the clip, so a menu opened
+/// away from it dims them instead of looking broken when they are clicked.
+fn applicable(clip: &Clip, action: ActionId, playhead: u32) -> bool {
+    match action {
+        // Splits this clip only from inside it: at either edge there is nothing
+        // to split off (project.rs `splittable`).
+        ActionId::Cut => clip.start < playhead && playhead < clip.end(),
+        // Rejoins whatever meets at the playhead, so it can mean something only
+        // at an edge of this clip. Whether those two halves were ever one take
+        // is the engine's question, and it words that refusal itself.
+        ActionId::Regroup => playhead == clip.start || playhead == clip.end(),
+        _ => true,
+    }
+}
+
+/// Where the menu actually hangs: at the pointer, pulled back inside the window
+/// when it would not fit -- an item off the bottom edge is an item nobody can
+/// click. Never negative, so a window smaller than the menu loses the bottom of
+/// it rather than the top, where the items are.
+fn menu_at(at: Point<Pixels>, viewport: Size<Pixels>, height: f32) -> (f32, f32) {
+    let fit = |v: f32, size: f32, room: f32| v.min(room - size).max(0.);
+    (
+        fit(f32::from(at.x), MENU_W, f32::from(viewport.width)),
+        fit(f32::from(at.y), height, f32::from(viewport.height)),
+    )
 }
 
 /// Whether the Add button does anything: a row picked, a timeline to put it on,
@@ -2674,11 +2979,12 @@ mod tests {
     use super::{
         ACCENT, CONTROL_H, Clip, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
         KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W,
-        Lane, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE,
-        SWATCH_W, Volume, WAVE_BPS, WAVE_COL, Wave, can_add, cancels_export, envelope, export_path,
-        export_settings, frac_along, is_bare_modifier, is_project, keymap, lane_clips, marked,
-        normalise, project_path, push_digit, scrub_due, show_label, source_frames, source_tint,
-        start_frac, timecode, unseen_sources, width_frac, window_title,
+        Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED,
+        SOURCE_TINTS, SURFACE, SWATCH_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, can_add,
+        cancels_export, envelope, export_path, export_settings, frac_along, frame_at,
+        is_bare_modifier, is_project, keymap, lane_clips, marked, menu_at, normalise, project_path,
+        push_digit, scrub_due, show_label, source_frames, source_tint, start_frac, timecode,
+        unseen_sources, width_frac, window_title,
     };
     use engine::PlaybackSession;
     use gpui::{Bounds, Pixels, point, px, size};
@@ -2730,6 +3036,64 @@ mod tests {
         assert_eq!(source_frames([clip(0, 10), clip(0, 90)].iter(), 0), 90);
         assert_eq!(source_frames([clip(0, 90), clip(0, 10)].iter(), 0), 90);
         assert_eq!(source_frames([].iter(), 0), 0);
+    }
+
+    /// What the clip menu offers, and where it hangs. The two items that act on
+    /// the playhead rather than on the clicked clip are the ones that can be
+    /// inapplicable, and a menu at the edge of the window has to come back
+    /// inside it or its last item cannot be clicked at all.
+    #[test]
+    fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
+        use keymap::{ActionId, Keymap};
+        // Frames 30..90 of the timeline, taken from the head of its source.
+        let clip = Clip {
+            start: 30,
+            in_frame: 0,
+            out_frame: 60,
+            source: 0,
+            link: None,
+        };
+        assert_eq!(clip.end(), 90);
+        // Cut splits from inside only: neither edge has anything to split off.
+        assert!(applicable(&clip, ActionId::Cut, 31));
+        assert!(applicable(&clip, ActionId::Cut, 89));
+        assert!(!applicable(&clip, ActionId::Cut, 30));
+        assert!(!applicable(&clip, ActionId::Cut, 90));
+        assert!(!applicable(&clip, ActionId::Cut, 200));
+        // Regroup is the other way round: only where this clip meets another.
+        assert!(applicable(&clip, ActionId::Regroup, 30));
+        assert!(applicable(&clip, ActionId::Regroup, 90));
+        assert!(!applicable(&clip, ActionId::Regroup, 60));
+        // The rest act on the clip that was clicked, so they always mean
+        // something -- the engine words its own refusals.
+        for action in [ActionId::Delete, ActionId::Lift, ActionId::ToggleMute] {
+            assert!(applicable(&clip, action, 0));
+            assert!(applicable(&clip, action, 60));
+        }
+        // The playhead frame is the engine's own rule, boundary included.
+        assert_eq!(frame_at(1.0, 30.), 30);
+        assert_eq!(frame_at(0.0, 30.), 0);
+        assert_eq!(frame_at(-1.0, 30.), 0);
+        // Where it hangs: at the pointer when it fits, back inside when not.
+        let viewport = size(px(800.), px(400.));
+        assert_eq!(menu_at(point(px(10.), px(10.)), viewport, 150.), (10., 10.));
+        assert_eq!(
+            menu_at(point(px(700.), px(380.)), viewport, 150.),
+            (800. - MENU_W, 250.)
+        );
+        // A window smaller than the menu loses its bottom, never its top.
+        assert_eq!(
+            menu_at(point(px(90.), px(40.)), size(px(100.), px(50.)), 150.),
+            (0., 0.)
+        );
+        // Every item is an action the registry knows, so the menu and the keys
+        // menu say the same thing about it -- and none of them is unreachable
+        // by keyboard, which is what makes the hint column worth drawing.
+        let keymap = Keymap::defaults();
+        for action in MENU_ITEMS {
+            assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
+            assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
     }
 
     /// The refusal path, end to end against the real files: an incompatible
@@ -3497,6 +3861,7 @@ fn main() {
                     done: false,
                     ruler: Rc::default(),
                     selected: None,
+                    context_menu: None,
                     selected_asset: None,
                     waves: HashMap::new(),
                     clipboard: None,
