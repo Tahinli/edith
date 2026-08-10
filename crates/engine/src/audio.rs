@@ -268,14 +268,23 @@ impl AudioSession {
         eqs: &[Option<EqParams>],
         speeds: &[Option<crate::project::Stretch>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        let Some((path, stream)) = sources.first() else {
+        // The first source that could have a track, which is not always index 0:
+        // a still image has none, and one at the front of the list (a save
+        // renumbers, a library removal moves indexes) would be opened as a
+        // broken audio file and take the whole timeline's sound down with it.
+        // The same rule `PlaybackSession` probes by (`audio_source_of`).
+        let Some((at, (path, stream))) = sources
+            .iter()
+            .enumerate()
+            .find(|(_, (path, _))| !crate::is_image(path))
+        else {
             return Ok(None);
         };
         let Some(first) = Track::open(path, *stream)? else {
             return Ok(None);
         };
-        // The timeline's meta is the first source's: policy makes every other
-        // source match it, and the checks below hold them to that.
+        // The timeline's meta is that source's: policy makes every other source
+        // match it, and the checks below hold them to that.
         let meta = AudioMeta {
             sample_rate: first.sample_rate(),
             channels: first.channels()?,
@@ -286,7 +295,7 @@ impl AudioSession {
         first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
-        tracks[0] = Some(first);
+        tracks[at] = Some(first);
         for &(source, ..) in segs {
             let Some(source) = source else {
                 continue; // a gap opens no file
@@ -459,8 +468,9 @@ impl AudioSession {
         let mut meta = None;
         let mut rxs = Vec::with_capacity(lanes.len());
         for (i, segs) in lanes.iter().enumerate() {
-            // Every lane probes the same source 0, so the metas agree by
-            // construction; `None` from any of them is a silent timeline.
+            // Every lane takes its meta from the same source, so the metas
+            // agree by construction; `None` from any of them is a silent
+            // timeline.
             let flat = Vec::new();
             let plain = Vec::new();
             let Some((lane_meta, rx)) = Self::open_multi_streams_speed(

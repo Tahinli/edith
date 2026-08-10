@@ -748,10 +748,20 @@ impl Project {
     ///
     /// Refused, changing nothing, while any clip still plays from it: the
     /// refusal names the lanes and how many clips each holds, so a caller can
-    /// say what has to be deleted first. Refused too for the last entry left,
-    /// because a project that names no file cannot be reopened
-    /// (`PlaybackSession::open_project`) and the timeline's audio parameters
-    /// are read off source 0.
+    /// say what has to be deleted first. The *last* entry goes like any other
+    /// -- a project may name no file at all, which is an empty library over an
+    /// empty timeline (nothing can play, since a clip would have refused the
+    /// removal). What a front-end does with that is its own decision: `edith`'s
+    /// window goes back to the empty state it launches in, and
+    /// [`PlaybackSession::save_project`](crate::PlaybackSession::save_project)
+    /// refuses to write a project that names nothing, because no such file
+    /// could be opened again.
+    ///
+    /// Every index past `idx` moves down by one, so a caller holding a *raw*
+    /// source index of its own -- a clipboard, which is the one thing outside
+    /// this type that does -- has to fix it up or drop it, or a paste plays a
+    /// different file. [`PlaybackSession::remove_source`] hands back the index
+    /// that went for exactly that.
     ///
     /// ponytail: this retires the undo stack. `history` holds lanes alone, so a
     /// snapshot older than the removal can name the very source being removed
@@ -766,12 +776,6 @@ impl Project {
             return Err(format!("there is no source {idx} to remove").into());
         };
         let name = source.path.display().to_string();
-        // Asked before the clips are counted: with one file left the answer is
-        // the same whatever plays, and "the only file" is the more useful half
-        // of it.
-        if self.sources.len() == 1 {
-            return Err(format!("{name} is the only file this project names").into());
-        }
         let used: Vec<String> = handles(&self.lanes)
             .into_iter()
             .zip(&self.lanes)
@@ -815,9 +819,16 @@ impl Project {
     /// only the ones a clip names.
     ///
     /// One exception, and it is the emptied timeline's: a project no clip plays
-    /// from still keeps source 0. It is the file a session is scaffolded from --
-    /// its frame rate is the timeline's and is written nowhere else -- so a save
-    /// that pruned it would write a project that cannot be loaded back at all.
+    /// from still keeps its first source, if it has one. A file is what a
+    /// reopened project scaffolds itself from -- the frame rate is written
+    /// nowhere else -- so a save that pruned the last of them would write a
+    /// project that cannot be loaded back at all.
+    ///
+    /// What comes out is *not* ordered by anything a reader may assume: first
+    /// use, lane by lane, means the entry at index 0 can be a still or a song
+    /// whatever the session was scaffolded from. `PlaybackSession::open_project`
+    /// picks its rate and its audio reference by what a source *is*, never by
+    /// where it sits.
     pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
@@ -3784,10 +3795,10 @@ mod tests {
     }
 
     /// The two edges of a removal: it retires the undo stack (the ponytail on
-    /// [`Project::remove_source`]), and the last entry standing cannot go --
-    /// source 0 is where a reopened project reads its frame rate.
+    /// [`Project::remove_source`]), and the last entry goes like any other
+    /// once nothing plays it -- a project may name no file at all.
     #[test]
-    fn remove_source_retires_undo_and_keeps_the_last_file() {
+    fn remove_source_retires_undo_and_empties_the_library() {
         let mut p = two_sources();
         assert!(p.delete_in(Lane::V1, 3), "FILE2's take goes first");
         assert!(!p.history.is_empty(), "there is something to undo");
@@ -3798,18 +3809,25 @@ mod tests {
         );
         assert!(!p.undo(), "and so there is nothing left to undo");
 
-        // The last file standing stays, whatever plays from it:
-        // `PlaybackSession::open_project` refuses a project that names no
-        // sources at all, and the timeline's frame rate lives in source 0.
+        // The last file standing is held to the one rule every row is -- what
+        // plays cannot go -- and to no other.
         assert_eq!(p.sources().len(), 1);
         let refusal = p
             .remove_source(0)
-            .expect_err("the only source must stay")
+            .expect_err("its clips are still on the lanes")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
-        assert_eq!(p.sources().len(), 1);
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert_eq!(p.sources().len(), 1, "a refusal changes nothing");
+        while p.delete_in(Lane::V1, 0) {}
+        p.remove_source(0)
+            .expect("the last row goes like any other");
         assert!(
-            p.remove_source(1).is_err(),
+            p.sources().is_empty(),
+            "a project may name no file at all: an empty library over an empty timeline"
+        );
+        assert_eq!(p.timeline_frames(), 0);
+        assert!(
+            p.remove_source(0).is_err(),
             "and an index that is not there is refused, not panicked on"
         );
     }
