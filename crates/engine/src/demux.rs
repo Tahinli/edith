@@ -1,6 +1,12 @@
-//! MP4 demux: pulls the video track out as access units the decoders take --
-//! Annex-B for H.264 and HEVC, the sample bytes untouched for VP9 (an mp4 VP9
-//! sample is a self-contained superframe already).
+//! Container demux: pulls the video track out as access units the decoders take
+//! -- Annex-B for H.264 and HEVC, the sample bytes untouched for VP9 (an mp4 VP9
+//! sample is a self-contained superframe already) and for AV1, whose Matroska
+//! block is one temporal unit in the low-overhead OBU format the decoder reads.
+//!
+//! Two containers, one interface: mp4 through the `mp4` crate, Matroska
+//! (`.mkv`/`.webm`) walked here as EBML. AV1 is why the second one exists --
+//! `mp4 0.14` has no `av01` sample entry at all, and AV1 ships in Matroska in
+//! practice.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -20,6 +26,7 @@ pub enum Codec {
     H264,
     Hevc,
     Vp9,
+    Av1,
 }
 
 impl Codec {
@@ -29,6 +36,7 @@ impl Codec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
             Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
         }
     }
 
@@ -53,7 +61,55 @@ pub struct VideoMeta {
     pub codec: Codec,
 }
 
-pub struct Demuxer {
+/// The file, whichever container it came in. Which one is decided by the
+/// extension at [`Demuxer::open`] and never again: everything downstream --
+/// playback, export, the plugin -- speaks access units and display frames.
+pub enum Demuxer {
+    Mp4(Mp4Demuxer),
+    Mkv(MkvDemuxer),
+}
+
+impl Demuxer {
+    pub fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
+        if is_matroska(path) {
+            let (meta, mkv) = MkvDemuxer::open(path)?;
+            return Ok((meta, Self::Mkv(mkv)));
+        }
+        let (meta, mp4) = Mp4Demuxer::open(path)?;
+        Ok((meta, Self::Mp4(mp4)))
+    }
+
+    /// Next access unit in decode order, `None` at end of track.
+    pub fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Mp4(d) => d.next_access_unit(),
+            Self::Mkv(d) => d.next_access_unit(),
+        }
+    }
+
+    /// Rewinds/forwards the read cursor to the latest sync sample at or before
+    /// display frame `frame` (0-based), which is the earliest point a decoder
+    /// can start from and still reach it. Returns the display index of the
+    /// first picture the caller will now be handed.
+    pub fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
+        match self {
+            Self::Mp4(d) => d.seek_to_sync_at_or_before(frame),
+            Self::Mkv(d) => d.seek_to_sync_at_or_before(frame),
+        }
+    }
+}
+
+/// Whether a path names a Matroska file, which is where AV1 arrives. Extension
+/// only, like [`crate::is_audio`]: the demuxer is what really decides, but the
+/// audio path has to know before it opens anything that this file's sound is
+/// not one it reads (see [`crate::audio::AudioSession::unsupported`]).
+pub fn is_matroska(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
+}
+
+pub struct Mp4Demuxer {
     reader: Mp4Reader<BufReader<File>>,
     track_id: u32,
     sample_count: u32,
@@ -75,8 +131,8 @@ pub struct Demuxer {
     next_sample: u32,
 }
 
-impl Demuxer {
-    pub fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
+impl Mp4Demuxer {
+    fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
@@ -131,7 +187,10 @@ impl Demuxer {
                 nal_length = len;
                 parameter_sets = sets;
             }
-            Codec::Vp9 => {}
+            // No parameter sets: a VP9 sample is self-contained, and AV1 never
+            // reaches this arm at all -- `mp4 0.14` knows no `av01` sample
+            // entry, so AV1 only ever arrives through [`MkvDemuxer`].
+            Codec::Vp9 | Codec::Av1 => {}
         }
         let sync_samples = track
             .trak
@@ -170,7 +229,7 @@ impl Demuxer {
 
     /// Next access unit in decode order: Annex-B framed for H.264 and HEVC, the
     /// mp4 sample verbatim for VP9. `None` at end of track.
-    pub fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
+    fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
         if self.next_sample > self.sample_count {
             return Ok(None);
         }
@@ -199,7 +258,7 @@ impl Demuxer {
     /// picture the caller will now be handed -- *negative* when the landing sync
     /// sample sits inside what the edit list trims, i.e. those pictures decode as
     /// references but are not frame 0 or later.
-    pub fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
+    fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
         let target = frame
             .saturating_add(self.first_sample)
             .clamp(1, self.sample_count.max(1));
@@ -207,6 +266,483 @@ impl Demuxer {
         self.next_sample = chosen;
         i64::from(chosen) - i64::from(self.first_sample)
     }
+}
+
+/// One Matroska block of the video track: where its bytes are and whether a
+/// decoder may start on it. 16 bytes an entry, so an hour of 30 fps costs ~1.7
+/// MB of index -- the price of knowing the frame count and the sync points of a
+/// container that indexes neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Block {
+    at: u64,
+    len: usize,
+    key: bool,
+}
+
+/// AV1 out of a Matroska file (`.mkv`/`.webm`).
+///
+/// The whole segment is walked once at open -- element *headers* only, the block
+/// payloads are seeked over -- because Matroska carries no sample table: the
+/// frame count and the sync points exist nowhere else, and Cues index only some
+/// keyframes and only when a muxer bothered to write them.
+pub struct MkvDemuxer {
+    file: File,
+    blocks: Vec<Block>,
+    /// The `av1C` configuration OBUs (the sequence header), re-injected ahead of
+    /// every keyframe exactly as the H.264 parameter sets are. An AV1 stream
+    /// repeats its sequence header at every keyframe anyway, and cros-codecs
+    /// ignores one identical to the sequence in force (`av1.rs:381`), so this is
+    /// free when the encoder already wrote one and load-bearing when it did not.
+    config: Vec<u8>,
+    next: usize,
+}
+
+impl MkvDemuxer {
+    fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
+        let mut file = File::open(path)?;
+        let end = file.metadata()?.len();
+        let segment = mkv_segment(&mut file, end)?;
+        let (video, _) = mkv_tracks(&mut file, segment)?;
+        let video = video.ok_or(
+            "no AV1 video track in this Matroska file — AV1 is the only codec read from one",
+        )?;
+        let (blocks, span) = mkv_blocks(&mut file, segment, video.number)?;
+        if blocks.is_empty() {
+            return Err("the AV1 track in this Matroska file has no frames".into());
+        }
+        // Timing, in this order: what the track declares, then what its own
+        // timestamps say. `DefaultDuration` is nanoseconds and exact -- 33333333
+        // for 30 fps, 41708333 for 23.976 -- which is the whole reason it is
+        // preferred; the fallback measures the presentation span instead, and
+        // that is in `TimestampScale` ticks (a millisecond, as good as every
+        // muxer writes), so it lands within ~0.05 % rather than exactly.
+        //
+        // ponytail: a genuinely variable-rate file is averaged to one rate here,
+        // because a timeline frame is a fixed slice of a second everywhere else
+        // in this engine. Per-frame durations are the upgrade path, and they are
+        // a project-wide change, not a demuxer one.
+        let frame_rate = match video.default_duration {
+            Some(ns) => 1e9 / ns as f64,
+            None => match span {
+                Some((first, last)) if last > first && blocks.len() > 1 => {
+                    (blocks.len() - 1) as f64 * 1e9
+                        / ((last - first) as f64 * video.timestamp_scale as f64)
+                }
+                // Nothing said and nothing measurable: `fps_from_stts` answers
+                // an mp4 with no timing the same way.
+                _ => 0.0,
+            },
+        };
+        let meta = VideoMeta {
+            width: video.width,
+            height: video.height,
+            frame_rate,
+            frame_count: blocks.len() as u32,
+            codec: Codec::Av1,
+        };
+        Ok((
+            meta,
+            Self {
+                file,
+                blocks,
+                config: video.config,
+                next: 0,
+            },
+        ))
+    }
+
+    fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
+        let Some(&block) = self.blocks.get(self.next) else {
+            return Ok(None);
+        };
+        self.next += 1;
+        let head = if block.key { self.config.len() } else { 0 };
+        let mut au = vec![0u8; head + block.len];
+        au[..head].copy_from_slice(&self.config[..head]);
+        read_exact_at(&mut self.file, block.at, &mut au[head..])?;
+        Ok(Some(au))
+    }
+
+    /// As [`Mp4Demuxer::seek_to_sync_at_or_before`]. Never negative: Matroska
+    /// has no edit list, so block 0 is frame 0.
+    fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
+        let target = (frame as usize).min(self.blocks.len().saturating_sub(1));
+        // The keyframe at or before the target, or -- for a stream whose first
+        // block is not one -- the earliest block there is, which is the only
+        // place a decoder can be started from anyway.
+        self.next = self.blocks[..=target]
+            .iter()
+            .rposition(|b| b.key)
+            .unwrap_or(0);
+        self.next as i64
+    }
+}
+
+/// The codec id of `path`'s first audio track (`A_AAC`, `A_OPUS`, ...), or
+/// `None` for a Matroska file with no sound at all. Header only, and only worth
+/// calling once a session has come up silent: no audio track of a Matroska file
+/// is decoded yet, so this exists to say which one is being left out.
+pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
+    let mut file = File::open(path)?;
+    let end = file.metadata()?.len();
+    let segment = mkv_segment(&mut file, end)?;
+    Ok(mkv_tracks(&mut file, segment)?.1)
+}
+
+/// What the `Tracks` element says about the AV1 track.
+struct MkvVideo {
+    number: u64,
+    width: u32,
+    height: u32,
+    default_duration: Option<u64>,
+    timestamp_scale: u64,
+    config: Vec<u8>,
+}
+
+// Matroska element IDs, written with the leading length marker they carry in
+// the file, which is what `ebml_element` reads them back as.
+const SEGMENT: u32 = 0x1853_8067;
+const INFO: u32 = 0x1549_A966;
+const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const TRACKS: u32 = 0x1654_AE6B;
+const TRACK_ENTRY: u32 = 0xAE;
+const TRACK_NUMBER: u32 = 0xD7;
+const TRACK_TYPE: u32 = 0x83;
+const CODEC_ID: u32 = 0x86;
+const CODEC_PRIVATE: u32 = 0x63A2;
+const DEFAULT_DURATION: u32 = 0x23E383;
+const VIDEO: u32 = 0xE0;
+const PIXEL_WIDTH: u32 = 0xB0;
+const PIXEL_HEIGHT: u32 = 0xBA;
+const CLUSTER: u32 = 0x1F43_B675;
+const CLUSTER_TIMESTAMP: u32 = 0xE7;
+const SIMPLE_BLOCK: u32 = 0xA3;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+const REFERENCE_BLOCK: u32 = 0xFB;
+
+/// Body range of the file's `Segment` element, which everything else lives in.
+fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
+    let mut at = 0;
+    while let Some(e) = ebml_element(file, at, end)? {
+        if e.0 == SEGMENT {
+            return Ok((e.1, e.2));
+        }
+        at = e.2;
+    }
+    Err("no Segment element: not a Matroska file".into())
+}
+
+/// The AV1 video track of `segment`, and how a *non*-AV1 audio track would be
+/// named -- the second is what tells a user why a file with sound plays silent
+/// ([`crate::audio::AudioSession::unsupported`]).
+///
+/// Header only: the walk stops at the first `Cluster`, so this costs a handful
+/// of seeks whatever the file weighs.
+fn mkv_tracks(
+    file: &mut File,
+    segment: (u64, u64),
+) -> crate::Result<(Option<MkvVideo>, Option<String>)> {
+    let (mut video, mut audio) = (None, None);
+    let mut timestamp_scale = 1_000_000;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        match id {
+            CLUSTER => break,
+            INFO => {
+                let mut at = body;
+                while let Some(e) = ebml_element(file, at, stop)? {
+                    if e.0 == TIMESTAMP_SCALE {
+                        timestamp_scale = ebml_uint(file, e.1, e.2)?.max(1);
+                    }
+                    at = e.2;
+                }
+            }
+            TRACKS => {
+                let mut at = body;
+                while let Some(e) = ebml_element(file, at, stop)? {
+                    if e.0 == TRACK_ENTRY {
+                        match mkv_track_entry(file, e.1, e.2, timestamp_scale)? {
+                            (Some(track), _) if video.is_none() => video = Some(track),
+                            (_, Some(codec)) if audio.is_none() => audio = Some(codec),
+                            _ => {}
+                        }
+                    }
+                    at = e.2;
+                }
+            }
+            _ => {}
+        }
+        at = stop;
+    }
+    Ok((video, audio))
+}
+
+/// One `TrackEntry`: `Some` video only for an 8-bit AV1 track, and the codec id
+/// of an audio track otherwise.
+fn mkv_track_entry(
+    file: &mut File,
+    body: u64,
+    end: u64,
+    timestamp_scale: u64,
+) -> crate::Result<(Option<MkvVideo>, Option<String>)> {
+    let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
+    let (mut width, mut height, mut config) = (0, 0, Vec::new());
+    let mut at = body;
+    while let Some((id, body, stop)) = ebml_element(file, at, end)? {
+        match id {
+            TRACK_NUMBER => number = ebml_uint(file, body, stop)?,
+            TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
+            DEFAULT_DURATION => {
+                default_duration = Some(ebml_uint(file, body, stop)?).filter(|d| *d > 0)
+            }
+            CODEC_ID => {
+                codec = String::from_utf8_lossy(&ebml_bytes(file, body, stop)?).into_owned()
+            }
+            CODEC_PRIVATE => config = ebml_bytes(file, body, stop)?,
+            VIDEO => {
+                let mut at = body;
+                while let Some(e) = ebml_element(file, at, stop)? {
+                    match e.0 {
+                        PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
+                        PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
+                        _ => {}
+                    }
+                    at = e.2;
+                }
+            }
+            _ => {}
+        }
+        at = stop;
+    }
+    // 1 is video, 2 is audio; the rest (subtitles, buttons) are nobody's here.
+    match (kind, codec.as_str()) {
+        (1, "V_AV1") => Ok((
+            Some(MkvVideo {
+                number,
+                width,
+                height,
+                default_duration,
+                timestamp_scale,
+                config: parse_av1c(&config)?,
+            }),
+            None,
+        )),
+        (2, _) => Ok((None, Some(codec))),
+        _ => Ok((None, None)),
+    }
+}
+
+/// The configuration OBUs of an `AV1CodecConfigurationRecord` (AV1-ISOBMFF
+/// §2.3.3): four fixed bytes, then the sequence header OBU in the same
+/// low-overhead format the blocks are in, so it needs no reframing.
+///
+/// An empty record is not an error -- an encoder that repeats its sequence
+/// header in-band needs none -- but a 10- or 12-bit one is refused by name, for
+/// the same reason HEVC Main 10 is: the plugin's NV12 pool and its `vaGetImage`
+/// read-back are 8-bit, and the upgrade path is a P010 pool.
+fn parse_av1c(rec: &[u8]) -> crate::Result<Vec<u8>> {
+    if rec.is_empty() {
+        return Ok(Vec::new());
+    }
+    let &flags = rec
+        .get(2)
+        .ok_or("av1C record shorter than its fixed header")?;
+    if flags & 0x40 != 0 {
+        return Err(format!(
+            "{}-bit AV1 is not supported yet — this file is not 8-bit",
+            if flags & 0x20 != 0 { 12 } else { 10 }
+        )
+        .into());
+    }
+    Ok(rec.get(4..).unwrap_or_default().to_vec())
+}
+
+/// Every block of track `number`, in storage order, with the presentation span
+/// (first and last timestamp in `TimestampScale` ticks) the frame-rate fallback
+/// needs.
+///
+/// Only element headers are read: a block's payload is seeked over and fetched
+/// later by [`MkvDemuxer::next_access_unit`], which is what keeps this an index
+/// pass rather than a read of the whole file.
+fn mkv_blocks(
+    file: &mut File,
+    segment: (u64, u64),
+    number: u64,
+) -> crate::Result<(Vec<Block>, Option<(i64, i64)>)> {
+    let mut blocks = Vec::new();
+    let mut span: Option<(i64, i64)> = None;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        at = stop;
+        if id != CLUSTER {
+            continue;
+        }
+        let mut cluster_ts = 0i64;
+        let mut child = body;
+        while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
+            child = stop;
+            let (block, key) = match id {
+                CLUSTER_TIMESTAMP => {
+                    cluster_ts = ebml_uint(file, body, stop)? as i64;
+                    continue;
+                }
+                SIMPLE_BLOCK => {
+                    let block = mkv_block(file, body, stop)?;
+                    // Bit 7 of the flags is the keyframe bit; a `Block` inside a
+                    // `BlockGroup` has no such bit, which is the case below.
+                    (block, block.flags & 0x80 != 0)
+                }
+                BLOCK_GROUP => {
+                    let (mut found, mut key) = (None, true);
+                    let mut child = body;
+                    while let Some(e) = ebml_element(file, child, stop)? {
+                        match e.0 {
+                            BLOCK => found = Some(mkv_block(file, e.1, e.2)?),
+                            // A block that references another is not one a
+                            // decoder can be started from.
+                            REFERENCE_BLOCK => key = false,
+                            _ => {}
+                        }
+                        child = e.2;
+                    }
+                    match found {
+                        Some(block) => (block, key),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if block.number != number {
+                continue;
+            }
+            // Lacing packs several frames into one block. Audio muxers use it,
+            // video ones do not, and guessing at frame boundaries inside a laced
+            // block is not something to do silently.
+            if block.flags & 0x06 != 0 {
+                return Err("laced video blocks are not supported".into());
+            }
+            let ts = cluster_ts + i64::from(block.rel);
+            span = Some(match span {
+                Some((first, last)) => (first.min(ts), last.max(ts)),
+                None => (ts, ts),
+            });
+            blocks.push(Block {
+                at: block.at,
+                len: block.len,
+                key,
+            });
+        }
+    }
+    Ok((blocks, span))
+}
+
+/// A `SimpleBlock`/`Block` header: track number, timestamp relative to the
+/// cluster's, flags, and where the frame's own bytes start.
+#[derive(Debug, Clone, Copy)]
+struct BlockHeader {
+    number: u64,
+    rel: i16,
+    flags: u8,
+    at: u64,
+    len: usize,
+}
+
+fn mkv_block(file: &mut File, body: u64, stop: u64) -> crate::Result<BlockHeader> {
+    let mut head = [0u8; 11];
+    let n = read_at(file, body, &mut head)?;
+    let (number, len) = ebml_vint(&head[..n], true)?;
+    let rest = head[..n]
+        .get(len..len + 3)
+        .ok_or("truncated Matroska block header")?;
+    let at = body + (len + 3) as u64;
+    Ok(BlockHeader {
+        number,
+        rel: i16::from_be_bytes([rest[0], rest[1]]),
+        flags: rest[2],
+        at,
+        len: stop.saturating_sub(at) as usize,
+    })
+}
+
+/// The EBML element at `at`: its id (marker bit and all), where its payload
+/// starts, and where it ends. `None` once `end` is reached. An element of
+/// unknown length -- what a muxer writes while it is still recording -- runs to
+/// the end of its parent, which is exactly how a reader is told to take it.
+fn ebml_element(file: &mut File, at: u64, end: u64) -> crate::Result<Option<(u32, u64, u64)>> {
+    if at + 2 > end {
+        return Ok(None);
+    }
+    let mut head = [0u8; 16];
+    let n = read_at(file, at, &mut head[..(end - at).min(16) as usize])?;
+    let (id, id_len) = ebml_vint(&head[..n], false)?;
+    let (size, size_len) = ebml_vint(&head[id_len..n], true)?;
+    let body = at + (id_len + size_len) as u64;
+    let stop = match size {
+        u64::MAX => end,
+        size => body.saturating_add(size).min(end),
+    };
+    if body > end {
+        return Err("truncated Matroska element header".into());
+    }
+    Ok(Some((id as u32, body, stop)))
+}
+
+/// EBML variable-length integer: the leading zeros of the first byte say how
+/// many bytes it takes. `strip` clears the marker bit, which is what a *size*
+/// wants and an *id* does not -- an id is written and compared with it. An
+/// all-ones size means unknown length, and comes back as [`u64::MAX`].
+fn ebml_vint(buf: &[u8], strip: bool) -> crate::Result<(u64, usize)> {
+    let &first = buf.first().ok_or("truncated EBML integer")?;
+    if first == 0 {
+        // A 9-byte-or-longer integer; Matroska defines none.
+        return Err("bad EBML variable-length integer".into());
+    }
+    let len = first.leading_zeros() as usize + 1;
+    let bytes = buf.get(..len).ok_or("truncated EBML integer")?;
+    // `0xFF >> len` in `u16`: an 8-byte integer shifts a `u8` mask right off
+    // its own end, and the marker bit is then all the first byte was.
+    let mut value = u64::from(if strip {
+        first & (0xFFu16 >> len) as u8
+    } else {
+        first
+    });
+    for &b in &bytes[1..] {
+        value = (value << 8) | u64::from(b);
+    }
+    if strip && value == (1u64 << (7 * len)) - 1 {
+        return Ok((u64::MAX, len));
+    }
+    Ok((value, len))
+}
+
+/// An EBML unsigned integer element: big-endian, as many bytes as it was
+/// written with, and an absent one is a zero by the spec's own default.
+fn ebml_uint(file: &mut File, body: u64, stop: u64) -> crate::Result<u64> {
+    Ok(ebml_bytes(file, body, stop)?
+        .iter()
+        .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+}
+
+/// The payload of an element, which is only ever a header field here -- 8 bytes
+/// for an integer, a few hundred for a `CodecPrivate`.
+fn ebml_bytes(file: &mut File, body: u64, stop: u64) -> crate::Result<Vec<u8>> {
+    let len = stop.saturating_sub(body);
+    if len > 1 << 20 {
+        return Err("a Matroska header field larger than a megabyte".into());
+    }
+    let mut buf = vec![0u8; len as usize];
+    read_exact_at(file, body, &mut buf)?;
+    Ok(buf)
+}
+
+/// Positioned reads, so the walk never has to keep a cursor in step with itself.
+fn read_at(file: &mut File, at: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, at)
+}
+
+fn read_exact_at(file: &mut File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, at)
 }
 
 /// Frames per second off the sample table. `mp4 0.14`'s own
@@ -512,6 +1048,70 @@ mod tests {
         // Nothing is read past the end of a truncated box.
         assert!(parse_hvcc(&rec[..20]).is_err());
         assert!(parse_hvcc(&rec[..rec.len() - 1]).is_err());
+    }
+
+    /// EBML's variable-length integers, which every Matroska read starts with:
+    /// the leading zeros of the first byte are the length, an *id* keeps its
+    /// marker bit and a *size* loses it, and an all-ones size is "unknown".
+    #[test]
+    fn ebml_integers_read_ids_and_sizes_differently() {
+        // The Segment id, 4 bytes, marker kept.
+        assert_eq!(
+            ebml_vint(&[0x18, 0x53, 0x80, 0x67], false).unwrap(),
+            (SEGMENT as u64, 4)
+        );
+        // A one-byte id, and the same byte read as a size is its low 7 bits.
+        assert_eq!(ebml_vint(&[0xA3], false).unwrap(), (0xA3, 1));
+        assert_eq!(ebml_vint(&[0xA3], true).unwrap(), (0x23, 1));
+        // Sizes: 0x4143 is 323 bytes, not 0x4143.
+        assert_eq!(ebml_vint(&[0x41, 0x43], true).unwrap(), (323, 2));
+        // Unknown length -- what a muxer writes while still recording.
+        assert_eq!(ebml_vint(&[0xFF], true).unwrap().0, u64::MAX);
+        assert_eq!(
+            ebml_vint(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], true)
+                .unwrap()
+                .0,
+            u64::MAX
+        );
+        // Nothing is read past the end of the buffer, and a zero first byte is
+        // a 9-byte integer Matroska never writes.
+        assert!(ebml_vint(&[0x41], true).is_err());
+        assert!(ebml_vint(&[], false).is_err());
+        assert!(ebml_vint(&[0x00, 1, 2], true).is_err());
+    }
+
+    /// The `av1C` record: four fixed bytes and then the sequence header OBU,
+    /// which is handed to the decoder as it stands. 10-bit is refused by name
+    /// exactly as HEVC Main 10 is, and for the same 8-bit read-back reason.
+    #[test]
+    fn reads_the_sequence_header_out_of_an_av1c_record() {
+        // marker/version, profile 0 + level 5, 8-bit 4:2:0, no delay; then a
+        // 13-byte sequence header OBU in low-overhead format.
+        let mut rec = vec![0x81, 0x05, 0x0C, 0x00];
+        rec.extend_from_slice(&[
+            0x0A, 0x0B, 0x00, 0x00, 0x00, 0x2D, 0x4C, 0xFF, 0xB3, 0xC0, 0x2F, 0x80, 0x00,
+        ]);
+        let config = parse_av1c(&rec).unwrap();
+        assert_eq!(config, rec[4..], "the fixed header is not part of the OBUs");
+        assert_eq!((config[0] >> 3) & 0xF, 1, "OBU type 1 is a sequence header");
+
+        let mut ten = rec.clone();
+        ten[2] |= 0x40; // high_bitdepth
+        let refused = parse_av1c(&ten).unwrap_err().to_string();
+        assert!(refused.contains("10-bit"), "{refused}");
+        let mut twelve = ten.clone();
+        twelve[2] |= 0x20; // twelve_bit
+        assert!(
+            parse_av1c(&twelve)
+                .unwrap_err()
+                .to_string()
+                .contains("12-bit")
+        );
+
+        // An encoder that repeats its sequence header in-band writes no record
+        // at all, which is not an error; a truncated one is.
+        assert!(parse_av1c(&[]).unwrap().is_empty());
+        assert!(parse_av1c(&[0x81, 0x05]).is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! VA-API decode (H.264, HEVC and VP9) and H.264 encode, shipped as a
+//! VA-API decode (H.264, HEVC, VP9 and AV1) and H.264 encode, shipped as a
 //! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
 //! libva/gbm/drm. Every entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
@@ -18,6 +18,7 @@ use std::rc::Rc;
 use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
 use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
+use cros_codecs::decoder::stateless::av1::Av1;
 use cros_codecs::decoder::stateless::h264::H264;
 use cros_codecs::decoder::stateless::h265::H265;
 use cros_codecs::decoder::stateless::vp9::Vp9;
@@ -53,14 +54,16 @@ type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 /// still loads and still decodes H.264 (it simply refuses the newer codecs'
 /// files at `Demuxer`).
 ///
-/// ponytail: 8-bit 4:2:0 only -- VP9 profile 0 and HEVC Main. VP9 profile 2 and
-/// HEVC Main 10 decode 10-bit, which the NV12 pool and the `vaGetImage`
-/// read-back here cannot carry (`Demuxer` refuses Main 10 by name); the upgrade
-/// path is a P010 pool selected from the stream info.
+/// ponytail: 8-bit 4:2:0 only -- VP9 profile 0, HEVC Main, AV1 Main. VP9
+/// profile 2, HEVC Main 10 and AV1 Professional decode 10-bit, which the NV12
+/// pool and the `vaGetImage` read-back here cannot carry (`Demuxer` refuses
+/// both HEVC Main 10 and 10-bit AV1 by name); the upgrade path is a P010 pool
+/// selected from the stream info.
 enum Decoder {
     H264(Dec<H264>),
     Hevc(Dec<H265>),
     Vp9(Dec<Vp9>),
+    Av1(Dec<Av1>),
 }
 
 impl Decoder {
@@ -69,6 +72,7 @@ impl Decoder {
             Self::H264(d) => d,
             Self::Hevc(d) => d,
             Self::Vp9(d) => d,
+            Self::Av1(d) => d,
         }
     }
 }
@@ -188,6 +192,9 @@ impl Session {
             }
             Codec::Vp9 => {
                 Decoder::Vp9(Dec::<Vp9>::new_vaapi(display, BlockingMode::Blocking).ok()?)
+            }
+            Codec::Av1 => {
+                Decoder::Av1(Dec::<Av1>::new_vaapi(display, BlockingMode::Blocking).ok()?)
             }
         };
         let pool = FramePool::new(move |info: &StreamInfo| {
