@@ -56,6 +56,61 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<PathBuf>, f6
     )
 }
 
+/// The version-1 promise: a file written before the lanes existed still opens,
+/// as one grouped video+audio pair per clip laid end to end, and saving it
+/// again writes version 2 -- which reopens as the same timeline.
+#[test]
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_2() {
+    let dir = scratch("v1");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("old.edith");
+    // 60 frames of picture from two clips: [0,30) then [60,90) of the source.
+    std::fs::write(
+        &path,
+        "edith 1\nplayhead 45\nsource test_av.mp4\nclip 0 30 0\nclip 60 90 0\n",
+    )
+    .expect("write a v1 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v1 file still opens");
+    let fps = loaded.meta().frame_rate;
+    assert_eq!(
+        loaded.clip_spans_by_source(),
+        vec![(0.0, 30.0 / fps, 0), (30.0 / fps, 30.0 / fps, 0)],
+        "v1 clips queue up, the second starting where the first ended"
+    );
+    assert_eq!(
+        loaded.lane_spans_by_source(engine::project::Lane::Audio),
+        loaded.clip_spans_by_source(),
+        "both lanes, fully grouped: a v1 timeline had no holes"
+    );
+    assert!(
+        (loaded.now() - 45.0 / fps).abs() < 1.0 / fps,
+        "playhead kept"
+    );
+
+    // Saved again it is v2, and v2 round-trips to the same timeline.
+    let v2 = dir.join("new.edith");
+    loaded.save_project(&v2).expect("save");
+    let text = std::fs::read_to_string(&v2).expect("read back");
+    assert!(text.starts_with("edith 2\n"), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("video ")).count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("audio ")).count(),
+        2,
+        "{text}"
+    );
+    let again = PlaybackSession::open_project(&v2).expect("open the v2 file");
+    assert_eq!(shape(&again), shape(&loaded));
+    // ...and re-saving it is byte-identical, so a round trip is stable.
+    let third = dir.join("third.edith");
+    again.save_project(&third).expect("save");
+    assert_eq!(std::fs::read(&third).expect("read"), text.as_bytes());
+}
+
 #[test]
 fn a_saved_project_reopens_as_the_same_timeline() {
     let dir = scratch("round_trip");
@@ -225,8 +280,16 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
     let good = "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\n";
 
     for (text, want) in [
-        ("edith 2\nsource test_av.mp4\nclip 0 30 0\n", "line 1"),
+        ("edith 3\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 1"),
         ("not a project at all\n", "line 1"),
+        // Dialects do not mix: lane lines are v2's, `clip` is v1's.
+        ("edith 2\nsource test_av.mp4\nclip 0 30 0\n", "line 3"),
+        ("edith 1\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 3"),
+        ("edith 2\nsource test_av.mp4\nvideo 0 0 30 0\n", "line 3"),
+        (
+            "edith 2\nsource test_av.mp4\nvideo 0 0 30 0 -\nvideo 10 0 30 0 -\n",
+            "line 4",
+        ),
         ("edith 1\nsource test_av.mp4\nclip 0 30\n", "line 3"),
         ("edith 1\nsource test_av.mp4\nclip 0 30 4\n", "line 3"),
         ("edith 1\nsource test_av.mp4\nclip 30 30 0\n", "line 3"),

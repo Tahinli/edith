@@ -108,6 +108,49 @@ impl DecodeSession {
         Ok((meta, rx, worker.detach()))
     }
 
+    /// A worker that decodes nothing and emits `len` black frames, indexed from
+    /// zero -- what a *gap* in the video lane looks like. It goes down the same
+    /// channel as decoded frames, so a gap costs the caller no branch at all
+    /// beyond choosing this opener: same bounded channel, same backpressure,
+    /// same cancel, same retire path.
+    pub(crate) fn open_black(width: u32, height: u32, len: u32) -> (Receiver<Frame>, Worker) {
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if len == 0 {
+            return (
+                rx,
+                Worker {
+                    cancel,
+                    handle: None,
+                },
+            );
+        }
+        let worker_cancel = Arc::clone(&cancel);
+        // One buffer, cloned per frame: opaque black is a constant, and the
+        // clone is a memcpy against a decode this replaces entirely.
+        let black = vec![[0u8, 0, 0, 255]; (width as usize) * (height as usize)].concat();
+        let handle = thread::Builder::new()
+            .name("black".into())
+            .spawn(move || {
+                for index in 0..len {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let frame = Frame {
+                        index,
+                        width,
+                        height,
+                        bgra: black.clone(),
+                    };
+                    if tx.send(frame).is_err() {
+                        return; // caller moved on
+                    }
+                }
+            })
+            .ok();
+        (rx, Worker { cancel, handle })
+    }
+
     /// As [`DecodeSession::open_range`], but the caller gets the whole
     /// [`Worker`] and can therefore *wait* for it. In-process only: a caller
     /// that outlives its workers has to be able to join them at exit.

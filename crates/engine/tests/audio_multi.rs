@@ -30,6 +30,12 @@ fn sources() -> Vec<PathBuf> {
 
 /// Drains a session flat, asserting chunks are contiguous, and reports the
 /// first chunk's `start_sample` plus how many chunks arrived.
+/// Every segment names a source: these tests are about joins between files,
+/// not about gaps (which name none).
+fn named(segs: &[(usize, f64, f64)]) -> Vec<(Option<usize>, f64, f64)> {
+    segs.iter().map(|&(s, a, b)| (Some(s), a, b)).collect()
+}
+
 fn drain(rx: Receiver<AudioChunk>) -> (Vec<f32>, u64, usize) {
     let (mut samples, mut first, mut chunks) = (Vec::new(), None, 0usize);
     for AudioChunk {
@@ -48,7 +54,8 @@ fn drain(rx: Receiver<AudioChunk>) -> (Vec<f32>, u64, usize) {
 }
 
 fn multi(segs: &[(usize, f64, f64)]) -> (Vec<f32>, u64, usize) {
-    let (_, rx) = AudioSession::open_multi_segments(&sources(), segs)
+    let segs = named(segs);
+    let (_, rx) = AudioSession::open_multi_segments(&sources(), &segs)
         .expect("open")
         .expect("the first source has an audio track");
     drain(rx)
@@ -128,7 +135,7 @@ fn assert_same_bytes(got: &[AacPacket], want: &[Vec<u8>], what: &str) {
 }
 
 fn copy(segs: &[(usize, f64, f64)]) -> Vec<AacPacket> {
-    AudioSession::copy_multi_segments(&sources(), segs)
+    AudioSession::copy_multi_segments(&sources(), &named(segs))
         .expect("copy")
         .expect("the first source has an audio track")
         .1
@@ -246,7 +253,7 @@ fn a_source_without_the_timeline_audio_is_refused() {
     // the copy and the decode paths refuse them again rather than mislabel one
     // esds for two different tracks.
     let mixed = [asset("test_av.mp4"), asset("test_mismatch.mp4")];
-    let segs = [(0, 0.0, 1.0), (1, 0.0, 1.0)];
+    let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     // (`.err()`, not `unwrap_err`: neither Ok payload is `Debug`.)
     for e in [
         AudioSession::copy_multi_segments(&mixed, &segs).err(),
@@ -258,6 +265,6 @@ fn a_source_without_the_timeline_audio_is_refused() {
         assert!(msg.contains("source 1"), "{msg}");
     }
     // An out-of-range index is an error, not a panic.
-    assert!(AudioSession::copy_multi_segments(&sources(), &[(2, 0.0, 1.0)]).is_err());
-    assert!(AudioSession::open_multi_segments(&sources(), &[(2, 0.0, 1.0)]).is_err());
+    assert!(AudioSession::copy_multi_segments(&sources(), &[(Some(2), 0.0, 1.0)]).is_err());
+    assert!(AudioSession::open_multi_segments(&sources(), &[(Some(2), 0.0, 1.0)]).is_err());
 }

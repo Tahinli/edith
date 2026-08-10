@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use engine::project::Lane;
 use engine::{DecodeSession, Frame, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
@@ -902,4 +903,100 @@ fn audio_runs_across_a_source_join() {
     // No EOS assertion: `run_for` takes a frame per 8 ms call, far faster than
     // real time, so the decoder may well have reached 9 s while the clock is at
     // 6 s (ledger; same reason `edits_keep_the_audio_clock` has none).
+}
+
+/// A hole in the video lane. Lifting a clip out of one lane leaves a *gap*
+/// rather than closing up, and a gap plays: the timeline keeps its length, the
+/// frame numbering stays contiguous straight through, and every picture over
+/// the hole is black. No audio needed, so this runs anywhere.
+#[test]
+fn a_video_gap_plays_black_without_shortening_the_timeline() {
+    let path = asset("test_baseline.mp4");
+    let mut session = PlaybackSession::open(&path).expect("open");
+    let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
+    let whole = session.timeline_duration();
+
+    assert!(session.cut_at(2.0), "split at 2 s");
+    assert!(session.cut_at(3.5), "split at 3.5 s");
+    assert!(
+        session.lift_clip(Lane::Video, 1),
+        "lift the middle picture out"
+    );
+    assert_eq!(
+        session.clip_spans().len(),
+        2,
+        "two placements, and a hole between them"
+    );
+    assert!(
+        (session.timeline_duration() - whole).abs() < 1e-9,
+        "a lift leaves a gap: the timeline is exactly as long as it was"
+    );
+
+    let (hole, hole_end) = ((2.0 * fps) as u32, (3.5 * fps) as u32);
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut expect, mut black, mut lit) = (0u32, 0u32, 0u32);
+    loop {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            assert_eq!(frame.index, expect, "timeline indices must be contiguous");
+            let is_black = frame.bgra.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]);
+            if (hole..hole_end).contains(&frame.index) {
+                assert!(is_black, "frame {} is inside the gap", frame.index);
+                black += 1;
+            } else {
+                lit += 1;
+            }
+            expect += 1;
+        }
+        if session.is_eos() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still draining after 20 s");
+        sleep(Duration::from_millis(4));
+    }
+    assert_eq!(expect, total, "the whole timeline, gap included");
+    assert_eq!(black, hole_end - hole, "every frame of the hole was black");
+    assert!(lit > 0, "and the clips around it still decoded");
+
+    // The gap is one undo step back to the clip that was there.
+    assert!(session.undo());
+    assert_eq!(session.clip_spans().len(), 3);
+}
+
+/// A hole in the *audio* lane, with the device running: the master clock counts
+/// samples the device has been fed, so silence has to be fed as real chunks or
+/// the timeline would stall on the hole. Needs a PipeWire daemon and the output
+/// plugin next to the test binary (`LD_LIBRARY_PATH=target/release`).
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn an_audio_gap_is_silent_and_the_clock_keeps_counting() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    assert!(session.cut_at(1.0), "split at 1 s");
+    assert!(session.cut_at(2.0), "split at 2 s");
+    // Silence over [1, 2) s while the picture plays on -- the two lanes part.
+    assert!(
+        session.lift_clip(Lane::Audio, 1),
+        "lift the middle sound out"
+    );
+    assert_eq!(session.clip_spans().len(), 3, "the video lane is untouched");
+    let duration = session.timeline_duration();
+
+    session.seek(0.0);
+    let mut last_index = None;
+    session.play();
+    // Straight across the hole: 2.4 s of wall time over a 1 s gap starting at
+    // 1 s, so a stall anywhere inside it cannot hide.
+    run_for(&mut session, &mut last_index, Duration::from_millis(2_400));
+    let now = session.now();
+    assert!(
+        now > 2.2 && now < duration,
+        "the clock stalled on the audio gap at {now:.3}s"
+    );
+    assert!(
+        last_index.map(|i| f64::from(i) > 2.0 * session.meta().frame_rate) == Some(true),
+        "pictures stopped over the silence: {last_index:?}"
+    );
+    eprintln!("audio gap: clock at {now:.3}s of {duration:.3}s, frame {last_index:?}");
 }

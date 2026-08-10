@@ -109,7 +109,7 @@ impl AudioSession {
         path: impl AsRef<Path>,
         segs: &[(f64, f64)],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        let segs: Vec<_> = segs.iter().map(|&(s, e)| (0, s, e)).collect();
+        let segs: Vec<_> = segs.iter().map(|&(s, e)| (Some(0), s, e)).collect();
         Self::open_multi_segments(&[path.as_ref().to_path_buf()], &segs)
     }
 
@@ -119,13 +119,18 @@ impl AudioSession {
     /// fresh either way. Each source contributes *its own* priming, packet table
     /// and length, which is the whole reason the resolution is per source.
     ///
+    /// A segment naming **no** source is a *gap*: that many seconds of silence
+    /// are synthesised into the stream as ordinary chunks. Real chunks, not a
+    /// pause — the master clock counts what the device has been fed, so a hole
+    /// that fed nothing would stall the whole timeline on it.
+    ///
     /// Only the sources some segment names are opened. `Ok(None)` when `sources`
     /// is empty or its first entry has no AAC track; a later source that is
     /// missing audio or disagrees on rate/layout is an `Err` — import refuses
     /// those up front (one timeline, one output device), this is the backstop.
     pub fn open_multi_segments(
         sources: &[PathBuf],
-        segs: &[(usize, f64, f64)],
+        segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let Some(first) = sources.first() else {
             return Ok(None);
@@ -147,6 +152,9 @@ impl AudioSession {
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
         tracks[0] = Some(first);
         for &(source, ..) in segs {
+            let Some(source) = source else {
+                continue; // a gap opens no file
+            };
             let slot = tracks
                 .get_mut(source)
                 .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))?;
@@ -171,18 +179,23 @@ impl AudioSession {
 
         let segments: Vec<Segment> = segs
             .iter()
-            .map(|&(source, start_secs, end_secs)| {
-                tracks[source]
+            .map(|&(source, start_secs, end_secs)| match source {
+                Some(source) => tracks[source]
                     .as_ref()
                     .expect("opened above")
-                    .segment(source, start_secs, end_secs)
+                    .segment(source, start_secs, end_secs),
+                None => Segment::silence(
+                    ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
+                ),
             })
             .collect();
         // Chunk numbering is continuous across every join, counted from the first
         // segment's audible start in its own source (see `open_segments`).
-        let timeline = segments.first().map_or(0, |s| {
-            s.media_target
-                .saturating_sub(tracks[s.source].as_ref().expect("opened above").priming)
+        let timeline = segments.first().map_or(0, |s| match s.source {
+            Some(source) => s
+                .media_target
+                .saturating_sub(tracks[source].as_ref().expect("opened above").priming),
+            None => 0,
         });
 
         // One AAC packet decodes to 1024 frames; at stereo f32 that is 8 KB, so
@@ -242,7 +255,7 @@ impl AudioSession {
         path: impl AsRef<Path>,
         segs: &[(f64, f64)],
     ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
-        let segs: Vec<_> = segs.iter().map(|&(s, e)| (0, s, e)).collect();
+        let segs: Vec<_> = segs.iter().map(|&(s, e)| (Some(0), s, e)).collect();
         Self::copy_multi_segments(&[path.as_ref().to_path_buf()], &segs)
     }
 
@@ -255,12 +268,26 @@ impl AudioSession {
     /// Every source must declare the same [`AacTrackParams`]: the copy becomes
     /// one output track with one esds. Import refuses a mismatch up front; the
     /// check here is the backstop, as is the missing-track `Err`.
+    ///
+    /// A segment naming **no** source is a gap. There is no AAC encoder here to
+    /// make silence with, so the gap is spent as *time* instead: its length is
+    /// added to the [`samples`](AacPacket::samples) of the packet next to it,
+    /// which is the duration the writer puts in the stts. Every packet after
+    /// the gap therefore still lands at its timeline position, so nothing
+    /// drifts out of lip sync, and a conforming reader renders the hole as
+    /// silence.
+    ///
+    /// ponytail: a gap at the *head* of the timeline has no packet before it to
+    /// lengthen, so its length goes on the first packet instead — that one
+    /// packet (23 ms) plays at zero rather than after the hole, and everything
+    /// from the second packet on is exact. Upgrade path is an empty `elst`
+    /// entry at the head of the audio track.
     pub fn copy_multi_segments(
         sources: &[PathBuf],
-        segs: &[(usize, f64, f64)],
+        segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
-        let Some(&(first, ..)) = segs.first() else {
-            return Ok(None);
+        let Some(&(Some(first), ..)) = segs.iter().find(|s| s.0.is_some()) else {
+            return Ok(None); // no segments, or nothing but silence
         };
         let path = sources
             .get(first)
@@ -273,8 +300,19 @@ impl AudioSession {
         tracks[first] = Some(track);
 
         let mut err = 0i64;
-        let mut packets = Vec::new();
-        for (i, &(source, start_secs, end_secs)) in segs.iter().enumerate() {
+        let mut packets: Vec<AacPacket> = Vec::new();
+        // Gap time with no packet in front of it to carry it: a leading gap,
+        // which the first packet written picks up (see the ponytail above).
+        let mut owed = 0u32;
+        for &(source, start_secs, end_secs) in segs {
+            let Some(source) = source else {
+                let len = ((end_secs - start_secs).max(0.0) * f64::from(params.sample_rate)) as u32;
+                match packets.last_mut() {
+                    Some(prev) => prev.samples += len,
+                    None => owed += len,
+                }
+                continue;
+            };
             let track = source_at(&mut tracks, sources, source)?;
             if track.track_params() != params {
                 return Err(format!(
@@ -289,7 +327,7 @@ impl AudioSession {
             let available = track.sample_count.saturating_sub(start_id - 1);
             // The head packet is the priming of the first segment only: a reader
             // drops exactly one, so an interior join must not add another.
-            let head = (i == 0 && start_id > 1).then(|| start_id - 1);
+            let head = (packets.is_empty() && start_id > 1).then(|| start_id - 1);
             let ids = head
                 .into_iter()
                 .chain(start_id..start_id + packet_run(&mut err, ideal, available));
@@ -303,6 +341,9 @@ impl AudioSession {
                     samples: SAMPLES_PER_PACKET,
                 });
             }
+        }
+        if let Some(first) = packets.first_mut() {
+            first.samples += owed;
         }
         Ok(Some((params, packets)))
     }
@@ -435,7 +476,7 @@ impl Track {
         // output is discarded below, so this only costs decode time.
         let (start_id, start_ts) = packet_at(self.stts.iter().copied(), target_ts, PRE_ROLL);
         Segment {
-            source,
+            source: Some(source),
             start_id,
             start_pos: scale(start_ts, self.sample_rate, self.timescale).unwrap_or(0),
             media_target,
@@ -586,11 +627,13 @@ fn packet_at(
     last
 }
 
-/// One window of a source to decode, resolved to media samples and packets.
+/// One window of a source to decode, resolved to media samples and packets —
+/// or, with no source, a stretch of synthesised silence.
 struct Segment {
     /// Index into the worker's tracks; the media positions below are that
-    /// source's, not the timeline's.
-    source: usize,
+    /// source's, not the timeline's. `None` for a gap, where only the length
+    /// (`media_end`) means anything.
+    source: Option<usize>,
     /// First packet to feed the decoder, 1-based; includes the pre-roll.
     start_id: u32,
     /// Media position of `start_id`'s first frame, in samples-per-channel.
@@ -600,6 +643,19 @@ struct Segment {
     media_target: u64,
     /// One past the last frame to emit; `u64::MAX` for "to the end of track".
     media_end: u64,
+}
+
+impl Segment {
+    /// `frames` per channel of silence — a gap in the audio lane.
+    fn silence(frames: u64) -> Self {
+        Self {
+            source: None,
+            start_id: 0,
+            start_pos: 0,
+            media_target: 0,
+            media_end: frames,
+        }
+    }
 }
 
 struct Worker {
@@ -621,7 +677,26 @@ fn run(mut w: Worker) {
     let segments = std::mem::take(&mut w.segments);
 
     for seg in &segments {
-        let Some(track) = w.tracks[seg.source].as_mut() else {
+        let Some(source) = seg.source else {
+            // A gap: hand the device real silence rather than nothing at all,
+            // in the same packet-sized chunks decoding produces, so `fed` and
+            // the master clock keep counting straight through the hole.
+            let mut left = seg.media_end;
+            while left > 0 {
+                let frames = left.min(u64::from(SAMPLES_PER_PACKET));
+                let chunk = AudioChunk {
+                    start_sample: timeline,
+                    samples: vec![0.0; frames as usize * channels],
+                };
+                if w.tx.send(chunk).is_err() {
+                    return; // caller moved on
+                }
+                timeline += frames;
+                left -= frames;
+            }
+            continue;
+        };
+        let Some(track) = w.tracks[source].as_mut() else {
             continue; // opener fills every named source; nothing to decode
         };
         let mut decoder = match AacDecoder::try_new(&track.params, &AudioDecoderOptions::default())

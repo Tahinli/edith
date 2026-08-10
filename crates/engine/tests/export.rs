@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
+use engine::project::Lane;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
@@ -183,7 +184,7 @@ fn two_sources() -> Project {
     let second = project.import(asset("test_av2.mp4"));
     assert_eq!(second, 1, "a second file is a second source");
     assert!(project.append_clip(second, av2.frame_count));
-    assert!(project.cut(120), "cut a second before the end of test_av");
+    assert!(project.split(120), "cut a second before the end of test_av");
     assert!(project.delete(1), "drop test_av's tail");
     assert_eq!(project.timeline_frames(), 120 + av2.frame_count);
     assert_eq!(
@@ -318,11 +319,11 @@ fn a_vanished_source_fails_the_export() {
 
     // Five frames of each: the export has to get going and then fail.
     let mut project = Project::single(&baseline, meta.frame_count);
-    assert!(project.cut(5));
+    assert!(project.split(5));
     assert!(project.delete(1));
     let second = project.import(&doomed);
     assert!(project.append_clip(second, meta.frame_count));
-    assert!(project.cut(10));
+    assert!(project.split(10));
     assert!(project.delete(2));
     assert_eq!(project.timeline_frames(), 10);
 
@@ -547,4 +548,75 @@ fn synthetic(index: u32, width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<
         vec![64u8.wrapping_add(index as u8); cw * ch],
         vec![192u8.wrapping_sub(index as u8); cw * ch],
     )
+}
+
+/// A timeline with a hole in each lane, exported. The video gap is encoded as
+/// black rather than skipped -- the file is as long as the timeline, frame for
+/// frame -- and the audio gap is spent as sample-table duration, so the audio
+/// track still covers the whole timeline inside the bresenham bound instead of
+/// ending a second early.
+#[test]
+fn exports_a_gapped_timeline_as_black_and_silence() {
+    pin_software();
+    let source = asset("test_av.mp4");
+    let mut session = PlaybackSession::open(&source).expect("open source");
+    assert!(session.cut_at(1.0), "split at 1 s");
+    assert!(session.cut_at(2.0), "split at 2 s");
+    // Lift the middle out of *both* lanes: one second of black and silence in
+    // the middle of a five-second timeline, with the length unchanged.
+    assert!(session.lift_clip(Lane::Video, 1));
+    assert!(session.lift_clip(Lane::Audio, 1));
+    session.pause();
+    let timeline = session.timeline_duration();
+    let frames = (timeline * FPS).round() as u32;
+    let out = out_path("gapped");
+
+    let handle = session.export_to(&out);
+    wait(&handle, Duration::from_secs(180)).expect("export");
+
+    // Every frame is there, and the ones over the hole are black.
+    let (video, _) = engine::demux::Demuxer::open(&out).unwrap();
+    assert_eq!(
+        video.frame_count, frames,
+        "a gap is encoded, not skipped: {} frames for a {timeline:.3}s timeline",
+        video.frame_count
+    );
+    let pictures = decode_all(&out);
+    assert_eq!(pictures.len() as u32, frames);
+    let (hole, hole_end) = ((1.0 * FPS) as usize, (2.0 * FPS) as usize);
+    // Encoded black, so not bit-exact: a mean absolute distance from true black
+    // well under one code value per channel is what "black" can mean here.
+    let black = [0u8, 0, 0, 255].repeat(pictures[0].len() / 4);
+    for (i, picture) in pictures.iter().enumerate() {
+        let diff = mean_abs_diff(picture, &black);
+        if (hole..hole_end).contains(&i) {
+            assert!(
+                diff < 4.0,
+                "frame {i} of the gap is not black (MAE {diff:.2})"
+            );
+        }
+    }
+    let lit = mean_abs_diff(&pictures[0], &black);
+    assert!(lit > 4.0, "the clips around the gap came out black too");
+
+    // The audio track still spans the whole timeline: the gap paid its way in
+    // stts duration, so nothing after it moved earlier.
+    let file = File::open(&out).unwrap();
+    let size = file.metadata().unwrap().len();
+    let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+    let track = &reader.tracks()[&2];
+    let duration = track.duration().as_secs_f64();
+    println!("gapped export: audio track {duration:.3}s for a {timeline:.3}s timeline");
+    assert!(
+        (duration - timeline).abs() < 3.0 * 1024.0 / 44_100.0,
+        "audio track is {duration:.3}s, timeline {timeline:.3}s"
+    );
+    // ...and the packets themselves cover only the audible four seconds, within
+    // the same half-packet-per-join bound the copier promises.
+    let packets = f64::from(reader.sample_count(2).expect("audio track") * 1024);
+    let audible = (timeline - 1.0) * 44_100.0;
+    assert!(
+        (packets - audible).abs() < 3.0 * 1024.0,
+        "{packets} samples copied for {audible} audible ones"
+    );
 }

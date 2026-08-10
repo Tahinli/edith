@@ -134,3 +134,114 @@ fn no_segments_ends_clean() {
         "an empty edit list decodes nothing"
     );
 }
+
+/// A segment naming no source is a gap, and a gap is *synthesised silence* in
+/// the same stream -- real chunks, contiguous with the audible ones (`drain`
+/// asserts that), so the master clock keeps counting through the hole instead
+/// of stalling on it.
+#[test]
+fn a_gap_segment_is_silence_of_its_own_length() {
+    let sources = [asset()];
+    let segs = [
+        (Some(0), 0.0, 0.5),
+        (None, 0.0, 1.0), // one second of hole
+        (Some(0), 2.0, 2.5),
+    ];
+    let (_, rx) = AudioSession::open_multi_segments(&sources, &segs)
+        .expect("open")
+        .expect("test_av.mp4 has an audio track");
+    let (samples, first, _) = drain(rx);
+    assert_eq!(first, 0, "the run still starts at audible zero");
+
+    let frames = samples.len() as u64 / CHANNELS as u64;
+    let want = 2 * RATE / 2 + RATE;
+    assert!(
+        frames.abs_diff(want) <= PACKET,
+        "{frames} frames for {want} asked for: a gap must cost exactly its length"
+    );
+    // The hole itself is digital silence, and what surrounds it is not.
+    let hole = (RATE / 2) as usize * CHANNELS..(RATE / 2 + RATE) as usize * CHANNELS;
+    assert!(
+        samples[hole.clone()].iter().all(|s| *s == 0.0),
+        "the gap must be silent"
+    );
+    assert!(
+        samples[..hole.start].iter().any(|s| s.abs() > 1e-3)
+            && samples[hole.end..].iter().any(|s| s.abs() > 1e-3),
+        "the clips around it must not be"
+    );
+
+    // Nothing but gap is a valid run of silence; the meta still comes from the
+    // source, because that is what the device was opened with.
+    let (meta, rx) = AudioSession::open_multi_segments(&sources, &[(None, 0.0, 0.25)])
+        .expect("open")
+        .expect("meta comes from source 0 even with nothing to decode");
+    assert_eq!(meta.sample_rate as u64, RATE);
+    let (samples, _, _) = drain(rx);
+    assert!(samples.iter().all(|s| *s == 0.0));
+    assert!(
+        (samples.len() as u64 / CHANNELS as u64).abs_diff(RATE / 4) <= PACKET,
+        "quarter second of silence"
+    );
+}
+
+/// The copy side of a gap: there is no AAC encoder here to make silence with,
+/// so the hole is spent as *duration* on the packet in front of it. Every
+/// packet after the gap therefore still lands at its timeline position.
+#[test]
+fn a_copied_gap_becomes_the_duration_of_the_packet_before_it() {
+    let sources = [asset()];
+    let plain = [(Some(0), 0.0, 1.0), (Some(0), 2.0, 3.0)];
+    let gapped = [(Some(0), 0.0, 1.0), (None, 0.0, 1.0), (Some(0), 2.0, 3.0)];
+
+    let (_, without) = AudioSession::copy_multi_segments(&sources, &plain)
+        .unwrap()
+        .unwrap();
+    let (_, with) = AudioSession::copy_multi_segments(&sources, &gapped)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        with.len(),
+        without.len(),
+        "a gap copies no packets: there is nothing in it"
+    );
+    let total = |p: &[engine::AacPacket]| p.iter().map(|p| u64::from(p.samples)).sum::<u64>();
+    assert_eq!(
+        total(&with) - total(&without),
+        RATE,
+        "...it costs exactly its own second of stts duration"
+    );
+    // Exactly one packet grew, and it is an interior one -- the last before
+    // the hole -- so every packet after the hole is pushed to where the
+    // timeline wants it rather than the whole tail drifting early.
+    let grown: Vec<usize> = with
+        .iter()
+        .zip(&without)
+        .enumerate()
+        .filter(|(_, (a, b))| a.samples != b.samples)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(grown.len(), 1, "one packet carries the whole gap");
+    assert!(
+        grown[0] > 0 && grown[0] < with.len() - 1,
+        "the gap rides on an interior packet, at {} of {}",
+        grown[0],
+        with.len()
+    );
+    assert!(
+        with.iter().zip(&without).all(|(a, b)| a.bytes == b.bytes),
+        "and not one byte of audio moved"
+    );
+
+    // A gap at the *head* has no packet before it: the first one picks it up
+    // (the documented ponytail), so nothing but that packet is misplaced.
+    let (_, leading) =
+        AudioSession::copy_multi_segments(&sources, &[(None, 0.0, 0.5), (Some(0), 0.0, 1.0)])
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        u64::from(leading[0].samples),
+        1024 + RATE / 2,
+        "the head gap rides on the first packet"
+    );
+}
