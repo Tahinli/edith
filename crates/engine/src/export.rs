@@ -31,7 +31,7 @@ use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
-use crate::project::Project;
+use crate::project::{LaneKind, Project};
 use crate::scale::Composer;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
@@ -173,10 +173,20 @@ pub fn start(
         // left to write a file of no frames that nothing opens. Every caller of
         // `start` comes through this, the app's own door
         // (`PlaybackSession::is_empty`) being only the first fence.
+        //
+        // An audio-only timeline is the other legal project no mp4 can be made
+        // of: every frame of it is a gap, so the file would be black picture
+        // over the sound -- minutes of encoding for a video of nothing. Refused
+        // by name, with the two formats that *are* that timeline, rather than
+        // written; the app says the same on the format row before a destination
+        // is even picked (`mp4_refusal`).
         let written = match settings.format {
             _ if project.timeline_frames() == 0 => {
                 Err("the timeline is empty: there is nothing to export".into())
             }
+            Format::Mp4 if !has_picture(&project) => Err("the timeline has no picture: \
+                 an mp4 would be black. Export WAV or FLAC, which are the sound itself"
+                .into()),
             Format::Mp4 => run(&project, &meta, &part, &worker, &settings),
             format => run_audio(&project, &meta, &part, &worker, format),
         };
@@ -191,6 +201,17 @@ pub fn start(
         settle(&shared, Err(e.into()));
     }
     ExportHandle { shared }
+}
+
+/// Whether any video lane holds anything at all -- what tells an audio-only
+/// timeline from one that merely opens on a gap. Asked of the *lanes* rather
+/// than of the sources, because a project may name a video file no clip plays
+/// from any more.
+fn has_picture(project: &Project) -> bool {
+    project
+        .lanes()
+        .into_iter()
+        .any(|lane| lane.kind == LaneKind::Video && !project.lane(lane).is_empty())
 }
 
 fn settle(shared: &Shared, result: crate::Result<()>) {
