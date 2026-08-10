@@ -1205,6 +1205,16 @@ impl Player {
         }) else {
             return;
         };
+        // A still is asked *before* the decoder is: handing a png to the mp4
+        // demuxer answers "a box with a larger size than it", which is a true
+        // sentence about a container and nothing a person can act on. A picture
+        // has no sound for the same reason a silent video has none, so it is
+        // refused in the same words.
+        if engine::is_image(&source.path) {
+            self.silence_open = None;
+            self.notice = Some(unscannable(lane, idx, &source.path).into());
+            return;
+        }
         let cached = self
             .silence_levels
             .as_ref()
@@ -1224,15 +1234,7 @@ impl Player {
                 // knows which one it meant.
                 Ok(None) => {
                     self.silence_open = None;
-                    self.notice = Some(
-                        format!(
-                            "{} clip {} has no audio to scan — {} is silent",
-                            lane.label(),
-                            idx + 1,
-                            file_name(&source.path)
-                        )
-                        .into(),
-                    );
+                    self.notice = Some(unscannable(lane, idx, &source.path).into());
                     return;
                 }
                 Err(e) => {
@@ -5833,6 +5835,27 @@ enum ColorKey {
     Reset,
 }
 
+/// Why the silence card has nothing to scan on that clip, in its own voice: the
+/// lane and index the user picked, the file it is of, and which of the two
+/// soundless things it is. One place, because a still and a silent video are
+/// the same answer to the same question -- "a box with a larger size than it"
+/// is what the *demuxer* would say about a png, and it is not an answer.
+///
+/// Costs nothing: the scan reads a file and writes marks, so a refusal here
+/// leaves the project (and its undo history) exactly where it was.
+fn unscannable(lane: Lane, idx: usize, path: &Path) -> String {
+    let what = match engine::is_image(path) {
+        true => "is a picture",
+        false => "is silent",
+    };
+    format!(
+        "{} clip {} has no audio to scan — {} {what}",
+        lane.label(),
+        idx + 1,
+        file_name(path)
+    )
+}
+
 /// The half of a take whose *sound* the silence card scans: a link is one span
 /// on however many lanes, so a card opened on the picture opens on the sound it
 /// is grouped with. That is the lane the waveform is drawn on, and so the lane
@@ -6592,7 +6615,7 @@ mod tests {
         silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
         unseen_sources, whole_take, width_frac, window_title,
     };
-    use super::{file_name, file_uri, library_rows};
+    use super::{LaneKind, file_name, file_uri, library_rows, unscannable};
 
     /// What the file manager is handed: the parts a path keeps as they are, and
     /// the ones the bus would otherwise read as something else.
@@ -8076,6 +8099,28 @@ mod tests {
         assert_eq!(push_digit(99, 9), 99);
         // Never past what the clamp can take back to a real bitrate.
         assert!(u64::from(push_digit(99, 9)) * 1_000_000 < u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn a_clip_with_no_sound_is_refused_in_the_same_words_whichever_kind_it_is() {
+        // A still and a video with no audio track are one answer to one
+        // question: the lane and index that were picked, the file, and which of
+        // the two soundless things it is. What must never reach the bar is the
+        // demuxer's own words -- a png handed to the mp4 reader answers "a box
+        // with a larger size than it", which is true of a container and useless
+        // to a person.
+        assert_eq!(
+            unscannable(Lane::V1, 1, std::path::Path::new("/tmp/shot.png")),
+            "V1 clip 2 has no audio to scan — shot.png is a picture"
+        );
+        assert_eq!(
+            unscannable(
+                Lane::new(LaneKind::Audio, 1),
+                0,
+                std::path::Path::new("/tmp/test_baseline.mp4")
+            ),
+            "A2 clip 1 has no audio to scan — test_baseline.mp4 is silent"
+        );
     }
 
     #[test]
