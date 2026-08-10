@@ -85,6 +85,20 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx265 -tag:v hev1 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_hevc.mp4
+# AV1 fixture, and the only Matroska one: `mp4 0.14` has no `av01` sample entry
+# at all, so AV1 is read out of an mkv (`demux::MkvDemuxer`). Same A/V shape as
+# the others so the tests measure the codec and nothing else -- but `-g 30` is
+# not a preference: it puts a second keyframe at frame 30, which is what the
+# sync index and the seek test are checked against. 8-bit Main profile, because
+# the plugin's NV12 read-back cannot carry 10-bit. Its AAC track is deliberate
+# too: Matroska audio is not wired to the decoder yet, and the notice that says
+# so needs a track to name.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_av1.mkv
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
