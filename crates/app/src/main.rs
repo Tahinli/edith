@@ -389,9 +389,10 @@ fn speed_at(permille: i32) -> Speed {
 }
 
 /// The silence card's rows, in the order it lists them: how wide the apply
-/// reaches, the four settings a scan is told, and the rate the speed-up plays
-/// at. What `silence_field` indexes and what [`Player::nudge_silence`] moves.
-const SILENCE_ROWS: usize = 6;
+/// reaches, the threshold and the unit it is read in, the three durations a
+/// scan is told, and the rate the speed-up plays at. What `silence_field`
+/// indexes and what [`Player::nudge_silence`] moves.
+const SILENCE_ROWS: usize = 7;
 
 /// How wide a jumpcut reaches. A ripple used to be the whole timeline's
 /// business and nothing else; it is a *choice* now, because a podcast track's
@@ -439,9 +440,12 @@ const SILENCE_DB_STEP: f32 = 1.;
 const SILENCE_SECS_STEP: f64 = 0.05;
 
 /// How far each of them may be pushed. UI decisions, all of them: the engine
-/// takes any finite number, but a threshold at 0 dBFS calls a whole take silent
-/// and a forgiveness of ten seconds finds nothing in a talking head.
-const SILENCE_DB_RANGE: (f32, f32) = (-80., -10.);
+/// takes any finite number, but a forgiveness of ten seconds finds nothing in a
+/// talking head. The threshold reaches full scale, which calls a whole take
+/// silent -- that is a thing someone may want to ask for (the preview on the
+/// lane says what it would cost before anything is cut), so the top is 0 rather
+/// than a number this card picked for them.
+const SILENCE_DB_RANGE: (f32, f32) = (-80., 0.);
 const SILENCE_SECS_RANGE: (f64, f64) = (0., 5.);
 
 /// The speed-up rate is bounded *below* by real time: a "speed-up" that slows
@@ -688,6 +692,14 @@ struct Player {
     /// Which of the card's [`SILENCE_ROWS`] the arrow keys move. The card's own
     /// focus, since nothing in it takes gpui's (ledger:182).
     silence_field: usize,
+    /// Whether the threshold is *labelled* dBFS or dB. Display only, and the
+    /// number is the same either way: the setting is a level below full scale,
+    /// so 0 is the loudest sample a file can hold and -40 is forty decibels
+    /// under it -- "dBFS" names that reference out loud, "dB" leaves it unsaid.
+    /// No conversion is hiding behind the row (there is no reference here worth
+    /// inventing, and a made-up SPL would be a lie about what was measured);
+    /// what it changes is which of the two spellings a person reads.
+    silence_dbfs: bool,
     /// What the last scan found, in timeline frames: what the lane draws marks
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
@@ -1350,9 +1362,12 @@ impl Player {
                     + steps as f32 * SILENCE_DB_STEP)
                     .clamp(SILENCE_DB_RANGE.0, SILENCE_DB_RANGE.1)
             }
-            2 => self.silence.min_silence = secs(self.silence.min_silence),
-            3 => self.silence.padding = secs(self.silence.padding),
-            4 => self.silence.min_keep = secs(self.silence.min_keep),
+            // Two spellings of the same level, so either arrow flips it -- a
+            // ring of two, like the scope row's.
+            2 => self.silence_dbfs = !self.silence_dbfs,
+            3 => self.silence.min_silence = secs(self.silence.min_silence),
+            4 => self.silence.padding = secs(self.silence.padding),
+            5 => self.silence.min_keep = secs(self.silence.min_keep),
             _ => {
                 self.silence_factor =
                     silence_rate(i32::from(self.silence_factor.permille()) + steps * SPEED_STEP)
@@ -1503,6 +1518,29 @@ impl Player {
             || self.speed_open.is_some()
             || self.silence_open.is_some()
             || self.exporting().is_some()
+    }
+
+    /// Which of [`Repeat`]'s three the window is in, for the hold gate at the
+    /// top of the key handler. Not [`Player::modal`]: that asks whether an
+    /// overlay is up at all, and here the cards with sliders in them are
+    /// exactly the ones that answer differently from the keys menu and the
+    /// export card.
+    fn repeat_scope(&self) -> Repeat {
+        if self.rebinding.is_some()
+            || self.keys_open
+            || self.export_open
+            || self.exporting().is_some()
+        {
+            Repeat::Nothing
+        } else if self.eq_open.is_some()
+            || self.color_open.is_some()
+            || self.speed_open.is_some()
+            || self.silence_open.is_some()
+        {
+            Repeat::Card
+        } else {
+            Repeat::Keymap
+        }
     }
 
     /// Opens the equalizer on the selected clip. Audio only, and it says so
@@ -2792,9 +2830,19 @@ impl Render for Player {
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                // `is_held` filters auto-repeat, which would otherwise toggle
-                // playback -- or cut the timeline -- many times a second.
-                if event.is_held {
+                let key = event.keystroke.key.as_str();
+                let ctrl = event.keystroke.modifiers.control;
+                // `is_held` is the auto-repeat, and a value is the one thing
+                // worth running on it: a held arrow on a card moves the slider
+                // it picked, and a held volume key runs the volume. Everything
+                // else is filtered exactly as it always was -- a repeat that
+                // toggled playback, or cut the timeline, many times a second is
+                // what this guard is for, and a row waiting for a stroke takes
+                // none of it either (it would bind the key, then fire what it
+                // just bound). See [`repeats`].
+                if event.is_held
+                    && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl))
+                {
                     return;
                 }
                 // Any key retires the last message, whatever it was -- and owes
@@ -2804,7 +2852,6 @@ impl Render for Player {
                 if this.notice.take().is_some() {
                     cx.notify();
                 }
-                let key = event.keystroke.key.as_str();
                 // A row is waiting for a stroke, and while it is, that stroke is
                 // data: it means the binding and nothing else, which is why this
                 // answers before the export guard and before the keymap is
@@ -2813,7 +2860,7 @@ impl Render for Player {
                     if key == ESCAPE {
                         this.rebinding = None;
                     } else if !is_bare_modifier(key) {
-                        this.capture(action, key, event.keystroke.modifiers.control);
+                        this.capture(action, key, ctrl);
                     }
                     cx.notify();
                     return;
@@ -2822,7 +2869,7 @@ impl Render for Player {
                 // control modifier set (the control code is mapped back), which
                 // is why the keymap is keyed on the pair and never on the key
                 // alone.
-                let action = this.keymap.lookup(key, event.keystroke.modifiers.control);
+                let action = this.keymap.lookup(key, ctrl);
                 // An export is reading the edit list every other action here
                 // would change, so cancelling is the only one that means
                 // anything until it is over.
@@ -4658,9 +4705,19 @@ impl Player {
     fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let cfg = self.silence;
+        // The unit is a label, never a conversion: the threshold is a level
+        // below full scale whichever of the two the row says (`silence_dbfs`).
+        let unit = match self.silence_dbfs {
+            true => "dBFS",
+            false => "dB",
+        };
         let rows = [
             ("Apply to", self.silence_scope.label(&self.silence_lanes())),
-            ("Silence is under", format!("{:.0} dBFS", cfg.threshold_db)),
+            (
+                "Silence is under",
+                format!("{:.0} {unit}", cfg.threshold_db),
+            ),
+            ("Level read in", format!("{unit} (0 = full scale)")),
             (
                 "Forgive quiet shorter than",
                 format!("{:.2} s", cfg.min_silence),
@@ -4759,7 +4816,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "↑↓ picks a setting, ←→ moves it — the marks on the lane are what would go; esc closes",
+                                    "↑↓ picks a setting, ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
                                 ),
                         )
                         .children(rows)
@@ -6252,6 +6309,39 @@ fn cancels_export(key: &str, action: Option<ActionId>) -> bool {
     key == ESCAPE || action == Some(ActionId::CancelExport)
 }
 
+/// Where a held key would land, which is the whole of what auto-repeat has to
+/// know. [`Player::repeat_scope`] answers it from the same state the handler
+/// walks below itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Repeat {
+    /// A card with values in it owns the keyboard: equalizer, colour, speed or
+    /// silence. Its arrows are sliders.
+    Card,
+    /// Nobody does, so the keymap answers -- and only one pair of its actions
+    /// is a value being moved rather than a thing being done once.
+    Keymap,
+    /// A stroke is being captured, an export is running, or an overlay with no
+    /// value in it is up. Nothing there is worth a repeat.
+    Nothing,
+}
+
+/// Whether a *held* stroke means it again. One press is always one action; a
+/// hold is only ever a value running, so this is what tells the two apart.
+///
+/// The cards' arrows, because that is what every one of them moves a slider
+/// with -- and only the arrows, so the equalizer's `r` cannot flatten five
+/// bands forty times a second and the silence card's `enter` cannot cut forty
+/// places again on the next tick. Outside a card the volume pair and nothing
+/// else: play, cut, delete, save, export and every other binding is a one-shot,
+/// exactly as it was when the handler filtered every held key alike.
+fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> bool {
+    match scope {
+        Repeat::Card => matches!(key, "up" | "down" | "left" | "right"),
+        Repeat::Keymap => matches!(action, Some(ActionId::VolumeUp | ActionId::VolumeDown)),
+        Repeat::Nothing => false,
+    }
+}
+
 /// The keys that are only ever half a chord. gpui delivers a lone modifier
 /// press as a keystroke of its own, and taking one as a binding would leave an
 /// action that fires the moment the user reaches for any chord that uses it --
@@ -6882,7 +6972,7 @@ mod tests {
         silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
         nothing_to_play, unseen_sources, whole_take, width_frac, window_title,
     };
-    use super::{LaneKind, file_name, file_uri, library_rows, unscannable};
+    use super::{LaneKind, Repeat, file_name, file_uri, library_rows, repeats, unscannable};
 
     /// What the file manager is handed: the parts a path keeps as they are, and
     /// the ones the bus would otherwise read as something else.
@@ -8390,11 +8480,47 @@ mod tests {
         );
     }
 
+    /// The hold gate: a value runs, everything else still means one press one
+    /// action -- which is the whole invariant the blanket `is_held` filter used
+    /// to carry on its own.
+    #[test]
+    fn a_held_key_moves_a_value_and_nothing_else() {
+        use keymap::ActionId;
+        // A card's four arrows, whichever card it is.
+        for key in ["up", "down", "left", "right"] {
+            assert!(repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // The card's own one-shots: flatten every band, cut forty places, play
+        // them fast, close. None of them on a hold.
+        for key in ["r", "enter", "f", "1", "escape"] {
+            assert!(!repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // Outside a card the keymap answers, and only the volume pair is a
+        // value being moved.
+        assert!(repeats(Repeat::Keymap, "up", Some(ActionId::VolumeUp)));
+        assert!(repeats(Repeat::Keymap, "down", Some(ActionId::VolumeDown)));
+        for action in ActionId::ALL {
+            let held = repeats(Repeat::Keymap, "k", Some(action));
+            assert_eq!(
+                held,
+                matches!(action, ActionId::VolumeUp | ActionId::VolumeDown),
+                "{action:?} on a hold"
+            );
+        }
+        // An arrow with nothing bound to it moves nothing on the timeline.
+        assert!(!repeats(Repeat::Keymap, "left", None));
+        // And a stroke being captured, an export, or the overlays: nothing at
+        // all, or the hold would bind a key and then fire what it just bound.
+        for key in ["up", "left", "escape", "5"] {
+            assert!(!repeats(Repeat::Nothing, key, Some(ActionId::VolumeUp)));
+        }
+    }
+
     #[test]
     fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
         // The same 640x360 floor, and this card starts below the header: a
-        // title and a hint over its five rows, the count line and the two
-        // buttons.
+        // title and a hint over its [`SILENCE_ROWS`] rows, the count line and
+        // the two buttons.
         let (title, hint, count) = (17., 17., 17.);
         let gaps = 6. * 5.;
         let padding = 24.;
@@ -9004,6 +9130,9 @@ fn main() {
                     // one a person can widen on purpose.
                     silence_scope: Scope::Take,
                     silence_field: 0,
+                    // The reference named, which is what the card said before
+                    // there was a choice about it.
+                    silence_dbfs: true,
                     silence_marks: Vec::new(),
                     silence_levels: None,
                     color_open: None,
