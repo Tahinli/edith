@@ -131,15 +131,15 @@ fn a_song_joins_a_video_timeline_on_the_audio_lane() {
     assert_eq!(session.sources().len(), 2);
     // The video lane never hears about it: one clip, the one the file opened
     // with. The audio lane has two.
-    assert_eq!(session.lane_clips(Lane::Video).len(), 1, "video lane");
-    assert_eq!(session.lane_clips(Lane::Audio).len(), 2, "audio lane");
-    let song = session.lane_clips(Lane::Audio)[1];
+    assert_eq!(session.lane_clips(Lane::V1).len(), 1, "video lane");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2, "audio lane");
+    let song = session.lane_clips(Lane::A1)[1];
     assert_eq!((song.source, song.in_frame, song.len()), (1, 0, 90));
 
     // And it plays: the segment list past the join names the song, so the
     // worker opens it rather than running silent.
     session.seek(before + 1.0);
-    assert!(session.lane_spans_by_source(Lane::Audio).len() >= 2);
+    assert!(session.lane_spans_by_source(Lane::A1).len() >= 2);
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn a_rate_the_device_cannot_mix_is_refused_at_the_door() {
     );
     // Refused means unchanged: no source, no clip, no length.
     assert_eq!(session.sources().len(), 1);
-    assert_eq!(session.lane_clips(Lane::Audio).len(), 1);
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
 }
 
 #[test]
@@ -198,9 +198,9 @@ fn a_song_survives_a_save_and_a_reload() {
     session.import(&copy("test_tone.flac")).expect("import");
     // And one placed at the playhead, the way a library row dropped on the
     // audio lane arrives -- so the reload has both doors to restore.
-    let song = session.lane_clips(Lane::Audio)[1];
+    let song = session.lane_clips(Lane::A1)[1];
     assert!(session.place_at(
-        Lane::Audio,
+        Lane::A1,
         1.0,
         Clip {
             in_frame: 0,
@@ -209,7 +209,7 @@ fn a_song_survives_a_save_and_a_reload() {
         }
     ));
     let before = (
-        session.lane_spans_by_source(Lane::Audio),
+        session.lane_spans_by_source(Lane::A1),
         session.sources().to_vec(),
         session.timeline_duration(),
     );
@@ -221,7 +221,7 @@ fn a_song_survives_a_save_and_a_reload() {
     reloaded.set_gain(0.0);
     assert_eq!(
         (
-            reloaded.lane_spans_by_source(Lane::Audio),
+            reloaded.lane_spans_by_source(Lane::A1),
             reloaded.sources().to_vec(),
             reloaded.timeline_duration()
         ),
