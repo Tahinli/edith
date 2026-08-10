@@ -23,7 +23,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
-use crate::project::{Clip, Project};
+use crate::project::{Clip, Lane, Project, Span};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -104,12 +104,13 @@ pub struct PlaybackSession {
     /// The edit list. Everything a caller says in seconds is a *timeline*
     /// position; only this maps it onto the file.
     project: Project,
-    /// Source range the current decode worker was opened for, and where that
-    /// range starts on the timeline -- together they rewrite a source frame
-    /// index into a timeline one. Not a clip index: a `cut` splits the clip
-    /// under a running worker, and only the mapping survives that.
-    range: Clip,
-    timeline_start: u32,
+    /// What the current video worker was opened for: where it sits on the
+    /// timeline, how long it runs, and which source frame it started at --
+    /// together they rewrite a source frame index into a timeline one. Not a
+    /// clip index: a `split` cuts the clip under a running worker, and only the
+    /// mapping survives that. A span with no source is a *gap*, and the worker
+    /// feeding it emits black frames indexed from zero.
+    span: Span,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
 }
@@ -127,10 +128,10 @@ impl PlaybackSession {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
         };
-        // One clip covering the file, so timeline == source until the first
-        // edit -- and the range opened above is exactly that clip's.
+        // One clip per lane covering the file, so timeline == source until the
+        // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
-        let range = project.clips()[0];
+        let span = project.span_at(Lane::Video, 0).expect("never empty");
         Ok(Self {
             meta,
             frames,
@@ -139,8 +140,7 @@ impl PlaybackSession {
             clock: PlaybackClock::new(source),
             audio,
             project,
-            range,
-            timeline_start: 0,
+            span,
             eos: false,
         })
     }
@@ -178,7 +178,7 @@ impl PlaybackSession {
                 .map_err(|e| format!("source {}: {e}", source.display()))?;
             counts.push(other.frame_count);
         }
-        for (i, clip) in doc.clips.iter().enumerate() {
+        for (i, clip) in doc.video.iter().chain(&doc.audio).enumerate() {
             if clip.out_frame > counts[clip.source] {
                 return Err(format!(
                     "clip {i} ends at frame {} but {} has {} frames",
@@ -191,9 +191,9 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.clips)
+        let project = Project::from_parts(doc.sources, doc.video, doc.audio)
             .ok_or("the project's clips do not fit its sources")?;
-        let range = project.clips()[0];
+        let span = project.span_at(Lane::Video, 0).expect("never empty");
         let mut session = Self {
             meta,
             frames,
@@ -205,8 +205,7 @@ impl PlaybackSession {
             }),
             audio,
             project,
-            range,
-            timeline_start: 0,
+            span,
             eos: false,
         };
         // The scaffolding above opened source 0 from its first frame and the
@@ -232,10 +231,10 @@ impl PlaybackSession {
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
-        let (sources, clips) = self.project.without_orphan_sources();
+        let (sources, video, audio) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
-        crate::edith::save(path, &sources, &clips, playhead)
+        crate::edith::save(path, &sources, &video, &audio, playhead)
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a
@@ -249,8 +248,10 @@ impl PlaybackSession {
         loop {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
-                    frame.index =
-                        self.timeline_start + frame.index.saturating_sub(self.range.in_frame);
+                    // A gap's worker indexes from zero, a decoder's from its in
+                    // point: `base` is whichever this span started at.
+                    let base = self.span.from.map_or(0, |(_, in_frame)| in_frame);
+                    frame.index = self.span.start + frame.index.saturating_sub(base);
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -287,39 +288,53 @@ impl PlaybackSession {
         self.retired.retain(|w| !w.is_finished());
     }
 
-    /// Starts decoding whatever follows the current range on the timeline;
-    /// `false` past the end. The next timeline frame is derived rather than
-    /// remembered as a clip index, because a `cut` while playing splits the
+    /// Starts feeding whatever follows the current span on the timeline --
+    /// another clip, or a gap, which is black frames from a worker that opens no
+    /// file. `false` past the end. The next timeline frame is derived rather
+    /// than remembered as a clip index, because a `split` while playing cuts the
     /// clip under the running worker and only the mapping stays true.
     fn next_clip(&mut self) -> bool {
-        let next = self.timeline_start + self.range.len();
-        let Some((idx, source)) = self.project.map_timeline(next) else {
+        let next = self.span.end();
+        let Some(span) = self.project.span_at(Lane::Video, next) else {
             return false;
         };
-        let clip = self.project.clips()[idx];
-        let out = clip.out_frame;
         // We only get here on a disconnect, so the old worker has already
         // returned; cancel anyway, so `retire` treats every path alike.
         self.worker.cancel();
-        match DecodeSession::open_worker(&self.project.sources()[clip.source], source, out) {
-            Ok((_, frames, worker)) => {
-                // Receiver first, worker second: the drop of the old receiver
-                // is what wakes a worker parked in `send`, and only then can it
-                // return and be reaped by a later sweep.
-                self.frames = frames;
-                self.retire(worker);
-            }
-            // Disappearing-file case, as in `seek`. The old receiver is still
-            // disconnected, so the next pass moves on to the clip after this.
-            Err(e) => eprintln!("clip at timeline frame {next}: video open failed: {e}"),
-        }
-        self.range = Clip {
-            in_frame: source,
-            out_frame: out,
-            ..clip
-        };
-        self.timeline_start = next;
+        self.start_span(span);
         true
+    }
+
+    /// Points the video worker at `span`: a decoder over its source range, or a
+    /// black-frame generator for a gap. The old worker must already have been
+    /// cancelled -- this is the half both `seek` and `next_clip` share.
+    ///
+    /// A source that will not open leaves the *span* installed anyway: the
+    /// timeline still moves, there are simply no more pictures, and the
+    /// disconnected receiver carries the session on to the next span.
+    fn start_span(&mut self, span: Span) {
+        let opened = match span.from {
+            Some((source, in_frame)) => DecodeSession::open_worker(
+                &self.project.sources()[source],
+                in_frame,
+                in_frame + span.len,
+            )
+            .map(|(_, frames, worker)| (frames, worker))
+            .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
+            None => Ok(DecodeSession::open_black(
+                self.meta.width,
+                self.meta.height,
+                span.len,
+            )),
+        };
+        if let Ok((frames, worker)) = opened {
+            // Receiver first, worker second: the drop of the old receiver is
+            // what wakes a worker parked in `send`, and only then can it return
+            // and be reaped by a later sweep.
+            self.frames = frames;
+            self.retire(worker);
+        }
+        self.span = span;
     }
 
     /// Length of the edited timeline in seconds -- what a ruler shows, and it
@@ -343,20 +358,46 @@ impl PlaybackSession {
     /// [`Project::sources`] each clip plays from -- what a lane needs to colour
     /// an imported clip differently from the file the session was opened with.
     pub fn clip_spans_by_source(&self) -> Vec<(f64, f64, usize)> {
-        self.clip_spans()
-            .into_iter()
-            .zip(self.project.clips())
-            .map(|((start, len), clip)| (start, len, clip.source))
+        self.lane_spans_by_source(Lane::Video)
+    }
+
+    /// [`clip_spans_by_source`](Self::clip_spans_by_source) for either lane,
+    /// with each clip's group id -- what a two-lane front-end draws. The holes
+    /// between consecutive entries are the gaps.
+    pub fn lane_spans_by_source(&self, lane: Lane) -> Vec<(f64, f64, usize)> {
+        let fps = self.meta.frame_rate;
+        self.project
+            .lane(lane)
+            .iter()
+            .map(|c| (f64::from(c.start) / fps, f64::from(c.len()) / fps, c.source))
             .collect()
     }
 
-    /// Splits the clip under `timeline_secs` in two. Metadata only: a cut never
-    /// changes the timeline->source mapping, so the running decoder stays
-    /// correct and playback does not blink. `false` at a clip start or past the
-    /// end, where there would be nothing to split off.
+    /// Splits every lane at `timeline_secs`, so the two sides become two
+    /// groups. Metadata only: a split never changes the timeline->source
+    /// mapping, so the running decoder stays correct and playback does not
+    /// blink. `false` at a clip start, in a gap and past the end, where there
+    /// would be nothing to split off.
     pub fn cut_at(&mut self, timeline_secs: f64) -> bool {
         self.project
-            .cut(secs_to_frame(timeline_secs, self.meta.frame_rate))
+            .split(secs_to_frame(timeline_secs, self.meta.frame_rate))
+    }
+
+    /// The inverse of [`cut_at`](Self::cut_at): rejoins the clips that meet at
+    /// `timeline_secs` in every lane and puts them back in one group. `false`
+    /// unless a split could have produced what is there. Metadata only, like the
+    /// split -- no reseek.
+    pub fn regroup_at(&mut self, timeline_secs: f64) -> bool {
+        self.project
+            .regroup(secs_to_frame(timeline_secs, self.meta.frame_rate))
+    }
+
+    /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
+    /// silence on the audio one, and nothing else moves. Reseeks, because what
+    /// the playhead sits on has changed. `false` for a bad index and for the
+    /// lift that would leave the whole timeline empty.
+    pub fn lift_clip(&mut self, lane: Lane, idx: usize) -> bool {
+        self.edit(|p| p.lift(lane, idx))
     }
 
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
@@ -374,14 +415,16 @@ impl PlaybackSession {
         self.edit(|p| p.paste(at, clip))
     }
 
-    /// Removes a clip and closes the gap. Unlike a cut this *does* move every
-    /// following frame, so the session reseeks to wherever the playhead now
-    /// points. `false` for a bad index or the last remaining clip.
+    /// Removes the video clip at `idx` and everything under it, closing the gap
+    /// on every lane. Unlike a split this *does* move every following frame, so
+    /// the session reseeks to wherever the playhead now points.
+    /// [`lift_clip`](Self::lift_clip) is the one that leaves a hole instead.
+    /// `false` for a bad index or the last remaining clip.
     pub fn delete_clip(&mut self, idx: usize) -> bool {
         self.edit(|p| p.delete(idx))
     }
 
-    /// Undoes the last successful cut or delete, and reseeks like a delete.
+    /// Undoes the last successful edit, and reseeks like a delete.
     pub fn undo(&mut self) -> bool {
         self.edit(Project::undo)
     }
@@ -495,28 +538,11 @@ impl PlaybackSession {
         // [`retire`](Self::retire), which is what keeps a scrub off the price
         // of a VA-API init.
         self.worker.cancel();
-        // `target` is inside the timeline (never empty), so this always maps;
-        // the range runs from there to the end of the clip it landed in.
-        if let Some((idx, source)) = self.project.map_timeline(target) {
-            let clip = self.project.clips()[idx];
-            let out = clip.out_frame;
-            match DecodeSession::open_worker(&self.project.sources()[clip.source], source, out) {
-                Ok((_, frames, worker)) => {
-                    // Receiver first, worker second -- see `next_clip`.
-                    self.frames = frames;
-                    self.retire(worker);
-                }
-                // The file opened once already, so this is a disappearing-file
-                // case: the timeline still moves, there are simply no more
-                // pictures.
-                Err(e) => eprintln!("seek: video reopen failed: {e}"),
-            }
-            self.range = Clip {
-                in_frame: source,
-                out_frame: out,
-                ..clip
-            };
-            self.timeline_start = target;
+        // `target` is inside the timeline (never empty), so this always spans;
+        // the span runs from there to the end of whatever it landed in -- a
+        // clip, or a gap, which starts a black-frame worker instead.
+        if let Some(span) = self.project.span_at(Lane::Video, target) {
+            self.start_span(span);
         }
         self.eos = false;
 
