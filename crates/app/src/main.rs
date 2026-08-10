@@ -60,12 +60,78 @@ const TIME_W: f32 = 200.;
 /// 360 px tall window. The rows are click targets, so `HIT_MIN` binds them too.
 const KEYS_W: f32 = 320.;
 const KEYS_ROW_H: f32 = HIT_MIN;
+/// How much of the row list is on screen at once; past this it scrolls. What
+/// keeps the card inside the smallest window no matter how many actions the
+/// editor grows -- ten rows fit here, and the eleventh is a scroll away.
+const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
 /// while the keymap itself is what is being changed -- so neither can go
 /// through the keymap to find it.
 const ESCAPE: &str = "escape";
+
+/// What the monitoring output is set to. Two things, not one: the level the
+/// user picked, and whether it is being held silent -- so unmuting comes back
+/// to the level rather than to a guess.
+///
+/// The level counts steps rather than carrying an `f32`, because 5% at a time
+/// down and back up again through a float would not land on the number it
+/// started from, and the label would eventually read `79%`.
+///
+/// Volume and mute stay independent on purpose: turning the level down while
+/// muted must not be what makes sound come out. Only the mute key unmutes, and
+/// the button says both things at once ("Muted 80%") so neither is a surprise.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Volume {
+    steps: u8,
+    muted: bool,
+}
+
+impl Volume {
+    /// 5% a press: twenty of them across the range.
+    const MAX_STEPS: u8 = 20;
+
+    /// What the device is set to: mute wins, and the level is what it returns
+    /// to. `0.0..=1.0`, which is the range the plugin's ABI accepts.
+    fn gain(self) -> f32 {
+        if self.muted {
+            0.
+        } else {
+            f32::from(self.steps) / f32::from(Self::MAX_STEPS)
+        }
+    }
+
+    /// One press up or down, clamped at both ends -- saturating, so the count
+    /// cannot wrap past silence into full volume.
+    fn step(&mut self, up: bool) {
+        self.steps = if up {
+            self.steps.saturating_add(1).min(Self::MAX_STEPS)
+        } else {
+            self.steps.saturating_sub(1)
+        };
+    }
+
+    /// What the button reads. The level shows while muted too: it is what the
+    /// next press of the mute key brings back.
+    fn label(self) -> String {
+        let percent = u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS);
+        if self.muted {
+            format!("Muted {percent}%")
+        } else {
+            format!("Vol {percent}%")
+        }
+    }
+}
+
+impl Default for Volume {
+    fn default() -> Self {
+        Self {
+            steps: Self::MAX_STEPS,
+            muted: false,
+        }
+    }
+}
 
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
@@ -117,6 +183,12 @@ struct Player {
     /// Which stroke means what, and what every shortcut on screen is called.
     /// The one place either question is answered.
     keymap: Keymap,
+    /// How loud the monitoring is, and whether it is muted. Lives here rather
+    /// than in the session so it survives closing one file and opening the
+    /// next -- it is a setting of the player, not of the timeline, which is
+    /// also why it is not written to the project file and cannot reach an
+    /// export. [`Player::apply_volume`] is what pushes it at a session.
+    volume: Volume,
     /// The keybindings overlay is up. While it is, it owns the keyboard and the
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
@@ -322,6 +394,9 @@ impl Player {
             Ok(session) => {
                 self.fps = session.meta().frame_rate;
                 self.session = Some(session);
+                // A fresh session comes up at full volume; the player's own
+                // setting outlives the file, so it is pushed at every new one.
+                self.apply_volume();
                 self.export_path = export_path(path);
                 self.project_path = project_path(path);
                 self.name = file_name(path).into();
@@ -376,6 +451,7 @@ impl Player {
                 // media: that is the only place an export has ever landed.
                 self.export_path = export_path(&session.sources()[0]);
                 self.session = Some(session);
+                self.apply_volume();
                 self.project_path = path.to_path_buf();
                 self.name = file_name(path).into();
                 // A copied clip names its source by index, which means a
@@ -472,6 +548,26 @@ impl Player {
 
     /// The play binding and the transport button share it: once the timeline is finished
     /// the only sensible "play" is from the top.
+    /// Pushes the current volume at the session, which is the only place it is
+    /// ever pushed: after a change here, and after a session arrives. A session
+    /// starts at full volume, so a file opened while muted has to be told --
+    /// that is the whole reason this is not just called from the key handler.
+    /// Silent no-op with no timeline, or with a run that has no audio device.
+    fn apply_volume(&self) {
+        if let Some(session) = &self.session {
+            session.set_gain(self.volume.gain());
+        }
+    }
+
+    /// The mute key and the two volume keys, and the click on the button. The
+    /// picture is not touched: silencing the output is not pausing it, so the
+    /// clock -- which the device still drives -- runs straight through.
+    fn set_volume(&mut self, change: impl FnOnce(&mut Volume), cx: &mut Context<Self>) {
+        change(&mut self.volume);
+        self.apply_volume();
+        cx.notify();
+    }
+
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -729,6 +825,11 @@ impl Render for Player {
                     Some(ActionId::Cut) => this.cut(cx),
                     Some(ActionId::Delete) => this.delete_selected(cx),
                     Some(ActionId::Undo) => this.undo(cx),
+                    Some(ActionId::ToggleMute) => {
+                        this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                    }
+                    Some(ActionId::VolumeUp) => this.set_volume(|volume| volume.step(true), cx),
+                    Some(ActionId::VolumeDown) => this.set_volume(|volume| volume.step(false), cx),
                     // Nothing to cancel while nothing is exporting.
                     Some(ActionId::CancelExport) | None => {}
                 }
@@ -930,6 +1031,24 @@ impl Player {
                         },
                         live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    // With the transport, not the edit group: it changes what
+                    // the file sounds like, never what it is. Reads as its own
+                    // state, so muted is legible without a tooltip.
+                    .child(control(
+                        "volume",
+                        None,
+                        self.volume.label(),
+                        format!(
+                            "{} mutes · {} louder · {} quieter",
+                            key(ActionId::ToggleMute),
+                            key(ActionId::VolumeUp),
+                            key(ActionId::VolumeDown)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                        }),
                     ))
                     .child(separator())
                     .child(control(
@@ -1164,9 +1283,9 @@ impl Player {
                         // two, and the notice bar it would otherwise appear in is
                         // under the scrim.
                         //
-                        // ponytail: a refusal long enough to wrap to three lines
-                        // pushes the card past a 360 px tall window. The upgrade
-                        // path is a scrolling row list, not a shorter message.
+                        // The row list below is capped and scrolls, so neither a
+                        // wrapped refusal here nor another action added to `ALL`
+                        // can push the card past a 360 px window any more.
                         .child(
                             div()
                                 .flex_none()
@@ -1179,7 +1298,19 @@ impl Player {
                                         .unwrap_or_else(|| "click a row, then press a key".into()),
                                 ),
                         )
-                        .children(rows),
+                        // Capped and scrolling rather than as tall as the action
+                        // list happens to be: the list grows with the editor,
+                        // the smallest window does not.
+                        .child(
+                            div()
+                                .id("keys-rows")
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .max_h(px(KEYS_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -1576,11 +1707,13 @@ fn width_frac(len: f64, total: f64) -> f32 {
 fn control(
     id: &'static str,
     glyph: Option<AnyElement>,
-    label: &'static str,
+    // Not `&'static str`: the volume button's label is its state.
+    label: impl Into<SharedString>,
     shortcut: String,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let label = label.into();
     let tip: SharedString = format!("{label} — {shortcut}").into();
     div()
         .id(id)
@@ -1762,9 +1895,10 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_W, LANE_H, Quality, RULER_HIT_H, SOURCE_TINTS,
-        SURFACE, cancels_export, export_path, export_settings, frac_along, is_bare_modifier,
-        is_project, keymap, project_path, push_digit, scrub_due, source_tint, timecode, width_frac,
+        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LANE_H, Quality, RULER_HIT_H,
+        SOURCE_TINTS, SURFACE, Volume, cancels_export, export_path, export_settings, frac_along,
+        is_bare_modifier, is_project, keymap, project_path, push_digit, scrub_due, source_tint,
+        timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
@@ -1908,22 +2042,81 @@ mod tests {
 
     #[test]
     fn the_keybindings_card_fits_the_smallest_window() {
-        // A row per action -- not per binding, which is why the count is
-        // `ALL` -- under a title and a status line, inside the 640x360 the rest
-        // of the layout is already sized for.
-        let rows = keymap::ActionId::ALL.len() as f32;
+        // The row list is capped and scrolls, so the card's height no longer
+        // depends on how many actions there are: a title, a status line and the
+        // viewport, inside the 640x360 the rest of the layout is sized for.
         let title = 17.; // 13 px text on its own line
         let status = 28.; // 11 px text, two lines: a refusal wraps
-        let gaps = (rows + 1.) * 2.;
+        let gaps = 3. * 2.;
         let padding = 24.;
         assert!(
-            title + status + rows * KEYS_ROW_H + gaps + padding <= 360.,
+            title + status + KEYS_ROWS_H + gaps + padding <= 360.,
             "card too tall"
+        );
+        // The cap is only honest if it is the taller list that scrolls, not the
+        // card that grows: every action must be reachable by scrolling, and
+        // enough of them visible that the list reads as a list.
+        assert!(
+            KEYS_ROWS_H / KEYS_ROW_H >= 8.,
+            "too few rows visible to scan"
         );
         assert!(KEYS_W <= 640., "card too wide");
         // The rows are clickable, so WCAG 2.5.8 binds them like every other
         // target in this window.
         assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+
+    /// Mute and level are one control with two states, and the whole point is
+    /// that mute keeps the level: the user gets back what they had, not 100%.
+    #[test]
+    fn muting_keeps_the_level_it_comes_back_to() {
+        let mut volume = Volume::default();
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(volume.label(), "Vol 100%");
+
+        // Four presses down, then muted: the gain is silence but the level is
+        // still what it was, and the button keeps saying so.
+        for _ in 0..4 {
+            volume.step(false);
+        }
+        assert_eq!(volume.gain(), 0.8);
+        volume.muted = true;
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Muted 80%");
+
+        // Turning it down while muted stays muted -- the one thing a mute
+        // button must never do is get louder because you asked for quieter.
+        volume.step(false);
+        assert_eq!(volume.gain(), 0.0);
+        assert!(volume.muted);
+
+        // Unmute returns to the level, including the step taken while silent.
+        volume.muted = false;
+        assert_eq!(volume.gain(), 0.75);
+    }
+
+    /// Both ends hold under a key held down: the ABI only accepts `0.0..=1.0`,
+    /// and a wrapped step count would hand it something else.
+    #[test]
+    fn the_volume_stops_at_both_ends() {
+        let mut volume = Volume::default();
+        for _ in 0..40 {
+            volume.step(true);
+        }
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(volume.steps, Volume::MAX_STEPS);
+
+        for _ in 0..40 {
+            volume.step(false);
+        }
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Vol 0%");
+
+        // Silent by the level rather than by the flag is still not muted: the
+        // button says which, because only one of them survives a step up.
+        assert!(!volume.muted);
+        volume.step(true);
+        assert_eq!(volume.gain(), 0.05);
     }
 
     #[test]
@@ -2106,6 +2299,9 @@ fn main() {
                     // screen. An empty window has none to wait for.
                     pending_seek: session.is_some(),
                     session,
+                    // Full and unmuted, which is what the session it was just
+                    // handed is already set to: nothing to push at startup.
+                    volume: Volume::default(),
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: meta.map_or(30., |meta| meta.frame_rate),
