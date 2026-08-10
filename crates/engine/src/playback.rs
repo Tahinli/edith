@@ -453,6 +453,19 @@ impl PlaybackSession {
         self.project.lane(lane)
     }
 
+    /// Every lane's handle, in display order -- what a front-end lays out top to
+    /// bottom, and the list [`add_lane`](Self::add_lane) grows.
+    pub fn lanes(&self) -> Vec<Lane> {
+        self.project.lanes()
+    }
+
+    /// Appends an empty lane and hands back its handle. One undo step
+    /// ([`Project::add_lane`]), and no reseek: an empty lane changes nothing
+    /// that plays until something is placed on it.
+    pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
+        self.project.add_lane(kind)
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
@@ -510,16 +523,21 @@ impl PlaybackSession {
     /// A front-end greys such a row out; this is the backstop that keeps a
     /// stale one from making the whole timeline silent.
     ///
-    /// Which lane it lands on is decided here, from the file: one with a
-    /// picture is pasted across both lanes as a grouped take, one without
-    /// ([`crate::is_audio`]) is *placed* on the audio lane alone, overwriting
-    /// what it lands on and rippling nothing. A caller never has to ask.
+    /// Which lane it lands on is decided here, from the file and from `onto` --
+    /// the lane it was let go over, if it was let go over one at all: a file
+    /// with a picture asked for by no lane, or for one of the first pair, is
+    /// pasted across `V1` and `A1` as a grouped take; asked for by any further
+    /// lane it is *placed* there alone, overwriting what it lands on and
+    /// rippling nothing. A file with no picture ([`crate::is_audio`]) is placed
+    /// on the audio lane it was asked for, or on `A1`, and never on a video
+    /// lane. A caller never has to ask.
     pub fn place_stream_at(
         &mut self,
         timeline_secs: f64,
         path: &Path,
         stream: usize,
         frames: u32,
+        onto: Option<Lane>,
     ) -> crate::Result<bool> {
         let wanted = Source::new(path, stream);
         // Another stream of a file whose picture is *already* on the timeline:
@@ -542,12 +560,26 @@ impl PlaybackSession {
         };
         // Which lane a source may land on is decided here and only here, so a
         // front-end never has to make the same call twice: a file with no
-        // picture goes on the audio lane alone, overwriting and rippling
+        // picture goes on an audio lane alone, overwriting and rippling
         // nothing, because there is nothing on the video lane to move along
-        // with it.
-        Ok(match crate::is_audio(path) {
-            true => self.place_at(Lane::A1, timeline_secs, clip),
-            false => self.paste_at(timeline_secs, clip),
+        // with it. A lane of the source's own kind takes it as it is dropped;
+        // only `V1` means the grouped take, since that is the pair the paste
+        // spans and a second video lane is a layer of its own.
+        let onto = match (crate::is_audio(path), onto) {
+            // No picture: an audio lane and nothing else, whichever one was
+            // asked for -- `A1` when none was.
+            (true, Some(lane)) if lane.kind == LaneKind::Audio => Some(lane),
+            (true, _) => Some(Lane::A1),
+            // A picture: the lane it was let go over, unless that is one of the
+            // first pair. Those two are the grouped take a paste spans, and a
+            // further lane is a layer of its own -- its picture on `V2`, its
+            // sound on `A2`.
+            (false, Some(lane)) if lane.ord > 0 => Some(lane),
+            (false, _) => None,
+        };
+        Ok(match onto {
+            Some(lane) => self.place_at(lane, timeline_secs, clip),
+            None => self.paste_at(timeline_secs, clip),
         })
     }
 
@@ -568,13 +600,17 @@ impl PlaybackSession {
         self.edit(|p| p.place(lane, at, clip))
     }
 
-    /// Removes the video clip at `idx` and everything under it, closing the gap
+    /// Removes `lane`'s clip at `idx` and everything under it, closing the gap
     /// on every lane. Unlike a split this *does* move every following frame, so
     /// the session reseeks to wherever the playhead now points.
     /// [`lift_clip`](Self::lift_clip) is the one that leaves a hole instead.
     /// `false` for a bad index or the last remaining clip.
-    pub fn delete_clip(&mut self, idx: usize) -> bool {
-        self.edit(|p| p.delete(idx))
+    ///
+    /// The lane travels because the index is a lane's own: `V2`'s third clip is
+    /// not `V1`'s, and a front-end that could only say "the third clip" would
+    /// delete the wrong one the moment a second lane exists.
+    pub fn delete_clip(&mut self, lane: Lane, idx: usize) -> bool {
+        self.edit(|p| p.delete_in(lane, idx))
     }
 
     /// Undoes the last successful edit, and reseeks like a delete.

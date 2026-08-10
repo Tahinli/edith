@@ -48,6 +48,8 @@ pub enum ActionId {
     Delete,
     Lift,
     Undo,
+    AddVideoLane,
+    AddAudioLane,
     ToggleMute,
     VolumeUp,
     VolumeDown,
@@ -57,7 +59,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 14] = [
+    pub const ALL: [ActionId; 16] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -68,6 +70,8 @@ impl ActionId {
         ActionId::Delete,
         ActionId::Lift,
         ActionId::Undo,
+        ActionId::AddVideoLane,
+        ActionId::AddAudioLane,
         ActionId::ToggleMute,
         ActionId::VolumeUp,
         ActionId::VolumeDown,
@@ -87,6 +91,8 @@ impl ActionId {
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Undo => "Undo",
+            ActionId::AddVideoLane => "Add a video track",
+            ActionId::AddAudioLane => "Add an audio track",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
@@ -108,6 +114,8 @@ impl ActionId {
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Undo => "undo",
+            ActionId::AddVideoLane => "add-video-lane",
+            ActionId::AddAudioLane => "add-audio-lane",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
@@ -126,7 +134,11 @@ impl ActionId {
         match self {
             ActionId::Play => Category::Playback,
             ActionId::Copy | ActionId::Paste | ActionId::Delete | ActionId::Lift => Category::Clips,
-            ActionId::Cut | ActionId::Regroup | ActionId::Undo => Category::Editing,
+            ActionId::Cut
+            | ActionId::Regroup
+            | ActionId::Undo
+            | ActionId::AddVideoLane
+            | ActionId::AddAudioLane => Category::Editing,
             ActionId::ToggleMute | ActionId::VolumeUp | ActionId::VolumeDown => Category::Audio,
             ActionId::Save | ActionId::Export | ActionId::CancelExport => Category::File,
         }
@@ -310,6 +322,11 @@ impl Keymap {
                 b(ActionId::Lift, "l", false),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
+                // The unshifted initials of what they add. Both were free --
+                // the copy and paste chords are the *ctrl* ones -- and a track
+                // is added often enough to deserve a key that is one press.
+                b(ActionId::AddVideoLane, "v", false),
+                b(ActionId::AddAudioLane, "a", false),
                 b(ActionId::ToggleMute, "m", false),
                 // The unshifted pair, which is what gpui reports for those two
                 // keys ("=" and "-", platform.rs:862): the volume keys every
@@ -542,7 +559,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 16);
+        assert_eq!(k.entries().len(), 18);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -555,6 +572,9 @@ mod tests {
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
+        // The track keys are the bare letters; the ctrl ones stay copy/paste.
+        assert_eq!(k.lookup("v", false), Some(ActionId::AddVideoLane));
+        assert_eq!(k.lookup("a", false), Some(ActionId::AddAudioLane));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
         // The volume pair is the unshifted one, so neither needs a modifier
         // and neither is the "+" gpui reports for shift+=.
@@ -689,7 +709,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 14);
+        assert_eq!(ActionId::ALL.len(), 16);
     }
 
     #[test]
