@@ -74,7 +74,7 @@ fn edited(source: &Path) -> PlaybackSession {
     let mut session = PlaybackSession::open(source).expect("open source");
     assert!(session.cut_at(30.0 / FPS), "cut at frame 30");
     assert!(session.cut_at(60.0 / FPS), "cut at frame 60");
-    assert!(session.delete_clip(1), "drop the middle clip");
+    assert!(session.delete_clip(Lane::V1, 1), "drop the middle clip");
     assert_eq!(session.clip_spans().len(), 2);
     session
 }
