@@ -108,8 +108,8 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 /// editor grows -- ten rows fit here, and the eleventh is a scroll away.
 const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
 /// The same for the export card, which carries a fixed-format line and a button
-/// under its list and so has less room: destination, six formats and five
-/// qualities are twelve rows, eight of them on screen.
+/// under its list and so has less room: destination, nine formats and five
+/// qualities are fifteen rows, eight of them on screen.
 const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
@@ -1982,8 +1982,12 @@ impl Player {
     fn set_format(&mut self, format: Format) {
         // The one door both the row and its initial go through, so a format the
         // card greys out cannot be picked by keyboard either.
-        if let (Format::Mp4, Some(why)) = (format, self.session.as_ref().and_then(mp4_refusal)) {
-            self.notice = Some(format!("NOT MP4 — {why}").into());
+        if let Some(why) = self
+            .session
+            .as_ref()
+            .and_then(|session| format_refusal(session, format))
+        {
+            self.notice = Some(format!("NOT {} — {why}", format_label(format)).into());
             return;
         }
         self.format = format;
@@ -2055,7 +2059,7 @@ impl Player {
         // default and an audio-only timeline (or a second audio lane) is one
         // edit away -- so the button asks again rather than starting a worker
         // that will only settle with the same refusal minutes later.
-        if let (Format::Mp4, Some(why)) = (self.format, mp4_refusal(session)) {
+        if let Some(why) = format_refusal(session, self.format) {
             self.notice = Some(format!("NOT EXPORTED — {why}").into());
             cx.notify();
             return;
@@ -3276,15 +3280,20 @@ impl Player {
         // An mp4 this timeline cannot be written as reads exactly like the
         // formats there is no encoder for: dimmed, unclickable, and carrying its
         // own reason instead of the detail line.
-        let refused = self.session.as_ref().and_then(mp4_refusal);
         let formats: Vec<_> = FORMATS
             .into_iter()
             .enumerate()
             .map(|(i, (format, label, detail))| {
-                let blocked = format == Some(Format::Mp4) && refused.is_some();
+                // Per row, because the two picture formats are refused by
+                // different things: an audio-only timeline greys both, a second
+                // audio lane only the mp4.
+                let refused = format
+                    .zip(self.session.as_ref())
+                    .and_then(|(f, s)| format_refusal(s, f));
+                let blocked = refused.is_some();
                 let detail: SharedString = match &refused {
-                    Some(why) if blocked => why.clone().into(),
-                    _ => detail.into(),
+                    Some(why) => why.clone().into(),
+                    None => detail.into(),
                 };
                 let picked = format == Some(self.format) && !blocked;
                 let format = format.filter(|_| !blocked);
@@ -3358,11 +3367,11 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "pick a format (m/w/f), then Export — esc closes".into()
+                                    "pick a format (m/a/w/f), then Export — esc closes".into()
                                 })),
                         )
                         // Capped and scrolling like the keybindings list: the
-                        // destination, six formats and five qualities are more
+                        // destination, nine formats and five qualities are more
                         // rows than a 360 px window has room for, and it is the
                         // list that scrolls, never the card that grows.
                         .child(
@@ -4927,14 +4936,29 @@ impl Quality {
 /// `None` is exactly that kind of row. The MP3 reason is a *licence* and not a
 /// capability: `shine-rs` encodes mp3 in pure Rust under LGPL-2.0, which is a
 /// decision about this project rather than about the code, and the row says so
-/// instead of pretending the encoder does not exist.
-const FORMATS: [(Option<Format>, &str, &str); 6] = [
+/// instead of pretending the encoder does not exist. HEVC and VP9 are the two
+/// this program *reads* and cannot write -- the plugin decodes both and there is
+/// no encoder for either here -- so they are rows for the same reason: a codec
+/// that opens but never comes back out is exactly the gap a user would other-
+/// wise go looking for.
+const FORMATS: [(Option<Format>, &str, &str); 9] = [
     (Some(Format::Mp4), "MP4", "H.264 picture + copied AAC"),
+    (
+        Some(Format::Av1),
+        "AV1",
+        "AV1 picture in .mkv — no sound: export WAV or FLAC for that",
+    ),
     (Some(Format::Wav), "WAV", "16-bit PCM — audio only"),
     (Some(Format::Flac), "FLAC", "lossless — audio only"),
     (None, "MP3", "encoder is LGPL — licence decision pending"),
     (None, "OGG", "no pure-Rust Vorbis or Opus encoder"),
     (None, "AAC", "no pure-Rust AAC encoder"),
+    (
+        None,
+        "HEVC",
+        "no encoder in this stack, and patent-encumbered",
+    ),
+    (None, "VP9", "superseded by AV1, which is the row above"),
 ];
 
 /// The format a key picks while the export card is up: the row's own initial,
@@ -5046,9 +5070,19 @@ fn export_line(format: Format, session: Option<&PlaybackSession>) -> String {
 fn format_line(format: Format) -> &'static str {
     match format {
         Format::Mp4 => "H.264 · MP4 · moov at end",
+        Format::Av1 => "AV1 · Matroska · picture only, no audio track",
         Format::Wav => "16-bit PCM · WAV · timeline audio only",
         Format::Flac => "FLAC · lossless · timeline audio only",
     }
+}
+
+/// The row a format is picked by, which is what a refusal calls it: `MP4`, not
+/// the `mkv` an AV1 file is named with.
+fn format_label(format: Format) -> &'static str {
+    FORMATS
+        .iter()
+        .find(|(row, ..)| *row == Some(format))
+        .map_or("EXPORT", |(_, label, _)| *label)
 }
 
 /// The destination under a format: `take.export.mp4` becomes `take.export.wav`.
@@ -5117,23 +5151,34 @@ fn is_bare_modifier(key: &str) -> bool {
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width
 /// box rather than as NaN, which gpui would carry into layout.
-/// Why this timeline cannot be written as an mp4, if it cannot: the mp4 path
-/// *copies* one AAC track and there is no encoder here to mix several with, so a
-/// timeline whose sound is spread over more than one audio lane is refused by
-/// the engine (`export::run`). Said on the row, before a destination has been
-/// picked, rather than after the write has started.
+/// Why this timeline cannot be written in `format`, if it cannot.
 ///
-/// An audio-only timeline is the other one: every frame of it is a gap, so the
-/// mp4 would be a black picture over the sound. The engine refuses it too
-/// (`export::start`); this is what greys the row before a destination has been
-/// picked.
-fn mp4_refusal(session: &PlaybackSession) -> Option<String> {
+/// An audio-only timeline is the one both picture formats refuse: every frame of
+/// it is a gap, so the file would be a black picture over the sound. The engine
+/// refuses it too (`export::start`); this is what greys the row before a
+/// destination has been picked.
+///
+/// The second reason is the mp4 path's alone: it *copies* one AAC track and
+/// there is no encoder here to mix several with, so a timeline whose sound is
+/// spread over more than one audio lane is refused by the engine
+/// (`export::run`). An AV1 export carries no sound at all -- said on its row as
+/// its detail, not as a refusal -- so no count of audio lanes stops it.
+fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
+    if !format.has_video() {
+        return None;
+    }
     let picture = session
         .lanes()
         .into_iter()
         .any(|lane| lane.kind == LaneKind::Video && !session.lane_clips(lane).is_empty());
     if !picture {
-        return Some("no picture — an mp4 would be black; export WAV or FLAC".to_string());
+        return Some(format!(
+            "no picture — {} would be black; export WAV or FLAC",
+            format.name()
+        ));
+    }
+    if format != Format::Mp4 {
+        return None;
     }
     let lanes = session
         .lanes()
@@ -5640,11 +5685,11 @@ mod tests {
         LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
         RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
         WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, color_snap,
-        envelope, eq_x, eq_y, export_path, export_settings, format_line, frac_along, frac_down,
-        frame_at, histogram, is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked,
-        menu_at, mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, source_frames, source_tint, span_partner, start_frac, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        envelope, eq_x, eq_y, export_path, export_settings, format_key, format_line,
+        format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
+        keymap, lane_clips, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit,
+        retarget, scrub_due, show_label, source_frames, source_tint, span_partner, start_frac,
+        timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -5784,11 +5829,19 @@ mod tests {
         assert_eq!(session.lane_clips(Lane::A1).len(), 2);
         assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
 
-        // The mp4 row carries the reason rather than the format's detail line.
+        // Both picture rows carry the reason rather than the format's detail
+        // line, each naming itself; the audio formats are what this timeline is
+        // and are never refused.
         assert_eq!(
-            mp4_refusal(&session).as_deref(),
+            format_refusal(&session, Format::Mp4).as_deref(),
             Some("no picture — an mp4 would be black; export WAV or FLAC")
         );
+        assert_eq!(
+            format_refusal(&session, Format::Av1).as_deref(),
+            Some("no picture — an AV1 export would be black; export WAV or FLAC")
+        );
+        assert_eq!(format_refusal(&session, Format::Wav), None);
+        assert_eq!(format_refusal(&session, Format::Flac), None);
     }
 
     fn info(
@@ -6382,19 +6435,26 @@ mod tests {
 
         // A second audio lane carrying sound is what an mp4 export cannot
         // write, so the card greys that row before a destination is picked.
-        assert_eq!(mp4_refusal(&session), None);
+        assert_eq!(format_refusal(&session, Format::Mp4), None);
         let a2 = session.add_lane(LaneKind::Audio);
         assert_eq!(a2.label(), "A2");
-        assert_eq!(mp4_refusal(&session), None, "an empty lane carries nothing");
+        assert_eq!(
+            format_refusal(&session, Format::Mp4),
+            None,
+            "an empty lane carries nothing"
+        );
         assert!(
             session
                 .place_stream_at(0.0, &path, 0, frames, Some(a2))
                 .expect("its own file is on this timeline")
         );
         assert_eq!(
-            mp4_refusal(&session).as_deref(),
+            format_refusal(&session, Format::Mp4).as_deref(),
             Some("2 audio lanes — an mp4 copies one")
         );
+        // ...and the one thing that does not stop an AV1 export, which carries
+        // no sound to have too much of.
+        assert_eq!(format_refusal(&session, Format::Av1), None);
 
         // Undo, one edit at a time and backwards: the drop on A2, the lane A2
         // itself, the lift, the drop on V2, and last the lane V2 -- an added
@@ -6405,7 +6465,7 @@ mod tests {
         }
         assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1]);
         assert_eq!(session.lane_clips(Lane::V1).len(), 1);
-        assert_eq!(mp4_refusal(&session), None);
+        assert_eq!(format_refusal(&session, Format::Mp4), None);
     }
 
     #[test]
@@ -7089,12 +7149,20 @@ mod tests {
 
     #[test]
     fn every_format_row_is_offered_or_says_why_not() {
-        // The three this program can write are rows that pick, each named after
-        // its own extension so a destination can never disagree with its bytes.
+        // The four this program can write are rows that pick. Three are named
+        // after their own extension, so a destination cannot disagree with its
+        // bytes; the fourth is named after its *codec*, because AV1 arrives and
+        // leaves in a Matroska file and "MKV" would name the box rather than
+        // what is in it.
         let offered: Vec<Format> = FORMATS.iter().filter_map(|&(f, ..)| f).collect();
-        assert_eq!(offered, vec![Format::Mp4, Format::Wav, Format::Flac]);
+        assert_eq!(
+            offered,
+            vec![Format::Mp4, Format::Av1, Format::Wav, Format::Flac]
+        );
+        assert_eq!(Format::Av1.ext(), "mkv");
         for (format, label, _) in FORMATS {
             match format {
+                Some(Format::Av1) => assert_eq!(label, "AV1"),
                 Some(format) => assert_eq!(format.ext(), label.to_lowercase()),
                 // A refused format is a row with a reason, never a hidden one:
                 // an empty detail column would read as an oversight.
@@ -7103,13 +7171,37 @@ mod tests {
         }
         for (format, label, detail) in FORMATS {
             assert!(!detail.is_empty(), "{label} says nothing");
-            // Only mp4 carries the picture, so only mp4 leaves the bitrate rows
-            // live -- the card dims them off exactly this.
+            // Only the two picture formats leave the bitrate rows live -- the
+            // card dims them off exactly this.
             assert_eq!(
                 format.is_some_and(Format::has_video),
-                format == Some(Format::Mp4)
+                matches!(format, Some(Format::Mp4 | Format::Av1))
             );
         }
+        // The two codecs this program reads and cannot write are rows of their
+        // own, refused by name rather than absent -- HEVC for want of an encoder
+        // (and for its patents), VP9 because AV1 is the row that replaced it.
+        for (label, word) in [("HEVC", "no encoder"), ("VP9", "superseded")] {
+            let (format, _, detail) = FORMATS
+                .into_iter()
+                .find(|(_, row, _)| *row == label)
+                .unwrap_or_else(|| panic!("{label} has no row"));
+            assert!(format.is_none(), "{label} is not offered");
+            assert!(detail.contains(word), "{label}: {detail}");
+        }
+        // The AV1 row says on the row itself that it carries no sound, which is
+        // the one thing a user could otherwise only find out by playing the file.
+        let (_, _, av1) = FORMATS
+            .into_iter()
+            .find(|(f, ..)| *f == Some(Format::Av1))
+            .expect("an AV1 row");
+        assert!(av1.contains("no sound"), "{av1}");
+        assert!(format_line(Format::Av1).contains("picture only"));
+        assert_eq!(
+            format_key("a"),
+            Some(Format::Av1),
+            "its own initial picks it"
+        );
         // The destination follows the format and keeps the stem, mp4 included.
         assert_eq!(
             retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),

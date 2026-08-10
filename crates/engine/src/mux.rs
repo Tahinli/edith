@@ -1,8 +1,13 @@
 //! Annex-B -> MP4, the mirror of `demux`: encoders emit start-code framed NALs,
 //! an mp4 sample wants 4-byte length prefixes with SPS/PPS living in `avcC`.
+//!
+//! ...and AV1 -> Matroska, the mirror of the *other* half of `demux`, for the
+//! same reason that half exists: `mp4 0.14` has no `av01` sample entry at all,
+//! so an AV1 export is written as EBML by hand exactly as an AV1 import is read
+//! as EBML by hand ([`MkvMuxer`]).
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use mp4::{
@@ -175,6 +180,323 @@ impl Mp4Muxer {
         self.writer.write_end()?;
         Ok(())
     }
+}
+
+// Matroska element ids, written with the leading length marker they carry in the
+// file -- the same spelling `demux` reads them back with.
+const EBML: u32 = 0x1A45_DFA3;
+const EBML_VERSION: u32 = 0x4286;
+const EBML_READ_VERSION: u32 = 0x42F7;
+const EBML_MAX_ID_LENGTH: u32 = 0x42F2;
+const EBML_MAX_SIZE_LENGTH: u32 = 0x42F3;
+const DOC_TYPE: u32 = 0x4282;
+const DOC_TYPE_VERSION: u32 = 0x4287;
+const DOC_TYPE_READ_VERSION: u32 = 0x4285;
+const SEGMENT: u32 = 0x1853_8067;
+const INFO: u32 = 0x1549_A966;
+const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const DURATION: u32 = 0x4489;
+const MUXING_APP: u32 = 0x4D80;
+const WRITING_APP: u32 = 0x5741;
+const TRACKS: u32 = 0x1654_AE6B;
+const TRACK_ENTRY: u32 = 0xAE;
+const TRACK_NUMBER: u32 = 0xD7;
+const TRACK_UID: u32 = 0x73C5;
+const TRACK_TYPE: u32 = 0x83;
+const FLAG_LACING: u32 = 0x9C;
+const CODEC_ID: u32 = 0x86;
+const CODEC_PRIVATE: u32 = 0x63A2;
+const DEFAULT_DURATION: u32 = 0x23E383;
+const VIDEO: u32 = 0xE0;
+const PIXEL_WIDTH: u32 = 0xB0;
+const PIXEL_HEIGHT: u32 = 0xBA;
+const CLUSTER: u32 = 0x1F43_B675;
+const CLUSTER_TIMESTAMP: u32 = 0xE7;
+const SIMPLE_BLOCK: u32 = 0xA3;
+
+/// One millisecond, the tick every Matroska muxer writes and this one's block
+/// timestamps are in. The *rate* is not derived from these -- `DefaultDuration`
+/// is, in exact nanoseconds -- so a millisecond is precise enough for the
+/// presentation times and coarse enough to keep a cluster's 16-bit relative
+/// timestamp covering half a minute.
+const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
+/// A cluster is buffered whole (its size is a header field), so it is flushed
+/// at the first keyframe past this -- a ceiling on what the muxer holds, not a
+/// target.
+const CLUSTER_BYTES: usize = 4 << 20;
+/// ...and on how far a block's timestamp may sit from its cluster's: the field
+/// is a signed 16-bit millisecond count.
+const CLUSTER_MS: i64 = 30_000;
+
+/// The fixed four bytes of an `AV1CodecConfigurationRecord` for what both encode
+/// paths here are configured to produce: profile 0, 8-bit, 4:2:0, no operating
+/// point delay. `seq_level_idx` is written as 31 -- "maximum parameters", i.e.
+/// unstated -- which is what rav1e's own `container_sequence_header` writes and
+/// what keeps this record from claiming a level neither encoder promised. The
+/// sequence header OBU follows it; that is where a decoder reads the real
+/// parameters from, and `demux::parse_av1c` hands exactly those bytes back.
+const AV1C_HEAD: [u8; 4] = [
+    0x81, // marker 1, version 1
+    0x1F, // seq_profile 0, seq_level_idx_0 31
+    0x0C, // tier 0, 8-bit, colour, chroma subsampled both ways
+    0x00, // no initial presentation delay
+];
+
+/// What an AV1 Matroska track declares. `config` is the sequence header OBU,
+/// which is [`av1_sequence_header`]'s answer for the first coded keyframe.
+pub struct Av1Params<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    pub config: &'a [u8],
+}
+
+/// Writes one AV1 video track as Matroska (`.mkv`). Picture only: this project
+/// has no encoder for any sound Matroska carries, and copying the timeline's AAC
+/// in would write a track its own reader refuses (`audio::AudioSession::open`
+/// leaves a Matroska file silent) -- so the sound is named as left out by the
+/// front-end rather than written unplayable.
+///
+/// The file is patched twice at [`finish`](MkvMuxer::finish) -- the segment size
+/// and the duration -- so a killed process leaves an unfinished file rather than
+/// a wrong one; the export's `.part` rename covers that already.
+pub struct MkvMuxer {
+    file: File,
+    /// Nanoseconds a frame lasts: `DefaultDuration`, which is the *only* exact
+    /// statement of the frame rate in the file (see `demux::MkvDemuxer::open`).
+    frame_ns: u64,
+    segment_size_at: u64,
+    duration_at: u64,
+    /// The cluster being built: everything after its id and size, so it can be
+    /// written once its length is known.
+    cluster: Vec<u8>,
+    cluster_ts: i64,
+    frames: u64,
+}
+
+impl MkvMuxer {
+    pub fn create(path: &Path, video: &Av1Params) -> crate::Result<Self> {
+        if !video.frame_rate.is_finite() || video.frame_rate <= 0.0 {
+            return Err(format!("bad frame rate {}", video.frame_rate).into());
+        }
+        if video.width == 0 || video.height == 0 {
+            return Err(format!("bad dimensions {}x{}", video.width, video.height).into());
+        }
+        let frame_ns = (1e9 / video.frame_rate).round() as u64;
+        if frame_ns == 0 {
+            return Err(format!("frame rate {} is too fast to time", video.frame_rate).into());
+        }
+        if video.config.is_empty() {
+            return Err("no AV1 sequence header for the track's CodecPrivate".into());
+        }
+
+        let mut head = Vec::new();
+        let mut ebml = Vec::new();
+        uint(&mut ebml, EBML_VERSION, 1);
+        uint(&mut ebml, EBML_READ_VERSION, 1);
+        uint(&mut ebml, EBML_MAX_ID_LENGTH, 4);
+        uint(&mut ebml, EBML_MAX_SIZE_LENGTH, 8);
+        elem(&mut ebml, DOC_TYPE, b"matroska");
+        uint(&mut ebml, DOC_TYPE_VERSION, 4);
+        uint(&mut ebml, DOC_TYPE_READ_VERSION, 2);
+        elem(&mut head, EBML, &ebml);
+
+        // The segment's size is only known at `finish`; it is reserved at the
+        // widest encoding (8 bytes) so patching it never moves a byte after it.
+        put_id(&mut head, SEGMENT);
+        let segment_size_at = head.len() as u64;
+        head.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut info = Vec::new();
+        uint(&mut info, TIMESTAMP_SCALE, TIMESTAMP_SCALE_NS);
+        elem(&mut info, MUXING_APP, b"edith");
+        elem(&mut info, WRITING_APP, b"edith");
+        put_id(&mut info, DURATION);
+        put_size(&mut info, 8);
+        // Where those eight bytes will land once `Info` is written into `head`,
+        // which is what `finish` seeks back to.
+        let duration_at = (head.len() + elem_head_len(INFO, info.len() + 8) + info.len()) as u64;
+        info.extend_from_slice(&0f64.to_be_bytes());
+        elem(&mut head, INFO, &info);
+
+        let mut entry = Vec::new();
+        uint(&mut entry, TRACK_NUMBER, 1);
+        uint(&mut entry, TRACK_UID, 1);
+        uint(&mut entry, TRACK_TYPE, 1); // video
+        uint(&mut entry, FLAG_LACING, 0);
+        elem(&mut entry, CODEC_ID, b"V_AV1");
+        let mut av1c = AV1C_HEAD.to_vec();
+        av1c.extend_from_slice(video.config);
+        elem(&mut entry, CODEC_PRIVATE, &av1c);
+        uint(&mut entry, DEFAULT_DURATION, frame_ns);
+        let mut dims = Vec::new();
+        uint(&mut dims, PIXEL_WIDTH, u64::from(video.width));
+        uint(&mut dims, PIXEL_HEIGHT, u64::from(video.height));
+        elem(&mut entry, VIDEO, &dims);
+        let mut tracks = Vec::new();
+        elem(&mut tracks, TRACK_ENTRY, &entry);
+        elem(&mut head, TRACKS, &tracks);
+
+        let mut file = File::create(path)?;
+        file.write_all(&head)?;
+        Ok(Self {
+            file,
+            frame_ns,
+            segment_size_at,
+            duration_at,
+            cluster: Vec::new(),
+            cluster_ts: 0,
+            frames: 0,
+        })
+    }
+
+    /// One coded picture: a whole AV1 temporal unit, in the low-overhead OBU
+    /// format the demuxer hands back. `key` marks a block a decoder may be
+    /// started from -- said by the encoder rather than guessed at here, and a
+    /// keyframe is where a new cluster opens, so every seek target is one.
+    pub fn write_frame(&mut self, obus: &[u8], key: bool) -> crate::Result<()> {
+        if obus.is_empty() {
+            return Err("an empty AV1 temporal unit".into());
+        }
+        let ts = (self.frames * self.frame_ns + TIMESTAMP_SCALE_NS / 2) as i64
+            / TIMESTAMP_SCALE_NS as i64;
+        // A new cluster at every keyframe -- a seek lands on one, so a cluster
+        // is a whole GOP -- and at the two limits a cluster has whatever the
+        // encoder keys: what it may weigh, and how far a 16-bit relative
+        // timestamp reaches.
+        if self.cluster.is_empty()
+            || key
+            || self.cluster.len() >= CLUSTER_BYTES
+            || ts - self.cluster_ts >= CLUSTER_MS
+        {
+            self.flush()?;
+            self.cluster_ts = ts;
+            uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+        }
+        let mut block = Vec::with_capacity(obus.len() + 4);
+        block.push(0x81); // track number 1, as a one-byte EBML integer
+        block.extend_from_slice(&((ts - self.cluster_ts) as i16).to_be_bytes());
+        block.push(if key { 0x80 } else { 0 });
+        block.extend_from_slice(obus);
+        elem(&mut self.cluster, SIMPLE_BLOCK, &block);
+        self.frames += 1;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> crate::Result<()> {
+        if self.cluster.is_empty() {
+            return Ok(());
+        }
+        let mut head = Vec::new();
+        put_id(&mut head, CLUSTER);
+        put_size(&mut head, self.cluster.len() as u64);
+        self.file.write_all(&head)?;
+        self.file.write_all(&self.cluster)?;
+        self.cluster.clear();
+        Ok(())
+    }
+
+    /// Closes the last cluster and patches the two fields that could not be
+    /// known while writing: the segment's size and the presentation duration.
+    pub fn finish(mut self) -> crate::Result<()> {
+        self.flush()?;
+        if self.frames == 0 {
+            return Err("no frames were written to the Matroska file".into());
+        }
+        let end = self.file.stream_position()?;
+        let body = end - (self.segment_size_at + 8);
+        // The reserved 8-byte size: marker bit in the top byte, value under it.
+        let size = (1u64 << 56) | body;
+        self.file.seek(SeekFrom::Start(self.segment_size_at))?;
+        self.file.write_all(&size.to_be_bytes())?;
+        let ms = self.frames as f64 * self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64;
+        self.file.seek(SeekFrom::Start(self.duration_at))?;
+        self.file.write_all(&ms.to_be_bytes())?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+/// The sequence header OBU of a coded temporal unit, for the track's
+/// `CodecPrivate`. `None` when the unit carries none, which the first keyframe
+/// of a stream never may -- no decoder can start without it.
+pub fn av1_sequence_header(obus: &[u8]) -> Option<&[u8]> {
+    let mut at = 0;
+    while at < obus.len() {
+        let header = obus[at];
+        // OBU header: type in bits 6..3, then the extension and size flags.
+        let kind = (header >> 3) & 0xF;
+        let mut len = 1 + usize::from(header & 0x4 != 0);
+        // Only the low-overhead format is written or read here: an OBU with no
+        // size field runs to the end of the unit, which makes the rest of it
+        // unwalkable, so it is not something to guess at.
+        if header & 0x2 == 0 {
+            return None;
+        }
+        let (size, size_len) = leb128(obus.get(at + len..)?)?;
+        len += size_len;
+        let body = obus.get(at + len..at + len + size)?;
+        if kind == 1 {
+            return Some(&obus[at..at + len + body.len()]);
+        }
+        at += len + size;
+    }
+    None
+}
+
+/// An unsigned LEB128 as AV1 writes its OBU sizes: `(value, bytes read)`.
+fn leb128(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    for (i, &byte) in buf.iter().take(8).enumerate() {
+        value |= usize::from(byte & 0x7F) << (i * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// An element id, written as the bytes it is spelled with -- the leading zeros
+/// of the constant are not part of it.
+fn put_id(out: &mut Vec<u8>, id: u32) {
+    let bytes = id.to_be_bytes();
+    let skip = bytes.iter().take_while(|&&b| b == 0).count();
+    out.extend_from_slice(&bytes[skip..]);
+}
+
+/// An element size as an EBML variable-length integer, in the fewest bytes that
+/// hold it. A value of all ones means *unknown* length, so a size that would
+/// land on one takes a byte more.
+fn put_size(out: &mut Vec<u8>, size: u64) {
+    let mut len = 1;
+    while len < 8 && size >= (1u64 << (7 * len)) - 1 {
+        len += 1;
+    }
+    let value = (1u64 << (7 * len)) | size;
+    out.extend_from_slice(&value.to_be_bytes()[8 - len..]);
+}
+
+fn elem(out: &mut Vec<u8>, id: u32, payload: &[u8]) {
+    put_id(out, id);
+    put_size(out, payload.len() as u64);
+    out.extend_from_slice(payload);
+}
+
+/// An unsigned integer element, big-endian in as few bytes as it takes (one at
+/// the least: a zero is a byte, not an absence).
+fn uint(out: &mut Vec<u8>, id: u32, value: u64) {
+    let bytes = value.to_be_bytes();
+    let skip = bytes.iter().take_while(|&&b| b == 0).count().min(7);
+    elem(out, id, &bytes[skip..]);
+}
+
+/// How many bytes an element's id and size take, which is what an offset inside
+/// a payload has to be moved by to become an offset in the file.
+fn elem_head_len(id: u32, payload: usize) -> usize {
+    let (mut head, mut size) = (Vec::new(), Vec::new());
+    put_id(&mut head, id);
+    put_size(&mut size, payload as u64);
+    head.len() + size.len()
 }
 
 /// `(timescale, ticks per frame)` for `fps`, chosen so one frame is a *whole*
@@ -481,6 +803,110 @@ mod tests {
         }
         assert!(demuxer.next_access_unit().unwrap().is_none());
 
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    /// One OBU in the low-overhead format: header byte, then a one-byte LEB128
+    /// size, which is all a payload this short needs.
+    fn obu(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(kind << 3) | 0x02, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An EBML size is written in the fewest bytes that hold it -- and never in
+    /// a length whose value is all ones, which is the *unknown* size the reader
+    /// would take for "runs to the end of its parent".
+    #[test]
+    fn element_sizes_never_spell_an_unknown_length() {
+        let size = |n| {
+            let mut out = Vec::new();
+            put_size(&mut out, n);
+            out
+        };
+        assert_eq!(size(0), [0x80]);
+        assert_eq!(size(126), [0xFE]);
+        assert_eq!(size(127), [0x40, 0x7F], "127 is all ones in one byte");
+        assert_eq!(size(128), [0x40, 0x80]);
+        assert_eq!(size(0x3FFE), [0x7F, 0xFE]);
+        assert_eq!(size(0x3FFF), [0x20, 0x3F, 0xFF], "and again at two bytes");
+        // Ids are their own bytes, marker and all: that is how `demux` compares
+        // them, so a one-byte id must not grow leading zeros here.
+        let mut id = Vec::new();
+        put_id(&mut id, SIMPLE_BLOCK);
+        assert_eq!(id, [0xA3]);
+        let mut id = Vec::new();
+        put_id(&mut id, CLUSTER);
+        assert_eq!(id, [0x1F, 0x43, 0xB6, 0x75]);
+    }
+
+    /// The Matroska half of the round trip, with no encoder in it: three coded
+    /// units out through the muxer and back in through our own demuxer, which is
+    /// where the hand-written EBML meets the hand-written EBML reader.
+    #[test]
+    fn an_av1_track_round_trips_through_our_own_matroska_reader() {
+        let sequence = obu(1, &[0x11, 0x22, 0x33]);
+        let mut key = sequence.clone();
+        key.extend_from_slice(&obu(6, &[0xAA; 8]));
+        let inter = obu(6, &[0xBB; 5]);
+
+        let out = std::env::temp_dir().join(format!("ve_mkv_{}.mkv", std::process::id()));
+        let config = av1_sequence_header(&key).expect("the keyframe carries one");
+        assert_eq!(config, &sequence[..], "the sequence header OBU, whole");
+        let mut muxer = MkvMuxer::create(
+            &out,
+            &Av1Params {
+                width: 640,
+                height: 360,
+                frame_rate: 30.0,
+                config,
+            },
+        )
+        .unwrap();
+        muxer.write_frame(&key, true).unwrap();
+        muxer.write_frame(&inter, false).unwrap();
+        muxer.write_frame(&inter, false).unwrap();
+        muxer.finish().unwrap();
+
+        let (meta, mut demuxer) = crate::demux::Demuxer::open(&out).expect("reopen");
+        assert_eq!(meta.codec, crate::demux::Codec::Av1);
+        assert_eq!((meta.width, meta.height), (640, 360));
+        assert!(
+            (meta.frame_rate - 30.0).abs() < 1e-6,
+            "DefaultDuration must state the rate exactly: {}",
+            meta.frame_rate
+        );
+        assert_eq!(meta.frame_count, 3);
+
+        // The keyframe comes back with the `CodecPrivate` sequence header in
+        // front of it, which is the demuxer's own doing -- so what this checks
+        // is that the record was written and parsed, not that the block grew.
+        let first = demuxer.next_access_unit().unwrap().unwrap();
+        assert_eq!(&first[..sequence.len()], &sequence[..]);
+        assert_eq!(&first[sequence.len()..], &key[..]);
+        assert_eq!(demuxer.next_access_unit().unwrap().unwrap(), inter);
+        assert_eq!(demuxer.next_access_unit().unwrap().unwrap(), inter);
+        assert!(demuxer.next_access_unit().unwrap().is_none());
+        // One keyframe, so every seek rewinds to it -- and the flag really was
+        // written, or block 0 would be the answer by default rather than by
+        // being a sync point.
+        assert_eq!(demuxer.seek_to_sync_at_or_before(2), 0);
+
+        // A track with no sequence header to declare is refused where the
+        // message still means something, rather than written unplayable.
+        assert!(
+            MkvMuxer::create(
+                &out,
+                &Av1Params {
+                    width: 640,
+                    height: 360,
+                    frame_rate: 30.0,
+                    config: &[],
+                },
+            )
+            .is_err()
+        );
+        assert!(av1_sequence_header(&inter).is_none(), "no sequence header");
         std::fs::remove_file(&out).unwrap();
     }
 
