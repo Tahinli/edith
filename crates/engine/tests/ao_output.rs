@@ -88,6 +88,51 @@ fn plays_and_tracks_position() {
     );
 }
 
+/// Muting is not pausing: the device keeps consuming and the master clock keeps
+/// running, which is the whole reason the picture can play on through a mute.
+/// That the samples really go quiet is the plugin's own `scale` unit test --
+/// nothing out here can hear the device.
+#[test]
+#[ignore = "needs libengine_audio.so and a PipeWire daemon"]
+fn muting_silences_without_stopping_the_clock() {
+    assert!(AoSession::probe(), "plugin not loadable");
+    let mut ao = AoSession::open(RATE, CHANNELS).expect("no PipeWire playback available");
+
+    let samples = tone();
+    assert_eq!(ao.write(&samples), Some(samples.len()), "short write");
+    let first = wait_for_playback(&ao, Duration::from_secs(2));
+
+    // Mute, then keep it fed: the position must move exactly as it would have.
+    assert!(ao.set_volume(0.0), "mute rejected");
+    assert_eq!(ao.write(&samples), Some(samples.len()), "short write");
+    std::thread::sleep(Duration::from_millis(300));
+    let muted = ao.position().expect("position went unknown");
+    let advanced = muted - first;
+    let expected = RATE as i64 * 300 / 1000;
+    eprintln!("clock advanced {advanced} samples in 300 ms while muted (expected ~{expected})");
+    assert!(
+        (advanced - expected).abs() < expected / 5,
+        "the clock stalled while muted: {advanced} samples in 300 ms"
+    );
+
+    // Every level in range is taken, and the two ends are in range.
+    for gain in [0.0, 0.5, 1.0] {
+        assert!(ao.set_volume(gain), "gain {gain} rejected");
+    }
+    // Out of range is refused at the ABI rather than multiplied into the
+    // speakers -- a NaN would otherwise reach the RT thread and stay there.
+    for gain in [-0.1, 1.5, f32::NAN, f32::INFINITY] {
+        assert!(!ao.set_volume(gain), "gain {gain} accepted");
+    }
+    // ...and a refusal changes nothing: the last accepted gain still stands.
+    assert_eq!(ao.write(&samples), Some(samples.len()), "short write");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        ao.position().expect("position went unknown") > muted,
+        "clock stopped after a refused gain"
+    );
+}
+
 /// No reachable daemon must fail the open cleanly and quickly, never hang.
 #[test]
 #[ignore = "needs libengine_audio.so and a PipeWire daemon"]
