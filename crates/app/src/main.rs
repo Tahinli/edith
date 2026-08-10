@@ -232,11 +232,13 @@ struct ContextMenu {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 8] = [
+const MENU_ITEMS: [ActionId; 10] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
+    ActionId::Detach,
+    ActionId::Group,
     ActionId::Equalizer,
     ActionId::Color,
     ActionId::Fit,
@@ -549,6 +551,8 @@ impl Player {
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),
             ActionId::Regroup => self.regroup(cx),
+            ActionId::Detach => self.detach(cx),
+            ActionId::Group => self.group(cx),
             ActionId::Select => self.select_under_playhead(cx),
             ActionId::SelectNext => self.select_step(true, cx),
             ActionId::SelectPrev => self.select_step(false, cx),
@@ -961,6 +965,63 @@ impl Player {
                         .into(),
                 );
             }
+        }
+        cx.notify();
+    }
+
+    /// Takes the selected clip out of its group, so the picture and the sound
+    /// under it are edited apart from here on: each half selects, moves, trims
+    /// and is removed alone, and both draw outlined instead of tinted. The
+    /// selection stays -- the half that was clicked is still the half in hand.
+    fn detach(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match (&mut self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => {
+                if !session.ungroup(lane, idx) {
+                    self.notice =
+                        Some("NOTHING DETACHED — that clip is not grouped with another".into());
+                }
+            }
+            (Some(_), None) => {
+                self.notice = Some("NOTHING DETACHED — click the take to take apart first".into())
+            }
+            (None, _) => {}
+        }
+        cx.notify();
+    }
+
+    /// Puts the selected clip back in a group with the clip covering exactly the
+    /// same frames on another track -- the way back from [`Player::detach`], and
+    /// the way to group a picture with sound it was never opened with. The
+    /// partner is not clicked because there is nothing to choose: a group id
+    /// names one span, so only a clip covering these very frames could join it,
+    /// and the engine words what to do when none does.
+    fn group(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let partner = match (&self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => span_partner(session, lane, idx),
+            _ => None,
+        };
+        match (&mut self.session, self.selected, partner) {
+            (Some(session), Some((lane, idx)), Some((other, o_idx))) => {
+                if let Err(e) = session.group(lane, idx, other, o_idx) {
+                    self.notice = Some(format!("NOT GROUPED — {e}").into());
+                }
+            }
+            (Some(_), Some(_), None) => {
+                self.notice = Some(
+                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these frames"
+                        .into(),
+                )
+            }
+            (Some(_), None, _) => {
+                self.notice = Some("NOTHING GROUPED — click one of the halves first".into())
+            }
+            (None, ..) => {}
         }
         cx.notify();
     }
@@ -3946,6 +4007,10 @@ fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool 
         // at an edge of this clip. Whether those two halves were ever one take
         // is the engine's question, and it words that refusal itself.
         ActionId::Regroup => playhead == clip.start || playhead == clip.end(),
+        // Nothing to take apart in a clip that names no group at all. Whether
+        // the group it names still has another half is the engine's question,
+        // like the regroup above, and it words that refusal itself.
+        ActionId::Detach => clip.link.is_some(),
         _ => true,
     }
 }
@@ -4457,18 +4522,48 @@ fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> bool {
     let Some(clip) = session.lane_clips(lane).get(idx) else {
         return false;
     };
-    match (lane.kind, lane.ord) {
-        (_, 1..) => false,
-        (LaneKind::Video, _) => true,
-        // The sound of a take, only while the take is still there: its group is
-        // carried by a clip on some other lane.
-        (LaneKind::Audio, _) => session
+    let paired = || {
+        session
             .lanes()
             .into_iter()
             .filter(|&other| other != lane)
             .flat_map(|other| session.lane_clips(other))
-            .any(|o| o.link.is_some() && o.link == clip.link),
+            .any(|o| o.link.is_some() && o.link == clip.link)
+    };
+    match (lane.kind, lane.ord) {
+        (_, 1..) => false,
+        // The picture of a take -- unless the take has been taken apart: a
+        // detached picture (a group id no other lane carries, which is also what
+        // a lift of the sound leaves) is a half like the sound is, and a ripple
+        // under it would drag away the very half it was detached from. A clip in
+        // no group at all is not a half but a placement, and on `V1` a placement
+        // is the take there is.
+        (LaneKind::Video, _) => clip.link.is_none() || paired(),
+        // The sound of a take, only while the take is still there: its group is
+        // carried by a clip on some other lane.
+        (LaneKind::Audio, _) => paired(),
     }
+}
+
+/// The clip a Group would pair this one with: the first clip on another track,
+/// in the order the lanes are drawn, covering exactly the same frames and not in
+/// this clip's group already. Exactly the same frames because that is all a
+/// group id can mean (engine `links_are_consistent`), which is what leaves
+/// nothing for a second click to choose. `None` when no track has one, and the
+/// notice says so.
+fn span_partner(session: &PlaybackSession, lane: Lane, idx: usize) -> Option<(Lane, usize)> {
+    let clip = *session.lane_clips(lane).get(idx)?;
+    session
+        .lanes()
+        .into_iter()
+        .filter(|&other| other != lane)
+        .find_map(|other| {
+            let i = session.lane_clips(other).iter().position(|c| {
+                (c.start, c.end()) == (clip.start, clip.end())
+                    && !(c.link.is_some() && c.link == clip.link)
+            })?;
+            Some((other, i))
+        })
 }
 
 /// Whether a click marks this clip: the clip that was clicked always, and the
@@ -4807,8 +4902,8 @@ mod tests {
         eq_y, export_path, export_settings, format_line, frac_along, frac_down, frame_at,
         is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked, menu_at, mp4_refusal,
         normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources, whole_take,
-        width_frac, window_title,
+        source_frames, source_tint, span_partner, start_frac, timecode, unseen_paths,
+        unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -5057,6 +5152,16 @@ mod tests {
         assert!(applicable(&clip, v1, ActionId::Regroup, 30));
         assert!(applicable(&clip, v1, ActionId::Regroup, 90));
         assert!(!applicable(&clip, v1, ActionId::Regroup, 60));
+        // Detach is the clip's own business: nothing to take apart in one that
+        // names no group, and whether the group still has another half is the
+        // engine's question. Group is offered on every clip, for that reason.
+        assert!(!applicable(&clip, v1, ActionId::Detach, 0));
+        let grouped = Clip {
+            link: Some(3),
+            ..clip
+        };
+        assert!(applicable(&grouped, v1, ActionId::Detach, 60));
+        assert!(applicable(&clip, a1, ActionId::Group, 0));
         // The equalizer is the one item the *lane* decides: it filters samples,
         // and a video clip has none of its own. Never the playhead's business.
         assert!(applicable(&clip, a1, ActionId::Equalizer, 0));
@@ -5096,6 +5201,55 @@ mod tests {
             assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
         }
+    }
+
+    /// What the Detach and Group items do to a real timeline: a music video's
+    /// sound comes off its picture, Delete on the loose half takes that half
+    /// only, undo puts both back, and Group makes the two one take again --
+    /// whole-take delete and all.
+    #[test]
+    fn a_detached_half_is_removed_alone_and_groups_again() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        assert!(whole_take(&session, Lane::V1, 0), "one take to start with");
+        assert!(whole_take(&session, Lane::A1, 0));
+        let frames = session.lane_clips(Lane::V1)[0].len();
+
+        // Detach audio: neither half is a whole take any more, so Delete on
+        // either leaves the other exactly where it is.
+        assert!(session.ungroup(Lane::V1, 0));
+        assert!(
+            !whole_take(&session, Lane::A1, 0),
+            "the sound is a half now"
+        );
+        assert!(!whole_take(&session, Lane::V1, 0), "and so is the picture");
+        assert!(session.lift_clip(Lane::A1, 0));
+        assert!(session.lane_clips(Lane::A1).is_empty(), "the sound went");
+        assert_eq!(session.lane_clips(Lane::V1).len(), 1, "the picture stayed");
+        assert_eq!(session.lane_clips(Lane::V1)[0].len(), frames, "untrimmed");
+
+        // One undo per edit, the removal then the detach.
+        assert!(session.undo());
+        assert_eq!(session.lane_clips(Lane::A1).len(), 1, "the sound is back");
+        assert!(session.undo());
+        assert!(whole_take(&session, Lane::A1, 0), "one take again");
+
+        // Group: the partner is the clip covering these very frames on the
+        // other track, which is what the item hands the engine.
+        assert!(session.ungroup(Lane::V1, 0));
+        assert_eq!(span_partner(&session, Lane::V1, 0), Some((Lane::A1, 0)));
+        session
+            .group(Lane::V1, 0, Lane::A1, 0)
+            .expect("both halves still cover the same frames");
+        assert!(
+            whole_take(&session, Lane::A1, 0),
+            "a take that ripples again"
+        );
+        assert_eq!(
+            span_partner(&session, Lane::V1, 0),
+            None,
+            "and nothing left on another track to group with"
+        );
     }
 
     /// The refusal path, end to end against the real files: an incompatible
