@@ -228,6 +228,59 @@ struct ContextMenu {
     details: bool,
 }
 
+/// An open library menu: which row it was opened on -- the file and the stream,
+/// the pair [`Player::selected_asset`] holds, so a list rebuilt under it (a
+/// probe landing, a source going) cannot slide another row beneath the menu the
+/// way a row *index* would -- where it hangs, and whether it has been turned
+/// over to show what the file *is*.
+#[derive(Clone)]
+struct LibraryMenu {
+    path: PathBuf,
+    stream: usize,
+    at: Point<Pixels>,
+    details: bool,
+}
+
+/// What a library row's menu offers, in the order it lists them. Unlike the clip
+/// menu's items none of these is a stroke -- there is no keyboard way to a row --
+/// so the label and the hint are written here rather than read off the keymap.
+#[derive(Clone, Copy, PartialEq)]
+enum RowItem {
+    Add,
+    Remove,
+    Reveal,
+    Properties,
+}
+
+const ROW_ITEMS: [RowItem; 4] = [
+    RowItem::Add,
+    RowItem::Remove,
+    RowItem::Reveal,
+    RowItem::Properties,
+];
+
+impl RowItem {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "Add at playhead",
+            Self::Remove => "Remove from library",
+            Self::Reveal => "Reveal in files",
+            Self::Properties => "Properties",
+        }
+    }
+
+    /// The dim right-hand column, where the clip menu prints the stroke: what
+    /// the item will do to the timeline, so nothing here is a surprise.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Add => "inserts the whole file",
+            Self::Remove => "only if nothing plays it",
+            Self::Reveal => "file manager",
+            Self::Properties => "…",
+        }
+    }
+}
+
 /// What the menu offers, in the order it lists them. Every one of these is an
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
@@ -338,6 +391,10 @@ struct Player {
     /// `selected` does, so it is closed by anything that can move indices --
     /// every stroke, and every item of its own.
     context_menu: Option<ContextMenu>,
+    /// The library menu a right-click on a row opened, if one is up. Names its
+    /// row by file and stream rather than by position, so it acts on the row it
+    /// was opened on however the list is rebuilt under it.
+    library_menu: Option<LibraryMenu>,
     /// Which library row is picked: the file and the audio stream that row
     /// names, which is what an insert needs and what survives a row list being
     /// rebuilt. Its own selection and not the timeline's: Delete keeps acting
@@ -1227,6 +1284,72 @@ impl Player {
         cx.notify();
     }
 
+    /// Takes a library row's file out of the list, which is the one thing a row
+    /// can lose. Refused in the engine's own words while clips still play from
+    /// it -- and those words name the lanes holding them, so the refusal says
+    /// what to delete first. The list itself is the report that it worked: the
+    /// row is gone from it.
+    fn remove_source(&mut self, path: &Path, stream: usize, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let removed = self
+            .session
+            .as_mut()
+            .map(|session| session.remove_source(path, stream));
+        let text = match removed {
+            Some(Ok(())) => {
+                // The picked row may be the one that just went, and the engine
+                // reseeks, so this owes the flag reset like every other edit.
+                if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
+                    self.selected_asset = None;
+                }
+                self.reset_after_reseek();
+                // The undo stack goes with it (`Project::remove_source`): said
+                // here, because a `z` that does nothing afterwards would
+                // otherwise read as a bug.
+                format!("REMOVED {} — there is nothing left to undo", file_name(path))
+            }
+            Some(Err(e)) => format!("NOT REMOVED — {e}"),
+            None => "NO TIMELINE — open a file first".to_string(),
+        };
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// One item of a library row's menu, done. Every one of them closes the
+    /// menu first -- the list under it is about to be rebuilt -- except the one
+    /// that turns the card over.
+    fn act_on_row(&mut self, item: RowItem, cx: &mut Context<Self>) {
+        let Some(menu) = self.library_menu.clone() else {
+            return;
+        };
+        match item {
+            RowItem::Properties => {
+                if let Some(open) = &mut self.library_menu {
+                    open.details = true;
+                }
+            }
+            RowItem::Add => {
+                self.library_menu = None;
+                self.insert_source(&menu.path, menu.stream, None, cx);
+            }
+            RowItem::Remove => {
+                self.library_menu = None;
+                self.remove_source(&menu.path, menu.stream, cx);
+            }
+            RowItem::Reveal => {
+                self.library_menu = None;
+                // Another process starting: off the UI thread, exactly as the
+                // export notice's own click starts it.
+                cx.background_executor()
+                    .spawn(async move { show_in_file_manager(&menu.path) })
+                    .detach();
+            }
+        }
+        cx.notify();
+    }
+
     /// The rate and layout the whole timeline's audio is, taken from source 0's
     /// own stream: what a library row has to match to be placeable. `None`
     /// until that file has been probed, and then nothing is greyed for it.
@@ -1848,7 +1971,12 @@ impl Render for Player {
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
                 // already lists (keymap.rs `FIXED`).
-                if this.context_menu.take().is_some() {
+                // Both menus, taken rather than short-circuited: the library's
+                // one names a row the edits below can remove, so it closes on a
+                // stroke exactly as the clip menu does.
+                let clip_menu = this.context_menu.take().is_some();
+                let row_menu = this.library_menu.take().is_some();
+                if clip_menu || row_menu {
                     cx.notify();
                     if key == ESCAPE {
                         return;
@@ -1989,6 +2117,10 @@ impl Render for Player {
             // Over the panel it was opened on, and under the cards: it is only
             // ever up while neither of them is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
+            // The library's own menu, the same way and for the same reason:
+            // over the panel it was opened on, under the cards, and never up
+            // while one of them is.
+            .children(self.library_card(window.viewport_size(), cx))
             // Last, so they are over everything -- they take no room in the
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
@@ -2035,7 +2167,7 @@ impl Player {
                 .as_ref()
                 .is_some_and(|p| *p == (row.path.clone(), row.stream));
             let name: SharedString = row.name.clone().into();
-            let tip: SharedString = match (&row.unusable, meta) {
+            let says: String = match (&row.unusable, meta) {
                 // A greyed row says why in full, where its length would be:
                 // the list is the one place the file's own tracks are named.
                 (Some(why), _) => format!("{} — {why}", row.path.display()),
@@ -2054,8 +2186,10 @@ impl Player {
                     meta.frame_rate
                 ),
                 (None, None) => row.path.display().to_string(),
-            }
-            .into();
+            };
+            // The menu is the third way into a row, after the click and the
+            // drag, and a right-click nothing advertises is one nobody finds.
+            let tip: SharedString = format!("{says} · right-click for more").into();
             let ghost = name.clone();
             // What the second line says: the stream, then either its length or
             // the reason it cannot be used.
@@ -2069,6 +2203,7 @@ impl Player {
             let usable = row.unusable.is_none();
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);
+            let menu_path = path.clone();
             div()
                 .id(("asset", i))
                 .flex_none()
@@ -2096,6 +2231,33 @@ impl Player {
                             cx.new(|_| Tip(ghost.clone()))
                         })
                 })
+                // The right button hangs the row's own menu at the pointer.
+                // Every row takes it, greyed ones included: a file that cannot
+                // join this timeline can still be revealed, described and taken
+                // out of the list, and Add is the one item that then refuses --
+                // in the engine's words, where the row's grey already says why.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        if this.modal() {
+                            return;
+                        }
+                        // Picked as a left-click would pick it, so the row the
+                        // menu is about is the row that reads as chosen -- but
+                        // only a row that *can* be picked, which is what keeps
+                        // the Add button under the list honest.
+                        if usable {
+                            this.selected_asset = Some((menu_path.clone(), stream));
+                        }
+                        this.library_menu = Some(LibraryMenu {
+                            path: menu_path.clone(),
+                            stream,
+                            at: event.position,
+                            details: false,
+                        });
+                        cx.notify();
+                    }),
+                )
                 .when(picked, |d| d.bg(rgb(SELECTED)).border_1())
                 .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                 // Full height and hard against the edge: the tint reads as
@@ -3207,6 +3369,157 @@ impl Player {
                                 }))
                                 .child("Reset"),
                         ),
+                ),
+        )
+    }
+
+    /// The menu a right-click on a library row opens: what can be done with the
+    /// *file* rather than with a clip of it, and a turn-over side saying what
+    /// that file is. Built like [`Player::context_card`] down to the scrim, the
+    /// row height and the clamp, because it is the same menu on the other panel
+    /// -- a click away or any stroke closes it.
+    fn library_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let menu = self.library_menu.clone()?;
+        let path = menu.path.clone();
+        let row = |n: usize| {
+            div()
+                .id(("library-menu", n))
+                .flex()
+                .min_h(px(MENU_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if menu.details {
+            // What the library knows about this row and nothing probed for the
+            // card: the streams table is filled once per file at import.
+            let info = self
+                .streams
+                .get(&path)
+                .and_then(|of_file| of_file.iter().find(|s| s.index == menu.stream));
+            let frames = self.session.as_ref().map_or(0, |session| {
+                source_frames(lane_clips(session), session.sources(), &path)
+            });
+            // How many clips play from this exact row -- the number that
+            // decides whether Remove is refused, so the card answers the
+            // question the refusal would otherwise raise.
+            let placed = self.session.as_ref().map_or(0, |session| {
+                let of_row = session
+                    .sources()
+                    .iter()
+                    .position(|s| s.path == path && s.audio_stream == menu.stream);
+                of_row.map_or(0, |idx| {
+                    lane_clips(session).filter(|c| c.source == idx).count()
+                })
+            });
+            for (label, value) in [
+                ("File", file_name(&path)),
+                ("Path", path.display().to_string()),
+                (
+                    "Audio",
+                    info.map_or_else(|| "no track of its own".to_string(), stream_detail),
+                ),
+                ("Length", timecode(f64::from(frames) / self.fps, self.fps)),
+                ("On the timeline", format!("{placed} clips")),
+            ] {
+                rows.push(
+                    row(rows.len())
+                        .child(label)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(value),
+                        )
+                        .into_any_element(),
+                );
+            }
+        } else {
+            // Everything but Add works without a timeline open -- and with no
+            // timeline there are no rows to right-click at all, so this is the
+            // export guard's shape and not a second policy.
+            let live = self.session.is_some() && self.exporting().is_none();
+            for item in ROW_ITEMS {
+                let enabled = match item {
+                    RowItem::Add | RowItem::Remove => live,
+                    RowItem::Reveal | RowItem::Properties => true,
+                };
+                rows.push(
+                    row(rows.len())
+                        .child(item.label())
+                        .child(div().text_color(rgb(INK_DIM)).child(item.hint()))
+                        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+                        .when(enabled, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.act_on_row(item, cx);
+                                }))
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
+        let (x, y) = menu_at(
+            menu.at,
+            viewport,
+            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+        );
+        let full: SharedString = path.display().to_string().into();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.library_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.library_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("library-menu-card")
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(MENU_W))
+                        .flex()
+                        .flex_col()
+                        .p(px(MENU_PAD))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        // Painted after the scrim, so this listener runs first
+                        // and a press meant for an item never closes the menu
+                        // out from under its own click (`context_card`).
+                        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .when(menu.details, |d| {
+                            d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
+                        })
+                        .children(rows),
                 ),
         )
     }
@@ -5179,6 +5492,52 @@ mod tests {
         );
     }
 
+    /// Remove from library, through the door the menu item uses
+    /// ([`Player::remove_source`] calls exactly this): refused by name while
+    /// clips play from the file, and once they do not the row leaves the list.
+    #[test]
+    fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let second = session.sources()[1].path.clone();
+        let streams = HashMap::new();
+        let rows = |session: &PlaybackSession| {
+            library_rows(session.sources(), &streams, None, |_| 0).len()
+        };
+        assert_eq!(rows(&session), 2, "a row per source");
+
+        let refusal = session
+            .remove_source(&second, 0)
+            .expect_err("its take is still on the timeline")
+            .to_string();
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert!(
+            refusal.contains("V1 (1 clip)") && refusal.contains("A1 (1 clip)"),
+            "the refusal names the lanes to clear: {refusal}"
+        );
+        assert_eq!(rows(&session), 2, "and the row is still there");
+
+        // Delete that take -- the whole group, from either half -- and the file
+        // can go. The list is what says so.
+        let last = session.lane_clips(Lane::V1).len() - 1;
+        assert!(session.delete_clip(Lane::V1, last));
+        session
+            .remove_source(&second, 0)
+            .expect("nothing plays av2 any more");
+        assert_eq!(rows(&session), 1, "the row went with it");
+        assert_eq!(session.sources().len(), 1);
+        // The one file left cannot go: a project that names none is not one
+        // that reopens.
+        let refusal = session
+            .remove_source(&session.sources()[0].path.clone(), 0)
+            .expect_err("the last file stays")
+            .to_string();
+        assert!(refusal.contains("only file"), "{refusal}");
+        // A row this timeline never had is refused, not panicked on.
+        assert!(session.remove_source(&second, 0).is_err());
+    }
+
     /// The move-a-clip-between-tracks path through the door the drop uses
     /// ([`Player::move_clip`] calls exactly this): the clip changes row, the
     /// *picture* comes from the new row afterwards -- which is what "it plays
@@ -6221,6 +6580,7 @@ fn main() {
                     ruler: Rc::default(),
                     selected: None,
                     context_menu: None,
+                    library_menu: None,
                     selected_asset: None,
                     waves: HashMap::new(),
                     streams: HashMap::new(),

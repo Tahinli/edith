@@ -268,7 +268,7 @@ pub struct Fixed {
 pub const FIXED: [Fixed; 12] = [
     Fixed {
         chord: "esc",
-        label: "Close this card or clip menu, or cancel a capture",
+        label: "Close this card or menu, or cancel a capture",
         category: Category::View,
     },
     Fixed {

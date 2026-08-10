@@ -508,6 +508,60 @@ impl Project {
         true
     }
 
+    /// Drops a source entry -- the file a library row *is* -- and renumbers
+    /// every clip that indexed past it, which is why this is more than a
+    /// `Vec::remove`.
+    ///
+    /// Refused, changing nothing, while any clip still plays from it: the
+    /// refusal names the lanes and how many clips each holds, so a caller can
+    /// say what has to be deleted first. Refused too for the last entry left,
+    /// because a project that names no file cannot be reopened
+    /// (`PlaybackSession::open_project`) and the timeline's audio parameters
+    /// are read off source 0.
+    ///
+    /// ponytail: this retires the undo stack. `history` holds lanes alone, so a
+    /// snapshot older than the removal can name the very source being removed
+    /// (delete a file's clips, then remove the file) and restoring it would
+    /// point a clip at an entry that is gone. The upgrade path is snapshotting
+    /// `sources` beside `lanes` in [`snapshot`](Project::snapshot) -- which the
+    /// "indexes are forever" rule ([`append_clip`](Project::append_clip), and
+    /// the reason [`without_orphan_sources`](Project::without_orphan_sources)
+    /// exists) currently rules out.
+    pub fn remove_source(&mut self, idx: usize) -> crate::Result<()> {
+        let Some(source) = self.sources.get(idx) else {
+            return Err(format!("there is no source {idx} to remove").into());
+        };
+        let name = source.path.display().to_string();
+        // Asked before the clips are counted: with one file left the answer is
+        // the same whatever plays, and "the only file" is the more useful half
+        // of it.
+        if self.sources.len() == 1 {
+            return Err(format!("{name} is the only file this project names").into());
+        }
+        let used: Vec<String> = handles(&self.lanes)
+            .into_iter()
+            .zip(&self.lanes)
+            .filter_map(
+                |(lane, data)| match data.clips.iter().filter(|c| c.source == idx).count() {
+                    0 => None,
+                    1 => Some(format!("{} (1 clip)", lane.label())),
+                    n => Some(format!("{} ({n} clips)", lane.label())),
+                },
+            )
+            .collect();
+        if !used.is_empty() {
+            return Err(format!("{name} still plays on {}", used.join(", ")).into());
+        }
+        self.sources.remove(idx);
+        for c in self.lanes.iter_mut().flat_map(|l| &mut l.clips) {
+            if c.source > idx {
+                c.source -= 1;
+            }
+        }
+        self.history.clear();
+        Ok(())
+    }
+
     /// The sources a clip actually names, with the clips reindexed onto them
     /// -- what a save writes. Indexes are forever *inside* a session (see
     /// [`Project::append_clip`]), so an undone import leaves an orphan source
@@ -2360,6 +2414,87 @@ mod tests {
         let reloaded = Project::from_parts(sources, lanes, eq, color).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
+    }
+
+    /// Taking a file out of the library: refused by name -- lanes and counts --
+    /// while a clip still plays from it, and once nothing does, the entry goes
+    /// and every clip that indexed past it is renumbered onto the short list.
+    #[test]
+    fn remove_source_refuses_what_plays_and_renumbers_what_is_left() {
+        // Sources 0 (FILE, three clips) and 1 (FILE2, one take on both lanes),
+        // plus a second stream of FILE as source 2 with a take of its own.
+        let mut p = two_sources();
+        assert_eq!(p.import(FILE, 1), 2, "another stream is another source");
+        assert!(p.append_clip(2, 4));
+
+        let refusal = p
+            .remove_source(1)
+            .expect_err("a source with clips on it cannot go")
+            .to_string();
+        assert!(refusal.contains(FILE2), "names the file: {refusal}");
+        assert!(
+            refusal.contains("V1 (1 clip)") && refusal.contains("A1 (1 clip)"),
+            "names the lanes holding it: {refusal}"
+        );
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert_eq!(p.sources().len(), 3, "a refusal changes nothing");
+        assert_eq!(shape(&p)[0][3].source, 1);
+
+        // Delete FILE2's take -- the whole span, on every lane -- and the entry
+        // is free to go. Source 2's clips become source 1's.
+        assert!(p.delete_in(Lane::V1, 3));
+        assert!(!p.clips().iter().any(|c| c.source == 1), "nothing plays it");
+        p.remove_source(1).expect("nothing plays FILE2 any more");
+        assert_eq!(
+            p.sources(),
+            [Source::new(FILE, 0), Source::new(FILE, 1)],
+            "the middle entry is gone"
+        );
+        assert_eq!(
+            shape(&p)[0].iter().map(|c| c.source).collect::<Vec<_>>(),
+            [0, 0, 0, 1],
+            "the clips past it renumbered"
+        );
+        assert_eq!(
+            shape(&p)[1].iter().map(|c| c.source).collect::<Vec<_>>(),
+            [0, 0, 0, 1],
+            "on every lane"
+        );
+        // What is left is a project that still loads, which is the whole point
+        // of renumbering rather than leaving a hole.
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        Project::from_parts(sources, lanes, eq, color).expect("from_parts");
+    }
+
+    /// The two edges of a removal: it retires the undo stack (the ponytail on
+    /// [`Project::remove_source`]), and the last entry standing cannot go --
+    /// source 0 is where a reopened project reads its frame rate.
+    #[test]
+    fn remove_source_retires_undo_and_keeps_the_last_file() {
+        let mut p = two_sources();
+        assert!(p.delete_in(Lane::V1, 3), "FILE2's take goes first");
+        assert!(!p.history.is_empty(), "there is something to undo");
+        p.remove_source(1).expect("nothing plays FILE2");
+        assert!(
+            p.history.is_empty(),
+            "a snapshot naming the removed source must not survive it"
+        );
+        assert!(!p.undo(), "and so there is nothing left to undo");
+
+        // The last file standing stays, whatever plays from it:
+        // `PlaybackSession::open_project` refuses a project that names no
+        // sources at all, and the timeline's frame rate lives in source 0.
+        assert_eq!(p.sources().len(), 1);
+        let refusal = p
+            .remove_source(0)
+            .expect_err("the only source must stay")
+            .to_string();
+        assert!(refusal.contains("only file"), "{refusal}");
+        assert_eq!(p.sources().len(), 1);
+        assert!(
+            p.remove_source(1).is_err(),
+            "and an index that is not there is refused, not panicked on"
+        );
     }
 
     /// A clip's equalizer is the clip's: it survives every edit that copies a
