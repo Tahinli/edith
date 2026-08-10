@@ -1,13 +1,14 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 3
+//! edith 4
 //! playhead 90
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
-//! video 0 0 120 0 0
-//! audio 0 0 120 0 0
-//! video 120 0 120 1 -
+//! video 1 0 0 120 0 0
+//! audio 1 0 0 120 0 0
+//! video 2 120 0 120 1 -
+//! audio 2
 //! ```
 //!
 //! A source line is `source <audio stream> <path>`: which of the file's audio
@@ -16,18 +17,27 @@
 //! stream first because a path runs to the end of the line (it may hold
 //! spaces) and an optional *trailing* field could not be told from one.
 //!
-//! A lane line is `<lane> <start> <in> <out> <source> <link>`: where the clip
-//! sits on the timeline, the half-open source range it plays, the file it plays
-//! from, and its group id (`-` for none). Timeline placement is explicit, so a
-//! *gap* is simply a stretch no line covers -- there is nothing to write for
-//! one, and nothing that can disagree about its length.
+//! A lane line is `<kind> <lane> <start> <in> <out> <source> <link>`: which lane
+//! the clip is on -- its kind and its 1-based number among the lanes of that
+//! kind, the [`crate::project::Lane::label`] a header column shows -- then where
+//! the clip sits on the timeline, the half-open source range it plays, the file
+//! it plays from, and its group id (`-` for none). Timeline placement is
+//! explicit, so a *gap* is simply a stretch no line covers -- there is nothing
+//! to write for one, and nothing that can disagree about its length.
 //!
-//! **Version 2** wrote `source <path>`, which is this file's stream 0 -- one
-//! per file, whichever audio track came first. **Version 1** wrote that and one
-//! lane, queued end to end: `clip <in> <out> <source>`. Both still load -- a v1
-//! file's clips are laid out cumulatively and copied onto both lanes as one
-//! group each, which is exactly what a v1 timeline meant -- and saving either
-//! again writes v3. An older reader refuses a newer file by name.
+//! A lane is declared by the clips on it, in the order the lanes are displayed
+//! in; a lane holding *nothing* has a bare `<kind> <lane>` line instead, which
+//! is the only way an empty lane could still be there on the way back. A lane
+//! number may not skip one of its kind.
+//!
+//! **Version 3** was this without the lane number, and held one video lane and
+//! one audio lane, no more. **Version 2** wrote `source <path>` as well, which
+//! is this file's stream 0 -- one per file, whichever audio track came first.
+//! **Version 1** wrote that and one lane, queued end to end: `clip <in> <out>
+//! <source>`. All three still load -- a v1 file's clips are laid out
+//! cumulatively and copied onto both lanes as one group each, which is exactly
+//! what a v1 timeline meant -- and saving any of them writes v4. An older
+//! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -53,11 +63,12 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use crate::project::{Clip, Source};
+use crate::project::{Clip, Lane, LaneKind, Source};
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 3";
+const MAGIC: &[u8] = b"edith 4";
+const MAGIC_V3: &[u8] = b"edith 3";
 const MAGIC_V2: &[u8] = b"edith 2";
 const MAGIC_V1: &[u8] = b"edith 1";
 
@@ -68,8 +79,10 @@ pub struct Document {
     /// Paths absolute, relative entries already joined to the file's own
     /// directory.
     pub sources: Vec<Source>,
-    pub video: Vec<Clip>,
-    pub audio: Vec<Clip>,
+    /// Every lane, in display order, which is the order
+    /// [`crate::Project::from_parts`] takes them in. Exactly two -- `V1` then
+    /// `A1` -- for every dialect before v4.
+    pub lanes: Vec<(LaneKind, Vec<Clip>)>,
     pub playhead: u32,
 }
 
@@ -78,8 +91,7 @@ pub struct Document {
 pub fn save(
     path: &Path,
     sources: &[Source],
-    video: &[Clip],
-    audio: &[Clip],
+    lanes: &[(LaneKind, Vec<Clip>)],
     playhead: u32,
 ) -> crate::Result<()> {
     let dir = project_dir(path);
@@ -92,7 +104,7 @@ pub fn save(
     // the second one puts the name itself there.
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
-            f.write_all(&emit(&dir, sources, video, audio, playhead))?;
+            f.write_all(&emit(&dir, sources, lanes, playhead))?;
             f.sync_all()
         })
         .and_then(|()| std::fs::rename(&part, path))
@@ -122,7 +134,12 @@ fn project_dir(path: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
-fn emit(dir: &Path, sources: &[Source], video: &[Clip], audio: &[Clip], playhead: u32) -> Vec<u8> {
+fn emit(
+    dir: &Path,
+    sources: &[Source],
+    lanes: &[(LaneKind, Vec<Clip>)],
+    playhead: u32,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(b'\n');
@@ -132,14 +149,31 @@ fn emit(dir: &Path, sources: &[Source], video: &[Clip], audio: &[Clip], playhead
         escape(s.path.strip_prefix(dir).unwrap_or(&s.path), &mut out);
         out.push(b'\n');
     }
-    // Lane by lane rather than interleaved by time: a lane reads as a list, and
-    // the parser gets its sortedness check for free from the order it is in.
-    for (keyword, clips) in [("video", video), ("audio", audio)] {
+    // Lane by lane rather than interleaved by time: a lane reads as a list, the
+    // parser gets its sortedness check for free from the order it is in, and
+    // the lanes come back out in the order they are displayed in.
+    let (mut video, mut audio) = (0, 0);
+    for (kind, clips) in lanes {
+        let (keyword, ord) = match kind {
+            LaneKind::Video => {
+                video += 1;
+                ("video", video)
+            }
+            LaneKind::Audio => {
+                audio += 1;
+                ("audio", audio)
+            }
+        };
+        // A lane is declared by its clips; one holding nothing has to say so on
+        // a line of its own, or the lane itself would not survive the round trip.
+        if clips.is_empty() {
+            out.extend_from_slice(format!("{keyword} {ord}\n").as_bytes());
+        }
         for c in clips {
             let link = c.link.map_or("-".to_string(), |l| l.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {} {} {} {} {link}\n",
+                    "{keyword} {ord} {} {} {} {} {link}\n",
                     c.start, c.in_frame, c.out_frame, c.source
                 )
                 .as_bytes(),
@@ -159,7 +193,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    if first != MAGIC && !streamless {
+    // ...and the one that numbers its lanes. Every older one held two.
+    let v4 = first == MAGIC;
+    if !v4 && !streamless && first != MAGIC_V3 {
         return Err(match first.strip_prefix(b"edith ") {
             Some(v) => format!("line 1: unsupported version {}", String::from_utf8_lossy(v)),
             None => "line 1: not a edith file".to_string(),
@@ -169,8 +205,13 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
 
     let mut doc = Document {
         sources: Vec::new(),
-        video: Vec::new(),
-        audio: Vec::new(),
+        // v4 declares its lanes as they come; every dialect before it held
+        // exactly `V1` and `A1`, either of which could be empty.
+        lanes: if v4 {
+            Vec::new()
+        } else {
+            vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())]
+        },
         playhead: 0,
     };
     let mut playhead_seen = false;
@@ -194,7 +235,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 playhead_seen = true;
             }
             b"source" => {
-                if !doc.video.is_empty() || !doc.audio.is_empty() {
+                if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
                     return Err(format!("line {n}: source after a clip").into());
                 }
                 // The stream comes first and the path is everything after it,
@@ -237,16 +278,35 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         in_frame: number(f[0], n)?,
                         out_frame: number(f[1], n)?,
                         source: number(f[2], n)? as usize,
-                        link: Some(doc.video.len() as u32),
+                        link: Some(doc.lanes[0].1.len() as u32),
                     },
                     &doc,
                     n,
                 )?;
                 queued = clip.end();
-                doc.video.push(clip);
-                doc.audio.push(clip);
+                doc.lanes[0].1.push(clip);
+                doc.lanes[1].1.push(clip);
             }
             b"video" | b"audio" if !v1 => {
+                let kind = match keyword {
+                    b"video" => LaneKind::Video,
+                    _ => LaneKind::Audio,
+                };
+                // v4 names the lane, and a line naming nothing else is an empty
+                // lane's whole existence. Older dialects had one lane per kind.
+                let (ord, rest) = if v4 {
+                    let at = rest.iter().position(|&b| b == b' ');
+                    (
+                        number(&rest[..at.unwrap_or(rest.len())], n)?,
+                        &rest[at.map_or(rest.len(), |at| at + 1)..],
+                    )
+                } else {
+                    (1, rest)
+                };
+                let at = lane_of(&mut doc.lanes, kind, ord, n)?;
+                if v4 && rest.is_empty() {
+                    continue;
+                }
                 let f = fields(rest, 5, "clip", n)?;
                 let clip = check(
                     Clip {
@@ -262,10 +322,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     &doc,
                     n,
                 )?;
-                let lane = match keyword {
-                    b"video" => &mut doc.video,
-                    _ => &mut doc.audio,
-                };
+                let lane = &mut doc.lanes[at].1;
                 // The sorted, non-overlapping placement invariant, checked at
                 // the only door untrusted clips come in through.
                 if lane.last().is_some_and(|prev| prev.end() > clip.start) {
@@ -289,10 +346,43 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
         }
     }
-    if doc.video.is_empty() && doc.audio.is_empty() {
+    if doc.lanes.iter().all(|(_, clips)| clips.is_empty()) {
         return Err("no clips: an empty timeline is not a project".into());
     }
     Ok(doc)
+}
+
+/// Where the lane a v4 line names sits, appending it if this is its first line.
+/// Lanes arrive in display order, so a number that skips one of its kind is a
+/// lane that was never declared, and is refused by the name it would have had.
+fn lane_of(
+    lanes: &mut Vec<(LaneKind, Vec<Clip>)>,
+    kind: LaneKind,
+    ord: u32,
+    line: usize,
+) -> crate::Result<usize> {
+    let mut seen = 0;
+    for (at, (k, _)) in lanes.iter().enumerate() {
+        if *k == kind {
+            seen += 1;
+            if seen == ord {
+                return Ok(at);
+            }
+        }
+    }
+    if ord != seen + 1 {
+        return Err(match ord.checked_sub(1) {
+            Some(prev) => format!(
+                "line {line}: lane {} comes before {}",
+                Lane::new(kind, prev as usize).label(),
+                Lane::new(kind, seen as usize).label()
+            ),
+            None => format!("line {line}: lane numbers start at 1"),
+        }
+        .into());
+    }
+    lanes.push((kind, Vec::new()));
+    Ok(lanes.len() - 1)
 }
 
 /// Splits a line's fields, refusing the wrong count by name.
@@ -413,47 +503,139 @@ mod tests {
         }
     }
 
-    fn doc() -> (PathBuf, Vec<Source>, Vec<Clip>, Vec<Clip>) {
+    /// Lanes in display order, as [`Document::lanes`] holds them.
+    type Lanes = Vec<(LaneKind, Vec<Clip>)>;
+
+    /// `V1` then `A1`, the shape every dialect before v4 held.
+    fn two(video: Vec<Clip>, audio: Vec<Clip>) -> Lanes {
+        vec![(LaneKind::Video, video), (LaneKind::Audio, audio)]
+    }
+
+    fn doc() -> (PathBuf, Vec<Source>, Lanes) {
         (
             PathBuf::from("/proj"),
             vec![source("/proj/a.mp4", 0), source("/elsewhere/b.mp4", 2)],
-            vec![clip(0, 0, 30, 0, Some(0)), clip(30, 10, 20, 1, Some(1))],
-            vec![clip(0, 0, 30, 0, Some(0))],
+            two(
+                vec![clip(0, 0, 30, 0, Some(0)), clip(30, 10, 20, 1, Some(1))],
+                vec![clip(0, 0, 30, 0, Some(0))],
+            ),
         )
     }
 
     #[test]
     fn relative_and_absolute_paths_round_trip() {
-        let (dir, sources, video, audio) = doc();
-        let bytes = emit(&dir, &sources, &video, &audio, 12);
+        let (dir, sources, lanes) = doc();
+        let bytes = emit(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 3\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
-             video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n",
+            "edith 4\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0\nvideo 1 30 10 20 1 1\naudio 1 0 0 30 0 0\n",
             "the file under the project directory is written relative to it, \
              each with the audio stream it plays"
         );
         let back = parse(&bytes, &dir).expect("parse");
         assert_eq!(back.sources, sources, "relative entries rejoin the dir");
-        assert_eq!(back.video, video);
         assert_eq!(
-            back.audio, audio,
-            "the trailing gap needs no line of its own"
+            back.lanes, lanes,
+            "both lanes, in display order; the trailing gap needs no line"
         );
         assert_eq!(back.playhead, 12);
         // ...and emitting the parsed document reproduces the same bytes.
+        assert_eq!(emit(&dir, &back.sources, &back.lanes, back.playhead), bytes);
+    }
+
+    /// The whole of the bump: a project of any number of lanes writes and reads
+    /// back, in display order, empty lanes and cross-lane groups included.
+    #[test]
+    fn any_number_of_lanes_round_trips() {
+        let dir = PathBuf::from("/proj");
+        let sources = vec![source("/proj/a.mp4", 0)];
+        // V1, A1, V2, A2 in *display* order -- the interleaving a front-end
+        // shows, not video-then-audio -- with one take grouped across V1 and A2
+        // (no paired ord, the lanes between them empty of it) and an A1 holding
+        // nothing at all.
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 30, 0, Some(4))]),
+            (LaneKind::Audio, Vec::new()),
+            (LaneKind::Video, vec![clip(40, 0, 10, 0, None)]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0, Some(4))]),
+        ];
+        let bytes = emit(&dir, &sources, &lanes, 7);
         assert_eq!(
-            emit(&dir, &back.sources, &back.video, &back.audio, back.playhead),
-            bytes
+            String::from_utf8_lossy(&bytes),
+            "edith 4\nplayhead 7\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 4\naudio 1\nvideo 2 40 0 10 0 -\naudio 2 0 0 30 0 4\n",
+            "an empty lane is a line of its own; everything else is its clips"
+        );
+        let back = parse(&bytes, &dir).expect("parse");
+        assert_eq!(back.lanes, lanes, "lane list, order and links all survive");
+        assert_eq!(back.playhead, 7);
+        assert_eq!(emit(&dir, &back.sources, &back.lanes, back.playhead), bytes);
+
+        // A lane number may not skip one of its kind: that lane was declared by
+        // nothing, and the refusal names it.
+        for (file, want) in [
+            (
+                "edith 4\nsource 0 a.mp4\nvideo 2 0 0 30 0 -\n",
+                "line 3: lane V2 comes before V1",
+            ),
+            (
+                "edith 4\nsource 0 a.mp4\nvideo 1 0 0 30 0 -\naudio 3\n",
+                "line 4: lane A3 comes before A1",
+            ),
+            (
+                "edith 4\nsource 0 a.mp4\nvideo 0 0 0 30 0 -\n",
+                "line 3: lane numbers start at 1",
+            ),
+            // The clip fields are still the clip fields, one lane number on.
+            (
+                "edith 4\nsource 0 a.mp4\nvideo 1 0 0 30 0\n",
+                "line 3: clip wants 5 fields, found 4",
+            ),
+            // ...and a v4 line in a v3 file reads as the garbled clip it is.
+            (
+                "edith 3\nsource 0 a.mp4\nvideo 1 0 0 30 0 -\n",
+                "line 3: clip wants 5 fields, found 6",
+            ),
+        ] {
+            assert_eq!(parse(file.as_bytes(), &dir).unwrap_err().to_string(), want);
+        }
+        // Lanes and nothing on them is not a project.
+        assert_eq!(
+            parse(b"edith 4\nsource 0 a.mp4\nvideo 1\naudio 1\n", &dir)
+                .unwrap_err()
+                .to_string(),
+            "no clips: an empty timeline is not a project"
         );
     }
 
-    /// The other half of the compatibility promise: a v2 file names no audio
-    /// stream and means stream 0 -- what the whole dialect could play -- and
-    /// saving it again writes v3 saying so, with nothing else changed.
+    /// The other half of the compatibility promise: a v3 file is a v4 one
+    /// without the lane numbers, and a v2 file names no audio stream and means
+    /// stream 0 -- what the whole dialect could play. Both load as the two lanes
+    /// they always were, and saving either writes v4 with nothing else changed.
     #[test]
-    fn a_v2_file_loads_as_stream_0() {
+    fn a_v3_file_is_two_lanes_and_a_v2_one_is_stream_0() {
         let dir = PathBuf::from("/proj");
+        let (_, _, lanes) = doc();
+        let v3 = b"edith 3\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
+                   video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n";
+        let old = parse(v3, &dir).expect("v3 parses");
+        assert_eq!(
+            (&old.sources, &old.lanes, old.playhead),
+            (
+                &vec![source("/proj/a.mp4", 0), source("/elsewhere/b.mp4", 2)],
+                &lanes,
+                12
+            ),
+            "a v3 file loads as exactly the state its v4 twin does"
+        );
+        // ...and re-saved it *is* that twin: the magic and a lane number per
+        // clip line, and not one byte else.
+        assert_eq!(
+            emit(&dir, &old.sources, &old.lanes, old.playhead),
+            emit(&dir, &old.sources, &lanes, 12),
+        );
+
         let v2 = b"edith 2\nplayhead 12\nsource a.mp4\nsource /elsewhere/b.mp4\n\
                    video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n";
         let back = parse(v2, &dir).expect("v2 parses");
@@ -461,40 +643,43 @@ mod tests {
             back.sources,
             vec![source("/proj/a.mp4", 0), source("/elsewhere/b.mp4", 0)],
         );
-        let (_, _, video, audio) = doc();
-        assert_eq!((&back.video, &back.audio), (&video, &audio));
+        assert_eq!(back.lanes, lanes);
 
-        let v3 = emit(&dir, &back.sources, &back.video, &back.audio, back.playhead);
+        let v4 = emit(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
-            String::from_utf8_lossy(&v3),
-            "edith 3\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
-             video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n",
-            "a re-saved v2 project differs only by its version and the streams \
-             it always meant"
+            String::from_utf8_lossy(&v4),
+            "edith 4\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0\nvideo 1 30 10 20 1 1\naudio 1 0 0 30 0 0\n",
+            "a re-saved v2 project differs only by its version, the lane \
+             numbers and the streams it always meant"
         );
-        let again = parse(&v3, &dir).expect("v3 parses");
+        let again = parse(&v4, &dir).expect("v4 parses");
         assert_eq!(again.sources, back.sources);
     }
 
     /// The compatibility promise: a v1 file is a fully-grouped, gapless pair of
-    /// lanes, and saving it again writes v3.
+    /// lanes, and saving it again writes v4.
     #[test]
     fn a_v1_file_loads_as_two_grouped_lanes() {
         let dir = PathBuf::from("/proj");
         let v1 = b"edith 1\nplayhead 5\nsource a.mp4\nclip 0 30 0\nclip 40 60 0\n";
         let back = parse(v1, &dir).expect("v1 parses");
         assert_eq!(
-            back.video,
+            back.lanes[0].1,
             vec![clip(0, 0, 30, 0, Some(0)), clip(30, 40, 60, 0, Some(1))],
             "v1 clips queue up: the second starts where the first ended"
         );
-        assert_eq!(back.audio, back.video, "one take per clip, on both lanes");
+        assert_eq!(
+            back.lanes,
+            two(back.lanes[0].1.clone(), back.lanes[0].1.clone()),
+            "one take per clip, on both lanes"
+        );
         assert_eq!(back.playhead, 5);
-        // Saved again it is v3, and that round-trips to the same document.
-        let v3 = emit(&dir, &back.sources, &back.video, &back.audio, back.playhead);
-        assert!(v3.starts_with(b"edith 3\n"));
-        let again = parse(&v3, &dir).expect("v3 parses");
-        assert_eq!((again.video, again.audio), (back.video, back.audio));
+        // Saved again it is v4, and that round-trips to the same document.
+        let v4 = emit(&dir, &back.sources, &back.lanes, back.playhead);
+        assert!(v4.starts_with(b"edith 4\n"));
+        let again = parse(&v4, &dir).expect("v4 parses");
+        assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
         for (bytes, want) in [
             (
@@ -532,7 +717,7 @@ mod tests {
         );
         // ...and a lane may be empty as long as the other one is not.
         let only_audio = parse(b"edith 2\nsource a.mp4\naudio 0 0 30 0 -\n", &dir).expect("parse");
-        assert!(only_audio.video.is_empty());
+        assert!(only_audio.lanes[0].1.is_empty(), "V1 is there and empty");
     }
 
     /// A `start` near the top of `u32` used to make `Clip::end` panic in debug
@@ -581,11 +766,11 @@ mod tests {
             path: source,
             audio_stream: 1,
         };
-        save(&path, &[entry], &one, &one, 0).expect("save");
+        save(&path, &[entry], &two(one.to_vec(), one.to_vec()), 0).expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 3\nplayhead 0\nsource 1 a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n"
+            "edith 4\nplayhead 0\nsource 1 a.mp4\nvideo 1 0 0 30 0 -\naudio 1 0 0 30 0 -\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
         // way the project was opened -- the same file, through the link, still
@@ -608,11 +793,17 @@ mod tests {
             path: PathBuf::from(OsString::from_vec(b"/proj/we\nird 100%\xff.mp4".to_vec())),
             audio_stream: 0,
         };
-        let bytes = emit(&dir, &[nasty.clone()], &[clip(0, 0, 5, 0, None)], &[], 0);
+        let bytes = emit(
+            &dir,
+            &[nasty.clone()],
+            &two(vec![clip(0, 0, 5, 0, None)], Vec::new()),
+            0,
+        );
         assert_eq!(
             bytes.iter().filter(|&&b| b == b'\n').count(),
-            4,
-            "the escaped newline must not become a line break"
+            5,
+            "the escaped newline must not become a line break: magic, playhead, \
+             source, the clip, and the empty audio lane's own line"
         );
         let back = parse(&bytes, &dir).expect("parse");
         // The spaces in it are the reason the stream field leads rather than
@@ -623,10 +814,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 4\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 5\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 4");
+        assert_eq!(err, "line 1: unsupported version 5");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
@@ -704,8 +895,8 @@ mod tests {
     /// Every truncation of a good file either parses or refuses; none panics.
     #[test]
     fn truncations_never_panic() {
-        let (dir, sources, video, audio) = doc();
-        let bytes = emit(&dir, &sources, &video, &audio, 12);
+        let (dir, sources, lanes) = doc();
+        let bytes = emit(&dir, &sources, &lanes, 12);
         for cut in 0..bytes.len() {
             let _ = parse(&bytes[..cut], &dir);
             // ...and the same file with a byte lopped off the front, which
