@@ -279,7 +279,11 @@ fn run(
         .lane(lane)
         .iter()
         .enumerate()
-        .find(|(idx, _)| project.eq_of(lane, *idx).is_some_and(|eq| !eq.is_identity()))
+        .find(|(idx, _)| {
+            project
+                .eq_of(lane, *idx)
+                .is_some_and(|eq| !eq.is_identity())
+        })
         .map(|(idx, clip)| (clip.start, idx))
     {
         return Err(format!(
@@ -732,10 +736,20 @@ impl Enc {
 enum ClipDecoder {
     Hw(HwSession),
     Sw(SwDecoder),
+    /// A still image: one picture, handed out for as long as the span runs.
+    /// It is decoded here rather than in `run`'s loop for the same reason the
+    /// other two are opened there -- the span's pictures come from one place.
+    Still(crate::decode::Still),
 }
 
 impl ClipDecoder {
     fn open(path: &Path, start_frame: u32) -> crate::Result<Self> {
+        // Before either decoder: an image is not a stream, so `start_frame`
+        // means nothing to it -- every frame of a still span is the same
+        // picture, which is what playback shows for it too.
+        if crate::is_image(path) {
+            return Ok(Self::Still(crate::decode::Still::open(path)?));
+        }
         if !forced("VE_SW")
             && let Some(hw) = HwSession::open_at(path, start_frame)
         {
@@ -747,6 +761,7 @@ impl ClipDecoder {
     /// The next picture as tightly packed I420, borrowed until the call after.
     fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
         match self {
+            Self::Still(still) => Ok(Some(still.picture())),
             Self::Hw(hw) => hw.next_frame(),
             Self::Sw(sw) => {
                 if !sw.advance()? {

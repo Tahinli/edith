@@ -46,6 +46,28 @@ const RING_FULL_WAIT: Duration = Duration::from_millis(10);
 /// placed in frames.
 const AUDIO_ONLY_CANVAS: (u32, u32, f64) = (1920, 1080, 30.0);
 
+/// The frame rate a timeline scaffolded from a still image runs at, for
+/// [`AUDIO_ONLY_CANVAS`]'s reason: nothing was shot on it. The *size* is not
+/// invented the same way -- an image has a picture of its own, and that picture
+/// is the canvas a later import meets.
+const IMAGE_ONLY_RATE: f64 = 30.0;
+
+/// How long a still image *is*, in seconds: the wall a trim may drag its edge
+/// out to, since an image has no length of its own to be walled by. Ten
+/// minutes, which is a title card nobody will run out of and still a finite
+/// number -- a `u32::MAX` sentinel here would make [`Self::trim_room`] hand a
+/// drag a wall past what the timeline can hold.
+///
+/// ponytail: a still cannot be held longer than this. Upgrade path is a
+/// per-source length the project file carries, which every `counts` reader
+/// would then have to take from the document rather than from the file.
+const IMAGE_MAX_SECS: f64 = 600.0;
+
+/// How long a still image is *placed* for: five seconds, the length a picture
+/// gets when nobody has said one -- trimmable either way up to
+/// [`IMAGE_MAX_SECS`].
+const IMAGE_PLACE_SECS: f64 = 5.0;
+
 /// The output half of a session: the device, plus what the feeder has handed it.
 /// Cloned into the feeder thread; every field that matters is shared.
 #[derive(Clone)]
@@ -174,6 +196,12 @@ impl PlaybackSession {
         // project is a project like any other, it simply plays black.
         if crate::is_audio(&path) {
             return Self::open_audio_only(&path);
+        }
+        // A still is the other source with no timeline in it: it has a picture
+        // (which becomes the canvas) but no rate and no length, so it too
+        // scaffolds rather than describes.
+        if crate::is_image(&path) {
+            return Self::open_image_only(&path);
         }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
@@ -316,6 +344,71 @@ impl PlaybackSession {
         })
     }
 
+    /// Opens a still image ([`crate::is_image`]) as a timeline of its own: one
+    /// clip on `V1`, [`IMAGE_PLACE_SECS`] long, over silence. The *canvas* is
+    /// the image's own picture -- unlike a song, a still has one, and inventing
+    /// a 1080p canvas around a 640x360 PNG would letterbox it against nothing.
+    /// The frame rate is [`IMAGE_ONLY_RATE`], for the reason an audio-only
+    /// timeline has one at all: nothing was shot on it.
+    ///
+    /// Wall time keeps the clock, as it does for any silent source.
+    fn open_image_only(path: &Path) -> crate::Result<Self> {
+        // Decoded here rather than probed: this is the door a `.png` that is
+        // not one comes to, and the picture is wanted a line later anyway.
+        let still = crate::decode::Still::open(path)?;
+        let meta = VideoMeta {
+            width: still.width,
+            height: still.height,
+            frame_rate: IMAGE_ONLY_RATE,
+            // Its length is the wall a trim is held to, exactly as a song's
+            // playing time is -- see [`image_frames`].
+            frame_count: image_frames(IMAGE_ONLY_RATE),
+            codec: Codec::H264,
+        };
+        let clip = Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+        };
+        // No group and no audio clip: a still is silent, and a clip on `A1`
+        // playing from a PNG is a source the audio worker cannot open.
+        let project = Project::from_parts(
+            vec![Source::new(path, 0)],
+            vec![(LaneKind::Video, vec![clip]), (LaneKind::Audio, Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let span = project.composite_span_at(0);
+        // The placeholder the first seek supersedes, opened here for `open`'s
+        // reason: the field has to exist before anything can seek.
+        let stream = DecodeSession::open_still(
+            path,
+            0,
+            span.map_or(1, |s| s.len),
+            ColorParams::default(),
+            Composer::passthrough(),
+        )?;
+        Ok(Self {
+            meta,
+            native: (meta.width, meta.height),
+            frames: stream.frames,
+            worker: stream.worker,
+            retired: Vec::new(),
+            clock: PlaybackClock::new(ClockSource::Wall),
+            audio: None,
+            audio_disabled: None,
+            project,
+            counts: vec![meta.frame_count],
+            span,
+            eos: false,
+        })
+    }
+
     /// Opens a project file written by [`save_project`](Self::save_project):
     /// the whole timeline, restored to where its playhead stood, paused like
     /// [`open`](Self::open).
@@ -367,6 +460,28 @@ impl PlaybackSession {
                 };
                 (meta, DecodeSession::open_black(width, height, 1))
             }
+            // ...and a still scaffolds its own picture as the canvas, exactly
+            // as a fresh `open_image_only` does, with the same placeholder
+            // stream the `seek` at the end supersedes.
+            false if crate::is_image(&first.path) => {
+                let still = crate::decode::Still::open(&first.path)
+                    .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+                let meta = VideoMeta {
+                    width: still.width,
+                    height: still.height,
+                    frame_rate: IMAGE_ONLY_RATE,
+                    frame_count: image_frames(IMAGE_ONLY_RATE),
+                    codec: Codec::H264,
+                };
+                let stream = DecodeSession::open_still(
+                    &first.path,
+                    0,
+                    1,
+                    ColorParams::default(),
+                    Composer::passthrough(),
+                )?;
+                (meta, stream)
+            }
             false => DecodeSession::open_worker(
                 &first.path,
                 0,
@@ -384,10 +499,20 @@ impl PlaybackSession {
             meta.width = width;
             meta.height = height;
         }
-        let first_audio = AudioSession::probe(&first.path, first.audio_stream)?;
+        let first_audio = first_audio_of(&doc.sources)?;
 
         let mut counts = vec![meta.frame_count];
         for source in &doc.sources[1..] {
+            // A still has neither a rate to match nor a track to match with:
+            // its length is the one it is held to, recomputed exactly as the
+            // import that first noted it did ([`image_frames`]), which is what
+            // makes the clip check below meaningful on a reload.
+            if crate::is_image(&source.path) {
+                crate::decode::image_size(&source.path)
+                    .map_err(|e| format!("source {}: {e}", source.path.display()))?;
+                counts.push(image_frames(meta.frame_rate));
+                continue;
+            }
             // A source with no picture is checked on what it does have, and
             // its length is its playing time -- the same two answers `import`
             // gave it when it first joined the timeline.
@@ -407,16 +532,27 @@ impl PlaybackSession {
         // (or hand-edited) project files are the one door this can come in
         // through, so it is refused by name here rather than becoming a clip
         // that decodes to nothing.
-        for clip in doc
+        for (kind, clip) in doc
             .lanes
             .iter()
-            .filter(|(kind, _)| *kind == LaneKind::Video)
-            .flat_map(|(_, clips)| clips)
+            .flat_map(|(kind, clips)| clips.iter().map(move |clip| (*kind, clip)))
         {
-            if crate::is_audio(&doc.sources[clip.source].path) {
+            let path = &doc.sources[clip.source].path;
+            if kind == LaneKind::Video && crate::is_audio(path) {
                 return Err(format!(
                     "{} has no picture: it can only play on an audio lane",
-                    doc.sources[clip.source].path.display()
+                    path.display()
+                )
+                .into());
+            }
+            // ...and the mirror of it: a still is silent, so a clip playing one
+            // on an audio lane is a segment the audio worker would open a PNG
+            // for. Refused by name here, which is the one door it can arrive
+            // through (`place_stream_at` never puts one there).
+            if kind == LaneKind::Audio && crate::is_image(path) {
+                return Err(format!(
+                    "{} is a still image: it can only play on a video lane",
+                    path.display()
                 )
                 .into());
             }
@@ -595,6 +731,29 @@ impl PlaybackSession {
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
             // the worker carries it and every frame it converts wears it.
+            Some(Span {
+                start,
+                len,
+                from: Some((source, in_frame)),
+            }) if crate::is_image(&self.project.sources()[source].path) => {
+                // A still: the same grade and the same canvas as any other
+                // clip, over a picture decoded once and repeated for the span.
+                DecodeSession::open_still(
+                    &self.project.sources()[source].path,
+                    in_frame,
+                    len,
+                    self.project
+                        .composite_color_at(start)
+                        .copied()
+                        .unwrap_or_default(),
+                    Composer::new(
+                        self.meta.width,
+                        self.meta.height,
+                        self.project.composite_fit_at(start),
+                    ),
+                )
+                .inspect_err(|e| eprintln!("timeline frame {start}: image open failed: {e}"))
+            }
             Some(Span {
                 start,
                 len,
@@ -964,7 +1123,10 @@ impl PlaybackSession {
     /// lane it is *placed* there alone, overwriting what it lands on and
     /// rippling nothing. A file with no picture ([`crate::is_audio`]) is placed
     /// on the audio lane it was asked for, or on `A1`, and never on a video
-    /// lane. A caller never has to ask.
+    /// lane. A still image ([`crate::is_image`]) is its mirror: the video lane
+    /// it was asked for or `V1`, never an audio one, and it goes down
+    /// [`IMAGE_PLACE_SECS`] long rather than at the length it is *allowed* to
+    /// be trimmed out to. A caller never has to ask.
     pub fn place_stream_at(
         &mut self,
         timeline_secs: f64,
@@ -982,14 +1144,23 @@ impl PlaybackSession {
         if frames == 0 {
             return Err(format!("{} is not on this timeline", path.display()).into());
         }
-        let first = self.first_audio()?;
-        audio_matches(&wanted, &first)?;
+        // A still has no sound to hold to the timeline's -- and no length
+        // either, so it goes down at [`IMAGE_PLACE_SECS`] rather than at the
+        // ten minutes it is *allowed* to be dragged out to.
+        let image = crate::is_image(path);
+        if !image {
+            let first = self.first_audio()?;
+            audio_matches(&wanted, &first)?;
+        }
         let source = self.project.import(path, stream);
         self.note_frames(source, frames);
         let clip = Clip {
             start: 0,
             in_frame: 0,
-            out_frame: frames.max(1),
+            out_frame: match image {
+                true => place_frames(frames, self.meta.frame_rate),
+                false => frames.max(1),
+            },
             source,
             link: None,
             eq: None,
@@ -1003,6 +1174,16 @@ impl PlaybackSession {
         // with it. A lane of the source's own kind takes it as it is dropped;
         // only `V1` means the grouped take, since that is the pair the paste
         // spans and a second video lane is a layer of its own.
+        // ...and a still is the mirror of a song: a picture and no sound, so a
+        // video lane and nothing else -- never the grouped take, which would
+        // put a clip on `A1` for a source the audio worker cannot open.
+        if image {
+            let lane = match onto {
+                Some(lane) if lane.kind == LaneKind::Video => lane,
+                _ => Lane::V1,
+            };
+            return Ok(self.place_at(lane, timeline_secs, clip));
+        }
         let onto = match (crate::is_audio(path), onto) {
             // No picture: an audio lane and nothing else, whichever one was
             // asked for -- `A1` when none was.
@@ -1055,8 +1236,7 @@ impl PlaybackSession {
     /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
     /// other source is held to it.
     fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
-        let first = &self.project.sources()[0];
-        AudioSession::probe(&first.path, first.audio_stream)
+        first_audio_of(self.project.sources())
     }
 
     /// Places `clip` on `lane` alone at the playhead, overwriting what it lands
@@ -1109,6 +1289,9 @@ impl PlaybackSession {
         if crate::is_audio(path) {
             return self.import_audio(path);
         }
+        if crate::is_image(path) {
+            return self.import_image(path);
+        }
         let (meta, _) = Demuxer::open(path)?;
         let first = self.first_audio()?;
         // Stream 0: an import brings a file in on its first audio track, and
@@ -1137,6 +1320,30 @@ impl PlaybackSession {
         let frames = audio_frames(path, self.meta.frame_rate)?;
         let source = self.project.import(path, 0);
         self.note_frames(source, frames);
+        Ok(source)
+    }
+
+    /// The same registration for a still image, and the shortest of the three:
+    /// a picture has nothing to agree with. No frame rate (it is one picture),
+    /// no audio (it is silent), and a resolution of its own is what every
+    /// import is allowed -- the clip is placed on the project canvas by its fit
+    /// policy. The one refusal left is a file that is not a picture at all, or
+    /// one too big to compose ([`crate::is_resolution`]), and the header alone
+    /// answers both.
+    ///
+    /// The length noted is the wall a trim is held to, not a duration the file
+    /// has: see [`image_frames`].
+    fn import_image(&mut self, path: &Path) -> crate::Result<usize> {
+        let (width, height) = crate::decode::image_size(path)?;
+        if !crate::is_resolution(width, height) {
+            return Err(format!(
+                "{} is {width}x{height}, which is not a picture this engine composes",
+                path.display()
+            )
+            .into());
+        }
+        let source = self.project.import(path, 0);
+        self.note_frames(source, image_frames(self.meta.frame_rate));
         Ok(source)
     }
 
@@ -1428,6 +1635,18 @@ fn matches_timeline(
 /// rate and layout plays alongside a timeline of mp4s perfectly well. What it
 /// cannot do is be copied into an export, which is a refusal of its own, at
 /// export time (`AudioSession::copy_multi_streams`).
+/// What a timeline's audio is held to: the probe of the first source that could
+/// have any. A still image is never it -- a picture defines no rate and no
+/// layout, and taking its silence for the timeline's would refuse every sound
+/// imported after it. `Ok(None)` for a timeline of nothing but stills, which is
+/// a silent one.
+fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
+    match sources.iter().find(|s| !crate::is_image(&s.path)) {
+        Some(first) => AudioSession::probe(&first.path, first.audio_stream),
+        None => Ok(None),
+    }
+}
+
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
     // Whole-probe equality: rate and layout, which the audio worker holds every
     // source to anyway. Both silent is a match.
@@ -1444,6 +1663,26 @@ fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::R
         ),
     }
     .into())
+}
+
+/// How many timeline frames a still image is *held to*: [`IMAGE_MAX_SECS`] of
+/// them, since an image has no length of its own. The number a source's own
+/// entry in [`PlaybackSession::counts`] gets, so a trim may drag an image out
+/// to ten minutes and no further -- and so a saved project reloads, because
+/// [`PlaybackSession::open_project`] recomputes exactly this and refuses a clip
+/// that ends past it.
+fn image_frames(fps: f64) -> u32 {
+    ((IMAGE_MAX_SECS * fps)
+        .ceil()
+        .clamp(1.0, f64::from(u32::MAX))) as u32
+}
+
+/// How long a still is placed for: [`IMAGE_PLACE_SECS`], never past the length
+/// it is held to and never zero (a clip is never empty).
+fn place_frames(count: u32, fps: f64) -> u32 {
+    ((IMAGE_PLACE_SECS * fps)
+        .ceil()
+        .clamp(1.0, f64::from(count.max(1)))) as u32
 }
 
 /// How many timeline frames a standalone audio file occupies: its playing time
