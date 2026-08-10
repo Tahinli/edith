@@ -120,6 +120,17 @@ impl PlaybackSession {
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // A timeline is scaffolded from source 0's picture -- its size, its
+        // frame rate, its clock. A song has none of that, so it joins a
+        // timeline (`import`) rather than starting one, and saying so beats
+        // failing in the demuxer's words.
+        if crate::is_audio(&path) {
+            return Err(format!(
+                "{} has no picture: open a video first, then import it onto the audio lane",
+                path.display()
+            )
+            .into());
+        }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
         let (meta, stream) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
@@ -181,11 +192,33 @@ impl PlaybackSession {
 
         let mut counts = vec![meta.frame_count];
         for source in &doc.sources[1..] {
+            // A source with no picture is checked on what it does have, and
+            // its length is its playing time -- the same two answers `import`
+            // gave it when it first joined the timeline.
+            if crate::is_audio(source) {
+                audio_matches(AudioSession::probe(source)?, &first_audio)
+                    .map_err(|e| format!("source {}: {e}", source.display()))?;
+                counts.push(audio_frames(source, meta.frame_rate)?);
+                continue;
+            }
             let (other, _) =
                 Demuxer::open(source).map_err(|e| format!("source {}: {e}", source.display()))?;
             matches_timeline(source, &other, &meta, &first_audio)
                 .map_err(|e| format!("source {}: {e}", source.display()))?;
             counts.push(other.frame_count);
+        }
+        // The video lane can only play files that have pictures. Hand-written
+        // (or hand-edited) project files are the one door this can come in
+        // through, so it is refused by name here rather than becoming a clip
+        // that decodes to nothing.
+        for clip in &doc.video {
+            if crate::is_audio(&doc.sources[clip.source]) {
+                return Err(format!(
+                    "{} has no picture: it can only play on the audio lane",
+                    doc.sources[clip.source].display()
+                )
+                .into());
+            }
         }
         for (i, clip) in doc.video.iter().chain(&doc.audio).enumerate() {
             if clip.out_frame > counts[clip.source] {
@@ -440,6 +473,16 @@ impl PlaybackSession {
         self.edit(|p| p.paste(at, clip))
     }
 
+    /// Places `clip` on `lane` alone at the playhead, overwriting what it lands
+    /// on and rippling nothing -- the one-lane insert a source with no picture
+    /// makes, and the only way an audio-only file reaches the timeline. The
+    /// placement belongs to no group (see [`Project::place`]). One undo step,
+    /// and it reseeks like every other edit.
+    pub fn place_at(&mut self, lane: Lane, timeline_secs: f64, clip: Clip) -> bool {
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        self.edit(|p| p.place(lane, at, clip))
+    }
+
     /// Removes the video clip at `idx` and everything under it, closing the gap
     /// on every lane. Unlike a split this *does* move every following frame, so
     /// the session reseeks to wherever the playhead now points.
@@ -463,6 +506,9 @@ impl PlaybackSession {
     /// the property that disagrees, for a caller to show. Nothing is changed by
     /// a refusal.
     pub fn import(&mut self, path: &Path) -> crate::Result<()> {
+        if crate::is_audio(path) {
+            return self.import_audio(path);
+        }
         let (meta, _) = Demuxer::open(path)?;
         let first = AudioSession::probe(&self.project.sources()[0])?;
         matches_timeline(path, &meta, &self.meta, &first)?;
@@ -476,6 +522,43 @@ impl PlaybackSession {
         // so without this the appended clip would play silent. At EOS the wall
         // clock has run on past the timeline, so resume from the join instead
         // of wherever it got to -- and the seek is what clears `eos`.
+        let at = if self.eos { old_end } else { self.now() };
+        self.seek(at);
+        Ok(())
+    }
+
+    /// Appends a standalone audio file to the end of the timeline, on the
+    /// **audio lane alone**: a song has no picture, so there is nothing to put
+    /// on the video lane and the timeline shows black under it. Its length is
+    /// its playing time rounded up to whole frames, which is the only frame
+    /// count such a source has.
+    ///
+    /// Refused in the same words as any other import when its rate or layout
+    /// disagrees with the timeline's -- one output device, one set of
+    /// parameters -- and refused outright on a silent timeline, which has no
+    /// device open at all. Nothing is changed by a refusal.
+    fn import_audio(&mut self, path: &Path) -> crate::Result<()> {
+        let first = AudioSession::probe(&self.project.sources()[0])?;
+        audio_matches(AudioSession::probe(path)?, &first)?;
+        let frames = audio_frames(path, self.meta.frame_rate)?;
+
+        let old_end = self.timeline_duration();
+        let source = self.project.import(path);
+        let at = self.project.timeline_frames();
+        self.project.place(
+            Lane::Audio,
+            at,
+            Clip {
+                start: at,
+                in_frame: 0,
+                out_frame: frames,
+                source,
+                link: None,
+            },
+        );
+        // Same reason as a video import: the running audio worker's segment
+        // list stops at the old end, so without a reseek the appended clip
+        // would play silent.
         let at = if self.eos { old_end } else { self.now() };
         self.seek(at);
         Ok(())
@@ -731,21 +814,50 @@ fn matches_timeline(
         )
         .into());
     }
-    // Whole-probe equality: rate, layout and the esds fields, which the audio
-    // worker holds every source to anyway. Both silent is a match.
-    let probe = AudioSession::probe(path)?;
-    if probe != *first {
-        return Err(match (probe, first) {
-            (None, _) => "the file is silent, the timeline has audio".to_string(),
-            (_, None) => "the file has audio, the timeline is silent".to_string(),
-            (Some(a), Some(b)) => format!(
-                "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
-                a.params.sample_rate, a.channels, b.params.sample_rate, b.channels
-            ),
-        }
+    audio_matches(AudioSession::probe(path)?, first)
+}
+
+/// Whether a candidate's audio may join a timeline whose first source probes as
+/// `first`: same rate, same layout, or both silent. One output device and one
+/// exported track is all there is, and no resampler.
+///
+/// The format itself is deliberately *not* part of this: an mp3 that agrees on
+/// rate and layout plays alongside a timeline of mp4s perfectly well. What it
+/// cannot do is be copied into an export, which is a refusal of its own, at
+/// export time (`AudioSession::copy_multi_segments`).
+fn audio_matches(
+    probe: Option<crate::AudioProbe>,
+    first: &Option<crate::AudioProbe>,
+) -> crate::Result<()> {
+    if probe == *first {
+        return Ok(());
+    }
+    Err(match (probe, first) {
+        (None, _) => "the file is silent, the timeline has audio".to_string(),
+        (_, None) => "the file has audio, the timeline is silent".to_string(),
+        (Some(a), Some(b)) => format!(
+            "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
+            a.sample_rate, a.channels, b.sample_rate, b.channels
+        ),
+    }
+    .into())
+}
+
+/// How many timeline frames a standalone audio file occupies: its playing time
+/// rounded *up*, so the last partial frame is still covered rather than cut off,
+/// and never zero (a clip is never empty).
+fn audio_frames(path: &Path, fps: f64) -> crate::Result<u32> {
+    let secs = AudioSession::duration_secs(path)?
+        .ok_or_else(|| format!("{} has no audio track", path.display()))?;
+    let frames = (secs * fps).ceil();
+    if !frames.is_finite() || frames < 0.0 || frames > f64::from(u32::MAX) {
+        return Err(format!(
+            "{} is {secs} s long, which is not a timeline",
+            path.display()
+        )
         .into());
     }
-    Ok(())
+    Ok((frames as u32).max(1))
 }
 
 /// `None` for a silent session -- no audio track, no plugin, no daemon, or a

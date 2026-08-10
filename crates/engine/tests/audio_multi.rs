@@ -193,7 +193,7 @@ fn probe_reads_the_import_policy_fields() {
         .expect("probe")
         .expect("test_av.mp4 has audio");
     assert_eq!(av.channels, 2);
-    assert_eq!(av.params.sample_rate, RATE as u32);
+    assert_eq!(av.sample_rate, RATE as u32);
     assert_eq!(
         AudioSession::probe(asset("test_av2.mp4")).unwrap().unwrap(),
         av,
