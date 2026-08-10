@@ -13,12 +13,13 @@ use engine::audio::StreamInfo;
 use engine::color::ColorParams;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
-use engine::project::{Lane, LaneKind, Source};
+use engine::project::{Edge, Lane, LaneKind, Source};
 use engine::scale::FitPolicy;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point,
     RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds,
     WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
@@ -216,6 +217,31 @@ struct ClipDrag {
     idx: usize,
 }
 
+/// A clip edge being dragged: which end of which clip, and the timeline frame
+/// the pointer has pulled it to. The box on screen is drawn from `to` while this
+/// is set and the engine hears about it once, at the release
+/// ([`Player::commit_trim`]) -- one edit, one undo step for the whole gesture,
+/// exactly as an equalizer drag works.
+#[derive(Clone, Copy)]
+struct Trim {
+    lane: Lane,
+    idx: usize,
+    edge: Edge,
+    /// Already clamped by `PlaybackSession::trim_room`, so the width drawn from
+    /// it is the width the release commits -- an edge stops under the pointer
+    /// rather than snapping back after the fact.
+    to: u32,
+    /// The dragged clip's group, so its other halves' boxes follow the edge on
+    /// screen exactly as the engine will move them.
+    link: Option<u32>,
+}
+
+/// How wide a clip's edge is as a *target*: the strip at each end where a press
+/// means "make this longer or shorter" instead of "move this to another lane".
+/// Wide enough to hit, narrow enough that the middle of even a small box is
+/// still the body.
+const EDGE_W: f32 = 6.;
+
 /// An open clip menu: which clip it was opened on, where it hangs, and whether
 /// it has been turned over to show what that clip *is* instead of what can be
 /// done to it. The lane and index are the ones the same click selected, so
@@ -298,16 +324,37 @@ const COLOR_BANDS: [(&str, f32, f32); 4] = [
     ("Tint (cool–warm)", -1., 1.),
 ];
 
-/// A press of a nudge key or button: a fortieth of a band's range, so a slider
-/// crosses it in forty presses and every stop is a number the file can write.
+/// A press of a nudge key: a fortieth of a band's range, so a slider crosses it
+/// in forty presses and every stop is a number the file can write. A drag lands
+/// on the same grid ([`Player::drag_color`]), so the pointer and the keyboard
+/// cannot reach two different sets of values.
 const COLOR_STEP: f32 = 0.05;
 
-/// The card's width: a slider row is a label, two buttons, the bar and the
-/// value, and the longest label has to fit beside all four without truncating
-/// (measured against "Tint (cool–warm)" at 460).
+/// The card's width: a slider row is a label, the bar and the value, and the
+/// longest label has to fit beside all three without truncating (measured
+/// against "Tint (cool–warm)").
 const COLOR_W: f32 = 460.;
-/// How much of a slider row the bar itself gets.
-const COLOR_BAR_W: f32 = 140.;
+/// How much of a slider row the bar itself gets -- what a drag is read against,
+/// so it takes the width the two nudge buttons used to.
+const COLOR_BAR_W: f32 = 240.;
+
+/// The histogram's bins per channel. 64 is four codes of an 8-bit ramp per bin:
+/// fine enough to see a grade tilt, coarse enough that a subsampled count is
+/// not noise.
+const HIST_BINS: usize = 64;
+
+/// How many pixels of a frame the histogram reads. The stride is
+/// `pixels / HIST_SAMPLES` (1920x1080 -> every 253rd pixel), which is a
+/// thousandth of the frame and walks across columns rather than down one.
+const HIST_SAMPLES: usize = 8_192;
+
+/// The histogram box. Shorter than the equalizer's curve because four slider
+/// rows stand under it and the card still has to fit a 360 px window.
+const HIST_H: f32 = 96.;
+
+/// What each channel's line is drawn in, in `[r, g, b]` order -- the channel it
+/// counts, lightened enough to read on the dark box.
+const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
 
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
@@ -361,6 +408,10 @@ struct Player {
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
+    /// A drag that started on a clip's edge, tracked on the root for
+    /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
+    /// [`Trim`].
+    trim: Option<Trim>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -428,9 +479,24 @@ struct Player {
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
     color_open: Option<(Lane, usize)>,
-    /// Which of the card's four sliders the arrow keys and the buttons move.
-    /// The card's own focus, since nothing in it takes gpui's (ledger:182).
+    /// Which of the card's four sliders the arrow keys and a drag move. The
+    /// card's own focus, since nothing in it takes gpui's (ledger:182).
     color_band: usize,
+    /// A slider is being dragged. Tracked on the root like `scrubbing` and the
+    /// equalizer's drag, for the same reason: a 4 px bar is left by the pointer
+    /// on the first move and its own listeners then stop firing.
+    color_dragging: bool,
+    /// Each slider's box, recorded at prepaint: a mouse listener is handed the
+    /// window position only, so this is what a press and a drag are read against
+    /// ([`frac_along`]). One per band, because the press picks the row it landed
+    /// on and the drag then belongs to that row's range.
+    color_bars: [Rc<Cell<Bounds<Pixels>>>; COLOR_BANDS.len()],
+    /// The frame on screen counted into `HIST_BINS` bins per channel -- the
+    /// *graded* frame, because the grade is applied in the decode worker and
+    /// what arrives here is already through it. Refilled by every pumped frame,
+    /// which is what makes the colour card's graph move as a slider is dragged:
+    /// each live write reseeks, and the reseek's frame is the next count.
+    histogram: [[u32; HIST_BINS]; 3],
     /// The action whose row is waiting for a stroke. The next key that is
     /// neither escape nor a lone modifier becomes the whole of what reaches it.
     rebinding: Option<ActionId>,
@@ -497,6 +563,12 @@ impl Player {
             });
             let buf = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
                 .expect("frame buffer sized width*height*4");
+            // Counted here rather than under `color_open`, because the card
+            // opens on a frame that was pumped before it: gating this on the
+            // card would leave its graph flat until something reseeked. A
+            // thousandth of the pixels, against a conversion that just touched
+            // all of them.
+            self.histogram = histogram(buf.as_raw());
             let next = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
             if let Some(old) = self.image.replace(next) {
                 // Every RenderImage gets a fresh id and its own atlas tile:
@@ -529,6 +601,11 @@ impl Player {
         self.eos = false;
         self.done = false;
         self.pending_seek = true;
+        // An edit moves the indices a drag in flight is holding -- a stroke
+        // during one is exactly that -- and an edge committed against a moved
+        // index would trim a clip nobody grabbed. Dropping it is the whole fix:
+        // nothing has been written yet.
+        self.trim = None;
     }
 
     /// What an action does, wherever it was asked for -- a stroke, or the clip
@@ -722,6 +799,7 @@ impl Player {
             Some(clip) => {
                 self.color_open = Some(clip);
                 self.color_band = 0;
+                self.color_dragging = false;
                 // One card at a time, the rule both the others already follow.
                 self.keys_open = false;
                 self.export_open = false;
@@ -748,6 +826,14 @@ impl Player {
     /// frame on screen repaints through the new grade; this only owes the flags
     /// that reseek clears.
     fn set_color(&mut self, params: ColorParams, cx: &mut Context<Self>) {
+        self.write_color(params, false, cx);
+    }
+
+    /// Both writes: `live` is the one that takes no undo step, which is what
+    /// every sample *inside* a drag goes through
+    /// (`PlaybackSession::set_color_live`). Either way the engine reseeks, so
+    /// the picture -- and the histogram counted off it -- is regraded at once.
+    fn write_color(&mut self, params: ColorParams, live: bool, cx: &mut Context<Self>) {
         let Some((lane, idx)) = self.color_open else {
             return;
         };
@@ -755,7 +841,11 @@ impl Player {
             return;
         };
         let grade = Some(params).filter(|p| !p.is_identity());
-        if session.set_color(lane, idx, grade) {
+        let took = match live {
+            true => session.set_color_live(lane, idx, grade),
+            false => session.set_color(lane, idx, grade),
+        };
+        if took {
             self.reset_after_reseek();
         }
         cx.notify();
@@ -769,6 +859,35 @@ impl Player {
         let value = band_mut(&mut params, self.color_band);
         *value = (*value + steps * COLOR_STEP).clamp(low, high);
         self.set_color(params, cx);
+    }
+
+    /// Where the pointer sits along a slider, as that band's value: the left end
+    /// of the bar is the bottom of its range and the right end the top. Called
+    /// on every pointer sample, so the grade -- and the picture, and the
+    /// histogram over it -- moves under the hand.
+    ///
+    /// `first` is the press: it takes the undo step the whole gesture rolls back
+    /// to, and every sample after it is live. That is why it writes even when
+    /// the value did not change -- without that snapshot the rest of the drag
+    /// would be unundoable.
+    ///
+    /// Values land on the [`COLOR_STEP`] grid the keys use, which also bounds
+    /// one drag to forty-odd entries in the project's colour table.
+    ///
+    /// ponytail: one reseek per step crossed, up to ~40 for a bar-wide sweep. If
+    /// that ever stutters, the throttle is [`scrub_due`]'s, which the ruler drag
+    /// already uses for the same cost.
+    fn drag_color(&mut self, x: Pixels, first: bool, cx: &mut Context<Self>) {
+        let (_, low, high) = COLOR_BANDS[self.color_band];
+        let along = frac_along(x, self.color_bars[self.color_band].get());
+        let value = color_snap(low + along * (high - low)).clamp(low, high);
+        let mut params = self.color_params();
+        let at = band_mut(&mut params, self.color_band);
+        if *at == value && !first {
+            return;
+        }
+        *at = value;
+        self.write_color(params, !first, cx);
     }
 
     /// Whether a card owns the window. While one does the timeline under it is
@@ -1227,6 +1346,135 @@ impl Player {
             }
         }
         cx.notify();
+    }
+
+    /// Opens the clip menu on the box under the pointer, from the right button
+    /// wherever it was pressed on that box -- its middle or one of its edge
+    /// strips, which cover the middle's own listener. Selecting first is part of
+    /// it: every item acts on the clip the menu names.
+    fn open_menu(&mut self, lane: Lane, idx: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.select((lane, idx), cx);
+        self.context_menu = Some(ContextMenu {
+            lane,
+            idx,
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
+    /// A press on a clip's edge: the start of the drag that changes how much of
+    /// its source it plays. It selects the clip as a press anywhere else on the
+    /// box does -- the edge strip covers the box's own listener (`occlude`), so
+    /// this is the only one that fires there.
+    fn start_trim(&mut self, lane: Lane, idx: usize, edge: Edge, cx: &mut Context<Self>) {
+        if self.modal() || self.exporting().is_some() {
+            return;
+        }
+        let Some(clip) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+        else {
+            return;
+        };
+        self.select((lane, idx), cx);
+        self.trim = Some(Trim {
+            lane,
+            idx,
+            edge,
+            // Where the edge already is: a press that never moves is not an
+            // edit, and `Project::trim` refuses exactly that.
+            to: match edge {
+                Edge::Start => clip.start,
+                Edge::End => clip.end(),
+            },
+            link: clip.link,
+        });
+        cx.notify();
+    }
+
+    /// Where the pointer has pulled the edge to, clamped to the room the engine
+    /// says that edge has. Along the same bed the ruler is measured on and
+    /// against the same duration the boxes are drawn to, so the edge tracks the
+    /// pointer exactly.
+    fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let (duration, fps) = (self.drawn_duration(), self.fps);
+        let frac = frac_along(x, self.ruler.get());
+        let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
+            return;
+        };
+        let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
+            return;
+        };
+        trim.to = frame_at(f64::from(frac) * duration, fps).clamp(lo, hi);
+        cx.notify();
+    }
+
+    /// The release: the whole drag reaches the engine as one edit, so it is one
+    /// undo step. The selection survives it -- a trim inserts and removes
+    /// nothing, so every index a lane had still names the clip it named.
+    fn commit_trim(&mut self, cx: &mut Context<Self>) {
+        let Some(trim) = self.trim.take() else {
+            return;
+        };
+        let trimmed = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.trim_clip(trim.lane, trim.idx, trim.edge, trim.to));
+        if trimmed {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// The clip as the drag is showing it: an edge under the pointer moves its
+    /// own box, and the boxes of the halves linked to it, before anything is
+    /// committed. Display only -- the project is not touched until the release.
+    fn trimmed(&self, lane: Lane, idx: usize, clip: Clip) -> Clip {
+        let Some(trim) = self.trim.filter(|t| {
+            (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == clip.link)
+        }) else {
+            return clip;
+        };
+        match trim.edge {
+            // The in-point follows the head, exactly as `Project::trim` moves
+            // it: what stays on screen plays what it always played.
+            Edge::Start => Clip {
+                in_frame: (i64::from(clip.in_frame) + i64::from(trim.to) - i64::from(clip.start))
+                    .clamp(0, i64::from(clip.out_frame - 1)) as u32,
+                start: trim.to,
+                ..clip
+            },
+            Edge::End => Clip {
+                out_frame: clip.in_frame + trim.to.saturating_sub(clip.start).max(1),
+                ..clip
+            },
+        }
+    }
+
+    /// How long the timeline is *drawn* as: its own length, and while a tail is
+    /// being dragged the furthest that tail may reach. A bed that ends exactly
+    /// at the last frame has nowhere to put a pointer that means "longer", so
+    /// without this the last clip on the timeline could be pulled in and never
+    /// let back out.
+    fn drawn_duration(&self) -> f64 {
+        let Some(session) = &self.session else {
+            return 0.;
+        };
+        let duration = session.timeline_duration();
+        match self.trim {
+            Some(trim) if trim.edge == Edge::End => {
+                let (_, hi) = session
+                    .trim_room(trim.lane, trim.idx, trim.edge)
+                    .unwrap_or((0, 0));
+                duration.max(f64::from(hi) / self.fps)
+            }
+            _ => duration,
+        }
     }
 
     /// The one way a library row reaches the timeline: the Add button and a row
@@ -1761,11 +2009,9 @@ impl Render for Player {
         }
 
         // Read per render, never cached: a delete shortens the timeline and the
-        // timecode, the ruler and the clamp below all have to follow it.
-        let duration = self
-            .session
-            .as_ref()
-            .map_or(0., PlaybackSession::timeline_duration);
+        // timecode, the ruler and the clamp below all have to follow it -- and
+        // so does the room a tail being dragged needs to grow into.
+        let duration = self.drawn_duration();
         // The clock keeps running after the last frame (wall time takes over at
         // audio EOF) while the picture is frozen, so the timeline the UI shows is
         // the clamped one, pinned to the out-point once playback is done.
@@ -1902,7 +2148,10 @@ impl Render for Player {
                 // the keys menu still lists them.
                 if this.color_open.is_some() {
                     match color_key(key) {
-                        Some(ColorKey::Close) => this.color_open = None,
+                        Some(ColorKey::Close) => {
+                            this.color_open = None;
+                            this.color_dragging = false;
+                        }
                         Some(ColorKey::Band(step)) => {
                             this.color_band = (this.color_band + step) % COLOR_BANDS.len();
                         }
@@ -1970,6 +2219,28 @@ impl Render for Player {
                     }
                     return;
                 }
+                // A clip edge is 6 px wide and the pointer leaves it on the
+                // first drag, so the gesture is tracked here for the same
+                // reason -- and it ends here too when the button came up
+                // outside the window, still owing its one edit.
+                if this.trim.is_some() {
+                    match event.pressed_button {
+                        Some(MouseButton::Left) => this.trim_to(event.position.x, cx),
+                        _ => this.commit_trim(cx),
+                    }
+                    return;
+                }
+                // A colour slider is 4 px tall and the pointer leaves it just as
+                // fast; every sample is live, so the release owes no write of
+                // its own -- what the last sample set is what the clip carries.
+                if this.color_dragging {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_color(event.position.x, false, cx);
+                    } else {
+                        this.color_dragging = false;
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -1990,6 +2261,20 @@ impl Render for Player {
                         // once -- the append-only table's whole reason.
                         this.drag_band(event.position.y, cx);
                         this.commit_eq(cx);
+                        return;
+                    }
+                    if this.trim.is_some() {
+                        // The release lands exactly, then the gesture is
+                        // written once -- one edit, one undo step.
+                        this.trim_to(event.position.x, cx);
+                        this.commit_trim(cx);
+                        return;
+                    }
+                    if std::mem::take(&mut this.color_dragging) {
+                        // The release lands exactly where the hand let go, and
+                        // it is a live write like every other sample: the undo
+                        // step the gesture rolls back to was the press's.
+                        this.drag_color(event.position.x, false, cx);
                         return;
                     }
                     if std::mem::take(&mut this.scrubbing) {
@@ -3147,14 +3432,17 @@ impl Player {
         )
     }
 
-    /// The colour card: a row per control, each showing where in its range it
-    /// stands and carrying the pair of buttons that move it -- the same move the
-    /// arrow keys make, because a control only the pointer can reach is not one
-    /// everyone can reach. Same scrim, surface and row shape as the other two
-    /// cards, and the same plain divs, so the root keeps the keyboard.
+    /// The colour card: the graded frame's histogram over a row per control,
+    /// each row a bar the pointer drags straight to a value -- no stepper
+    /// buttons, because a slider is a thing to pull, and the arrow keys still
+    /// move the same value for anyone not using a pointer. Same scrim, surface
+    /// and row shape as the other two cards, and the same plain divs, so the
+    /// root keeps the keyboard.
     ///
     /// The values are read from the project every render: what is drawn is what
-    /// the decoder is grading with, never a copy that could drift from it.
+    /// the decoder is grading with, never a copy that could drift from it. The
+    /// graph above them is counted off the frame that came *back* through that
+    /// grade ([`histogram`]), so pulling exposure tilts it while the hand moves.
     fn color_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.color_open?;
         let params = self.color_params();
@@ -3166,26 +3454,6 @@ impl Player {
                 let value = *band_mut(&mut read, i);
                 let frac = ((value - low) / (high - low)).clamp(0., 1.);
                 let picked = i == self.color_band;
-                // Both buttons of a row do what the arrows do, so there is one
-                // rule for what a press is worth and one place it is clamped.
-                let step = |name: &'static str, steps: f32| {
-                    div()
-                        .id((name, i))
-                        .w(px(CONTROL_H))
-                        .h(px(CONTROL_H))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(3.))
-                        .bg(rgb(CHROME))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(HOVER)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.color_band = i;
-                            this.nudge_color(steps, cx);
-                        }))
-                        .child(if steps < 0. { "–" } else { "+" })
-                };
                 div()
                     .id(("color-row", i))
                     .flex()
@@ -3202,22 +3470,43 @@ impl Player {
                         cx.notify();
                     }))
                     .child(div().flex_1().min_w(px(0.)).truncate().child(label))
-                    .child(step("color-down", -1.))
                     .child(
+                        // The bar is 4 px to look at and a whole row to hit
+                        // (WCAG 2.5.8), the same split the ruler makes between
+                        // what is drawn and what is grabbed. The press is
+                        // already the first sample of the drag, so a plain click
+                        // sets the value it landed on.
                         div()
+                            .id(("color-bar", i))
+                            .relative()
                             .w(px(COLOR_BAR_W))
-                            .h(px(4.))
-                            .rounded(px(2.))
-                            .bg(rgb(CHROME))
+                            .h(px(KEYS_ROW_H))
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.color_band = i;
+                                    this.color_dragging = true;
+                                    this.drag_color(event.position.x, true, cx);
+                                }),
+                            )
+                            .child(bounds_probe(self.color_bars[i].clone()))
                             .child(
                                 div()
-                                    .h_full()
-                                    .w(relative(frac))
+                                    .w_full()
+                                    .h(px(4.))
                                     .rounded(px(2.))
-                                    .bg(rgb(ACCENT)),
+                                    .bg(rgb(CHROME))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(frac))
+                                            .rounded(px(2.))
+                                            .bg(rgb(ACCENT)),
+                                    ),
                             ),
                     )
-                    .child(step("color-up", 1.))
                     .child(
                         div()
                             .w(px(44.))
@@ -3258,7 +3547,22 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child("↑↓ picks a slider, ←→ moves it, r resets — esc closes"),
+                                .child(
+                                    "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — esc closes",
+                                ),
+                        )
+                        // The frame as it is being graded, over the controls
+                        // grading it: the three lines are what the picture is
+                        // made of, and every sample of a drag reseeks, so they
+                        // move with the bar under the hand.
+                        .child(
+                            div()
+                                .flex_none()
+                                .h(px(HIST_H))
+                                .rounded(px(3.))
+                                .bg(rgb(HOVER_DIM))
+                                .relative()
+                                .child(hist_curves(self.histogram)),
                         )
                         .children(rows)
                         .child(
@@ -3515,7 +3819,7 @@ impl Player {
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
         let tip: SharedString = format!(
-            "Select (or {} under the playhead, {}/{} along the lane) — {} removes the take, {} leaves a gap, {} rejoins a cut",
+            "Select (or {} under the playhead, {}/{} along the lane) — drag an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Select),
             self.keymap.display(ActionId::SelectPrev),
             self.keymap.display(ActionId::SelectNext),
@@ -3573,6 +3877,9 @@ impl Player {
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
+                        // What a drag on an edge is showing, which is the clip
+                        // itself while nothing is being dragged.
+                        let clip = &self.trimmed(lane, i, *clip);
                         let (start, len) = (
                             f64::from(clip.start) / self.fps,
                             f64::from(clip.len()) / self.fps,
@@ -3651,19 +3958,44 @@ impl Player {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    if this.modal() {
-                                        return;
-                                    }
-                                    this.select((lane, i), cx);
-                                    this.context_menu = Some(ContextMenu {
-                                        lane,
-                                        idx: i,
-                                        at: event.position,
-                                        details: false,
-                                    });
-                                    cx.notify();
+                                    this.open_menu(lane, i, event.position, cx);
                                 }),
                             )
+                            // The two strips a drag *lengthens* the clip by,
+                            // one at each end. They occlude the box behind
+                            // them, which is what keeps one gesture one thing:
+                            // a press here trims, a press anywhere else on the
+                            // box still starts the move to another lane.
+                            .children([Edge::Start, Edge::End].map(|edge| {
+                                let mut zone = div()
+                                    .absolute()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(EDGE_W))
+                                    .occlude()
+                                    .cursor(CursorStyle::ResizeLeftRight)
+                                    .hover(|s| s.bg(rgb(ACCENT)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                            this.start_trim(lane, i, edge, cx);
+                                        }),
+                                    )
+                                    // Occluded, so the box's own right-button
+                                    // listener never fires here: the menu is
+                                    // the same menu, opened by the same call.
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.open_menu(lane, i, event.position, cx);
+                                        }),
+                                    );
+                                zone = match edge {
+                                    Edge::Start => zone.left_0(),
+                                    Edge::End => zone.right_0(),
+                                };
+                                zone
+                            }))
                             // Under the label row, never through it.
                             .children(wave.filter(|_| audio).and_then(|wave| {
                                 let inner: AnyElement = match wave {
@@ -4788,6 +5120,73 @@ fn frac_down(y: Pixels, bounds: Bounds<Pixels>) -> f32 {
     ((y - bounds.top()) / bounds.size.height).clamp(0., 1.)
 }
 
+/// A slider value on the [`COLOR_STEP`] grid: what a drag rounds to, so the
+/// pointer stops where the arrow keys do and "0.35" on screen is the number the
+/// file writes rather than a rounding of one.
+fn color_snap(value: f32) -> f32 {
+    (value / COLOR_STEP).round() * COLOR_STEP
+}
+
+/// How the frame on screen is spread across the tone range: `HIST_BINS` counts
+/// per channel, read off the BGRA the decoder handed over -- which is the
+/// *graded* picture, because the grade is folded into the conversion
+/// (`engine::convert::i420_to_bgra_with`). So what this counts is what the eye
+/// is looking at, and moving a slider moves it.
+///
+/// Every [`HIST_SAMPLES`]th-of-a-frame pixel, not every pixel: a shape drawn
+/// from eight thousand samples is the same shape, at a thousandth of the reads.
+fn histogram(bgra: &[u8]) -> [[u32; HIST_BINS]; 3] {
+    let pixels = bgra.len() / 4;
+    let stride = (pixels / HIST_SAMPLES).max(1);
+    let mut bins = [[0u32; HIST_BINS]; 3];
+    for p in (0..pixels).step_by(stride) {
+        let px = &bgra[p * 4..];
+        // BGRA on the wire, `[r, g, b]` in the bins: the graph names channels
+        // the way a person does.
+        for (channel, value) in [px[2], px[1], px[0]].into_iter().enumerate() {
+            bins[channel][usize::from(value) * HIST_BINS / 256] += 1;
+        }
+    }
+    bins
+}
+
+/// The three counts drawn as three lines across the box, tallest bin to the top.
+///
+/// Square root, not linear: a shot with a big flat area (a night sky, a title
+/// card) puts one bin so far above the rest that a linear graph is a single
+/// spike beside a flat line, and the tilt a grade puts in the rest is exactly
+/// what the card is for.
+fn hist_curves(bins: [[u32; HIST_BINS]; 3]) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            // Shared across the channels, so their relative weight is readable;
+            // never zero, so an unpumped (all-zero) histogram is a flat line
+            // rather than a division by nothing.
+            let top = bins.iter().flatten().copied().max().unwrap_or(0).max(1) as f32;
+            for (channel, counts) in bins.iter().enumerate() {
+                let mut path = PathBuilder::stroke(px(1.5));
+                for (bin, &count) in counts.iter().enumerate() {
+                    let at = point(
+                        o.x + s.width * (bin as f32 / (HIST_BINS - 1) as f32),
+                        o.y + s.height * (1. - (count as f32 / top).sqrt()),
+                    );
+                    match bin {
+                        0 => path.move_to(at),
+                        _ => path.line_to(at),
+                    }
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, rgb(HIST_INK[channel]));
+                }
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// The cascade's frequency response, drawn as one line across the graph.
 ///
 /// Every point comes from `EqParams::response_db`, which reads the very
@@ -4893,16 +5292,17 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, CONTROL_H, Clip, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE,
-        EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_FREQ_HIGH,
+        EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_TICKS, EXPORT_ROWS_H, FORMATS,
+        Format, HEADER_GAP, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM,
         KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX,
         LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
         RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
-        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, envelope, eq_x,
-        eq_y, export_path, export_settings, format_line, frac_along, frac_down, frame_at,
-        is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked, menu_at, mp4_refusal,
-        normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        source_frames, source_tint, span_partner, start_frac, timecode, unseen_paths,
+        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, color_snap,
+        envelope, eq_x, eq_y, export_path, export_settings, format_line, frac_along, frac_down,
+        frame_at, histogram, is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked,
+        menu_at, mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due,
+        show_label, source_frames, source_tint, span_partner, start_frac, timecode, unseen_paths,
         unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
@@ -5341,6 +5741,64 @@ mod tests {
             source_frames(lane_clips(&session), session.sources(), &path),
             frames
         );
+    }
+
+    /// The trim-a-clip path through the doors the edge drag uses:
+    /// [`Player::trim_to`] clamps the pointer with `trim_room` and
+    /// [`Player::commit_trim`] writes it with `trim_clip`. The clip plays less
+    /// of its file, the sound linked to it follows, the head trim moves the
+    /// in-point, and one undo takes a whole gesture back.
+    ///
+    /// The routing *to* these doors -- the 6 px edge strip claiming the press
+    /// the clip's own body-drag would otherwise take -- is gpui hitbox
+    /// behaviour (`occlude`) and is not reachable without a window.
+    #[test]
+    fn a_clip_trimmed_by_its_edge_plays_less_of_its_file() {
+        use engine::project::Edge;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let whole = session.lane_clips(Lane::V1)[0];
+        let full = session.timeline_duration();
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::End),
+            Some((whole.start + 1, whole.end())),
+            "the file's own last frame is how far the tail goes"
+        );
+        assert!(
+            !session.trim_clip(Lane::V1, 0, Edge::End, 9_999),
+            "it already plays all of it"
+        );
+
+        // Pulled in by a third: the timeline ends earlier and the sound with it.
+        let shorter = whole.end() - whole.len() / 3;
+        assert!(session.trim_clip(Lane::V1, 0, Edge::End, shorter));
+        assert_eq!(session.lane_clips(Lane::V1)[0].end(), shorter);
+        assert_eq!(
+            session.lane_clips(Lane::A1)[0].end(),
+            shorter,
+            "the linked sound was trimmed with the picture"
+        );
+        assert!(session.timeline_duration() < full, "and plays out earlier");
+
+        // ...and dragged back out, as far as the file goes and no further.
+        assert!(session.trim_clip(Lane::V1, 0, Edge::End, 9_999));
+        assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the whole take back");
+
+        // The head takes the in-point with it, so what plays at the new start
+        // is source frame 10 rather than source frame 0.
+        assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 10));
+        let head = session.lane_clips(Lane::V1)[0];
+        assert_eq!((head.start, head.in_frame), (10, 10));
+        assert_eq!(session.lane_clips(Lane::A1)[0].in_frame, 10, "sound too");
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::Start).map(|r| r.0),
+            Some(0),
+            "and it may be pulled back out to the file's first frame"
+        );
+
+        assert!(session.undo(), "one step for the whole drag");
+        assert_eq!(session.lane_clips(Lane::V1)[0], whole);
     }
 
     /// The move-a-clip-between-tracks path through the door the drop uses
@@ -5876,6 +6334,130 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// A colour slider is dragged straight to a value, so where the pointer
+    /// lands and where the bar then paints have to be the same place: this is
+    /// the round trip [`Player::drag_color`] makes, pixels -> value -> fill.
+    #[test]
+    fn a_colour_drag_lands_where_it_paints_and_the_card_fits_the_smallest_window() {
+        // A bar as laid out, somewhere that is not the window's origin -- a
+        // mapping that forgot the offset would pass at zero.
+        let bar = Bounds {
+            origin: point(px(180.), px(240.)),
+            size: size(px(COLOR_BAR_W), px(KEYS_ROW_H)),
+        };
+        for &(label, low, high) in &COLOR_BANDS {
+            // The ends are the ends: the left of the bar is the bottom of the
+            // range and the right is the top, so a slider can be pulled to
+            // either without hunting for the last pixel.
+            let at = |x: f32| color_snap(low + frac_along(px(x), bar) * (high - low));
+            assert_eq!(at(180.), low, "{label} left end");
+            assert_eq!(at(180. + COLOR_BAR_W), high, "{label} right end");
+            // Off either end clamps rather than running past the range.
+            assert_eq!(at(-4000.), low, "{label} off the left");
+            assert_eq!(at(9999.), high, "{label} off the right");
+
+            for step in 0..=48 {
+                let along = step as f32 / 48.;
+                let value = at(180. + along * COLOR_BAR_W);
+                // Every stop is one the keyboard can also reach, which is what
+                // keeps "0.35" the number the file writes.
+                let steps = value / COLOR_STEP;
+                assert!(
+                    (steps - steps.round()).abs() < 1e-3,
+                    "{label}: {value} is off the {COLOR_STEP} grid"
+                );
+                assert!(
+                    (low..=high).contains(&value),
+                    "{label}: {value} outside {low}..{high}"
+                );
+                // What the row paints from that value is where the pointer was,
+                // to within the half step the snap costs.
+                let painted = (value - low) / (high - low);
+                let slack = COLOR_STEP / (high - low) / 2. + 1e-4;
+                assert!(
+                    (painted - along).abs() <= slack,
+                    "{label}: pressed at {along}, paints at {painted}"
+                );
+            }
+        }
+
+        // The same shape as the other two cards, so it fits where they do: the
+        // graph, four rows and the reset button inside a 360 px window.
+        let (title, status, gaps, padding) = (17., 17., 6. * 2., 24.);
+        let rows = COLOR_BANDS.len() as f32 * KEYS_ROW_H;
+        assert!(
+            title + status + HIST_H + rows + gaps + padding + CONTROL_H + 4. <= 360.,
+            "card too tall"
+        );
+        assert!(COLOR_W <= 640., "card too wide");
+        // The label still has room beside the bar and the readout, which is
+        // what the buttons coming off the row bought.
+        let row = COLOR_W - padding - 12. - 2. * 8. - COLOR_BAR_W - 44.;
+        assert!(row >= LABEL_MIN_W, "no room left for a label: {row}px");
+        // What is dragged is the whole row's height, not the 4 px the bar is
+        // drawn as (WCAG 2.5.8) -- the same split the ruler makes.
+        assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+
+    /// The graph over the sliders is the frame the grade already went through,
+    /// so it has to count what is actually in those bytes -- BGRA on the wire,
+    /// red-green-blue in the bins.
+    #[test]
+    fn the_histogram_counts_the_frame_it_is_handed() {
+        // Half pure red, half mid grey: two known values, in two known bins.
+        let (w, h) = (64usize, 64usize);
+        let mut frame = Vec::with_capacity(w * h * 4);
+        for _ in 0..h {
+            for col in 0..w {
+                match col < w / 2 {
+                    true => frame.extend_from_slice(&[0, 0, 255, 255]),
+                    false => frame.extend_from_slice(&[128, 128, 128, 255]),
+                }
+            }
+        }
+        let bins = histogram(&frame);
+        let half = (w * h / 2) as u32;
+        // 64 bins over 256 codes: 255 is the last bin, 128 the middle one, 0 the
+        // first.
+        assert_eq!(bins[0][63], half, "the red half tops the red channel");
+        assert_eq!(bins[0][32], half, "and the grey half sits mid red");
+        for channel in [1, 2] {
+            assert_eq!(bins[channel][0], half, "no green or blue in the red half");
+            assert_eq!(bins[channel][32], half);
+            assert_eq!(bins[channel][63], 0);
+        }
+        // Nothing is counted twice and nothing is dropped: this frame is small
+        // enough to be read whole.
+        for channel in bins {
+            assert_eq!(channel.iter().sum::<u32>(), (w * h) as u32);
+        }
+
+        // A grade shifts it, which is the whole point of drawing it: the same
+        // frame darkened lands in lower bins.
+        let darker: Vec<u8> = frame.iter().map(|b| b / 2).collect();
+        let bins = histogram(&darker);
+        assert_eq!(bins[0][31], half, "255 -> 127");
+        assert_eq!(bins[0][16], half, "128 -> 64");
+
+        // A real frame is subsampled: a 1080p one is read every 253rd pixel, so
+        // the shape costs a thousandth of the reads and still counts thousands.
+        let big = vec![200u8; 1920 * 1080 * 4];
+        let bins = histogram(&big);
+        let counted = bins[0].iter().sum::<u32>();
+        let pixels = 1920 * 1080usize;
+        let expected = pixels.div_ceil(pixels / HIST_SAMPLES) as u32;
+        assert_eq!(counted, expected, "every strided pixel counted, once");
+        assert!(
+            (HIST_SAMPLES as u32..=HIST_SAMPLES as u32 + 64).contains(&counted),
+            "{counted} samples is not the budget"
+        );
+        assert_eq!(bins[0][200 * HIST_BINS / 256], counted, "all in one bin");
+
+        // An empty buffer is a flat graph rather than a panic: the card is open
+        // before the first frame is pumped.
+        assert_eq!(histogram(&[]), [[0; HIST_BINS]; 3]);
+    }
+
     /// Mute and level are one control with two states, and the whole point is
     /// that mute keeps the level: the user gets back what they had, not 100%.
     #[test]
@@ -6390,6 +6972,7 @@ fn main() {
                     streams: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
+                    trim: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
@@ -6408,6 +6991,11 @@ fn main() {
                     eq_graph: Rc::default(),
                     color_open: None,
                     color_band: 0,
+                    color_dragging: false,
+                    color_bars: std::array::from_fn(|_| Rc::default()),
+                    // Empty until the first frame is pumped, which draws as a
+                    // flat line rather than as a shape nothing measured.
+                    histogram: [[0; HIST_BINS]; 3],
                     // What an export is until someone says otherwise: the
                     // bitrate the picture asks for.
                     quality: Quality::Auto,
