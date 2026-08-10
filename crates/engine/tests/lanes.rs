@@ -236,6 +236,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
         source: 0,
         link: None,
         eq: None,
+        color: None,
     };
     let project = Project::from_parts(
         vec![Source::new(&source, 0)],
@@ -244,6 +245,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
             (LaneKind::Audio, Vec::new()),
             (LaneKind::Audio, vec![clip]),
         ],
+        vec![],
         vec![],
     )
     .expect("valid parts");
@@ -293,12 +295,13 @@ fn two_audio_lanes_are_summed() {
         source: 0,
         link: None,
         eq: None,
+        color: None,
     };
     let a2 = project.add_lane(LaneKind::Audio);
     assert!(project.place(a2, TOP_IN, doubled), "place the second lane");
-    let (sources, lanes, eq) = project.without_orphan_sources();
+    let (sources, lanes, eq, color) = project.without_orphan_sources();
     assert_eq!(lanes.len(), 3, "V1, A1 and the new A2");
-    let project = Project::from_parts(sources, lanes, eq).expect("valid parts");
+    let project = Project::from_parts(sources, lanes, eq, color).expect("valid parts");
 
     let (meta, _) = engine::demux::Demuxer::open(&asset("test_av.mp4")).unwrap();
     let wav = |name: &str, project: Project| {
