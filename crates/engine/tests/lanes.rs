@@ -14,7 +14,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::{Clip, LaneKind, Source};
+use engine::project::{Clip, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
@@ -239,6 +239,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     };
     let project = Project::from_parts(
         vec![Source::new(&source, 0)],
@@ -299,6 +300,7 @@ fn two_audio_lanes_are_summed() {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     };
     let a2 = project.add_lane(LaneKind::Audio);
     assert!(project.place(a2, TOP_IN, doubled), "place the second lane");

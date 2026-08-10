@@ -25,7 +25,7 @@ use crate::color::ColorParams;
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span};
+use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span, Speed};
 use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -309,6 +309,7 @@ impl PlaybackSession {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         let project = Project::from_parts(
             vec![Source::new(path, 0)],
@@ -374,6 +375,7 @@ impl PlaybackSession {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         // No group and no audio clip: a still is silent, and a clip on `A1`
         // playing from a PNG is a source the audio worker cannot open.
@@ -654,10 +656,17 @@ impl PlaybackSession {
                     // A gap's worker indexes from zero, a decoder's from its in
                     // point: `base` is whichever this span started at. An empty
                     // timeline has no span, and its one black frame is frame 0.
-                    let (start, base) = self
-                        .span
-                        .map_or((0, 0), |s| (s.start, s.from.map_or(0, |(_, i)| i)));
-                    frame.index = start + frame.index.saturating_sub(base);
+                    let (start, base, speed) = self.span.map_or((0, 0, Speed::NORMAL), |s| {
+                        (s.start, s.from.map_or(0, |(_, i)| i), s.speed)
+                    });
+                    // ...and a *speeded* clip's decoder counts source frames
+                    // faster than the timeline does, so the offset comes back
+                    // through the clip's own rate. At 2x two decoded frames land
+                    // on one timeline frame and the display drops the earlier of
+                    // them; at half speed each lands two apart and is held until
+                    // it is due. Real time divides by one and is the arithmetic
+                    // this always did.
+                    frame.index = start + speed.timeline_at(frame.index.saturating_sub(base));
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -733,15 +742,18 @@ impl PlaybackSession {
             // the worker carries it and every frame it converts wears it.
             Some(Span {
                 start,
-                len,
                 from: Some((source, in_frame)),
+                ..
             }) if crate::is_image(&self.project.sources()[source].path) => {
                 // A still: the same grade and the same canvas as any other
                 // clip, over a picture decoded once and repeated for the span.
+                // As many pictures as the span reads *source* frames, so a still
+                // is numbered like a decoder's output and a speed reaches it
+                // through the same rewrite (`try_frame`) as any other clip.
                 DecodeSession::open_still(
                     &self.project.sources()[source].path,
                     in_frame,
-                    len,
+                    span.expect("matched above").source_len(),
                     self.project
                         .composite_color_at(start)
                         .copied()
@@ -756,12 +768,14 @@ impl PlaybackSession {
             }
             Some(Span {
                 start,
-                len,
                 from: Some((source, in_frame)),
+                ..
             }) => DecodeSession::open_worker(
                 &self.project.sources()[source].path,
                 in_frame,
-                in_frame + len,
+                // Source frames, which a speed makes more (or fewer) than the
+                // timeline frames the span covers.
+                in_frame + span.expect("matched above").source_len(),
                 self.project
                     .composite_color_at(start)
                     .copied()
@@ -959,6 +973,36 @@ impl PlaybackSession {
         let now = self.now();
         self.seek(now);
         true
+    }
+
+    /// How fast the clip at `idx` of `lane` plays -- what a card shows before
+    /// anyone drags it.
+    pub fn speed_of(&self, lane: Lane, idx: usize) -> Speed {
+        self.project.speed_of(lane, idx)
+    }
+
+    /// Sets it, for that clip and its whole group ([`Project::set_speed`]): one
+    /// undo step for the lot. Reseeks like every other edit, so the picture runs
+    /// -- and the sound is resampled -- from the next frame on rather than at the
+    /// next play. The `Err` names the clip in the way when slowing one down
+    /// would run it into its neighbour, and nothing changes.
+    pub fn set_speed(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
+        // Spelled out rather than through `edit`, whose closure hands back a
+        // bool and would drop the refusal's own words.
+        self.project.set_speed(lane, idx, speed)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
+    }
+
+    /// [`set_speed`](Self::set_speed) without the undo step -- the samples inside
+    /// one drag ([`Project::set_speed_live`]). Reseeks like the committing one,
+    /// which is what makes the bar move the picture under the hand.
+    pub fn set_speed_live(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
+        self.project.set_speed_live(lane, idx, speed)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
     }
 
     /// Where that edge may land, `(first, last)` timeline frame inclusive: what
@@ -1166,6 +1210,7 @@ impl PlaybackSession {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         // Which lane a source may land on is decided here and only here, so a
         // front-end never has to make the same call twice: a file with no
@@ -1478,13 +1523,20 @@ impl PlaybackSession {
             // changed a band restarts the workers with the new curve already in
             // them, and no live channel has to reach into a running one.
             let eqs = self.project.audio_eqs_from(target, fps);
+            // ...and the rates, the same way again: a speeded segment is
+            // resampled inside its own worker, before the mix, so what the ear
+            // hears is what the timeline shows. Empty for a project nobody has
+            // speeded, which is the path that decodes the same samples it always
+            // did.
+            let speeds = self.project.audio_speeds_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
-            audio_running = match AudioSession::open_mixed_streams_eq(&sources, &segs, &eqs) {
-                Ok(Some((_, rx))) => audio.spawn_feeder(rx),
-                _ => false,
-            };
+            audio_running =
+                match AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds) {
+                    Ok(Some((_, rx))) => audio.spawn_feeder(rx),
+                    _ => false,
+                };
             if !audio_running {
                 // Nothing will ever be fed again; let `tick` fall to wall time
                 // instead of waiting on a device that has no more work coming.

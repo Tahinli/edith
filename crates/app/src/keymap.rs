@@ -70,13 +70,14 @@ pub enum ActionId {
     VolumeUp,
     VolumeDown,
     Equalizer,
+    Speed,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 31] = [
+    pub const ALL: [ActionId; 32] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -107,6 +108,7 @@ impl ActionId {
         ActionId::VolumeUp,
         ActionId::VolumeDown,
         ActionId::Equalizer,
+        ActionId::Speed,
         ActionId::CancelExport,
     ];
 
@@ -143,6 +145,7 @@ impl ActionId {
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
             ActionId::Equalizer => "Equalizer",
+            ActionId::Speed => "Speed (tape)…",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -181,6 +184,7 @@ impl ActionId {
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
             ActionId::Equalizer => "equalizer",
+            ActionId::Speed => "speed",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -209,7 +213,11 @@ impl ActionId {
             | ActionId::Delete
             | ActionId::Lift
             | ActionId::Color
-            | ActionId::Fit => Category::Clips,
+            | ActionId::Fit
+            // A rate is the clip's, not the sound's: it re-times the picture
+            // and the sound together, and the card opens on whichever half was
+            // clicked.
+            | ActionId::Speed => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
             ActionId::Resolution => Category::View,
@@ -507,6 +515,11 @@ impl Keymap {
                 // The one free letter that says the word: "e" is already the
                 // export and an equalizer is the q in nobody else's way.
                 b(ActionId::Equalizer, "q", false),
+                // "s" is the save's ctrl chord, so the speed card takes the
+                // unshifted letter beside it: "j" was free, sits under the
+                // right hand with the other clip keys (k grades, l lifts), and
+                // is not next to anything that deletes.
+                b(ActionId::Speed, "j", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -769,7 +782,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 33);
+        assert_eq!(k.entries().len(), 34);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -814,7 +827,8 @@ mod tests {
         // The modifier is half the chord: ctrl+e is not e.
         assert_eq!(k.lookup("e", true), None);
         assert_eq!(k.lookup("space", true), None);
-        assert_eq!(k.lookup("j", false), None);
+        assert_eq!(k.lookup("j", false), Some(ActionId::Speed));
+        assert_eq!(k.lookup("j", true), None);
         // Nothing is bound twice, or lookup's first match would be a coin toss.
         for (i, a) in k.entries().iter().enumerate() {
             assert!(
@@ -996,7 +1010,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 31);
+        assert_eq!(ActionId::ALL.len(), 32);
     }
 
     #[test]

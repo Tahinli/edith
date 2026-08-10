@@ -22,8 +22,7 @@ use std::time::{Duration, Instant};
 use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
-use engine::project::Lane;
-use engine::project::Source;
+use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
@@ -195,6 +194,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     };
     let clips = vec![clip(0, 0), clip(1, 10)];
     let project = Project::from_parts(
@@ -275,6 +275,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     };
     // Stream 1 is the 22.05 kHz mono French track; stream 0 is 44.1 kHz
     // stereo. A project may only hold streams that agree, so this timeline is
