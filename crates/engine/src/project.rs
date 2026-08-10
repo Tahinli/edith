@@ -71,6 +71,31 @@ impl Clip {
     }
 }
 
+/// A file the timeline plays from, and *which* of its audio streams it plays:
+/// a file carrying one track per language is several sources, one per stream,
+/// sharing a path. Two entries differing only in the stream are two sources --
+/// they are what a clip names, and a clip plays exactly one stream.
+///
+/// The path is always canonical ([`Source::new`]), so the same file reached by
+/// two paths is one source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub path: PathBuf,
+    /// Position among the file's audio tracks in file order, the numbering
+    /// [`crate::AudioSession::probe_streams`] hands out. `0` for a file with a
+    /// single track, and for a silent one.
+    pub audio_stream: usize,
+}
+
+impl Source {
+    pub fn new(path: impl AsRef<Path>, audio_stream: usize) -> Self {
+        Self {
+            path: canonical(path.as_ref()),
+            audio_stream,
+        }
+    }
+}
+
 /// Which lane an operation acts on. The lanes are peers: no operation reads one
 /// to decide what to do to the other, except the grouped ones that say so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +137,7 @@ impl Span {
 #[derive(Clone, Debug)]
 pub struct Project {
     /// Append-only: never popped, never reordered. See the module docs.
-    sources: Vec<PathBuf>,
+    sources: Vec<Source>,
     /// Indexed by [`Lane::index`]. Each lane is sorted by `start` and disjoint.
     lanes: [Vec<Clip>; 2],
     /// Snapshots pushed *before* each successful edit; `undo` pops one.
@@ -136,7 +161,9 @@ impl Project {
             link: Some(0),
         };
         Self {
-            sources: vec![canonical(path.as_ref())],
+            // A file is opened on its first audio stream: nothing has picked
+            // one yet, and every file with audio at all has that one.
+            sources: vec![Source::new(path, 0)],
             lanes: [vec![clip], vec![clip]],
             history: Vec::new(),
             next_link: 1,
@@ -152,7 +179,7 @@ impl Project {
     /// whose end overflows, a lane that is unsorted or self-overlapping, and
     /// the grouping rules of [`Clip::link`] below.
     pub fn from_parts(
-        sources: Vec<PathBuf>,
+        sources: Vec<Source>,
         video: Vec<Clip>,
         audio: Vec<Clip>,
     ) -> crate::Result<Self> {
@@ -200,7 +227,10 @@ impl Project {
             // ceiling ids stop being fresh, which loses grouping, not memory.
             .map_or(0, |m| m.saturating_add(1));
         Ok(Self {
-            sources: sources.iter().map(|s| canonical(s)).collect(),
+            sources: sources
+                .iter()
+                .map(|s| Source::new(&s.path, s.audio_stream))
+                .collect(),
             lanes,
             history: Vec::new(),
             next_link,
@@ -219,20 +249,32 @@ impl Project {
 
     /// The files the clips index into, in import order; index 0 is the file the
     /// project was opened with.
-    pub fn sources(&self) -> &[PathBuf] {
+    pub fn sources(&self) -> &[Source] {
         &self.sources
     }
 
-    /// Index for `path`, appending it if it is new. Deduped by
-    /// `fs::canonicalize`, so the same file reached by two paths imports once.
+    /// The same list in the `(path, stream)` shape the audio engine indexes
+    /// into -- [`crate::AudioSession::open_multi_streams`] and
+    /// [`crate::AudioSession::copy_multi_streams`] take it, so the stream a clip
+    /// was placed with is the stream that plays *and* the stream that exports.
+    pub fn audio_sources(&self) -> Vec<(PathBuf, usize)> {
+        self.sources
+            .iter()
+            .map(|s| (s.path.clone(), s.audio_stream))
+            .collect()
+    }
+
+    /// Index for `path` played on `audio_stream`, appending it if it is new.
+    /// Deduped by `fs::canonicalize` *and* by stream, so the same file reached
+    /// by two paths imports once and two streams of one file are two sources.
     /// The lanes are untouched -- see [`Project::append_clip`] -- so this pushes
     /// no history: a source entry alone changes nothing playable.
-    pub fn import(&mut self, path: impl AsRef<Path>) -> usize {
-        let path = canonical(path.as_ref());
-        match self.sources.iter().position(|s| *s == path) {
+    pub fn import(&mut self, path: impl AsRef<Path>, audio_stream: usize) -> usize {
+        let source = Source::new(path, audio_stream);
+        match self.sources.iter().position(|s| *s == source) {
             Some(idx) => idx,
             None => {
-                self.sources.push(path);
+                self.sources.push(source);
                 self.sources.len() - 1
             }
         }
@@ -268,7 +310,7 @@ impl Project {
     /// nothing plays refuse a future load. New indexes are assigned in order of
     /// first use -- video lane first, then audio -- so the same project always
     /// emits the same bytes.
-    pub fn without_orphan_sources(&self) -> (Vec<PathBuf>, Vec<Clip>, Vec<Clip>) {
+    pub fn without_orphan_sources(&self) -> (Vec<Source>, Vec<Clip>, Vec<Clip>) {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
         let mut lanes = self.lanes.clone();
@@ -1252,7 +1294,7 @@ mod tests {
     /// of source 0 then [0,4) of source 1.
     fn two_sources() -> Project {
         let mut p = three();
-        let s = p.import(FILE2);
+        let s = p.import(FILE2, 0);
         assert_eq!(s, 1);
         assert!(p.append_clip(s, 4));
         p
@@ -1262,11 +1304,18 @@ mod tests {
     fn import_dedups_and_appends() {
         let mut p = Project::single(FILE, 9);
         assert_eq!(p.sources().len(), 1, "the opened file is source 0");
-        assert_eq!(p.import(FILE), 0, "reimporting the open file reuses 0");
-        assert_eq!(p.import(FILE2), 1);
-        assert_eq!(p.import(FILE2), 1, "second import of the same path");
-        assert_eq!(p.sources().len(), 2);
-        assert!(!p.append_clip(2, 5), "unknown source index");
+        assert_eq!(p.import(FILE, 0), 0, "reimporting the open file reuses 0");
+        assert_eq!(p.import(FILE2, 0), 1);
+        assert_eq!(p.import(FILE2, 0), 1, "second import of the same path");
+        // ...but the same file on another audio stream is another source: it is
+        // what a clip names, and a clip plays exactly one stream.
+        assert_eq!(p.import(FILE2, 1), 2, "a second stream is a second source");
+        assert_eq!(p.import(FILE2, 1), 2, "and dedups on the pair");
+        assert_eq!(p.sources()[2].audio_stream, 1);
+        assert!(p.append_clip(2, 4), "a stream entry is placeable");
+        assert!(p.undo());
+        assert_eq!(p.sources().len(), 3);
+        assert!(!p.append_clip(3, 5), "unknown source index");
         assert_eq!(p.clips().len(), 1, "a refusal changes nothing");
 
         // Two spellings of one real file are one source: this is the case the
@@ -1274,7 +1323,7 @@ mod tests {
         let here = concat!(env!("CARGO_MANIFEST_DIR"), "/src/project.rs");
         let detour = concat!(env!("CARGO_MANIFEST_DIR"), "/src/../src/project.rs");
         let mut p = Project::single(here, 9);
-        assert_eq!(p.import(detour), 0);
+        assert_eq!(p.import(detour, 0), 0);
         assert_eq!(p.sources().len(), 1);
     }
 
@@ -1362,20 +1411,20 @@ mod tests {
         let mut p = two_sources();
         assert!(p.undo());
         let (sources, video, audio) = p.without_orphan_sources();
-        assert_eq!(sources, vec![PathBuf::from(FILE)], "the orphan is gone");
+        assert_eq!(sources, vec![Source::new(FILE, 0)], "the orphan is gone");
         assert_eq!(video, three().clips(), "the clips are untouched");
         assert_eq!(audio, three().lane(Lane::Audio));
 
         // Three sources where only the middle one is orphaned: the survivors
         // renumber, and the clips follow.
         let mut p = Project::single(FILE, 9);
-        assert_eq!(p.import(FILE2), 1);
-        assert_eq!(p.import("/nonexistent/c.mp4"), 2);
+        assert_eq!(p.import(FILE2, 0), 1);
+        assert_eq!(p.import("/nonexistent/c.mp4", 0), 2);
         assert!(p.append_clip(2, 4));
         let (sources, video, audio) = p.without_orphan_sources();
         assert_eq!(
             sources,
-            vec![PathBuf::from(FILE), PathBuf::from("/nonexistent/c.mp4")]
+            vec![Source::new(FILE, 0), Source::new("/nonexistent/c.mp4", 0)]
         );
         assert_eq!(video.iter().map(|c| c.source).collect::<Vec<_>>(), [0, 1]);
         // ...and what comes out is loadable, with the same timeline.
@@ -1423,7 +1472,7 @@ mod tests {
     /// because what an edit produces is what a save writes and a load reads.
     #[test]
     fn a_link_id_is_never_two_clips_of_one_lane() {
-        let sources = vec![PathBuf::from(FILE)];
+        let sources = vec![Source::new(FILE, 0)];
         let linked = |start, in_frame, out_frame, link| Clip {
             start,
             in_frame,
@@ -1509,6 +1558,25 @@ mod tests {
         assert!(p.regroup(30), "only the audio lane can rejoin");
         assert!(p.split(60));
         reloads(&p, "lift, regroup one lane, split");
+
+        // Two audio streams of one file, both placed: two source entries with
+        // one path between them, which is the state a stream picked out of the
+        // library reaches -- and the state a save has to write and read back.
+        let mut p = Project::single(FILE, 150);
+        let second = p.import(FILE, 1);
+        assert_eq!(second, 1, "the same file on another stream is a new source");
+        assert!(p.append_clip(second, 150));
+        assert!(p.split(200));
+        reloads(
+            &p,
+            "a second audio stream of the same file, placed and split",
+        );
+        let (sources, ..) = p.without_orphan_sources();
+        assert_eq!(
+            sources.iter().map(|s| s.audio_stream).collect::<Vec<_>>(),
+            [0, 1],
+            "both entries survive the orphan prune: both are played"
+        );
     }
 
     /// The same claim, swept: random op sequences off the public surface, the

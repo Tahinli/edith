@@ -159,8 +159,14 @@ fn run(
     // files stays in sync. A source whose AAC parameters disagree with the
     // first one is an `Err` from there -- import refuses those up front, this
     // is the backstop -- and the caller deletes the `.part`.
-    let audio =
-        AudioSession::copy_multi_segments(sources, &project.segments_from(0, meta.frame_rate))?;
+    //
+    // The stream each source is copied from is the one it plays: `audio_sources`
+    // is the same list `PlaybackSession::seek` hands the decoder, so an export
+    // of a timeline playing a file's second audio track carries *that* track.
+    let audio = AudioSession::copy_multi_streams(
+        &project.audio_sources(),
+        &project.segments_from(0, meta.frame_rate),
+    )?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
@@ -180,10 +186,10 @@ fn run(
         // file boundaries, which are just cuts that change the path.
         let mut pictures = match span.from {
             Some((source, in_frame)) => {
-                let path = sources
+                let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                Some(ClipDecoder::open(path, in_frame)?)
+                Some(ClipDecoder::open(&entry.path, in_frame)?)
             }
             None => None,
         };

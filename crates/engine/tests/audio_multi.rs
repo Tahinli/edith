@@ -189,19 +189,21 @@ fn each_source_ends_where_its_own_track_does() {
 
 #[test]
 fn probe_reads_the_import_policy_fields() {
-    let av = AudioSession::probe(asset("test_av.mp4"))
+    let av = AudioSession::probe(asset("test_av.mp4"), 0)
         .expect("probe")
         .expect("test_av.mp4 has audio");
     assert_eq!(av.channels, 2);
     assert_eq!(av.params.sample_rate, RATE as u32);
     assert_eq!(
-        AudioSession::probe(asset("test_av2.mp4")).unwrap().unwrap(),
+        AudioSession::probe(asset("test_av2.mp4"), 0)
+            .unwrap()
+            .unwrap(),
         av,
         "the fixtures are the matching pair import must accept"
     );
     for silent in ["test_baseline.mp4", "test_mismatch.mp4"] {
         assert!(
-            AudioSession::probe(asset(silent)).unwrap().is_none(),
+            AudioSession::probe(asset(silent), 0).unwrap().is_none(),
             "{silent} has no audio track"
         );
     }

@@ -259,12 +259,13 @@ impl AudioSession {
         Ok(Some((meta, rx)))
     }
 
-    /// The audio parameters of `path`, for checking an import against the
-    /// timeline's first source: header only, no decoder and no worker.
-    /// `Ok(None)` means no AAC track — an audio-less file, which import pairs
-    /// only with other audio-less files.
-    pub fn probe(path: impl AsRef<Path>) -> crate::Result<Option<AudioProbe>> {
-        let Some(track) = Track::open(path.as_ref(), 0)? else {
+    /// The audio parameters of `path`'s `stream`, for checking an import
+    /// against the timeline's first source: header only, no decoder and no
+    /// worker. `Ok(None)` means no AAC track — an audio-less file, which import
+    /// pairs only with other audio-less files. A *named* stream that is not
+    /// there or does not decode is an `Err`, as everywhere else.
+    pub fn probe(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<AudioProbe>> {
+        let Some(track) = Track::open(path.as_ref(), stream)? else {
             return Ok(None);
         };
         Ok(Some(AudioProbe {
@@ -357,13 +358,27 @@ impl AudioSession {
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
+        let sources: Vec<_> = sources.iter().map(|p| (p.clone(), 0)).collect();
+        Self::copy_multi_streams(&sources, segs)
+    }
+
+    /// [`copy_multi_segments`](Self::copy_multi_segments) with each source
+    /// naming *which* of its audio streams to copy — the same `(path, stream)`
+    /// list [`open_multi_streams`](Self::open_multi_streams) plays. The two
+    /// take it in the same shape on purpose: an export that copied a different
+    /// stream from the one the timeline played would be a file that sounds
+    /// nothing like what was edited, and nothing would say so.
+    pub fn copy_multi_streams(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+    ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
         let Some(&(Some(first), ..)) = segs.iter().find(|s| s.0.is_some()) else {
             return Ok(None); // no segments, or nothing but silence
         };
-        let path = sources
+        let (path, stream) = sources
             .get(first)
             .ok_or_else(|| format!("segment names source {first} of {}", sources.len()))?;
-        let Some(track) = Track::open(path, 0)? else {
+        let Some(track) = Track::open(path, *stream)? else {
             return Ok(None); // silent source, silent export
         };
         let params = track.track_params();
@@ -452,24 +467,20 @@ fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
     }
 }
 
-/// The source at `index`, opened on first use. Sources a segment list never
-/// names are never touched: a project's list only grows.
-///
-/// ponytail: the copy path is still stream 0 of every source — an export of a
-/// timeline playing stream 1 would carry stream 0's audio. Upgrade path is the
-/// `(PathBuf, usize)` list [`AudioSession::open_multi_streams`] already takes,
-/// which is S4b's job once a stream can be picked at all.
+/// The source at `index`, on the stream it names, opened on first use. Sources
+/// a segment list never names are never touched: a project's list only grows.
 fn source_at<'a>(
     tracks: &'a mut [Option<Track>],
-    sources: &[PathBuf],
+    sources: &[(PathBuf, usize)],
     index: usize,
 ) -> crate::Result<&'a mut Track> {
     let slot = tracks
         .get_mut(index)
         .ok_or_else(|| format!("segment names source {index} of {}", sources.len()))?;
     if slot.is_none() {
+        let (path, stream) = &sources[index];
         *slot = Some(
-            Track::open(&sources[index], 0)?
+            Track::open(path, *stream)?
                 .ok_or_else(|| format!("source {index} has no audio track"))?,
         );
     }
