@@ -128,7 +128,13 @@ pub struct PlaybackSession {
     /// clip index: a `split` cuts the clip under a running worker, and only the
     /// mapping survives that. A span with no source is a *gap*, and the worker
     /// feeding it emits black frames indexed from zero.
-    span: Span,
+    ///
+    /// `None` is the *emptied* timeline -- no clip on any lane, so there is no
+    /// stretch to be inside of. It is a state, not a failure: the picture is
+    /// black ([`start_span`](Self::start_span) feeds one black frame for it),
+    /// the sound is silence, the duration is zero, and placing anything reseeks
+    /// straight back out of it.
+    span: Option<Span>,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
 }
@@ -174,7 +180,7 @@ impl PlaybackSession {
         // One clip per lane covering the file, so timeline == source until the
         // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
-        let span = project.composite_span_at(0).expect("never empty");
+        let span = project.composite_span_at(0);
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
@@ -290,7 +296,7 @@ impl PlaybackSession {
 
         let playhead = doc.playhead;
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?;
-        let span = project.composite_span_at(0).expect("never empty");
+        let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
@@ -370,9 +376,12 @@ impl PlaybackSession {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
                     // A gap's worker indexes from zero, a decoder's from its in
-                    // point: `base` is whichever this span started at.
-                    let base = self.span.from.map_or(0, |(_, in_frame)| in_frame);
-                    frame.index = self.span.start + frame.index.saturating_sub(base);
+                    // point: `base` is whichever this span started at. An empty
+                    // timeline has no span, and its one black frame is frame 0.
+                    let (start, base) = self
+                        .span
+                        .map_or((0, 0), |s| (s.start, s.from.map_or(0, |(_, i)| i)));
+                    frame.index = start + frame.index.saturating_sub(base);
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -415,35 +424,47 @@ impl PlaybackSession {
     /// than remembered as a clip index, because a `split` while playing cuts the
     /// clip under the running worker and only the mapping stays true.
     fn next_clip(&mut self) -> bool {
-        let next = self.span.end();
+        // No span is the emptied timeline: it was played out the moment its one
+        // black frame went by, and there is no "next" to walk to.
+        let next = match self.span {
+            Some(span) => span.end(),
+            None => return false,
+        };
         let Some(span) = self.project.composite_span_at(next) else {
             return false;
         };
         // We only get here on a disconnect, so the old worker has already
         // returned; cancel anyway, so `retire` treats every path alike.
         self.worker.cancel();
-        self.start_span(span);
+        self.start_span(Some(span));
         true
     }
 
     /// Points the video worker at `span`: a decoder over its source range, or a
-    /// black-frame generator for a gap. The old worker must already have been
-    /// cancelled -- this is the half both `seek` and `next_clip` share.
+    /// black-frame generator for a gap -- and for `None`, the emptied timeline,
+    /// which is one frame of black so the viewer shows the nothing that is
+    /// there rather than the last picture of the clip that was deleted. The old
+    /// worker must already have been cancelled -- this is the half both `seek`
+    /// and `next_clip` share.
     ///
     /// A source that will not open leaves the *span* installed anyway: the
     /// timeline still moves, there are simply no more pictures, and the
     /// disconnected receiver carries the session on to the next span.
-    fn start_span(&mut self, span: Span) {
-        let opened = match span.from {
+    fn start_span(&mut self, span: Option<Span>) {
+        let opened = match span {
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
             // the worker carries it and every frame it converts wears it.
-            Some((source, in_frame)) => DecodeSession::open_worker(
+            Some(Span {
+                start,
+                len,
+                from: Some((source, in_frame)),
+            }) => DecodeSession::open_worker(
                 &self.project.sources()[source].path,
                 in_frame,
-                in_frame + span.len,
+                in_frame + len,
                 self.project
-                    .composite_color_at(span.start)
+                    .composite_color_at(start)
                     .copied()
                     .unwrap_or_default(),
                 // ...and the canvas it is placed on: the project's resolution
@@ -452,15 +473,18 @@ impl PlaybackSession {
                 Composer::new(
                     self.meta.width,
                     self.meta.height,
-                    self.project.composite_fit_at(span.start),
+                    self.project.composite_fit_at(start),
                 ),
             )
             .map(|(_, stream)| stream)
-            .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
-            None => Ok(DecodeSession::open_black(
+            .inspect_err(|e| eprintln!("timeline frame {start}: video open failed: {e}")),
+            // A gap: black for as long as it runs. An emptied timeline has no
+            // span at all and gets one frame of it -- enough to put black on
+            // screen, and it ends where the timeline does, at once.
+            gap => Ok(DecodeSession::open_black(
                 self.meta.width,
                 self.meta.height,
-                span.len,
+                gap.map_or(1, |s| s.len),
             )),
         };
         if let Ok(stream) = opened {
@@ -478,6 +502,14 @@ impl PlaybackSession {
     /// shrinks with every delete.
     pub fn timeline_duration(&self) -> f64 {
         f64::from(self.project.timeline_frames()) / self.meta.frame_rate
+    }
+
+    /// Whether no lane holds anything: the emptied timeline, which plays black
+    /// and silent and is zero seconds long. A state, not a failure -- but the
+    /// one a caller with nothing to render (an export) has to refuse by name
+    /// rather than write a file of no frames.
+    pub fn is_empty(&self) -> bool {
+        self.project.timeline_frames() == 0
     }
 
     /// `(start, len)` per clip in timeline seconds, in order: what a clips lane
@@ -575,8 +607,9 @@ impl PlaybackSession {
 
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
     /// silence on the audio one, and nothing else moves. Reseeks, because what
-    /// the playhead sits on has changed. `false` for a bad index and for the
-    /// lift that would leave the whole timeline empty.
+    /// the playhead sits on has changed. `false` for a bad index -- the lift of
+    /// the last placement there is empties the timeline, which is a state
+    /// ([`is_empty`](Self::is_empty)) and one undo away.
     pub fn lift_clip(&mut self, lane: Lane, idx: usize) -> bool {
         self.edit(|p| p.lift(lane, idx))
     }
@@ -785,7 +818,8 @@ impl PlaybackSession {
     /// on every lane. Unlike a split this *does* move every following frame, so
     /// the session reseeks to wherever the playhead now points.
     /// [`lift_clip`](Self::lift_clip) is the one that leaves a hole instead.
-    /// `false` for a bad index or the last remaining clip.
+    /// `false` for a bad index; the last remaining clip goes like any other and
+    /// leaves the timeline empty ([`is_empty`](Self::is_empty)).
     ///
     /// The lane travels because the index is a lane's own: `V2`'s third clip is
     /// not `V1`'s, and a front-end that could only say "the third clip" would
@@ -976,12 +1010,10 @@ impl PlaybackSession {
         // [`retire`](Self::retire), which is what keeps a scrub off the price
         // of a VA-API init.
         self.worker.cancel();
-        // `target` is inside the timeline (never empty), so this always spans;
-        // the span runs from there to the end of whatever it landed in -- a
-        // clip, or a gap, which starts a black-frame worker instead.
-        if let Some(span) = self.project.composite_span_at(target) {
-            self.start_span(span);
-        }
+        // The span runs from `target` to the end of whatever it landed in -- a
+        // clip, or a gap, which starts a black-frame worker instead. `None` is
+        // the emptied timeline, black too, and `start_span` says so.
+        self.start_span(self.project.composite_span_at(target));
         self.eos = false;
 
         let mut audio_running = false;
