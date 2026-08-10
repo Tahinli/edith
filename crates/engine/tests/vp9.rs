@@ -44,7 +44,7 @@ fn the_demuxer_reports_a_vp9_track() {
         .expect("probe")
         .expect("the fixture has an AAC track");
     assert_eq!(
-        (probe.params.sample_rate, probe.channels),
+        (probe.sample_rate, probe.channels),
         (44_100, 2),
         "audio is read the same whatever the picture is coded with"
     );
