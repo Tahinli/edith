@@ -100,6 +100,44 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
+/// Why a trim's tail stops where the file ends: a clip reaching past the last
+/// frame of its source is a project that will not open again (`open_project`
+/// refuses it by name). Pulled in on both ends and then dragged out as far as
+/// the pointer can ask for, the save still comes back as itself.
+#[test]
+fn a_trimmed_timeline_saves_and_opens_again() {
+    use engine::project::Edge;
+
+    let dir = scratch("trim");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    let whole = session.clip_at(0).expect("one clip");
+
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, whole.end() / 2));
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 5));
+    let path = dir.join("trimmed.edith");
+    session.save_project(&path).expect("save");
+    let loaded = PlaybackSession::open_project(&path).expect("a trimmed project opens");
+    assert_eq!(
+        loaded.clip_at(0).map(|c| (c.start, c.in_frame, c.out_frame)),
+        Some((5, 5, whole.end() / 2)),
+        "the trimmed range is what came back"
+    );
+
+    // A hand that keeps pulling: the tail stops at the file's own last frame,
+    // and the save of *that* opens too.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, u32::MAX));
+    assert_eq!(
+        session.clip_at(0).expect("still one clip").out_frame,
+        whole.out_frame,
+        "as far as the file goes and not one frame further"
+    );
+    session.save_project(&path).expect("save");
+    PlaybackSession::open_project(&path).expect("and it still opens");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
 /// Two files, four clips, one of them deleted, playhead at 3 s -- a timeline
 /// with something to lose in every field.
 fn edited(dir: &Path) -> PlaybackSession {
