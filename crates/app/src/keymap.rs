@@ -53,6 +53,8 @@ pub enum ActionId {
     Paste,
     Cut,
     Regroup,
+    Detach,
+    Group,
     Select,
     SelectNext,
     SelectPrev,
@@ -74,7 +76,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 29] = [
+    pub const ALL: [ActionId; 31] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -88,6 +90,8 @@ impl ActionId {
         ActionId::Paste,
         ActionId::Cut,
         ActionId::Regroup,
+        ActionId::Detach,
+        ActionId::Group,
         ActionId::Select,
         ActionId::SelectNext,
         ActionId::SelectPrev,
@@ -122,6 +126,8 @@ impl ActionId {
             ActionId::Paste => "Paste",
             ActionId::Cut => "Cut",
             ActionId::Regroup => "Regroup",
+            ActionId::Detach => "Detach the sound from the picture",
+            ActionId::Group => "Group with the clip on another track",
             ActionId::Select => "Select the clip under the playhead (again for the next lane)",
             ActionId::SelectNext => "Select the next clip in the lane",
             ActionId::SelectPrev => "Select the previous clip in the lane",
@@ -158,6 +164,8 @@ impl ActionId {
             ActionId::Paste => "paste",
             ActionId::Cut => "cut",
             ActionId::Regroup => "regroup",
+            ActionId::Detach => "detach",
+            ActionId::Group => "group",
             ActionId::Select => "select",
             ActionId::SelectNext => "select-next",
             ActionId::SelectPrev => "select-prev",
@@ -207,6 +215,8 @@ impl ActionId {
             ActionId::Resolution => Category::View,
             ActionId::Cut
             | ActionId::Regroup
+            | ActionId::Detach
+            | ActionId::Group
             | ActionId::Undo
             | ActionId::AddVideoLane
             | ActionId::AddAudioLane => Category::Editing,
@@ -268,7 +278,7 @@ pub struct Fixed {
 pub const FIXED: [Fixed; 12] = [
     Fixed {
         chord: "esc",
-        label: "Close this card or clip menu, or cancel a capture",
+        label: "Close this card or menu, or cancel a capture",
         category: Category::View,
     },
     Fixed {
@@ -453,6 +463,12 @@ impl Keymap {
                 // The two lane keys, on the letters they are named after: both
                 // were free, and neither is next to a key that edits.
                 b(ActionId::Regroup, "g", false),
+                // The pair that takes a take apart and puts it back: "d" for
+                // detach was free and is one press like the rest of the clip
+                // keys, and grouping two clips is the "g" that rejoins a cut one
+                // lane over -- the chord beside it, so the two read as one idea.
+                b(ActionId::Detach, "d", false),
+                b(ActionId::Group, "g", true),
                 // Selection without a pointer. Tab is what a keyboard already
                 // means by "move on to the next thing", and the two brackets
                 // are the pair either side of it in the lane -- shift+tab is
@@ -753,7 +769,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 31);
+        assert_eq!(k.entries().len(), 33);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -769,6 +785,9 @@ mod tests {
         assert_eq!(k.lookup("v", true), Some(ActionId::Paste));
         assert_eq!(k.lookup("c", false), Some(ActionId::Cut));
         assert_eq!(k.lookup("g", false), Some(ActionId::Regroup));
+        // The take apart / put back pair beside it.
+        assert_eq!(k.lookup("d", false), Some(ActionId::Detach));
+        assert_eq!(k.lookup("g", true), Some(ActionId::Group));
         // The keyboard's way onto a clip, and the pair that walks the lane.
         assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
         assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
@@ -977,7 +996,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 29);
+        assert_eq!(ActionId::ALL.len(), 31);
     }
 
     #[test]
