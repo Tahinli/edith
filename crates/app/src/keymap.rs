@@ -179,7 +179,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 3] = [
+pub const FIXED: [Fixed; 5] = [
     Fixed {
         chord: "esc",
         label: "Close this card or clip menu, or cancel a capture",
@@ -188,6 +188,16 @@ pub const FIXED: [Fixed; 3] = [
     Fixed {
         chord: "0–9",
         label: "Type a custom export bitrate",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "m / w / f",
+        label: "Pick the export format: MP4, WAV or FLAC",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "enter",
+        label: "Start the export the card is set to",
         category: Category::File,
     },
     Fixed {
