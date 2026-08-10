@@ -298,6 +298,17 @@ impl AudioSession {
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
+        // Matroska: the demuxer reads its picture and nothing else yet, so a
+        // file that has sound is told so by name rather than playing silent
+        // with no reason given. A Matroska file with no audio track at all
+        // returns `None` here like any other silent file.
+        if crate::demux::is_matroska(path.as_ref()) {
+            return Ok(
+                crate::demux::matroska_audio_codec(path.as_ref())?.map(|codec| {
+                    format!("{codec} audio in a Matroska file is not wired to the decoder yet")
+                }),
+            );
+        }
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
@@ -343,6 +354,12 @@ impl AudioSession {
     /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
+        // A Matroska file's audio tracks are not readable here yet ([`Track`]),
+        // and a stream nothing can open is not one to offer: an mkv lists as
+        // the silent source it currently is.
+        if crate::demux::is_matroska(path) {
+            return Ok(Vec::new());
+        }
         if crate::is_audio(path) {
             let track = SymTrack::open(path)?;
             return Ok(vec![StreamInfo {
@@ -638,6 +655,12 @@ impl Track {
     /// has exactly one, so any `stream` above 0 there is a promise the file
     /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
+        // A Matroska file's sound is not wired to either reader yet: its picture
+        // is what this slice delivers, and the source counts as a silent one --
+        // which `AudioSession::unsupported` puts into words for the user.
+        if crate::demux::is_matroska(path) {
+            return Ok(None);
+        }
         let audio_file = crate::is_audio(path);
         match AacTrack::open(path, stream) {
             Ok(Some(track)) => return Ok(Some(Self::Aac(track))),
