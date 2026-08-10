@@ -1,5 +1,5 @@
-//! Export: the edit list rendered back out as one mp4 — or, picture left
-//! behind, as one WAV or FLAC of the timeline's audio alone.
+//! Export: the edit list rendered back out as one mp4 or one AV1-in-Matroska —
+//! or, picture left behind, as one WAV or FLAC of the timeline's audio alone.
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
 //! is impossible — while audio is copied packet for packet, because there is no
@@ -30,7 +30,7 @@ use flacenc::error::Verify;
 use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
-use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
+use crate::mux::{AudioParams, Av1Params, MkvMuxer, Mp4Muxer, VideoParams};
 use crate::project::{LaneKind, Project};
 use crate::scale::Composer;
 
@@ -44,12 +44,17 @@ const BITS_PER_PIXEL: f64 = 0.1;
 const MIN_BITRATE: u64 = 1_000_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
-/// What an export writes. Three, not more: H.264-in-mp4 is the only *video*
-/// pair with both an encoder and a decoder under this project's no-install
-/// rule, and WAV and FLAC are the only audio formats with a pure-Rust encoder
-/// at all. MP3 has one (`shine-rs`) under LGPL-2.0, which is a licensing
-/// decision this project has not taken; Vorbis, Opus and AAC have none. A
-/// front-end says so rather than hiding the rows.
+/// `rav1e`'s fastest preset. Anything slower is minutes per second of timeline
+/// on a build with no assembly, which is what this one is.
+const AV1_SPEED: u8 = 10;
+
+/// What an export writes. Four, not more: H.264-in-mp4 and AV1-in-Matroska are
+/// the only *video* pairs with both an encoder and a decoder under this
+/// project's no-install rule, and WAV and FLAC are the only audio formats with
+/// a pure-Rust encoder at all. MP3 has one (`shine-rs`) under LGPL-2.0, which is
+/// a licensing decision this project has not taken; Vorbis, Opus and AAC have
+/// none. HEVC and VP9 have no encoder here at all (`hevc`/`vp9` import through
+/// the plugin and stop there). A front-end says so rather than hiding the rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
     /// Picture and sound: video re-encoded, AAC copied. Copied, so it carries
@@ -57,6 +62,12 @@ pub enum Format {
     /// by name here and mixed by the other two formats, which decode.
     #[default]
     Mp4,
+    /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
+    /// this project can write: there is no AAC or Opus encoder here, and an AAC
+    /// track copied in would be one *this engine's own reader* leaves silent
+    /// (`audio::AudioSession::open` refuses Matroska audio). The sound of an AV1
+    /// export is a WAV or FLAC beside it, which a front-end says up front.
+    Av1,
     /// The audio lane alone, 16-bit PCM.
     Wav,
     /// The audio lane alone, losslessly compressed.
@@ -69,15 +80,26 @@ impl Format {
     pub fn ext(self) -> &'static str {
         match self {
             Self::Mp4 => "mp4",
+            Self::Av1 => "mkv",
             Self::Wav => "wav",
             Self::Flac => "flac",
         }
     }
 
     /// Whether this format carries the picture. The bitrate settings are video
-    /// settings and mean nothing to the other two.
+    /// settings and mean nothing to the audio two.
     pub fn has_video(self) -> bool {
-        matches!(self, Self::Mp4)
+        matches!(self, Self::Mp4 | Self::Av1)
+    }
+
+    /// What the format is called where a refusal names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mp4 => "an mp4",
+            Self::Av1 => "an AV1 export",
+            Self::Wav => "a WAV",
+            Self::Flac => "a FLAC",
+        }
     }
 }
 
@@ -184,10 +206,13 @@ pub fn start(
             _ if project.timeline_frames() == 0 => {
                 Err("the timeline is empty: there is nothing to export".into())
             }
-            Format::Mp4 if !has_picture(&project) => Err("the timeline has no picture: \
-                 an mp4 would be black. Export WAV or FLAC, which are the sound itself"
-                .into()),
-            Format::Mp4 => run(&project, &meta, &part, &worker, &settings),
+            format if format.has_video() && !has_picture(&project) => Err(format!(
+                "the timeline has no picture: {} would be black. Export WAV or \
+                 FLAC, which are the sound itself",
+                format.name()
+            )
+            .into()),
+            Format::Mp4 | Format::Av1 => run(&project, &meta, &part, &worker, &settings),
             format => run_audio(&project, &meta, &part, &worker, format),
         };
         let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
@@ -220,22 +245,17 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
     shared.finished.store(true, Ordering::Release);
 }
 
-fn run(
+/// The timeline's one audio lane, copied packet for packet: the mp4 path's
+/// sound, and the reason that path carries only one lane of it.
+///
+/// ponytail: this holds the whole exported AAC track in memory (~3 kB per
+/// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
+/// `copy_segments` that yields packets instead of collecting them.
+#[allow(clippy::type_complexity)]
+fn copy_audio(
     project: &Project,
     meta: &VideoMeta,
-    out: &Path,
-    shared: &Shared,
-    settings: &ExportSettings,
-) -> crate::Result<()> {
-    let total = project.timeline_frames();
-    let sources = project.sources();
-    // Audio first: a track has to be declared when the muxer is created, which
-    // happens as soon as the first coded picture arrives.
-    //
-    // ponytail: this holds the whole exported AAC track in memory (~3 kB per
-    // 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
-    // `copy_segments` that yields packets instead of collecting them.
-    //
+) -> crate::Result<Option<(crate::AacTrackParams, Vec<crate::AacPacket>)>> {
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
     // files stays in sync. A source whose AAC parameters disagree with the
@@ -279,7 +299,11 @@ fn run(
         .lane(lane)
         .iter()
         .enumerate()
-        .find(|(idx, _)| project.eq_of(lane, *idx).is_some_and(|eq| !eq.is_identity()))
+        .find(|(idx, _)| {
+            project
+                .eq_of(lane, *idx)
+                .is_some_and(|eq| !eq.is_identity())
+        })
         .map(|(idx, clip)| (clip.start, idx))
     {
         return Err(format!(
@@ -290,7 +314,28 @@ fn run(
         )
         .into());
     }
-    let audio = AudioSession::copy_multi_streams(&project.audio_sources(), segments)?;
+    AudioSession::copy_multi_streams(&project.audio_sources(), segments)
+}
+
+fn run(
+    project: &Project,
+    meta: &VideoMeta,
+    out: &Path,
+    shared: &Shared,
+    settings: &ExportSettings,
+) -> crate::Result<()> {
+    let total = project.timeline_frames();
+    let sources = project.sources();
+    // Audio first: a track has to be declared when the muxer is created, which
+    // happens as soon as the first coded picture arrives. None of it for AV1 --
+    // that one is picture only, for the reason [`Format::Av1`] states -- and no
+    // refusal of it either: a timeline with sound is exported as the video it
+    // also is, and the front-end says the sound is not in the file *before* the
+    // export starts rather than failing it here.
+    let audio = match settings.format {
+        Format::Av1 => None,
+        _ => copy_audio(project, meta)?,
+    };
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
@@ -366,8 +411,16 @@ fn run(
             // Grade first, place second: the grade is the clip's own pixels
             // and the bars around them are not the clip (see `scale::Composer`).
             let (y, u, v, width, height) = canvas.place(y, u, v, width, height);
-            if let Some(au) = encoder.encode(y, u, v, width, height)? {
-                write_video(&mut muxer, out, meta, audio_params.as_ref(), au)?;
+            if let Some((au, key)) = encoder.encode(y, u, v, width, height)? {
+                write_video(
+                    &mut muxer,
+                    out,
+                    meta,
+                    settings,
+                    audio_params.as_ref(),
+                    au,
+                    key,
+                )?;
             }
             done += 1;
             shared
@@ -375,21 +428,33 @@ fn run(
                 .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
         }
     }
-    while let Some(au) = encoder.drain()? {
-        write_video(&mut muxer, out, meta, audio_params.as_ref(), au)?;
+    while let Some((au, key)) = encoder.drain()? {
+        write_video(
+            &mut muxer,
+            out,
+            meta,
+            settings,
+            audio_params.as_ref(),
+            au,
+            key,
+        )?;
     }
     // Progress reads 100% from here on, but nothing is published yet: draining,
     // the audio pass and `finish` are all still cancellable.
     cancelled(shared)?;
 
-    let Some(mut muxer) = muxer else {
+    let Some(muxer) = muxer else {
         return Err("export produced no coded pictures".into());
     };
-    if let Some((_, packets)) = audio {
-        for packet in packets {
-            muxer.write_audio_packet(&packet.bytes)?;
+    let muxer = match (muxer, audio) {
+        (Muxer::Mp4(mut mp4), Some((_, packets))) => {
+            for packet in packets {
+                mp4.write_audio_packet(&packet.bytes)?;
+            }
+            Muxer::Mp4(mp4)
         }
-    }
+        (muxer, _) => muxer,
+    };
     cancelled(shared)?;
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
@@ -471,7 +536,7 @@ fn run_audio(
     match format {
         Format::Wav => write_wav(out, &samples, &audio)?,
         Format::Flac => write_flac(out, &samples, &audio)?,
-        Format::Mp4 => unreachable!("the mp4 path is `run`"),
+        Format::Mp4 | Format::Av1 => unreachable!("the picture formats are `run`"),
     }
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
@@ -571,26 +636,72 @@ fn cancelled(shared: &Shared) -> crate::Result<()> {
     Ok(())
 }
 
+/// The two containers an export writes, so the picture loop above is one loop:
+/// H.264 goes into mp4, AV1 into Matroska, and nothing else is offered.
+enum Muxer {
+    Mp4(Mp4Muxer),
+    Mkv(MkvMuxer),
+}
+
+impl Muxer {
+    fn finish(self) -> crate::Result<()> {
+        match self {
+            Self::Mp4(mp4) => mp4.finish(),
+            Self::Mkv(mkv) => mkv.finish(),
+        }
+    }
+}
+
 /// Writes one access unit, creating the file on the first one -- the parameter
-/// sets for `avcC` only exist once the encoder has coded something. Units with
-/// no coded slice are skipped: a software encoder may hand back an empty buffer
-/// while it buffers, and the muxer rejects a sample that would carry no picture.
+/// sets for `avcC` (and the sequence header for `CodecPrivate`) only exist once
+/// the encoder has coded something. Units with no coded slice are skipped: a
+/// software encoder may hand back an empty buffer while it buffers, and the
+/// muxer rejects a sample that would carry no picture.
 fn write_video(
-    muxer: &mut Option<Mp4Muxer>,
+    muxer: &mut Option<Muxer>,
     out: &Path,
     meta: &VideoMeta,
+    settings: &ExportSettings,
     audio: Option<&AudioParams>,
     au: &[u8],
+    key: bool,
 ) -> crate::Result<()> {
+    if settings.format == Format::Av1 {
+        let muxer = match muxer {
+            Some(Muxer::Mkv(mkv)) => mkv,
+            Some(Muxer::Mp4(_)) => unreachable!("the format picks the muxer once"),
+            none => {
+                // Every AV1 stream opens on a keyframe, and a keyframe carries
+                // the sequence header the track has to declare: an encoder that
+                // handed back neither has produced nothing a decoder can start.
+                let config = crate::mux::av1_sequence_header(au)
+                    .ok_or("the first coded picture carries no AV1 sequence header")?;
+                let Muxer::Mkv(mkv) = none.insert(Muxer::Mkv(MkvMuxer::create(
+                    out,
+                    &Av1Params {
+                        width: meta.width,
+                        height: meta.height,
+                        frame_rate: meta.frame_rate,
+                        config,
+                    },
+                )?)) else {
+                    unreachable!("just inserted a Matroska muxer")
+                };
+                mkv
+            }
+        };
+        return muxer.write_frame(au, key);
+    }
     if !crate::mux::has_coded_slice(au) {
         return Ok(());
     }
     let muxer = match muxer {
-        Some(muxer) => muxer,
+        Some(Muxer::Mp4(mp4)) => mp4,
+        Some(Muxer::Mkv(_)) => unreachable!("the format picks the muxer once"),
         none => {
             let (sps, pps) = crate::mux::parameter_sets(au)
                 .ok_or("the first coded picture carries no SPS/PPS")?;
-            none.insert(Mp4Muxer::create(
+            let Muxer::Mp4(mp4) = none.insert(Muxer::Mp4(Mp4Muxer::create(
                 out,
                 &VideoParams {
                     width: meta.width,
@@ -600,7 +711,10 @@ fn write_video(
                     pps,
                 },
                 audio,
-            )?)
+            )?)) else {
+                unreachable!("just inserted an mp4 muxer")
+            };
+            mp4
         }
     };
     muxer.write_video_au(au)
@@ -616,7 +730,10 @@ fn forced(var: &str) -> bool {
 }
 
 /// Hardware where it is available, software everywhere else -- chosen once for
-/// the whole export, so the stream never changes encoder mid-file.
+/// the whole export, so the stream never changes encoder mid-file. Both codecs
+/// have both seats: an AV1 export runs on the plugin's VA-API encoder where the
+/// GPU has one and on `rav1e` where it has not, which is the same pair H.264 has
+/// had and the same silent fallback.
 enum Enc {
     Hw(HwEncoder),
     Sw {
@@ -626,10 +743,26 @@ enum Enc {
         au: Vec<u8>,
         flushed: bool,
     },
+    /// AV1 on the GPU, through the same plugin the H.264 seat uses.
+    Av1Hw(HwEncoder),
+    Av1Sw {
+        context: rav1e::Context<u8>,
+        /// Temporal units the encoder has finished but the caller has not
+        /// collected: `rav1e` reorders and may hand back several at once, while
+        /// this interface is one picture in, one unit out (the plugin's own
+        /// `ready` queue exists for the same reason).
+        ready: std::collections::VecDeque<(Vec<u8>, bool)>,
+        /// The unit currently lent out, for the same reason `Sw` owns one.
+        au: Vec<u8>,
+        flushed: bool,
+    },
 }
 
 impl Enc {
     fn open(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
+        if settings.format == Format::Av1 {
+            return Self::open_av1(meta, settings);
+        }
         // A caller's number goes through the same clamp as the computed one: a
         // zero bitrate switches the software encoder's lookahead on, which would
         // break the one-picture-per-call contract `encode` documents below.
@@ -667,7 +800,75 @@ impl Enc {
         })
     }
 
-    /// One picture in, at most one access unit out.
+    /// The AV1 pair. The hardware seat is the plugin's, opened by a symbol of
+    /// its own (`vh_enc_av1_open`) so a plugin built before AV1 encode existed
+    /// simply has none and this falls through -- the same "no" a GPU without an
+    /// AV1 encode entrypoint gives, and the same silent fallback either way.
+    ///
+    /// It is **opt-in**, which is the one place this pair does not mirror the
+    /// H.264 one: the vendored cros-codecs AV1 encoder hung the GPU on this
+    /// project's own radeonsi box -- `engine_hw: operation failed`, then an
+    /// amdgpu hard recovery and a lost context, measured 2026-08-10 exporting
+    /// the 720p fixture. A software encoder that takes half a minute is a worse
+    /// export than a hardware one; a driver reset is not an export at all. So
+    /// the plugin's AV1 seat is wired, kept and only entered when `VE_HW_AV1=1`
+    /// asks for it by name.
+    ///
+    /// ponytail: the upgrade path is a driver this was reproduced against (or a
+    /// cros-codecs release that fixes it) plus a probe encode of one frame at
+    /// open, after which this can prefer hardware the way H.264 does.
+    fn open_av1(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
+        let bitrate = settings
+            .bitrate
+            .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE));
+        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
+        // Two seconds between keyframes, as the H.264 seat does: a seek may only
+        // land on one, and this is what a cluster of the Matroska file is.
+        let gop = (meta.frame_rate * 2.0).round().max(1.0) as u64;
+        if forced("VE_HW_AV1")
+            && !settings.force_sw
+            && !forced("VE_SW_ENC")
+            && let Some(hw) =
+                HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
+        {
+            eprintln!("export encoder: hardware AV1 (VA-API plugin)");
+            return Ok(Self::Av1Hw(hw));
+        }
+        eprintln!("export encoder: software AV1 (rav1e)");
+        let mut cfg = rav1e::EncoderConfig::default();
+        cfg.width = meta.width as usize;
+        cfg.height = meta.height as usize;
+        cfg.bit_depth = 8;
+        cfg.chroma_sampling = rav1e::prelude::ChromaSampling::Cs420;
+        // Seconds per frame, which is what `frame_timing` already has as an
+        // exact rational -- 1001/24000 rather than a rounded 23.976.
+        cfg.time_base = rav1e::prelude::Rational::new(u64::from(fps_den), u64::from(fps_num));
+        cfg.min_key_frame_interval = gop;
+        cfg.max_key_frame_interval = gop;
+        cfg.bitrate = bitrate.min(i32::MAX as u64) as i32;
+        // The fastest preset there is, and it is still slow: `rav1e` is built
+        // here without its assembly (no `nasm` in this project's build), so an
+        // export runs at a fraction of realtime. The export worker reports
+        // progress the whole way, which is what makes that bearable rather than
+        // hidden.
+        cfg.speed_settings = rav1e::prelude::SpeedSettings::from_preset(AV1_SPEED);
+        let config = rav1e::Config::new()
+            .with_encoder_config(cfg)
+            .with_threads(std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let context = config
+            .new_context::<u8>()
+            .map_err(|e| format!("software AV1 encoder: {e}"))?;
+        Ok(Self::Av1Sw {
+            context,
+            ready: std::collections::VecDeque::new(),
+            au: Vec::new(),
+            flushed: false,
+        })
+    }
+
+    /// One picture in, at most one access unit out, and whether that unit is one
+    /// a decoder may be started from -- which only the Matroska muxer asks, the
+    /// mp4 one reading its own sync flag off the IDR slice.
     ///
     /// ponytail: `rusty_h264` buffers a whole GOP and returns it in one buffer
     /// when its lookahead is active, which would make this "one access unit"
@@ -681,9 +882,35 @@ impl Enc {
         v: &[u8],
         width: u32,
         height: u32,
-    ) -> crate::Result<Option<&[u8]>> {
+    ) -> crate::Result<Option<(&[u8], bool)>> {
         match self {
-            Self::Hw(hw) => hw.encode(y, u, v, width, height, false),
+            Self::Av1Hw(hw) => {
+                let au = hw.encode(y, u, v, width, height, false)?;
+                // What the *bitstream* says, not what was asked for: an AV1
+                // keyframe carries the sequence header, which is the same mark
+                // `demux` reads a sync point off. A driver that emitted one
+                // unasked is then still a seek target, and one that skipped a
+                // requested keyframe cannot be mistaken for a decoder's start.
+                Ok(au.map(|au| (au, crate::mux::av1_sequence_header(au).is_some())))
+            }
+            Self::Av1Sw {
+                context, ready, au, ..
+            } => {
+                let mut frame = context.new_frame();
+                let (w, h) = (width as usize, height as usize);
+                let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                frame.planes[0].copy_from_raw_u8(&y[..w * h], w, 1);
+                frame.planes[1].copy_from_raw_u8(&u[..cw * ch], cw, 1);
+                frame.planes[2].copy_from_raw_u8(&v[..cw * ch], cw, 1);
+                if let Err(e) = context.send_frame(frame) {
+                    return Err(format!("software AV1 encode: {e}").into());
+                }
+                collect_av1(context, ready)?;
+                Ok(pop_av1(ready, au))
+            }
+            Self::Hw(hw) => Ok(hw
+                .encode(y, u, v, width, height, false)?
+                .map(|au| (au, false))),
             Self::Sw { encoder, au, .. } => {
                 let frame = YuvFrame {
                     width: width as usize,
@@ -695,15 +922,32 @@ impl Enc {
                 *au = encoder
                     .try_encode(&frame)
                     .map_err(|e| format!("software encode: {e}"))?;
-                Ok(Some(&au[..]).filter(|au| !au.is_empty()))
+                Ok(Some((&au[..], false)).filter(|(au, _)| !au.is_empty()))
             }
         }
     }
 
     /// End of stream; call until it returns `None`.
-    fn drain(&mut self) -> crate::Result<Option<&[u8]>> {
+    fn drain(&mut self) -> crate::Result<Option<(&[u8], bool)>> {
         match self {
-            Self::Hw(hw) => hw.drain(),
+            Self::Av1Hw(hw) => {
+                let au = hw.drain()?;
+                Ok(au.map(|au| (au, crate::mux::av1_sequence_header(au).is_some())))
+            }
+            Self::Av1Sw {
+                context,
+                ready,
+                au,
+                flushed,
+            } => {
+                if !*flushed {
+                    *flushed = true;
+                    context.flush();
+                    collect_av1(context, ready)?;
+                }
+                Ok(pop_av1(ready, au))
+            }
+            Self::Hw(hw) => Ok(hw.drain()?.map(|au| (au, false))),
             Self::Sw {
                 encoder,
                 au,
@@ -716,10 +960,41 @@ impl Enc {
                 *au = encoder
                     .try_flush()
                     .map_err(|e| format!("software encoder flush: {e}"))?;
-                Ok(Some(&au[..]).filter(|au| !au.is_empty()))
+                Ok(Some((&au[..], false)).filter(|(au, _)| !au.is_empty()))
             }
         }
     }
+}
+
+/// Every temporal unit `rav1e` has finished, moved into the queue in display
+/// order. `NeedMoreData` (send another picture) and `LimitReached` (the flush is
+/// through) are the two ways it says there is nothing more; `Encoded` means a
+/// picture was coded but not yet packetised, which is a *keep asking* -- taking
+/// it for an end leaves the tail of the export inside the encoder.
+fn collect_av1(
+    context: &mut rav1e::Context<u8>,
+    ready: &mut std::collections::VecDeque<(Vec<u8>, bool)>,
+) -> crate::Result<()> {
+    use rav1e::prelude::{EncoderStatus, FrameType};
+    loop {
+        match context.receive_packet() {
+            Ok(packet) => ready.push_back((packet.data, packet.frame_type == FrameType::KEY)),
+            Err(EncoderStatus::Encoded) => {}
+            Err(EncoderStatus::NeedMoreData | EncoderStatus::LimitReached) => return Ok(()),
+            Err(e) => return Err(format!("software AV1 encode: {e}").into()),
+        }
+    }
+}
+
+/// The oldest finished unit, moved into the buffer that is lent out -- the same
+/// "valid until the next call" contract the plugin's slice has.
+fn pop_av1<'a>(
+    ready: &mut std::collections::VecDeque<(Vec<u8>, bool)>,
+    au: &'a mut Vec<u8>,
+) -> Option<(&'a [u8], bool)> {
+    let (unit, key) = ready.pop_front()?;
+    *au = unit;
+    Some((&au[..], key))
 }
 
 /// I420 straight out of the decoder: the export never converts to BGRA and back,

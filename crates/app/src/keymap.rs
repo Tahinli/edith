@@ -287,8 +287,8 @@ pub const FIXED: [Fixed; 12] = [
         category: Category::File,
     },
     Fixed {
-        chord: "m / w / f",
-        label: "Pick the export format: MP4, WAV or FLAC",
+        chord: "m / a / w / f",
+        label: "Pick the export format: MP4, AV1, WAV or FLAC",
         category: Category::File,
     },
     Fixed {

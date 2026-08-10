@@ -1636,6 +1636,7 @@ dependencies = [
  "mp4",
  "oxideav-ac3",
  "oxideav-core",
+ "rav1e",
  "rusty_h264",
  "symphonia",
  "symphonia-codec-aac",
