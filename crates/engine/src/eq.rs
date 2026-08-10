@@ -67,6 +67,18 @@ impl EqParams {
     pub fn is_identity(&self) -> bool {
         self.bands.iter().all(|b| b.gain_db.abs() < 1e-4)
     }
+
+    /// How much the cascade moves a sine at `freq_hz`, in dB — the curve a UI
+    /// draws. Read off the *same* [`Coeffs`] [`EqState`] filters with and
+    /// evaluated at `z = e^{jw}`, so a drawn curve cannot drift from what is
+    /// heard: there is one set of coefficients and one formula for both.
+    /// Cascaded sections multiply, so their dB add.
+    pub fn response_db(&self, freq_hz: f32, sample_rate: u32) -> f32 {
+        self.bands
+            .iter()
+            .map(|b| Coeffs::new(b, sample_rate).magnitude_db(freq_hz, sample_rate))
+            .sum()
+    }
 }
 
 /// Normalized biquad coefficients (a0 divided out).
@@ -127,6 +139,25 @@ impl Coeffs {
             a1: (a1 / a0) as f32,
             a2: (a2 / a0) as f32,
         }
+    }
+
+    /// |H(e^{jw})| in dB for this section at `freq_hz`. Past Nyquist there is
+    /// no answer to give, so the frequency clamps there like `f0` does.
+    fn magnitude_db(&self, freq_hz: f32, sample_rate: u32) -> f32 {
+        let fs = f64::from(sample_rate.max(1));
+        let w = 2.0 * PI * f64::from(freq_hz).clamp(0.0, fs * 0.5) / fs;
+        let (sin1, cos1) = w.sin_cos();
+        let (sin2, cos2) = (2.0 * w).sin_cos();
+        let (b0, b1, b2) = (f64::from(self.b0), f64::from(self.b1), f64::from(self.b2));
+        let (a1, a2) = (f64::from(self.a1), f64::from(self.a2));
+        let num = ((b0 + b1 * cos1 + b2 * cos2).powi(2) + (b1 * sin1 + b2 * sin2).powi(2)).sqrt();
+        // A stable section never puts the denominator at zero, but a hand-
+        // written file could; the floor keeps the curve finite rather than
+        // painting an infinity.
+        let den = ((1.0 + a1 * cos1 + a2 * cos2).powi(2) + (a1 * sin1 + a2 * sin2).powi(2))
+            .sqrt()
+            .max(1e-12);
+        (20.0 * (num / den).log10()) as f32
     }
 }
 
@@ -287,6 +318,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The curve a card draws is the filter a listener hears: a sine measured
+    /// through `process` lands where `response_db` said it would, at the band
+    /// centres and between them, boosted and cut.
+    #[test]
+    fn the_drawn_response_is_the_gain_the_samples_actually_get() {
+        let mut params = EqParams::default_layout();
+        params.bands[0].gain_db = -8.0; // 80 Hz low shelf
+        params.bands[2].gain_db = 10.0; // 1 kHz peak
+        params.bands[2].q = 1.4;
+        params.bands[4].gain_db = 5.0; // 12 kHz high shelf
+
+        // Centres, the slopes between them, and the two ends of the axis the
+        // card draws -- a curve is wrong in the gaps or nowhere.
+        for freq in [
+            40.0, 80.0, 250.0, 600.0, 1000.0, 2000.0, 4000.0, 12000.0, 16000.0,
+        ] {
+            let input = sine(freq, 48_000, 1);
+            let mut out = input.clone();
+            EqState::new(&params, FS, 1).process(&mut out);
+            let measured = db(rms(&out), rms(&input));
+            let drawn = params.response_db(freq, FS);
+            assert!(
+                (measured - drawn).abs() < 0.5,
+                "{freq} Hz: curve says {drawn:+.2} dB, samples measured {measured:+.2} dB"
+            );
+        }
+
+        // Flat draws flat, and nothing is drawn past Nyquist.
+        let flat = EqParams::default_layout();
+        assert!(flat.response_db(1000.0, FS).abs() < 1e-4);
+        assert!(params.response_db(FS as f32, FS).is_finite());
     }
 
     #[test]
