@@ -18,6 +18,7 @@ struct Plugin {
     write: unsafe extern "C" fn(*mut c_void, *const f32, usize) -> isize,
     position: unsafe extern "C" fn(*mut c_void) -> i64,
     set_active: unsafe extern "C" fn(*mut c_void, u32) -> i32,
+    set_volume: unsafe extern "C" fn(*mut c_void, f32) -> i32,
     flush: unsafe extern "C" fn(*mut c_void) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
@@ -56,7 +57,11 @@ fn load() -> Option<Plugin> {
                     position: *lib.get(b"ao_position\0").ok()?,
                     set_active: *lib.get(b"ao_set_active\0").ok()?,
                     // Required, so a plugin predating seek is rejected whole
-                    // and we play muted rather than half-working.
+                    // and we play muted rather than half-working. Volume is
+                    // required on the same terms: the two ship from one build,
+                    // and a mute button that does nothing is worse than a run
+                    // with no sound at all, which at least says so.
+                    set_volume: *lib.get(b"ao_set_volume\0").ok()?,
                     flush: *lib.get(b"ao_flush\0").ok()?,
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
@@ -121,6 +126,15 @@ impl AoSession {
     pub fn set_active(&self, active: bool) -> bool {
         // SAFETY: `handle` came from `ao_open` and is still open.
         unsafe { (self.plugin.set_active)(self.handle, active as u32) == 0 }
+    }
+
+    /// Sets the output gain, 0.0 (silent) to 1.0 (as written): the editor's
+    /// volume and its mute are the same knob by the time they get here. The
+    /// clock is unaffected -- a silenced stream still plays, so the picture
+    /// keeps running against it. `false` for a gain outside the range.
+    pub fn set_volume(&self, gain: f32) -> bool {
+        // SAFETY: `handle` came from `ao_open` and is still open.
+        unsafe { (self.plugin.set_volume)(self.handle, gain) == 0 }
     }
 
     /// Drops everything still queued, so the next samples written play right
