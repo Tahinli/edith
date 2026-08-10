@@ -11,7 +11,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
-use crate::project::{Clip, Lane, Project, Span};
+use crate::project::{Clip, Lane, Project, Source, Span};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -128,7 +128,9 @@ impl PlaybackSession {
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
         let (meta, stream) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
-        let (audio, audio_disabled) = open_audio(&path);
+        // A file is opened on its first audio stream, like `Project::single`
+        // names it: nothing has picked one yet.
+        let (audio, audio_disabled) = open_audio(&path, 0);
         let source = match audio {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
@@ -181,16 +183,16 @@ impl PlaybackSession {
         // locals drop in reverse declaration order -- a bare worker would join
         // its decode thread while the receiver next to it was still holding
         // that thread parked in `send`, which is a hang (see [`FrameStream`]).
-        let (meta, stream) = DecodeSession::open_worker(&first, 0, u32::MAX)
-            .map_err(|e| format!("source {}: {e}", first.display()))?;
-        let first_audio = AudioSession::probe(&first)?;
+        let (meta, stream) = DecodeSession::open_worker(&first.path, 0, u32::MAX)
+            .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        let first_audio = AudioSession::probe(&first.path, first.audio_stream)?;
 
         let mut counts = vec![meta.frame_count];
         for source in &doc.sources[1..] {
-            let (other, _) =
-                Demuxer::open(source).map_err(|e| format!("source {}: {e}", source.display()))?;
+            let (other, _) = Demuxer::open(&source.path)
+                .map_err(|e| format!("source {}: {e}", source.path.display()))?;
             matches_timeline(source, &other, &meta, &first_audio)
-                .map_err(|e| format!("source {}: {e}", source.display()))?;
+                .map_err(|e| format!("source {}: {e}", source.path.display()))?;
             counts.push(other.frame_count);
         }
         for (i, clip) in doc.video.iter().chain(&doc.audio).enumerate() {
@@ -198,7 +200,7 @@ impl PlaybackSession {
                 return Err(format!(
                     "clip {i} ends at frame {} but {} has {} frames",
                     clip.out_frame,
-                    doc.sources[clip.source].display(),
+                    doc.sources[clip.source].path.display(),
                     counts[clip.source]
                 )
                 .into());
@@ -213,7 +215,7 @@ impl PlaybackSession {
         // only a session's `drop` retires it, so a refusal above this line would
         // leave a PipeWire stream and a thread behind for a project that never
         // opened. Nothing before it needs the device.
-        let (audio, audio_disabled) = open_audio(&first);
+        let (audio, audio_disabled) = open_audio(&first.path, first.audio_stream);
         let mut session = Self {
             meta,
             frames: stream.frames,
@@ -252,7 +254,7 @@ impl PlaybackSession {
 
     /// The files this timeline plays from, index 0 first -- a caller needs it
     /// to name an export or a window after the media rather than the project.
-    pub fn sources(&self) -> &[PathBuf] {
+    pub fn sources(&self) -> &[Source] {
         self.project.sources()
     }
 
@@ -344,7 +346,7 @@ impl PlaybackSession {
     fn start_span(&mut self, span: Span) {
         let opened = match span.from {
             Some((source, in_frame)) => DecodeSession::open_worker(
-                &self.project.sources()[source],
+                &self.project.sources()[source].path,
                 in_frame,
                 in_frame + span.len,
             )
@@ -455,6 +457,56 @@ impl PlaybackSession {
         self.edit(|p| p.paste(at, clip))
     }
 
+    /// Places `frames` of `path` played on its audio `stream` at
+    /// `timeline_secs`, the way [`paste_at`](Self::paste_at) places a copy --
+    /// the door a library row goes through, and the only way a stream other
+    /// than the one an import brought in reaches the timeline. The `(file,
+    /// stream)` pair becomes a source if it is not one already.
+    ///
+    /// Refused, changing nothing, unless that stream can join *this* timeline:
+    /// same audio parameters as the first source, in the same words
+    /// [`import`](Self::import) refuses a file with. One output device and one
+    /// copied AAC track mean one set of audio parameters for the whole
+    /// timeline, so a 22 kHz mono track cannot join a 44.1 kHz stereo one --
+    /// there is no resampler here, and no AAC encoder to write the join with.
+    /// A front-end greys such a row out; this is the backstop that keeps a
+    /// stale one from making the whole timeline silent.
+    pub fn place_stream_at(
+        &mut self,
+        timeline_secs: f64,
+        path: &Path,
+        stream: usize,
+        frames: u32,
+    ) -> crate::Result<bool> {
+        let wanted = Source::new(path, stream);
+        // Another stream of a file whose picture is *already* on the timeline:
+        // that is what a library row is, and it is why nothing here has to
+        // check dimensions or frame rate -- the file passed that at import.
+        if !self.project.sources().iter().any(|s| s.path == wanted.path) {
+            return Err(format!("{} is not on this timeline", path.display()).into());
+        }
+        let first = self.first_audio()?;
+        audio_matches(&wanted, &first)?;
+        let source = self.project.import(path, stream);
+        Ok(self.paste_at(
+            timeline_secs,
+            Clip {
+                start: 0,
+                in_frame: 0,
+                out_frame: frames.max(1),
+                source,
+                link: None,
+            },
+        ))
+    }
+
+    /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
+    /// other source is held to it.
+    fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
+        let first = &self.project.sources()[0];
+        AudioSession::probe(&first.path, first.audio_stream)
+    }
+
     /// Removes the video clip at `idx` and everything under it, closing the gap
     /// on every lane. Unlike a split this *does* move every following frame, so
     /// the session reseeks to wherever the playhead now points.
@@ -479,11 +531,14 @@ impl PlaybackSession {
     /// a refusal.
     pub fn import(&mut self, path: &Path) -> crate::Result<()> {
         let (meta, _) = Demuxer::open(path)?;
-        let first = AudioSession::probe(&self.project.sources()[0])?;
-        matches_timeline(path, &meta, &self.meta, &first)?;
+        let first = self.first_audio()?;
+        // Stream 0: an import brings a file in on its first audio track, and
+        // [`place_stream_at`](Self::place_stream_at) is how any other one of
+        // its streams reaches the timeline afterwards.
+        matches_timeline(&Source::new(path, 0), &meta, &self.meta, &first)?;
 
         let old_end = self.timeline_duration();
-        let source = self.project.import(path);
+        let source = self.project.import(path, 0);
         // Refused only for an unknown index, and this one just came from `import`.
         self.project.append_clip(source, meta.frame_count);
         // Reseek like any other edit, even though nothing before the playhead
@@ -619,7 +674,10 @@ impl PlaybackSession {
             // ear never hears it -- and a join between two *files* is just
             // another segment, because every segment names its own source.
             let segs = self.project.segments_from(target, fps);
-            audio_running = match AudioSession::open_multi_segments(self.project.sources(), &segs) {
+            // Each source on the stream it was placed with: what plays is what
+            // the library row said, and what an export copies (`export::run`).
+            let sources = self.project.audio_sources();
+            audio_running = match AudioSession::open_multi_streams(&sources, &segs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };
@@ -726,7 +784,7 @@ impl Drop for PlaybackSession {
 /// [`PlaybackSession::open_project`] share them so a file refused at import is
 /// refused in the same words at load.
 fn matches_timeline(
-    path: &Path,
+    source: &Source,
     meta: &VideoMeta,
     timeline: &VideoMeta,
     first: &Option<crate::AudioProbe>,
@@ -746,9 +804,16 @@ fn matches_timeline(
         )
         .into());
     }
+    audio_matches(source, first)
+}
+
+/// The audio half of [`matches_timeline`], which a stream placed on its own
+/// ([`PlaybackSession::place_stream_at`]) has to pass while the picture it
+/// comes with is already on the timeline.
+fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
     // Whole-probe equality: rate, layout and the esds fields, which the audio
     // worker holds every source to anyway. Both silent is a match.
-    let probe = AudioSession::probe(path)?;
+    let probe = AudioSession::probe(&source.path, source.audio_stream)?;
     if probe != *first {
         return Err(match (probe, first) {
             (None, _) => "the file is silent, the timeline has audio".to_string(),
@@ -771,23 +836,25 @@ fn matches_timeline(
 /// a surprise worth showing (see
 /// [`audio_disabled_reason`](PlaybackSession::audio_disabled_reason)), where a
 /// file with no audio at all and a machine with no output device are not.
-fn open_audio(path: &Path) -> (Option<Audio>, Option<String>) {
-    let (meta, rx) = match AudioSession::open(path) {
-        Ok(Some(opened)) => opened,
-        // No AAC track: silent by nature, or sound in a codec we do not have --
-        // and only the second of those is worth a word.
-        Ok(None) => {
-            let reason = AudioSession::unsupported(path).ok().flatten();
-            if let Some(reason) = &reason {
-                eprintln!("audio disabled: {reason}");
+fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
+    let sources = [(path.to_path_buf(), stream)];
+    let (meta, rx) =
+        match AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)]) {
+            Ok(Some(opened)) => opened,
+            // No AAC track: silent by nature, or sound in a codec we do not
+            // have -- and only the second of those is worth a word.
+            Ok(None) => {
+                let reason = AudioSession::unsupported(path).ok().flatten();
+                if let Some(reason) = &reason {
+                    eprintln!("audio disabled: {reason}");
+                }
+                return (None, reason);
             }
-            return (None, reason);
-        }
-        Err(e) => {
-            eprintln!("audio disabled: {e}");
-            return (None, Some(e.to_string()));
-        }
-    };
+            Err(e) => {
+                eprintln!("audio disabled: {e}");
+                return (None, Some(e.to_string()));
+            }
+        };
     let Some(ao) = AoSession::open(meta.sample_rate, u32::from(meta.channels)) else {
         return (None, None); // no device: the machine's business, not the file's
     };

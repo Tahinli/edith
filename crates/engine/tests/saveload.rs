@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use engine::PlaybackSession;
+use engine::project::Source;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -32,6 +33,73 @@ fn copy_in(dir: &Path, name: &str) -> PathBuf {
     to
 }
 
+/// The whole of what a picked audio stream has to survive: a file's second
+/// language goes on the timeline beside its first, the project says so on
+/// disk, and reopening it plays the same two streams. This is the file-level
+/// half of what a library row does -- `place_stream_at` is the one door that
+/// row goes through.
+#[test]
+fn a_picked_audio_stream_lands_saves_and_comes_back() {
+    let dir = scratch("streams");
+    let media = copy_in(&dir, "test_multilang.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0); // silent like the rest of the suites
+    let frames = session.clip_at(0).expect("one clip").out_frame;
+    let end = session.timeline_duration();
+
+    // Stream 1 is the French track, same rate and layout as stream 0, so it
+    // can join this timeline; it lands as a second source of the same file.
+    assert!(
+        session
+            .place_stream_at(end, &media, 1, frames)
+            .expect("stream 1 matches the timeline")
+    );
+    assert_eq!(
+        session
+            .sources()
+            .iter()
+            .map(|s| s.audio_stream)
+            .collect::<Vec<_>>(),
+        [0, 1],
+        "the same file twice, on two streams"
+    );
+    assert_eq!(session.timeline_duration(), end * 2.0);
+
+    let path = dir.join("langs.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains("source 0 test_multilang.mp4")
+            && text.contains("source 1 test_multilang.mp4"),
+        "the streams did not reach the file:\n{text}"
+    );
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen the project");
+    assert_eq!(loaded.sources(), session.sources());
+    assert_eq!(loaded.timeline_duration(), session.timeline_duration());
+
+    // And the refusals, in the engine's own words: a stream that cannot share
+    // one output device with the timeline, and a file that is not on it.
+    let other = copy_in(&dir, "test_multiaudio.mp4");
+    let mut session = PlaybackSession::open(&other).expect("open the fixture");
+    session.set_gain(0.0);
+    let frames = session.clip_at(0).expect("one clip").out_frame;
+    let err = session
+        .place_stream_at(0.0, &other, 1, frames)
+        .expect_err("22.05 kHz mono cannot join a 44.1 kHz stereo timeline")
+        .to_string();
+    assert!(err.contains("22050"), "unhelpful refusal: {err}");
+    assert!(
+        session
+            .place_stream_at(0.0, &media, 1, frames)
+            .expect_err("a file that is not a source")
+            .to_string()
+            .contains("not on this timeline")
+    );
+    assert_eq!(session.sources().len(), 1, "a refusal added a source");
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
 /// Two files, four clips, one of them deleted, playhead at 3 s -- a timeline
 /// with something to lose in every field.
 fn edited(dir: &Path) -> PlaybackSession {
@@ -48,7 +116,7 @@ fn edited(dir: &Path) -> PlaybackSession {
 }
 
 /// What has to survive a round trip, all of it public API.
-fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<PathBuf>, f64) {
+fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<Source>, f64) {
     (
         session.clip_spans_by_source(),
         session.sources().to_vec(),
@@ -58,9 +126,9 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<PathBuf>, f6
 
 /// The version-1 promise: a file written before the lanes existed still opens,
 /// as one grouped video+audio pair per clip laid end to end, and saving it
-/// again writes version 2 -- which reopens as the same timeline.
+/// again writes version 3 -- which reopens as the same timeline.
 #[test]
-fn a_version_1_project_loads_fully_grouped_and_saves_as_version_2() {
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_3() {
     let dir = scratch("v1");
     copy_in(&dir, "test_av.mp4");
     let path = dir.join("old.edith");
@@ -88,11 +156,11 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_2() {
         "playhead kept"
     );
 
-    // Saved again it is v2, and v2 round-trips to the same timeline.
+    // Saved again it is v3, and v3 round-trips to the same timeline.
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 2\n"), "{text}");
+    assert!(text.starts_with("edith 3\n"), "{text}");
     assert_eq!(
         text.lines().filter(|l| l.starts_with("video ")).count(),
         2,
@@ -109,6 +177,25 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_2() {
     let third = dir.join("third.edith");
     again.save_project(&third).expect("save");
     assert_eq!(std::fs::read(&third).expect("read"), text.as_bytes());
+
+    // And the same promise one version on: a v2 file names no audio stream and
+    // opens on stream 0, which is the only one that dialect could play.
+    let v2 = dir.join("v2.edith");
+    std::fs::write(
+        &v2,
+        "edith 2\nplayhead 0\nsource test_av.mp4\nvideo 0 0 30 0 0\naudio 0 0 30 0 0\n",
+    )
+    .expect("write a v2 file");
+    let loaded = PlaybackSession::open_project(&v2).expect("a v2 file still opens");
+    assert_eq!(loaded.sources().len(), 1);
+    assert_eq!(loaded.sources()[0].audio_stream, 0);
+    loaded.save_project(&v2).expect("save");
+    assert!(
+        std::fs::read_to_string(&v2)
+            .expect("read back")
+            .contains("source 0 test_av.mp4"),
+        "a re-saved v2 project says the stream it always meant"
+    );
 }
 
 #[test]
@@ -160,7 +247,7 @@ fn a_folder_of_media_and_its_project_can_be_moved() {
     let moved = PlaybackSession::open_project(&to.join("edit.edith")).expect("open the copy");
     assert_eq!(moved.timeline_duration(), 6.0);
     assert!(
-        moved.sources().iter().all(|s| s.starts_with(&to)),
+        moved.sources().iter().all(|s| s.path.starts_with(&to)),
         "sources did not follow the folder: {:?}",
         moved.sources()
     );
@@ -321,7 +408,12 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
     let good = "edith 1\nplayhead 0\nsource test_av.mp4\nclip 0 30 0\n";
 
     for (text, want) in [
-        ("edith 3\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 1"),
+        (
+            "edith 4\nsource 0 test_av.mp4\nvideo 0 0 30 0 -\n",
+            "line 1",
+        ),
+        // A v2 source line in a v3 file: the stream field is not optional.
+        ("edith 3\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 2"),
         ("not a project at all\n", "line 1"),
         // Dialects do not mix: lane lines are v2's, `clip` is v1's.
         ("edith 2\nsource test_av.mp4\nclip 0 30 0\n", "line 3"),
