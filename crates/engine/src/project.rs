@@ -68,6 +68,116 @@ use crate::color::ColorParams;
 use crate::eq::EqParams;
 use crate::scale::FitPolicy;
 
+/// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
+/// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
+/// [`Clip`]'s sake -- a clip is `Copy` *and* `Eq`, a float is neither exactly
+/// comparable nor exactly writable, and `.edith` has to read back the very
+/// number that was set. A thousandth is finer than any card can drag and coarser
+/// than any rounding anyone can hear.
+///
+/// The rate alone: a speeded clip is resampled, so its pitch moves with it (the
+/// tape effect). Nothing here preserves pitch and nothing here plays backwards
+/// -- [`Speed::MIN`] is a quarter speed, [`Speed::MAX`] four times.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct Speed(u16);
+
+impl Speed {
+    /// Real time -- what every clip is until something says otherwise, and the
+    /// value every path in this engine short-circuits on.
+    pub const NORMAL: Speed = Speed(1000);
+    pub const MIN: Speed = Speed(250);
+    pub const MAX: Speed = Speed(4000);
+
+    /// Clamped into `[MIN, MAX]`, which is what makes a zero (or a reverse)
+    /// unrepresentable rather than merely refused: nothing downstream divides
+    /// by a speed that could be nothing.
+    pub fn from_permille(permille: u16) -> Self {
+        Speed(permille.clamp(Self::MIN.0, Self::MAX.0))
+    }
+
+    pub fn permille(self) -> u16 {
+        self.0
+    }
+
+    pub fn is_normal(self) -> bool {
+        self == Self::NORMAL
+    }
+
+    /// As a multiplier, for the sound worker and for a label.
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.0) / 1000.
+    }
+
+    /// How many *timeline* frames `source` source frames occupy at this rate --
+    /// the clip's footprint. Rounded to the nearest frame and **never zero**: a
+    /// clip that occupied no frames would be an empty placement, which the lane
+    /// invariant forbids and which nothing could ever click on again.
+    pub fn frames(self, source: u32) -> u32 {
+        let n = (u64::from(source) * 1000 + u64::from(self.0) / 2) / u64::from(self.0);
+        n.clamp(1, u64::from(u32::MAX)) as u32
+    }
+
+    /// The mapping itself: which source frame of a clip the `offset`th timeline
+    /// frame of it plays. Floored, so the first timeline frame is the clip's own
+    /// in-point at every rate.
+    pub fn source_at(self, offset: u32) -> u32 {
+        (u64::from(offset) * u64::from(self.0) / 1000).min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Its inverse, for a decoder's frames on their way back out: which timeline
+    /// frame of the clip the `offset`th *source* frame of it lands on.
+    pub fn timeline_at(self, offset: u32) -> u32 {
+        (u64::from(offset) * 1000 / u64::from(self.0)).min(u64::from(u32::MAX)) as u32
+    }
+
+    /// The longest source range that still *fits* in `frames` timeline frames at
+    /// this rate, and at least one frame. What a trim commits: rounding could
+    /// otherwise hand back a range one frame wider than the room the edge was
+    /// clamped to, and a clip that outgrew its room would overlap its
+    /// neighbour -- the one thing a lane may never do. At real time this is
+    /// `frames` itself, so nothing about an unspeeded trim changes.
+    pub fn fit(self, frames: u32) -> u32 {
+        let mut src = self.source_at(frames).max(1);
+        while src > 1 && self.frames(src) > frames {
+            src -= 1;
+        }
+        src
+    }
+
+    /// Where in the source a cut `offset` timeline frames into a clip of `len`
+    /// source frames falls -- and `None` when this rate cannot address that
+    /// frame at all.
+    ///
+    /// At half speed a clip of ten source frames is twenty timeline frames long
+    /// and every source frame is on screen twice, so a cut between the two
+    /// showings of one frame is not a cut in the *file*: taking it would leave
+    /// two halves whose lengths no longer add up to the clip that was cut --
+    /// a hole in the lane, or an overlap of the next clip. Refused instead, so
+    /// the model stays exact and the front-end can say why. At real time every
+    /// interior frame answers, which is the path a project without speeds is on.
+    pub fn split_at(self, len: u32, offset: u32) -> Option<u32> {
+        let src = self.source_at(offset);
+        (src > 0
+            && src < len
+            && self.frames(src) == offset
+            && self.frames(len - src) == self.frames(len) - offset)
+            .then_some(src)
+    }
+}
+
+impl Default for Speed {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+impl std::fmt::Display for Speed {
+    /// `2.00x` -- what a card prints and what a clip box is marked with.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.2}x", self.as_f64())
+    }
+}
+
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
 /// Never empty.
@@ -103,17 +213,37 @@ pub struct Clip {
     /// it at all. [`FitPolicy::Fit`] is the default -- the whole picture, bars
     /// where the aspect does not agree.
     pub fit: FitPolicy,
+    /// How fast it plays ([`Speed`]). Inline like [`Clip::fit`] and unlike the
+    /// eq and colour indexes: it is two bytes with nothing to share, and a table
+    /// would put a level of indirection between the mapping and the one number
+    /// every frame of it is divided by.
+    ///
+    /// It does **not** move `in_frame`/`out_frame`: those stay the source range
+    /// the clip plays, so a trim and a split still address the file. What it
+    /// changes is how many *timeline* frames that range is spread over
+    /// ([`Clip::frames`]).
+    pub speed: Speed,
 }
 
 impl Clip {
-    /// Frame count; `>= 1` by the never-empty invariant.
+    /// Source frame count; `>= 1` by the never-empty invariant. What the clip
+    /// reads out of its file -- not how long it is on the timeline, which is
+    /// [`Clip::frames`] and differs the moment it is speeded.
     pub fn len(&self) -> u32 {
         self.out_frame - self.in_frame
     }
 
+    /// Timeline frames it occupies: its source range at its own speed, never
+    /// zero (see [`Speed::frames`]). Every placement question -- where it ends,
+    /// what it overlaps, how wide its box is -- is asked of this and not of
+    /// [`Clip::len`].
+    pub fn frames(&self) -> u32 {
+        self.speed.frames(self.len())
+    }
+
     /// One past the last timeline frame it covers.
     pub fn end(&self) -> u32 {
-        self.start + self.len()
+        self.start + self.frames()
     }
 }
 
@@ -235,6 +365,12 @@ pub struct Span {
     /// `(source index, first source frame)`, or `None` for a gap -- which the
     /// engine renders as black frames and as silence.
     pub from: Option<(usize, u32)>,
+    /// The rate the clip this came off plays at ([`Clip::speed`]);
+    /// [`Speed::NORMAL`] for a gap, which has no source to run fast. `len` is
+    /// timeline frames whatever it says -- the speed is how many *source* frames
+    /// those cover ([`Span::source_len`]) and how a decoder's own frame numbers
+    /// come back to the timeline.
+    pub speed: Speed,
 }
 
 impl Span {
@@ -242,6 +378,30 @@ impl Span {
     pub fn end(&self) -> u32 {
         self.start + self.len
     }
+
+    /// How many source frames it reads: what a decoder is asked for and how wide
+    /// an audio window is. `len` at real time, and the one arithmetic both the
+    /// picture and the sound go through, so they cannot disagree about where a
+    /// speeded clip ends.
+    pub fn source_len(&self) -> u32 {
+        match self.from {
+            Some(_) => self.speed.source_at(self.len).max(1),
+            None => self.len,
+        }
+    }
+}
+
+/// What one speeded audio segment asks of the worker: how many source frames to
+/// consume per output frame, and how many seconds of timeline it has to fill.
+/// [`Project::audio_speeds_from`] builds it; `None` there means real time and no
+/// resampling at all.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Stretch {
+    /// Source frames per output frame -- the speed as a multiplier.
+    pub step: f64,
+    /// What the segment owes the timeline, which is what it is padded or
+    /// trimmed to.
+    pub timeline_secs: f64,
 }
 
 /// What a save writes and a load takes back: the sources, every lane in
@@ -290,6 +450,7 @@ impl Project {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         Self {
             // A file is opened on its first audio stream: nothing has picked
@@ -358,7 +519,7 @@ impl Project {
                     )
                     .into());
                 }
-                if c.start.checked_add(c.len()).is_none() {
+                if c.start.checked_add(c.frames()).is_none() {
                     return Err(format!(
                         "{name} clip at {} runs past the last frame there is",
                         c.start
@@ -517,6 +678,7 @@ impl Project {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         for data in &mut self.lanes {
             data.clips.push(clip);
@@ -758,6 +920,77 @@ impl Project {
         true
     }
 
+    /// How fast the clip at `idx` of `lane` plays. [`Speed::NORMAL`] for an
+    /// index that is not there, which is what every clip starts at anyway.
+    pub fn speed_of(&self, lane: Lane, idx: usize) -> Speed {
+        self.lane(lane).get(idx).map_or(Speed::NORMAL, |c| c.speed)
+    }
+
+    /// Sets it, for the clip **and its whole group**: a link is one span on
+    /// however many lanes ([`links_are_consistent`]), so a picture sped up away
+    /// from its sound would be a group no save could load. One snapshot, so the
+    /// group's change is one [`Project::undo`].
+    ///
+    /// The source range is untouched -- a speed says how many timeline frames
+    /// that range is spread over ([`Clip::frames`]), which is why a trim and a
+    /// split still address the file afterwards.
+    ///
+    /// Refused, changing nothing and costing no undo step, when the clip would
+    /// grow into the one after it on its own lane: slowing a clip down makes it
+    /// wider, and a lane may not overlap itself. The refusal *names* the clip in
+    /// the way -- by lane and timeline frame -- because "it did not fit" is not
+    /// something a user can go and fix. Also for an index that is not there.
+    pub fn set_speed(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
+        self.write_speed(lane, idx, speed, true)
+    }
+
+    /// [`set_speed`](Self::set_speed) without the undo step: the samples *inside*
+    /// one pointer drag, whose first write (a plain `set_speed`) already took the
+    /// snapshot the gesture rolls back to. A drag across the bar is one undo,
+    /// not one per rate it passed through -- exactly as
+    /// [`set_color_live`](Self::set_color_live) is for a slider.
+    pub fn set_speed_live(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
+        self.write_speed(lane, idx, speed, false)
+    }
+
+    fn write_speed(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        speed: Speed,
+        snapshot: bool,
+    ) -> crate::Result<()> {
+        let Some(members) = self.group_of(lane, idx) else {
+            return Err(format!("there is no clip {idx} on {}", lane.label()).into());
+        };
+        for &(l, i) in &members {
+            let clips = &self.lanes[l].clips;
+            let mut moved = clips[i];
+            moved.speed = speed;
+            if let Some(next) = clips.get(i + 1)
+                && moved.end() > next.start
+            {
+                let name = handles(&self.lanes)[l].label();
+                return Err(format!(
+                    "at {speed} that clip would run to frame {} and the next {name} clip starts at {}: \
+                     move it along, or trim this one first",
+                    moved.end(),
+                    next.start
+                )
+                .into());
+            }
+        }
+        if snapshot {
+            self.snapshot();
+        }
+        for (l, i) in members {
+            self.lanes[l].clips[i].speed = speed;
+            debug_assert!(sorted_disjoint(&self.lanes[l].clips));
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        Ok(())
+    }
+
     /// How the clip at `idx` of `lane` meets a project canvas of another shape.
     /// [`FitPolicy::Fit`] for an index that is not there, which is the default
     /// every clip starts at anyway.
@@ -796,7 +1029,12 @@ impl Project {
     }
 
     pub fn lane_spans(&self, lane: Lane) -> Vec<(u32, u32)> {
-        self.lane(lane).iter().map(|c| (c.start, c.len())).collect()
+        // Timeline frames, not source ones: a box on a lane is as wide as the
+        // clip is long *there*, which a speed halves or quadruples.
+        self.lane(lane)
+            .iter()
+            .map(|c| (c.start, c.frames()))
+            .collect()
     }
 
     /// Timeline frame -> `(clip index, source frame)` in `lane`. `None` in a gap
@@ -805,10 +1043,7 @@ impl Project {
     pub fn map(&self, lane: Lane, timeline_frame: u32) -> Option<(usize, u32)> {
         let clips = self.lane(lane);
         let idx = at(clips, timeline_frame)?;
-        Some((
-            idx,
-            clips[idx].in_frame + (timeline_frame - clips[idx].start),
-        ))
+        Some((idx, source_frame(&clips[idx], timeline_frame)))
     }
 
     /// [`map`](Project::map) on `V1` -- the mapping a decoder follows.
@@ -831,13 +1066,12 @@ impl Project {
             Some(idx) => Span {
                 start: timeline_frame,
                 len: clips[idx].end() - timeline_frame,
-                from: Some((
-                    clips[idx].source,
-                    clips[idx].in_frame + (timeline_frame - clips[idx].start),
-                )),
+                from: Some((clips[idx].source, source_frame(&clips[idx], timeline_frame))),
+                speed: clips[idx].speed,
             },
             None => Span {
                 start: timeline_frame,
+                speed: Speed::NORMAL,
                 // The next placement, or the end of the timeline: a gap is
                 // bounded by what comes after it, never by its own bookkeeping.
                 len: clips
@@ -892,20 +1126,18 @@ impl Project {
         let winner = video
             .iter()
             .rposition(|&lane| at(self.lane(lane), timeline_frame).is_some());
-        let (from, until) = match winner {
+        let (from, speed, until) = match winner {
             Some(i) => {
                 let clips = self.lane(video[i]);
                 let idx = at(clips, timeline_frame).expect("just found above");
                 (
-                    Some((
-                        clips[idx].source,
-                        clips[idx].in_frame + (timeline_frame - clips[idx].start),
-                    )),
+                    Some((clips[idx].source, source_frame(&clips[idx], timeline_frame))),
+                    clips[idx].speed,
                     clips[idx].end(),
                 )
             }
             // Nothing covers it: black until something above the floor starts.
-            None => (None, total),
+            None => (None, Speed::NORMAL, total),
         };
         let takeover = video[winner.map_or(0, |i| i + 1)..]
             .iter()
@@ -916,6 +1148,7 @@ impl Project {
             start: timeline_frame,
             len: takeover.map_or(until, |t| t.min(until)) - timeline_frame,
             from,
+            speed,
         })
     }
 
@@ -1012,7 +1245,11 @@ impl Project {
                 continue;
             };
             let mut tail = data.clips[idx];
-            tail.in_frame += timeline_frame - tail.start;
+            // Where the cut lands *in the file*, which is the clip's own rate
+            // away from where it lands on the timeline. Both halves keep the
+            // speed, and `splittable` has already refused any frame at which
+            // the two would not add up to the one being cut.
+            tail.in_frame = split_source(&tail, timeline_frame).expect("splittable said so");
             tail.start = timeline_frame;
             tail.link = right;
             data.clips[idx].out_frame = tail.in_frame;
@@ -1295,12 +1532,19 @@ impl Project {
             let c = &mut self.lanes[l].clips[i];
             match edge {
                 Edge::Start => {
+                    // The frames that stay play what they played, so the room
+                    // that survives is measured from the *end*: at a speed the
+                    // source range that fits in it is `Speed::fit`'s answer, and
+                    // at real time it is the offset itself, unchanged.
+                    let keep = c.speed.fit(c.end() - to).min(c.out_frame);
                     // Non-negative by `lo`, which is what keeps the in-point on
                     // the source.
-                    c.in_frame = (i64::from(c.in_frame) + i64::from(to) - i64::from(c.start)) as u32;
+                    c.in_frame = c.out_frame - keep;
                     c.start = to;
                 }
-                Edge::End => c.out_frame = c.in_frame + (to - c.start),
+                // Never wider than the room the edge was clamped to: see
+                // [`Speed::fit`].
+                Edge::End => c.out_frame = c.in_frame + c.speed.fit(to - c.start),
             }
             debug_assert!(sorted_disjoint(&self.lanes[l].clips));
         }
@@ -1325,27 +1569,32 @@ impl Project {
             let c = clips[i];
             let (member_lo, member_hi) = match edge {
                 Edge::Start => (
-                    // Back to the source's own first frame, and never over the
-                    // clip in front of it. Saturating because a clip may hold
-                    // *more* head than the timeline has room for -- a ripple
-                    // delete slides a clip back to frame 0 with its in-point
-                    // wherever the cut left it -- and frame 0 is the other wall.
+                    // Back to the source's own first frame -- as many *timeline*
+                    // frames as that head is worth at the clip's rate, which at
+                    // real time is the head itself -- and never over the clip in
+                    // front of it. Saturating because a clip may hold *more*
+                    // head than the timeline has room for -- a ripple delete
+                    // slides a clip back to frame 0 with its in-point wherever
+                    // the cut left it -- and frame 0 is the other wall.
                     c.start
-                        .saturating_sub(c.in_frame)
+                        .saturating_sub(c.speed.timeline_at(c.in_frame))
                         .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
                     c.end() - 1,
                 ),
                 Edge::End => (
                     c.start + 1,
-                    // Out to whatever is left of the source, and never over the
-                    // clip behind it.
+                    // Out to whatever is left of the source -- again in timeline
+                    // frames, at this clip's rate -- and never over the clip
+                    // behind it.
                     c.start
                         .saturating_add(
-                            source_frames
-                                .get(c.source)
-                                .copied()
-                                .unwrap_or(c.out_frame)
-                                .saturating_sub(c.in_frame),
+                            c.speed.timeline_at(
+                                source_frames
+                                    .get(c.source)
+                                    .copied()
+                                    .unwrap_or(c.out_frame)
+                                    .saturating_sub(c.in_frame),
+                            ),
                         )
                         .min(clips.get(i + 1).map_or(u32::MAX, |n| n.start)),
                 ),
@@ -1415,7 +1664,9 @@ impl Project {
         // that clip -- and a save the engine's own `open_project` then refuses.
         let picture_only = crate::is_image(&source.path);
         let at = timeline_frame.min(self.timeline_frames());
-        let len = clip.len();
+        // The room it takes on the timeline, which its speed decides -- not the
+        // source range it reads.
+        let len = clip.frames();
         // Room for it: `open_room` adds `len` to every start from `at` on, and a
         // hand-written file may hold a clip that ends at the very last frame
         // (`edith::check` permits `start + len == u32::MAX`). Refused here
@@ -1427,6 +1678,19 @@ impl Project {
                 .iter()
                 .flat_map(|l| &l.clips)
                 .any(|c| c.end() > at && c.end().checked_add(len).is_none())
+        {
+            return false;
+        }
+        // ...and room *to open*: the paste splits whatever it lands inside of,
+        // and a speeded clip can only be cut where its own rate has a source
+        // frame ([`Speed::split_at`]). Refused rather than pasted over the top
+        // of one, which is the overlap a lane may never hold. At real time every
+        // frame answers, so this cannot refuse an unspeeded paste.
+        let lands_inside = |clips: &[Clip]| clips.iter().any(|c| c.start < at && at < c.end());
+        if self
+            .lanes
+            .iter()
+            .any(|l| lands_inside(&l.clips) && splittable(&l.clips, at).is_none())
         {
             return false;
         }
@@ -1450,7 +1714,7 @@ impl Project {
             .filter_map(|&kind| self.index(Lane::new(kind, 0)))
             .collect();
         for (i, data) in self.lanes.iter_mut().enumerate() {
-            open_room(&mut data.clips, at, clip.len());
+            open_room(&mut data.clips, at, len);
             if takes.contains(&i) {
                 let idx = data.clips.partition_point(|c| c.start < at);
                 data.clips.insert(idx, clip);
@@ -1515,7 +1779,7 @@ impl Project {
         let Some(clip) = self.lane(lane).get(idx).copied() else {
             return false;
         };
-        self.ripple_delete(clip.start, clip.len())
+        self.ripple_delete(clip.start, clip.frames())
     }
 
     /// Restore every lane from before the last successful edit -- the clips and
@@ -1555,11 +1819,13 @@ impl Project {
             .iter()
             .map(|span| match span.from {
                 // A clip's window is in *source* seconds: where in the file it
-                // reads from, which a delete before it never shifts.
+                // reads from, which a delete before it never shifts. How many
+                // source frames that is, is the span's own arithmetic -- at a
+                // speed it is not the timeline length ([`Span::source_len`]).
                 Some((source, in_frame)) => (
                     Some(source),
                     f64::from(in_frame) / fps,
-                    f64::from(in_frame + span.len) / fps,
+                    f64::from(in_frame + span.source_len()) / fps,
                 ),
                 // A gap has no file, so all it can say is how long it is.
                 None => (None, 0.0, f64::from(span.len) / fps),
@@ -1605,6 +1871,52 @@ impl Project {
             true => vec![Lane::A1],
             false => lanes,
         }
+    }
+
+    /// The rate each of [`audio_segments_from`](Project::audio_segments_from)'s
+    /// segments plays at, and how long the timeline gives it: the same lanes in
+    /// the same order, one entry per segment, `None` for a segment at real time
+    /// -- which is every segment of a project nobody has speeded, and the path
+    /// the audio worker leaves bit-identical.
+    ///
+    /// A parallel list for [`audio_eqs_from`](Project::audio_eqs_from)'s reason:
+    /// the segment tuple is what every opener and a dozen tests speak, and a
+    /// rate is not part of *which samples* a segment names.
+    ///
+    /// The seconds are what makes a resample exact: a segment's own window
+    /// resolves to whole source frames, and dividing that by the rate would
+    /// leave each clip a fraction of a frame short or long -- a drift that grows
+    /// clip by clip. Told how much timeline it owes, the worker pads or trims
+    /// the last few samples of each segment instead, so the sound stays locked
+    /// to the picture however many speeded cuts it walks through.
+    pub fn audio_speeds_from(&self, timeline_frame: u32, fps: f64) -> Vec<Vec<Option<Stretch>>> {
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| self.lane_speeds_from(lane, timeline_frame, fps))
+            .collect()
+    }
+
+    /// [`audio_speeds_from`](Project::audio_speeds_from) for one lane, matching
+    /// [`lane_segments_from`](Project::lane_segments_from) entry for entry --
+    /// same walk, same `fps` refusal.
+    pub fn lane_speeds_from(
+        &self,
+        lane: Lane,
+        timeline_frame: u32,
+        fps: f64,
+    ) -> Vec<Option<Stretch>> {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Vec::new();
+        }
+        self.spans_from(lane, timeline_frame)
+            .iter()
+            .map(|span| {
+                (!span.speed.is_normal()).then(|| Stretch {
+                    step: span.speed.as_f64(),
+                    timeline_secs: f64::from(span.len) / fps,
+                })
+            })
+            .collect()
     }
 
     /// The equalizer each of [`audio_segments_from`](Project::audio_segments_from)'s
@@ -1705,6 +2017,16 @@ fn handles(lanes: &[LaneData]) -> Vec<Lane> {
         .collect()
 }
 
+/// Which source frame a clip plays at `timeline_frame`: its in-point plus the
+/// offset *at the clip's own rate*. The one place the two frame spaces meet, so
+/// a speed cannot be applied twice or forgotten in one of them.
+fn source_frame(c: &Clip, timeline_frame: u32) -> u32 {
+    // Clamped inside the clip's own range: rounding at a slow rate can put the
+    // last timeline frame of a clip a frame past its out-point, and a source
+    // frame outside the range is one the next clip owns.
+    (c.in_frame + c.speed.source_at(timeline_frame - c.start)).min(c.out_frame - 1)
+}
+
 /// Index of the clip covering `frame`, or `None` for a gap or past the end.
 /// Binary search: the sorted-disjoint invariant is what makes it legal.
 fn at(clips: &[Clip], frame: u32) -> Option<usize> {
@@ -1716,7 +2038,20 @@ fn at(clips: &[Clip], frame: u32) -> Option<usize> {
 /// there would cut in two. A placement's own first frame is not inside it.
 fn splittable(clips: &[Clip], frame: u32) -> Option<usize> {
     let idx = at(clips, frame)?;
-    (frame > clips[idx].start).then_some(idx)
+    // ...and, on a speeded clip, one its rate can actually address
+    // ([`Speed::split_at`]): a cut between two showings of one source frame
+    // would leave halves that no longer add up to the clip that was cut.
+    (frame > clips[idx].start)
+        .then_some(idx)
+        .filter(|&idx| split_source(&clips[idx], frame).is_some())
+}
+
+/// Where in the source a split of `c` at `frame` cuts, or `None` when the clip's
+/// rate cannot address that frame.
+fn split_source(c: &Clip, frame: u32) -> Option<u32> {
+    c.speed
+        .split_at(c.len(), frame - c.start)
+        .map(|src| c.in_frame + src)
 }
 
 /// Index of the first of the two clips a [`Project::regroup`] at `frame` would
@@ -1724,10 +2059,16 @@ fn splittable(clips: &[Clip], frame: u32) -> Option<usize> {
 fn joinable(clips: &[Clip], frame: u32) -> Option<usize> {
     let idx = clips.iter().position(|c| c.end() == frame)?;
     let next = clips.get(idx + 1)?;
+    let joined = clips[idx].len() + next.len();
     (next.start == frame
         && next.source == clips[idx].source
-        && next.in_frame == clips[idx].out_frame)
-        .then_some(idx)
+        && next.in_frame == clips[idx].out_frame
+        // ...at one rate, and one that puts the rejoined clip back in exactly
+        // the room the two took up: what a split could have produced, which is
+        // all this undoes.
+        && next.speed == clips[idx].speed
+        && clips[idx].speed.frames(joined) == clips[idx].frames() + next.frames())
+    .then_some(idx)
 }
 
 /// The lane invariant: sorted by `start`, no two placements overlapping, no
@@ -1824,19 +2165,24 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             out.push(c);
             continue;
         }
-        // The head that survives in front of the hole.
+        // The head that survives in front of the hole -- as much source as fits
+        // in the room in front of it at this clip's own rate ([`Speed::fit`]),
+        // which at real time is that room itself. Never *more*: a head that
+        // outgrew its room would reach into the hole it is being cut out of.
         if c.start < start {
             out.push(Clip {
-                out_frame: c.in_frame + (start - c.start),
+                out_frame: c.in_frame + c.speed.fit(start - c.start).min(c.len()),
                 link: None,
                 ..c
             });
         }
-        // ...and the tail behind it, which keeps reading where it would have.
+        // ...and the tail behind it, which keeps reading up to where it would
+        // have: measured from its out-point for the head's reason, so what it
+        // occupies still ends where the whole clip did.
         if c.end() > end {
             out.push(Clip {
                 start: end,
-                in_frame: c.in_frame + (end - c.start),
+                in_frame: c.out_frame - c.speed.fit(c.end() - end).min(c.len()),
                 link: None,
                 ..c
             });
@@ -1852,7 +2198,11 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
 fn open_room(clips: &mut Vec<Clip>, at: u32, len: u32) {
     if let Some(idx) = splittable(clips, at) {
         let mut tail = clips[idx];
-        tail.in_frame += at - tail.start;
+        // The cut in *source* frames, at the clip's own rate. `splittable` has
+        // already refused a frame the rate cannot address, which is why
+        // [`Project::paste`] refuses one too rather than opening room inside a
+        // clip that cannot be cut there.
+        tail.in_frame = split_source(&tail, at).expect("splittable said so");
         tail.start = at;
         tail.link = None;
         clips[idx].out_frame = tail.in_frame;
@@ -1892,6 +2242,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         }
     }
 
@@ -2177,7 +2528,8 @@ mod tests {
             Some(Span {
                 start: 6,
                 len: 3,
-                from: Some((0, 6))
+                from: Some((0, 6)),
+                speed: Speed::NORMAL
             })
         );
         assert_eq!(p.span_at(Lane::V1, 9), None);
@@ -2211,6 +2563,7 @@ mod tests {
         eq: None,
         color: None,
         fit: FitPolicy::Fit,
+        speed: Speed::NORMAL,
     };
 
     #[test]
@@ -2398,7 +2751,8 @@ mod tests {
             Some(Span {
                 start: 3,
                 len: 2,
-                from: None
+                from: None,
+                speed: Speed::NORMAL
             })
         );
         assert_eq!(p.map(Lane::V1, 4), Some((1, 4)), "video plays on");
@@ -2416,7 +2770,8 @@ mod tests {
             Some(Span {
                 start: 5,
                 len: 4,
-                from: None
+                from: None,
+                speed: Speed::NORMAL
             }),
             "the audio lane holds silence to the end of the picture"
         );
@@ -2507,7 +2862,8 @@ mod tests {
             Some(Span {
                 start: 9,
                 len: 11,
-                from: None
+                from: None,
+                speed: Speed::NORMAL
             })
         );
         assert!(!p.place(Lane::V1, 0, clip(0, 7, 7, 0)), "empty clip");
@@ -3398,6 +3754,7 @@ mod tests {
             vec![Clip {
                 color: Some(i),
                 fit: FitPolicy::default(),
+                speed: Speed::NORMAL,
                 ..video[0]
             }]
         };
@@ -3459,6 +3816,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
 
         // The door: named errors, one per cause.
@@ -3559,6 +3917,94 @@ mod tests {
         );
     }
 
+    /// The mapping a speed changes, and the one it does not: a 2x clip reads two
+    /// source frames per timeline frame and still starts at its own in-point,
+    /// and a half-speed one shows every source frame twice.
+    #[test]
+    fn a_rate_maps_timeline_frames_onto_source_frames() {
+        let mut p = Project::single(FILE, 40);
+        p.set_speed(Lane::V1, 0, Speed::from_permille(2000))
+            .expect("room enough");
+        assert_eq!(p.timeline_frames(), 20, "40 source frames at 2x");
+        assert_eq!(
+            p.map(Lane::V1, 0),
+            Some((0, 0)),
+            "and it starts where it did"
+        );
+        assert_eq!(p.map(Lane::V1, 1), Some((0, 2)));
+        assert_eq!(p.map(Lane::V1, 19), Some((0, 38)));
+        assert_eq!(p.map(Lane::V1, 20), None, "and ends where the clip does");
+        // The span a decoder is handed: as many source frames as it will read.
+        let span = p.span_at(Lane::V1, 0).expect("a span");
+        assert_eq!((span.len, span.source_len()), (20, 40));
+        // ...and the same clip the other way round.
+        let mut p = Project::single(FILE, 40);
+        p.set_speed(Lane::V1, 0, Speed::from_permille(500))
+            .expect("room enough");
+        assert_eq!(p.timeline_frames(), 80);
+        assert_eq!(p.map(Lane::V1, 0), Some((0, 0)));
+        assert_eq!(p.map(Lane::V1, 1), Some((0, 0)), "each frame shows twice");
+        assert_eq!(p.map(Lane::V1, 2), Some((0, 1)));
+        assert_eq!(
+            p.map(Lane::V1, 79),
+            Some((0, 39)),
+            "and the last timeline frame is still inside the source range"
+        );
+    }
+
+    /// A trim of a speeded clip is still a trim of its *source*, and the edge
+    /// still stops at the wall: the room a rate leaves is measured in timeline
+    /// frames and the range it commits in source ones.
+    #[test]
+    fn trimming_a_speeded_clip_stays_inside_its_room() {
+        let mut p = Project::single(FILE, 40);
+        p.set_speed(Lane::V1, 0, Speed::from_permille(2000))
+            .expect("room enough");
+        // A second clip butted against the first, so the wall is a real one.
+        assert!(p.place(Lane::V1, 20, clip(0, 0, 10, 0)));
+        let room = p.trim_room(Lane::V1, 0, Edge::End, &[40]).expect("a clip");
+        assert_eq!(room, (1, 20), "out to the neighbour and no further");
+        assert!(
+            !p.trim(Lane::V1, 0, Edge::End, 30, &[40]),
+            "clamped to the wall, which is where the edge already is"
+        );
+        let c = p.clips()[0];
+        assert_eq!(c.end(), 20, "so nothing moved");
+        assert_eq!(c.out_frame, 40, "and it is still the whole source range");
+        // ...and in: half the timeline frames is half the source range.
+        assert!(p.trim(Lane::V1, 0, Edge::End, 10, &[40]));
+        let c = p.clips()[0];
+        assert_eq!((c.in_frame, c.out_frame), (0, 20), "in source frames");
+        assert_eq!(c.end(), 10, "and ten timeline frames of them");
+        assert!(sorted_disjoint(p.clips()));
+    }
+
+    /// The frames a rate cannot address: at half speed each source frame is on
+    /// screen twice, and the cut between the two showings is not a cut in the
+    /// file. Refused, so the two halves always add up to the clip that was cut.
+    #[test]
+    fn a_slow_clip_cuts_only_where_its_source_has_a_frame() {
+        let mut p = Project::single(FILE, 10);
+        p.set_speed(Lane::V1, 0, Speed::from_permille(500))
+            .expect("room enough");
+        assert_eq!(p.timeline_frames(), 20);
+        assert!(
+            !p.split(3),
+            "an odd frame is between two showings of one frame"
+        );
+        assert_eq!(p.clips().len(), 1, "and nothing was cut");
+        assert!(p.split(4), "an even one is a frame boundary");
+        let halves = p.clips().to_vec();
+        assert_eq!(
+            (halves[0].end(), halves[1].start, halves[1].end()),
+            (4, 4, 20),
+            "the halves meet, and still end where the clip did"
+        );
+        assert_eq!(halves[0].out_frame, halves[1].in_frame, "in source frames");
+        assert!(p.regroup(4), "and the inverse puts it back");
+        assert_eq!(p.clips().len(), 1);
+    }
+
     /// The same claim, swept: random op sequences off the public surface, the
     /// project reloaded after every one of them. A failure prints its seed, and
     /// the seed replays the whole sequence.
@@ -3584,7 +4030,7 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = if next(2) == 0 { Lane::V1 } else { Lane::A1 };
                 let idx = next(4) as usize;
-                let _ = match next(13) {
+                let _ = match next(14) {
                     0 => p.split(frame),
                     1 => p.regroup(frame),
                     2 => p.lift(lane, idx),
@@ -3602,6 +4048,13 @@ mod tests {
                     // reason: it rides on the clip and its orphans must go.
                     10 => p.set_color(lane, idx, Some(grade_at(next(4)))),
                     11 => p.set_color(lane, idx, None),
+                    // ...and a rate in with them, which is the one of the three
+                    // that moves *placements*: a clip that grew has to be
+                    // refused rather than overlap, and one that shrank leaves a
+                    // lane that still loads. Both are what `reloads` asks.
+                    12 => p
+                        .set_speed(lane, idx, Speed::from_permille(250 + next(16) as u16 * 250))
+                        .is_ok(),
                     _ => p.append_clip(0, 1 + next(9)),
                 };
                 reloads(&p, &format!("seed {seed}, step {step}"));
@@ -3711,7 +4164,8 @@ mod tests {
             Some(Span {
                 start: 0,
                 len: 4,
-                from: None
+                from: None,
+                speed: Speed::NORMAL
             })
         );
         // Every lane still covers the whole timeline, gaps included.
@@ -3807,6 +4261,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         let lanes = vec![
             LaneData {
@@ -3841,6 +4296,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         // V1, A1, V2, A2 -- one take over [0, 4) on all four.
         let kinds = [
@@ -3944,9 +4400,15 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = lanes[next(3) as usize];
                 let idx = next(4) as usize;
-                let _ = match next(12) {
+                let _ = match next(13) {
                     10 => p.set_eq(lane, idx, Some(band_at(next(4)))),
                     11 => p.set_eq(lane, idx, None),
+                    // A rate, which on many lanes is the group rule as well:
+                    // every clip carrying the link moves together or none of
+                    // them does, and `invariants_hold` is what says so.
+                    12 => p
+                        .set_speed(lane, idx, Speed::from_permille(250 + next(16) as u16 * 250))
+                        .is_ok(),
                     0 => p.split(frame),
                     1 => p.regroup(frame),
                     2 => p.lift(lane, idx),
@@ -3991,17 +4453,20 @@ mod tests {
                 Span {
                     start: 0,
                     len: 10,
-                    from: Some((0, 0))
+                    from: Some((0, 0)),
+                    speed: Speed::NORMAL
                 },
                 Span {
                     start: 10,
                     len: 10,
-                    from: Some((1, 5))
+                    from: Some((1, 5)),
+                    speed: Speed::NORMAL
                 },
                 Span {
                     start: 20,
                     len: 10,
-                    from: Some((0, 20))
+                    from: Some((0, 20)),
+                    speed: Speed::NORMAL
                 },
             ],
             "V2 takes over for its own span and hands V1 back"
@@ -4012,7 +4477,8 @@ mod tests {
             Some(Span {
                 start: 15,
                 len: 5,
-                from: Some((1, 10))
+                from: Some((1, 10)),
+                speed: Speed::NORMAL
             })
         );
         assert_eq!(p.composite_span_at(30), None, "past the end");
@@ -4032,22 +4498,26 @@ mod tests {
                 Span {
                     start: 0,
                     len: 5,
-                    from: Some((0, 0))
+                    from: Some((0, 0)),
+                    speed: Speed::NORMAL
                 },
                 Span {
                     start: 5,
                     len: 5,
-                    from: None
+                    from: None,
+                    speed: Speed::NORMAL
                 },
                 Span {
                     start: 10,
                     len: 10,
-                    from: Some((1, 0))
+                    from: Some((1, 0)),
+                    speed: Speed::NORMAL
                 },
                 Span {
                     start: 20,
                     len: 10,
-                    from: None
+                    from: None,
+                    speed: Speed::NORMAL
                 },
             ]
         );

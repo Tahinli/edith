@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
-use engine::project::{Lane, LaneKind, Source};
+use engine::project::{Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
@@ -61,6 +61,7 @@ fn clip(start: u32, source: usize, frames: u32) -> Clip {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     }
 }
 

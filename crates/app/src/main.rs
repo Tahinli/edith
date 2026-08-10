@@ -13,7 +13,7 @@ use engine::audio::StreamInfo;
 use engine::color::ColorParams;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
-use engine::project::{Edge, Lane, LaneKind, Source};
+use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
@@ -311,7 +311,7 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 10] = [
+const MENU_ITEMS: [ActionId; 11] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
@@ -319,6 +319,7 @@ const MENU_ITEMS: [ActionId; 10] = [
     ActionId::Detach,
     ActionId::Group,
     ActionId::Equalizer,
+    ActionId::Speed,
     ActionId::Color,
     ActionId::Fit,
     ActionId::ToggleMute,
@@ -338,6 +339,23 @@ const EQ_GAIN_LIMIT: f32 = 12.;
 /// One dB per keystroke, which is roughly the smallest step anyone hears on a
 /// single band.
 const EQ_STEP: f32 = 1.;
+
+/// A twentieth of real time per keystroke, in the thousandths a [`Speed`] is
+/// held in: fine enough to creep up on a rate, coarse enough that the whole
+/// range is eighty presses and not eight hundred -- and it divides 1000, so
+/// stepping from anywhere lands on exactly 1.00x on the way past.
+const SPEED_STEP: i32 = 50;
+
+/// The rates the card's buttons offer, so the ones people actually name are one
+/// click and not a drag. Real time is among them: it is the reset.
+const SPEED_PRESETS: [u16; 6] = [250, 500, 1000, 1500, 2000, 4000];
+
+/// A rate from a number of thousandths that may have run off either end -- what
+/// a keystroke and a drag both produce. Clamped, not refused: a hand pushing
+/// past the limit means "as far as it goes", exactly as a trim does.
+fn speed_at(permille: i32) -> Speed {
+    Speed::from_permille(permille.clamp(0, i32::from(u16::MAX)) as u16)
+}
 
 /// The graph's frequency axis: the range an ear works in, and the range every
 /// band a file can carry sits inside. Log-spaced, so an octave is an octave
@@ -542,6 +560,17 @@ struct Player {
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
     color_open: Option<(Lane, usize)>,
+    /// The speed card is up on this clip -- the lane it is on and its index
+    /// there, exactly as the colour card's handle is. `None` when it is closed;
+    /// the rate itself is the project's, so there is nothing else to hold.
+    speed_open: Option<(Lane, usize)>,
+    /// The speed bar's box, recorded at prepaint: a mouse listener is handed the
+    /// window position only, so this is what a press and a drag are read against
+    /// ([`frac_along`]).
+    speed_bar: Rc<Cell<Bounds<Pixels>>>,
+    /// The bar is being dragged. On the root like the colour card's, for the
+    /// same reason: the pointer leaves a 4 px bar on the first move.
+    speed_dragging: bool,
     /// Which of the card's four sliders the arrow keys and a drag move. The
     /// card's own focus, since nothing in it takes gpui's (ledger:182).
     color_band: usize,
@@ -708,6 +737,7 @@ impl Player {
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
             ActionId::Equalizer => self.open_eq(cx),
+            ActionId::Speed => self.open_speed(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -953,6 +983,108 @@ impl Player {
         self.write_color(params, !first, cx);
     }
 
+    /// Opens the speed card on the clip whose rate is to change: the selected
+    /// one, or -- with nothing selected -- the clip the picture is coming from,
+    /// which is what a person means by "this shot". Either half of a take will
+    /// do: a rate applies to the whole group, so opening it on the sound and
+    /// opening it on the picture are the same card.
+    fn open_speed(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.notice = Some("no timeline to re-time — open a file first".into());
+            cx.notify();
+            return;
+        };
+        match self
+            .selected
+            .or_else(|| session.video_clip_at(session.now()))
+        {
+            Some(clip) => {
+                self.speed_open = Some(clip);
+                self.speed_dragging = false;
+                // One card at a time, the rule the other three follow.
+                self.keys_open = false;
+                self.export_open = false;
+                self.eq_open = None;
+                self.color_open = None;
+                self.context_menu = None;
+            }
+            None => self.notice = Some("no clip under the playhead to re-time".into()),
+        }
+        cx.notify();
+    }
+
+    /// What the card's clip plays at right now -- real time for one nobody has
+    /// touched, which is where the bar starts.
+    fn card_speed(&self) -> Speed {
+        self.speed_open
+            .zip(self.session.as_ref())
+            .map_or(Speed::NORMAL, |((lane, idx), session)| {
+                session.speed_of(lane, idx)
+            })
+    }
+
+    /// Writes a rate at the card's clip and its whole group -- one undo step for
+    /// the lot ([`engine::PlaybackSession::set_speed`]). The engine reseeks, so
+    /// the picture runs at the new rate and the sound is resampled from the next
+    /// chunk on; a refusal (a slower clip would run into its neighbour) comes
+    /// back in the engine's own words and *names* the clip in the way, because
+    /// "it did not fit" is not something a person can go and fix.
+    fn set_speed(&mut self, speed: Speed, cx: &mut Context<Self>) {
+        self.write_speed(speed, false, cx);
+    }
+
+    /// Both writes: `live` is the one that takes no undo step, which is what
+    /// every sample *inside* a drag goes through -- so a drag from 1.00x to
+    /// 2.00x is one undo press and lands back where the hand picked it up, and
+    /// the whole linked group comes back with it.
+    fn write_speed(&mut self, speed: Speed, live: bool, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.speed_open else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if speed != session.speed_of(lane, idx) {
+            let wrote = match live {
+                true => session.set_speed_live(lane, idx, speed),
+                false => session.set_speed(lane, idx, speed),
+            };
+            match wrote {
+                Ok(()) => self.reset_after_reseek(),
+                Err(e) => self.notice = Some(e.to_string().into()),
+            }
+        }
+        cx.notify();
+    }
+
+    /// One [`SPEED_STEP`] per keystroke, clamped to what a [`Speed`] can hold.
+    fn nudge_speed(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let at = i32::from(self.card_speed().permille()) + steps * SPEED_STEP;
+        self.set_speed(speed_at(at), cx);
+    }
+
+    /// Where the pointer sits along the bar, as a rate: the left end is
+    /// [`Speed::MIN`] and the right end [`Speed::MAX`], on the same
+    /// [`SPEED_STEP`] grid the keys move on -- so a drag can land on exactly
+    /// 1.00x and the same drag twice is one entry, not forty.
+    /// `first` is the press: it takes the undo step the whole gesture rolls back
+    /// to, and every sample after it is live -- the colour card's rule, for the
+    /// colour card's reason.
+    fn drag_speed(&mut self, x: Pixels, first: bool, cx: &mut Context<Self>) {
+        let along = frac_along(x, self.speed_bar.get());
+        let lo = f32::from(Speed::MIN.permille());
+        let hi = f32::from(Speed::MAX.permille());
+        let raw = lo + along * (hi - lo);
+        // Snapped to the grid, then to real time itself when it is within half a
+        // step of it: 1.00x is the one value a hand must be able to hit, and
+        // nothing about the bar's geometry guarantees a pixel lands on it.
+        let stepped = (raw / SPEED_STEP as f32).round() as i32 * SPEED_STEP;
+        self.write_speed(speed_at(stepped), !first, cx);
+    }
+
     /// Whether a card owns the window. While one does the timeline under it is
     /// out of reach, so a right-click there opens no menu -- the same rule the
     /// key handler and the drop target already follow.
@@ -961,6 +1093,7 @@ impl Player {
             || self.export_open
             || self.eq_open.is_some()
             || self.color_open.is_some()
+            || self.speed_open.is_some()
             || self.exporting().is_some()
     }
 
@@ -2344,6 +2477,29 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The speed card, the same way again: its arrows move the rate
+                // and `r` puts it back to real time, and neither means anything
+                // outside the card -- so neither is a binding (see `FIXED`,
+                // where the keys menu still lists them).
+                if this.speed_open.is_some() {
+                    match color_key(key) {
+                        Some(ColorKey::Close) => {
+                            this.speed_open = None;
+                            this.speed_dragging = false;
+                        }
+                        // The card has one value, so the pair that picks a
+                        // slider on the colour card moves this one by a whole
+                        // preset's worth instead of a step.
+                        Some(ColorKey::Band(step)) => {
+                            this.nudge_speed(if step == 1 { -2 } else { 2 }, cx)
+                        }
+                        Some(ColorKey::Nudge(steps)) => this.nudge_speed(steps as i32, cx),
+                        Some(ColorKey::Reset) => this.set_speed(Speed::NORMAL, cx),
+                        None => {}
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
@@ -2426,6 +2582,16 @@ impl Render for Player {
                     }
                     return;
                 }
+                // The speed bar, the same 4 px and the same live writes: the
+                // press took the undo step and every sample since is live.
+                if this.speed_dragging {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_speed(event.position.x, false, cx);
+                    } else {
+                        this.speed_dragging = false;
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -2460,6 +2626,10 @@ impl Render for Player {
                         // it is a live write like every other sample: the undo
                         // step the gesture rolls back to was the press's.
                         this.drag_color(event.position.x, false, cx);
+                        return;
+                    }
+                    if std::mem::take(&mut this.speed_dragging) {
+                        this.drag_speed(event.position.x, false, cx);
                         return;
                     }
                     if std::mem::take(&mut this.scrubbing) {
@@ -2540,6 +2710,7 @@ impl Render for Player {
             .children(self.export_card(cx))
             .children(self.eq_card(cx))
             .children(self.color_card(cx))
+            .children(self.speed_card(cx))
     }
 }
 
@@ -3834,6 +4005,138 @@ impl Player {
         )
     }
 
+    /// The speed card: one bar from a quarter speed to four times it, the rates
+    /// people name as buttons under it, and the clip's new length in frames --
+    /// which is the number a person is actually choosing. Built like the colour
+    /// card down to the scrim and the bar's own hit height, because it is the
+    /// same kind of card: one continuous value on one clip, live at the clip as
+    /// it moves.
+    ///
+    /// Honest about what it does: the sound is *resampled*, so the pitch goes up
+    /// with the rate, which is what the tape in the title means.
+    fn speed_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (lane, idx) = self.speed_open?;
+        let speed = self.card_speed();
+        let session = self.session.as_ref()?;
+        let clip = session.lane_clips(lane).get(idx).copied()?;
+        let lo = f32::from(Speed::MIN.permille());
+        let hi = f32::from(Speed::MAX.permille());
+        let frac = ((f32::from(speed.permille()) - lo) / (hi - lo)).clamp(0., 1.);
+        let presets: Vec<_> = SPEED_PRESETS
+            .into_iter()
+            .map(|permille| {
+                let at = Speed::from_permille(permille);
+                div()
+                    .id(("speed-preset", usize::from(permille)))
+                    .flex_1()
+                    .flex()
+                    .h(px(CONTROL_H))
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(rgb(match at == speed {
+                        true => SELECTED,
+                        false => CHROME,
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_speed(at, cx);
+                    }))
+                    .child(format!("{at}"))
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(COLOR_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(div().flex_none().px(px(6.)).child(format!(
+                            "Speed (tape) — {} clip {}",
+                            lane.label(),
+                            idx + 1
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(
+                                    "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; esc closes",
+                                ),
+                        )
+                        .child(
+                            // 4 px to look at and a whole row to hit (WCAG
+                            // 2.5.8), the split the colour sliders and the ruler
+                            // both make.
+                            div()
+                                .id("speed-bar")
+                                .relative()
+                                .w_full()
+                                .h(px(KEYS_ROW_H))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        this.speed_dragging = true;
+                                        this.drag_speed(event.position.x, true, cx);
+                                    }),
+                                )
+                                .child(bounds_probe(self.speed_bar.clone()))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(4.))
+                                        .rounded(px(2.))
+                                        .bg(rgb(CHROME))
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(relative(frac))
+                                                .rounded(px(2.))
+                                                .bg(rgb(ACCENT)),
+                                        ),
+                                ),
+                        )
+                        .child(div().flex().gap(px(4.)).children(presets))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                // What the choice *is*, in the numbers the
+                                // timeline is measured in: the source range
+                                // never moves, the room it takes does.
+                                .child(format!(
+                                    "{speed} — {} source frames over {} on the timeline ({})",
+                                    clip.len(),
+                                    clip.frames(),
+                                    timecode(f64::from(clip.frames()) / self.fps, self.fps)
+                                )),
+                        ),
+                ),
+        )
+    }
+
     /// The menu a right-click on a library row opens: what can be done with the
     /// *file* rather than with a clip of it, and a turn-over side saying what
     /// that file is. Built like [`Player::context_card`] down to the scrim, the
@@ -4055,7 +4358,11 @@ impl Player {
                     "Source range",
                     format!("{} – {}", secs(clip.in_frame), secs(clip.out_frame)),
                 ),
-                ("This clip", secs(clip.len())),
+                // How long it is *where it sits*, which its rate decides -- and
+                // the rate itself beside it, because a clip half its source's
+                // length could be either a trim or a 2x.
+                ("This clip", secs(clip.frames())),
+                ("Speed", format!("{} (tape)", clip.speed)),
                 ("Source duration", secs(session.file_frames(&source.path))),
             ] {
                 rows.push(
@@ -4296,9 +4603,12 @@ impl Player {
                         // What a drag on an edge is showing, which is the clip
                         // itself while nothing is being dragged.
                         let clip = &self.trimmed(lane, i, *clip);
+                        // Its *timeline* length, which a speed halves or
+                        // quadruples: the box is as wide as the clip is long
+                        // where it sits, not as long as the source it reads.
                         let (start, len) = (
                             f64::from(clip.start) / self.fps,
-                            f64::from(clip.len()) / self.fps,
+                            f64::from(clip.frames()) / self.fps,
                         );
                         let on = marked((lane, i), clip.link, sel, sel_link);
                         // A group with a half in the other lane wears its tint;
@@ -4442,6 +4752,25 @@ impl Player {
                                         .child(inner),
                                 )
                             }))
+                            // A speeded clip says so on the box, in the corner
+                            // the label does not reach: the box's width alone
+                            // cannot say whether a short clip is a trim or a
+                            // clip at 4x, and that is the difference between a
+                            // cut and a re-time.
+                            .when(!clip.speed.is_normal(), |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .px(px(3.))
+                                        .rounded(px(3.))
+                                        .bg(rgb(ACCENT))
+                                        .text_size(px(9.))
+                                        .text_color(rgb(SURFACE))
+                                        .child(format!("{}", clip.speed)),
+                                )
+                            })
                             .when_some(label.filter(|_| show_label(bed_w * width)), |d, label| {
                                 d.child(
                                     div()
@@ -4716,8 +5045,19 @@ fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool 
         // A fit policy is a picture setting for the same reason.
         ActionId::Color | ActionId::Fit => lane.kind == LaneKind::Video,
         // Splits this clip only from inside it: at either edge there is nothing
-        // to split off (project.rs `splittable`).
-        ActionId::Cut => clip.start < playhead && playhead < clip.end(),
+        // to split off -- and, on a speeded clip, only at a frame its own rate
+        // can address, which is the same question `splittable` asks.
+        ActionId::Cut => {
+            clip.start < playhead
+                && playhead < clip.end()
+                && clip
+                    .speed
+                    .split_at(clip.len(), playhead - clip.start)
+                    .is_some()
+        }
+        // A rate applies to a clip of either kind and to its whole group, so
+        // there is no lane it means nothing on -- `_ => true` below is its
+        // answer, and the engine words the one refusal there is (no room).
         // Rejoins whatever meets at the playhead, so it can mean something only
         // at an edge of this clip. Whether those two halves were ever one take
         // is the engine's question, and it words that refusal itself.
@@ -5735,13 +6075,13 @@ mod tests {
         Format, HEADER_GAP, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM,
         KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX,
         LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
-        RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
-        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, color_snap,
-        envelope, eq_x, eq_y, export_path, export_settings, format_key, format_line,
-        format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
-        keymap, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit, retarget,
-        scrub_due, show_label, source_tint, span_partner, start_frac, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        RULER_HIT_H, SELECTED, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
+        Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
+        cancels_export, color_snap, envelope, eq_x, eq_y, export_path, export_settings, format_key,
+        format_line, format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier,
+        is_project, keymap, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit,
+        retarget, scrub_due, show_label, source_tint, span_partner, speed_at, start_frac, timecode,
+        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -6028,6 +6368,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         };
         assert_eq!(clip.end(), 90);
         // Cut splits from inside only: neither edge has anything to split off.
@@ -6942,6 +7283,58 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// The speed bar is the same round trip -- pixels -> rate -> fill -- with
+    /// one thing the colour sliders do not have to promise: **exactly 1.00x has
+    /// to be reachable**, by a hand as well as by the reset. A grid that missed
+    /// it would leave a clip nobody could put back.
+    #[test]
+    fn the_speed_bar_lands_where_it_paints_and_real_time_is_reachable() {
+        let bar = Bounds {
+            origin: point(px(180.), px(240.)),
+            size: size(px(COLOR_BAR_W), px(KEYS_ROW_H)),
+        };
+        let (lo, hi) = (
+            f32::from(Speed::MIN.permille()),
+            f32::from(Speed::MAX.permille()),
+        );
+        // The same arithmetic `Player::drag_speed` runs, which is the one thing
+        // a test of it can share without re-deriving it.
+        let at = |x: f32| {
+            let raw = lo + frac_along(px(x), bar) * (hi - lo);
+            speed_at((raw / SPEED_STEP as f32).round() as i32 * SPEED_STEP)
+        };
+        assert_eq!(at(180.), Speed::MIN, "the left end is a quarter speed");
+        assert_eq!(at(180. + COLOR_BAR_W), Speed::MAX, "the right end is 4x");
+        assert_eq!(at(-4000.), Speed::MIN, "off the left clamps");
+        assert_eq!(at(9999.), Speed::MAX, "off the right clamps");
+        let mut hits_real_time = false;
+        for step in 0..=240 {
+            let along = step as f32 / 240.;
+            let speed = at(180. + along * COLOR_BAR_W);
+            hits_real_time |= speed == Speed::NORMAL;
+            assert_eq!(
+                i32::from(speed.permille()) % SPEED_STEP,
+                0,
+                "{speed} is off the {SPEED_STEP} grid the keys move on"
+            );
+            // What the bar paints from that rate is where the pointer was, to
+            // within the half step the snap costs.
+            let painted = (f32::from(speed.permille()) - lo) / (hi - lo);
+            let slack = SPEED_STEP as f32 / (hi - lo) / 2. + 1e-4;
+            assert!(
+                (painted - along).abs() <= slack,
+                "pressed at {along}, paints at {painted}"
+            );
+        }
+        assert!(hits_real_time, "a drag can land on exactly 1.00x");
+        // ...and every preset the card offers is a rate the bar can also reach.
+        for permille in SPEED_PRESETS {
+            assert_eq!(Speed::from_permille(permille).permille(), permille);
+            assert_eq!(i32::from(permille) % SPEED_STEP, 0);
+        }
+        assert!(SPEED_PRESETS.contains(&Speed::NORMAL.permille()), "reset");
+    }
+
     /// A colour slider is dragged straight to a value, so where the pointer
     /// lands and where the bar then paints have to be the same place: this is
     /// the round trip [`Player::drag_color`] makes, pixels -> value -> fill.
@@ -7633,6 +8026,9 @@ fn main() {
                     eq_band: 0,
                     eq_dragging: false,
                     eq_graph: Rc::default(),
+                    speed_open: None,
+                    speed_bar: Rc::default(),
+                    speed_dragging: false,
                     color_open: None,
                     color_band: 0,
                     color_dragging: false,

@@ -113,6 +113,23 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# Sync fixture: one flash and one beep, at the same instant. Black picture with
+# a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
+# stretch — so a test can find each of them and say how far apart they came out.
+# What it is for is *speed*: a re-timed clip that drifts puts the beep somewhere
+# the flash is not, and nothing else in the fixture set has a mark to measure
+# that against. Same 30 fps / 44.1k stereo shape as test_av.mp4, so it can share
+# a timeline with the rest.
+# The beep is silence-then-tone-then-silence rather than a gated tone: lavfi's
+# `sine` comes out at an eighth of full scale, and a mark a test looks for has
+# to be plainly louder than anything around it.
+ffmpeg -y -f lavfi -i "color=c=black:s=320x180:r=30:d=3" \
+    -f lavfi -i "sine=frequency=1000:duration=0.1:sample_rate=44100" \
+    -filter_complex "[0:v]drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:\
+enable='between(t,1,1.1)'[v];\
+[1:a]volume=6,aformat=channel_layouts=stereo,adelay=1000|1000,apad=whole_dur=3[a]" \
+    -map "[v]" -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_speed_sync.mp4
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \

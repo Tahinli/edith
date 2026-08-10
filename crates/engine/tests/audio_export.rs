@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::LaneKind;
-use engine::project::Source;
+use engine::project::{LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
@@ -68,6 +67,7 @@ fn mixed_project() -> Project {
         eq: None,
         color: None,
         fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
     };
     Project::from_parts(
         vec![
@@ -89,6 +89,7 @@ fn mixed_project() -> Project {
                     eq: None,
                     color: None,
                     fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
                 }],
             ),
             (LaneKind::Audio, vec![clip(0, 0), clip(60, 1)]),
@@ -325,6 +326,7 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
                 eq: None,
                 color: None,
                 fit: FitPolicy::default(),
+                speed: Speed::NORMAL,
             }],
         )],
         Vec::new(),

@@ -1,16 +1,16 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 7
+//! edith 8
 //! playhead 90
 //! resolution 1920 1080
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
 //! eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk
 //! color 0.1:1.2:0.9:-0.3
-//! video 1 0 0 120 0 0 0 0 fit
-//! audio 1 0 0 120 0 0 0 - fit
-//! video 2 120 0 120 1 - - - fill
+//! video 1 0 0 120 0 0 0 0 fit 1000
+//! audio 1 0 0 120 0 0 0 - fit 1000
+//! video 2 120 0 120 1 - - - fill 2000
 //! audio 2
 //! ```
 //!
@@ -39,22 +39,28 @@
 //! -- the first colour line is color 0 -- printed and refused by the same rules.
 //!
 //! A lane line is `<kind> <lane> <start> <in> <out> <source> <link> <eq>
-//! <color> <fit>`: which lane the clip is on -- its kind and its 1-based number
+//! <color> <fit> <speed>`: which lane the clip is on -- its kind and its 1-based number
 //! among the lanes of that kind, the [`crate::project::Lane::label`] a header
 //! column shows -- then where the clip sits on the timeline, the half-open
 //! source range it plays, the file it plays from, its group id, the eq line it
 //! plays through, the colour line it is graded by (`-` for none of those three)
 //! and how it meets a project canvas of another shape, spelled `fit`, `fill`,
-//! `stretch` or `center` ([`crate::scale::FitPolicy`]). Timeline placement is
+//! `stretch` or `center` ([`crate::scale::FitPolicy`]), and how fast it plays,
+//! in thousandths of real time ([`crate::project::Speed`], `1000` for a clip
+//! nobody has speeded). Timeline placement is
 //! explicit, so a *gap* is simply a stretch no line covers -- there is nothing
-//! to write for one, and nothing that can disagree about its length.
+//! to write for one, and nothing that can disagree about its length. The `<in>`
+//! and `<out>` are *source* frames whatever the speed says: how long the clip is
+//! on the timeline is that range divided by the rate, and is written nowhere.
 //!
 //! A lane is declared by the clips on it, in the order the lanes are displayed
 //! in; a lane holding *nothing* has a bare `<kind> <lane>` line instead, which
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 6** was this without the `resolution` line and without the clip's
+//! **Version 7** was this without the clip's speed field -- every clip of such
+//! a project plays at real time, which is the only rate there was.
+//! **Version 6** was that without the `resolution` line and without the clip's
 //! fit field -- such a project is the size of its first source and letterboxes
 //! nothing, because nothing on it could differ in size. **Version 5** was that
 //! without the colour lines and without the clip's colour
@@ -63,10 +69,11 @@
 //! lane and one audio lane, no more. **Version 2** wrote `source <path>` as
 //! well, which is this file's stream 0 -- one per file, whichever audio track
 //! came first. **Version 1** wrote that and one lane, queued end to end: `clip
-//! <in> <out> <source>`. All five still load -- a v1 file's clips are laid out
+//! <in> <out> <source>`. All six still load -- a v1 file's clips are laid out
 //! cumulatively and copied onto both lanes as one group each, which is exactly
 //! what a v1 timeline meant, and an older file simply equalizes and grades
-//! nothing -- and saving any of them writes v7. An older reader refuses a newer
+//! nothing, and an older one plays everything at real time -- and saving any of
+//! them writes v8. An older reader refuses a newer
 //! file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -95,12 +102,13 @@ use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
 use crate::eq::{Band, BandKind, EqParams};
-use crate::project::{Clip, Lane, LaneKind, Source};
+use crate::project::{Clip, Lane, LaneKind, Source, Speed};
 use crate::scale::FitPolicy;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 7";
+const MAGIC: &[u8] = b"edith 8";
+const MAGIC_V7: &[u8] = b"edith 7";
 const MAGIC_V6: &[u8] = b"edith 6";
 const MAGIC_V5: &[u8] = b"edith 5";
 const MAGIC_V4: &[u8] = b"edith 4";
@@ -256,12 +264,13 @@ fn emit(
             let color = c.color.map_or("-".to_string(), |e| e.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {}\n",
+                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {} {}\n",
                     c.start,
                     c.in_frame,
                     c.out_frame,
                     c.source,
-                    fit_name(c.fit)
+                    fit_name(c.fit),
+                    c.speed.permille()
                 )
                 .as_bytes(),
             );
@@ -280,8 +289,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries a project resolution and per-clip fit policies...
-    let v7 = first == MAGIC;
+    // The one that carries a per-clip speed...
+    let v8 = first == MAGIC;
+    // ...the ones that carry a project resolution and per-clip fit policies...
+    let v7 = v8 || first == MAGIC_V7;
     // ...the ones that carry colour grades...
     let v6 = v7 || first == MAGIC_V6;
     // ...the ones that carry equalizer settings...
@@ -430,6 +441,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         eq: None,
                         color: None,
                         fit: FitPolicy::default(),
+                        speed: Speed::NORMAL,
                     },
                     &doc,
                     n,
@@ -459,9 +471,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if numbered && rest.is_empty() {
                     continue;
                 }
-                // v7 grew the fit field, v6 the colour one and v5 the eq one;
-                // every older dialect ends at the link.
-                let want = 5 + usize::from(v5) + usize::from(v6) + usize::from(v7);
+                // v8 grew the speed field, v7 the fit one, v6 the colour one and
+                // v5 the eq one; every older dialect ends at the link.
+                let want =
+                    5 + usize::from(v5) + usize::from(v6) + usize::from(v7) + usize::from(v8);
                 let f = fields(rest, want, "clip", n)?;
                 let clip = check(
                     Clip {
@@ -476,6 +489,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         eq: table_index(f.get(5).copied(), doc.eq.len(), "eq", n)?,
                         color: table_index(f.get(6).copied(), doc.color.len(), "color", n)?,
                         fit: fit_policy(f.get(7).copied(), n)?,
+                        speed: speed_of(f.get(8).copied(), n)?,
                     },
                     &doc,
                     n,
@@ -581,7 +595,7 @@ fn check(clip: Clip, doc: &Document, line: usize) -> crate::Result<Clip> {
     // Everything downstream -- `Clip::end`, the overlap check, the v1 queue --
     // adds `start + len` as plain `u32`, which panics in debug and wraps in
     // release on a crafted file. Bound it here, at the door.
-    if clip.start.checked_add(clip.len()).is_none() {
+    if clip.start.checked_add(clip.frames()).is_none() {
         return Err(format!(
             "line {line}: clip at {} runs past the last frame there is",
             clip.start
@@ -589,6 +603,29 @@ fn check(clip: Clip, doc: &Document, line: usize) -> crate::Result<Clip> {
         .into());
     }
     Ok(clip)
+}
+
+/// A clip's `<speed>` field: thousandths of real time, as
+/// [`crate::project::Speed`] holds it -- `1000` is the rate it was shot at. A
+/// dialect with no such field (everything before v8) means real time, which is
+/// what such a project always played at. A number outside the range the editor
+/// can set is *refused* rather than clamped: a project file is generated, so
+/// that is a corrupt line and not a dialect.
+fn speed_of(field: Option<&[u8]>, line: usize) -> crate::Result<Speed> {
+    let Some(field) = field else {
+        return Ok(Speed::NORMAL);
+    };
+    let permille = number(field, line)?;
+    let speed = Speed::from_permille(permille.min(u32::from(u16::MAX)) as u16);
+    if u32::from(speed.permille()) != permille {
+        return Err(format!(
+            "line {line}: speed {permille} is outside {}-{} thousandths",
+            Speed::MIN.permille(),
+            Speed::MAX.permille()
+        )
+        .into());
+    }
+    Ok(speed)
 }
 
 /// How a fit policy is spelled in the file. One word each, so a clip line stays
@@ -746,6 +783,7 @@ mod tests {
             eq: None,
             color: None,
             fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
         }
     }
 
@@ -795,10 +833,10 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
-             audio 1 0 0 30 0 0 - - fit\n",
+             video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
+             audio 1 0 0 30 0 0 - - fit 1000\n",
             "the file under the project directory is written relative to it, \
              each with the audio stream it plays"
         );
@@ -832,9 +870,9 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 7\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 4 - - fit\naudio 1\n\
-             video 2 40 0 10 0 - - - fit\naudio 2 0 0 30 0 4 - - fit\n",
+            "edith 8\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
+             video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -940,12 +978,12 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
-             video 1 0 0 30 0 0 0 - fit\nvideo 1 30 10 20 0 - 1 - fit\n\
-             audio 1 0 0 30 0 0 0 - fit\naudio 1 30 0 10 0 - 2 - fit\n",
+             video 1 0 0 30 0 0 0 - fit 1000\nvideo 1 30 10 20 0 - 1 - fit 1000\n\
+             audio 1 0 0 30 0 0 0 - fit 1000\naudio 1 30 0 10 0 - 2 - fit 1000\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -1016,11 +1054,13 @@ mod tests {
                 Clip {
                     color: Some(0),
                     fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
                     ..clip(0, 0, 30, 0, Some(0))
                 },
                 Clip {
                     color: Some(1),
                     fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
                     ..clip(30, 10, 20, 0, None)
                 },
             ],
@@ -1028,11 +1068,13 @@ mod tests {
                 Clip {
                     color: Some(0),
                     fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
                     ..clip(0, 0, 30, 0, Some(0))
                 },
                 Clip {
                     color: Some(2),
                     fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
                     ..clip(30, 0, 10, 0, None)
                 },
             ],
@@ -1040,12 +1082,12 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
-             video 1 0 0 30 0 0 - 0 fit\nvideo 1 30 10 20 0 - - 1 fit\n\
-             audio 1 0 0 30 0 0 - 0 fit\naudio 1 30 0 10 0 - - 2 fit\n",
+             video 1 0 0 30 0 0 - 0 fit 1000\nvideo 1 30 10 20 0 - - 1 fit 1000\n\
+             audio 1 0 0 30 0 0 - 0 fit 1000\naudio 1 30 0 10 0 - - 2 fit 1000\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -1105,9 +1147,81 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 7\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
-             video 1 0 0 30 0 0 0 - fit\naudio 1 0 0 30 0 0 - - fit\n"
+             video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
+        );
+    }
+
+    /// The whole of the v8 bump, the eq and colour tests' twin: a clip's rate is
+    /// written on its own line, comes back as the very number that was set, and
+    /// a v7 file -- which has no such field -- loads at real time and re-saves
+    /// saying so.
+    #[test]
+    fn speeds_round_trip_and_a_v7_file_plays_at_real_time() {
+        let dir = PathBuf::from("/proj");
+        let sources = vec![Source::new("/proj/a.mp4", 0)];
+        let speeded = |start, in_frame, out_frame, permille| Clip {
+            start,
+            in_frame,
+            out_frame,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+            speed: Speed::from_permille(permille),
+        };
+        // 30 source frames at 2x is 15 timeline frames, which is where the
+        // second clip starts -- the file writes the source range and the rate,
+        // and the length on the timeline is derived from the two.
+        let lanes = vec![
+            (
+                LaneKind::Video,
+                vec![speeded(0, 0, 30, 2000), speeded(15, 30, 40, 250)],
+            ),
+            (LaneKind::Audio, vec![speeded(0, 0, 30, 2000)]),
+        ];
+        let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
+             audio 1 0 0 30 0 - - - fit 2000\n",
+            "the rate is the clip line's last field, in thousandths"
+        );
+        let back = parse(&bytes, &dir).expect("parse");
+        assert_eq!(back.lanes, lanes, "every clip keeps the rate it named");
+
+        // ...and the dialect before it, which had no rate to name.
+        let v7 = b"edith 7\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+                   video 1 0 0 30 0 0 - - fit\naudio 1 0 0 30 0 0 - - fit\n";
+        let old = parse(v7, &dir).expect("v7 parses");
+        assert!(
+            old.lanes
+                .iter()
+                .flat_map(|(_, clips)| clips)
+                .all(|c| c.speed == Speed::NORMAL),
+            "nothing before v8 plays at anything but real time"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&emit(
+                &dir,
+                &old.sources,
+                &old.lanes,
+                &old.eq,
+                &old.color,
+                (1280, 720),
+                old.playhead
+            )),
+            "edith 8\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
+        );
+        // A rate outside what the editor can set is a corrupt line, by name.
+        let bad = b"edith 8\nsource 0 a.mp4\nvideo 1 0 0 30 0 - - - fit 9000\n";
+        assert_eq!(
+            parse(bad, &dir).unwrap_err().to_string(),
+            "line 3: speed 9000 is outside 250-4000 thousandths"
         );
     }
 
@@ -1241,10 +1355,10 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
-             audio 1 0 0 30 0 0 - - fit\n"
+             video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
+             audio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // An empty lane's line is still the whole of that lane, eq or no eq.
         let empty = parse(
@@ -1294,10 +1408,10 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
-             audio 1 0 0 30 0 0 - - fit\n",
+             video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
+             audio 1 0 0 30 0 0 - - fit 1000\n",
             "a re-saved v2 project differs only by its version, the lane \
              numbers, the streams it always meant and an equalizer it has none of"
         );
@@ -1326,7 +1440,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 7\n"));
+        assert!(v5.starts_with(b"edith 8\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1428,8 +1542,8 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 7\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
-             video 1 0 0 30 0 - - - fit\naudio 1 0 0 30 0 - - - fit\n"
+            "edith 8\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
         // way the project was opened -- the same file, through the link, still
@@ -1473,10 +1587,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 8\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 9\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 8");
+        assert_eq!(err, "line 1: unsupported version 9");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
