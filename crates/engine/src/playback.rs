@@ -149,7 +149,7 @@ impl PlaybackSession {
         // One clip per lane covering the file, so timeline == source until the
         // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
-        let span = project.span_at(Lane::Video, 0).expect("never empty");
+        let span = project.span_at(Lane::V1, 0).expect("never empty");
         Ok(Self {
             meta,
             frames: stream.frames,
@@ -242,7 +242,7 @@ impl PlaybackSession {
 
         let playhead = doc.playhead;
         let project = Project::from_parts(doc.sources, doc.video, doc.audio)?;
-        let span = project.span_at(Lane::Video, 0).expect("never empty");
+        let span = project.span_at(Lane::V1, 0).expect("never empty");
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
@@ -295,7 +295,7 @@ impl PlaybackSession {
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
-        let (sources, video, audio) = self.project.without_orphan_sources();
+        let (sources, video, audio) = self.project.without_orphan_sources()?;
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
         crate::edith::save(path, &sources, &video, &audio, playhead)
@@ -359,7 +359,7 @@ impl PlaybackSession {
     /// clip under the running worker and only the mapping stays true.
     fn next_clip(&mut self) -> bool {
         let next = self.span.end();
-        let Some(span) = self.project.span_at(Lane::Video, next) else {
+        let Some(span) = self.project.span_at(Lane::V1, next) else {
             return false;
         };
         // We only get here on a disconnect, so the old worker has already
@@ -423,7 +423,7 @@ impl PlaybackSession {
     /// [`Project::sources`] each clip plays from -- what a lane needs to colour
     /// an imported clip differently from the file the session was opened with.
     pub fn clip_spans_by_source(&self) -> Vec<(f64, f64, usize)> {
-        self.lane_spans_by_source(Lane::Video)
+        self.lane_spans_by_source(Lane::V1)
     }
 
     /// [`clip_spans_by_source`](Self::clip_spans_by_source) for either lane,
@@ -539,7 +539,7 @@ impl PlaybackSession {
         // nothing, because there is nothing on the video lane to move along
         // with it.
         Ok(match crate::is_audio(path) {
-            true => self.place_at(Lane::Audio, timeline_secs, clip),
+            true => self.place_at(Lane::A1, timeline_secs, clip),
             false => self.paste_at(timeline_secs, clip),
         })
     }
@@ -630,7 +630,7 @@ impl PlaybackSession {
         let source = self.project.import(path, 0);
         let at = self.project.timeline_frames();
         self.project.place(
-            Lane::Audio,
+            Lane::A1,
             at,
             Clip {
                 start: at,
@@ -752,7 +752,7 @@ impl PlaybackSession {
         // `target` is inside the timeline (never empty), so this always spans;
         // the span runs from there to the end of whatever it landed in -- a
         // clip, or a gap, which starts a black-frame worker instead.
-        if let Some(span) = self.project.span_at(Lane::Video, target) {
+        if let Some(span) = self.project.span_at(Lane::V1, target) {
             self.start_span(span);
         }
         self.eos = false;
