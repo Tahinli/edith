@@ -23,7 +23,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
 use crate::decode::{DecodeSession, Frame, Worker};
-use crate::demux::{Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span};
 use crate::scale::{Composer, FitPolicy};
@@ -31,6 +31,20 @@ use crate::scale::{Composer, FitPolicy};
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
 const RING_FULL_WAIT: Duration = Duration::from_millis(10);
+
+/// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
+/// nothing was shot on it, so it is the canvas a *later* import meets rather
+/// than a description of the song. H.264 because it is the one codec that
+/// decodes without the plugin, 30 fps because a rounded-up audio length is what
+/// the frame count means and a whole number of frames per second keeps it
+/// honest; both are what a video imported onto such a timeline is held to
+/// ([`matches_timeline`]).
+///
+/// ponytail: a 25 fps video refused by an audio-only timeline it could have
+/// defined is the ceiling here. Upgrade path is adopting the first *picture's*
+/// rate and codec on import, which means retiming every audio clip already
+/// placed in frames.
+const AUDIO_ONLY_CANVAS: (u32, u32, f64) = (1920, 1080, 30.0);
 
 /// The output half of a session: the device, plus what the feeder has handed it.
 /// Cloned into the feeder thread; every field that matters is shared.
@@ -153,16 +167,12 @@ impl PlaybackSession {
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        // A timeline is scaffolded from source 0's picture -- its size, its
-        // frame rate, its clock. A song has none of that, so it joins a
-        // timeline (`import`) rather than starting one, and saying so beats
-        // failing in the demuxer's words.
+        // A timeline is normally scaffolded from source 0's picture -- its size,
+        // its frame rate, its clock. A song has none of that, so it scaffolds
+        // the *canvas* instead and its own sound keeps the clock: an audio-only
+        // project is a project like any other, it simply plays black.
         if crate::is_audio(&path) {
-            return Err(format!(
-                "{} has no picture: open a video first, then import it onto the audio lane",
-                path.display()
-            )
-            .into());
+            return Self::open_audio_only(&path);
         }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
@@ -206,6 +216,77 @@ impl PlaybackSession {
         })
     }
 
+    /// Opens a standalone audio file ([`crate::is_audio`]) as a timeline of its
+    /// own: one clip on `A1`, nothing on the video lane, and a picture that is
+    /// the black of an uncovered canvas ([`AUDIO_ONLY_CANVAS`]) for as long as
+    /// the song runs. Its own sound keeps the clock, exactly as a video's does.
+    ///
+    /// Refused when the file has no sound to time it by: a source with neither a
+    /// picture nor a playable length is not a timeline, and that is what
+    /// [`audio_frames`] answers -- the *device* is a different question, and a
+    /// machine without one opens this like any other session, silently.
+    fn open_audio_only(path: &Path) -> crate::Result<Self> {
+        let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+        let meta = VideoMeta {
+            width,
+            height,
+            frame_rate,
+            // Rounded up to whole frames, which is the only frame count a
+            // source with no picture has -- the same length `import_audio`
+            // gives a song joining a timeline of video. The demuxer's words are
+            // named with the file, since this is the door a file that is not
+            // really audio at all comes to.
+            frame_count: audio_frames(path, frame_rate)
+                .map_err(|e| format!("{}: {e}", path.display()))?,
+            codec: Codec::H264,
+        };
+        let (audio, audio_disabled) = open_audio(path, 0);
+        // Through `from_parts` rather than `Project::single`, which is the
+        // *video* open's pair of grouped clips: here there is no picture to
+        // group the sound with, so the video lane starts empty.
+        let clip = Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: meta.frame_count,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+        };
+        let project = Project::from_parts(
+            vec![Source::new(path, 0)],
+            vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, vec![clip])],
+            Vec::new(),
+            Vec::new(),
+        )?;
+        // Every frame of this timeline is a gap, since no video lane covers
+        // anything: `composite_span_at` says so and the black worker
+        // `start_span` would open is opened here instead, for the reason `open`
+        // opens its decoder inline -- the field has to exist for the first seek.
+        let span = project.composite_span_at(0);
+        let stream = DecodeSession::open_black(width, height, span.map_or(1, |s| s.len));
+        Ok(Self {
+            meta,
+            native: (width, height),
+            frames: stream.frames,
+            worker: stream.worker,
+            retired: Vec::new(),
+            // The song keeps the clock, as a video's own sound does -- and wall
+            // time keeps it on a machine with no device, where the picture
+            // (black) still has to move at some rate.
+            clock: PlaybackClock::new(match audio {
+                Some(_) => ClockSource::Audio,
+                None => ClockSource::Wall,
+            }),
+            audio,
+            audio_disabled,
+            project,
+            span,
+            eos: false,
+        })
+    }
+
     /// Opens a project file written by [`save_project`](Self::save_project):
     /// the whole timeline, restored to where its playhead stood, paused like
     /// [`open`](Self::open).
@@ -239,14 +320,33 @@ impl PlaybackSession {
         // Ungraded, and superseded before a frame of it is shown: the `seek` at
         // the end of this function reopens the playhead's span through
         // `start_span`, which is where a saved grade reaches the picture.
-        let (mut meta, stream) = DecodeSession::open_worker(
-            &first.path,
-            0,
-            u32::MAX,
-            ColorParams::default(),
-            Composer::passthrough(),
-        )
-        .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        // ...unless it has no picture to open: a project whose source 0 is a
+        // song scaffolds the canvas the same way a fresh audio-only open does
+        // ([`open_audio_only`](Self::open_audio_only)), and the placeholder
+        // black stream is superseded by the `seek` at the end of this function
+        // like every other worker opened here.
+        let (mut meta, stream) = match crate::is_audio(&first.path) {
+            true => {
+                let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+                let meta = VideoMeta {
+                    width,
+                    height,
+                    frame_rate,
+                    frame_count: audio_frames(&first.path, frame_rate)
+                        .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+                    codec: Codec::H264,
+                };
+                (meta, DecodeSession::open_black(width, height, 1))
+            }
+            false => DecodeSession::open_worker(
+                &first.path,
+                0,
+                u32::MAX,
+                ColorParams::default(),
+                Composer::passthrough(),
+            )
+            .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+        };
         // The project's own resolution, which is source 0's picture unless the
         // file says otherwise -- every dialect before v7 had no way to say it,
         // and that default is exactly what those projects meant.
