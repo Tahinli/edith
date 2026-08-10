@@ -50,6 +50,10 @@ const HEADER_H: f32 = 32.;
 // between them, with a few px of slack so a taller text line cannot push a lane
 // off the bottom.
 const PANEL_H: f32 = 220.;
+/// How many lane rows are drawn before the lane column starts scrolling: past
+/// this the panel would be taller than the picture it belongs under, and a
+/// timeline that pushes the video off the window is not a timeline.
+const LANES_MAX: usize = 6;
 const LANE_H: f32 = 48.;
 /// The lane header column: wide enough for `V1`/`A1` and fixed, so both lanes
 /// and the ruler above them start at the same pixel and are the same width --
@@ -428,6 +432,8 @@ impl Player {
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Undo => self.undo(cx),
+            ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
+            ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
@@ -502,32 +508,20 @@ impl Player {
             return;
         }
         let selected = self.selected.take();
-        // Exhaustive over the kind, and explicit about the ord: both engine
-        // calls below take a *first*-lane index (`delete_clip` deletes the V1
-        // clip at `idx`, `video_half` reads A1), so a selection on a second
-        // lane of either kind would delete a different clip than the one
-        // clicked. It is refused by name until the add-track slice teaches
-        // those two a lane -- a wildcard here would drop it silently.
+        // Whichever lane it was clicked in: the index is that lane's own, and
+        // the ripple cuts the clip's span out of every lane -- a group covers
+        // one span, so deleting a take by its audio half is the same edit as by
+        // its picture. What is not a whole take is lifted instead, which is what
+        // reaches a clip on an added track ([`whole_take`]).
         let deleted = match (&mut self.session, selected) {
-            (Some(session), Some((lane, idx))) if lane.ord == 0 => match lane.kind {
-                LaneKind::Video => session.delete_clip(idx),
-                LaneKind::Audio => match video_half(session, idx) {
-                    Some(video) => session.delete_clip(video),
-                    None => session.lift_clip(lane, idx),
-                },
+            (Some(session), Some((lane, idx))) => match whole_take(session, lane, idx) {
+                true => session.delete_clip(lane, idx),
+                false => session.lift_clip(lane, idx),
             },
             _ => false,
         };
-        if let Some((lane, _)) = selected.filter(|_| !deleted) {
-            if lane.ord > 0 {
-                self.notice = Some(
-                    format!(
-                        "NOTHING DELETED — delete does not reach {} yet",
-                        lane.label()
-                    )
-                    .into(),
-                );
-            }
+        if selected.is_some() && !deleted {
+            self.notice = Some("NOTHING DELETED — the timeline cannot be emptied".into());
         }
         if deleted {
             self.reset_after_reseek();
@@ -677,14 +671,15 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        // A file with no picture belongs on the audio lane and nowhere else:
-        // dropped on the video lane it is refused by name, and asked for by the
+        // A file with no picture belongs on an audio lane and nowhere else:
+        // dropped on a video lane it is refused by name, and asked for by the
         // Add button (which names no lane) it goes to the audio one -- which is
         // the engine's choice, in `place_stream_at`, not one made twice here.
-        if engine::is_audio(path) && onto == Some(Lane::V1) {
+        if engine::is_audio(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Video) {
             let name = file_name(path);
+            let lane = onto.expect("checked above").label();
             self.notice = Some(
-                format!("NOT ON THE VIDEO LANE — {name} has no picture; drop it on A1").into(),
+                format!("NOT ON {lane} — {name} has no picture; drop it on an audio lane").into(),
             );
             cx.notify();
             return;
@@ -696,7 +691,9 @@ impl Player {
         // -- an undone import leaves the source entry behind (project.rs:264)
         // -- so there is no length to insert and no file to ask for one.
         let placed = match (&mut self.session, frames) {
-            (Some(session), 1..) => session.place_stream_at(session.now(), path, stream, frames),
+            (Some(session), 1..) => {
+                session.place_stream_at(session.now(), path, stream, frames, onto)
+            }
             _ => Ok(false),
         };
         match placed {
@@ -875,6 +872,31 @@ impl Player {
         cx.notify();
     }
 
+    /// A new empty track under the ones already there. One undo step in the
+    /// engine, so the stroke that takes back an edit takes back a track too, and
+    /// no reseek: nothing plays differently until something is dropped on it.
+    /// The selection stays -- the lanes it indexes into have not moved.
+    fn add_lane(&mut self, kind: LaneKind, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match &mut self.session {
+            Some(session) => {
+                let lane = session.add_lane(kind);
+                self.notice = Some(
+                    format!(
+                        "{} ADDED — drag a clip onto it, {} takes it back",
+                        lane.label(),
+                        self.keymap.display(ActionId::Undo)
+                    )
+                    .into(),
+                );
+            }
+            None => self.notice = Some("NO TRACK ADDED — open a file first".into()),
+        }
+        cx.notify();
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
             self.reset_after_reseek();
@@ -998,6 +1020,12 @@ impl Player {
     /// written to a path ending in `.mp4` is a file every player will lie
     /// about -- keeping whatever stem the save dialog last left there.
     fn set_format(&mut self, format: Format) {
+        // The one door both the row and its initial go through, so a format the
+        // card greys out cannot be picked by keyboard either.
+        if let (Format::Mp4, Some(why)) = (format, self.session.as_ref().and_then(mp4_refusal)) {
+            self.notice = Some(format!("NOT MP4 — {why}").into());
+            return;
+        }
         self.format = format;
         self.export_path = retarget(&self.export_path, format);
     }
@@ -1591,6 +1619,18 @@ impl Player {
         // open they are dimmed rather than silently doing nothing.
         let live = self.session.is_some() && !exporting;
         let key = |action| self.keymap.display(action);
+        // The lanes the project has, or the pair a fresh one starts with so the
+        // panel reads the same before a file is open as after.
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or_else(|| vec![Lane::V1, Lane::A1], PlaybackSession::lanes);
+        // A loop rather than a `map`: each row takes `cx` in turn, where a
+        // closure would hold it for as long as the iterator lives.
+        let mut rows = Vec::new();
+        for &lane in &lanes {
+            rows.push(self.lane_row(lane, duration, filled, cx));
+        }
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
             (
@@ -1618,7 +1658,7 @@ impl Player {
         };
         div()
             .flex_none()
-            .h(px(PANEL_H))
+            .h(px(panel_h(lanes.len())))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -1664,6 +1704,36 @@ impl Player {
                         },
                         live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    // With the edit group, beside the buttons that change the
+                    // edit list: a track is a row of it, and adding one is an
+                    // undoable edit like the rest. Two buttons rather than one
+                    // with a choice, because the choice is the whole action.
+                    .child(control(
+                        "add-video-lane",
+                        None,
+                        "+ V",
+                        format!(
+                            "{} — adds a video track under the ones there",
+                            key(ActionId::AddVideoLane)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.add_lane(LaneKind::Video, cx)
+                        }),
+                    ))
+                    .child(control(
+                        "add-audio-lane",
+                        None,
+                        "+ A",
+                        format!(
+                            "{} — adds an audio track under the ones there",
+                            key(ActionId::AddAudioLane)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.add_lane(LaneKind::Audio, cx)
+                        }),
                     ))
                     // With the transport, not the edit group: it changes what
                     // the file sounds like, never what it is. Reads as its own
@@ -1799,8 +1869,22 @@ impl Player {
                             ),
                     ),
             )
-            .child(self.lane_row(Lane::V1, "V1", duration, filled, cx))
-            .child(self.lane_row(Lane::A1, "A1", duration, filled, cx))
+            // Every lane the project has, in its own order -- and its own
+            // column, so a project with more lanes than the panel is tall
+            // scrolls its tracks instead of pushing the picture off the window.
+            // The gap is the panel's own, so two lanes lay out exactly as they
+            // did when they were two children of it.
+            .child(
+                div()
+                    .id("lanes")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .max_h(px(lanes_h(LANES_MAX)))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
     }
 
     /// A notice holds its own bar, full width, until it is answered: any key
@@ -2027,11 +2111,21 @@ impl Player {
         };
         // The formats first: the quality rows below are *video* bitrate, so
         // which file is being written decides whether they mean anything.
+        // An mp4 this timeline cannot be written as reads exactly like the
+        // formats there is no encoder for: dimmed, unclickable, and carrying its
+        // own reason instead of the detail line.
+        let refused = self.session.as_ref().and_then(mp4_refusal);
         let formats: Vec<_> = FORMATS
             .into_iter()
             .enumerate()
             .map(|(i, (format, label, detail))| {
-                let picked = format == Some(self.format);
+                let blocked = format == Some(Format::Mp4) && refused.is_some();
+                let detail: SharedString = match &refused {
+                    Some(why) if blocked => why.clone().into(),
+                    _ => detail.into(),
+                };
+                let picked = format == Some(self.format) && !blocked;
+                let format = format.filter(|_| !blocked);
                 live(row(("format", i)), format.is_some())
                     .when(picked, |d| d.bg(rgb(SELECTED)))
                     .when_some(format, |d, format| {
@@ -2363,27 +2457,36 @@ impl Player {
     fn lane_row(
         &self,
         lane: Lane,
-        name: &'static str,
         duration: f64,
         filled: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+        // Borrows nothing it was given (`use<>`): the rows are built one after
+        // another into a list, and a row still holding `cx` would be the only
+        // one that could be built.
+    ) -> impl IntoElement + use<> {
         // The bed's own width, measured last repaint off the ruler's bar: the
         // two are laid out identically (same header offset, same `flex_1`), so
         // one probe answers for both. Zero before the first paint, which only
         // costs the labels one frame.
         let bed_w = f32::from(self.ruler.get().size.width);
-        let (clips, others) = match &self.session {
-            Some(session) => (
-                session.lane_clips(lane),
-                session.lane_clips(if lane.kind == LaneKind::Video {
-                    Lane::A1
-                } else {
-                    Lane::V1
-                }),
-            ),
-            None => (&[][..], &[][..]),
-        };
+        let clips = self
+            .session
+            .as_ref()
+            .map_or(&[][..], |session| session.lane_clips(lane));
+        // The group ids some *other* lane carries: a clip whose id is in here
+        // has a half elsewhere, and one whose is not is a detached half however
+        // many lanes there are.
+        let others: Vec<u32> = self.session.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|&other| other != lane)
+                .flat_map(|other| session.lane_clips(other))
+                .filter_map(|clip| clip.link)
+                .collect()
+        });
+        let name = lane.label();
+        let row_id: SharedString = format!("{name}-clip").into();
         let sources = self
             .session
             .as_ref()
@@ -2447,8 +2550,7 @@ impl Player {
                         // A group with a half in the other lane wears its tint;
                         // one without is outlined, so a detached half is visible
                         // as detached before anyone clicks it.
-                        let grouped =
-                            clip.link.is_some() && others.iter().any(|o| o.link == clip.link);
+                        let grouped = clip.link.is_some_and(|link| others.contains(&link));
                         // Tinted by *file*, not by source entry: two audio
                         // streams of one file are two sources, and the library
                         // gives them one swatch because they are one file.
@@ -2470,7 +2572,9 @@ impl Player {
                         );
                         let tip = tip.clone();
                         div()
-                            .id((if audio { "aclip" } else { "vclip" }, i))
+                            // Named per lane: two rows numbering their clips
+                            // from zero would hand gpui the same id twice.
+                            .id((row_id.clone(), i))
                             .absolute()
                             .top_0()
                             .h_full()
@@ -2708,12 +2812,14 @@ fn unseen_paths(sources: &[Source], streams: &HashMap<PathBuf, Vec<StreamInfo>>)
     out
 }
 
-/// Both lanes' clips, which is everything the timeline knows about its sources.
+/// Every lane's clips, which is everything the timeline knows about its sources.
+/// Every lane, not the first two: a clip that plays only on `V2` is still a clip
+/// the source is used by, and a walk that missed it would call the file unused.
 fn lane_clips(session: &PlaybackSession) -> impl Iterator<Item = &Clip> {
     session
-        .lane_clips(Lane::V1)
-        .iter()
-        .chain(session.lane_clips(Lane::A1))
+        .lanes()
+        .into_iter()
+        .flat_map(|lane| session.lane_clips(lane))
 }
 
 /// How long a source is, as the timeline knows it: the furthest frame any clip
@@ -3121,6 +3227,37 @@ fn is_bare_modifier(key: &str) -> bool {
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width
 /// box rather than as NaN, which gpui would carry into layout.
+/// Why this timeline cannot be written as an mp4, if it cannot: the mp4 path
+/// *copies* one AAC track and there is no encoder here to mix several with, so a
+/// timeline whose sound is spread over more than one audio lane is refused by
+/// the engine (`export::run`). Said on the row, before a destination has been
+/// picked, rather than after the write has started.
+fn mp4_refusal(session: &PlaybackSession) -> Option<String> {
+    let lanes = session
+        .lanes()
+        .into_iter()
+        .filter(|&lane| lane.kind == LaneKind::Audio && !session.lane_clips(lane).is_empty())
+        .count();
+    (lanes > 1).then(|| format!("{lanes} audio lanes — an mp4 copies one"))
+}
+
+/// How tall a column of `lanes` rows is, gaps included -- the panel's own gap
+/// between them, since the rows sit in it.
+fn lanes_h(lanes: usize) -> f32 {
+    match lanes {
+        0 => 0.,
+        n => n as f32 * LANE_H + (n - 1) as f32 * 8.,
+    }
+}
+
+/// How tall the panel is with `lanes` tracks in it: [`PANEL_H`] is sized for the
+/// two a project starts with, and every further one adds its own row -- up to
+/// [`LANES_MAX`], past which the lane column scrolls instead and the panel stops
+/// growing.
+fn panel_h(lanes: usize) -> f32 {
+    PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
+}
+
 fn width_frac(len: f64, total: f64) -> f32 {
     if total > 0. { (len / total) as f32 } else { 1. }
 }
@@ -3136,15 +3273,31 @@ fn start_frac(start: f64, total: f64) -> f32 {
     }
 }
 
-/// The video-lane index of the take an audio clip belongs to, if the video lane
-/// still holds that half. `None` for a half whose picture was lifted -- which is
-/// what makes it a thing of its own to delete.
-fn video_half(session: &PlaybackSession, audio: usize) -> Option<usize> {
-    let link = session.lane_clips(Lane::A1).get(audio)?.link?;
-    session
-        .lane_clips(Lane::V1)
-        .iter()
-        .position(|clip| clip.link == Some(link))
+/// Whether this clip is a whole take, i.e. whether deleting it may close the
+/// hole under it: a take is what the first pair of lanes carries between them,
+/// `V1`'s picture and the sound grouped with it, and dropping one moves the
+/// frames after it on every lane.
+///
+/// Everything else is a half or a layer, and is *lifted* instead: a half whose
+/// picture was lifted (what a lift leaves behind) has no take to ripple, and a
+/// clip on a further lane is laid over the timeline rather than part of it --
+/// closing a hole under it would drag the take beneath out of step with it.
+fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> bool {
+    let Some(clip) = session.lane_clips(lane).get(idx) else {
+        return false;
+    };
+    match (lane.kind, lane.ord) {
+        (_, 1..) => false,
+        (LaneKind::Video, _) => true,
+        // The sound of a take, only while the take is still there: its group is
+        // carried by a clip on some other lane.
+        (LaneKind::Audio, _) => session
+            .lanes()
+            .into_iter()
+            .filter(|&other| other != lane)
+            .flat_map(|other| session.lane_clips(other))
+            .any(|o| o.link.is_some() && o.link == clip.link),
+    }
 }
 
 /// Whether a click marks this clip: the clip that was clicked always, and the
@@ -3428,14 +3581,14 @@ fn timecode(t: f64, fps: f64) -> String {
 mod tests {
     use super::{
         ACCENT, CONTROL_H, Clip, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_W, HIT_MIN,
-        INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX,
-        LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
-        RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
-        WAVE_BPS, WAVE_COL, Wave, applicable, can_add, cancels_export, envelope, export_path,
-        export_settings, format_line, frac_along, frame_at, is_bare_modifier, is_project, keymap,
-        lane_clips, marked, menu_at, normalise, project_path, push_digit, retarget, scrub_due,
-        show_label, source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources,
-        width_frac, window_title,
+        INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
+        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H,
+        Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo,
+        Volume, WAVE_BPS, WAVE_COL, Wave, applicable, can_add, cancels_export, envelope,
+        export_path, export_settings, format_line, frac_along, frame_at, is_bare_modifier,
+        is_project, keymap, lane_clips, lanes_h, marked, menu_at, mp4_refusal, normalise, panel_h,
+        project_path, push_digit, retarget, scrub_due, show_label, source_frames, source_tint,
+        start_frac, timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, library_rows};
     use engine::PlaybackSession;
@@ -3740,7 +3893,7 @@ mod tests {
         // stream: the button, the drop and this are one call.
         assert!(
             session
-                .place_stream_at(2.0, &second, 0, frames)
+                .place_stream_at(2.0, &second, 0, frames, None)
                 .expect("av2 is already on the timeline")
         );
         // The whole of source 1 went in and nothing was painted over: the
@@ -3772,7 +3925,7 @@ mod tests {
         let end = session.timeline_duration();
         assert!(
             session
-                .place_stream_at(end, &path, 1, frames)
+                .place_stream_at(end, &path, 1, frames, None)
                 .expect("the French track shares the timeline's parameters")
         );
         assert_eq!(session.sources()[1].audio_stream, 1);
@@ -3783,6 +3936,74 @@ mod tests {
             source_frames(lane_clips(&session), session.sources(), &path),
             frames
         );
+    }
+
+    /// The add-a-track path end to end through the doors the buttons and the
+    /// drop use: `+ V` adds a row, a library row let go over it lands there and
+    /// nowhere else, Delete on it leaves the lanes under it where they are, and
+    /// undo takes the whole thing back one step at a time.
+    #[test]
+    fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
+        use engine::project::LaneKind;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1]);
+        // What the `+ V` button asks for, and what the row it draws is called.
+        let v2 = session.add_lane(LaneKind::Video);
+        assert_eq!(v2.label(), "V2");
+        assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1, v2]);
+        assert!(session.lane_clips(v2).is_empty());
+        // A library row let go over that row: the same door the Add button
+        // uses, told which lane it was let go over.
+        let path = session.sources()[0].path.clone();
+        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        assert!(
+            session
+                .place_stream_at(1.0, &path, 0, frames, Some(v2))
+                .expect("its own file is on this timeline")
+        );
+        assert_eq!(session.lane_clips(v2).len(), 1, "the drop landed on V2");
+        assert_eq!(session.lane_clips(v2)[0].start, 30, "at the playhead");
+        // And nowhere else: the first pair is exactly as it was, one take each.
+        assert_eq!(session.lane_clips(Lane::V1).len(), 1);
+        assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+        // Delete on the layer is a lift: it is laid over the timeline, so
+        // closing a hole under it would drag the take beneath out of step with
+        // it. The take on the first pair is still a take, and still ripples.
+        assert!(!whole_take(&session, v2, 0));
+        assert!(whole_take(&session, Lane::V1, 0));
+        assert!(whole_take(&session, Lane::A1, 0));
+        assert!(session.lift_clip(v2, 0));
+        assert!(session.lane_clips(v2).is_empty());
+        assert_eq!(session.lane_clips(Lane::V1).len(), 1, "V1 stayed put");
+
+        // A second audio lane carrying sound is what an mp4 export cannot
+        // write, so the card greys that row before a destination is picked.
+        assert_eq!(mp4_refusal(&session), None);
+        let a2 = session.add_lane(LaneKind::Audio);
+        assert_eq!(a2.label(), "A2");
+        assert_eq!(mp4_refusal(&session), None, "an empty lane carries nothing");
+        assert!(
+            session
+                .place_stream_at(0.0, &path, 0, frames, Some(a2))
+                .expect("its own file is on this timeline")
+        );
+        assert_eq!(
+            mp4_refusal(&session).as_deref(),
+            Some("2 audio lanes — an mp4 copies one")
+        );
+
+        // Undo, one edit at a time and backwards: the drop on A2, the lane A2
+        // itself, the lift, the drop on V2, and last the lane V2 -- an added
+        // track is one step like every other edit.
+        for lanes in [4, 3, 3, 3, 2] {
+            assert!(session.undo());
+            assert_eq!(session.lanes().len(), lanes);
+        }
+        assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1]);
+        assert_eq!(session.lane_clips(Lane::V1).len(), 1);
+        assert_eq!(mp4_refusal(&session), None);
     }
 
     #[test]
@@ -4301,6 +4522,22 @@ mod tests {
         assert!(LANE_H >= HIT_MIN);
         // A label row that ate the whole lane would leave no waveform.
         assert!(LABEL_H < LANE_H / 2.);
+        // An added track adds its own row to the panel, and the two a project
+        // starts with leave it exactly the height it has always been.
+        assert_eq!(panel_h(2), PANEL_H);
+        assert_eq!(panel_h(1), PANEL_H);
+        assert_eq!(panel_h(3), PANEL_H + LANE_H + 8.);
+        assert_eq!(
+            panel_h(LANES_MAX),
+            PANEL_H + lanes_h(LANES_MAX) - lanes_h(2)
+        );
+        // Past the cap the column scrolls instead: the panel stops growing, so
+        // no number of tracks can push the picture off the window.
+        assert_eq!(panel_h(LANES_MAX + 1), panel_h(LANES_MAX));
+        assert_eq!(panel_h(50), panel_h(LANES_MAX));
+        assert_eq!(lanes_h(0), 0.);
+        assert_eq!(lanes_h(1), LANE_H);
+        assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
     }
 
     #[test]
