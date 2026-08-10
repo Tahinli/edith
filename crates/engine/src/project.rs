@@ -1390,8 +1390,10 @@ impl Project {
     /// twice over (and leave an mp4 export with two tracks to copy). A clip of a
     /// source with no picture ([`crate::is_audio`]) reaches `A1` only -- on a
     /// video lane it is a clip that decodes to nothing, and a save carrying one
-    /// does not open again. The room is still opened everywhere, or the lanes it
-    /// was not inserted into would slide out of step with the ones it was.
+    /// does not open again -- and a still image ([`crate::is_image`]) reaches
+    /// `V1` only, for the mirror of that reason. The room is still opened
+    /// everywhere, or the lanes it was not inserted into would slide out of step
+    /// with the ones it was.
     ///
     /// Exactly one history snapshot, so one [`Project::undo`] takes it back.
     /// Changes the timeline->source mapping: the caller must reseek. Refused for
@@ -1407,6 +1409,11 @@ impl Project {
             return false;
         }
         let audio_only = crate::is_audio(&source.path);
+        // ...and its mirror: a still is a picture and no sound, so a copy of one
+        // reaches `V1` only. Pasted onto `A1` as well it is a PNG the audio
+        // worker tries to demux -- which silences the *whole session*, not just
+        // that clip -- and a save the engine's own `open_project` then refuses.
+        let picture_only = crate::is_image(&source.path);
         let at = timeline_frame.min(self.timeline_frames());
         let len = clip.len();
         // Room for it: `open_room` adds `len` to every start from `at` on, and a
@@ -1433,10 +1440,10 @@ impl Project {
         // an audio lane and nowhere else, exactly as `place_stream_at` decides
         // it for an import. On a video lane it would decode to nothing, and the
         // save it wrote would not open again.
-        let kinds: &[LaneKind] = if audio_only {
-            &[LaneKind::Audio]
-        } else {
-            &[LaneKind::Video, LaneKind::Audio]
+        let kinds: &[LaneKind] = match (audio_only, picture_only) {
+            (true, _) => &[LaneKind::Audio],
+            (_, true) => &[LaneKind::Video],
+            _ => &[LaneKind::Video, LaneKind::Audio],
         };
         let takes: Vec<usize> = kinds
             .iter()

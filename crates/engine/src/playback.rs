@@ -1637,9 +1637,15 @@ fn matches_timeline(
 /// export time (`AudioSession::copy_multi_streams`).
 /// What a timeline's audio is held to: the probe of the first source that could
 /// have any. A still image is never it -- a picture defines no rate and no
-/// layout, and taking its silence for the timeline's would refuse every sound
-/// imported after it. `Ok(None)` for a timeline of nothing but stills, which is
-/// a silent one.
+/// layout, so a PNG at index 0 would otherwise be *probed* as a broken mp4 and
+/// fail the open outright.
+///
+/// `Ok(None)` for a timeline whose first such source is silent, and for one of
+/// nothing but stills. That is a silent timeline, and a file with sound is
+/// still refused by [`audio_matches`] in the words it always used ("the file
+/// has audio, the timeline is silent") -- the same answer a silent *video* as
+/// source 0 has always given. This function widens which source is asked, not
+/// what the answer means.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
     match sources.iter().find(|s| !crate::is_image(&s.path)) {
         Some(first) => AudioSession::probe(&first.path, first.audio_stream),

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use engine::export::{ExportSettings, Format};
 use engine::project::{Edge, Lane, LaneKind};
 use engine::{DecodeSession, ExportHandle, PlaybackSession};
 
@@ -207,6 +208,82 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
     // ...and back in, which is the half a five-second title card actually uses.
     assert!(session.trim_clip(Lane::V1, 0, Edge::End, clip.start + 60));
     assert_eq!(session.lane_clips(Lane::V1)[0].len(), 60);
+}
+
+/// The *clipboard* door, which is the second way a clip picks its lanes and
+/// the one that does not go through `place_stream_at`: a copied still pasted at
+/// the playhead is a grouped take everywhere else, and a take of a picture with
+/// no sound is one lane. Pasted onto `A1` as well it would be a PNG the audio
+/// worker demuxes -- which silences the whole session, not just that clip --
+/// and a save the engine's own loader then refuses.
+///
+/// Both consequences are asserted, not just the lane count: the failure this
+/// guards against was invisible in the clip list.
+#[test]
+fn pasting_a_copied_still_never_reaches_the_audio_lane() {
+    pin_software();
+    let dir = std::env::temp_dir().join(format!("ve_images_paste_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let media = dir.join("test_av.mp4");
+    let still = dir.join("test_still.png");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the video");
+    std::fs::copy(asset("test_still.png"), &still).expect("copy the still");
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&still).expect("a picture");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &still, 0, Some(Lane::V1))
+            .expect("a still joins any timeline")
+    );
+    let audio_clips = session.lane_clips(Lane::A1).len();
+
+    // Copy the still clip and paste it at the playhead, exactly as the app's
+    // ctrl+c / ctrl+v pair does (`Player::copy` takes `clip_at`, `Player::paste`
+    // hands it to `paste_at`).
+    let last = session.lane_clips(Lane::V1).len() - 1;
+    let copied = session.clip_at(last).expect("the clipboard sees the still");
+    session.seek(0.0);
+    assert!(session.paste_at(0.0, copied), "the paste takes");
+
+    assert_eq!(
+        session.lane_clips(Lane::A1).len(),
+        audio_clips,
+        "a still is silent: the audio lane gains nothing from a paste"
+    );
+    assert!(
+        session
+            .lane_clips(Lane::A1)
+            .iter()
+            .all(|c| !engine::is_image(&session.sources()[c.source].path)),
+        "no audio clip may play from a picture"
+    );
+    // The sound itself, through the one public door that reads the same play
+    // list playback feeds from (`audio_segments_from` ->
+    // `open_mixed_streams_eq`): a WAV export. With a PNG on the audio lane this
+    // is the demux error that silences the session, not a file.
+    let wav = dir.join("pasted.wav");
+    let settings = ExportSettings {
+        format: Format::Wav,
+        ..ExportSettings::default()
+    };
+    wait(
+        &session.export_to_with(&wav, &settings),
+        Duration::from_secs(120),
+    )
+    .expect("the timeline's sound is still there");
+    assert!(
+        std::fs::metadata(&wav).expect("the wav exists").len() > 1_000,
+        "a silent-by-failure export would be the header alone"
+    );
+    // ...and the save the engine writes is one the engine can open.
+    let project = dir.join("pasted.edith");
+    session.save_project(&project).expect("save");
+    PlaybackSession::open_project(&project).expect("the engine's own save reopens");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Saved and reopened: the clip that comes back plays the same picture for the
