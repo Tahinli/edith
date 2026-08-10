@@ -5,6 +5,12 @@ edition.workspace = true
 
 # No UI dependency here, ever: the engine must stay reusable across front-ends.
 [dependencies]
+# The two audio-only export formats. Pure Rust, both of them, which is the whole
+# reason they are the two: `hound` writes the RIFF header and the PCM, `flacenc`
+# encodes FLAC. No default features on flacenc -- its `par` (rayon), `log` and
+# `serde` are for its own command-line front-end, and this needs none of them.
+hound = "3.5.1"
+flacenc = { version = "0.5.1", default-features = false }
 libloading = "0.8"
 mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
