@@ -1,6 +1,19 @@
-//! Background audio decode worker: pulls the AAC track out of an MP4 and hands
+//! Background audio decode worker: pulls a source's audio track and hands
 //! interleaved f32 over a bounded channel, same shape as `decode`. Uses its own
-//! `Mp4Reader` so the video demuxer stays single-owner.
+//! reader so the video demuxer stays single-owner.
+//!
+//! Two readers, one output. An mp4 goes through `mp4`+`symphonia-codec-aac` as
+//! it always has -- that path also yields the raw access units the export
+//! copies, which is the only reason it is kept separate -- and a standalone
+//! audio file (`crate::is_audio`: mp3, wav, flac, ogg, ALAC, ADTS) goes through
+//! symphonia's own format probe. Everything downstream of [`Track`] sees the
+//! same samples either way; only the packet copy asks which reader it came from,
+//! because there is nothing to copy out of an mp3 that an mp4 can hold.
+//!
+//! Both readers are addressed as `(path, stream)`. An mp4 may carry several
+//! audio tracks and the caller picks one; a standalone audio file carries
+//! exactly one, so any stream above 0 there is an `Err` rather than a silent
+//! fallback to the only track it has.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -13,8 +26,17 @@ use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known::CODEC_ID_AAC,
 };
+use symphonia_core::formats::probe::Hint;
+// `TrackType` is the name both readers give their track kinds; the mp4 one is
+// imported above and used far more often here, so symphonia's is the one aliased.
+use symphonia_core::formats::{
+    FormatOptions, FormatReader, SeekMode, SeekTo, TrackType as SymKind,
+};
+use symphonia_core::io::MediaSourceStream;
+use symphonia_core::meta::MetadataOptions;
 use symphonia_core::packet::Packet;
 use symphonia_core::units;
+use symphonia_core::units::{Time, TimeBase};
 
 /// ffmpeg's AAC-LC encoder delay, used when the file carries no edit list.
 /// (HE-AAC/iTunes files use 2112, but those are rejected as unsupported here.)
@@ -29,6 +51,12 @@ const PRE_ROLL: u32 = 2;
 
 /// Frames per channel one AAC-LC packet carries. Fixed by the codec.
 const SAMPLES_PER_PACKET: u32 = 1024;
+
+/// Frames per channel a seek into a standalone audio file lands ahead of the
+/// window, decoded and thrown away: enough to refill an mp3's bit reservoir
+/// (a frame is 1152 samples and the reservoir reaches back two of them) at any
+/// rate we accept.
+const SYM_PRE_ROLL: u64 = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioMeta {
@@ -67,9 +95,14 @@ pub struct AacPacket {
 
 /// Everything an import check needs from a candidate file's audio track. Two
 /// files may share a timeline only when their probes are equal (or both `None`).
+///
+/// Rate and layout only: those are what one output device and one exported track
+/// can carry, and an mp3 that agrees on both may join a timeline of mp4s even
+/// though nothing about it can be *copied* into an export -- that is a separate
+/// refusal, at export time, in [`AudioSession::copy_multi_segments`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioProbe {
-    pub params: AacTrackParams,
+    pub sample_rate: u32,
     pub channels: u16,
 }
 
@@ -183,13 +216,13 @@ impl AudioSession {
         // The timeline's meta is the first source's: policy makes every other
         // source match it, and the checks below hold them to that.
         let meta = AudioMeta {
-            sample_rate: first.sample_rate,
+            sample_rate: first.sample_rate(),
             channels: first.channels()?,
-            total_samples: first.total_samples,
+            total_samples: first.total_samples(),
         };
         // Built here only so an undecodable stream is an `Err` from the opener
         // rather than a silently empty channel; the worker makes its own.
-        AacDecoder::try_new(&first.params, &AudioDecoderOptions::default())?;
+        first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
         tracks[0] = Some(first);
@@ -206,17 +239,17 @@ impl AudioSession {
             let (path, stream) = &sources[source];
             let track = Track::open(path, *stream)?
                 .ok_or_else(|| format!("source {source} has no audio track"))?;
-            if (track.sample_rate, track.channels()?) != (meta.sample_rate, meta.channels) {
+            if (track.sample_rate(), track.channels()?) != (meta.sample_rate, meta.channels) {
                 return Err(format!(
                     "source {source} is {} Hz {} ch, the timeline is {} Hz {} ch",
-                    track.sample_rate,
+                    track.sample_rate(),
                     track.channels()?,
                     meta.sample_rate,
                     meta.channels
                 )
                 .into());
             }
-            AacDecoder::try_new(&track.params, &AudioDecoderOptions::default())?;
+            track.check_decoder()?;
             *slot = Some(track);
         }
 
@@ -237,7 +270,7 @@ impl AudioSession {
         let timeline = segments.first().map_or(0, |s| match s.source {
             Some(source) => s
                 .media_target
-                .saturating_sub(tracks[source].as_ref().expect("opened above").priming),
+                .saturating_sub(tracks[source].as_ref().expect("opened above").priming()),
             None => 0,
         });
 
@@ -282,15 +315,15 @@ impl AudioSession {
 
     /// The audio parameters of `path`'s `stream`, for checking an import
     /// against the timeline's first source: header only, no decoder and no
-    /// worker. `Ok(None)` means no AAC track — an audio-less file, which import
-    /// pairs only with other audio-less files. A *named* stream that is not
-    /// there or does not decode is an `Err`, as everywhere else.
+    /// worker. `Ok(None)` means no audio track — a silent file, which import
+    /// pairs only with other silent files. A *named* stream that is not there
+    /// or does not decode is an `Err`, as everywhere else.
     pub fn probe(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<AudioProbe>> {
         let Some(track) = Track::open(path.as_ref(), stream)? else {
             return Ok(None);
         };
         Ok(Some(AudioProbe {
-            params: track.track_params(),
+            sample_rate: track.sample_rate(),
             channels: track.channels()?,
         }))
     }
@@ -303,8 +336,27 @@ impl AudioSession {
     ///
     /// An empty list means the file has no audio at all, which is a valid
     /// silent source.
+    ///
+    /// A standalone audio file ([`crate::is_audio`]) has exactly one stream by
+    /// construction — one track, no picture beside it — so it is described from
+    /// symphonia's own header rather than walked as an mp4, which an mp3 is not
+    /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        if crate::is_audio(path) {
+            let track = SymTrack::open(path)?;
+            return Ok(vec![StreamInfo {
+                index: 0,
+                codec: track.codec.into(),
+                channels: track.channels,
+                sample_rate: track.sample_rate,
+                // Neither the mp3 nor the wav headers carry an ISO-639 tag the
+                // way an mdhd does, and a lone track needs no telling apart.
+                lang: None,
+                decodable: matches!(track.channels, 1 | 2) && track.decoder().is_ok(),
+            }]);
+        }
+        let file = File::open(path)?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
         Ok(audio_track_ids(&reader)
@@ -329,6 +381,37 @@ impl AudioSession {
                 }
             })
             .collect())
+    }
+
+    /// How long `path`'s audio plays, in seconds. `Ok(None)` for a silent file.
+    ///
+    /// A standalone audio file is a source with no frame count of its own, so
+    /// this is what its length on the timeline is derived from. Taken from the
+    /// header where there is one; a stream that does not say — a bare mp3 with
+    /// no Xing header is the usual one — is *decoded* to find out, which is
+    /// linear in its length (~0.5 ms per source second) and happens once, at
+    /// import, rather than per repaint.
+    ///
+    /// Stream 0: this answers for a standalone audio file, whose only stream
+    /// that is. A video source's length is its frame count, never this.
+    pub fn duration_secs(path: impl AsRef<Path>) -> crate::Result<Option<f64>> {
+        let path = path.as_ref();
+        let Some(track) = Track::open(path, 0)? else {
+            return Ok(None);
+        };
+        let rate = f64::from(track.sample_rate().max(1));
+        if let Some(total) = track.total_samples() {
+            return Ok(Some(total as f64 / rate));
+        }
+        drop(track);
+        let Some((meta, rx)) = Self::open(path)? else {
+            return Ok(None);
+        };
+        let channels = usize::from(meta.channels.max(1));
+        let last = rx.into_iter().fold(0, |_, chunk| {
+            chunk.start_sample + (chunk.samples.len() / channels) as u64
+        });
+        Ok(Some(last as f64 / f64::from(meta.sample_rate.max(1))))
     }
 
     /// The raw AAC packets covering `segs` — the same half-open source-second
@@ -399,11 +482,11 @@ impl AudioSession {
         let (path, stream) = sources
             .get(first)
             .ok_or_else(|| format!("segment names source {first} of {}", sources.len()))?;
-        let Some(track) = Track::open(path, *stream)? else {
+        let Some(track) = copy_track(path, *stream)? else {
             return Ok(None); // silent source, silent export
         };
         let params = track.track_params();
-        let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
+        let mut tracks: Vec<Option<AacTrack>> = sources.iter().map(|_| None).collect();
         tracks[first] = Some(track);
 
         let sample_rate = params.sample_rate;
@@ -491,28 +574,248 @@ fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
 /// The source at `index`, on the stream it names, opened on first use. Sources
 /// a segment list never names are never touched: a project's list only grows.
 fn source_at<'a>(
-    tracks: &'a mut [Option<Track>],
+    tracks: &'a mut [Option<AacTrack>],
     sources: &[(PathBuf, usize)],
     index: usize,
-) -> crate::Result<&'a mut Track> {
+) -> crate::Result<&'a mut AacTrack> {
     let slot = tracks
         .get_mut(index)
         .ok_or_else(|| format!("segment names source {index} of {}", sources.len()))?;
     if slot.is_none() {
         let (path, stream) = &sources[index];
         *slot = Some(
-            Track::open(path, *stream)?
+            copy_track(path, *stream)?
                 .ok_or_else(|| format!("source {index} has no audio track"))?,
         );
     }
     Ok(slot.as_mut().expect("just opened"))
 }
 
+/// A source's track for the *copy* path, which needs raw AAC access units.
+///
+/// An mp3, a wav, a flac — anything the export cannot copy — is refused here by
+/// name and by format rather than exported silent or, worse, exported as noise:
+/// there is no AAC encoder in this project (see [`AudioSession::copy_segments`]),
+/// so a timeline carrying one of those simply cannot become an mp4 today. The
+/// wording is what a front-end shows.
+///
+/// `Ok(None)` for a file with no audio at all, which is a silent export.
+fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
+    match Track::open(path, stream)? {
+        None => Ok(None),
+        Some(Track::Aac(track)) => Ok(Some(track)),
+        Some(Track::Sym(track)) => Err(format!(
+            "export needs AAC audio today; {} is {}",
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy(),
+            track.codec
+        )
+        .into()),
+    }
+}
+
+/// One source's audio, however it is stored: the mp4 AAC track the export can
+/// copy, or a standalone file read through symphonia's probe. The opener and
+/// the worker speak to this, never to either reader directly.
+enum Track {
+    Aac(AacTrack),
+    Sym(SymTrack),
+}
+
+impl Track {
+    /// `Ok(None)` for a file with no audio, which is a valid silent source.
+    ///
+    /// The mp4 reader goes first and its verdict is final for anything that is
+    /// not [`crate::is_audio`]: a video file's audio track is exactly what it
+    /// always was, silent mp4s included (an mp4 whose only `soun` track is one
+    /// we cannot decode has always been a silent source, not an error). Only a
+    /// standalone audio file falls through to symphonia — which is also how an
+    /// ALAC `.m4a` is reached, since it parses as an mp4 with no AAC track.
+    ///
+    /// `stream` counts audio tracks in file order, as
+    /// [`AudioSession::probe_streams`] hands them out. A standalone audio file
+    /// has exactly one, so any `stream` above 0 there is a promise the file
+    /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
+    fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
+        let audio_file = crate::is_audio(path);
+        match AacTrack::open(path, stream) {
+            Ok(Some(track)) => return Ok(Some(Self::Aac(track))),
+            Ok(None) if !audio_file => return Ok(None),
+            Err(e) if !audio_file => return Err(e),
+            _ => {}
+        }
+        if stream > 0 {
+            return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
+        }
+        SymTrack::open(path).map(|track| Some(Self::Sym(track)))
+    }
+
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Aac(t) => t.sample_rate,
+            Self::Sym(t) => t.sample_rate,
+        }
+    }
+
+    /// Mono or stereo; anything wider is refused here rather than one packet at
+    /// a time, because one output device and one copied track is all there is.
+    fn channels(&self) -> crate::Result<u16> {
+        match self {
+            Self::Aac(t) => t.channels(),
+            Self::Sym(t) => match t.channels {
+                1 | 2 => Ok(t.channels),
+                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
+            },
+        }
+    }
+
+    /// Frames per channel of *audible* audio, priming already subtracted.
+    fn total_samples(&self) -> Option<u64> {
+        match self {
+            Self::Aac(t) => t.total_samples,
+            Self::Sym(t) => t.total_samples,
+        }
+    }
+
+    /// Encoder delay of this file. Sources are joined, priming is not shared.
+    fn priming(&self) -> u64 {
+        match self {
+            Self::Aac(t) => t.priming,
+            Self::Sym(t) => t.priming,
+        }
+    }
+
+    /// One `[start, end)` window of this source's seconds, resolved to whatever
+    /// its own reader needs to find it again.
+    fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
+        match self {
+            Self::Aac(t) => t.segment(source, start_secs, end_secs),
+            Self::Sym(t) => {
+                let media_target = t.media(start_secs);
+                Segment {
+                    source: Some(source),
+                    start_id: 0,
+                    start_pos: 0,
+                    media_target,
+                    media_end: t.media(end_secs).max(media_target),
+                }
+            }
+        }
+    }
+
+    /// Builds and throws away a decoder, so an undecodable stream is an `Err`
+    /// from the opener rather than a silently empty channel.
+    fn check_decoder(&self) -> crate::Result<()> {
+        match self {
+            Self::Aac(t) => {
+                AacDecoder::try_new(&t.params, &AudioDecoderOptions::default())?;
+            }
+            Self::Sym(t) => {
+                t.decoder()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A standalone audio file — mp3, wav, flac, vorbis in ogg, ALAC, ADTS — read
+/// through symphonia's own probe and codec registry. No packet table and no
+/// sample ids: the reader is *seeked* per segment and the packets it then hands
+/// out carry their own timestamps.
+struct SymTrack {
+    reader: Box<dyn FormatReader>,
+    track_id: u32,
+    sample_rate: u32,
+    channels: u16,
+    /// Frames per channel of audible audio, `None` when the header does not say.
+    total_samples: Option<u64>,
+    /// Encoder delay: the same role [`AacTrack::priming`] plays, taken from the
+    /// container where it declares one (mp3's Xing/LAME tag, ALAC's edit list).
+    priming: u64,
+    time_base: TimeBase,
+    params: AudioCodecParameters,
+    /// The format's short name, for the export refusal. `&'static` because it
+    /// comes out of the codec registry, which outlives everything here.
+    codec: &'static str,
+}
+
+impl SymTrack {
+    fn open(path: &Path) -> crate::Result<Self> {
+        let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
+        // The extension is a hint, not a decision: the probe reads the magic and
+        // is free to disagree, which is what makes a mislabelled file work.
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+        let reader = symphonia::default::get_probe().probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )?;
+        let track = reader
+            .default_track(SymKind::Audio)
+            .ok_or_else(|| format!("{} has no audio track", path.display()))?;
+        let (track_id, num_frames, delay) = (track.id, track.num_frames, track.delay);
+        let time_base = track
+            .time_base
+            .ok_or_else(|| format!("{} declares no time base", path.display()))?;
+        let Some(symphonia_core::codecs::CodecParameters::Audio(params)) =
+            track.codec_params.clone()
+        else {
+            return Err(format!("{} declares no audio codec", path.display()).into());
+        };
+        let sample_rate = params
+            .sample_rate
+            .ok_or_else(|| format!("{} declares no sample rate", path.display()))?;
+        let channels = params
+            .channels
+            .as_ref()
+            .map(|c| c.count() as u16)
+            .ok_or_else(|| format!("{} declares no channel layout", path.display()))?;
+        let codec = symphonia::default::get_codecs()
+            .get_audio_decoder(params.codec)
+            .map_or("an unsupported format", |d| d.codec.info.short_name);
+        Ok(Self {
+            reader,
+            track_id,
+            sample_rate,
+            channels,
+            total_samples: num_frames,
+            priming: u64::from(delay.unwrap_or(0)),
+            time_base,
+            params,
+            codec,
+        })
+    }
+
+    /// A fresh decoder: seeking mid-stream leaves state that belongs to the
+    /// packets we skipped, exactly as on the AAC path.
+    fn decoder(&self) -> crate::Result<Box<dyn AudioDecoder>> {
+        Ok(symphonia::default::get_codecs()
+            .make_audio_decoder(&self.params, &AudioDecoderOptions::default())?)
+    }
+
+    /// `secs` on this source's audible timeline into media samples (priming
+    /// included, so it compares directly against a decoded position).
+    fn media(&self, secs: f64) -> u64 {
+        ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
+    }
+
+    /// A packet timestamp in the track's time base, as samples per channel.
+    fn samples_at(&self, ts: symphonia_core::units::Timestamp) -> u64 {
+        let secs = self.time_base.calc_time_saturating(ts).as_secs_f64();
+        (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+    }
+}
+
 /// One source's AAC track, resolved once: the reader plus everything the header
 /// has to say about it. `stts` is copied out because every other field would
 /// otherwise keep a borrow alive on the reader the worker needs mutably — a real
 /// AAC track has one entry, so it is two `u32`s.
-struct Track {
+struct AacTrack {
     reader: Mp4Reader<BufReader<File>>,
     track_id: u32,
     sample_count: u32,
@@ -530,15 +833,16 @@ struct Track {
     params: AudioCodecParameters,
 }
 
-impl Track {
+impl AacTrack {
     /// The `stream`-th audio track of `path`, counted in file order over *all*
     /// audio tracks — the numbering [`AudioSession::probe_streams`] hands out.
     ///
-    /// Stream 0 is best effort: `Ok(None)` when there is no audio there at all
-    /// or the codec is one we do not decode, which is a valid silent source (a
-    /// file whose audio is AC-3 still has a picture worth editing). A stream the
-    /// caller *named* is a promise instead, so out of range or undecodable
-    /// there is an `Err` rather than silence the caller did not ask for.
+    /// Stream 0 is best effort: `Ok(None)` when there is no AAC track there at
+    /// all, which is a valid silent source (a file whose audio is AC-3 still has
+    /// a picture worth editing) and, for a standalone audio file, the door
+    /// through to symphonia ([`Track::open`]). A stream the caller *named* is a
+    /// promise instead, so out of range or not AAC there is an `Err` rather than
+    /// silence the caller did not ask for.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
@@ -896,6 +1200,15 @@ fn run(mut w: Worker) {
         let Some(track) = w.tracks[source].as_mut() else {
             continue; // opener fills every named source; nothing to decode
         };
+        let track = match track {
+            Track::Sym(track) => {
+                if !run_sym(track, seg, channels, &mut timeline, &w.tx) {
+                    return; // consumer went away
+                }
+                continue;
+            }
+            Track::Aac(track) => track,
+        };
         let mut decoder = match AacDecoder::try_new(&track.params, &AudioDecoderOptions::default())
         {
             Ok(decoder) => decoder,
@@ -933,35 +1246,126 @@ fn run(mut w: Worker) {
             };
             buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
             let next = pos + (interleaved.len() / channels) as u64;
-
-            // Everything before the target is encoder priming and/or decoder
-            // pre-roll, not audio the caller asked for: drop it, splitting the
-            // packet that straddles the target.
-            if next <= seg.media_target {
-                pos = next;
-                continue;
-            }
-            if pos < seg.media_target {
-                interleaved.drain(..(seg.media_target - pos) as usize * channels);
-                pos = seg.media_target;
-            }
-            // And the tail past the segment end goes too — on a short segment
-            // that is this same buffer, trimmed at both ends.
-            if next > seg.media_end {
-                interleaved.truncate((seg.media_end - pos) as usize * channels);
-            }
-            pos = next;
-            if interleaved.is_empty() {
-                continue; // nothing left of it; the loop head ends the segment
-            }
-            let chunk = AudioChunk {
-                start_sample: timeline,
-                samples: std::mem::take(&mut interleaved),
-            };
-            timeline += (chunk.samples.len() / channels) as u64;
-            if w.tx.send(chunk).is_err() {
+            if !emit(
+                &mut interleaved,
+                channels,
+                seg,
+                pos,
+                next,
+                &mut timeline,
+                &w.tx,
+            ) {
                 return; // consumer went away
             }
+            pos = next;
+        }
+    }
+}
+
+/// Trims one decoded buffer to the segment window and sends what survives.
+/// `pos` is the media position of its first frame and `next` of the one after
+/// it; both readers hand the same thing here, which is why the window rules
+/// live in one place. `false` means the consumer went away.
+///
+/// Everything before the target is encoder priming and/or decoder pre-roll, not
+/// audio the caller asked for: it is dropped, splitting the buffer that
+/// straddles the target. The tail past the segment end goes too — on a short
+/// segment that is this same buffer, trimmed at both ends.
+fn emit(
+    interleaved: &mut Vec<f32>,
+    channels: usize,
+    seg: &Segment,
+    pos: u64,
+    next: u64,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    if next <= seg.media_target {
+        return true;
+    }
+    let mut pos = pos;
+    if pos < seg.media_target {
+        interleaved.drain(..(seg.media_target - pos) as usize * channels);
+        pos = seg.media_target;
+    }
+    if next > seg.media_end {
+        interleaved.truncate((seg.media_end - pos) as usize * channels);
+    }
+    if interleaved.is_empty() {
+        return true; // nothing left of it; the loop head ends the segment
+    }
+    let chunk = AudioChunk {
+        start_sample: *timeline,
+        samples: std::mem::take(interleaved),
+    };
+    *timeline += (chunk.samples.len() / channels) as u64;
+    tx.send(chunk).is_ok()
+}
+
+/// One segment of a standalone audio file: seek the reader to just before the
+/// window, then decode forward until the window is filled.
+///
+/// The seek goes [`SYM_PRE_ROLL`] ahead of the target and everything before the
+/// target is thrown away by [`emit`], which is what gives a codec with decoder
+/// state — mp3's bit reservoir above all — something to warm up on, exactly as
+/// the AAC path's two-packet pre-roll does. A reader that cannot seek at all
+/// simply decodes from wherever it is; the window rules still hold, it is only
+/// slower. `false` means the consumer went away.
+fn run_sym(
+    track: &mut SymTrack,
+    seg: &Segment,
+    channels: usize,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    let mut decoder = match track.decoder() {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let rate = f64::from(track.sample_rate.max(1));
+    let from = seg.media_target.saturating_sub(SYM_PRE_ROLL) as f64 / rate;
+    if let Some(time) = Time::try_from_secs_f64(from) {
+        let to = SeekTo::Time {
+            time,
+            track_id: Some(track.track_id),
+        };
+        // A failed seek is not fatal: it leaves the reader where it was, and
+        // the window rules below still only emit what the segment asked for.
+        if let Err(e) = track.reader.seek(SeekMode::Accurate, to) {
+            eprintln!("audio seek to {from:.3}s failed: {e}");
+        }
+    }
+    let mut interleaved = Vec::new();
+    loop {
+        let packet = match track.reader.next_packet() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => return true, // end of the file, and of the segment
+            Err(e) => {
+                eprintln!("audio demux error: {e}");
+                return true;
+            }
+        };
+        if packet.track_id != track.track_id {
+            continue; // another track of the same container
+        }
+        let pos = track.samples_at(packet.pts);
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let buf = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            Err(e) => {
+                eprintln!("audio decode error at sample {pos}: {e}");
+                return true;
+            }
+        };
+        buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
+        let next = pos + (interleaved.len() / channels) as u64;
+        if !emit(&mut interleaved, channels, seg, pos, next, timeline, tx) {
+            return false;
         }
     }
 }
