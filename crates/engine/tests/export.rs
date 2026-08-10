@@ -374,6 +374,7 @@ fn a_higher_bitrate_writes_a_bigger_file() {
         let settings = ExportSettings {
             bitrate: Some(bitrate),
             force_sw: true,
+            ..Default::default()
         };
         let handle = session.export_to_with(&out, &settings);
         wait(&handle, Duration::from_secs(180)).expect("export");
