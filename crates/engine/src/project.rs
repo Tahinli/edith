@@ -666,6 +666,67 @@ impl Project {
         Lane::new(kind, self.lane_count(kind) - 1)
     }
 
+    /// Drops an *empty* lane -- [`add_lane`](Project::add_lane) taken back, and
+    /// one undo step like it, which restores the lane where it stood.
+    ///
+    /// Refused, changing nothing, while the lane holds anything: the refusal
+    /// names the clips (file and first frame), because a track removal that
+    /// deleted takes with it would be the one edit nobody sees coming. Refused
+    /// too for the last lane of its kind, which is `V1` or `A1`: those two are
+    /// where an import and a paste land ([`Project::paste`] takes lane 0 of each
+    /// kind and *skips* a kind that is not there), so a project without one
+    /// would swallow half of every file dropped on it, silently.
+    ///
+    /// The lanes below it move up one `ord`, so a handle a caller was holding
+    /// (a selection, an open card) names the lane after it from here on -- the
+    /// one thing a front-end owes this call.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        let Some(i) = self.index(lane) else {
+            return Err(format!("there is no {} to remove", lane.label()).into());
+        };
+        if self.lane_count(lane.kind) == 1 {
+            return Err(format!(
+                "{} is the only {} track: every import lands on it",
+                lane.label(),
+                match lane.kind {
+                    LaneKind::Video => "video",
+                    LaneKind::Audio => "audio",
+                }
+            )
+            .into());
+        }
+        let clips = &self.lanes[i].clips;
+        if !clips.is_empty() {
+            // Three names and a count: a lane can hold forty clips and a
+            // refusal nobody reads to the end says nothing at all.
+            let named: Vec<String> = clips
+                .iter()
+                .take(3)
+                .map(|c| {
+                    let name = self.sources.get(c.source).map_or_else(
+                        || format!("source {}", c.source),
+                        |s| s.path.display().to_string(),
+                    );
+                    format!("{name} at frame {}", c.start)
+                })
+                .collect();
+            let rest = match clips.len().saturating_sub(named.len()) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            return Err(format!(
+                "{} still holds {}{rest}: delete those clips (or drag them to \
+                 another track) first",
+                lane.label(),
+                named.join(", ")
+            )
+            .into());
+        }
+        self.snapshot();
+        self.lanes.remove(i);
+        Ok(())
+    }
+
     /// Where `lane` sits in [`Project::lanes`], or `None` for a lane that is
     /// not there. The one place a handle becomes a position.
     fn index(&self, lane: Lane) -> Option<usize> {
@@ -1658,8 +1719,19 @@ impl Project {
         }
         self.snapshot();
         for (&(l, i), keep) in members.iter().zip(fitted) {
+            let still = self.is_still(&self.lanes[l].clips[i]);
             let c = &mut self.lanes[l].clips[i];
             match edge {
+                // A still has no earlier frame to walk an in-point back to --
+                // every frame of it is the same picture -- so its head grows
+                // *forward*: the range it plays is however long the new room
+                // is, anchored at the source's frame 0. Bounded by `lo`, which
+                // is where the cap in `source_frames` is applied.
+                Edge::Start if still => {
+                    c.in_frame = 0;
+                    c.out_frame = keep;
+                    c.start = to;
+                }
                 Edge::Start => {
                     // Non-negative by `lo`, which is what keeps the in-point on
                     // the source.
@@ -1700,9 +1772,24 @@ impl Project {
                     // head than the timeline has room for -- a ripple delete
                     // slides a clip back to frame 0 with its in-point wherever
                     // the cut left it -- and frame 0 is the other wall.
-                    c.start
-                        .saturating_sub(c.speed.room(c.in_frame))
-                        .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                    //
+                    // A still is measured from its *tail* instead: it has no
+                    // in-point worth the name (every frame the same picture), so
+                    // its head reaches exactly as far as its tail does -- out to
+                    // the length the caller's table gives it, whole. Measured
+                    // from the in-point it would have no head room at all, which
+                    // is a placed picture whose left edge cannot be dragged out.
+                    // No entry in the table means no growth, as it does at the
+                    // other end.
+                    if self.is_still(&c) {
+                        c.end().saturating_sub(
+                            c.speed
+                                .room(source_frames.get(c.source).copied().unwrap_or(c.len())),
+                        )
+                    } else {
+                        c.start.saturating_sub(c.speed.room(c.in_frame))
+                    }
+                    .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
                     // One *frame of clip* always survives, and at a rate below
                     // real time one frame of clip is several frames of timeline
                     // ([`Speed::room`]): an edge dragged closer than that would
@@ -1737,6 +1824,16 @@ impl Project {
         // contains the edge's own place, and a caller's wrong `source_frames`
         // must not become an empty range (or a panicking `clamp`) here.
         Some((lo, hi.max(lo)))
+    }
+
+    /// Whether `clip` plays a still image ([`crate::is_image`]): a file whose
+    /// every frame is the same picture, so which frame of it a clip's in-point
+    /// names is not a question -- what [`Project::trim`] lets grow at either
+    /// end. `false` for a source that is not there.
+    fn is_still(&self, clip: &Clip) -> bool {
+        self.sources
+            .get(clip.source)
+            .is_some_and(|s| crate::is_image(&s.path))
     }
 
     /// The clips that move as one with the clip at `idx` of `lane` -- itself and
@@ -3411,6 +3508,56 @@ mod tests {
         assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)]);
     }
 
+    /// A still is trimmed from its head exactly as it is from its tail: it has
+    /// no earlier frame to walk an in-point back to, so the wall is the length
+    /// the caller's table allows it, measured back from the tail. Measured from
+    /// the in-point -- which a placed picture has at 0 -- its left edge could
+    /// never be dragged outwards at all.
+    #[test]
+    fn a_stills_head_stretches_out_like_its_tail() {
+        const STILL: &str = "/nonexistent/card.png";
+        /// What a still is held to, as `PlaybackSession` fills the table in.
+        const CAP: &[u32] = &[60];
+
+        let mut p = Project::single(STILL, 20);
+        assert!(p.lift(Lane::A1, 0), "a picture is silent");
+        assert!(p.lift(Lane::V1, 0), "and this one is not at frame 0");
+        assert!(p.place(Lane::V1, 100, clip(0, 0, 20, 0)));
+
+        // A source with no entry in the table may not grow, here as at the tail.
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, &[]),
+            Some((100, 119)),
+            "a length nobody told us buys no head room"
+        );
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, CAP),
+            Some((60, 119)),
+            "back to a whole cap's worth, one frame of clip surviving"
+        );
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 80, CAP));
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(80, 0, 40, 0),
+            "twenty frames longer, and still read from the source's first frame"
+        );
+        // Past the cap is clamped, exactly as the tail is -- not refused.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, CAP));
+        assert_eq!(shape(&p)[0][0], clip(60, 0, 60, 0), "a cap's worth, no more");
+        // ...and the clip in front is the nearer wall of the two: no head trim
+        // may open an overlap.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 90, CAP));
+        assert!(p.place(Lane::V1, 70, clip(0, 0, 15, 0)));
+        assert_eq!(
+            p.trim_room(Lane::V1, 1, Edge::Start, CAP),
+            Some((85, 119)),
+            "up to the neighbour's last frame and not over it"
+        );
+        assert!(p.trim(Lane::V1, 1, Edge::Start, 0, CAP));
+        assert_eq!(shape(&p)[0][1], clip(85, 0, 35, 0), "butted against it");
+        assert!(sorted_disjoint(p.lane(Lane::V1)), "no overlap");
+    }
+
     /// Linked halves trim as one: a link is one span on however many lanes, so
     /// the sound follows the picture's edge -- and the tightest wall of the two
     /// is what stops both.
@@ -4695,6 +4842,53 @@ mod tests {
         assert!(p.undo(), "and one more step takes the lane itself back");
         assert_eq!(p.lane_count(LaneKind::Video), 1);
         assert_eq!(shape(&p), shape(&three()));
+    }
+
+    /// The add taken back: an empty lane comes off, a lane holding clips never
+    /// does (and says which clips), the last lane of a kind never does, the
+    /// lanes below the one that went move up an `ord`, and one undo puts it
+    /// back where it stood.
+    #[test]
+    fn an_empty_lane_comes_off_again() {
+        let mut p = three();
+        let v2 = p.add_lane(LaneKind::Video);
+        let v3 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v3, 0, clip(0, 0, 3, 0)));
+        let why = |r: crate::Result<()>| r.expect_err("refused").to_string();
+        let history = p.history.len();
+
+        // The last lane of its kind stays: `V1`/`A1` are where an import and a
+        // paste land, and a project missing one would swallow half of a file
+        // dropped on it.
+        assert!(why(p.remove_lane(Lane::A1)).contains("only audio track"));
+        assert_eq!(
+            why(p.remove_lane(Lane::new(LaneKind::Video, 9))),
+            "there is no V10 to remove"
+        );
+
+        // A lane with clips on it refuses and names them: a track removal never
+        // deletes a take.
+        let refusal = why(p.remove_lane(v3));
+        assert!(refusal.contains("V3 still holds"), "{refusal}");
+        assert!(refusal.contains(FILE), "{refusal}");
+        assert!(refusal.contains("at frame 0"), "{refusal}");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)], "the clip is still there");
+        assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
+
+        // The empty one in the middle goes, and `V3` becomes `V2` -- clip and
+        // all.
+        p.remove_lane(v2).expect("V2 is empty");
+        assert_eq!(p.lane_count(LaneKind::Video), 2);
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2]);
+        assert_eq!(p.lane_spans(v2), vec![(0, 3)], "the lane below moved up");
+        assert_eq!(p.history.len(), history + 1, "one snapshot per removal");
+        invariants_hold(&p, "remove V2");
+
+        // ...and one stroke puts the empty lane back above it.
+        assert!(p.undo());
+        assert_eq!(p.lane_count(LaneKind::Video), 3);
+        assert!(p.lane(v2).is_empty(), "back where it stood, still empty");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)]);
     }
 
     /// The grouping rule across more than two lanes: a link id is one *span*,
