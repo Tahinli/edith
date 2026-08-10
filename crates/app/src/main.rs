@@ -929,7 +929,7 @@ impl Player {
             _ => false,
         };
         if selected.is_some() && !deleted {
-            self.notice = Some("NOTHING DELETED — the timeline cannot be emptied".into());
+            self.notice = Some("NOTHING DELETED — that clip is no longer there".into());
         }
         if deleted {
             self.reset_after_reseek();
@@ -949,7 +949,7 @@ impl Player {
                 if session.lift_clip(lane, idx) {
                     self.reset_after_reseek();
                 } else {
-                    self.notice = Some("NOTHING LIFTED — the timeline cannot be emptied".into());
+                    self.notice = Some("NOTHING LIFTED — that half is no longer there".into());
                 }
             }
             (Some(_), None) => {
@@ -1503,6 +1503,13 @@ impl Player {
             cx.notify();
             return;
         };
+        // An emptied timeline is a timeline; it is simply not a file. Refused by
+        // name here rather than written as a project of no frames.
+        if session.is_empty() {
+            self.notice = Some("NOTHING TO EXPORT — the timeline is empty".into());
+            cx.notify();
+            return;
+        }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
         // The card has been answered; the progress line takes the panel from
