@@ -7,6 +7,7 @@ pub mod convert;
 pub mod decode;
 pub mod demux;
 pub mod edith;
+pub mod eq;
 pub mod export;
 pub mod hw;
 pub mod mux;
