@@ -372,6 +372,16 @@ impl PlaybackSession {
             .collect()
     }
 
+    /// Every placement of one lane, in timeline order. What a two-lane
+    /// front-end draws and nothing
+    /// [`lane_spans_by_source`](Self::lane_spans_by_source) can answer: a clip
+    /// carries its group id (which halves a click marks together) and its
+    /// source range (where a waveform reads its peaks from) as well as its
+    /// span. The holes between consecutive clips are the gaps.
+    pub fn lane_clips(&self, lane: Lane) -> &[Clip] {
+        self.project.lane(lane)
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
