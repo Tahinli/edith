@@ -143,7 +143,8 @@ pub struct PlaybackSession {
     /// end of a file, which is a save that would not open again
     /// ([`Self::open_project`] refuses one by name). Append-only for
     /// `sources`'s reason: an index handed out stays valid, undone import or
-    /// not.
+    /// not -- with the single exception `sources` itself has,
+    /// [`Self::remove_source`], which takes the same entry out of both.
     counts: Vec<u32>,
     /// What the current video worker was opened for: where it sits on the
     /// timeline, how long it runs, and which source frame it started at --
@@ -723,6 +724,21 @@ impl PlaybackSession {
             .regroup(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// Takes that clip out of its group, so its picture and its sound are edited
+    /// apart from here on. Metadata only like a cut -- no reseek -- and one undo
+    /// step. `false` for a bad index and for a clip that is not grouped with
+    /// anything, which is already detached.
+    pub fn ungroup(&mut self, lane: Lane, idx: usize) -> bool {
+        self.project.ungroup(lane, idx)
+    }
+
+    /// Puts two clips covering the same frames back into one group: the regroup
+    /// of what [`ungroup`](Self::ungroup) took apart. Metadata only, one undo
+    /// step, and the error says why when it refuses.
+    pub fn group(&mut self, a: Lane, a_idx: usize, b: Lane, b_idx: usize) -> crate::Result<()> {
+        self.project.group(a, a_idx, b, b_idx)
+    }
+
     /// What the clip at `idx` of `lane` is equalized with, or `None` for one
     /// that plays flat -- what a card shows before it lets anyone drag a band.
     pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {
@@ -1003,6 +1019,37 @@ impl PlaybackSession {
             Some(lane) => self.place_at(lane, timeline_secs, clip),
             None => self.paste_at(timeline_secs, clip),
         })
+    }
+
+    /// Takes `path` played on `stream` out of the library -- the door a library
+    /// row's own remove goes through, naming the row exactly as
+    /// [`place_stream_at`](Self::place_stream_at) does. Refused in
+    /// [`Project::remove_source`]'s words while a clip still plays from it, and
+    /// for a row this timeline does not have.
+    ///
+    /// Reseeks like an edit even though nothing playable changed: the clip
+    /// indexes into the source list have just moved, and the running workers
+    /// were opened against the old numbering.
+    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<()> {
+        let wanted = Source::new(path, stream);
+        let idx = self
+            .project
+            .sources()
+            .iter()
+            .position(|s| *s == wanted)
+            .ok_or_else(|| format!("{} is not on this timeline", path.display()))?;
+        self.project.remove_source(idx)?;
+        // The one thing that shortens the source list, so the one place
+        // [`Self::counts`] shortens with it: left behind, the gone file's length
+        // would become the wall a *surviving* source is trimmed against
+        // ([`trim_room`](Self::trim_room)) and the next import would land its
+        // count one index late.
+        if idx < self.counts.len() {
+            self.counts.remove(idx);
+        }
+        let now = self.now();
+        self.seek(now);
+        Ok(())
     }
 
     /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
@@ -1511,7 +1558,67 @@ fn secs_to_frame(secs: f64, fps: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::secs_to_frame;
+    use super::{Edge, Lane, PlaybackSession, secs_to_frame};
+    use std::path::PathBuf;
+
+    fn asset(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    }
+
+    /// The seam between the two lists a source index reaches: dropping a file
+    /// from the library shortens `sources`, and `counts` -- the frame length
+    /// per source, which is what a trim is walled by -- has to lose the same
+    /// entry. Left behind, the dead file's length would wall the survivor.
+    #[test]
+    fn removing_a_source_takes_its_frame_count_with_it() {
+        // Source 0 is 5 s, source 1 is 4 s: two different walls, so a stale
+        // count cannot pass for the right one.
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Imported, then dragged onto the end -- an import alone places nothing
+        // ([`PlaybackSession::import`]), and this test needs both takes there.
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let end = session.timeline_duration();
+        assert!(
+            session
+                .place_stream_at(end, &asset("test_av2.mp4"), 0, None)
+                .expect("a file just imported is on this timeline")
+        );
+        let (long, short) = (session.counts[0], session.counts[1]);
+        assert!(long > short, "{long} vs {short}");
+
+        // Clear source 0's take, then take the file itself out: av2's clip is
+        // the only one left and it is source 0 now.
+        assert!(session.delete_clip(Lane::V1, 0));
+        session
+            .remove_source(&asset("test_av.mp4"), 0)
+            .expect("nothing plays it any more");
+        assert_eq!(session.counts, vec![short], "the dead length went with it");
+        assert_eq!(session.sources().len(), session.counts.len());
+
+        // The wall is the surviving file's own length, not the gone one's: a
+        // whole-file clip cannot be dragged out any further at all.
+        let clip = session.lane_clips(Lane::V1)[0];
+        assert_eq!(clip.len(), short, "av2's take, whole");
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::End),
+            Some((clip.start + 1, clip.end()))
+        );
+        assert!(
+            !session.trim_clip(Lane::V1, 0, Edge::End, clip.end() + 30),
+            "past the file's last frame is refused, by ITS length"
+        );
+
+        // ...and the next import still lines the two lists up, which is the
+        // alignment `note_frames` asserts on.
+        session
+            .import(&asset("test_av.mp4"))
+            .expect("it may come back");
+        assert_eq!(session.counts, vec![short, long]);
+        assert_eq!(session.sources().len(), session.counts.len());
+    }
 
     #[test]
     fn boundary_seconds_round_trip_to_their_own_frame() {

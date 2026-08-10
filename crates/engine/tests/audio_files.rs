@@ -322,6 +322,60 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A *song* as the first import into an empty window: `open_library` takes the
+/// audio-only fork of `open` (there is no picture to scaffold a canvas from) and
+/// still leaves the timeline empty. The row is there at the song's own length,
+/// the canvas and the clock a song would have set are set, and the drag that
+/// follows is what makes it play.
+#[test]
+fn the_first_import_of_a_song_opens_a_library_over_an_empty_timeline() {
+    let mp3 = asset("test_tone.mp3");
+    let mut session = PlaybackSession::open_library(&mp3).expect("open into the library");
+    session.set_gain(0.0);
+    assert!(session.is_empty(), "the timeline must start empty");
+    assert_eq!(session.timeline_duration(), 0.0);
+    assert!(session.lane_clips(Lane::A1).is_empty(), "nothing placed");
+    assert!(session.lane_clips(Lane::V1).is_empty(), "no picture either");
+    // The canvas a song scaffolds, and the clock that goes with it -- a session
+    // with an empty timeline is still this file's session.
+    let meta = *session.meta();
+    assert_eq!((meta.width, meta.height), (1920, 1080), "the song canvas");
+    assert_eq!(meta.frame_rate, 30.0);
+    assert_eq!(session.sources().len(), 1, "the library row");
+    assert_eq!(session.file_frames(&mp3), 90, "3 s at 30 fps, never placed");
+    assert!(!session.undo(), "opening a library is not an undo step");
+    // A file this session never took in has no length and cannot be placed.
+    assert_eq!(session.file_frames(&asset("test_tone.flac")), 0);
+    assert_eq!(
+        refusal(session.place_stream_at(0.0, &asset("test_tone.flac"), 0, None)),
+        format!(
+            "{} is not on this timeline",
+            asset("test_tone.flac").display()
+        )
+    );
+
+    // The drag: onto the audio lane and nowhere else, at the song's own length.
+    assert!(
+        session
+            .place_stream_at(0.0, &mp3, 0, None)
+            .expect("its own file is on this timeline")
+    );
+    assert!(!session.is_empty());
+    assert!((session.timeline_duration() - 3.0).abs() < 0.05);
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+    assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
+    let clip = session.lane_clips(Lane::A1)[0];
+    assert_eq!((clip.source, clip.in_frame, clip.len()), (0, 0, 90));
+    // And it plays: the segment list names the song, so the worker opens it
+    // rather than running silent.
+    session.seek(1.0);
+    assert!(!session.lane_spans_by_source(Lane::A1).is_empty());
+    // One `z` takes the drag back to the empty timeline, row and all.
+    assert!(session.undo(), "undo the drag");
+    assert!(session.is_empty());
+    assert_eq!(session.sources().len(), 1, "the row survives the undo");
+}
+
 /// The other half of the door: a *video* joining a timeline a song scaffolded.
 /// It is held to the canvas the song set (H.264, 30 fps), so a matching file
 /// brings its picture in -- and the timeline stops being audio-only, mp4 export
