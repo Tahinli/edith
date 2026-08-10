@@ -23,6 +23,7 @@ use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
 use engine::project::Lane;
+use engine::project::Source;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
@@ -174,6 +175,86 @@ fn exports_an_edited_timeline_in_hardware() {
     round_trip("hw", Duration::from_secs(60));
 }
 
+/// The trap this slice exists to close: a timeline playing a file's *second*
+/// audio stream must export that stream's packets. Playing one stream and
+/// exporting another is a file that sounds nothing like what was edited, and
+/// nothing in it would say so -- so the check is the copied bytes, not just the
+/// header. Software only: the picture is beside the point here.
+#[test]
+fn exports_the_audio_stream_the_timeline_plays() {
+    pin_software();
+    let multi = asset("test_multiaudio.mp4");
+    let (meta, _) = engine::demux::Demuxer::open(&multi).expect("open the fixture");
+    let whole = engine::Clip {
+        start: 0,
+        in_frame: 0,
+        out_frame: meta.frame_count,
+        source: 0,
+        link: Some(0),
+    };
+    // Stream 1 is the 22.05 kHz mono French track; stream 0 is 44.1 kHz
+    // stereo. A project may only hold streams that agree, so this timeline is
+    // stream 1 alone -- which is exactly what an export must carry.
+    let project = Project::from_parts(
+        vec![Source {
+            path: multi.clone(),
+            audio_stream: 1,
+        }],
+        vec![whole],
+        vec![whole],
+    )
+    .expect("a one-source project on stream 1");
+    let out = out_path("stream1");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    wait(&handle, Duration::from_secs(120)).expect("export");
+
+    let (audio, _) = engine::AudioSession::open(&out)
+        .expect("reopen export audio")
+        .expect("the export has audio");
+    assert_eq!(
+        (audio.sample_rate, audio.channels),
+        (22_050, 1),
+        "the export carries stream 0's parameters, not the stream that played"
+    );
+
+    // Byte for byte: the exported track is the copy of stream 1, and it is not
+    // the copy of stream 0 -- the second assert is what makes the first one
+    // mean something.
+    let segs = [(Some(0), 0.0, f64::from(meta.frame_count) / FPS)];
+    let copy = |stream| {
+        engine::AudioSession::copy_multi_streams(&[(multi.clone(), stream)], &segs)
+            .expect("copy")
+            .expect("has audio")
+            .1
+            .into_iter()
+            .map(|p| p.bytes)
+            .collect::<Vec<_>>()
+    };
+    let (one, zero) = (copy(1), copy(0));
+    assert_ne!(one, zero, "the two streams are not the same bytes");
+
+    let file = File::open(&out).unwrap();
+    let size = file.metadata().unwrap().len();
+    let mut reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+    let track = *reader
+        .tracks()
+        .keys()
+        .find(|id| reader.sample_count(**id).unwrap_or(0) as usize == one.len())
+        .unwrap_or(&2);
+    let written: Vec<Vec<u8>> = (1..=reader.sample_count(track).expect("audio track"))
+        .map(|id| {
+            reader
+                .read_sample(track, id)
+                .expect("sample")
+                .expect("present")
+                .bytes
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(written, one, "the exported packets are stream 1's");
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// `test_av[0,120)` then the whole of `test_av2`: the last second of the first
 /// source is deleted, so timeline frame 120 is both a cut and a file change --
 /// the join the multi-source export exists for.
@@ -183,7 +264,7 @@ fn two_sources() -> Project {
     assert_eq!((av.width, av.height), (av2.width, av2.height), "policy a");
 
     let mut project = Project::single(asset("test_av.mp4"), av.frame_count);
-    let second = project.import(asset("test_av2.mp4"));
+    let second = project.import(asset("test_av2.mp4"), 0);
     assert_eq!(second, 1, "a second file is a second source");
     assert!(project.append_clip(second, av2.frame_count));
     assert!(project.split(120), "cut a second before the end of test_av");
@@ -323,7 +404,7 @@ fn a_vanished_source_fails_the_export() {
     let mut project = Project::single(&baseline, meta.frame_count);
     assert!(project.split(5));
     assert!(project.delete(1));
-    let second = project.import(&doomed);
+    let second = project.import(&doomed, 0);
     assert!(project.append_clip(second, meta.frame_count));
     assert!(project.split(10));
     assert!(project.delete(2));

@@ -4,13 +4,14 @@ use keymap::{ActionId, Keymap};
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use engine::audio::StreamInfo;
 use engine::export::ExportSettings;
-use engine::project::Lane;
+use engine::project::{Lane, Source};
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
@@ -183,10 +184,10 @@ enum Wave {
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 
-/// A library row being dragged. The source index and nothing else: the row is
-/// only a way of naming a source, and where it lands does not change what is
-/// inserted.
-struct AssetDrag(usize);
+/// A library row being dragged: the file and which of its audio streams that
+/// row is, which is the whole of what a row names. Where it lands does not
+/// change what is inserted.
+struct AssetDrag(PathBuf, usize);
 
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
@@ -215,16 +216,21 @@ struct Player {
     /// screen, but Lift has to know which half it was aimed at. Indices move
     /// under every edit, so this is cleared by all of them.
     selected: Option<(Lane, usize)>,
-    /// Which library row is picked, as an index into the session's sources.
-    /// Its own selection and not the timeline's: Delete keeps acting on the
-    /// clip that was clicked in a lane, whatever the library is showing. Source
-    /// indexes are forever (project.rs:264), so this cannot go stale under an
-    /// edit -- only a new session clears it.
-    selected_asset: Option<usize>,
+    /// Which library row is picked: the file and the audio stream that row
+    /// names, which is what an insert needs and what survives a row list being
+    /// rebuilt. Its own selection and not the timeline's: Delete keeps acting
+    /// on the clip that was clicked in a lane, whatever the library is showing.
+    selected_asset: Option<(PathBuf, usize)>,
     /// What is known about each source's audio, taken once and kept. Keyed on
-    /// the path, and the key is inserted the moment the decode is *started*:
-    /// presence means "asked", so a repaint mid-decode cannot ask again.
-    waves: HashMap<PathBuf, Wave>,
+    /// the path *and stream* -- two streams of one file are two envelopes -- and
+    /// the key is inserted the moment the decode is *started*: presence means
+    /// "asked", so a repaint mid-decode cannot ask again.
+    waves: HashMap<(PathBuf, usize), Wave>,
+    /// Which audio streams each imported file has, as its header describes
+    /// them: one library row per entry. Keyed and filled like `waves` --
+    /// presence means "asked" -- and an empty list is a silent file, which is
+    /// exactly one row and no stream tags.
+    streams: HashMap<PathBuf, Vec<StreamInfo>>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -474,7 +480,8 @@ impl Player {
         }
     }
 
-    /// Starts a peak decode for every source that has arrived since the last
+    /// Starts a peak decode -- and a stream probe -- for every source that has
+    /// arrived since the last
     /// repaint. One call from the render rather than three at the doors,
     /// because argv, an import and a project load are all doors and only this
     /// one is guaranteed to run after each of them.
@@ -485,16 +492,35 @@ impl Player {
     /// meanwhile and the repaint comes with the peaks. The entry is written
     /// *before* the spawn, so the sixty repaints that happen while a decode runs
     /// start no further ones.
-    fn cache_waves(&mut self, cx: &mut Context<Self>) {
+    fn cache_media(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
-        for path in unseen_sources(session.sources(), &self.waves) {
-            self.waves.insert(path.clone(), Wave::Loading);
-            let decoded = cx.background_executor().spawn({
+        // Which audio streams each file has, for the library's rows. Header
+        // only, but a big file's sample tables are not free to parse, so it
+        // goes off the render thread like the peaks do.
+        for path in unseen_paths(session.sources(), &self.streams) {
+            self.streams.insert(path.clone(), Vec::new());
+            let probed = cx.background_executor().spawn({
                 let path = path.clone();
+                async move { engine::AudioSession::probe_streams(&path).unwrap_or_default() }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.streams.insert(path, probed);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        for key in unseen_sources(session.sources(), &self.waves) {
+            self.waves.insert(key.clone(), Wave::Loading);
+            let decoded = cx.background_executor().spawn({
+                let (path, stream) = key.clone();
                 async move {
-                    engine::waveform::peaks(&path, WAVE_BPS)
+                    engine::waveform::peaks(&path, stream, WAVE_BPS)
                         .ok()
                         .flatten()
                         .map(|peaks| Arc::new(normalise(peaks)))
@@ -504,7 +530,7 @@ impl Player {
                 let decoded = decoded.await;
                 this.update(cx, |this, cx| {
                     this.waves.insert(
-                        path,
+                        key,
                         match decoded {
                             Some(peaks) => Wave::Peaks(peaks),
                             // Either no audio track or a file we could not read
@@ -549,36 +575,48 @@ impl Player {
     /// moves along rather than being painted over. Reseeks like every other
     /// edit, and drops the timeline's selection with it: the insert has just
     /// moved the indices it pointed at.
-    fn insert_source(&mut self, source: usize, cx: &mut Context<Self>) {
+    fn insert_source(&mut self, path: &Path, stream: usize, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
-        let clip = self.session.as_ref().and_then(|session| {
-            let frames = source_frames(lane_clips(session), source);
-            // Zero means nothing on the timeline plays from that file any more
-            // -- an undone import leaves the source entry behind (project.rs:264)
-            // -- so there is no length to insert and no file to ask for one.
-            (frames > 0).then_some(Clip {
-                start: 0,
-                in_frame: 0,
-                out_frame: frames,
-                source,
-                link: None,
-            })
+        let frames = self.session.as_ref().map_or(0, |session| {
+            source_frames(lane_clips(session), session.sources(), path)
         });
-        let added = match (&mut self.session, clip) {
-            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
-            _ => false,
+        // Zero means nothing on the timeline plays from that file any more
+        // -- an undone import leaves the source entry behind (project.rs:264)
+        // -- so there is no length to insert and no file to ask for one.
+        let placed = match (&mut self.session, frames) {
+            (Some(session), 1..) => session.place_stream_at(session.now(), path, stream, frames),
+            _ => Ok(false),
         };
-        if added {
-            self.selected = None;
-            self.reset_after_reseek();
-        } else {
-            self.notice = Some(
-                "NOTHING ADDED — no clip on the timeline plays from that file any more".into(),
-            );
+        match placed {
+            Ok(true) => {
+                self.selected = None;
+                self.reset_after_reseek();
+            }
+            // The engine's own words: a stream that cannot join this timeline
+            // says which property disagrees, exactly as a refused import does.
+            Err(e) => self.notice = Some(format!("NOTHING ADDED — {e}").into()),
+            Ok(false) => {
+                self.notice = Some(
+                    "NOTHING ADDED — no clip on the timeline plays from that file any more".into(),
+                )
+            }
         }
         cx.notify();
+    }
+
+    /// The rate and layout the whole timeline's audio is, taken from source 0's
+    /// own stream: what a library row has to match to be placeable. `None`
+    /// until that file has been probed, and then nothing is greyed for it.
+    fn timeline_audio(&self) -> Option<(u32, u16)> {
+        let first = self.session.as_ref()?.sources().first()?;
+        let info = self
+            .streams
+            .get(&first.path)?
+            .iter()
+            .find(|s| s.index == first.audio_stream)?;
+        Some((info.sample_rate, info.channels))
     }
 
     /// Appends a file to the end of the timeline. A drop is not a key press, so
@@ -670,7 +708,7 @@ impl Player {
                 self.fps = session.meta().frame_rate;
                 // A project is named after itself but still exports beside its
                 // media: that is the only place an export has ever landed.
-                self.export_path = export_path(&session.sources()[0]);
+                self.export_path = export_path(&session.sources()[0].path);
                 self.session = Some(session);
                 self.apply_volume();
                 self.project_path = path.to_path_buf();
@@ -936,7 +974,7 @@ impl Render for Player {
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
-        self.cache_waves(cx);
+        self.cache_media(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
         let title = window_title(&self.name);
@@ -1207,81 +1245,108 @@ impl Player {
         // the door (the import policy, ledger:436), so the session's own meta
         // describes every row and nothing has to be probed to say so.
         let meta = self.session.as_ref().map(PlaybackSession::meta);
-        let rows: Vec<_> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                let picked = self.selected_asset == Some(i);
-                let frames = self
-                    .session
-                    .as_ref()
-                    .map_or(0, |session| source_frames(lane_clips(session), i));
-                let name: SharedString = file_name(path).into();
-                let tip: SharedString = match meta {
-                    Some(meta) => format!(
-                        "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
-                        path.display(),
-                        meta.width,
-                        meta.height,
-                        meta.frame_rate
-                    ),
-                    None => path.display().to_string(),
-                }
-                .into();
-                let ghost = name.clone();
-                div()
-                    .id(("asset", i))
-                    .flex_none()
-                    .h(px(ROW_H))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .pr(px(6.))
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(HOVER)))
-                    .when(picked, |d| d.bg(rgb(SELECTED)).border_1())
-                    .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.selected_asset = Some(i);
-                        cx.notify();
-                    }))
-                    // The drag carries the row's source and the row's name: one
-                    // for the drop to insert, one for the pointer to carry, so
-                    // what is being dragged is legible on the way down.
-                    .on_drag(AssetDrag(i), move |_, _, _, cx| {
-                        cx.new(|_| Tip(ghost.clone()))
-                    })
-                    // Full height and hard against the edge: the tint reads as
-                    // the lane's colour continuing into the list, not as a chip
-                    // that happens to be near it.
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(SWATCH_W))
-                            .h_full()
-                            .rounded(px(2.))
-                            .bg(rgb(source_tint(i))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .flex()
-                            .flex_col()
-                            // Two lines rather than two columns: at the width
-                            // this panel yields to, a name and a timecode side
-                            // by side leave room for neither.
-                            .child(div().truncate().text_size(px(11.)).child(name))
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(INK_DIM))
-                                    .child(timecode(f64::from(frames) / self.fps, self.fps)),
-                            ),
-                    )
-            })
-            .collect();
+        let clips: Vec<Clip> = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, |session| lane_clips(session).copied().collect());
+        let rows: Vec<_> = library_rows(sources, &self.streams, self.timeline_audio(), |path| {
+            source_frames(clips.iter(), sources, path)
+        })
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let picked = self
+                .selected_asset
+                .as_ref()
+                .is_some_and(|p| *p == (row.path.clone(), row.stream));
+            let name: SharedString = row.name.clone().into();
+            let tip: SharedString = match (&row.unusable, meta) {
+                // A greyed row says why in full, where its length would be:
+                // the list is the one place the file's own tracks are named.
+                (Some(why), _) => format!("{} — {why}", row.path.display()),
+                (None, Some(meta)) => format!(
+                    "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
+                    row.path.display(),
+                    meta.width,
+                    meta.height,
+                    meta.frame_rate
+                ),
+                (None, None) => row.path.display().to_string(),
+            }
+            .into();
+            let ghost = name.clone();
+            // What the second line says: the stream, then either its length or
+            // the reason it cannot be used.
+            let under = match &row.unusable {
+                Some(why) => join_detail(&row.detail, why),
+                None => join_detail(
+                    &row.detail,
+                    &timecode(f64::from(row.frames) / self.fps, self.fps),
+                ),
+            };
+            let usable = row.unusable.is_none();
+            let (path, stream) = (row.path.clone(), row.stream);
+            let dragged = (path.clone(), stream);
+            div()
+                .id(("asset", i))
+                .flex_none()
+                .h(px(ROW_H))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .pr(px(6.))
+                .rounded(px(3.))
+                // A row that cannot be placed takes no click and no drag, and
+                // reads as unavailable rather than merely unlucky.
+                .when(!usable, |d| d.text_color(rgb(INK_DIM)).opacity(0.55))
+                .when(usable, |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.selected_asset = Some((path.clone(), stream));
+                            cx.notify();
+                        }))
+                        // The drag carries the row's file and stream and the
+                        // row's name: one for the drop to insert, one for the
+                        // pointer to carry, so what is being dragged is legible
+                        // on the way down.
+                        .on_drag(AssetDrag(dragged.0, dragged.1), move |_, _, _, cx| {
+                            cx.new(|_| Tip(ghost.clone()))
+                        })
+                })
+                .when(picked, |d| d.bg(rgb(SELECTED)).border_1())
+                .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                // Full height and hard against the edge: the tint reads as
+                // the lane's colour continuing into the list, not as a chip
+                // that happens to be near it.
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(SWATCH_W))
+                        .h_full()
+                        .rounded(px(2.))
+                        .bg(rgb(source_tint(row.tint))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        // Two lines rather than two columns: at the width
+                        // this panel yields to, a name and a timecode side
+                        // by side leave room for neither.
+                        .child(div().truncate().text_size(px(11.)).child(name))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(10.))
+                                .text_color(rgb(INK_DIM))
+                                .child(under),
+                        ),
+                )
+        })
+        .collect();
         div()
             .flex_none()
             .w(px(width))
@@ -1344,10 +1409,14 @@ impl Player {
                     Some(_) => "inserts the picked file at the playhead".to_string(),
                     None => "click a file above first — or drag one onto a lane".to_string(),
                 },
-                can_add(self.selected_asset, self.session.is_some(), exporting),
+                can_add(
+                    self.selected_asset.as_ref(),
+                    self.session.is_some(),
+                    exporting,
+                ),
                 cx.listener(|this, _: &ClickEvent, _, cx| {
-                    if let Some(source) = this.selected_asset {
-                        this.insert_source(source, cx);
+                    if let Some((path, stream)) = this.selected_asset.clone() {
+                        this.insert_source(&path, stream, cx);
                     }
                 }),
             ))
@@ -1986,9 +2055,9 @@ impl Player {
                     // Add button makes, through the same call -- at the
                     // playhead, not at the pointer: clips here are placed end
                     // to end, so where along the bed it landed says nothing.
-                    .on_drop(
-                        cx.listener(|this, drag: &AssetDrag, _, cx| this.insert_source(drag.0, cx)),
-                    )
+                    .on_drop(cx.listener(|this, drag: &AssetDrag, _, cx| {
+                        this.insert_source(&drag.0.clone(), drag.1, cx)
+                    }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         let (start, len) = (
@@ -2001,12 +2070,20 @@ impl Player {
                         // as detached before anyone clicks it.
                         let grouped =
                             clip.link.is_some() && others.iter().any(|o| o.link == clip.link);
-                        let tint = source_tint(clip.source);
+                        // Tinted by *file*, not by source entry: two audio
+                        // streams of one file are two sources, and the library
+                        // gives them one swatch because they are one file.
+                        let tint = source_tint(
+                            sources
+                                .get(clip.source)
+                                .and_then(|s| sources.iter().position(|o| o.path == s.path))
+                                .unwrap_or(clip.source),
+                        );
                         let width = width_frac(len, duration);
-                        let label = sources.get(clip.source).map(|path| file_name(path));
+                        let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
-                            .and_then(|path| self.waves.get(path))
+                            .and_then(|s| self.waves.get(&(s.path.clone(), s.audio_stream)))
                             .cloned();
                         let (from, to) = (
                             f64::from(clip.in_frame) / self.fps,
@@ -2200,12 +2277,27 @@ fn file_name(path: &std::path::Path) -> String {
 /// The sources a repaint has not asked about yet. A key that is already there
 /// means "asked", whatever state it is in, which is what stops a decode already
 /// running from being started again by the next of sixty repaints a second.
-fn unseen_sources(sources: &[PathBuf], waves: &HashMap<PathBuf, Wave>) -> Vec<PathBuf> {
+fn unseen_sources(
+    sources: &[Source],
+    waves: &HashMap<(PathBuf, usize), Wave>,
+) -> Vec<(PathBuf, usize)> {
     sources
         .iter()
-        .filter(|path| !waves.contains_key(*path))
-        .cloned()
+        .map(|s| (s.path.clone(), s.audio_stream))
+        .filter(|key| !waves.contains_key(key))
         .collect()
+}
+
+/// The same, for the per-file stream probe: one entry per *file*, however many
+/// of its streams the timeline plays.
+fn unseen_paths(sources: &[Source], streams: &HashMap<PathBuf, Vec<StreamInfo>>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for s in sources {
+        if !streams.contains_key(&s.path) && !out.contains(&s.path) {
+            out.push(s.path.clone());
+        }
+    }
+    out
 }
 
 /// Both lanes' clips, which is everything the timeline knows about its sources.
@@ -2217,17 +2309,25 @@ fn lane_clips(session: &PlaybackSession) -> impl Iterator<Item = &Clip> {
 }
 
 /// How long a source is, as the timeline knows it: the furthest frame any clip
-/// plays from it. Exact for a source the timeline still holds whole -- which is
-/// every source the moment it is imported -- and never longer than the file,
-/// since every clip was checked against it, so a clip built from this can
-/// always be played. Zero for a source nothing plays from any more.
+/// plays from *the file*. Exact for a source the timeline still holds whole --
+/// which is every source the moment it is imported -- and never longer than the
+/// file, since every clip was checked against it, so a clip built from this can
+/// always be played. Zero for a file nothing plays from any more.
+///
+/// By file rather than by source entry, because a second audio stream of a file
+/// already on the timeline is a row that has no clips of its own yet, and every
+/// stream of a file is the same length -- the picture is what the length is.
 ///
 /// ponytail: a source trimmed on the timeline reads as its trimmed length. The
 /// file's own length would need a `Demuxer::open` probe per source, off the
 /// render path like the peak decode is -- that is the upgrade path.
-fn source_frames<'a>(clips: impl Iterator<Item = &'a Clip>, source: usize) -> u32 {
+fn source_frames<'a>(
+    clips: impl Iterator<Item = &'a Clip>,
+    sources: &[Source],
+    path: &Path,
+) -> u32 {
     clips
-        .filter(|clip| clip.source == source)
+        .filter(|clip| sources.get(clip.source).is_some_and(|s| s.path == path))
         .map(|clip| clip.out_frame)
         .max()
         .unwrap_or(0)
@@ -2236,8 +2336,163 @@ fn source_frames<'a>(clips: impl Iterator<Item = &'a Clip>, source: usize) -> u3
 /// Whether the Add button does anything: a row picked, a timeline to put it on,
 /// and no export reading that timeline. A button that would do nothing is dimmed
 /// and takes no click, like every other one here.
-fn can_add(picked: Option<usize>, timeline: bool, exporting: bool) -> bool {
+fn can_add(picked: Option<&(PathBuf, usize)>, timeline: bool, exporting: bool) -> bool {
     picked.is_some() && timeline && !exporting
+}
+
+/// One library row: a file and one of its audio streams. Plain data, planned
+/// before anything is drawn -- which rows exist at all is the branchy part.
+#[derive(Debug, PartialEq)]
+struct Row {
+    path: PathBuf,
+    stream: usize,
+    /// The file, plus which stream this is when the file has several.
+    name: String,
+    /// What the stream is, or blank for a file with a single one.
+    detail: String,
+    /// Why it cannot be put on this timeline, for a row that cannot: shown in
+    /// place of the length and the only thing that greys a row out.
+    unusable: Option<String>,
+    /// Frames of the *file*, for the length line.
+    frames: u32,
+    /// Index into `SOURCE_TINTS`, shared by every stream of one file: the
+    /// swatch says which file, and the lanes tint their clips the same way.
+    tint: usize,
+}
+
+/// Every row the library shows: one per source entry, plus one for each further
+/// audio stream those files have that no clip plays yet -- a remux with a track
+/// per language lists them all, the ones this engine cannot use greyed out
+/// rather than hidden. Streams a file has not been probed for yet simply are
+/// not there; the row for what *is* on the timeline is always there.
+///
+/// `timeline_audio` is the rate and layout of source 0's stream, which every
+/// other source must match: one output device and one copied AAC track for the
+/// whole timeline (`PlaybackSession::place_stream_at`). `None` while unknown,
+/// and then nothing is greyed for it -- the engine still refuses.
+fn library_rows(
+    sources: &[Source],
+    streams: &HashMap<PathBuf, Vec<StreamInfo>>,
+    timeline_audio: Option<(u32, u16)>,
+    frames: impl Fn(&Path) -> u32,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let of_file = streams.get(&source.path).map_or(&[][..], Vec::as_slice);
+        let info = of_file.iter().find(|s| s.index == source.audio_stream);
+        let tint = sources
+            .iter()
+            .position(|s| s.path == source.path)
+            .expect("a source finds itself");
+        rows.push(Row {
+            path: source.path.clone(),
+            stream: source.audio_stream,
+            name: row_name(&source.path, source.audio_stream, of_file.len() > 1),
+            // Only where there is a choice to describe: a file with one audio
+            // track is the row it has always been, name and length, and the
+            // length is what would be squeezed out at the panel's least width.
+            detail: info
+                .filter(|_| of_file.len() > 1)
+                .map_or_else(String::new, stream_detail),
+            // A stream already on the timeline is playing: whatever a probe
+            // would say about it now, it is usable by demonstration.
+            unusable: None,
+            frames: frames(&source.path),
+            tint,
+        });
+        // The file's other streams, listed once, right after the last entry
+        // that names the file -- so a file's rows sit together.
+        if sources[i + 1..].iter().any(|s| s.path == source.path) {
+            continue;
+        }
+        for info in of_file {
+            if sources
+                .iter()
+                .any(|s| s.path == source.path && s.audio_stream == info.index)
+            {
+                continue; // it has a row of its own above
+            }
+            rows.push(Row {
+                path: source.path.clone(),
+                stream: info.index,
+                name: row_name(&source.path, info.index, true),
+                detail: stream_detail(info),
+                unusable: unusable(info, timeline_audio),
+                frames: frames(&source.path),
+                tint,
+            });
+        }
+    }
+    rows
+}
+
+/// The row's second line: what the stream is and then either how long it is or
+/// why it cannot be used, with the separator only where both halves exist (a
+/// single-stream file says nothing about its stream).
+fn join_detail(detail: &str, tail: &str) -> String {
+    match detail.is_empty() {
+        true => tail.to_string(),
+        false => format!("{detail} · {tail}"),
+    }
+}
+
+/// How a row names its file: the file alone when it has one audio stream or
+/// none, and the file plus which stream this row is when it has several --
+/// counted from 1, the way a player numbers tracks.
+fn row_name(path: &Path, stream: usize, several: bool) -> String {
+    match several {
+        false => file_name(path),
+        true => format!("{} [audio {}]", file_name(path), stream + 1),
+    }
+}
+
+/// What a stream is, for the row's second line: the language if the file says
+/// one, then rate and layout. A field the header does not give is left out
+/// rather than shown as a zero -- a stream we cannot parse says nothing about
+/// itself, and saying "0 Hz" would be saying something.
+fn stream_detail(info: &StreamInfo) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(lang) = &info.lang {
+        parts.push(lang.clone());
+    }
+    if info.sample_rate > 0 {
+        parts.push(format!("{} kHz", f64::from(info.sample_rate) / 1000.));
+    }
+    parts.extend(layout(info.channels));
+    parts.join(" ")
+}
+
+fn layout(channels: u16) -> Option<String> {
+    match channels {
+        0 => None,
+        1 => Some("mono".to_string()),
+        2 => Some("stereo".to_string()),
+        n => Some(format!("{n} ch")),
+    }
+}
+
+/// Why a stream cannot go on this timeline, or `None` if it can. Both answers
+/// are shown: a stream nothing can be done with is listed greyed with the
+/// reason, never dropped from the list -- a file has the tracks it has, and a
+/// picker that hides them is a picker that lies.
+fn unusable(info: &StreamInfo, timeline_audio: Option<(u32, u16)>) -> Option<String> {
+    if !info.decodable {
+        // ponytail: mp4 0.14 keeps no fourcc for a sample entry it does not
+        // parse (`StreamInfo::codec`), so an AC-3 track can only be named as
+        // unsupported, not as AC-3. Upgrade path is reading the stsd ourselves.
+        return Some(match info.codec.as_str() {
+            "unknown" => "unsupported codec".to_string(),
+            codec => format!("{codec} is not supported"),
+        });
+    }
+    let (rate, channels) = timeline_audio?;
+    ((info.sample_rate, info.channels) != (rate, channels)).then(|| {
+        format!(
+            "the timeline is {} kHz {}",
+            f64::from(rate) / 1000.,
+            layout(channels).unwrap_or_else(|| "silent".to_string())
+        )
+    })
 }
 
 /// What the media list is given of the window. A share of it, so a narrow
@@ -2675,11 +2930,13 @@ mod tests {
         ACCENT, CONTROL_H, Clip, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
         KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W,
         Lane, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE,
-        SWATCH_W, Volume, WAVE_BPS, WAVE_COL, Wave, can_add, cancels_export, envelope, export_path,
-        export_settings, frac_along, is_bare_modifier, is_project, keymap, lane_clips, marked,
-        normalise, project_path, push_digit, scrub_due, show_label, source_frames, source_tint,
-        start_frac, timecode, unseen_sources, width_frac, window_title,
+        SWATCH_W, Source, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave, can_add, cancels_export,
+        envelope, export_path, export_settings, frac_along, is_bare_modifier, is_project, keymap,
+        lane_clips, marked, normalise, project_path, push_digit, scrub_due, show_label,
+        source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources, width_frac,
+        window_title,
     };
+    use super::{file_name, library_rows};
     use engine::PlaybackSession;
     use gpui::{Bounds, Pixels, point, px, size};
     use std::collections::HashMap;
@@ -2704,7 +2961,15 @@ mod tests {
         }
     }
 
-    /// The whole of the library's row data comes off the clips: which sources
+    /// A source entry for `path` on `stream`, as the project keeps them.
+    fn source(path: &str, stream: usize) -> Source {
+        Source {
+            path: PathBuf::from(path),
+            audio_stream: stream,
+        }
+    }
+
+    /// The whole of the library's row data comes off the clips: which files
     /// there are, how long each one is, and therefore which tint each row wears
     /// -- one index into one list, so a swatch cannot name a different file from
     /// the boxes it is meant to point at.
@@ -2713,11 +2978,12 @@ mod tests {
         // Source 0 whole, source 1 trimmed to half of what it was, source 2 on
         // the audio lane only (its picture was lifted), source 3 imported and
         // then undone -- an entry with nothing playing from it.
+        let sources: Vec<Source> = (0..4).map(|i| source(&format!("/m/{i}.mp4"), 0)).collect();
         let video = [clip(0, 150), clip(1, 60)];
         let audio = [clip(0, 150), clip(1, 30), clip(2, 90)];
         for (row, frames) in [(0, 150), (1, 60), (2, 90), (3, 0)] {
             assert_eq!(
-                source_frames(video.iter().chain(&audio), row),
+                source_frames(video.iter().chain(&audio), &sources, &sources[row].path),
                 frames,
                 "row {row}"
             );
@@ -2725,11 +2991,146 @@ mod tests {
             // function -- what makes the panel and the lanes one association.
             assert_eq!(source_tint(row), SOURCE_TINTS[row % SOURCE_TINTS.len()]);
         }
-        // The longest clip of a source wins, whichever lane it is in and
+        // The longest clip of a file wins, whichever lane it is in and
         // whatever order the lanes are read in.
-        assert_eq!(source_frames([clip(0, 10), clip(0, 90)].iter(), 0), 90);
-        assert_eq!(source_frames([clip(0, 90), clip(0, 10)].iter(), 0), 90);
-        assert_eq!(source_frames([].iter(), 0), 0);
+        let one = [source("/m/0.mp4", 0)];
+        let path = &one[0].path;
+        assert_eq!(
+            source_frames([clip(0, 10), clip(0, 90)].iter(), &one, path),
+            90
+        );
+        assert_eq!(
+            source_frames([clip(0, 90), clip(0, 10)].iter(), &one, path),
+            90
+        );
+        assert_eq!(source_frames([].iter(), &one, path), 0);
+        // Two audio streams of one file are two source entries and one length:
+        // the second stream's row is placeable the moment the file is there,
+        // before any clip names that entry.
+        let two = [source("/m/0.mp4", 0), source("/m/0.mp4", 1)];
+        assert_eq!(source_frames([clip(0, 90)].iter(), &two, &two[1].path), 90);
+    }
+
+    fn info(
+        index: usize,
+        rate: u32,
+        channels: u16,
+        lang: Option<&str>,
+        decodable: bool,
+    ) -> StreamInfo {
+        StreamInfo {
+            index,
+            codec: if decodable { "aac" } else { "unknown" }.into(),
+            channels,
+            sample_rate: rate,
+            lang: lang.map(str::to_string),
+            decodable,
+        }
+    }
+
+    /// A file's every audio track gets a row: the ones the timeline can take
+    /// are placeable, the ones it cannot are listed greyed with the reason.
+    /// Which rows exist at all is the branchy part of the panel, so it is
+    /// planned as data and checked here rather than through the pointer.
+    #[test]
+    fn every_audio_stream_of_a_file_is_a_row_usable_or_not() {
+        let multi = PathBuf::from("/m/movie.mp4");
+        let sources = [source("/m/movie.mp4", 0)];
+        let mut streams = HashMap::new();
+        streams.insert(
+            multi.clone(),
+            vec![
+                info(0, 44_100, 2, None, true),
+                info(1, 44_100, 2, Some("fra"), true),
+                info(2, 22_050, 1, Some("deu"), true),
+                info(3, 0, 0, None, false),
+            ],
+        );
+        let rows = library_rows(&sources, &streams, Some((44_100, 2)), |_| 90);
+        assert_eq!(
+            rows.iter().map(|r| r.stream).collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "one row per audio stream, in file order"
+        );
+        assert!(
+            rows.iter().all(|r| r.path == multi && r.tint == 0),
+            "every stream of one file wears the file's own tint"
+        );
+        assert_eq!(rows[0].name, "movie.mp4 [audio 1]");
+        assert_eq!(rows[1].name, "movie.mp4 [audio 2]");
+        assert_eq!(rows[1].detail, "fra 44.1 kHz stereo");
+        // Placeable: the one already on the timeline, and the one that matches
+        // it. The 22 kHz mono track cannot join a 44.1 kHz stereo timeline --
+        // one device and one copied AAC track for the whole of it -- and the
+        // codec we cannot read cannot join anything. Both say which.
+        assert_eq!((&rows[0].unusable, &rows[1].unusable), (&None, &None));
+        assert_eq!(
+            rows[2].unusable.as_deref(),
+            Some("the timeline is 44.1 kHz stereo")
+        );
+        assert_eq!(rows[3].unusable.as_deref(), Some("unsupported codec"));
+        assert_eq!(
+            rows[3].detail, "",
+            "a stream we cannot parse claims nothing"
+        );
+        // Every row is the same file, so every row is that file's length.
+        assert!(rows.iter().all(|r| r.frames == 90));
+
+        // The single-stream case is exactly one row and no stream tag: no
+        // regression for the media everything else in the world is.
+        let plain = [source("/m/plain.mp4", 0)];
+        let mut one = HashMap::new();
+        one.insert(
+            PathBuf::from("/m/plain.mp4"),
+            vec![info(0, 44_100, 2, None, true)],
+        );
+        let rows = library_rows(&plain, &one, Some((44_100, 2)), |_| 90);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "plain.mp4");
+        assert_eq!(
+            rows[0].detail, "",
+            "one audio track is the row it has always been: name and length"
+        );
+        // ...as is a silent file, and a file not probed yet.
+        let mut silent = HashMap::new();
+        silent.insert(PathBuf::from("/m/plain.mp4"), Vec::new());
+        for probe in [silent, HashMap::new()] {
+            let rows = library_rows(&plain, &probe, None, |_| 90);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].name, "plain.mp4");
+            assert_eq!(rows[0].detail, "");
+        }
+
+        // A second stream *placed* on the timeline is a source entry of its
+        // own: it keeps its row, no duplicate appears for it, and the rows of
+        // one file stay together whatever order the entries came in.
+        let placed = [
+            source("/m/movie.mp4", 0),
+            source("/m/other.mp4", 0),
+            source("/m/movie.mp4", 2),
+        ];
+        streams.insert(
+            PathBuf::from("/m/other.mp4"),
+            vec![info(0, 44_100, 2, None, true)],
+        );
+        let rows = library_rows(&placed, &streams, Some((44_100, 2)), |_| 90);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (file_name(&r.path), r.stream))
+                .collect::<Vec<_>>(),
+            [
+                ("movie.mp4".to_string(), 0),
+                ("other.mp4".to_string(), 0),
+                ("movie.mp4".to_string(), 2),
+                ("movie.mp4".to_string(), 1),
+                ("movie.mp4".to_string(), 3),
+            ]
+        );
+        assert!(
+            rows[2].unusable.is_none(),
+            "a stream already on the timeline is playing, whatever a probe says"
+        );
+        assert_eq!(rows[1].tint, 1, "the other file is the other tint");
     }
 
     /// The refusal path, end to end against the real files: an incompatible
@@ -2751,7 +3152,11 @@ mod tests {
         // at 30 fps, exactly what was appended.
         session.import(&asset("test_av2.mp4")).expect("av2 matches");
         assert_eq!(session.sources().len(), 2);
-        assert_eq!(source_frames(lane_clips(&session), 1), 120);
+        let second = session.sources()[1].path.clone();
+        assert_eq!(
+            source_frames(lane_clips(&session), session.sources(), &second),
+            120
+        );
         assert_eq!(timecode(120. / 30., 30.), "00:00:04:00");
     }
 
@@ -2766,17 +3171,15 @@ mod tests {
         assert_eq!(session.timeline_duration(), 9.0);
         // Two seconds in, which is inside the first take: the insert splits it.
         session.seek(2.0);
-        let frames = source_frames(lane_clips(&session), 1);
-        assert!(session.paste_at(
-            2.0,
-            Clip {
-                start: 0,
-                in_frame: 0,
-                out_frame: frames,
-                source: 1,
-                link: None,
-            }
-        ));
+        let second = session.sources()[1].path.clone();
+        let frames = source_frames(lane_clips(&session), session.sources(), &second);
+        // Through the engine door `insert_source` uses, with the row's own
+        // stream: the button, the drop and this are one call.
+        assert!(
+            session
+                .place_stream_at(2.0, &second, 0, frames)
+                .expect("av2 is already on the timeline")
+        );
         // The whole of source 1 went in and nothing was painted over: the
         // timeline is longer by exactly that file.
         assert_eq!(session.timeline_duration(), 13.0);
@@ -2797,32 +3200,89 @@ mod tests {
         assert_eq!(at(video).len(), frames);
         assert!(at(video).link.is_some());
         assert_eq!(video.len(), audio.len());
+
+        // The same door with a *second audio stream* of a file already there:
+        // a new source entry, the same picture, and the row that was dragged
+        // is what plays. This is the whole user-facing point of the slice.
+        let mut session =
+            PlaybackSession::open(asset("test_multilang.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let path = session.sources()[0].path.clone();
+        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        let end = session.timeline_duration();
+        assert!(
+            session
+                .place_stream_at(end, &path, 1, frames)
+                .expect("the French track shares the timeline's parameters")
+        );
+        assert_eq!(session.sources()[1].audio_stream, 1);
+        assert_eq!(session.timeline_duration(), end * 2.0);
+        // Both rows are the same file, so both rows are that file's length --
+        // the second one before any clip of its own existed.
+        assert_eq!(
+            source_frames(lane_clips(&session), session.sources(), &path),
+            frames
+        );
     }
 
     #[test]
     fn a_source_is_only_ever_asked_for_its_peaks_once() {
         let (a, b) = (asset("test_av.mp4"), asset("test_av2.mp4"));
-        let sources = [a.clone(), b.clone()];
-        let mut waves: HashMap<PathBuf, Wave> = HashMap::new();
-        assert_eq!(unseen_sources(&sources, &waves), sources);
+        // Two files, and two streams of the first: three envelopes, because
+        // one file's two audio tracks are two different waveforms.
+        let sources = [
+            Source {
+                path: a.clone(),
+                audio_stream: 0,
+            },
+            Source {
+                path: a.clone(),
+                audio_stream: 1,
+            },
+            Source {
+                path: b.clone(),
+                audio_stream: 0,
+            },
+        ];
+        let keys = |s: &[Source]| {
+            s.iter()
+                .map(|s| (s.path.clone(), s.audio_stream))
+                .collect::<Vec<_>>()
+        };
+        let mut waves: HashMap<(PathBuf, usize), Wave> = HashMap::new();
+        assert_eq!(unseen_sources(&sources, &waves), keys(&sources));
         // The entry goes in when the decode *starts*, so the sixty repaints a
         // second that happen while it runs must not start it again -- which is
         // what this asserts about a key whose value is not an answer yet.
-        waves.insert(a, Wave::Loading);
-        assert_eq!(unseen_sources(&sources, &waves), vec![b.clone()]);
+        waves.insert((a.clone(), 0), Wave::Loading);
+        assert_eq!(
+            unseen_sources(&sources, &waves),
+            keys(&sources[1..]),
+            "the file's other stream is a key of its own"
+        );
         // A file with no audio is an answer like any other: never re-asked.
-        waves.insert(b, Wave::Silent);
+        waves.insert((a, 1), Wave::Silent);
+        waves.insert((b.clone(), 0), Wave::Silent);
         assert!(unseen_sources(&sources, &waves).is_empty());
+        // The stream probe is per *file*: the two entries of `a` ask once.
+        let mut streams: HashMap<PathBuf, Vec<StreamInfo>> = HashMap::new();
+        assert_eq!(
+            unseen_paths(&sources, &streams),
+            vec![asset("test_av.mp4"), b]
+        );
+        streams.insert(asset("test_av.mp4"), Vec::new());
+        assert_eq!(unseen_paths(&sources, &streams).len(), 1);
     }
 
     #[test]
     fn the_add_button_is_dead_unless_it_would_do_something() {
-        assert!(can_add(Some(0), true, false));
+        let picked = (PathBuf::from("/m/0.mp4"), 0);
+        assert!(can_add(Some(&picked), true, false));
         // Nothing picked, nothing to put it on, or an export reading the very
         // edit list this would change.
         assert!(!can_add(None, true, false));
-        assert!(!can_add(Some(0), false, false));
-        assert!(!can_add(Some(0), true, true));
+        assert!(!can_add(Some(&picked), false, false));
+        assert!(!can_add(Some(&picked), true, true));
     }
 
     #[test]
@@ -3314,7 +3774,7 @@ mod tests {
                 .join(name)
         };
         let peaks = normalise(
-            engine::waveform::peaks(asset("test_av.mp4"), WAVE_BPS)
+            engine::waveform::peaks(asset("test_av.mp4"), 0, WAVE_BPS)
                 .expect("open the fixture")
                 .expect("test_av.mp4 has audio"),
         );
@@ -3333,7 +3793,7 @@ mod tests {
         );
         // A video-only source draws no waveform at all rather than a flat fake.
         assert!(
-            engine::waveform::peaks(asset("test_baseline.mp4"), WAVE_BPS)
+            engine::waveform::peaks(asset("test_baseline.mp4"), 0, WAVE_BPS)
                 .expect("open the fixture")
                 .is_none()
         );
@@ -3431,9 +3891,9 @@ fn main() {
     let meta = session.as_ref().map(|session| *session.meta());
     // Beside the media even for a project: an export has never landed anywhere
     // but next to the picture it came from.
-    let out = session
-        .as_ref()
-        .map_or_else(PathBuf::new, |session| export_path(&session.sources()[0]));
+    let out = session.as_ref().map_or_else(PathBuf::new, |session| {
+        export_path(&session.sources()[0].path)
+    });
     let project = match &arg {
         Some(arg) if is_project(arg) => arg.clone(),
         Some(arg) => project_path(arg),
@@ -3499,6 +3959,7 @@ fn main() {
                     selected: None,
                     selected_asset: None,
                     waves: HashMap::new(),
+                    streams: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
                     last_scrub: Instant::now(),
