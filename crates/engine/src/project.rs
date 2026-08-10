@@ -212,6 +212,17 @@ impl LaneData {
     }
 }
 
+/// Which end of a clip a [`Project::trim`] moves: the one the pointer grabbed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    /// Its first timeline frame; moving it changes where in the source the clip
+    /// starts reading, so the picture behind the edge slides with it.
+    Start,
+    /// One past its last timeline frame; moving it only says how much of the
+    /// source to keep.
+    End,
+}
+
 /// What a lane holds over one stretch of the timeline: either a placed clip or
 /// a gap. Returned already trimmed to the position it was asked about, so a
 /// caller can hand `len` straight to a decoder (or to a black-frame generator).
@@ -299,10 +310,16 @@ impl Project {
     /// [`Project::undo`] is `false` until the first edit of the new session.
     /// This is the one door untrusted parts come in through, so every invariant
     /// every other constructor keeps is checked here, by name and in release:
-    /// every lane empty, an empty clip, a clip naming a source (or an equalizer,
+    /// no lanes at all, an empty clip, a clip naming a source (or an equalizer,
     /// or a colour) that is not there, a clip whose end overflows, a lane that is
     /// unsorted or self-overlapping, and the grouping rules of [`Clip::link`]
     /// below.
+    ///
+    /// A project whose lanes are all *empty* is not among them: an emptied
+    /// timeline is a project like any other -- it plays black and silent, it
+    /// saves, and it loads back. What a project cannot be is laneless, because
+    /// [`Project::lanes`] is what a front-end lays out and what every `Lane`
+    /// handle indexes into.
     pub fn from_parts(
         sources: Vec<Source>,
         lanes: Vec<(LaneKind, Vec<Clip>)>,
@@ -315,8 +332,8 @@ impl Project {
         if let Some(bad) = color.iter().position(|p| !color_finite(p)) {
             return Err(format!("color {bad} holds a value that is not a finite number").into());
         }
-        if lanes.iter().all(|(_, clips)| clips.is_empty()) {
-            return Err("every lane is empty: that is not a project".into());
+        if lanes.is_empty() {
+            return Err("no lanes at all: that is not a project".into());
         }
         let lanes: Vec<LaneData> = lanes
             .into_iter()
@@ -421,9 +438,8 @@ impl Project {
     /// that could not be taken back would be the one edit with no way out.
     /// Nothing plays differently until something is placed on it.
     ///
-    /// The new lane being empty is fine even though [`Project::from_parts`]
-    /// refuses an all-empty project: the lanes that were there still hold the
-    /// timeline, and "no lane holds anything" is what that door refuses.
+    /// An empty lane is a lane like any other -- so is a whole project of them
+    /// ([`Project::from_parts`]); nothing plays until something is placed.
     pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
         self.snapshot();
         self.lanes.push(LaneData {
@@ -525,6 +541,11 @@ impl Project {
     /// [`set_color`](Project::set_color) leaves settings nothing plays behind,
     /// and this is the one moment they can go -- the indexes that survive it are
     /// only the ones a clip names.
+    ///
+    /// One exception, and it is the emptied timeline's: a project no clip plays
+    /// from still keeps source 0. It is the file a session is scaffolded from --
+    /// its frame rate is the timeline's and is written nowhere else -- so a save
+    /// that pruned it would write a project that cannot be loaded back at all.
     pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
@@ -565,6 +586,9 @@ impl Project {
                     }
                 });
             }
+        }
+        if sources.is_empty() {
+            sources.extend(self.sources.first().cloned());
         }
         (
             sources,
@@ -1051,6 +1075,145 @@ impl Project {
         true
     }
 
+    /// Move one `edge` of the clip at `idx` of `lane` to timeline frame `to` --
+    /// the drag on a clip's end that makes it play more or less of its source.
+    /// The rest of the lane stays exactly where it is (nothing ripples), so what
+    /// a shortened clip leaves behind is a gap and what a lengthened one takes
+    /// is room that was already empty. One snapshot, so a whole drag is one
+    /// [`Project::undo`] -- commit once, at the release, rather than per pointer
+    /// sample. Changes the timeline->source mapping: the caller must reseek.
+    ///
+    /// [`Edge::Start`] moves the in-point with it: the frames that stay play
+    /// exactly what they played before, which is what makes this a trim and not
+    /// a slip.
+    ///
+    /// `to` is **clamped**, never refused -- a hand pulling an edge past what is
+    /// legal means "as far as it goes", and stopping the box there is the
+    /// affordance. The walls are: one frame of clip always survives, an edge
+    /// never crosses the neighbouring clip on its own lane, an in-point never
+    /// walks back past the source's first frame, and an out-point never runs
+    /// past `source_frames[clip.source]` -- the caller's table of how long each
+    /// source actually is ([`Project`] does not know, and a clip ending past its
+    /// file's last frame is a save that will not open again; see
+    /// `PlaybackSession::trim_clip`, which fills it in). A source with no entry
+    /// there may not grow at all.
+    ///
+    /// Linked clips trim *together*, to one clamped edge: a link is one span on
+    /// however many lanes ([`links_are_consistent`]), so a picture trimmed away
+    /// from its sound would be a group no save could load. The room is therefore
+    /// what every member of the group has -- the tightest wall wins.
+    ///
+    /// `false`, changing nothing and costing no undo step, for an index that is
+    /// not there and for an edge that is already where it was asked to go.
+    pub fn trim(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        to: u32,
+        source_frames: &[u32],
+    ) -> bool {
+        let (Some((lo, hi)), Some(clip)) = (
+            self.trim_room(lane, idx, edge, source_frames),
+            self.lane(lane).get(idx).copied(),
+        ) else {
+            return false;
+        };
+        let to = to.clamp(lo, hi);
+        let at = match edge {
+            Edge::Start => clip.start,
+            Edge::End => clip.end(),
+        };
+        if to == at {
+            return false;
+        }
+        self.snapshot();
+        for (l, i) in self.group_of(lane, idx).expect("checked above") {
+            let c = &mut self.lanes[l].clips[i];
+            match edge {
+                Edge::Start => {
+                    // Non-negative by `lo`, which is what keeps the in-point on
+                    // the source.
+                    c.in_frame = (i64::from(c.in_frame) + i64::from(to) - i64::from(c.start)) as u32;
+                    c.start = to;
+                }
+                Edge::End => c.out_frame = c.in_frame + (to - c.start),
+            }
+            debug_assert!(sorted_disjoint(&self.lanes[l].clips));
+        }
+        true
+    }
+
+    /// How far that edge may travel, `(first, last)` timeline frame inclusive --
+    /// the walls [`trim`](Project::trim) clamps to, without moving anything.
+    /// What a front-end drawing the box *during* a drag asks, so the live width
+    /// is the width the release will commit and an edge stops under the pointer
+    /// rather than snapping back. `None` for an index that is not there.
+    pub fn trim_room(
+        &self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        source_frames: &[u32],
+    ) -> Option<(u32, u32)> {
+        let (mut lo, mut hi) = (u32::MIN, u32::MAX);
+        for (l, i) in self.group_of(lane, idx)? {
+            let clips = &self.lanes[l].clips;
+            let c = clips[i];
+            let (member_lo, member_hi) = match edge {
+                Edge::Start => (
+                    // Back to the source's own first frame, and never over the
+                    // clip in front of it. Saturating because a clip may hold
+                    // *more* head than the timeline has room for -- a ripple
+                    // delete slides a clip back to frame 0 with its in-point
+                    // wherever the cut left it -- and frame 0 is the other wall.
+                    c.start
+                        .saturating_sub(c.in_frame)
+                        .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                    c.end() - 1,
+                ),
+                Edge::End => (
+                    c.start + 1,
+                    // Out to whatever is left of the source, and never over the
+                    // clip behind it.
+                    c.start
+                        .saturating_add(
+                            source_frames
+                                .get(c.source)
+                                .copied()
+                                .unwrap_or(c.out_frame)
+                                .saturating_sub(c.in_frame),
+                        )
+                        .min(clips.get(i + 1).map_or(u32::MAX, |n| n.start)),
+                ),
+            };
+            lo = lo.max(member_lo);
+            hi = hi.min(member_hi);
+        }
+        // `hi.max(lo)`: for a clip the invariants hold for, the range always
+        // contains the edge's own place, and a caller's wrong `source_frames`
+        // must not become an empty range (or a panicking `clamp`) here.
+        Some((lo, hi.max(lo)))
+    }
+
+    /// The clips that move as one with the clip at `idx` of `lane` -- itself and
+    /// whatever carries its link on the other lanes -- as `(lane storage index,
+    /// clip index)` pairs. `None` for an index that is not there.
+    fn group_of(&self, lane: Lane, idx: usize) -> Option<Vec<(usize, usize)>> {
+        let clip = *self.lane(lane).get(idx)?;
+        Some(match clip.link {
+            Some(link) => self
+                .lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(l, data)| {
+                    Some((l, data.clips.iter().position(|c| c.link == Some(link))?))
+                })
+                .collect(),
+            None => vec![(self.index(lane).expect("the clip was found on it"), idx)],
+        })
+    }
+
     /// Insert `clip` into the first lane of each kind at `timeline_frame` as one
     /// new group, pushing everything from there on later by its length in
     /// *every* lane -- the grouped, rippling paste a clipboard does. Mid-clip
@@ -1128,13 +1291,12 @@ impl Project {
     }
 
     /// Lift the clip at `idx` out of `lane`, leaving a gap: black frames or
-    /// silence, and nothing else moves. Refused for an out-of-range index (which
-    /// a lane that is not there always is) and for the lift that would leave
-    /// *every* lane empty -- an empty timeline is the front-end's state, not a
-    /// project's (see the never-empty invariant).
+    /// silence, and nothing else moves. Refused only for an out-of-range index
+    /// (which a lane that is not there always is) -- lifting the last placement
+    /// there is leaves an *empty* timeline, which is a state the project holds
+    /// like any other and an undo brings back.
     pub fn lift(&mut self, lane: Lane, idx: usize) -> bool {
-        let placed: usize = self.lanes.iter().map(|l| l.clips.len()).sum();
-        if idx >= self.lane(lane).len() || placed == 1 {
+        if idx >= self.lane(lane).len() {
             return false;
         }
         self.snapshot();
@@ -1144,23 +1306,17 @@ impl Project {
 
     /// Cut the timeline frames `[at, at + len)` out of *every* lane and close
     /// the hole: everything after slides back by `len`. The rippling delete --
-    /// [`lift`](Project::lift) is the one that leaves a gap. Refused for an
-    /// empty range and when it would leave every lane empty.
+    /// [`lift`](Project::lift) is the one that leaves a gap. Refused only for an
+    /// empty range; a delete that leaves nothing behind empties the timeline,
+    /// which is a state like any other and one undo away.
     pub fn ripple_delete(&mut self, at: u32, len: u32) -> bool {
         if len == 0 {
             return false;
         }
-        let survivors: usize = self
-            .lanes
-            .iter()
-            .map(|l| {
-                l.clips
-                    .iter()
-                    .filter(|c| c.start < at || c.end() > at + len)
-                    .count()
-            })
-            .sum();
-        if survivors == 0 {
+        // Nothing reaches past `at`: there is nothing to cut and nothing to
+        // slide back, and a delete that changes nothing must not cost an undo
+        // step (see [`snapshot`](Project::snapshot)).
+        if !self.lanes.iter().flat_map(|l| &l.clips).any(|c| c.end() > at) {
             return false;
         }
         self.snapshot();
@@ -1951,7 +2107,11 @@ mod tests {
 
         assert!(!p.delete(2), "index past the end");
         assert!(p.delete(1));
-        assert!(!p.delete(0), "the last remaining clip stays");
+        assert!(p.delete(0), "and the last remaining clip goes too");
+        assert_eq!(p.clips().len(), 0);
+        assert_eq!(p.timeline_frames(), 0, "the timeline is emptiable");
+        assert!(!p.delete(0), "there is nothing left to delete");
+        assert!(p.undo(), "one gesture, one undo");
         assert_eq!(p.clips().len(), 1);
     }
 
@@ -2002,13 +2162,28 @@ mod tests {
         }
     }
 
+    /// The timeline is emptiable: the last placement comes off like any other,
+    /// the project holds "nothing on any lane" as a state, and one undo per
+    /// gesture brings it back.
     #[test]
-    fn the_last_clip_of_the_last_lane_cannot_be_lifted() {
+    fn the_last_clip_of_the_last_lane_lifts_and_undoes() {
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0), "a silent timeline is fine");
-        assert!(!p.lift(Lane::V1, 0), "an empty one is not");
+        assert!(p.lift(Lane::V1, 0), "and an empty one is a timeline too");
+        assert_eq!(p.timeline_frames(), 0);
+        assert_eq!(p.composite_span_at(0), None, "nothing to show");
+        assert!(p.audio_segments_from(0, FPS).len() == 1, "one all-gap list");
         assert!(!p.lift(Lane::A1, 0), "index past the end");
-        assert_eq!(p.timeline_frames(), 9);
+        assert!(p.undo(), "and the last lift comes back");
+        assert_eq!(p.lane_spans(Lane::V1), vec![(0, 9)]);
+        // A saved-and-loaded empty timeline is a project like any other, and it
+        // still names the file its frame rate came from.
+        assert!(p.lift(Lane::V1, 0));
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        assert_eq!(sources.len(), 1, "source 0 survives an emptied timeline");
+        let back = Project::from_parts(sources, lanes, eq, color).expect("an empty project loads");
+        assert_eq!(back.timeline_frames(), 0);
+        assert_eq!(back.lanes().len(), 2, "and it kept its lanes");
     }
 
     /// What a keyboard selection walks: one answer per lane, gaps included --
@@ -2113,6 +2288,139 @@ mod tests {
         assert_eq!(shape(&p)[2], vec![clip(0, 0, 3, 0), clip(3, 100, 101, 0)]);
     }
 
+    /// How long `FILE` is, which is what a trim's tail is allowed to reach:
+    /// [`three`] cuts up all nine of its frames.
+    const SRC: &[u32] = &[9];
+
+    /// The drag on a clip's tail: it plays less (or more) of its source, nothing
+    /// else on the lane moves, and every wall stops the edge rather than
+    /// refusing the gesture.
+    #[test]
+    fn trimming_the_tail_stops_at_every_wall() {
+        let mut p = three();
+
+        // Pulled in: a gap opens behind it and the clip after it stays put.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 4, SRC));
+        assert_eq!(
+            shape(&p)[0],
+            vec![clip(0, 0, 3, 0), clip(3, 3, 4, 0), clip(5, 5, 9, 0)]
+        );
+        assert_eq!(p.timeline_frames(), 9, "a trim ripples nothing");
+        assert_eq!(p.map(Lane::V1, 4), None, "the frame it gave up is a gap");
+
+        // ...and back out, no further than the clip behind it.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 8, SRC));
+        assert_eq!(shape(&p)[0][1], clip(3, 3, 5, 0), "stopped at the neighbour");
+        assert!(!p.trim(Lane::V1, 1, Edge::End, 8, SRC), "already at the wall");
+
+        // One frame of clip always survives, however far back the pointer went.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 0, SRC));
+        assert_eq!(shape(&p)[0][1], clip(3, 3, 4, 0));
+
+        // The last clip has no neighbour, so what stops it is the file: nine
+        // frames is nine frames.
+        assert!(p.trim(Lane::V1, 2, Edge::End, 7, SRC));
+        assert!(p.trim(Lane::V1, 2, Edge::End, 9999, SRC));
+        assert_eq!(shape(&p)[0][2], clip(5, 5, 9, 0), "back to the whole take");
+        assert!(!p.trim(Lane::V1, 2, Edge::End, 9999, SRC), "and no further");
+        // A source nobody told us the length of may not grow at all -- an
+        // out-point past the end of a file is a save that will not open again.
+        assert!(p.trim(Lane::V1, 2, Edge::End, 7, &[]));
+        assert!(!p.trim(Lane::V1, 2, Edge::End, 9, &[]), "length unknown");
+    }
+
+    /// The head pulled in takes the in-point with it -- what stays plays what it
+    /// always played -- and stops at the source's own first frame.
+    #[test]
+    fn trimming_the_head_moves_the_in_point() {
+        let mut p = three();
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
+        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0), "two frames off the front");
+        assert_eq!(p.map(Lane::V1, 2), Some((0, 2)), "frame 2 still plays 2");
+        assert_eq!(p.map(Lane::V1, 1), None, "and the front is a gap");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "back out again");
+        assert_eq!(shape(&p)[0][0], clip(0, 0, 3, 0));
+        // One frame survives here too.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 9, SRC));
+        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0));
+
+        // A clip that does not begin at its source's first frame: its head goes
+        // back to source frame 0 and not one frame further.
+        let mut p = Project::single(FILE, 9);
+        assert!(p.place(Lane::V1, 5, clip(0, 1, 4, 0)));
+        assert!(p.lift(Lane::V1, 0), "nothing in front of it to stop it");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC));
+        assert_eq!(shape(&p)[0][0], clip(4, 0, 4, 0), "one frame of head left");
+    }
+
+    /// A clip whose in-point is *past* its own start -- what a ripple delete
+    /// leaves, the piece in front of it gone and this one slid back to frame 0
+    /// carrying the in-point the cut gave it. Its head has more source behind it
+    /// than the timeline has room for, and the timeline's own first frame is the
+    /// wall: asking is not an overflow, and the answer is 0.
+    #[test]
+    fn a_ripple_closed_clip_can_still_be_head_trimmed() {
+        let mut p = Project::single(FILE, 9);
+        assert!(p.split(5));
+        assert!(p.delete_in(Lane::V1, 0), "the first piece goes");
+        assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)], "start 0, in-point 5");
+
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, SRC),
+            Some((0, 3)),
+            "back to frame 0 at most, and one frame of clip always survives"
+        );
+        assert!(!p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "already there");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
+        assert_eq!(shape(&p)[0], vec![clip(2, 7, 9, 0)], "the in-point followed");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "and back out");
+        assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)]);
+    }
+
+    /// Linked halves trim as one: a link is one span on however many lanes, so
+    /// the sound follows the picture's edge -- and the tightest wall of the two
+    /// is what stops both.
+    #[test]
+    fn linked_halves_trim_together() {
+        let mut p = three();
+        let link = p.lane(Lane::V1)[2].link.expect("a split hands out ids");
+        assert_eq!(p.lane(Lane::A1)[2].link, Some(link), "both halves grouped");
+
+        assert!(p.trim(Lane::V1, 2, Edge::Start, 7, SRC));
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0));
+        assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0), "the sound followed");
+        assert!(p.trim(Lane::A1, 2, Edge::End, 8, SRC), "either half drags it");
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 8, 0), "and the picture follows");
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+
+        // Something in the way on the *audio* lane stops the picture's tail as
+        // well: the group can only go as far as its tightest member.
+        assert!(p.place(Lane::A1, 9, clip(0, 0, 1, 0)));
+        assert!(p.trim(Lane::V1, 2, Edge::End, 9999, SRC));
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0), "stopped by A1's clip");
+        assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0));
+        links_are_consistent(&p.lanes).expect("still one span");
+    }
+
+    /// A whole drag is one undo step -- the front-end commits once, at the
+    /// release -- and an edge asked to stay where it is costs none at all.
+    #[test]
+    fn a_trim_is_one_undo_step() {
+        let mut p = three();
+        let before = shape(&p);
+        let history = p.history.len();
+
+        assert!(p.trim(Lane::V1, 1, Edge::End, 4, SRC));
+        assert_eq!(p.history.len(), history + 1, "one snapshot per gesture");
+        assert!(!p.trim(Lane::V1, 1, Edge::End, 4, SRC), "already there");
+        assert!(!p.trim(Lane::V1, 9, Edge::End, 4, SRC), "no such clip");
+        assert!(!p.trim(Lane::new(LaneKind::Video, 7), 0, Edge::End, 4, SRC));
+        assert_eq!(p.history.len(), history + 1, "a refusal snapshots nothing");
+
+        assert!(p.undo());
+        assert_eq!(shape(&p), before, "both halves back, in one step");
+    }
+
     /// A moved half stays in its group: a link names a span, not a lane, so the
     /// picture on `V2` is still the same take as the sound under it on `A1`.
     #[test]
@@ -2141,7 +2449,16 @@ mod tests {
         assert_eq!(shape(&p)[1], shape(&p)[0]);
         assert_eq!(p.timeline_frames(), 5);
         assert!(!p.ripple_delete(0, 0), "an empty range is not a delete");
-        assert!(!p.ripple_delete(0, 100), "and one that empties every lane");
+        assert!(p.undo());
+        assert_eq!(shape(&p), shape(&three()));
+        // One that takes everything is a delete like any other: the timeline
+        // empties, and the undo it cost brings it back whole.
+        assert!(p.ripple_delete(0, 100), "the timeline is emptiable");
+        assert_eq!(p.timeline_frames(), 0);
+        assert!(
+            !p.ripple_delete(0, 100),
+            "and a delete with nothing left to take is not an undo step"
+        );
         assert!(p.undo());
         assert_eq!(shape(&p), shape(&three()));
     }
@@ -2628,7 +2945,8 @@ mod tests {
         assert!(p.split(4), "...and is editable from there");
         assert!(p.undo());
 
-        // A lane may be empty; every lane may not, and neither may no lane.
+        // A lane may be empty, and so may every lane -- an emptied timeline is a
+        // project. No lane at all is not one: there would be nothing to place on.
         assert!(
             Project::from_parts(
                 sources.clone(),
@@ -2645,7 +2963,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             )
-            .is_err()
+            .is_ok()
         );
         assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
