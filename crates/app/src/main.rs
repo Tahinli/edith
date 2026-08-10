@@ -640,8 +640,26 @@ impl Player {
     /// moves along rather than being painted over. Reseeks like every other
     /// edit, and drops the timeline's selection with it: the insert has just
     /// moved the indices it pointed at.
-    fn insert_source(&mut self, path: &Path, stream: usize, cx: &mut Context<Self>) {
+    fn insert_source(
+        &mut self,
+        path: &Path,
+        stream: usize,
+        onto: Option<Lane>,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
+            return;
+        }
+        // A file with no picture belongs on the audio lane and nowhere else:
+        // dropped on the video lane it is refused by name, and asked for by the
+        // Add button (which names no lane) it goes to the audio one -- which is
+        // the engine's choice, in `place_stream_at`, not one made twice here.
+        if engine::is_audio(path) && onto == Some(Lane::Video) {
+            let name = file_name(path);
+            self.notice = Some(
+                format!("NOT ON THE VIDEO LANE — {name} has no picture; drop it on A1").into(),
+            );
+            cx.notify();
             return;
         }
         let frames = self.session.as_ref().map_or(0, |session| {
@@ -1334,6 +1352,13 @@ impl Player {
                 // A greyed row says why in full, where its length would be:
                 // the list is the one place the file's own tracks are named.
                 (Some(why), _) => format!("{} — {why}", row.path.display()),
+                // A file with no picture has no size and no frame rate to
+                // report, and only one lane it can go on: saying so is the
+                // difference between a hint and a lie.
+                (None, _) if engine::is_audio(&row.path) => format!(
+                    "{} — audio only · drag onto the audio lane, or Add at playhead",
+                    row.path.display()
+                ),
                 (None, Some(meta)) => format!(
                     "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
                     row.path.display(),
@@ -1486,7 +1511,9 @@ impl Player {
                 ),
                 cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some((path, stream)) = this.selected_asset.clone() {
-                        this.insert_source(&path, stream, cx);
+                        // No lane: the button means "wherever this belongs",
+                        // which for a file with no picture is the audio lane.
+                        this.insert_source(&path, stream, None, cx);
                     }
                 }),
             ))
@@ -2311,8 +2338,8 @@ impl Player {
                     // Add button makes, through the same call -- at the
                     // playhead, not at the pointer: clips here are placed end
                     // to end, so where along the bed it landed says nothing.
-                    .on_drop(cx.listener(|this, drag: &AssetDrag, _, cx| {
-                        this.insert_source(&drag.0.clone(), drag.1, cx)
+                    .on_drop(cx.listener(move |this, drag: &AssetDrag, _, cx| {
+                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
