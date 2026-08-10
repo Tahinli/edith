@@ -789,6 +789,18 @@ fn matches_timeline(
     timeline: &VideoMeta,
     first: &Option<crate::AudioProbe>,
 ) -> crate::Result<()> {
+    // Codec first: one timeline is one kind of source. Mixing them would decode
+    // (every clip opens its own decoder) but on a machine without the VA-API
+    // plugin the VP9 half would be black frames with the refusal only on
+    // stderr, which is exactly what a front-end cannot show.
+    if meta.codec != timeline.codec {
+        return Err(format!(
+            "{} does not match the timeline's {}",
+            meta.codec.name(),
+            timeline.codec.name()
+        )
+        .into());
+    }
     if (meta.width, meta.height) != (timeline.width, timeline.height) {
         return Err(format!(
             "{}x{} does not match the timeline's {}x{}",

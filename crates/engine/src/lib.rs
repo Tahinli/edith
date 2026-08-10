@@ -20,7 +20,7 @@ pub use audio::{
 };
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
-pub use demux::VideoMeta;
+pub use demux::{Codec, VideoMeta};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
 pub use playback::PlaybackSession;

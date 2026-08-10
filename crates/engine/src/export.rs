@@ -475,7 +475,13 @@ struct SwDecoder {
 
 impl SwDecoder {
     fn open(path: &Path, start_frame: u32) -> crate::Result<Self> {
-        let (_, mut demuxer) = Demuxer::open(path)?;
+        let (meta, mut demuxer) = Demuxer::open(path)?;
+        // The software decoder is H.264-only; a VP9 source that got this far
+        // means the plugin refused it, and the export says so instead of
+        // handing VP9 bytes to `rusty_h264`.
+        if meta.codec != crate::demux::Codec::H264 {
+            return Err(crate::demux::VP9_NEEDS_PLUGIN.into());
+        }
         // Decoding restarts at a sync sample, so pictures between it and the in
         // point are decoded (the target references them) and then dropped.
         let index = demuxer.seek_to_sync_at_or_before(start_frame);
@@ -521,6 +527,7 @@ mod tests {
             height,
             frame_rate,
             frame_count: 1,
+            codec: crate::demux::Codec::H264,
         };
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
