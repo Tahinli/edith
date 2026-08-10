@@ -5572,12 +5572,34 @@ fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     if format != Format::Mp4 {
         return None;
     }
-    let lanes = session
+    let audio: Vec<Lane> = session
         .lanes()
         .into_iter()
         .filter(|&lane| lane.kind == LaneKind::Audio && !session.lane_clips(lane).is_empty())
-        .count();
-    (lanes > 1).then(|| format!("{lanes} audio lanes — an mp4 copies one"))
+        .collect();
+    if audio.len() > 1 {
+        return Some(format!("{} audio lanes — an mp4 copies one", audio.len()));
+    }
+    // ...and the third reason, the same path's: a copied AAC packet carries no
+    // rate, so a speeded clip on the lane being copied would come back at 1.00x
+    // under a picture the export *does* re-time. The engine refuses it by name
+    // (`export::copy_audio`); this greys the row before anyone picks a
+    // destination. The picture's own rate is no reason at all -- the export walk
+    // honours that -- so only this one lane is asked.
+    audio
+        .first()
+        .and_then(|&lane| {
+            session
+                .lane_clips(lane)
+                .iter()
+                .find(|c| !c.speed.is_normal())
+        })
+        .map(|c| {
+            format!(
+                "sound at {} — an mp4 copies packets, which carry no rate",
+                c.speed
+            )
+        })
 }
 
 /// How tall a column of `lanes` rows is, gaps included -- the panel's own gap
