@@ -221,9 +221,97 @@ impl std::fmt::Display for Speed {
     }
 }
 
+/// What a file's own frame rate is against the timeline's, as an exact rational
+/// in thousandths of a frame per second: how many frames of the *file* one frame
+/// of the timeline is worth.
+///
+/// Every frame number in this module counts **timeline** frames -- a clip's
+/// `in_frame` and `out_frame` included -- so a 23.976 fps file placed on a 30 fps
+/// timeline is as many frames long as the seconds it lasts, and every edit
+/// (trim, split, speed, paste) is the same arithmetic it always was. This is the
+/// one conversion, and it happens at the decoder's door: [`PlaybackSession`]
+/// opens a worker with it and [`crate::export`] pulls pictures through it. The
+/// file's own numbering exists nowhere else.
+///
+/// The same floor/ceil pair as [`Speed`], for the same reason: the frame an
+/// export encodes at a timeline frame has to be the frame playback is holding
+/// there. Composed *after* a speed rather than folded into it, so a 2x 24 fps
+/// clip on a 30 fps timeline is exactly both (`rate_composes_with_speed`).
+///
+/// ponytail: the rate is rounded to milli-fps, so 24000/1001 is carried as
+/// 23.976 -- about a frame per 40000, or a frame off after seven hours of one
+/// clip. Upgrade path is carrying the container's own timescale rational in
+/// [`crate::VideoMeta`] and building this from it.
+///
+/// [`PlaybackSession`]: crate::PlaybackSession
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rate {
+    /// Milli-fps of the file...
+    source: u64,
+    /// ...and of the timeline it plays on.
+    timeline: u64,
+}
+
+impl Rate {
+    /// A file shot at the timeline's own rate: every conversion below is the
+    /// identity, which is the path a single-rate project is on.
+    pub const REAL_TIME: Self = Self {
+        source: 1,
+        timeline: 1,
+    };
+
+    /// The rate of a file at `source_fps` on a timeline at `timeline_fps`.
+    /// Rounded to milli-fps, and [`REAL_TIME`](Self::REAL_TIME) for the rates
+    /// that agree there -- container rates are computed from timescales, so
+    /// "the same rate" is never `==` either.
+    pub fn new(source_fps: f64, timeline_fps: f64) -> Self {
+        let milli = |fps: f64| match fps.is_finite() && fps > 0. {
+            true => (fps * 1000.).round().clamp(1., 1e9) as u64,
+            // Not a rate at all: read the file frame for frame rather than
+            // dividing the timeline by a zero.
+            false => 0,
+        };
+        match (milli(source_fps), milli(timeline_fps)) {
+            (0, _) | (_, 0) => Self::REAL_TIME,
+            (source, timeline) if source == timeline => Self::REAL_TIME,
+            (source, timeline) => Self { source, timeline },
+        }
+    }
+
+    pub fn is_real_time(self) -> bool {
+        self.source == self.timeline
+    }
+
+    /// As a multiplier of the timeline's rate: what a *file's* own frame rate
+    /// is, given the timeline's, for a library row that names it.
+    pub fn as_f64(self) -> f64 {
+        self.source as f64 / self.timeline as f64
+    }
+
+    /// Which frame of the file the `frame`th timeline-rate frame of it is:
+    /// floored, [`Speed::source_at`]'s half of the pair.
+    pub fn source_at(self, frame: u32) -> u32 {
+        (u64::from(frame) * self.source / self.timeline).min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Its inverse, ceiled ([`Speed::timeline_at`]'s half): the first
+    /// timeline-rate frame that shows source frame `source_frame` -- which is
+    /// the stamp playback puts on a decoded picture, and, applied to a file's
+    /// frame *count*, how long that file is in timeline frames.
+    pub fn timeline_at(self, source_frame: u32) -> u32 {
+        (u64::from(source_frame) * self.timeline)
+            .div_ceil(self.source)
+            .min(u64::from(u32::MAX)) as u32
+    }
+}
+
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
 /// Never empty.
+///
+/// Counted at the **timeline's** frame rate, not the file's: a source shot at
+/// another rate is converted at the decoder's door ([`Rate`]), so every edit
+/// here is frames of one clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Clip {
     /// Timeline frame the clip's first frame is shown at. Meaningless on a
@@ -4537,6 +4625,78 @@ mod tests {
         assert_eq!(Speed::from_permille(1000), Speed::NORMAL);
         assert_eq!(Speed::NORMAL.to_string(), "1.00x");
         assert_eq!(Speed::from_permille(2500).to_string(), "2.50x");
+    }
+
+    /// [`Rate`] is [`Speed`]'s pair again, over the *file's* rate: the frame an
+    /// export encodes at a timeline frame is the one playback is holding there,
+    /// a file is as long in timeline frames as the seconds it lasts, and the two
+    /// compose so a speeded clip at another rate is exactly both.
+    #[test]
+    fn rate_composes_with_speed() {
+        // 23.976 into 30 (the ratio that does not terminate), 30 into 23.976,
+        // 60 into 30, 25 into 30 -- and the timeline's own rate, which must be
+        // the identity map or a single-rate project would move.
+        for (source_fps, timeline_fps) in [
+            (24000. / 1001., 30.),
+            (30., 24000. / 1001.),
+            (60., 30.),
+            (25., 30.),
+            (30., 30.),
+        ] {
+            let rate = Rate::new(source_fps, timeline_fps);
+            for n in 0..2000u32 {
+                let source = rate.source_at(n);
+                // The stamp is the *first* timeline-rate frame that shows it, so
+                // the picture on screen at `n` is the picture encoded at `n`.
+                let held = (0..=source + 4)
+                    .filter(|&s| rate.timeline_at(s) <= n)
+                    .next_back();
+                assert_eq!(held, Some(source), "{source_fps} on {timeline_fps} at {n}");
+            }
+            // A file of `count` frames is `timeline_at(count)` frames long here,
+            // and its last one still reads a frame the file has.
+            for count in 1..500u32 {
+                let frames = rate.timeline_at(count);
+                assert!(frames >= 1, "a file is never zero frames long");
+                assert!(
+                    rate.source_at(frames - 1) < count,
+                    "{source_fps} on {timeline_fps}: {count} frames reads past the file"
+                );
+            }
+            // No drift: the mapping is one exact division, not an accumulation,
+            // so an hour in is as true as the first second. (`Rate` rounds the
+            // rate itself to milli-fps -- 23.976 for 24000/1001 -- which is the
+            // 3e-8 the tolerance below allows for.)
+            let milli = |fps: f64| (fps * 1000.).round();
+            for n in [1u32, 100, 10_000, 500_000, 3_000_000] {
+                let want = f64::from(n) * milli(source_fps) / milli(timeline_fps);
+                assert!(
+                    (f64::from(rate.source_at(n)) - want).abs() < 1.,
+                    "{source_fps} on {timeline_fps}: frame {n} drifted"
+                );
+            }
+        }
+        // The timeline's own rate is the identity, whichever way it is written.
+        assert!(Rate::new(30., 30.).is_real_time());
+        assert!(Rate::new(30.0004, 30.).is_real_time(), "milli-fps rounding");
+        assert!(Rate::new(0., 30.).is_real_time(), "not a rate at all");
+        for n in 0..1000 {
+            assert_eq!(Rate::REAL_TIME.source_at(n), n);
+            assert_eq!(Rate::REAL_TIME.timeline_at(n), n);
+        }
+        // ...and the composition, in the order the decoder's door applies it:
+        // the speed picks the clip's (timeline-rate) frame, the rate picks the
+        // file's. A 2x clip of a 23.976 fps file on a 30 fps timeline reads two
+        // timeline frames per frame shown, each of them 0.799 of a file frame.
+        let rate = Rate::new(24000. / 1001., 30.);
+        let speed = Speed::from_permille(2000);
+        for d in 0..100u32 {
+            assert_eq!(
+                rate.source_at(speed.source_at(d)),
+                (u64::from(d) * 2 * 23976 / 30000) as u32,
+                "2x of a 23.976 fps file at timeline frame {d}"
+            );
+        }
     }
 
     /// The mapping a speed changes, and the one it does not: a 2x clip reads two
