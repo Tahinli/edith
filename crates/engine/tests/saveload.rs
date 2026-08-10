@@ -256,6 +256,47 @@ fn a_source_that_shrank_is_refused_by_clip() {
     assert_eq!(whole.timeline_duration(), 5.0);
 }
 
+/// A refusal must *return*. Opening a project starts decoding source 0 before
+/// it has validated anything, so by the time a later source is refused the
+/// worker is several frames in -- and with a two-frame channel that nobody is
+/// draining, it is parked in `send`. Tearing that down in the wrong order joins
+/// a thread that is waiting for a receiver the same scope still holds, and the
+/// app hangs on a bad project file instead of showing the error.
+///
+/// The many sources are what make the park a certainty rather than a race: each
+/// one is opened and probed before the clip check that refuses, which is far
+/// longer than the few frames it takes to fill the channel.
+#[test]
+fn a_refused_project_does_not_hang_on_its_own_decoder() {
+    let dir = scratch("refusal_hang");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("refused.edith");
+    let mut text = String::from("edith 1\nplayhead 0\n");
+    for _ in 0..1024 {
+        text.push_str("source test_av.mp4\n");
+    }
+    // Legal until the last line, which runs off the end of a 150-frame file.
+    text.push_str("clip 0 150 0\nclip 0 10000 0\n");
+    std::fs::write(&path, &text).expect("write");
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let probe = path.clone();
+    std::thread::spawn(move || {
+        let err = PlaybackSession::open_project(&probe)
+            .err()
+            .map(|e| e.to_string());
+        let _ = tx.send(err);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Some(err)) => assert!(err.contains("150"), "refused, but not by name: {err}"),
+        Ok(None) => panic!("a clip past the end of its file must not open"),
+        Err(_) => panic!(
+            "open_project hung on a refusal: its own decode worker is parked in \
+             send and the teardown is waiting for it"
+        ),
+    }
+}
+
 #[test]
 fn a_project_that_names_itself_is_refused() {
     let dir = scratch("self_reference");
