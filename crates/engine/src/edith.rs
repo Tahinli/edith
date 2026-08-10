@@ -1,14 +1,20 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 2
+//! edith 3
 //! playhead 90
-//! source test_av.mp4
-//! source /elsewhere/test_av2.mp4
+//! source 0 test_av.mp4
+//! source 1 /elsewhere/test_av2.mp4
 //! video 0 0 120 0 0
 //! audio 0 0 120 0 0
 //! video 120 0 120 1 -
 //! ```
+//!
+//! A source line is `source <audio stream> <path>`: which of the file's audio
+//! tracks that source plays, in the file order
+//! [`crate::AudioSession::probe_streams`] numbers, and then the path -- the
+//! stream first because a path runs to the end of the line (it may hold
+//! spaces) and an optional *trailing* field could not be told from one.
 //!
 //! A lane line is `<lane> <start> <in> <out> <source> <link>`: where the clip
 //! sits on the timeline, the half-open source range it plays, the file it plays
@@ -16,10 +22,12 @@
 //! *gap* is simply a stretch no line covers -- there is nothing to write for
 //! one, and nothing that can disagree about its length.
 //!
-//! **Version 1** wrote one lane, queued end to end: `clip <in> <out> <source>`.
-//! Such a file still loads -- the clips are laid out cumulatively and copied
-//! onto both lanes as one group each, which is exactly what a v1 timeline meant
-//! -- and saving it again writes v2. A v1 reader refuses a v2 file by name.
+//! **Version 2** wrote `source <path>`, which is this file's stream 0 -- one
+//! per file, whichever audio track came first. **Version 1** wrote that and one
+//! lane, queued end to end: `clip <in> <out> <source>`. Both still load -- a v1
+//! file's clips are laid out cumulatively and copied onto both lanes as one
+//! group each, which is exactly what a v1 timeline meant -- and saving either
+//! again writes v3. An older reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -45,19 +53,21 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use crate::project::Clip;
+use crate::project::{Clip, Source};
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
-/// docs for what that dialect looked like.
-const MAGIC: &[u8] = b"edith 2";
+/// docs for what those dialects looked like.
+const MAGIC: &[u8] = b"edith 3";
+const MAGIC_V2: &[u8] = b"edith 2";
 const MAGIC_V1: &[u8] = b"edith 1";
 
 /// What a project file says: an edit list plus where the playhead stood.
 /// Structurally valid by construction -- see [`parse`].
 #[derive(Debug)]
 pub struct Document {
-    /// Absolute, relative entries already joined to the file's own directory.
-    pub sources: Vec<PathBuf>,
+    /// Paths absolute, relative entries already joined to the file's own
+    /// directory.
+    pub sources: Vec<Source>,
     pub video: Vec<Clip>,
     pub audio: Vec<Clip>,
     pub playhead: u32,
@@ -67,7 +77,7 @@ pub struct Document {
 /// orphan-free ([`crate::Project::without_orphan_sources`]).
 pub fn save(
     path: &Path,
-    sources: &[PathBuf],
+    sources: &[Source],
     video: &[Clip],
     audio: &[Clip],
     playhead: u32,
@@ -112,14 +122,14 @@ fn project_dir(path: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
-fn emit(dir: &Path, sources: &[PathBuf], video: &[Clip], audio: &[Clip], playhead: u32) -> Vec<u8> {
+fn emit(dir: &Path, sources: &[Source], video: &[Clip], audio: &[Clip], playhead: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(b'\n');
     out.extend_from_slice(format!("playhead {playhead}\n").as_bytes());
     for s in sources {
-        out.extend_from_slice(b"source ");
-        escape(s.strip_prefix(dir).unwrap_or(s), &mut out);
+        out.extend_from_slice(format!("source {} ", s.audio_stream).as_bytes());
+        escape(s.path.strip_prefix(dir).unwrap_or(&s.path), &mut out);
         out.push(b'\n');
     }
     // Lane by lane rather than interleaved by time: a lane reads as a list, and
@@ -146,7 +156,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     let mut lines = body.split(|&b| b == b'\n').enumerate();
     let (_, first) = lines.next().unwrap_or((0, &[]));
     let v1 = first == MAGIC_V1;
-    if first != MAGIC && !v1 {
+    // The dialects that wrote a source line without its stream field. Reading
+    // one is the whole of what "an old project still opens" means here.
+    let streamless = v1 || first == MAGIC_V2;
+    if first != MAGIC && !streamless {
         return Err(match first.strip_prefix(b"edith ") {
             Some(v) => format!("line 1: unsupported version {}", String::from_utf8_lossy(v)),
             None => "line 1: not a edith file".to_string(),
@@ -184,16 +197,33 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if !doc.video.is_empty() || !doc.audio.is_empty() {
                     return Err(format!("line {n}: source after a clip").into());
                 }
+                // The stream comes first and the path is everything after it,
+                // spaces and all; an older dialect wrote no stream and meant 0.
+                let (audio_stream, rest) = if streamless {
+                    (0, rest)
+                } else {
+                    // No space at all still has to reach `number`, so a v2 line
+                    // in a v3 file is refused as the missing field it is rather
+                    // than as a missing path.
+                    let at = rest.iter().position(|&b| b == b' ');
+                    (
+                        number(&rest[..at.unwrap_or(rest.len())], n)? as usize,
+                        &rest[at.map_or(rest.len(), |at| at + 1)..],
+                    )
+                };
                 if rest.is_empty() {
                     return Err(format!("line {n}: source without a path").into());
                 }
                 let path = unescape(rest, n)?;
                 // Relative means "next to the project file", which is what
                 // makes a whole folder relocatable.
-                doc.sources.push(if path.is_absolute() {
-                    path
-                } else {
-                    dir.join(path)
+                doc.sources.push(Source {
+                    path: if path.is_absolute() {
+                        path
+                    } else {
+                        dir.join(path)
+                    },
+                    audio_stream,
                 });
             }
             // v1: one lane, no placement, no groups. Every clip becomes one
@@ -376,13 +406,17 @@ mod tests {
     /// Two sources, one under the project's own directory and one not, a clip
     /// from each on the video lane, and an audio lane with a gap in the middle
     /// -- the shape every case below starts from.
-    fn doc() -> (PathBuf, Vec<PathBuf>, Vec<Clip>, Vec<Clip>) {
+    fn source(path: &str, audio_stream: usize) -> Source {
+        Source {
+            path: PathBuf::from(path),
+            audio_stream,
+        }
+    }
+
+    fn doc() -> (PathBuf, Vec<Source>, Vec<Clip>, Vec<Clip>) {
         (
             PathBuf::from("/proj"),
-            vec![
-                PathBuf::from("/proj/a.mp4"),
-                PathBuf::from("/elsewhere/b.mp4"),
-            ],
+            vec![source("/proj/a.mp4", 0), source("/elsewhere/b.mp4", 2)],
             vec![clip(0, 0, 30, 0, Some(0)), clip(30, 10, 20, 1, Some(1))],
             vec![clip(0, 0, 30, 0, Some(0))],
         )
@@ -394,9 +428,10 @@ mod tests {
         let bytes = emit(&dir, &sources, &video, &audio, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 2\nplayhead 12\nsource a.mp4\nsource /elsewhere/b.mp4\n\
+            "edith 3\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
              video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n",
-            "the file under the project directory is written relative to it"
+            "the file under the project directory is written relative to it, \
+             each with the audio stream it plays"
         );
         let back = parse(&bytes, &dir).expect("parse");
         assert_eq!(back.sources, sources, "relative entries rejoin the dir");
@@ -413,8 +448,36 @@ mod tests {
         );
     }
 
+    /// The other half of the compatibility promise: a v2 file names no audio
+    /// stream and means stream 0 -- what the whole dialect could play -- and
+    /// saving it again writes v3 saying so, with nothing else changed.
+    #[test]
+    fn a_v2_file_loads_as_stream_0() {
+        let dir = PathBuf::from("/proj");
+        let v2 = b"edith 2\nplayhead 12\nsource a.mp4\nsource /elsewhere/b.mp4\n\
+                   video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n";
+        let back = parse(v2, &dir).expect("v2 parses");
+        assert_eq!(
+            back.sources,
+            vec![source("/proj/a.mp4", 0), source("/elsewhere/b.mp4", 0)],
+        );
+        let (_, _, video, audio) = doc();
+        assert_eq!((&back.video, &back.audio), (&video, &audio));
+
+        let v3 = emit(&dir, &back.sources, &back.video, &back.audio, back.playhead);
+        assert_eq!(
+            String::from_utf8_lossy(&v3),
+            "edith 3\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
+             video 0 0 30 0 0\nvideo 30 10 20 1 1\naudio 0 0 30 0 0\n",
+            "a re-saved v2 project differs only by its version and the streams \
+             it always meant"
+        );
+        let again = parse(&v3, &dir).expect("v3 parses");
+        assert_eq!(again.sources, back.sources);
+    }
+
     /// The compatibility promise: a v1 file is a fully-grouped, gapless pair of
-    /// lanes, and saving it again writes v2.
+    /// lanes, and saving it again writes v3.
     #[test]
     fn a_v1_file_loads_as_two_grouped_lanes() {
         let dir = PathBuf::from("/proj");
@@ -427,10 +490,10 @@ mod tests {
         );
         assert_eq!(back.audio, back.video, "one take per clip, on both lanes");
         assert_eq!(back.playhead, 5);
-        // Saved again it is v2, and that round-trips to the same document.
-        let v2 = emit(&dir, &back.sources, &back.video, &back.audio, back.playhead);
-        assert!(v2.starts_with(b"edith 2\n"));
-        let again = parse(&v2, &dir).expect("v2 parses");
+        // Saved again it is v3, and that round-trips to the same document.
+        let v3 = emit(&dir, &back.sources, &back.video, &back.audio, back.playhead);
+        assert!(v3.starts_with(b"edith 3\n"));
+        let again = parse(&v3, &dir).expect("v3 parses");
         assert_eq!((again.video, again.audio), (back.video, back.audio));
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
         for (bytes, want) in [
@@ -514,17 +577,25 @@ mod tests {
         let path = dir.join("link/p.edith");
 
         let one = [clip(0, 0, 30, 0, None)];
-        save(&path, &[source], &one, &one, 0).expect("save");
+        let entry = Source {
+            path: source,
+            audio_stream: 1,
+        };
+        save(&path, &[entry], &one, &one, 0).expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 2\nplayhead 0\nsource a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n"
+            "edith 3\nplayhead 0\nsource 1 a.mp4\nvideo 0 0 30 0 -\naudio 0 0 30 0 -\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
-        // way the project was opened -- the same file, through the link.
+        // way the project was opened -- the same file, through the link, still
+        // playing the stream it was saved on.
         assert_eq!(
             load(&path).expect("load").sources,
-            vec![dir.join("link/a.mp4")]
+            vec![Source {
+                path: dir.join("link/a.mp4"),
+                audio_stream: 1,
+            }]
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
@@ -533,7 +604,10 @@ mod tests {
     fn escapes_survive_the_bytes_json_would_not() {
         let dir = PathBuf::from("/proj");
         // A newline and a percent in a filename, plus a non-UTF-8 byte.
-        let nasty = PathBuf::from(OsString::from_vec(b"/proj/we\nird 100%\xff.mp4".to_vec()));
+        let nasty = Source {
+            path: PathBuf::from(OsString::from_vec(b"/proj/we\nird 100%\xff.mp4".to_vec())),
+            audio_stream: 0,
+        };
         let bytes = emit(&dir, &[nasty.clone()], &[clip(0, 0, 5, 0, None)], &[], 0);
         assert_eq!(
             bytes.iter().filter(|&&b| b == b'\n').count(),
@@ -541,16 +615,18 @@ mod tests {
             "the escaped newline must not become a line break"
         );
         let back = parse(&bytes, &dir).expect("parse");
+        // The spaces in it are the reason the stream field leads rather than
+        // trails: everything after the first one is path.
         assert_eq!(back.sources, vec![nasty]);
     }
 
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 3\nsource a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 4\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 3");
+        assert_eq!(err, "line 1: unsupported version 4");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
@@ -562,7 +638,16 @@ mod tests {
     #[test]
     fn malformed_lines_name_their_line_number() {
         let dir = PathBuf::from("/proj");
-        let cases: [(&[u8], &str); 8] = [
+        let cases: [(&[u8], &str); 10] = [
+            // v3 wants the stream before the path, and a path after it.
+            (
+                b"edith 3\nsource a.mp4\nvideo 0 0 5 0 -\n",
+                "line 2: \"a.mp4\" is not a number",
+            ),
+            (
+                b"edith 3\nsource 0\nvideo 0 0 5 0 -\n",
+                "line 2: source without a path",
+            ),
             (
                 b"edith 1\nsource a.mp4\nclip 0 5\n",
                 "line 3: clip wants 3 fields, found 2",
