@@ -3826,9 +3826,9 @@ fn layout(channels: u16) -> Option<String> {
 /// picker that hides them is a picker that lies.
 fn unusable(info: &StreamInfo, timeline_audio: Option<(u32, u16)>) -> Option<String> {
     if !info.decodable {
-        // ponytail: mp4 0.14 keeps no fourcc for a sample entry it does not
-        // parse (`StreamInfo::codec`), so an AC-3 track can only be named as
-        // unsupported, not as AC-3. Upgrade path is reading the stsd ourselves.
+        // AAC and AC-3 name themselves (`StreamInfo::codec`, which reads the
+        // stsd fourcc by hand); anything else mp4 0.14 does not parse has no
+        // name to give, and a row with no name still says why it is greyed.
         return Some(match info.codec.as_str() {
             "unknown" => "unsupported codec".to_string(),
             codec => format!("{codec} is not supported"),

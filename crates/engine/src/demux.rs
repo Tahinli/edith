@@ -876,8 +876,9 @@ fn hvcc_record(path: &Path, track_id: u32) -> crate::Result<Vec<u8>> {
 /// entry's payload. Read by hand for the same reason the record above is: the
 /// crate keeps no fourcc for a sample entry it does not recognise, so this is
 /// the only thing that can tell an `hvc1` track from a track in a codec nothing
-/// here reads.
-fn sample_entry(path: &Path, track_id: u32) -> crate::Result<([u8; 4], Vec<u8>)> {
+/// here reads. Shared with `audio`, which asks it the same question of a `soun`
+/// track: `mp4a` or the `ac-3` the crate drops on the floor.
+pub(crate) fn sample_entry(path: &Path, track_id: u32) -> crate::Result<([u8; 4], Vec<u8>)> {
     let moov = read_top_level(path, b"moov")?.ok_or("no moov box in file")?;
     let trak = boxes(&moov)
         .filter(|(kind, _)| *kind == b"trak")
