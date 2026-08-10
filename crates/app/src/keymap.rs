@@ -63,6 +63,9 @@ pub enum ActionId {
     Color,
     Fit,
     Resolution,
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
     Undo,
     AddVideoLane,
     AddAudioLane,
@@ -80,7 +83,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 35] = [
+    pub const ALL: [ActionId; 38] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -104,6 +107,9 @@ impl ActionId {
         ActionId::Color,
         ActionId::Fit,
         ActionId::Resolution,
+        ActionId::ZoomIn,
+        ActionId::ZoomOut,
+        ActionId::ZoomFit,
         ActionId::Undo,
         ActionId::AddVideoLane,
         ActionId::AddAudioLane,
@@ -144,6 +150,9 @@ impl ActionId {
             ActionId::Color => "Colour…",
             ActionId::Fit => "Fit policy: fit → fill → stretch → centre",
             ActionId::Resolution => "Project resolution: source → 2160p → 1080p → 720p → 480p",
+            ActionId::ZoomIn => "Zoom in on the timeline (around the playhead)",
+            ActionId::ZoomOut => "Zoom out of the timeline",
+            ActionId::ZoomFit => "Fit the whole timeline on screen",
             ActionId::Undo => "Undo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
@@ -186,6 +195,9 @@ impl ActionId {
             ActionId::Color => "color",
             ActionId::Fit => "fit",
             ActionId::Resolution => "resolution",
+            ActionId::ZoomIn => "zoom-in",
+            ActionId::ZoomOut => "zoom-out",
+            ActionId::ZoomFit => "zoom-fit",
             ActionId::Undo => "undo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
@@ -236,7 +248,11 @@ impl ActionId {
             | ActionId::Silence => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
-            ActionId::Resolution => Category::View,
+            // Neither is how much of the timeline the panel shows: a zoom edits
+            // nothing, it magnifies.
+            ActionId::Resolution | ActionId::ZoomIn | ActionId::ZoomOut | ActionId::ZoomFit => {
+                Category::View
+            }
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -307,7 +323,7 @@ pub const FIXED: [Fixed; 16] = [
     // holding anything else still does what one press did.
     Fixed {
         chord: "hold ← → ↑ ↓",
-        label: "Run a card's slider, or the volume keys, while held",
+        label: "Run a card's slider, or the volume and zoom keys, while held",
         category: Category::View,
     },
     Fixed {
@@ -544,6 +560,14 @@ impl Keymap {
                 // it changes what every clip is composed onto.
                 b(ActionId::Fit, "p", false),
                 b(ActionId::Resolution, "r", true),
+                // The zoom pair, on the chords every editor and every browser
+                // magnifies with. The bare "=" and "-" are the volume keys, so
+                // these take the ctrl versions of them -- and ctrl+0 is the
+                // "back to 100%" of the same family, which here is the whole
+                // timeline across the bed.
+                b(ActionId::ZoomIn, "=", true),
+                b(ActionId::ZoomOut, "-", true),
+                b(ActionId::ZoomFit, "0", true),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
                 // The unshifted initials of what they add. Both were free --
@@ -839,7 +863,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 37);
+        assert_eq!(k.entries().len(), 40);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -1015,7 +1039,8 @@ mod tests {
         // A bindable chord is one `rebind_action` may keep: what it writes is
         // what the next load reads, for every stroke that passes here.
         let mut k = Keymap::defaults();
-        k.rebind_action(ActionId::Play, chord("=", true)).unwrap();
+        // Any free chord will do here; ctrl+= is the zoom's.
+        k.rebind_action(ActionId::Play, chord("w", true)).unwrap();
         assert_eq!(whole(&emit(&k)), k);
     }
 
@@ -1072,7 +1097,8 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 35);
+        assert_eq!(ActionId::ALL.len(), 38);
+        assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
 
     #[test]
