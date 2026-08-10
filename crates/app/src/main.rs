@@ -120,6 +120,11 @@ const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
 const MENU_W: f32 = 260.;
 const MENU_ROW_H: f32 = HIT_MIN;
 const MENU_PAD: f32 = 6.;
+/// How much of the item list is on screen at once, capped and scrolling like the
+/// keybindings and export lists: every action the pointer can reach is an item
+/// here, and a menu taller than the 640x360 floor would hang its last items off
+/// the bottom edge, where nobody can click them.
+const MENU_ROWS_H: f32 = 12. * MENU_ROW_H;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -342,8 +347,13 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 11] = [
+const MENU_ITEMS: [ActionId; 14] = [
     ActionId::Cut,
+    // The clipboard pair, which had no door but a chord: copy takes the clip the
+    // menu names, and paste is the timeline's rather than this clip's -- the
+    // same kind of global item the mute below already is.
+    ActionId::Copy,
+    ActionId::Paste,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
@@ -351,6 +361,10 @@ const MENU_ITEMS: [ActionId; 11] = [
     ActionId::Group,
     ActionId::Equalizer,
     ActionId::Speed,
+    // The scan is a clip card like the two above it -- opened on whichever half
+    // was clicked -- and a card only a stroke could open is one a pointer never
+    // finds.
+    ActionId::Silence,
     ActionId::Color,
     ActionId::Fit,
     ActionId::ToggleMute,
@@ -3636,6 +3650,10 @@ impl Player {
         // Everything but Import and Keys needs a timeline to act on: with none
         // open they are dimmed rather than silently doing nothing.
         let live = self.session.is_some() && !exporting;
+        // The project's own picture size, for the button that cycles it: read
+        // per render like everything else here, so a cycle shows on the button
+        // that made it.
+        let resolution = self.session.as_ref().map(PlaybackSession::resolution);
         let key = |action| self.keymap.display(action);
         // The lanes the project has, or the pair a fresh one starts with so the
         // panel reads the same before a file is open as after.
@@ -3685,12 +3703,20 @@ impl Player {
             .bg(rgb(CHROME))
             // Transport | edit | file: three groups, so the eye can skip two of
             // them. Every button says what it does; the tooltip adds its key.
+            //
+            // The row scrolls rather than losing its tail: at the 640 px floor
+            // this window is sized for it is wider than the panel, and a button
+            // off the right edge is a button a pointer cannot press. A plain
+            // wheel moves it -- gpui puts a vertical delta on the x axis when
+            // that is the only one scrolling (div.rs:2424).
             .child(
                 div()
+                    .id("controls")
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .overflow_x_scroll()
                     .child(control(
                         "transport",
                         Some(transport_glyph(playing).into_any_element()),
@@ -3731,6 +3757,17 @@ impl Player {
                         },
                         live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    // The way back from every one of them. It was a stroke and
+                    // nothing else, which made the whole edit group a one-way
+                    // door for anyone working with a pointer.
+                    .child(control(
+                        "undo",
+                        None,
+                        "Undo",
+                        format!("{} — takes the last edit back", key(ActionId::Undo)),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
                     ))
                     // With the edit group, beside the buttons that change the
                     // edit list: a track is a row of it, and adding one is an
@@ -3790,19 +3827,60 @@ impl Player {
                         cx,
                     ))
                     .child(separator())
+                    // The size every clip is composed onto, which is also the
+                    // size the export comes out at: the one project setting a
+                    // stroke used to be the only way to. Cycles exactly as the
+                    // key does, and says where it is now rather than opening a
+                    // list to close again.
+                    .child(control(
+                        "resolution",
+                        None,
+                        resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                        match resolution {
+                            Some((w, h)) => format!(
+                                "{} — the project is {w}x{h}; cycles source → 2160p → 1080p → 720p → 480p",
+                                key(ActionId::Resolution)
+                            ),
+                            None => format!("{} — open a file first", key(ActionId::Resolution)),
+                        },
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_resolution(cx)),
+                    ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
                     // which one is the real one.
+                    //
+                    // While one runs, this button is the way out of it: the
+                    // progress line promised esc and nothing else, which left a
+                    // pointer no way to stop an export it had started.
                     .child(control(
                         "export",
                         None,
-                        "Export",
-                        format!(
-                            "{} — quality and destination, then writes the timeline out",
-                            key(ActionId::Export)
-                        ),
-                        live && self.export.is_none(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_export(cx)),
+                        if exporting { "Cancel" } else { "Export" },
+                        if exporting {
+                            format!(
+                                "{} — stops the export; the part-written file goes",
+                                key(ActionId::CancelExport)
+                            )
+                        } else {
+                            format!(
+                                "{} — quality and destination, then writes the timeline out",
+                                key(ActionId::Export)
+                            )
+                        },
+                        if exporting {
+                            true
+                        } else {
+                            live && self.export.is_none()
+                        },
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if this.exporting().is_some() {
+                                this.cancel_export();
+                                cx.notify();
+                            } else {
+                                this.open_export(cx);
+                            }
+                        }),
                     ))
                     .child(control(
                         "save",
@@ -4952,7 +5030,45 @@ impl Player {
                         cx.notify();
                     }))
                     .child(div().text_color(rgb(INK_DIM)).child(label))
-                    .child(value)
+                    // The value and the two steps that move it. Every other
+                    // card has something to drag or press; this one had the
+                    // arrow keys and nothing else, so a row was a setting a
+                    // pointer could pick but never change. One press each, the
+                    // same call the arrows make -- the hold-to-run is the
+                    // keyboard's own and is not a thing a button has.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(value)
+                            .children([-1, 1].map(|steps: i32| {
+                                div()
+                                    .id(("silence-step", n * 2 + usize::from(steps > 0)))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h(px(KEYS_ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(CHROME))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        // Picked as well as moved: the row a
+                                        // press lands on is the row the arrows
+                                        // carry on from.
+                                        this.silence_field = n;
+                                        this.nudge_silence(steps);
+                                        cx.notify();
+                                    }))
+                                    .child(match steps > 0 {
+                                        true => "+",
+                                        false => "−",
+                                    })
+                            })),
+                    )
             })
             .collect();
         // The two buttons the ask names, side by side: a mode toggle would hide
@@ -5010,7 +5126,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "↑↓ picks a setting, ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
                                 ),
                         )
                         .children(rows)
@@ -5291,7 +5407,7 @@ impl Player {
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
-                let label = if action == ActionId::ToggleMute {
+                let label = if matches!(action, ActionId::ToggleMute | ActionId::Paste) {
                     format!("{} (global)", action.label())
                 } else {
                     action.label().to_string()
@@ -5338,7 +5454,10 @@ impl Player {
         let (x, y) = menu_at(
             menu.at,
             viewport,
-            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+            // The cap once the list is longer than it: past that the list
+            // scrolls and the card stops growing, exactly as the keybindings and
+            // export lists do.
+            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
         );
         let full: SharedString = source.path.display().to_string().into();
         Some(
@@ -5393,7 +5512,18 @@ impl Player {
                         .when(menu.details, |d| {
                             d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
                         })
-                        .children(rows),
+                        // The list scrolls where the card would otherwise grow
+                        // past the window's floor -- an item hanging off the
+                        // bottom edge is an item nobody can click.
+                        .child(
+                            div()
+                                .id("menu-rows")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(MENU_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -7328,10 +7458,10 @@ mod tests {
         EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS,
         HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
         LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
-        MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
-        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
-        VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
-        cancels_export, color_snap, envelope, eq_spectrum, eq_x, eq_y, export_path,
+        MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H,
+        SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
+        Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label,
+        can_add, cancels_export, color_snap, envelope, eq_spectrum, eq_x, eq_y, export_path,
         export_settings, format_key, format_line, format_refusal, frac_along, frac_down, frame_at,
         histogram, is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at, normalise,
         nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
@@ -7686,6 +7816,89 @@ mod tests {
         for action in MENU_ITEMS {
             assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
+        // ...and the whole card still fits the 640x360 floor, however many items
+        // it grows to: the list is what scrolls past the cap, never the card.
+        let items = MENU_ITEMS.len() + 1; // Properties
+        assert!(MENU_PAD * 2. + MENU_ROWS_H <= 360., "menu too tall");
+        assert!(
+            MENU_ROWS_H / MENU_ROW_H >= 12.,
+            "too few items visible to scan"
+        );
+        assert_eq!(
+            menu_at(point(px(0.), px(0.)), size(px(640.), px(360.)), {
+                MENU_PAD * 2. + (items as f32 * MENU_ROW_H).min(MENU_ROWS_H)
+            }),
+            (0., 0.)
+        );
+    }
+
+    /// The other half of the keys menu's guarantee, and the audit this batch was
+    /// asked for kept as a test: no action may be a stroke and nothing else.
+    /// Either the clip menu offers it, or a control in the panel does -- named
+    /// here by the id [`control`] is handed, read out of this file's own source
+    /// like `no_stroke_is_missing_from_the_keys_menu` reads the key handler.
+    #[test]
+    fn every_action_is_reachable_without_the_keyboard() {
+        use keymap::ActionId;
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let element = |id: &str| source.contains(&format!("\"{id}\""));
+        for action in ActionId::ALL {
+            let by_pointer = MENU_ITEMS.contains(&action)
+                || match action {
+                    ActionId::Play => element("transport"),
+                    // One slot, two states: it starts an export and stops the
+                    // one it started.
+                    ActionId::Export | ActionId::CancelExport => element("export"),
+                    ActionId::Save => element("save"),
+                    ActionId::Undo => element("undo"),
+                    ActionId::Resolution => element("resolution"),
+                    ActionId::AddVideoLane => element("add-video-lane"),
+                    ActionId::AddAudioLane => element("add-audio-lane"),
+                    // The × in a lane's own header, which takes any track and
+                    // not only the last one.
+                    ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
+                        source.contains("this.remove_lane(lane, cx)")
+                    }
+                    ActionId::ToggleMute => element("volume"),
+                    ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
+                    // The ruler seeks anywhere the pointer points; the frame and
+                    // the second are the keyboard's finer grain of that move.
+                    ActionId::StepBack
+                    | ActionId::StepForward
+                    | ActionId::JumpBack
+                    | ActionId::JumpForward
+                    | ActionId::GoStart
+                    | ActionId::GoEnd => element("ruler"),
+                    // A press on a clip is the selection, group and all.
+                    ActionId::Select | ActionId::SelectNext | ActionId::SelectPrev => {
+                        source.contains("this.select((lane, i), cx)")
+                    }
+                    _ => false,
+                };
+            assert!(by_pointer, "{action:?} is reachable by keyboard only");
+        }
+        // The card-local strokes have the same rule, and each of them is a thing
+        // on its card: the graph and its two buttons, the colour bars and their
+        // reset, the speed bar and its presets, and the silence card's rows --
+        // whose steppers are the pointer's only way to a threshold.
+        for id in [
+            "eq-graph",
+            "eq-reset",
+            "eq-spectrum",
+            "color-bar",
+            "color-reset",
+            "speed-bar",
+            "speed-preset",
+            "silence-row",
+            "silence-step",
+            "silence-apply",
+            "export-confirm",
+        ] {
+            assert!(element(id), "{id} is not on any card");
         }
     }
 
@@ -8983,8 +9196,11 @@ mod tests {
                 <= 360.,
             "card too tall"
         );
-        // Its rows and buttons are clicked, so WCAG 2.5.8 binds them.
+        // Its rows, its steppers and its buttons are clicked, so WCAG 2.5.8
+        // binds them: a stepper is `HIT_MIN` square inside a row of that height.
         assert!(KEYS_ROW_H >= HIT_MIN);
+        // ...and the pair of them fits beside the widest value the card prints.
+        assert!(2. * HIT_MIN + 4. < COLOR_W / 2., "steppers crowd the value");
         // A "speed-up" is never a slow-down: the rate stops above real time at
         // one end and at what a clip can hold at the other, whatever the keys
         // ask for. A silence played *slower* would make the timeline longer,
