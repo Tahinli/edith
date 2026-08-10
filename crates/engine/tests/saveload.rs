@@ -295,6 +295,12 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
         ("edith 1\nsource test_av.mp4\nclip 30 30 0\n", "line 3"),
         ("edith 1\nsource test_av.mp4\n\nclip 0 30 0\n", "line 3"),
         ("edith 1\nsource test_av.mp4\nwhat 1\n", "line 3"),
+        // Crafted numbers: `start + len` used to wrap past the top of `u32`,
+        // and a wrapped end walks straight through the overlap check.
+        (
+            "edith 2\nsource test_av.mp4\nvideo 4294967290 0 30 0 -\n",
+            "line 3",
+        ),
     ] {
         std::fs::write(&path, text).expect("write");
         let err = PlaybackSession::open_project(&path)
