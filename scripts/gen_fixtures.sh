@@ -75,16 +75,23 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -map 0:v -map "[a]" -c:v libvpx-vp9 -b:v 2M -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_vp9.mp4
 # HEVC fixture: the same A/V shape again, so the tests measure the codec and
-# nothing else. `-tag:v hev1` is not a preference: mp4 0.14 only recognises a
-# hev1 sample entry, so an hvc1-tagged file would read back as no video track at
-# all. 8-bit Main profile, because the plugin's NV12 read-back cannot carry
-# Main 10.
+# nothing else. 8-bit Main profile, because the plugin's NV12 read-back cannot
+# carry Main 10.
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -f lavfi -i "sine=frequency=880:duration=2" \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx265 -tag:v hev1 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_hevc.mp4
+# The same HEVC stream tagged hvc1, which is what Apple and ffmpeg's mov muxer
+# write in practice: mp4 0.14 recognises only a hev1 sample entry, so this one
+# is found by demux.rs reading the stsd fourcc itself (`tests/hevc_hvc1.rs`).
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx265 -tag:v hvc1 -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_hevc_hvc1.mp4
 # AV1 fixture, and the only Matroska one: `mp4 0.14` has no `av01` sample entry
 # at all, so AV1 is read out of an mkv (`demux::MkvDemuxer`). Same A/V shape as
 # the others so the tests measure the codec and nothing else -- but `-g 30` is
