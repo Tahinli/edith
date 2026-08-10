@@ -47,6 +47,7 @@ pub enum ActionId {
     Regroup,
     Delete,
     Lift,
+    Color,
     Undo,
     AddVideoLane,
     AddAudioLane,
@@ -60,7 +61,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 17] = [
+    pub const ALL: [ActionId; 18] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -70,6 +71,7 @@ impl ActionId {
         ActionId::Regroup,
         ActionId::Delete,
         ActionId::Lift,
+        ActionId::Color,
         ActionId::Undo,
         ActionId::AddVideoLane,
         ActionId::AddAudioLane,
@@ -92,6 +94,7 @@ impl ActionId {
             ActionId::Regroup => "Regroup",
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
+            ActionId::Color => "Colour…",
             ActionId::Undo => "Undo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
@@ -116,6 +119,7 @@ impl ActionId {
             ActionId::Regroup => "regroup",
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
+            ActionId::Color => "color",
             ActionId::Undo => "undo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
@@ -137,7 +141,11 @@ impl ActionId {
     pub fn category(self) -> Category {
         match self {
             ActionId::Play => Category::Playback,
-            ActionId::Copy | ActionId::Paste | ActionId::Delete | ActionId::Lift => Category::Clips,
+            ActionId::Copy
+            | ActionId::Paste
+            | ActionId::Delete
+            | ActionId::Lift
+            | ActionId::Color => Category::Clips,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Undo
@@ -198,7 +206,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 9] = [
+pub const FIXED: [Fixed; 12] = [
     Fixed {
         chord: "esc",
         label: "Close this card or clip menu, or cancel a capture",
@@ -246,6 +254,23 @@ pub const FIXED: [Fixed; 9] = [
         chord: "r",
         label: "Flatten every band",
         category: Category::Audio,
+    },
+    // The colour card's own three, which mean nothing outside it -- the same
+    // card-local input the export card's digits are.
+    Fixed {
+        chord: "↑ / ↓",
+        label: "Pick a colour slider",
+        category: Category::Clips,
+    },
+    Fixed {
+        chord: "← / →",
+        label: "Move the picked colour slider",
+        category: Category::Clips,
+    },
+    Fixed {
+        chord: "r",
+        label: "Take the colour grade off the clip",
+        category: Category::Clips,
     },
 ];
 
@@ -350,6 +375,10 @@ impl Keymap {
                 b(ActionId::Delete, "x", false),
                 b(ActionId::Delete, "delete", false),
                 b(ActionId::Lift, "l", false),
+                // The c of colour is Cut and ctrl+c is Copy, so the grade takes
+                // k: free, next to nothing that edits, and one press like the
+                // rest of the clip keys.
+                b(ActionId::Color, "k", false),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
                 // The unshifted initials of what they add. Both were free --
@@ -592,7 +621,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 19);
+        assert_eq!(k.entries().len(), 20);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -603,6 +632,7 @@ mod tests {
         assert_eq!(k.lookup("x", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
+        assert_eq!(k.lookup("k", false), Some(ActionId::Color));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
         // The track keys are the bare letters; the ctrl ones stay copy/paste.
@@ -743,7 +773,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 17);
+        assert_eq!(ActionId::ALL.len(), 18);
     }
 
     #[test]
