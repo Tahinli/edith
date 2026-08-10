@@ -507,6 +507,25 @@ impl PlaybackSession {
         }
     }
 
+    /// Sets the monitoring gain, 0.0 (silent) to 1.0. Mute is a gain of 0.0:
+    /// one knob, because muting and turning it down are the same thing to the
+    /// device, and *which* the user meant is a question only the UI can answer
+    /// -- it keeps the level to come back to.
+    ///
+    /// Deliberately not session state: nothing here remembers it, so a caller
+    /// pushes it once per session and an export -- which renders the file
+    /// rather than what the speakers are doing -- can never pick it up. Silent
+    /// with no audio device, which is also the only honest answer there.
+    ///
+    /// Mute is not pause: the samples are still consumed and the device clock
+    /// still runs, so the picture keeps playing against it.
+    pub fn set_gain(&self, gain: f32) -> bool {
+        match &self.audio {
+            Some(audio) => audio.ao.lock().unwrap().set_volume(gain),
+            None => false,
+        }
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
