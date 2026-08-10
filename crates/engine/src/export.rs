@@ -246,7 +246,7 @@ fn run(
         .lane(lane)
         .iter()
         .enumerate()
-        .find(|(idx, _)| project.eq_of(lane, *idx).is_some())
+        .find(|(idx, _)| project.eq_of(lane, *idx).is_some_and(|eq| !eq.is_identity()))
         .map(|(idx, clip)| (clip.start, idx))
     {
         return Err(format!(
