@@ -72,6 +72,19 @@ const WAVE_COL: f32 = 2.;
 /// WCAG 2.5.8: nothing clickable is smaller than this. The scrub bar stays 6 px
 /// to look at -- `RULER_HIT_H` is the strip that has to be hit.
 const HIT_MIN: f32 = 24.;
+/// The media library's column: a share of the window rather than a fixed width,
+/// so it yields on a narrow one, and never more than a third of it -- the
+/// picture is what this program is for and keeps the majority at every size.
+/// The floor is what a file name and a timecode need to be readable at all.
+const LIBRARY_FRAC: f32 = 0.2;
+const LIBRARY_MIN_W: f32 = 120.;
+const LIBRARY_MAX_W: f32 = 220.;
+/// A library row: a name over its duration, two lines and a click target, so
+/// `HIT_MIN` binds it like every other one.
+const ROW_H: f32 = 32.;
+/// The tint swatch down the left of a row: the same colour that source's clips
+/// wear in the lanes, which is the whole of the panel<->timeline association.
+const SWATCH_W: f32 = 4.;
 const CONTROL_H: f32 = 28.;
 const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
@@ -91,6 +104,10 @@ const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
 /// while the keymap itself is what is being changed -- so neither can go
 /// through the keymap to find it.
 const ESCAPE: &str = "escape";
+
+/// What the header says with no timeline open, and what the window title reads
+/// as a program name rather than as a file name.
+const NO_FILE: &str = "no file open";
 
 /// What the monitoring output is set to. Two things, not one: the level the
 /// user picked, and whether it is being held silent -- so unmuting comes back
@@ -154,6 +171,23 @@ impl Default for Volume {
     }
 }
 
+/// What is known about a source's audio. Three states and not two, because a
+/// file whose peaks have not come back yet must not be drawn as one that has no
+/// audio at all: the first shows a bed, the second shows nothing.
+#[derive(Clone)]
+enum Wave {
+    /// Asked for; the decode is running on a background thread.
+    Loading,
+    /// The file has no audio track. An answer, not a miss.
+    Silent,
+    Peaks(Arc<Vec<(f32, f32)>>),
+}
+
+/// A library row being dragged. The source index and nothing else: the row is
+/// only a way of naming a source, and where it lands does not change what is
+/// inserted.
+struct AssetDrag(usize);
+
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
@@ -181,10 +215,16 @@ struct Player {
     /// screen, but Lift has to know which half it was aimed at. Indices move
     /// under every edit, so this is cleared by all of them.
     selected: Option<(Lane, usize)>,
-    /// Peaks per source file, taken once and kept. `None` is a source with no
-    /// audio track, which is an answer and not a miss: it must not be asked
-    /// again every repaint.
-    waves: HashMap<PathBuf, Option<Arc<Vec<(f32, f32)>>>>,
+    /// Which library row is picked, as an index into the session's sources.
+    /// Its own selection and not the timeline's: Delete keeps acting on the
+    /// clip that was clicked in a lane, whatever the library is showing. Source
+    /// indexes are forever (project.rs:264), so this cannot go stale under an
+    /// edit -- only a new session clears it.
+    selected_asset: Option<usize>,
+    /// What is known about each source's audio, taken once and kept. Keyed on
+    /// the path, and the key is inserted the moment the decode is *started*:
+    /// presence means "asked", so a repaint mid-decode cannot ask again.
+    waves: HashMap<PathBuf, Wave>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -237,6 +277,10 @@ struct Player {
     /// until it is answered -- any key retires it, so does a click on it -- so a
     /// failure is read in full instead of blinking past.
     notice: Option<SharedString>,
+    /// What the compositor was last told this window is called. Setting a title
+    /// is a protocol round trip and a repaint is sixty a second, so the title is
+    /// pushed only when it is not this any more.
+    titled: String,
     displayed: u32,
     dropped: u32,
     /// Wall clock of the first displayed frame -- the real-speed measurement.
@@ -430,31 +474,50 @@ impl Player {
         }
     }
 
-    /// Fills the peak cache for every source that has arrived since the last
+    /// Starts a peak decode for every source that has arrived since the last
     /// repaint. One call from the render rather than three at the doors,
     /// because argv, an import and a project load are all doors and only this
     /// one is guaranteed to run after each of them.
     ///
-    /// ponytail: the decode is synchronous, so the first repaint after a long
-    /// file arrives waits on it -- ~0.3 s for ten minutes at the decoder's
-    /// ~1700x realtime. Upgrade path is `cx.background_executor().spawn` with
-    /// the peaks posted back, the way the file chooser already runs off-thread.
-    fn cache_waves(&mut self) {
+    /// The decode itself runs on a background thread, like the file chooser:
+    /// whole-file audio decode is ~1 s for a half-hour source, and on the render
+    /// path that is the window not painting for a second. The lane draws a bed
+    /// meanwhile and the repaint comes with the peaks. The entry is written
+    /// *before* the spawn, so the sixty repaints that happen while a decode runs
+    /// start no further ones.
+    fn cache_waves(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
-        let sources: Vec<PathBuf> = session
-            .sources()
-            .iter()
-            .filter(|path| !self.waves.contains_key(*path))
-            .cloned()
-            .collect();
-        for path in sources {
-            let peaks = engine::waveform::peaks(&path, WAVE_BPS)
-                .ok()
-                .flatten()
-                .map(|peaks| Arc::new(normalise(peaks)));
-            self.waves.insert(path, peaks);
+        for path in unseen_sources(session.sources(), &self.waves) {
+            self.waves.insert(path.clone(), Wave::Loading);
+            let decoded = cx.background_executor().spawn({
+                let path = path.clone();
+                async move {
+                    engine::waveform::peaks(&path, WAVE_BPS)
+                        .ok()
+                        .flatten()
+                        .map(|peaks| Arc::new(normalise(peaks)))
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let decoded = decoded.await;
+                this.update(cx, |this, cx| {
+                    this.waves.insert(
+                        path,
+                        match decoded {
+                            Some(peaks) => Wave::Peaks(peaks),
+                            // Either no audio track or a file we could not read
+                            // it from; both mean the lane has nothing to draw,
+                            // and neither is worth asking about again.
+                            None => Wave::Silent,
+                        },
+                    );
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
@@ -475,6 +538,45 @@ impl Player {
         if pasted {
             self.selected = None;
             self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// The one way a library row reaches the timeline: the Add button and a row
+    /// dragged onto a lane both come here, so there is a single answer to what
+    /// "add this source" does. The whole source goes in at the playhead as one
+    /// grouped take -- the same insert a paste makes, so everything after it
+    /// moves along rather than being painted over. Reseeks like every other
+    /// edit, and drops the timeline's selection with it: the insert has just
+    /// moved the indices it pointed at.
+    fn insert_source(&mut self, source: usize, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let clip = self.session.as_ref().and_then(|session| {
+            let frames = source_frames(lane_clips(session), source);
+            // Zero means nothing on the timeline plays from that file any more
+            // -- an undone import leaves the source entry behind (project.rs:264)
+            // -- so there is no length to insert and no file to ask for one.
+            (frames > 0).then_some(Clip {
+                start: 0,
+                in_frame: 0,
+                out_frame: frames,
+                source,
+                link: None,
+            })
+        });
+        let added = match (&mut self.session, clip) {
+            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
+            _ => false,
+        };
+        if added {
+            self.selected = None;
+            self.reset_after_reseek();
+        } else {
+            self.notice = Some(
+                "NOTHING ADDED — no clip on the timeline plays from that file any more".into(),
+            );
         }
         cx.notify();
     }
@@ -577,6 +679,9 @@ impl Player {
                 // different file -- or none -- in another project.
                 self.clipboard = None;
                 self.selected = None;
+                // A different set of sources: the row that was picked is not
+                // the file that index names any more.
+                self.selected_asset = None;
                 // The counters describe one timeline; the eof line must not
                 // report the old one's frames against the new one.
                 self.displayed = 0;
@@ -831,7 +936,14 @@ impl Render for Player {
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
-        self.cache_waves();
+        self.cache_waves(cx);
+        // What the compositor calls this window. Pushed only when it changes:
+        // it is a protocol round trip and this runs at vsync.
+        let title = window_title(&self.name);
+        if title != self.titled {
+            window.set_window_title(&title);
+            self.titled = title;
+        }
         // No shadow flag: the clock is the only truth about play state.
         let playing = self
             .session
@@ -1022,32 +1134,44 @@ impl Render for Player {
                     .bg(rgb(CHROME))
                     .child(self.name.clone()),
             )
+            // The library beside the picture rather than under it: a media pool
+            // is a column in every editor that has one, and the timeline below
+            // already owns the full width. `library_w` is what keeps the
+            // picture the majority of the row at every window size.
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .overflow_hidden()
                     .flex()
-                    .justify_center()
-                    .items_center()
-                    .children(
-                        self.image
-                            .clone()
-                            .map(|i| {
-                                img(i)
-                                    .size_full()
-                                    .object_fit(gpui::ObjectFit::Contain)
-                                    .into_any_element()
-                            })
-                            // With no file open the letterbox is the whole
-                            // window, and a black rectangle says only that
-                            // something is broken -- so it says what it wants
-                            // instead. The window is already the drop target.
-                            .or_else(|| {
-                                self.session
-                                    .is_none()
-                                    .then(|| empty_hint().into_any_element())
-                            }),
+                    .child(self.library(library_w(f32::from(window.viewport_size().width)), cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .flex()
+                            .justify_center()
+                            .items_center()
+                            .children(
+                                self.image
+                                    .clone()
+                                    .map(|i| {
+                                        img(i)
+                                            .size_full()
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .into_any_element()
+                                    })
+                                    // With no file open the letterbox is the
+                                    // whole window, and a black rectangle says
+                                    // only that something is broken -- so it
+                                    // says what it wants instead. The window is
+                                    // already the drop target.
+                                    .or_else(|| {
+                                        self.session
+                                            .is_none()
+                                            .then(|| empty_hint().into_any_element())
+                                    }),
+                            ),
                     ),
             )
             // Above the panel and only when there is one to show, so it costs
@@ -1062,6 +1186,173 @@ impl Render for Player {
 }
 
 impl Player {
+    /// The media library: a row per source the timeline knows, in the order
+    /// they arrived, each wearing the tint its clips wear in the lanes -- the
+    /// swatch *is* what says which boxes down there came from this file. A
+    /// click picks a row, the button under the list drops that source in at the
+    /// playhead, and a row dragged onto either lane does the same thing through
+    /// the same call.
+    ///
+    /// Import lives here, because this is the list it adds to. Plain divs like
+    /// the rest of this window: nothing in it takes focus, so the root keeps
+    /// the keyboard and the play key still works after a row is clicked
+    /// (ledger:182).
+    fn library(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let exporting = self.exporting().is_some();
+        let sources = self
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        // Every source matches the first in size and rate or it was refused at
+        // the door (the import policy, ledger:436), so the session's own meta
+        // describes every row and nothing has to be probed to say so.
+        let meta = self.session.as_ref().map(PlaybackSession::meta);
+        let rows: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let picked = self.selected_asset == Some(i);
+                let frames = self
+                    .session
+                    .as_ref()
+                    .map_or(0, |session| source_frames(lane_clips(session), i));
+                let name: SharedString = file_name(path).into();
+                let tip: SharedString = match meta {
+                    Some(meta) => format!(
+                        "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
+                        path.display(),
+                        meta.width,
+                        meta.height,
+                        meta.frame_rate
+                    ),
+                    None => path.display().to_string(),
+                }
+                .into();
+                let ghost = name.clone();
+                div()
+                    .id(("asset", i))
+                    .flex_none()
+                    .h(px(ROW_H))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .pr(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .when(picked, |d| d.bg(rgb(SELECTED)).border_1())
+                    .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.selected_asset = Some(i);
+                        cx.notify();
+                    }))
+                    // The drag carries the row's source and the row's name: one
+                    // for the drop to insert, one for the pointer to carry, so
+                    // what is being dragged is legible on the way down.
+                    .on_drag(AssetDrag(i), move |_, _, _, cx| {
+                        cx.new(|_| Tip(ghost.clone()))
+                    })
+                    // Full height and hard against the edge: the tint reads as
+                    // the lane's colour continuing into the list, not as a chip
+                    // that happens to be near it.
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(SWATCH_W))
+                            .h_full()
+                            .rounded(px(2.))
+                            .bg(rgb(source_tint(i))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            // Two lines rather than two columns: at the width
+                            // this panel yields to, a name and a timecode side
+                            // by side leave room for neither.
+                            .child(div().truncate().text_size(px(11.)).child(name))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(INK_DIM))
+                                    .child(timecode(f64::from(frames) / self.fps, self.fps)),
+                            ),
+                    )
+            })
+            .collect();
+        div()
+            .flex_none()
+            .w(px(width))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .p(px(8.))
+            .bg(rgb(CHROME))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child("Media"),
+                    )
+                    .child(control(
+                        "import",
+                        None,
+                        "Import",
+                        "opens a file chooser — or drop a file on the window".to_string(),
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .id("library-rows")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .overflow_y_scroll()
+                    // Never a blank column: with nothing imported the list is
+                    // where the way in is said.
+                    .when(rows.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child("No media yet — Import, or drop a file on the window"),
+                        )
+                    })
+                    .children(rows),
+            )
+            .child(control(
+                "add-asset",
+                None,
+                "Add at playhead",
+                match self.selected_asset {
+                    Some(_) => "inserts the picked file at the playhead".to_string(),
+                    None => "click a file above first — or drag one onto a lane".to_string(),
+                },
+                can_add(self.selected_asset, self.session.is_some(), exporting),
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(source) = this.selected_asset {
+                        this.insert_source(source, cx);
+                    }
+                }),
+            ))
+    }
+
     /// Transport, edit and file buttons, timecode, playhead, clips lane.
     fn panel(
         &self,
@@ -1176,14 +1467,9 @@ impl Player {
                         }),
                     ))
                     .child(separator())
-                    .child(control(
-                        "import",
-                        None,
-                        "Import",
-                        "opens a file chooser — or drop a file on the window".to_string(),
-                        !exporting,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
-                    ))
+                    // Import is not here: it belongs to the media list it adds
+                    // to, and two doors into one action is a question about
+                    // which one is the real one.
                     .child(control(
                         "export",
                         None,
@@ -1654,6 +1940,14 @@ impl Player {
                     .rounded(px(3.))
                     .bg(rgb(LETTERBOX))
                     .overflow_hidden()
+                    // A library row let go over a lane is the same insert the
+                    // Add button makes, through the same call -- at the
+                    // playhead, not at the pointer: clips here are placed end
+                    // to end, so where along the bed it landed says nothing.
+                    .on_drop(
+                        cx.listener(|this, drag: &AssetDrag, _, cx| this.insert_source(drag.0, cx)),
+                    )
+                    .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         let (start, len) = (
                             f64::from(clip.start) / self.fps,
@@ -1668,11 +1962,14 @@ impl Player {
                         let tint = source_tint(clip.source);
                         let width = width_frac(len, duration);
                         let label = sources.get(clip.source).map(|path| file_name(path));
-                        let peaks = sources
+                        let wave = sources
                             .get(clip.source)
                             .and_then(|path| self.waves.get(path))
-                            .cloned()
-                            .flatten();
+                            .cloned();
+                        let (from, to) = (
+                            f64::from(clip.in_frame) / self.fps,
+                            f64::from(clip.out_frame) / self.fps,
+                        );
                         let tip = tip.clone();
                         div()
                             .id((if audio { "aclip" } else { "vclip" }, i))
@@ -1703,21 +2000,35 @@ impl Player {
                                 }),
                             )
                             // Under the label row, never through it.
-                            .when_some(peaks.filter(|_| audio), |d, peaks| {
-                                d.child(
+                            .children(wave.filter(|_| audio).and_then(|wave| {
+                                let inner: AnyElement = match wave {
+                                    Wave::Peaks(peaks) => {
+                                        waveform(peaks, from, to).into_any_element()
+                                    }
+                                    // A bed while the decode runs, and dimmer
+                                    // than any waveform is drawn: a flat
+                                    // `INK_DIM` line here would be the shape a
+                                    // silent file makes, which this file is not
+                                    // known to be yet.
+                                    Wave::Loading => div()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .child(div().w_full().h(px(1.)).bg(rgb(HOVER)))
+                                        .into_any_element(),
+                                    // No audio track: nothing, never a fake.
+                                    Wave::Silent => return None,
+                                };
+                                Some(
                                     div()
                                         .absolute()
                                         .left_0()
                                         .right_0()
                                         .top(px(LABEL_H))
                                         .bottom_0()
-                                        .child(waveform(
-                                            peaks,
-                                            f64::from(clip.in_frame) / self.fps,
-                                            f64::from(clip.out_frame) / self.fps,
-                                        )),
+                                        .child(inner),
                                 )
-                            })
+                            }))
                             .when_some(label.filter(|_| show_label(bed_w * width)), |d, label| {
                                 d.child(
                                     div()
@@ -1842,6 +2153,70 @@ fn file_name(path: &std::path::Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into(),
     )
+}
+
+/// The sources a repaint has not asked about yet. A key that is already there
+/// means "asked", whatever state it is in, which is what stops a decode already
+/// running from being started again by the next of sixty repaints a second.
+fn unseen_sources(sources: &[PathBuf], waves: &HashMap<PathBuf, Wave>) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .filter(|path| !waves.contains_key(*path))
+        .cloned()
+        .collect()
+}
+
+/// Both lanes' clips, which is everything the timeline knows about its sources.
+fn lane_clips(session: &PlaybackSession) -> impl Iterator<Item = &Clip> {
+    session
+        .lane_clips(Lane::Video)
+        .iter()
+        .chain(session.lane_clips(Lane::Audio))
+}
+
+/// How long a source is, as the timeline knows it: the furthest frame any clip
+/// plays from it. Exact for a source the timeline still holds whole -- which is
+/// every source the moment it is imported -- and never longer than the file,
+/// since every clip was checked against it, so a clip built from this can
+/// always be played. Zero for a source nothing plays from any more.
+///
+/// ponytail: a source trimmed on the timeline reads as its trimmed length. The
+/// file's own length would need a `Demuxer::open` probe per source, off the
+/// render path like the peak decode is -- that is the upgrade path.
+fn source_frames<'a>(clips: impl Iterator<Item = &'a Clip>, source: usize) -> u32 {
+    clips
+        .filter(|clip| clip.source == source)
+        .map(|clip| clip.out_frame)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether the Add button does anything: a row picked, a timeline to put it on,
+/// and no export reading that timeline. A button that would do nothing is dimmed
+/// and takes no click, like every other one here.
+fn can_add(picked: Option<usize>, timeline: bool, exporting: bool) -> bool {
+    picked.is_some() && timeline && !exporting
+}
+
+/// What the media list is given of the window. A share of it, so a narrow
+/// window gives the panel less rather than giving the picture nothing, floored
+/// where a name stops being readable and capped at a third of the window --
+/// the picture is what the program is for and keeps the majority at every size.
+fn library_w(window_w: f32) -> f32 {
+    (window_w * LIBRARY_FRAC)
+        .clamp(LIBRARY_MIN_W, LIBRARY_MAX_W)
+        .min(window_w / 3.)
+}
+
+/// What the window is called: the program, and what is open in it. The name is
+/// what the header shows, so an empty window says the program alone rather than
+/// "no file open — edith".
+fn window_title(name: &str) -> String {
+    if name == NO_FILE {
+        "edith".to_string()
+    } else {
+        format!("{name} — edith")
+    }
 }
 
 /// The tint a clip from source `n` wears. Cycled rather than extended: past the
@@ -2200,7 +2575,7 @@ fn empty_hint() -> impl IntoElement {
         .child(
             div()
                 .text_size(px(11.))
-                .child("or click Import below to choose one"),
+                .child("or click Import in the media list"),
         )
 }
 
@@ -2255,15 +2630,183 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, CONTROL_H, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H,
-        KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX, Lane, PANEL_H, Quality, RULER_HIT_H,
-        SELECTED, SOURCE_TINTS, SURFACE, Volume, WAVE_BPS, WAVE_COL, cancels_export, envelope,
-        export_path, export_settings, frac_along, is_bare_modifier, is_project, keymap, marked,
-        normalise, project_path, push_digit, scrub_due, show_label, source_tint, start_frac,
-        timecode, width_frac,
+        ACCENT, CONTROL_H, Clip, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
+        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W,
+        Lane, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE,
+        SWATCH_W, Volume, WAVE_BPS, WAVE_COL, Wave, can_add, cancels_export, envelope, export_path,
+        export_settings, frac_along, is_bare_modifier, is_project, keymap, lane_clips, marked,
+        normalise, project_path, push_digit, scrub_due, show_label, source_frames, source_tint,
+        start_frac, timecode, unseen_sources, width_frac, window_title,
     };
+    use engine::PlaybackSession;
     use gpui::{Bounds, Pixels, point, px, size};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    fn asset(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    }
+
+    /// A clip of `source`, `frames` long, at the top of the timeline. Only the
+    /// two fields the library reads are meant to be looked at.
+    fn clip(source: usize, frames: u32) -> Clip {
+        Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: frames,
+            source,
+            link: None,
+        }
+    }
+
+    /// The whole of the library's row data comes off the clips: which sources
+    /// there are, how long each one is, and therefore which tint each row wears
+    /// -- one index into one list, so a swatch cannot name a different file from
+    /// the boxes it is meant to point at.
+    #[test]
+    fn a_rows_swatch_and_duration_come_off_the_clips_that_name_it() {
+        // Source 0 whole, source 1 trimmed to half of what it was, source 2 on
+        // the audio lane only (its picture was lifted), source 3 imported and
+        // then undone -- an entry with nothing playing from it.
+        let video = [clip(0, 150), clip(1, 60)];
+        let audio = [clip(0, 150), clip(1, 30), clip(2, 90)];
+        for (row, frames) in [(0, 150), (1, 60), (2, 90), (3, 0)] {
+            assert_eq!(
+                source_frames(video.iter().chain(&audio), row),
+                frames,
+                "row {row}"
+            );
+            // The swatch is the clip colour, by the same index and the same
+            // function -- what makes the panel and the lanes one association.
+            assert_eq!(source_tint(row), SOURCE_TINTS[row % SOURCE_TINTS.len()]);
+        }
+        // The longest clip of a source wins, whichever lane it is in and
+        // whatever order the lanes are read in.
+        assert_eq!(source_frames([clip(0, 10), clip(0, 90)].iter(), 0), 90);
+        assert_eq!(source_frames([clip(0, 90), clip(0, 10)].iter(), 0), 90);
+        assert_eq!(source_frames([].iter(), 0), 0);
+    }
+
+    /// The refusal path, end to end against the real files: an incompatible
+    /// import changes nothing, and the library mirrors `sources()` 1:1, so a
+    /// refused file cannot leave a row behind.
+    #[test]
+    fn a_refused_import_leaves_no_row_and_an_accepted_one_is_whole() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        // Silent like the engine suite: this opens the real device.
+        session.set_gain(0.0);
+        assert_eq!(session.sources().len(), 1);
+        let refusal = session
+            .import(&asset("test_mismatch.mp4"))
+            .expect_err("640x360 must not join a 1280x720 timeline")
+            .to_string();
+        assert!(refusal.contains("640"), "refusal must name it: {refusal}");
+        assert_eq!(session.sources().len(), 1, "a refusal added a row");
+        // An accepted one does add a row, and it reads as the whole file: 4 s
+        // at 30 fps, exactly what was appended.
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        assert_eq!(session.sources().len(), 2);
+        assert_eq!(source_frames(lane_clips(&session), 1), 120);
+        assert_eq!(timecode(120. / 30., 30.), "00:00:04:00");
+    }
+
+    /// What the Add button and a dropped row both do, minus the pointer: the
+    /// clip [`Player::insert_source`] builds, put in where the playhead is. One
+    /// call, so what a drop does cannot drift from what the button does.
+    #[test]
+    fn adding_a_row_drops_the_whole_source_in_at_the_playhead() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        assert_eq!(session.timeline_duration(), 9.0);
+        // Two seconds in, which is inside the first take: the insert splits it.
+        session.seek(2.0);
+        let frames = source_frames(lane_clips(&session), 1);
+        assert!(session.paste_at(
+            2.0,
+            Clip {
+                start: 0,
+                in_frame: 0,
+                out_frame: frames,
+                source: 1,
+                link: None,
+            }
+        ));
+        // The whole of source 1 went in and nothing was painted over: the
+        // timeline is longer by exactly that file.
+        assert_eq!(session.timeline_duration(), 13.0);
+        let (video, audio) = (
+            session.lane_clips(Lane::Video),
+            session.lane_clips(Lane::Audio),
+        );
+        // One take, not a video clip with no sound under it: both lanes hold
+        // the same clip at the same place, in the same group.
+        let at = |lane: &[Clip]| {
+            *lane
+                .iter()
+                .find(|c| c.start == 60)
+                .expect("inserted at 2 s")
+        };
+        assert_eq!(at(video), at(audio));
+        assert_eq!(at(video).source, 1);
+        assert_eq!(at(video).len(), frames);
+        assert!(at(video).link.is_some());
+        assert_eq!(video.len(), audio.len());
+    }
+
+    #[test]
+    fn a_source_is_only_ever_asked_for_its_peaks_once() {
+        let (a, b) = (asset("test_av.mp4"), asset("test_av2.mp4"));
+        let sources = [a.clone(), b.clone()];
+        let mut waves: HashMap<PathBuf, Wave> = HashMap::new();
+        assert_eq!(unseen_sources(&sources, &waves), sources);
+        // The entry goes in when the decode *starts*, so the sixty repaints a
+        // second that happen while it runs must not start it again -- which is
+        // what this asserts about a key whose value is not an answer yet.
+        waves.insert(a, Wave::Loading);
+        assert_eq!(unseen_sources(&sources, &waves), vec![b.clone()]);
+        // A file with no audio is an answer like any other: never re-asked.
+        waves.insert(b, Wave::Silent);
+        assert!(unseen_sources(&sources, &waves).is_empty());
+    }
+
+    #[test]
+    fn the_add_button_is_dead_unless_it_would_do_something() {
+        assert!(can_add(Some(0), true, false));
+        // Nothing picked, nothing to put it on, or an export reading the very
+        // edit list this would change.
+        assert!(!can_add(None, true, false));
+        assert!(!can_add(Some(0), false, false));
+        assert!(!can_add(Some(0), true, true));
+    }
+
+    #[test]
+    fn the_media_column_never_takes_the_picture_over() {
+        for window in [360., 640., 1280., 1920., 3840.] {
+            let w = super::library_w(window);
+            // The whole point of the budget: the picture keeps the majority of
+            // the row at every size a window can be.
+            assert!(w <= window / 3., "{window}px window gave the list {w}px");
+            assert!(w >= LIBRARY_MIN_W.min(window / 3.), "{window}px: {w}px");
+            assert!(w <= LIBRARY_MAX_W);
+        }
+        // It yields: a narrower window gives the list less, never the same.
+        assert!(super::library_w(640.) < super::library_w(1280.));
+        // Rows are clickable, so WCAG 2.5.8 binds them like every other target,
+        // and a name over a timecode has to fit inside one.
+        assert!(ROW_H >= HIT_MIN);
+        assert!(SWATCH_W < LIBRARY_MIN_W);
+    }
+
+    #[test]
+    fn the_window_is_named_after_the_program_and_what_is_open() {
+        assert_eq!(window_title("test_av.mp4"), "test_av.mp4 — edith");
+        // An empty window is the program, not "no file open — edith".
+        assert_eq!(window_title(NO_FILE), "edith");
+    }
 
     #[test]
     fn frac_along_measures_from_the_elements_own_left_edge() {
@@ -2800,7 +3343,7 @@ fn main() {
     };
     let name: SharedString = arg
         .as_deref()
-        .map_or_else(|| "no file open".into(), |arg| file_name(arg).into());
+        .map_or_else(|| NO_FILE.into(), |arg| file_name(arg).into());
     if let (Some(arg), Some(meta)) = (&arg, &meta) {
         println!(
             "{}: {}x{} @ {:.2} fps, {} samples",
@@ -2826,6 +3369,12 @@ fn main() {
                     title: Some("edith".into()),
                     ..Default::default()
                 }),
+                // What a desktop groups this window under. The title beside it
+                // is pushed from the render, because wayland takes neither of
+                // them from the titlebar options above (gpui's wayland window
+                // reads only `app_id`, window.rs:1202 / window.rs:939) and the
+                // title has to follow the file being opened anyway.
+                app_id: Some("edith".to_string()),
                 ..Default::default()
             },
             |window, cx| {
@@ -2849,6 +3398,7 @@ fn main() {
                     done: false,
                     ruler: Rc::default(),
                     selected: None,
+                    selected_asset: None,
                     waves: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
@@ -2867,6 +3417,9 @@ fn main() {
                     custom_mbps: 0,
                     rebinding: None,
                     notice: notice.clone().map(SharedString::from),
+                    // Nothing pushed yet, and never a real title: the first
+                    // render is what names the window.
+                    titled: String::new(),
                     displayed: 0,
                     dropped: 0,
                     started: None,
