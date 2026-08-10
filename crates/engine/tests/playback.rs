@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
 use engine::{DecodeSession, Frame, PlaybackSession};
 
@@ -1169,6 +1170,34 @@ fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
     run_for(&mut session, &mut last_index, Duration::from_millis(200));
     assert!(session.is_eos(), "an empty timeline is played out at once");
     session.pause();
+
+    // Exporting nothing is a refusal in words, not a file of no frames -- and
+    // in the *same* words whichever format asked, because the fence sits in
+    // `export::start` ahead of the format, not in the mp4 path alone.
+    for format in [Format::Mp4, Format::Wav, Format::Flac] {
+        let out = std::env::temp_dir().join(format!("ve_nothing_{}", std::process::id()));
+        let handle = session.export_to_with(
+            &out,
+            &ExportSettings {
+                format,
+                ..ExportSettings::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            if let Some(result) = handle.result() {
+                break result.expect_err("an empty timeline cannot be exported");
+            }
+            assert!(Instant::now() < deadline, "{format:?} export never settled");
+            sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            err.to_string(),
+            "the timeline is empty: there is nothing to export",
+            "{format:?}"
+        );
+        assert!(!out.exists(), "{format:?} wrote a file anyway");
+    }
 
     // It saves and loads back -- still a project, still two lanes, and still
     // naming the file whose frame rate the timeline counts in.

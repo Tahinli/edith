@@ -1553,7 +1553,10 @@ impl Player {
             return;
         };
         // An emptied timeline is a timeline; it is simply not a file. Refused by
-        // name here rather than written as a project of no frames.
+        // name here rather than written as a project of no frames -- and the
+        // engine refuses it again on the worker (`export::start`), so a caller
+        // that is not this button cannot get past it either. Two fences on
+        // purpose: this one is the one with a keystroke to blame.
         if session.is_empty() {
             self.notice = Some("NOTHING TO EXPORT — the timeline is empty".into());
             cx.notify();
