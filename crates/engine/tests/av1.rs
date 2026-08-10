@@ -224,8 +224,176 @@ fn an_av1_source_exports_as_h264() {
     handle.result().expect("outcome").expect("export");
 
     let (written, _) = Demuxer::open(&out).expect("reopen the export");
-    assert_eq!(written.codec, Codec::H264, "exports are always H.264");
+    assert_eq!(written.codec, Codec::H264, "the default format is H.264");
     assert_eq!(written.frame_count, FRAMES, "every timeline frame written");
     assert_eq!((written.width, written.height), (1280, 720));
     let _ = std::fs::remove_file(&out);
+}
+
+/// A short timeline out of the H.264 fixture, which is what the AV1 export tests
+/// below write: `rav1e` is built here without its assembly, so the length of the
+/// timeline is the length of the test.
+fn short_timeline(frames: f64) -> PlaybackSession {
+    let mut session = PlaybackSession::open(asset("test_baseline.mp4")).expect("open the fixture");
+    assert!(session.cut_at(frames / 30.0), "cut at frame {frames}");
+    assert!(
+        session.delete_clip(engine::project::Lane::V1, 1),
+        "drop everything after it"
+    );
+    session
+}
+
+fn av1_settings() -> ExportSettings {
+    ExportSettings {
+        format: engine::export::Format::Av1,
+        // The software encoder, on every machine: the hardware twin below is
+        // where the plugin's AV1 seat is exercised.
+        force_sw: true,
+        ..Default::default()
+    }
+}
+
+fn exported(
+    session: &PlaybackSession,
+    name: &str,
+    settings: &ExportSettings,
+    limit: Duration,
+) -> PathBuf {
+    let out = std::env::temp_dir().join(format!("ve_av1_{name}_{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let started = Instant::now();
+    let handle = session.export_to_with(&out, settings);
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < limit,
+            "export did not finish in {limit:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.result().expect("outcome").expect("export");
+    assert_eq!(handle.progress(), 1.0, "finished at full progress");
+    let spent = started.elapsed().as_secs_f64();
+    let frames = (session.timeline_duration() * 30.0).round().max(1.0);
+    eprintln!(
+        "{name}: {frames} frames in {spent:.2} s = {:.2} ms/frame",
+        spent * 1000.0 / frames
+    );
+    out
+}
+
+/// The export half of this slice: AV1 out of the software encoder, into a
+/// Matroska file this project's own demuxer walks back. Nothing installed is
+/// needed -- the file is *read* as a container here, which is where the
+/// hand-written EBML either agrees with the hand-written EBML reader or does not.
+#[test]
+fn an_av1_export_reopens_through_our_own_demuxer() {
+    let session = short_timeline(30.0);
+    let out = exported(&session, "sw", &av1_settings(), Duration::from_secs(300));
+
+    let (meta, mut demuxer) = Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(meta.codec, Codec::Av1, "an AV1 export is AV1");
+    assert_eq!((meta.width, meta.height), (1280, 720));
+    assert!(
+        (meta.frame_rate - 30.0).abs() < 1e-6,
+        "DefaultDuration must state the rate exactly: {}",
+        meta.frame_rate
+    );
+    assert_eq!(meta.frame_count, 30, "every timeline frame is a block");
+
+    // The first block is a keyframe and leads with the sequence header -- the
+    // demuxer prepends `CodecPrivate` to every keyframe, so this is also the
+    // check that the `av1C` record was written and parsed back.
+    let first = demuxer.next_access_unit().expect("read").expect("a unit");
+    assert_eq!(
+        (first[0] >> 3) & 0xF,
+        1,
+        "the keyframe leads with the sequence header"
+    );
+    assert_eq!(first[0] & 0x2, 2, "obu_has_size_field: low-overhead format");
+    let mut count = 1;
+    while demuxer.next_access_unit().expect("read").is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 30, "every block comes back out");
+    assert_eq!(
+        demuxer.seek_to_sync_at_or_before(29),
+        0,
+        "one GOP, one sync point"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// An audio-only timeline is refused an AV1 export by name, exactly as it is
+/// refused an mp4: every frame of it is a gap, so the file would be black.
+#[test]
+fn an_av1_export_of_an_audio_only_timeline_is_refused_by_name() {
+    let session = PlaybackSession::open(asset("test_tone.wav")).expect("open the tone");
+    let out = std::env::temp_dir().join(format!("ve_av1_refused_{}.mkv", std::process::id()));
+    let handle = session.export_to_with(&out, &av1_settings());
+    while !handle.is_finished() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let refused = handle
+        .result()
+        .expect("outcome")
+        .expect_err("an audio-only timeline has no picture to code")
+        .to_string();
+    assert!(refused.contains("no picture"), "{refused}");
+    assert!(refused.contains("AV1"), "{refused}");
+    assert!(!out.exists(), "nothing is written for a refusal");
+}
+
+/// The whole loop, and the only place it is closed: the file the export wrote is
+/// decoded back into pictures, and those pictures are the source's.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
+fn an_av1_export_decodes_back_into_the_pictures_that_went_in() {
+    let session = short_timeline(30.0);
+    let out = exported(
+        &session,
+        "roundtrip",
+        &av1_settings(),
+        Duration::from_secs(300),
+    );
+
+    let (_, frames) = DecodeSession::open(&out).expect("decode the export");
+    let frames: Vec<_> = frames.into_iter().collect();
+    assert_eq!(frames.len(), 30, "every written frame decodes back");
+    let (_, source, _) = DecodeSession::open_range(asset("test_baseline.mp4"), 0, 30)
+        .expect("open the source again");
+    let source: Vec<_> = source.into_iter().collect();
+    for (i, (written, original)) in frames.iter().zip(&source).enumerate() {
+        let diff: f64 = written
+            .bgra
+            .iter()
+            .zip(&original.bgra)
+            .map(|(a, b)| f64::from(a.abs_diff(*b)))
+            .sum::<f64>()
+            / written.bgra.len() as f64;
+        assert!(
+            diff < 12.0,
+            "frame {i} drifted by {diff:.2} from the source"
+        );
+    }
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The hardware seat of the same pair, which is opt-in: `VE_HW_AV1=1` is what
+/// enters it, because the vendored encoder reset the GPU of the box this was
+/// written on (see `export::Enc::open_av1`). Without that variable this measures
+/// the software encoder again, which is the honest outcome rather than a
+/// failure, so what it asserts is the file.
+#[test]
+#[ignore = "needs libengine_hw.so, VE_HW_AV1=1 and a driver whose AV1 encoder survives it"]
+fn an_av1_export_runs_on_the_plugin_where_the_gpu_has_one() {
+    let session = short_timeline(60.0);
+    let settings = ExportSettings {
+        format: engine::export::Format::Av1,
+        ..Default::default()
+    };
+    let out = exported(&session, "hw", &settings, Duration::from_secs(600));
+    let (meta, _) = Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(meta.codec, Codec::Av1);
+    assert_eq!(meta.frame_count, 60);
+    std::fs::remove_file(&out).unwrap();
 }

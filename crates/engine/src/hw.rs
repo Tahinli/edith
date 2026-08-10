@@ -200,6 +200,13 @@ unsafe impl Send for HwSession {}
 
 struct EncPlugin {
     open: extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void,
+    /// The AV1 seat, and the one symbol that may be missing: a plugin built
+    /// before AV1 encode existed exports the four below and not this, which
+    /// costs an AV1 export its hardware path and nothing else. Every session it
+    /// opens is fed and closed through the very same three entry points -- the
+    /// plugin keeps one session type for both codecs, so the codec is decided
+    /// once, at the open, exactly as the H.264 seat's parameters are.
+    open_av1: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
     frame:
         unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
     drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
@@ -225,6 +232,7 @@ fn load_enc() -> Option<EncPlugin> {
             (|| {
                 Some(EncPlugin {
                     open: *lib.get(b"vh_enc_open\0").ok()?,
+                    open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
                     frame: *lib.get(b"vh_enc_frame\0").ok()?,
                     drain: *lib.get(b"vh_enc_drain\0").ok()?,
                     close: *lib.get(b"vh_enc_close\0").ok()?,
@@ -253,7 +261,50 @@ impl HwEncoder {
     /// falls back to the software encoder.
     pub fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
         let plugin = enc_plugin()?;
-        let handle = (plugin.open)(width, height, fps_num, fps_den, bitrate);
+        Self::opened(
+            plugin,
+            plugin.open,
+            width,
+            height,
+            fps_num,
+            fps_den,
+            bitrate,
+        )
+    }
+
+    /// The same, coding AV1 instead. `None` on everything [`HwEncoder::open`]
+    /// answers `None` to *and* on a plugin or a GPU with no AV1 encoder -- an
+    /// AV1 encode entrypoint is recent hardware, so this is the fallback that
+    /// really fires, and the caller's software AV1 encoder takes the export
+    /// without saying anything about it.
+    ///
+    /// The caller only reaches this behind `VE_HW_AV1=1`: the vendored encoder
+    /// reset this project's own GPU, which [`crate::export::Enc::open_av1`]
+    /// states in full.
+    pub fn open_av1(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+    ) -> Option<Self> {
+        let plugin = enc_plugin()?;
+        let open = plugin.open_av1?;
+        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
+    }
+
+    /// The null check both opens share, which is the plugin's whole way of
+    /// saying "no".
+    fn opened(
+        plugin: &'static EncPlugin,
+        open: extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void,
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+    ) -> Option<Self> {
+        let handle = open(width, height, fps_num, fps_den, bitrate);
         if handle.is_null() {
             return None;
         }
