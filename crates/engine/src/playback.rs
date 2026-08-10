@@ -25,7 +25,7 @@ use crate::color::ColorParams;
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Lane, LaneKind, Project, Source, Span};
+use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span};
 use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -122,6 +122,15 @@ pub struct PlaybackSession {
     /// The edit list. Everything a caller says in seconds is a *timeline*
     /// position; only this maps it onto the file.
     project: Project,
+    /// How many frames each source actually holds, indexed exactly as
+    /// [`Project::sources`] is and grown with it. The project itself does not
+    /// know -- a clip names a source by index and carries its own range -- and
+    /// [`Self::trim_clip`] is the one edit that could ask for frames past the
+    /// end of a file, which is a save that would not open again
+    /// ([`Self::open_project`] refuses one by name). Append-only for
+    /// `sources`'s reason: an index handed out stays valid, undone import or
+    /// not.
+    counts: Vec<u32>,
     /// What the current video worker was opened for: where it sits on the
     /// timeline, how long it runs, and which source frame it started at --
     /// together they rewrite a source frame index into a timeline one. Not a
@@ -191,6 +200,7 @@ impl PlaybackSession {
             audio,
             audio_disabled,
             project,
+            counts: vec![meta.frame_count],
             span,
             eos: false,
         })
@@ -316,6 +326,7 @@ impl PlaybackSession {
             audio,
             audio_disabled,
             project,
+            counts,
             span,
             eos: false,
         };
@@ -639,6 +650,45 @@ impl PlaybackSession {
         self.edit(|p| p.move_to_lane(from, idx, to))
     }
 
+    /// Drags one end of that clip to timeline frame `to`, changing how much of
+    /// its source it plays and nothing else on the lane -- see [`Project::trim`]
+    /// for the walls it is clamped by, which this fills the source lengths in
+    /// for. One undo step per call, so a front-end calls it once, at the release
+    /// of the drag. Reseeks like every other edit, which is what makes the
+    /// picture (and the sound) follow a new in-point straight away. `false` for
+    /// a bad index and for an edge already where it was asked to go.
+    ///
+    /// A *frame*, where the rest of this type takes seconds: a drag has already
+    /// asked [`trim_room`](Self::trim_room) where the edge may land, and that
+    /// answer is in frames -- converting it back through seconds would be a
+    /// rounding step between the width drawn and the width committed.
+    pub fn trim_clip(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> bool {
+        // Spelled out rather than through `edit`, whose closure cannot hold a
+        // second borrow of the session while it has the project.
+        if !self.project.trim(lane, idx, edge, to, &self.counts) {
+            return false;
+        }
+        let now = self.now();
+        self.seek(now);
+        true
+    }
+
+    /// Where that edge may land, `(first, last)` timeline frame inclusive: what
+    /// a drag clamps the pointer to so the box it draws is the box
+    /// [`trim_clip`](Self::trim_clip) will commit. `None` for a bad index.
+    pub fn trim_room(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(u32, u32)> {
+        self.project.trim_room(lane, idx, edge, &self.counts)
+    }
+
+    /// Records how long a source is, for a source index that may be one
+    /// `Project::import` just made or one it handed back. See [`Self::counts`].
+    fn note_frames(&mut self, source: usize, frames: u32) {
+        if source == self.counts.len() {
+            self.counts.push(frames);
+        }
+        debug_assert_eq!(self.counts.len(), self.project.sources().len());
+    }
+
     /// The clip the picture is coming from at `timeline_secs`: the lane it sits
     /// on and its index there, by the same topmost-lane-wins rule the decoder
     /// follows. `None` over a gap and past the end. What a card that grades
@@ -670,6 +720,14 @@ impl PlaybackSession {
     /// index that is not there and for a value that is not finite.
     pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
         self.edit(|p| p.set_color(lane, idx, params))
+    }
+
+    /// The same grade and the same reseek without the undo step
+    /// ([`Project::set_color_live`]): what the samples inside one slider drag go
+    /// through, so the frame regrades under the hand and the whole gesture is
+    /// still a single `z`.
+    pub fn set_color_live(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.edit(|p| p.set_color_live(lane, idx, params))
     }
 
     /// The project's resolution: what every clip is composed onto, what the
@@ -777,6 +835,7 @@ impl PlaybackSession {
         let first = self.first_audio()?;
         audio_matches(&wanted, &first)?;
         let source = self.project.import(path, stream);
+        self.note_frames(source, frames.max(1));
         let clip = Clip {
             start: 0,
             in_frame: 0,
@@ -869,6 +928,7 @@ impl PlaybackSession {
 
         let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
+        self.note_frames(source, meta.frame_count);
         // Refused only for an unknown index, and this one just came from `import`.
         self.project.append_clip(source, meta.frame_count);
         // Reseek like any other edit, even though nothing before the playhead
@@ -901,6 +961,7 @@ impl PlaybackSession {
 
         let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
+        self.note_frames(source, frames);
         let at = self.project.timeline_frames();
         self.project.place(
             Lane::A1,
