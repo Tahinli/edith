@@ -451,6 +451,36 @@ const EQ_TICKS: [(f32, &str); 5] = [
     (20000., "20k"),
 ];
 
+/// The gains the graph rules a line across, besides the 0 dB one it already
+/// had: half way to each limit, so a boost can be read as "about six" without
+/// counting pixels. The limits themselves are the box's own edges and are
+/// named at the corners instead.
+const EQ_DB_GRID: [f32; 2] = [6., -6.];
+
+/// The grid's ink: above the card's background and below everything drawn on
+/// it, so the lines are a ruling rather than a thing to look at.
+const EQ_GRID: u32 = 0x3a3a3a;
+
+/// How many played samples one spectrum frame is transformed from. A power of
+/// two ([`fft`] is radix-2) and the whole of the engine's tap: 1024 at 48 kHz
+/// is a 47 Hz bin, fine enough that the bass end is a shape and short enough
+/// (21 ms) that the analyser moves with the music.
+const EQ_FFT: usize = 1024;
+
+/// The level range the analyser is drawn across, floor to ceiling in dBFS: the
+/// bottom of the box is silence and the top is a bin at -12 dBFS, which is
+/// about where a mixed track's loudest band sits. A look, not a measurement --
+/// the numbers on the axis are the curve's dB, never the analyser's.
+const EQ_SPECTRUM_DB: (f32, f32) = (-96., -12.);
+
+/// The analyser's fill, behind the curve: a dim blue-grey with enough alpha to
+/// read as a haze the accent line sits on top of.
+const EQ_SPECTRUM_INK: u32 = 0x7f95ad66;
+
+/// The area under the response curve, same accent as the line at a tenth of
+/// its weight: it is what makes a boost read as a hill rather than as a wire.
+const EQ_FILL_INK: u32 = 0x4a9eff26;
+
 /// The colour card's four controls, in the order it lists them: what each is
 /// called and the range it moves in. The order is `ColorParams`' own, which is
 /// what [`color_band`] indexes.
@@ -622,6 +652,11 @@ struct Player {
     /// window position only, so this is what a press and a drag are read
     /// against ([`frac_along`], [`frac_down`]).
     eq_graph: Rc<Cell<Bounds<Pixels>>>,
+    /// Whether the analyser is drawn behind the curve. On by default -- what
+    /// the curve is being *shaped against* is the point of drawing it -- and
+    /// off with one press for anyone who would rather read the curve alone.
+    /// Card state, not the project's: it changes nothing that plays.
+    eq_spectrum: bool,
     /// The colour card is up on this clip -- the lane it is on and its index
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
@@ -2816,6 +2851,11 @@ impl Render for Player {
                             band.gain_db = 0.;
                         }
                         this.commit_eq(cx);
+                    } else if key == "s" {
+                        // The analyser off and on. Nothing is committed: it is
+                        // what the card *shows*, so it survives no further than
+                        // this window.
+                        this.eq_spectrum = !this.eq_spectrum;
                     } else if let Ok(digit) = key.parse::<usize>() {
                         // 1-based, as the rows are numbered on screen; a digit
                         // past the last band picks nothing rather than panics.
@@ -4096,6 +4136,18 @@ impl Player {
         // clip and a 48 kHz one are not the same shape.
         let sample_rate = self.timeline_audio().map_or(48_000, |(rate, _)| rate);
         let picked = self.eq_params.bands.get(self.eq_band);
+        // What is playing, drawn behind the curve -- and only while something
+        // *is* playing: the tap freezes with the device, and a still spectrum
+        // under a paused timeline would look like sound that is not there.
+        let spectrum = self
+            .eq_spectrum
+            .then_some(self.session.as_ref())
+            .flatten()
+            .filter(|session| session.is_playing())
+            .and_then(PlaybackSession::audio_tap)
+            .map(|(samples, rate)| eq_spectrum(&samples, rate))
+            .filter(|levels| !levels.is_empty())
+            .map(eq_spectrum_curve);
         let handles: Vec<_> = self
             .eq_params
             .bands
@@ -4141,6 +4193,44 @@ impl Player {
                 }),
             )
             .child(bounds_probe(self.eq_graph.clone()))
+            // The analyser first, so everything else is drawn on top of it.
+            .children(spectrum)
+            // The decades, so a hump can be read as "around 200 Hz" without
+            // dropping the eye to the labels along the bottom. The two ends
+            // are the box's own edges and rule nothing.
+            .children(
+                EQ_TICKS
+                    .iter()
+                    .filter(|(freq, _)| *freq > EQ_FREQ_LOW && *freq < EQ_FREQ_HIGH)
+                    .map(|(freq, _)| {
+                        div()
+                            .absolute()
+                            .left(relative(eq_x(*freq)))
+                            .w(px(1.))
+                            .h_full()
+                            .bg(rgb(EQ_GRID))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            // Half way to each limit, each carrying its own number: the curve
+            // is a curve of decibels, and until now only one of them was drawn.
+            .children(EQ_DB_GRID.map(|db| {
+                div()
+                    .absolute()
+                    .top(relative(eq_y(db)))
+                    .w_full()
+                    .h(px(1.))
+                    .bg(rgb(EQ_GRID))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(px(-11.))
+                            .text_size(px(9.))
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("{db:+.0}")),
+                    )
+            }))
             // 0 dB: the line a boost is a boost *from*.
             .child(
                 div()
@@ -4175,6 +4265,9 @@ impl Player {
                     .text_color(rgb(INK_DIM))
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
+        // The bottom of the axis is not named: -12 dB would land in the same
+        // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
+        // already say what the box is worth per pixel.
         Some(
             div()
                 .absolute()
@@ -4209,7 +4302,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag the curve, or 1–5 then up/down — esc closes".into()
+                                    "drag the curve, or 1–5 then up/down — s hides the spectrum, esc closes".into()
                                 })),
                         )
                         .child(graph)
@@ -4218,34 +4311,72 @@ impl Player {
                         // one pulling the other way is not readable off it.
                         .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
                             match picked {
+                                // Q as well as the two the curve shows: it is
+                                // how wide the hump under the handle is, and
+                                // nothing else on the card says so.
                                 Some(band) => format!(
-                                    "{} {} {:+.1} dB",
+                                    "{} {} {:+.1} dB — Q {:.2}",
                                     self.eq_band + 1,
                                     band_label(band),
-                                    band.gain_db
+                                    band.gain_db,
+                                    band.q
                                 ),
                                 None => "no bands".into(),
                             },
                         ))
                         .child(
                             div()
-                                .id("eq-reset")
                                 .mt(px(4.))
                                 .flex()
-                                .h(px(CONTROL_H))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(rgb(SELECTED))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    for band in &mut this.eq_params.bands {
-                                        band.gain_db = 0.;
-                                    }
-                                    this.commit_eq(cx);
-                                }))
-                                .child("Flatten"),
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .id("eq-reset")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(SELECTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            for band in &mut this.eq_params.bands {
+                                                band.gain_db = 0.;
+                                            }
+                                            this.commit_eq(cx);
+                                        }))
+                                        .child("Flatten"),
+                                )
+                                // The analyser's switch, next to the one other
+                                // button the card has: `s` does the same, and a
+                                // toggle only a keystroke can reach is one most
+                                // people never find.
+                                .child(
+                                    div()
+                                        .id("eq-spectrum")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(match self.eq_spectrum {
+                                            true => SELECTED,
+                                            false => HOVER_DIM,
+                                        }))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.eq_spectrum = !this.eq_spectrum;
+                                            cx.notify();
+                                        }))
+                                        .child(match self.eq_spectrum {
+                                            true => "Spectrum on",
+                                            false => "Spectrum off",
+                                        }),
+                                ),
                         ),
                 ),
         )
@@ -6599,6 +6730,131 @@ fn hist_curves(bins: [[u32; HIST_BINS]; 3]) -> impl IntoElement {
     .size_full()
 }
 
+/// In-place radix-2 FFT of `re`/`im`, whose length must be a power of two.
+///
+/// Hand-written, and deliberately: a 1024-point transform once a frame is a
+/// few tens of microseconds of plain arithmetic, and a dependency for it would
+/// be a build cost this editor pays on every compile for one card's backdrop.
+fn fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    // Decimation in time: the input is first put in bit-reversed order, after
+    // which the butterflies run over neighbours.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut span = 2;
+    while span <= n {
+        let step = std::f32::consts::TAU / span as f32;
+        for start in (0..n).step_by(span) {
+            for k in 0..span / 2 {
+                // e^{-i2πk/span}: the negative sign is the forward transform.
+                let (sin, cos) = (-step * k as f32).sin_cos();
+                let (a, b) = (start + k, start + k + span / 2);
+                let (tr, ti) = (cos * re[b] - sin * im[b], cos * im[b] + sin * re[b]);
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        span <<= 1;
+    }
+}
+
+/// The played signal as one height per curve point, 0 (silence) to 1 (the top
+/// of the box) -- the analyser the response curve is drawn on top of.
+///
+/// The newest [`EQ_FFT`] samples of the engine's tap, Hann-windowed so a tone
+/// that does not land on a bin centre is one hump rather than a smear across
+/// the axis. Each column takes the *loudest* bin between it and its
+/// neighbours: the axis is logarithmic, so one column near 20 Hz is a fraction
+/// of a bin while one near 20 kHz is hundreds, and averaging those would sink
+/// every peak up there into the noise beside it.
+///
+/// Empty -- nothing to draw -- for a tap too short to transform, which is what
+/// a session has just after a seek.
+///
+/// ponytail: one transform length for the whole axis, so the bass end is a bin
+/// (47 Hz at 48 kHz) wide however many columns are drawn across it -- a 60 Hz
+/// hum and an 80 Hz one are the same hump down there. Upgrade path is the
+/// analyser every mastering EQ uses: two or three transforms of different
+/// lengths, each drawn over the octaves it resolves.
+fn eq_spectrum(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.len() < EQ_FFT {
+        return Vec::new();
+    }
+    let tail = &samples[samples.len() - EQ_FFT..];
+    let mut re: Vec<f32> = tail
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let w = 0.5 * (1. - (std::f32::consts::TAU * i as f32 / EQ_FFT as f32).cos());
+            s * w
+        })
+        .collect();
+    let mut im = vec![0.; EQ_FFT];
+    fft(&mut re, &mut im);
+    // Magnitude per bin, scaled so a full-scale sine reads 0 dBFS: half the
+    // energy is in the mirrored half of the transform, and the Hann window
+    // takes another factor of two off.
+    let mags: Vec<f32> = (0..EQ_FFT / 2)
+        .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt() * 4. / EQ_FFT as f32)
+        .collect();
+    let bin_hz = sample_rate as f32 / EQ_FFT as f32;
+    let (floor, ceiling) = EQ_SPECTRUM_DB;
+    let at = |along: f32| EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+    (0..=EQ_CURVE_STEPS)
+        .map(|step| {
+            let along = step as f32 / EQ_CURVE_STEPS as f32;
+            let half = 0.5 / EQ_CURVE_STEPS as f32;
+            // Bin 0 is DC and means nothing here, so the low end starts at 1.
+            let low = (at(along - half) / bin_hz).round().max(1.) as usize;
+            let high = (at(along + half) / bin_hz).round().max(1.) as usize;
+            let peak = (low..=high)
+                .filter_map(|k| mags.get(k))
+                .fold(0f32, |a, &b| a.max(b));
+            let db = 20. * peak.max(1e-9).log10();
+            ((db - floor) / (ceiling - floor)).clamp(0., 1.)
+        })
+        .collect()
+}
+
+/// The analyser drawn as one filled shape from the floor of the box.
+fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let last = levels.len().saturating_sub(1).max(1) as f32;
+            let mut path = PathBuilder::fill();
+            path.move_to(point(o.x, o.y + s.height));
+            for (i, level) in levels.iter().enumerate() {
+                path.line_to(point(
+                    o.x + s.width * (i as f32 / last),
+                    o.y + s.height * (1. - level),
+                ));
+            }
+            path.line_to(point(o.x + s.width, o.y + s.height));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(EQ_SPECTRUM_INK));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// The cascade's frequency response, drawn as one line across the graph.
 ///
 /// Every point comes from `EqParams::response_db`, which reads the very
@@ -6613,14 +6869,31 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             let (o, s) = (bounds.origin, bounds.size);
+            let points: Vec<_> = (0..=EQ_CURVE_STEPS)
+                .map(|step| {
+                    let along = step as f32 / EQ_CURVE_STEPS as f32;
+                    let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+                    point(
+                        o.x + s.width * along,
+                        o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
+                    )
+                })
+                .collect();
+            // The area between the curve and 0 dB, closed along that line: a
+            // boost and a cut wind opposite ways around it, which is exactly
+            // what makes both of them fill and the flat parts stay empty.
+            let mut area = PathBuilder::fill();
+            area.move_to(point(o.x, o.y + s.height / 2.));
+            for at in &points {
+                area.line_to(*at);
+            }
+            area.line_to(point(o.x + s.width, o.y + s.height / 2.));
+            area.close();
+            if let Ok(area) = area.build() {
+                window.paint_path(area, rgba(EQ_FILL_INK));
+            }
             let mut path = PathBuilder::stroke(px(2.));
-            for step in 0..=EQ_CURVE_STEPS {
-                let along = step as f32 / EQ_CURVE_STEPS as f32;
-                let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
-                let at = point(
-                    o.x + s.width * along,
-                    o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
-                );
+            for (step, at) in points.into_iter().enumerate() {
                 match step {
                     0 => path.move_to(at),
                     _ => path.line_to(at),
@@ -6704,19 +6977,19 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_FREQ_HIGH,
-        EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_TICKS, EXPORT_ROWS_H, FORMATS,
-        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
-        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
-        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H,
-        Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave,
-        applicable, band_label, can_add, cancels_export, color_snap, envelope, eq_x, eq_y,
-        export_path, export_settings, format_key, format_line, format_refusal, frac_along,
-        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
-        menu_at, normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
+        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
+        EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS,
+        HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
+        LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
+        MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
+        Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export,
+        color_snap, envelope, eq_spectrum, eq_x, eq_y, export_path, export_settings, format_key,
+        format_line, format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier,
+        is_project, keymap, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit,
+        retarget, scrub_due, show_label, silence_rate, source_tint, span_partner, speed_at,
+        start_frac, timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{LaneKind, file_name, file_uri, library_rows, unscannable};
 
@@ -7918,6 +8191,86 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// The analyser drawn behind the curve: a tone has to land on its own
+    /// frequency, or the backdrop is a decoration rather than a reading of what
+    /// is playing -- and someone shaping a band against it would be aiming at
+    /// the wrong octave.
+    #[test]
+    fn the_spectrum_puts_a_tone_under_its_own_frequency() {
+        use std::f32::consts::TAU;
+        let rate = 48_000u32;
+        let sine = |hz: f32, amp: f32| -> Vec<f32> {
+            (0..EQ_FFT)
+                .map(|i| amp * (TAU * hz * i as f32 / rate as f32).sin())
+                .collect()
+        };
+
+        // Silence is the floor of the box everywhere, not a band of noise.
+        let quiet = eq_spectrum(&vec![0.; EQ_FFT], rate);
+        assert_eq!(quiet.len(), EQ_CURVE_STEPS + 1);
+        assert!(quiet.iter().all(|&l| l == 0.), "silence drew something");
+
+        // A tone peaks over its own frequency, and the columns two octaves
+        // either side of it are near the floor. "Over" to within a bin down low
+        // and a column up high, which is all a 1024-point transform on a log
+        // axis can promise: at 200 Hz a whole column is a fraction of a bin
+        // wide, so the peak sits on the bin the tone fell in.
+        let column = |freq: f32| (eq_x(freq) * EQ_CURVE_STEPS as f32).round() as usize;
+        let freq_at = |col: usize| {
+            let along = col as f32 / EQ_CURVE_STEPS as f32;
+            EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along)
+        };
+        for hz in [200., 1000., 5000.] {
+            let levels = eq_spectrum(&sine(hz, 0.05), rate);
+            let (at, top) =
+                levels
+                    .iter()
+                    .enumerate()
+                    .fold((0, 0f32), |best, (i, &l)| match l > best.1 {
+                        true => (i, l),
+                        false => best,
+                    });
+            let slack = 1.5 * rate as f32 / EQ_FFT as f32 + 0.04 * hz;
+            assert!(
+                (freq_at(at) - hz).abs() <= slack,
+                "{hz} Hz peaked at {:.0} Hz (column {at})",
+                freq_at(at)
+            );
+            // -26 dBFS, which is where a 0.05 tone sits on the axis.
+            let want =
+                (20. * 0.05f32.log10() - EQ_SPECTRUM_DB.0) / (EQ_SPECTRUM_DB.1 - EQ_SPECTRUM_DB.0);
+            assert!(
+                (top - want).abs() < 0.05,
+                "a -26 dBFS tone drew {top} of the box, not {want}"
+            );
+            // Two octaves off is far enough down the box that the hump reads as
+            // one hump: 0.4 of the axis is a little over 30 dB.
+            for off in [hz / 4., hz * 4.] {
+                let away = levels[column(off).min(EQ_CURVE_STEPS)];
+                assert!(
+                    top - away > 0.4,
+                    "{hz} Hz drew {top} but still {away} at {off} Hz"
+                );
+            }
+        }
+
+        // Level reads as level: 40 dB quieter sits lower by the fraction of the
+        // axis those 40 dB are.
+        let loud = eq_spectrum(&sine(1000., 0.05), rate);
+        let soft = eq_spectrum(&sine(1000., 0.0005), rate);
+        let at = column(1000.);
+        let drop = loud[at] - soft[at];
+        let (floor, ceiling) = EQ_SPECTRUM_DB;
+        assert!(
+            (drop - 40. / (ceiling - floor)).abs() < 0.05,
+            "40 dB quieter moved the analyser {drop} of the box"
+        );
+
+        // A tap the engine has not filled yet (right after a seek) draws
+        // nothing at all rather than a transform of half a window.
+        assert!(eq_spectrum(&[0.; 16], rate).is_empty());
+    }
+
     /// The speed bar is the same round trip -- pixels -> rate -> fill -- with
     /// one thing the colour sliders do not have to promise: **exactly 1.00x has
     /// to be reachable**, by a hand as well as by the reset. A grid that missed
@@ -8716,6 +9069,7 @@ fn main() {
                     eq_band: 0,
                     eq_dragging: false,
                     eq_graph: Rc::default(),
+                    eq_spectrum: true,
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
