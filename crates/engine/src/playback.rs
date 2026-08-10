@@ -21,6 +21,7 @@ use std::time::Duration;
 use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
+use crate::color::ColorParams;
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::eq::EqParams;
@@ -139,7 +140,11 @@ impl PlaybackSession {
         }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
-        let (meta, stream) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
+        // Ungraded: a file just opened has one clip per lane and nothing has
+        // graded it yet. Every later span is opened by `start_span`, which asks
+        // the project.
+        let (meta, stream) =
+            DecodeSession::open_worker(&path, 0, u32::MAX, ColorParams::default())?;
         // A file is opened on its first audio stream, like `Project::single`
         // names it: nothing has picked one yet.
         let (audio, audio_disabled) = open_audio(&path, 0);
@@ -195,8 +200,12 @@ impl PlaybackSession {
         // locals drop in reverse declaration order -- a bare worker would join
         // its decode thread while the receiver next to it was still holding
         // that thread parked in `send`, which is a hang (see [`FrameStream`]).
-        let (meta, stream) = DecodeSession::open_worker(&first.path, 0, u32::MAX)
-            .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        // Ungraded, and superseded before a frame of it is shown: the `seek` at
+        // the end of this function reopens the playhead's span through
+        // `start_span`, which is where a saved grade reaches the picture.
+        let (meta, stream) =
+            DecodeSession::open_worker(&first.path, 0, u32::MAX, ColorParams::default())
+                .map_err(|e| format!("source {}: {e}", first.path.display()))?;
         let first_audio = AudioSession::probe(&first.path, first.audio_stream)?;
 
         let mut counts = vec![meta.frame_count];
@@ -384,10 +393,17 @@ impl PlaybackSession {
     /// disconnected receiver carries the session on to the next span.
     fn start_span(&mut self, span: Span) {
         let opened = match span.from {
+            // The grade is the composite's at this frame -- the same clip the
+            // span itself came from -- and it is constant across the span, so
+            // the worker carries it and every frame it converts wears it.
             Some((source, in_frame)) => DecodeSession::open_worker(
                 &self.project.sources()[source].path,
                 in_frame,
                 in_frame + span.len,
+                self.project
+                    .composite_color_at(span.start)
+                    .copied()
+                    .unwrap_or_default(),
             )
             .map(|(_, stream)| stream)
             .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
@@ -513,6 +529,30 @@ impl PlaybackSession {
     /// lift that would leave the whole timeline empty.
     pub fn lift_clip(&mut self, lane: Lane, idx: usize) -> bool {
         self.edit(|p| p.lift(lane, idx))
+    }
+
+    /// The clip the picture is coming from at `timeline_secs`: the lane it sits
+    /// on and its index there, by the same topmost-lane-wins rule the decoder
+    /// follows. `None` over a gap and past the end. What a card that grades
+    /// "this clip" opens on when nothing has been clicked.
+    pub fn video_clip_at(&self, timeline_secs: f64) -> Option<(Lane, usize)> {
+        self.project
+            .composite_clip_at(secs_to_frame(timeline_secs, self.meta.frame_rate))
+    }
+
+    /// How the clip at `idx` of `lane` is graded, or `None` for one that plays
+    /// as it was shot -- what a colour card reads when it opens.
+    pub fn color_of(&self, lane: Lane, idx: usize) -> Option<&ColorParams> {
+        self.project.color_of(lane, idx)
+    }
+
+    /// Grades that clip, or takes the grade off with `None`. One undo step like
+    /// every other edit, and it reseeks like one too -- which is what puts the
+    /// new grade on the frame that is already on screen, paused or playing,
+    /// without the caller having to nudge the playhead itself. `false` for an
+    /// index that is not there and for a value that is not finite.
+    pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.edit(|p| p.set_color(lane, idx, params))
     }
 
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
