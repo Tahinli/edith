@@ -101,6 +101,11 @@ pub struct PlaybackSession {
     retired: Vec<Worker>,
     clock: PlaybackClock,
     audio: Option<Audio>,
+    /// Why this timeline is silent, when the file itself is not: an audio track
+    /// we cannot decode is a session that plays perfectly and says nothing about
+    /// it otherwise. `None` for a file that has usable audio *and* for one that
+    /// has none at all, which is not a surprise worth a notice.
+    audio_disabled: Option<String>,
     /// The edit list. Everything a caller says in seconds is a *timeline*
     /// position; only this maps it onto the file.
     project: Project,
@@ -123,7 +128,7 @@ impl PlaybackSession {
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
         let (meta, stream) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
-        let audio = open_audio(&path);
+        let (audio, audio_disabled) = open_audio(&path);
         let source = match audio {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
@@ -139,6 +144,7 @@ impl PlaybackSession {
             retired: Vec::new(),
             clock: PlaybackClock::new(source),
             audio,
+            audio_disabled,
             project,
             span,
             eos: false,
@@ -207,7 +213,7 @@ impl PlaybackSession {
         // only a session's `drop` retires it, so a refusal above this line would
         // leave a PipeWire stream and a thread behind for a project that never
         // opened. Nothing before it needs the device.
-        let audio = open_audio(&first);
+        let (audio, audio_disabled) = open_audio(&first);
         let mut session = Self {
             meta,
             frames: stream.frames,
@@ -218,6 +224,7 @@ impl PlaybackSession {
                 None => ClockSource::Wall,
             }),
             audio,
+            audio_disabled,
             project,
             span,
             eos: false,
@@ -233,6 +240,14 @@ impl PlaybackSession {
 
     pub fn meta(&self) -> &VideoMeta {
         &self.meta
+    }
+
+    /// Why this session plays silent although the file has sound -- an audio
+    /// track in a codec we cannot decode, or one the decoder refused. `None`
+    /// when there is audio, and for a file that never had any. A front-end
+    /// shows it once, at open: without it the whole thing is a stderr line.
+    pub fn audio_disabled_reason(&self) -> Option<&str> {
+        self.audio_disabled.as_deref()
     }
 
     /// The files this timeline plays from, index 0 first -- a caller needs it
@@ -751,16 +766,31 @@ fn matches_timeline(
 /// `None` for a silent session -- no audio track, no plugin, no daemon, or a
 /// track the decoder refuses. Dropping the receiver on the way out stops the
 /// audio decode worker, so a failure here leaves nothing running.
-fn open_audio(path: &Path) -> Option<Audio> {
+///
+/// The second half is why, for the cases the *file* is to blame for: those are
+/// a surprise worth showing (see
+/// [`audio_disabled_reason`](PlaybackSession::audio_disabled_reason)), where a
+/// file with no audio at all and a machine with no output device are not.
+fn open_audio(path: &Path) -> (Option<Audio>, Option<String>) {
     let (meta, rx) = match AudioSession::open(path) {
         Ok(Some(opened)) => opened,
-        Ok(None) => return None,
+        // No AAC track: silent by nature, or sound in a codec we do not have --
+        // and only the second of those is worth a word.
+        Ok(None) => {
+            let reason = AudioSession::unsupported(path).ok().flatten();
+            if let Some(reason) = &reason {
+                eprintln!("audio disabled: {reason}");
+            }
+            return (None, reason);
+        }
         Err(e) => {
             eprintln!("audio disabled: {e}");
-            return None;
+            return (None, Some(e.to_string()));
         }
     };
-    let ao = AoSession::open(meta.sample_rate, u32::from(meta.channels))?;
+    let Some(ao) = AoSession::open(meta.sample_rate, u32::from(meta.channels)) else {
+        return (None, None); // no device: the machine's business, not the file's
+    };
     // The stream comes up streaming; a session starts paused, so silence the
     // device until `play`. The feeder still fills the ring in the meantime.
     ao.set_active(false);
@@ -774,7 +804,7 @@ fn open_audio(path: &Path) -> Option<Audio> {
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
     };
-    audio.spawn_feeder(rx).then_some(audio)
+    (audio.spawn_feeder(rx).then_some(audio), None)
 }
 
 /// Pours decoded chunks into the device, keeping whatever the ring would not

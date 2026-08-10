@@ -679,6 +679,9 @@ impl Player {
         match PlaybackSession::open(path) {
             Ok(session) => {
                 self.fps = session.meta().frame_rate;
+                // Read before the session moves: a file that plays silent says
+                // so here or nowhere.
+                let silent = audio_notice(&session);
                 self.session = Some(session);
                 // A fresh session comes up at full volume; the player's own
                 // setting outlives the file, so it is pushed at every new one.
@@ -687,7 +690,7 @@ impl Player {
                 self.project_path = project_path(path);
                 self.name = file_name(path).into();
                 self.reset_after_reseek();
-                format!("OPENED {}", file_name(path))
+                format!("OPENED {}{}", file_name(path), silent.unwrap_or_default())
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         }
@@ -733,6 +736,7 @@ impl Player {
         let text = match PlaybackSession::open_project(path) {
             Ok(session) => {
                 self.fps = session.meta().frame_rate;
+                let silent = audio_notice(&session);
                 // A project is named after itself but still exports beside its
                 // media: that is the only place an export has ever landed.
                 self.export_path = export_path(&session.sources()[0]);
@@ -760,7 +764,7 @@ impl Player {
                 // reaches the screen the way a seek's does. The old picture is
                 // released by the swap in `pump`, as after any other seek.
                 self.reset_after_reseek();
-                format!("LOADED {}", file_name(path))
+                format!("LOADED {}{}", file_name(path), silent.unwrap_or_default())
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         };
@@ -2465,6 +2469,15 @@ fn file_name(path: &std::path::Path) -> String {
     )
 }
 
+/// The tail an open/load notice grows when the file has sound the engine cannot
+/// decode: it plays perfectly, in silence, and that is the one thing the window
+/// would otherwise never say (the engine's own word for it, verbatim).
+fn audio_notice(session: &PlaybackSession) -> Option<String> {
+    session
+        .audio_disabled_reason()
+        .map(|reason| format!(" — NO AUDIO: {reason}"))
+}
+
 /// The sources a repaint has not asked about yet. A key that is already there
 /// means "asked", whatever state it is in, which is what stops a decode already
 /// running from being started again by the next of sixty repaints a second.
@@ -3791,6 +3804,13 @@ fn main() {
             eprintln!("{extra}: {text}");
             notice.get_or_insert(text);
         }
+    }
+    // A file that plays silent is as much news at launch as it is on a drop, and
+    // behind the keymap notice for the same reason an import refusal is.
+    if let Some(reason) = session.as_ref().and_then(PlaybackSession::audio_disabled_reason) {
+        let text = format!("NO AUDIO: {reason}");
+        eprintln!("{text}");
+        notice.get_or_insert(text);
     }
     let meta = session.as_ref().map(|session| *session.meta());
     // Beside the media even for a project: an export has never landed anywhere

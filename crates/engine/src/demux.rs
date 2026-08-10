@@ -4,7 +4,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use mp4::{MediaType, Mp4Reader};
+use mp4::{MediaType, Mp4Reader, Mp4Track};
+
+use crate::audio::{edit_media_time, packet_at, stts_pairs};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -20,6 +22,10 @@ pub struct Demuxer {
     reader: Mp4Reader<BufReader<File>>,
     track_id: u32,
     sample_count: u32,
+    /// 1-based sample id of *frame 0*: the edit list can start the presentation
+    /// a couple of frames into the media, exactly as it does for audio priming
+    /// (`audio::priming_samples`), and frame indices count from there.
+    first_sample: u32,
     /// Annex-B SPS+PPS, re-injected ahead of every sync sample.
     parameter_sets: Vec<u8>,
     /// `stss` entries, ascending 1-based sample ids. Empty means no `stss` box
@@ -44,9 +50,10 @@ impl Demuxer {
         let meta = VideoMeta {
             width: track.width() as u32,
             height: track.height() as u32,
-            frame_rate: track.frame_rate(),
+            frame_rate: frame_rate(track),
             frame_count: 0,
         };
+        let first_sample = first_frame_sample(stts_pairs(track), trim_ticks(track));
         let mut parameter_sets = Vec::new();
         parameter_sets.extend_from_slice(&START_CODE);
         parameter_sets.extend_from_slice(track.sequence_parameter_set()?);
@@ -63,18 +70,24 @@ impl Demuxer {
             .unwrap_or_default();
 
         let sample_count = reader.sample_count(track_id)?;
+        // Where a seek to frame 0 would put the cursor: the samples the edit list
+        // trims are still read, they are references for the ones that show.
+        let next_sample = sync_at_or_before(&sync_samples, first_sample);
         Ok((
             VideoMeta {
-                frame_count: sample_count,
+                // The samples the edit list trims off the front are not frames of
+                // the presentation, so they are not counted as ones.
+                frame_count: sample_count.saturating_sub(first_sample - 1),
                 ..meta
             },
             Self {
                 reader,
                 track_id,
                 sample_count,
+                first_sample,
                 parameter_sets,
                 sync_samples,
-                next_sample: 1, // sample ids are 1-based
+                next_sample,
             },
         ))
     }
@@ -99,14 +112,82 @@ impl Demuxer {
     }
 
     /// Rewinds/forwards the read cursor to the latest sync sample at or before
-    /// `sample_id` (1-based), which is the earliest point a decoder can start
-    /// from and still reach `sample_id`. Returns the sample it landed on.
-    pub fn seek_to_sync_at_or_before(&mut self, sample_id: u32) -> u32 {
-        let target = sample_id.clamp(1, self.sample_count.max(1));
+    /// display frame `frame` (0-based), which is the earliest point a decoder can
+    /// start from and still reach it. Returns the display index of the first
+    /// picture the caller will now be handed -- *negative* when the landing sync
+    /// sample sits inside what the edit list trims, i.e. those pictures decode as
+    /// references but are not frame 0 or later.
+    pub fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
+        let target = frame
+            .saturating_add(self.first_sample)
+            .clamp(1, self.sample_count.max(1));
         let chosen = sync_at_or_before(&self.sync_samples, target);
         self.next_sample = chosen;
-        chosen
+        i64::from(chosen) - i64::from(self.first_sample)
     }
+}
+
+/// Frames per second off the sample table. `mp4 0.14`'s own
+/// [`Mp4Track::frame_rate`] divides the sample count by whole *milliseconds*
+/// before the float cast (`track.rs:166`), so 24000/1001 reads back as a flat
+/// 23.0 -- with the audio clock as master that is 4 % of drift, five minutes of
+/// it by the end of a two-hour film.
+fn frame_rate(track: &Mp4Track) -> f64 {
+    fps_from_stts(stts_pairs(track), track.timescale())
+}
+
+/// Whole track over whole track: constant-delta tables (the common case) come
+/// out as exactly `timescale / delta`, and a table that spreads 3753/3754 ticks
+/// to average 3753.75 averages instead of truncating. All of it in `f64`, which
+/// is the bug the caller above exists to avoid.
+fn fps_from_stts(entries: impl IntoIterator<Item = (u32, u32)>, timescale: u32) -> f64 {
+    let (samples, ticks) = entries
+        .into_iter()
+        .fold((0u64, 0u64), |(samples, ticks), (count, delta)| {
+            (
+                samples + u64::from(count),
+                ticks + u64::from(count) * u64::from(delta),
+            )
+        });
+    match ticks {
+        // No timing in the header at all; `mp4`'s own answer for that is 0.0 too.
+        0 => 0.0,
+        ticks => samples as f64 * f64::from(timescale) / ticks as f64,
+    }
+}
+
+/// What the edit list really trims off the front, in media ticks: its
+/// `media_time` less the first sample's own composition offset. A stream with
+/// B-frames carries a `ctts` delay, and every muxer writes `media_time` equal to
+/// exactly that delay -- which is not a trim at all, it is the container saying
+/// "sample 1 is still the first picture". Reading it as one drops real frames
+/// (`test_high.mp4` loses two, and so did the film this bug came from). What is
+/// left over after the delay is the genuine trim.
+///
+/// ponytail: empty edits are ignored and `media_time` is otherwise taken at face
+/// value, which is exactly what [`crate::audio::edit_media_time`] gives the audio
+/// track -- symmetry between the two is the point, not a full edit-list engine.
+/// Their *empty* edits can differ (83 ms of video against 62 ms of audio in that
+/// film, so the picture stays 21 ms -- half a frame -- early); honouring those is
+/// the upgrade path, and it belongs to both tracks at once.
+fn trim_ticks(track: &Mp4Track) -> Option<u64> {
+    let delay = track
+        .trak
+        .mdia
+        .minf
+        .stbl
+        .ctts
+        .as_ref()
+        .and_then(|ctts| ctts.entries.first())
+        .map_or(0, |e| e.sample_offset.max(0) as u64);
+    edit_media_time(track).map(|t| t.saturating_sub(delay))
+}
+
+/// 1-based id of the sample the presentation starts on, for a track trimmed by
+/// `trim` media ticks ([`trim_ticks`]). `None` (no edit list) and zero are both
+/// "no trim", i.e. the first sample.
+fn first_frame_sample(entries: impl IntoIterator<Item = (u32, u32)>, trim: Option<u64>) -> u32 {
+    trim.map_or(1, |t| packet_at(entries, t, 0).0)
 }
 
 /// Largest entry of the ascending sync table that is `<= sample_id`. An empty
@@ -166,6 +247,38 @@ mod tests {
         assert_eq!(sync_at_or_before(&[1, 31, 61], 45), 31, "between syncs");
         assert_eq!(sync_at_or_before(&[5, 31], 2), 5, "before the first sync");
         assert_eq!(sync_at_or_before(&[1, 31, 61], 900), 61, "past the last");
+    }
+
+    /// The desync bug: NTSC rates must survive the sample table as themselves.
+    #[test]
+    fn ntsc_frame_rates_come_out_fractional() {
+        // 24000/1001 on a 90 kHz clock is 3753.75 ticks a frame, so a muxer
+        // spreads 3753/3754 and only the total is exact -- 4 frames, 15015 ticks.
+        let ntsc = fps_from_stts([(1u32, 3753u32), (3, 3754)], 90_000);
+        assert!(
+            (ntsc - 24_000.0 / 1001.0).abs() < 1e-9,
+            "23.976 fps read back as {ntsc} (mp4 0.14 says 23.0)"
+        );
+        // Constant delta stays an exact division, not an average.
+        assert_eq!(fps_from_stts([(300u32, 3000u32)], 90_000), 30.0);
+        assert_eq!(fps_from_stts([(120u32, 1001u32)], 30_000), 30_000.0 / 1001.0);
+        assert_eq!(fps_from_stts([(0u32, 0u32)], 90_000), 0.0, "no timing");
+    }
+
+    /// A video edit list trims the head of the media exactly as the audio one
+    /// does; frame 0 is the first frame that is *shown*. The B-frame delay is
+    /// the case that must **not** move it -- that one is a lie of a `media_time`
+    /// and taking it literally throws two real frames away.
+    #[test]
+    fn a_video_edit_list_moves_frame_zero_but_a_ctts_delay_does_not() {
+        let entries = [(1u32, 3753u32), (3, 3754)];
+        // The film's own numbers: media_time 7507 at 90 kHz, and a first ctts
+        // offset of 7507 to go with it -- nothing trimmed.
+        assert_eq!(first_frame_sample(entries, Some(7507 - 7507)), 1);
+        // Two frames genuinely cut off the front.
+        assert_eq!(first_frame_sample(entries, Some(7507)), 3);
+        assert_eq!(first_frame_sample(entries, None), 1, "no edit list, no trim");
+        assert_eq!(first_frame_sample(entries, Some(0)), 1, "zero is no trim");
     }
 
     #[test]
