@@ -269,19 +269,10 @@ impl AudioSession {
     /// one output track with one esds. Import refuses a mismatch up front; the
     /// check here is the backstop, as is the missing-track `Err`.
     ///
-    /// A segment naming **no** source is a gap. There is no AAC encoder here to
-    /// make silence with, so the gap is spent as *time* instead: its length is
-    /// added to the [`samples`](AacPacket::samples) of the packet next to it,
-    /// which is the duration the writer puts in the stts. Every packet after
-    /// the gap therefore still lands at its timeline position, so nothing
-    /// drifts out of lip sync, and a conforming reader renders the hole as
-    /// silence.
-    ///
-    /// ponytail: a gap at the *head* of the timeline has no packet before it to
-    /// lengthen, so its length goes on the first packet instead — that one
-    /// packet (23 ms) plays at zero rather than after the hole, and everything
-    /// from the second packet on is exact. Upgrade path is an empty `elst`
-    /// entry at the head of the audio track.
+    /// A segment naming **no** source is a gap, and is copied as that many
+    /// packets of [`silent_packet`] silence — the rounding debt carried through
+    /// it like any other, so the hole occupies its exact duration and the audio
+    /// after it stays in sync with the picture.
     pub fn copy_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -299,17 +290,18 @@ impl AudioSession {
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
         tracks[first] = Some(track);
 
+        let sample_rate = params.sample_rate;
         let mut err = 0i64;
         let mut packets: Vec<AacPacket> = Vec::new();
-        // Gap time with no packet in front of it to carry it: a leading gap,
-        // which the first packet written picks up (see the ponytail above).
-        let mut owed = 0u32;
         for &(source, start_secs, end_secs) in segs {
             let Some(source) = source else {
-                let len = ((end_secs - start_secs).max(0.0) * f64::from(params.sample_rate)) as u32;
-                match packets.last_mut() {
-                    Some(prev) => prev.samples += len,
-                    None => owed += len,
+                let ideal = ((end_secs - start_secs).max(0.0) * f64::from(sample_rate)) as i64;
+                let bytes = silent_packet(params.chan_conf)?;
+                for _ in 0..packet_run(&mut err, ideal, u32::MAX) {
+                    packets.push(AacPacket {
+                        bytes: bytes.clone(),
+                        samples: SAMPLES_PER_PACKET,
+                    });
                 }
                 continue;
             };
@@ -342,10 +334,32 @@ impl AudioSession {
                 });
             }
         }
-        if let Some(first) = packets.first_mut() {
-            first.samples += owed;
-        }
         Ok(Some((params, packets)))
+    }
+}
+
+/// One AAC-LC access unit of silence, for the gaps in an exported timeline —
+/// the export copies packets and has no AAC encoder, so the only silence it can
+/// write is one spelled out by hand.
+///
+/// It is the shortest legal `raw_data_block` there is: one element carrying
+/// `max_sfb = 0`, which is "no scalefactor bands", which is a frame with no
+/// spectral data at all and therefore 1024 samples of exact zero. Every field
+/// is zero except the element id and the terminating `ID_END`, so the whole
+/// thing is 4 bytes mono and 7 stereo. Verified against our own decoder in the
+/// unit tests, which is the only claim worth making about hand-written
+/// bitstream.
+///
+/// ponytail: mono and stereo only, because `chan_conf` beyond 2 needs more
+/// elements per block; the timeline refuses such a source at import today, so
+/// this `Err` is a backstop. Upgrade path is emitting `chan_conf` elements.
+fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
+    match chan_conf {
+        // ID_SCE(000) tag(0000) + 22 zero bits + ID_END(111), byte-aligned.
+        1 => Ok(vec![0x00, 0x00, 0x00, 0x07]),
+        // ID_CPE(001) tag(0000) common_window(0) + 2 x 22 zero bits + ID_END.
+        2 => Ok(vec![0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E]),
+        n => Err(format!("cannot write silence for a {n}-channel AAC track").into()),
     }
 }
 
@@ -881,5 +895,45 @@ mod tests {
             (freq_index << 7) | (chan_conf << 3),
         ];
         assert_eq!(asc, [0x12, 0x10]);
+    }
+
+    /// The one claim worth making about a hand-written bitstream: our own
+    /// decoder turns it into exactly one packet of exactly zero.
+    #[test]
+    fn a_silent_packet_decodes_to_a_packet_of_zero() {
+        use super::{AacDecoder, AudioDecoder, AudioDecoderOptions, silent_packet};
+        use symphonia_core::codecs::audio::{AudioCodecParameters, well_known::CODEC_ID_AAC};
+        use symphonia_core::{packet::Packet, units};
+
+        for (chan_conf, channels) in [(1u8, 1usize), (2, 2)] {
+            // AAC-LC (profile 2), 44100 (freq_index 4), `chan_conf` channels.
+            let asc: Box<[u8]> = Box::new([(2 << 3) | (4 >> 1), (4 << 7) | (chan_conf << 3)]);
+            let mut params = AudioCodecParameters::new();
+            params
+                .for_codec(CODEC_ID_AAC)
+                .with_sample_rate(44100)
+                .with_extra_data(asc);
+            let mut decoder =
+                AacDecoder::try_new(&params, &AudioDecoderOptions::default()).expect("decoder");
+            let bytes = silent_packet(chan_conf).expect("silence");
+            let packet = Packet::new(
+                0,
+                units::Timestamp::new(0),
+                units::Duration::new(u64::from(SAMPLES_PER_PACKET)),
+                &bytes[..],
+            );
+            let buf = decoder.decode(&packet).expect("decodes as AAC-LC");
+            let mut out = Vec::new();
+            buf.copy_to_vec_interleaved::<f32>(&mut out);
+            assert_eq!(out.len(), SAMPLES_PER_PACKET as usize * channels);
+            assert!(
+                out.iter().all(|&s| s == 0.0),
+                "{chan_conf} ch is not silent"
+            );
+        }
+        assert!(
+            silent_packet(6).is_err(),
+            "beyond stereo is refused, not faked"
+        );
     }
 }

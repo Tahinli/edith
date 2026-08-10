@@ -191,8 +191,7 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.video, doc.audio)
-            .ok_or("the project's clips do not fit its sources")?;
+        let project = Project::from_parts(doc.sources, doc.video, doc.audio)?;
         let span = project.span_at(Lane::Video, 0).expect("never empty");
         let mut session = Self {
             meta,

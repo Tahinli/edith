@@ -33,8 +33,10 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Per-run unique: two suite runs at once (a release sweep beside a debug one,
+/// or two agents) would otherwise write and delete each other's export.
 fn out_path(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_export_{name}.mp4"));
+    let path = std::env::temp_dir().join(format!("ve_export_{name}_{}.mp4", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(part_path(&path));
     path
@@ -552,9 +554,9 @@ fn synthetic(index: u32, width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<
 
 /// A timeline with a hole in each lane, exported. The video gap is encoded as
 /// black rather than skipped -- the file is as long as the timeline, frame for
-/// frame -- and the audio gap is spent as sample-table duration, so the audio
-/// track still covers the whole timeline inside the bresenham bound instead of
-/// ending a second early.
+/// frame -- and the audio gap is copied as real silent packets, so the audio
+/// track covers the whole timeline inside the bresenham bound instead of ending
+/// a second early.
 #[test]
 fn exports_a_gapped_timeline_as_black_and_silence() {
     pin_software();
@@ -599,24 +601,42 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
     let lit = mean_abs_diff(&pictures[0], &black);
     assert!(lit > 4.0, "the clips around the gap came out black too");
 
-    // The audio track still spans the whole timeline: the gap paid its way in
-    // stts duration, so nothing after it moved earlier.
+    // The audio track spans the whole timeline in packets: the hole is real
+    // silent access units, so the bresenham bound the copier promises -- half a
+    // packet per join, carried through the gap -- covers the gap too.
     let file = File::open(&out).unwrap();
     let size = file.metadata().unwrap().len();
     let reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
-    let track = &reader.tracks()[&2];
-    let duration = track.duration().as_secs_f64();
-    println!("gapped export: audio track {duration:.3}s for a {timeline:.3}s timeline");
+    let count = reader.sample_count(2).expect("audio track");
+    let samples = f64::from(count * 1024);
+    let wanted = timeline * 44_100.0;
+    println!("gapped export: {count} packets = {samples} samples for {wanted}");
     assert!(
-        (duration - timeline).abs() < 3.0 * 1024.0 / 44_100.0,
-        "audio track is {duration:.3}s, timeline {timeline:.3}s"
+        (samples - wanted).abs() < 3.0 * 1024.0,
+        "audio length {samples} drifted from {wanted} across the gap"
     );
-    // ...and the packets themselves cover only the audible four seconds, within
-    // the same half-packet-per-join bound the copier promises.
-    let packets = f64::from(reader.sample_count(2).expect("audio track") * 1024);
-    let audible = (timeline - 1.0) * 44_100.0;
-    assert!(
-        (packets - audible).abs() < 3.0 * 1024.0,
-        "{packets} samples copied for {audible} audible ones"
-    );
+
+    // ...and the silence is really silent, where the lift was.
+    let (_, chunks) = engine::AudioSession::open(&out)
+        .expect("reopen export audio")
+        .expect("export has an audio track");
+    let mut pcm: Vec<f32> = Vec::new();
+    while let Ok(chunk) = chunks.recv_timeout(Duration::from_secs(10)) {
+        pcm.resize(chunk.start_sample as usize * 2, 0.0);
+        pcm.extend_from_slice(&chunk.samples);
+    }
+    let window = |from: f64, to: f64| {
+        let (a, b) = ((from * 44_100.0) as usize * 2, (to * 44_100.0) as usize * 2);
+        pcm[a.min(pcm.len())..b.min(pcm.len())]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    };
+    // Inside the hole, off its own edges: AAC is lapped, so the packets either
+    // side of a splice carry a little of their neighbour.
+    let quiet = window(1.2, 1.8);
+    assert!(quiet < 1e-3, "the gap is not silent: {quiet}");
+    assert!(window(0.1, 0.9) > 1e-2, "the sound before it went missing");
+    assert!(window(2.2, 4.9) > 1e-2, "the sound after it went missing");
+
+    std::fs::remove_file(&out).unwrap();
 }
