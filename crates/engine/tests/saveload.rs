@@ -129,9 +129,9 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<Source>, f64
 
 /// The version-1 promise: a file written before the lanes existed still opens,
 /// as one grouped video+audio pair per clip laid end to end, and saving it
-/// again writes version 6 -- which reopens as the same timeline.
+/// again writes version 7 -- which reopens as the same timeline.
 #[test]
-fn a_version_1_project_loads_fully_grouped_and_saves_as_version_6() {
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
     let dir = scratch("v1");
     copy_in(&dir, "test_av.mp4");
     let path = dir.join("old.edith");
@@ -159,11 +159,15 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_6() {
         "playhead kept"
     );
 
-    // Saved again it is v6, and v6 round-trips to the same timeline.
+    // Saved again it is v7, and v7 round-trips to the same timeline.
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 6\n"), "{text}");
+    assert!(text.starts_with("edith 7\n"), "{text}");
+    assert!(
+        text.contains("\nresolution 1280 720\n"),
+        "a project with no resolution of its own is saved at source 0's: {text}"
+    );
     assert_eq!(
         text.lines().filter(|l| l.starts_with("video ")).count(),
         2,
@@ -240,16 +244,17 @@ fn a_version_4_project_holds_more_than_two_lanes() {
     );
     assert_eq!(loaded.timeline_duration(), 60.0 / loaded.meta().frame_rate);
 
-    // ...and saving it writes the v6 twin of what it read: the lane list, its
-    // order and the empty lane all survive, each clip now saying it plays flat
-    // and ungraded.
+    // ...and saving it writes the v7 twin of what it read: the lane list, its
+    // order and the empty lane all survive, each clip now saying it plays flat,
+    // ungraded and fitted, under a project resolution taken from the media.
     let again = dir.join("again.edith");
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 6\nplayhead 0\nsource 0 test_av.mp4\n\
-         video 1 0 0 30 0 3 - -\naudio 1\nvideo 2 40 0 20 0 - - -\naudio 2 0 0 30 0 3 - -\n",
-        "a four-lane project is written as it was read, two versions on"
+        "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 3 - - fit\naudio 1\n\
+         video 2 40 0 20 0 - - - fit\naudio 2 0 0 30 0 3 - - fit\n",
+        "a four-lane project is written as it was read, three versions on"
     );
 }
 
@@ -276,18 +281,20 @@ fn a_version_5_project_carries_per_clip_equalizers() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 6\nplayhead 0\nsource 0 test_av.mp4\n\
+        "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
          eq 12000.0:6.25:0.5:hs\n\
-         video 1 0 0 30 0 - 0 -\nvideo 1 30 30 60 0 - 1 -\n\
-         audio 1 0 0 30 0 - 0 -\naudio 1 30 30 60 0 - - -\n",
+         video 1 0 0 30 0 - 0 - fit\nvideo 1 30 30 60 0 - 1 - fit\n\
+         audio 1 0 0 30 0 - 0 - fit\naudio 1 30 30 60 0 - - - fit\n",
         "the equalizer table and every clip's index survive a round trip"
     );
 }
 
 /// What version 6 is for, the same claim one version on: a clip carries a
-/// colour grade beside its equalizer, the file names each once for however many
-/// clips share it, and the whole thing comes back out byte for byte.
+/// colour grade beside its equalizer and the file names each once for however
+/// many clips share it. A format bump necessarily rewrites the file, so what is
+/// asserted here is the v7 twin of what was read; the byte-identity claim lives
+/// in `a_version_7_project_carries_a_resolution_and_fit_policies` below.
 #[test]
 fn a_version_6_project_carries_per_clip_colours() {
     let dir = scratch("v6_color");
@@ -309,9 +316,84 @@ fn a_version_6_project_carries_per_clip_colours() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        text,
+        "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
+         eq 80.0:-3.0:0.707:ls\n\
+         color 0.1:1.2:0.9:-0.3\n\
+         color -0.25:1.0:0.0:0.5\n\
+         video 1 0 0 30 0 - 0 0 fit\nvideo 1 30 30 60 0 - - 1 fit\n\
+         audio 1 0 0 30 0 - - 0 fit\naudio 1 30 30 60 0 - - - fit\n",
         "the colour table and every clip's index survive a round trip"
     );
+    // A dialect that could not say either one means the defaults, and those are
+    // what such a project always was: the media's own size, nothing letterboxed.
+    assert_eq!(loaded.resolution(), (1280, 720));
+    assert_eq!(
+        loaded.fit_of(engine::project::Lane::V1, 0),
+        engine::scale::FitPolicy::Fit
+    );
+}
+
+/// What version 7 is for: the project's picture size is its own, not source 0's,
+/// and each clip says how it meets it. Both survive the engine's door byte for
+/// byte -- and a project whose resolution is nobody's media size is exactly the
+/// case that could not be written down before.
+#[test]
+fn a_version_7_project_carries_a_resolution_and_fit_policies() {
+    let dir = scratch("v7_resolution");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("mixed.edith");
+    let text = "edith 7\nplayhead 0\nresolution 960 720\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 - - - fill\nvideo 1 30 30 60 0 - - - center\n\
+                audio 1 0 0 60 0 - - - fit\n";
+    std::fs::write(&path, text).expect("write a v7 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v7 project opens");
+    assert_eq!(
+        loaded.resolution(),
+        (960, 720),
+        "the project's own size, which is not the media's 1280x720"
+    );
+    assert_eq!(
+        loaded.native_resolution(),
+        (1280, 720),
+        "...and the media's own size is still known"
+    );
+    let v1 = engine::project::Lane::V1;
+    assert_eq!(loaded.fit_of(v1, 0), engine::scale::FitPolicy::Fill);
+    assert_eq!(loaded.fit_of(v1, 1), engine::scale::FitPolicy::Center);
+
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        text,
+        "a v7 project is written exactly as it was read"
+    );
+
+    // The refusals the new grammar adds, each naming its line.
+    for (bad, want) in [
+        (
+            "edith 7\nresolution 0 720\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
+            "0x720 is not a picture",
+        ),
+        (
+            "edith 7\nresolution 960 720\nresolution 960 720\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "resolution belongs once",
+        ),
+        (
+            "edith 7\nresolution 960 720\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - squish\n",
+            "not a fit policy",
+        ),
+    ] {
+        let path = dir.join("bad.edith");
+        std::fs::write(&path, bad).expect("write");
+        let err = PlaybackSession::open_project(&path)
+            .err()
+            .expect("a malformed v7 file must be refused")
+            .to_string();
+        assert!(err.contains(want), "wanted {want:?}, got {err:?}");
+    }
 }
 
 #[test]
@@ -525,7 +607,7 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 
     for (text, want) in [
         (
-            "edith 7\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - -\n",
+            "edith 8\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
             "line 1",
         ),
         // An eq index the table does not hold, and a band shape there is none.
@@ -599,11 +681,13 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
         .err()
         .expect("a source that stopped matching must not open")
         .to_string();
-    // The suffix is `import`'s own refusal, word for word.
+    // The suffix is `import`'s own refusal, word for word. The substitute is
+    // 640x360 *and* silent; only the second of those is a refusal now -- a
+    // resolution of its own is placed on the project canvas.
     assert_eq!(
         err,
         format!(
-            "source {}: 640x360 does not match the timeline's 1280x720",
+            "source {}: the file is silent, the timeline has audio",
             dir.join("test_av2.mp4").display()
         )
     );

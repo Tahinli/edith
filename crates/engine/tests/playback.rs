@@ -726,11 +726,24 @@ fn import_appends_a_second_source_and_plays_across_the_join() {
 fn import_refuses_what_does_not_match() {
     let mut session = open(asset("test_av.mp4"));
 
+    // A different *codec* cannot join: one timeline is one kind of source.
+    let err = session
+        .import(&asset("test_vp9.mp4"))
+        .expect_err("VP9 must be refused")
+        .to_string();
+    assert!(err.contains("VP9"), "refusal must name the codec: {err}");
+
+    // A different resolution is no longer among the refusals -- it is placed on
+    // the project canvas instead -- but this file is also silent, and that is.
     let err = session
         .import(&asset("test_mismatch.mp4"))
-        .expect_err("640x360 must be refused")
+        .expect_err("a silent file must be refused")
         .to_string();
-    assert!(err.contains("640x360"), "refusal must name the size: {err}");
+    assert!(err.contains("audio"), "refusal must name the audio: {err}");
+    assert!(
+        !err.contains("640x360"),
+        "a resolution of its own is not a refusal any more: {err}"
+    );
 
     // Same size and rate, no audio track: the timeline has one.
     let err = session
@@ -753,6 +766,97 @@ fn import_refuses_what_does_not_match() {
         .expect_err("audio into a silent timeline")
         .to_string();
     assert!(err.contains("audio"), "refusal must name the audio: {err}");
+}
+
+/// The user-facing point of a project resolution: media of two sizes on one
+/// timeline, each composed onto the project's own canvas.
+///
+/// 640x360 joins a 1280x720 timeline (it would have been refused before this
+/// slice), and both clips come out of `try_frame` at the project's size --
+/// which is what makes the export, the window and the renderer one shape.
+#[test]
+fn media_of_two_resolutions_share_one_timeline() {
+    let mut session = open(asset("test_baseline.mp4"));
+    assert_eq!(session.resolution(), (1280, 720), "source 0's picture");
+    assert_eq!(session.native_resolution(), (1280, 720));
+    session
+        .import(&asset("test_mismatch.mp4"))
+        .expect("640x360 must join a 1280x720 timeline");
+    // 150 frames of the first file, then 60 of the second, at 30 fps.
+    assert_eq!(session.clip_spans().len(), 2);
+    assert!((session.timeline_duration() - 7.0).abs() < 1e-9);
+
+    for (at, what) in [(1.0, "the 1280x720 clip"), (6.0, "the 640x360 clip")] {
+        session.seek(at);
+        let frame = next_frame(&mut session, what);
+        assert_eq!(
+            (frame.width, frame.height),
+            (1280, 720),
+            "{what} did not come out at the project resolution"
+        );
+        assert_eq!(frame.bgra.len(), 1280 * 720 * 4);
+    }
+}
+
+/// The geometry, asserted on the pixels: on a canvas whose aspect the media does
+/// not share, a `Fit` clip is letterboxed -- bars exactly black, picture where
+/// `scale::fit_rect` puts it -- and `Fill` crops the bars away.
+#[test]
+fn a_fitted_clip_is_letterboxed_and_a_filled_one_is_not() {
+    let mut session = open(asset("test_baseline.mp4"));
+    session
+        .import(&asset("test_mismatch.mp4"))
+        .expect("640x360 joins");
+    // A 4:3 project: both clips are 16:9, so both are letterboxed on it. 960x720
+    // holds the whole 640x360 picture as 960x540 with 90 rows of bar either way
+    // (fit_rect's own arithmetic, asserted in scale.rs).
+    assert!(session.set_resolution(960, 720), "4:3 project");
+    session.seek(6.0);
+    let frame = next_frame(&mut session, "the 640x360 clip on a 4:3 canvas");
+    assert_eq!((frame.width, frame.height), (960, 720));
+    let row = |frame: &Frame, y: usize| {
+        frame.bgra[y * 960 * 4..][..960 * 4]
+            .chunks_exact(4)
+            .map(|px| (px[0], px[1], px[2]))
+            .collect::<Vec<_>>()
+    };
+    let black = |row: &[(u8, u8, u8)]| row.iter().all(|&px| px == (0, 0, 0));
+    assert!(black(&row(&frame, 0)), "top bar is not black");
+    assert!(black(&row(&frame, 89)), "the bar stops one row early");
+    assert!(black(&row(&frame, 719)), "bottom bar is not black");
+    assert!(
+        !black(&row(&frame, 360)),
+        "the picture area is black: nothing was composed"
+    );
+    // Same clip, filled: the canvas is covered, so no row is a bar.
+    let (lane, idx) = session.video_clip_at(6.0).expect("a clip at 6 s");
+    assert!(session.set_fit(lane, idx, engine::scale::FitPolicy::Fill));
+    session.seek(6.0);
+    let filled = next_frame(&mut session, "the same clip filled");
+    assert_eq!((filled.width, filled.height), (960, 720));
+    assert!(!black(&row(&filled, 0)), "Fill left a top bar");
+    assert!(!black(&row(&filled, 719)), "Fill left a bottom bar");
+    assert_ne!(
+        row(&frame, 360),
+        row(&filled, 360),
+        "Fill showed the same pixels as Fit: the crop did nothing"
+    );
+}
+
+/// The clip that pays nothing: a project at its media's own size must hand the
+/// decoder's bytes through untouched, not merely equal ones. Same frame, same
+/// bytes, whether or not the composition path exists.
+#[test]
+fn a_project_at_the_media_size_is_the_decoder_untouched() {
+    let mut session = open(asset("test_baseline.mp4"));
+    session.seek(1.0);
+    let frame = next_frame(&mut session, "seek to 1 s");
+    assert_eq!((frame.width, frame.height), (1280, 720));
+    assert_eq!(
+        frame.bgra,
+        source_frame(&asset("test_baseline.mp4"), frame.index),
+        "the pass-through path changed a byte"
+    );
 }
 
 /// The same file twice is two clips of one source -- a source index is handed
