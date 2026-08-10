@@ -971,6 +971,115 @@ impl Project {
         true
     }
 
+    /// Take the clip at `idx` of `lane` out of its group: every clip carrying
+    /// its id -- on however many lanes -- is handed an id of its own, so from
+    /// here on each half moves, trims and is deleted alone. The music video
+    /// whose sound is to be cut against its picture starts here.
+    ///
+    /// An id of its own rather than none at all: a half no other lane is grouped
+    /// with is exactly what a [`lift`](Project::lift) leaves behind and is legal
+    /// (see [`links_are_consistent`]), and it is what a front-end already draws
+    /// as detached. `None` would instead say "was never part of a take", which
+    /// is what a one-lane [`place`](Project::place) means.
+    ///
+    /// Metadata only, like a [`split`](Project::split): no mapping changes, so
+    /// nothing has to be reseeked. One snapshot, so one [`Project::undo`] puts
+    /// the group back. Refused (`false`, nothing changed) for an index that is
+    /// not there, a clip in no group at all, and one whose group has no other
+    /// half -- that one is already detached, and a refusal must not cost an undo
+    /// step.
+    pub fn ungroup(&mut self, lane: Lane, idx: usize) -> bool {
+        let Some(id) = self.lane(lane).get(idx).and_then(|c| c.link) else {
+            return false;
+        };
+        let members = self
+            .lanes
+            .iter()
+            .flat_map(|l| &l.clips)
+            .filter(|c| c.link == Some(id))
+            .count();
+        if members < 2 {
+            return false;
+        }
+        self.snapshot();
+        // Drawn before the walk: `new_link` takes the whole project, and the
+        // walk holds the lanes.
+        let mut fresh = (0..members).map(|_| self.new_link()).collect::<Vec<_>>();
+        for data in &mut self.lanes {
+            for c in data.clips.iter_mut().filter(|c| c.link == Some(id)) {
+                c.link = fresh.pop();
+            }
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        true
+    }
+
+    /// Put two clips on two lanes into one group, so what moves one moves the
+    /// other again -- the undo of a [`ungroup`](Project::ungroup) by hand, and
+    /// how a picture is regrouped with sound it was never opened with. Whatever
+    /// either of them was grouped with comes along: those clips cover this same
+    /// span already, so the result is one group and not two overlapping ones.
+    ///
+    /// Same frames or nothing: a group id names **one span** on however many
+    /// lanes ([`links_are_consistent`] refuses to load anything else), so two
+    /// clips that do not cover the same frames cannot be one take, and the
+    /// refusal says which bounds to trim to. Kinds are *not* checked: a take may
+    /// run on `V1` and `V2` at once, and picture-with-sound is the case people
+    /// mean, not the rule.
+    ///
+    /// Metadata only, one snapshot. The error says what is wrong, because
+    /// `false` would not: a bad index, one lane twice (a group is at most one
+    /// clip per lane), spans that disagree, and a pair that is already one take
+    /// -- nothing changes, and none of them costs an undo step.
+    pub fn group(&mut self, a: Lane, a_idx: usize, b: Lane, b_idx: usize) -> crate::Result<()> {
+        if a == b {
+            return Err(format!(
+                "a group is one clip per lane: pick the clip to group with on another track, not a second one on {}",
+                a.label()
+            )
+            .into());
+        }
+        let clip = |p: &Self, lane: Lane, idx: usize| -> crate::Result<Clip> {
+            p.lane(lane)
+                .get(idx)
+                .copied()
+                .ok_or_else(|| format!("there is no clip {idx} on {}", lane.label()).into())
+        };
+        let (x, y) = (clip(self, a, a_idx)?, clip(self, b, b_idx)?);
+        if (x.start, x.end()) != (y.start, y.end()) {
+            return Err(format!(
+                "{} covers [{}, {}) and {} covers [{}, {}): trim them to matching bounds first",
+                a.label(),
+                x.start,
+                x.end(),
+                b.label(),
+                y.start,
+                y.end()
+            )
+            .into());
+        }
+        if x.link.is_some() && x.link == y.link {
+            return Err("those two are one take already".into());
+        }
+        self.snapshot();
+        let id = self.new_link();
+        // Every clip either of them was grouped with, by the same rule: all of
+        // them cover this span, so one id over the lot stays consistent.
+        let old = [x.link, y.link];
+        for data in &mut self.lanes {
+            for c in data.clips.iter_mut().filter(|c| c.link.is_some()) {
+                if old.contains(&c.link) {
+                    c.link = Some(id);
+                }
+            }
+        }
+        // And the two themselves, which a `place` may have left in no group.
+        self.lane_mut(a).expect("read above")[a_idx].link = Some(id);
+        self.lane_mut(b).expect("read above")[b_idx].link = Some(id);
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        Ok(())
+    }
+
     /// Place `clip` in one lane at `timeline_frame`, overwriting whatever it
     /// lands on and leaving every other clip exactly where it is -- the
     /// per-lane paste. Anything already there is trimmed away (and split in two
@@ -1669,6 +1778,103 @@ mod tests {
             p.lane(Lane::A1)[0].link,
             "and the rejoined clip is one group again"
         );
+    }
+
+    /// The music video's own path: the take comes apart into halves that carry
+    /// ids of their own, one undo puts it back, and two clips over the same
+    /// frames become one take again by hand.
+    #[test]
+    fn a_take_comes_apart_and_goes_back_together() {
+        let mut p = Project::single(FILE, 9);
+        let one = p.clips()[0].link.expect("a fresh project is one take");
+        assert_eq!(p.lane(Lane::A1)[0].link, Some(one));
+
+        // A third lane in the same group -- and the merge case with it: a
+        // placement is in no group, and grouping it in leaves *one* group.
+        let v2 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v2, 0, clip(0, 0, 9, 0)));
+        assert!(p.lane(v2)[0].link.is_none(), "a placement joins no group");
+        p.group(Lane::V1, 0, v2, 0)
+            .expect("the same frames, one lane over");
+        let id = p.clips()[0].link.expect("still a group");
+        assert!(
+            p.lanes().into_iter().all(|l| p.lane(l)[0].link == Some(id)),
+            "one id over the three, not two groups sharing a span"
+        );
+        links_are_consistent(&p.lanes).expect("one id, one span");
+
+        // Detached by the sound: every half of the group, not only the two.
+        assert!(p.ungroup(Lane::A1, 0));
+        let ids: Vec<Option<u32>> = p.lanes().into_iter().map(|l| p.lane(l)[0].link).collect();
+        assert!(
+            ids.iter().all(Option::is_some),
+            "a half keeps an id of its own"
+        );
+        assert!(
+            ids.iter()
+                .enumerate()
+                .all(|(i, a)| ids[..i].iter().all(|b| a != b)),
+            "and no two halves are the same group any more: {ids:?}"
+        );
+        links_are_consistent(&p.lanes).expect("a lone id is legal");
+
+        // One snapshot for the whole detach.
+        assert!(p.undo());
+        assert!(
+            p.lanes().into_iter().all(|l| p.lane(l)[0].link == Some(id)),
+            "one undo puts the whole group back"
+        );
+
+        // And back together by hand: the two the pointer named, and only them.
+        assert!(p.ungroup(Lane::V1, 0));
+        p.group(Lane::V1, 0, Lane::A1, 0)
+            .expect("both cover [0, 9)");
+        assert_eq!(p.lane(Lane::V1)[0].link, p.lane(Lane::A1)[0].link);
+        assert_ne!(
+            p.lane(v2)[0].link,
+            p.lane(Lane::V1)[0].link,
+            "the third half stayed detached"
+        );
+        links_are_consistent(&p.lanes).expect("one id, one span");
+    }
+
+    /// What a group may not be, and what a detach has nothing to take apart --
+    /// none of which may cost an undo step.
+    #[test]
+    fn a_group_is_one_span_and_one_clip_per_lane() {
+        let mut p = three();
+        let before = shape(&p);
+        let why = |r: crate::Result<()>| r.expect_err("refused").to_string();
+
+        assert!(
+            why(p.group(Lane::V1, 0, Lane::V1, 1)).contains("one clip per lane"),
+            "two clips of one lane are never one take"
+        );
+        assert!(why(p.group(Lane::V1, 0, Lane::A1, 9)).contains("there is no clip 9 on A1"));
+        let spans = why(p.group(Lane::V1, 0, Lane::A1, 1));
+        assert!(
+            spans.contains("V1 covers [0, 3) and A1 covers [3, 5)"),
+            "{spans}"
+        );
+        assert!(
+            spans.contains("trim them to matching bounds first"),
+            "{spans}"
+        );
+        assert!(why(p.group(Lane::V1, 0, Lane::A1, 0)).contains("one take already"));
+
+        // A half nothing else is grouped with is already detached, a placement
+        // is in no group at all, and an index that is not there has nothing to
+        // detach either.
+        assert!(p.place(Lane::V1, 20, clip(20, 0, 3, 0)));
+        assert!(!p.ungroup(Lane::V1, 3), "a placement is in no group");
+        assert!(p.lift(Lane::A1, 0));
+        assert!(!p.ungroup(Lane::V1, 0), "its group has no other half");
+        assert!(!p.ungroup(Lane::V1, 9), "no clip there");
+
+        // Two undos, one per edit: not one of the refusals pushed a snapshot.
+        assert!(p.undo());
+        assert!(p.undo());
+        assert_eq!(shape(&p), before);
     }
 
     #[test]

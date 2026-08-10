@@ -584,6 +584,21 @@ impl PlaybackSession {
             .regroup(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// Takes that clip out of its group, so its picture and its sound are edited
+    /// apart from here on. Metadata only like a cut -- no reseek -- and one undo
+    /// step. `false` for a bad index and for a clip that is not grouped with
+    /// anything, which is already detached.
+    pub fn ungroup(&mut self, lane: Lane, idx: usize) -> bool {
+        self.project.ungroup(lane, idx)
+    }
+
+    /// Puts two clips covering the same frames back into one group: the regroup
+    /// of what [`ungroup`](Self::ungroup) took apart. Metadata only, one undo
+    /// step, and the error says why when it refuses.
+    pub fn group(&mut self, a: Lane, a_idx: usize, b: Lane, b_idx: usize) -> crate::Result<()> {
+        self.project.group(a, a_idx, b, b_idx)
+    }
+
     /// What the clip at `idx` of `lane` is equalized with, or `None` for one
     /// that plays flat -- what a card shows before it lets anyone drag a band.
     pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {
