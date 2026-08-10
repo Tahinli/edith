@@ -381,6 +381,18 @@ fn a_version_7_project_carries_a_resolution_and_fit_policies() {
           video 1 0 0 30 0 - - - fit\n",
             "resolution belongs once",
         ),
+        // Past 8K is refused by the same bound the keystroke has: unbounded,
+        // this line reached `open_black` and panicked on a capacity overflow.
+        (
+            "edith 7\nresolution 4294967295 4294967295\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "4294967295x4294967295 is not a picture",
+        ),
+        (
+            "edith 7\nresolution 7681 1080\nsource 0 test_av.mp4\n\
+          video 1 0 0 30 0 - - - fit\n",
+            "7681x1080 is not a picture",
+        ),
         (
             "edith 7\nresolution 960 720\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - squish\n",
             "not a fit policy",
