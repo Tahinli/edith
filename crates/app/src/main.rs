@@ -206,6 +206,16 @@ enum Wave {
 /// change what is inserted.
 struct AssetDrag(PathBuf, usize);
 
+/// A clip already on the timeline being dragged: the lane it is on and its index
+/// there, which is how every other edit names a clip. Unlike an [`AssetDrag`]
+/// nothing is inserted -- the same clip changes lane and keeps its frames -- so
+/// where along the bed it is let go says nothing here either.
+#[derive(Clone, Copy)]
+struct ClipDrag {
+    lane: Lane,
+    idx: usize,
+}
+
 /// An open clip menu: which clip it was opened on, where it hangs, and whether
 /// it has been turned over to show what that clip *is* instead of what can be
 /// done to it. The lane and index are the ones the same click selected, so
@@ -1107,6 +1117,53 @@ impl Player {
         if pasted {
             self.selected = None;
             self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// A clip dragged off one lane and let go over another: it changes track and
+    /// keeps the frames it covers, as one undo step. Dropped back on its own
+    /// lane it is not an edit at all, so nothing is said about it. The engine
+    /// reseeks, so all this owes is the flag reset -- and the selection, whose
+    /// index was that lane's own and now names a different clip there.
+    fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, cx: &mut Context<Self>) {
+        if self.exporting().is_some() || from == to {
+            return;
+        }
+        let moved = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.move_clip_to_lane(from, idx, to));
+        let (kind, lanes) = match from.kind {
+            LaneKind::Video => ("picture", "video"),
+            LaneKind::Audio => ("sound", "audio"),
+        };
+        match moved {
+            true => {
+                self.selected = None;
+                self.reset_after_reseek();
+            }
+            // The two ways a drag is refused, told apart by the one thing the
+            // front-end already knows: a lane's kind. Everything else that
+            // could refuse (a clip that is not there) cannot be dragged.
+            false if from.kind != to.kind => {
+                self.notice = Some(
+                    format!(
+                        "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
+                        to.label()
+                    )
+                    .into(),
+                )
+            }
+            false => {
+                self.notice = Some(
+                    format!(
+                        "NOT MOVED — another clip already covers those frames on {}",
+                        to.label()
+                    )
+                    .into(),
+                )
+            }
         }
         cx.notify();
     }
@@ -3437,6 +3494,13 @@ impl Player {
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
+                    // A clip let go over another lane changes track and keeps
+                    // the frames it covers -- the pointer's position along the
+                    // bed says nothing here either, for the reason above.
+                    .on_drop(cx.listener(move |this, drag: &ClipDrag, _, cx| {
+                        this.move_clip(drag.lane, drag.idx, lane, cx)
+                    }))
+                    .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         let (start, len) = (
                             f64::from(clip.start) / self.fps,
@@ -3467,6 +3531,12 @@ impl Player {
                             f64::from(clip.out_frame) / self.fps,
                         );
                         let tip = tip.clone();
+                        // What the pointer carries on the way to another lane:
+                        // the file the box is showing, the same ghost a library
+                        // row makes. A box too narrow for its own label still
+                        // says what is moving.
+                        let ghost: SharedString =
+                            label.clone().unwrap_or_else(|| lane.label()).into();
                         div()
                             // Named per lane: two rows numbering their clips
                             // from zero would hand gpui the same id twice.
@@ -3490,6 +3560,13 @@ impl Player {
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT)))
                             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                            // Dragged onto another lane it *moves* there; the
+                            // click that starts the drag still selects, so
+                            // picking a clip up and putting it back down where
+                            // it was is exactly a click.
+                            .on_drag(ClipDrag { lane, idx: i }, move |_, _, _, cx| {
+                                cx.new(|_| Tip(ghost.clone()))
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -5100,6 +5177,48 @@ mod tests {
             source_frames(lane_clips(&session), session.sources(), &path),
             frames
         );
+    }
+
+    /// The move-a-clip-between-tracks path through the door the drop uses
+    /// ([`Player::move_clip`] calls exactly this): the clip changes row, the
+    /// *picture* comes from the new row afterwards -- which is what "it plays
+    /// from there" means -- and one undo puts it back.
+    #[test]
+    fn a_clip_dragged_onto_another_track_plays_from_it() {
+        use engine::project::LaneKind;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let v2 = session.add_lane(LaneKind::Video);
+        assert_eq!(session.video_clip_at(0.0), Some((Lane::V1, 0)));
+
+        assert!(session.move_clip_to_lane(Lane::V1, 0, v2), "V1 -> V2");
+        assert!(session.lane_clips(Lane::V1).is_empty(), "it left V1");
+        assert_eq!(session.lane_clips(v2).len(), 1, "and landed on V2");
+        assert_eq!(
+            session.video_clip_at(0.0),
+            Some((v2, 0)),
+            "the picture now comes from V2"
+        );
+        assert_eq!(session.lane_clips(Lane::A1).len(), 1, "its sound stayed");
+
+        // Dropped on a lane of the other kind it is refused and nothing moves --
+        // the notice the front-end shows for it says which kind of lane to use.
+        // (The other refusal, landing on another clip, is the engine's own test
+        // `move_to_lane_keeps_the_frames_and_refuses_the_rest`.)
+        assert!(!session.move_clip_to_lane(v2, 0, Lane::A1), "picture on A1");
+        assert_eq!(session.lane_clips(v2).len(), 1, "and it stayed on V2");
+        assert!(
+            session.move_clip_to_lane(v2, 0, Lane::V1),
+            "dragged back down"
+        );
+
+        // One undo per move, and each is a single step.
+        assert!(session.undo(), "the drag back");
+        assert_eq!(session.video_clip_at(0.0), Some((v2, 0)));
+        assert!(session.undo(), "the drag up");
+        assert_eq!(session.video_clip_at(0.0), Some((Lane::V1, 0)));
+        assert!(session.lane_clips(v2).is_empty());
     }
 
     /// The add-a-track path end to end through the doors the buttons and the
