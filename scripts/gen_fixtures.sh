@@ -29,4 +29,31 @@ ffmpeg -y -f lavfi -i testsrc=size=1280x720:rate=30:duration=4 \
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
     -an -c:v libx264 -profile:v baseline -pix_fmt yuv420p assets/test_mismatch.mp4
+# Standalone audio fixtures: the same 440/880 Hz tone with the 1 Hz pulse the
+# A/V fixture carries, at test_av.mp4's own 44.1k stereo -- so an imported song
+# can share a timeline with the video clips and the peaks tests can reuse the
+# dip pattern. One per container we claim to read.
+tone="[0:a][1:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]"
+for fmt in mp3 wav flac ogg m4a aac; do
+    case $fmt in
+        mp3) codec=(-c:a libmp3lame -b:a 128k) ;;
+        wav) codec=(-c:a pcm_s16le) ;;
+        flac) codec=(-c:a flac) ;;
+        ogg) codec=(-c:a libvorbis) ;;
+        # ALAC in mp4, and raw AAC in ADTS -- the two the mp4/AAC packet-copy
+        # path cannot claim: one is not AAC, the other is not in an mp4.
+        m4a) codec=(-c:a alac) ;;
+        aac) codec=(-c:a aac -b:a 128k -f adts) ;;
+    esac
+    ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
+        -f lavfi -i "sine=frequency=880:duration=3" \
+        -filter_complex "$tone" -map "[a]" -ar 44100 "${codec[@]}" \
+        "assets/test_tone.$fmt"
+done
+# The refusal fixture: same tone at 48k, which one output device cannot mix
+# with a 44.1k timeline.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
+    -f lavfi -i "sine=frequency=880:duration=3" \
+    -filter_complex "$tone" -map "[a]" -ar 48000 -c:a pcm_s16le \
+    assets/test_tone_48k.wav
 echo "fixtures written to assets/"
