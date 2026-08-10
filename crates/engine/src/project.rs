@@ -55,9 +55,16 @@
 //! index the clip had. Only a *save* prunes the table
 //! ([`Project::without_orphan_sources`]), for the reason an undone import
 //! leaves its source entry behind: an index handed out is an index forever.
+//!
+//! Its colour grade is a third such table ([`Clip::color`],
+//! [`Project::set_color`]) and behaves in every way like the equalizer one --
+//! shared by equal settings, inherited by both halves of a split, pruned only at
+//! a save. An index rather than the four floats themselves for the same reason:
+//! twenty clips graded alike name one entry, and the file writes it once.
 
 use std::path::{Path, PathBuf};
 
+use crate::color::ColorParams;
 use crate::eq::EqParams;
 
 /// A half-open `[in_frame, out_frame)` range of frames of source
@@ -83,6 +90,11 @@ pub struct Clip {
     /// plain assignment. The table is append-only within a session, so an index
     /// on a clipboard clip or inside an undo snapshot can never dangle.
     pub eq: Option<u16>,
+    /// Index into the project's colour table
+    /// ([`Project::color_of`]/[`Project::set_color`]), or `None` for a clip that
+    /// plays ungraded. An index for [`Clip::eq`]'s reason, and with the same
+    /// promises: `Copy`, append-only within a session, never dangling.
+    pub color: Option<u16>,
 }
 
 impl Clip {
@@ -214,9 +226,15 @@ impl Span {
 }
 
 /// What a save writes and a load takes back: the sources, every lane in
-/// display order with its kind, and the equalizer table their clips index into
-/// -- [`Project::without_orphan_sources`] out, [`Project::from_parts`] in.
-pub type Parts = (Vec<Source>, Vec<(LaneKind, Vec<Clip>)>, Vec<EqParams>);
+/// display order with its kind, and the equalizer and colour tables their clips
+/// index into -- [`Project::without_orphan_sources`] out,
+/// [`Project::from_parts`] in.
+pub type Parts = (
+    Vec<Source>,
+    Vec<(LaneKind, Vec<Clip>)>,
+    Vec<EqParams>,
+    Vec<ColorParams>,
+);
 
 /// The edit list plus its undo history.
 #[derive(Clone, Debug)]
@@ -228,6 +246,8 @@ pub struct Project {
     lanes: Vec<LaneData>,
     /// Append-only, exactly as `sources` is: what [`Clip::eq`] indexes into.
     eq: Vec<EqParams>,
+    /// The same, for [`Clip::color`].
+    color: Vec<ColorParams>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one. The
     /// whole lane list, so adding a lane undoes as well.
     history: Vec<Vec<LaneData>>,
@@ -249,6 +269,7 @@ impl Project {
             source: 0,
             link: Some(0),
             eq: None,
+            color: None,
         };
         Self {
             // A file is opened on its first audio stream: nothing has picked
@@ -256,6 +277,7 @@ impl Project {
             sources: vec![Source::new(path, 0)],
             lanes: LaneData::two_lanes(vec![clip], vec![clip]),
             eq: Vec::new(),
+            color: Vec::new(),
             history: Vec::new(),
             next_link: 1,
         }
@@ -268,16 +290,21 @@ impl Project {
     /// [`Project::undo`] is `false` until the first edit of the new session.
     /// This is the one door untrusted parts come in through, so every invariant
     /// every other constructor keeps is checked here, by name and in release:
-    /// every lane empty, an empty clip, a clip naming a source (or an equalizer)
-    /// that is not there, a clip whose end overflows, a lane that is unsorted or
-    /// self-overlapping, and the grouping rules of [`Clip::link`] below.
+    /// every lane empty, an empty clip, a clip naming a source (or an equalizer,
+    /// or a colour) that is not there, a clip whose end overflows, a lane that is
+    /// unsorted or self-overlapping, and the grouping rules of [`Clip::link`]
+    /// below.
     pub fn from_parts(
         sources: Vec<Source>,
         lanes: Vec<(LaneKind, Vec<Clip>)>,
         eq: Vec<EqParams>,
+        color: Vec<ColorParams>,
     ) -> crate::Result<Self> {
         if let Some(bad) = eq.iter().position(|p| !finite(p)) {
             return Err(format!("eq {bad} holds a band that is not a finite number").into());
+        }
+        if let Some(bad) = color.iter().position(|p| !color_finite(p)) {
+            return Err(format!("color {bad} holds a value that is not a finite number").into());
         }
         if lanes.iter().all(|(_, clips)| clips.is_empty()) {
             return Err("every lane is empty: that is not a project".into());
@@ -321,6 +348,15 @@ impl Project {
                     )
                     .into());
                 }
+                if c.color.is_some_and(|i| usize::from(i) >= color.len()) {
+                    return Err(format!(
+                        "{name} clip at {} names color {} of {}",
+                        c.start,
+                        c.color.unwrap_or_default(),
+                        color.len()
+                    )
+                    .into());
+                }
             }
             if !sorted_disjoint(&data.clips) {
                 return Err(format!("the {name} lane is out of order or overlaps itself").into());
@@ -342,6 +378,7 @@ impl Project {
                 .collect(),
             lanes,
             eq,
+            color,
             history: Vec::new(),
             next_link,
         })
@@ -453,6 +490,7 @@ impl Project {
             source,
             link: Some(self.new_link()),
             eq: None,
+            color: None,
         };
         for data in &mut self.lanes {
             data.clips.push(clip);
@@ -469,11 +507,12 @@ impl Project {
     /// emits the same bytes.
     ///
     /// Every lane comes out, in display order and with its kind: that is what a
-    /// v5 `.edith` holds (empty lanes included) and what [`Project::from_parts`]
+    /// v6 `.edith` holds (empty lanes included) and what [`Project::from_parts`]
     /// takes back.
     ///
-    /// The equalizer table is pruned the same way and for the same reason: an
-    /// undone [`set_eq`](Project::set_eq) leaves settings nothing plays behind,
+    /// The equalizer and colour tables are pruned the same way and for the same
+    /// reason: an undone [`set_eq`](Project::set_eq) or
+    /// [`set_color`](Project::set_color) leaves settings nothing plays behind,
     /// and this is the one moment they can go -- the indexes that survive it are
     /// only the ones a clip names.
     pub fn without_orphan_sources(&self) -> Parts {
@@ -481,6 +520,8 @@ impl Project {
         let mut sources = Vec::new();
         let mut moved_eq = vec![None; self.eq.len()];
         let mut eq = Vec::new();
+        let mut moved_color = vec![None; self.color.len()];
+        let mut color = Vec::new();
         let mut lanes = self.lanes.clone();
         for c in lanes.iter_mut().flat_map(|l| &mut l.clips) {
             let old = c.source;
@@ -503,11 +544,23 @@ impl Project {
                     }
                 });
             }
+            if let Some(old) = c.color.map(usize::from) {
+                c.color = Some(match moved_color[old] {
+                    Some(new) => new,
+                    None => {
+                        color.push(self.color[old]);
+                        let new = (color.len() - 1) as u16;
+                        moved_color[old] = Some(new);
+                        new
+                    }
+                });
+            }
         }
         (
             sources,
             lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
             eq,
+            color,
         )
     }
 
@@ -554,6 +607,46 @@ impl Project {
         };
         self.snapshot();
         self.lane_mut(lane).expect("checked above")[idx].eq = slot;
+        true
+    }
+
+    /// How the clip at `idx` of `lane` is graded, or `None` for one that plays
+    /// ungraded (and for an index that is not there) -- what the renderer and
+    /// the export ask before they call [`crate::color::apply_yuv`].
+    pub fn color_of(&self, lane: Lane, idx: usize) -> Option<&ColorParams> {
+        self.color
+            .get(usize::from(self.lane(lane).get(idx)?.color?))
+    }
+
+    /// Give the clip at `idx` of `lane` this colour grade, or `None` to take it
+    /// off. [`Project::set_eq`]'s twin in every respect: one undo step, `false`
+    /// (and no history) for an index that is not there or a value that is not
+    /// finite, and equal settings share a table entry.
+    pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        let slot = match params {
+            None => None,
+            Some(params) => {
+                if !color_finite(&params) {
+                    return false;
+                }
+                Some(match self.color.iter().position(|p| *p == params) {
+                    Some(at) => at as u16,
+                    // ponytail: the 65535th *distinct* grade of one session is
+                    // refused rather than silently aliased, exactly as `set_eq`
+                    // refuses the 65535th curve; same upgrade path.
+                    None if self.color.len() >= usize::from(u16::MAX) => return false,
+                    None => {
+                        self.color.push(params);
+                        (self.color.len() - 1) as u16
+                    }
+                })
+            }
+        };
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].color = slot;
         true
     }
 
@@ -1085,6 +1178,16 @@ fn finite(params: &EqParams) -> bool {
         .all(|b| b.freq_hz.is_finite() && b.gain_db.is_finite() && b.q.is_finite())
 }
 
+/// The same for a colour grade: [`crate::color`] itself falls back to identity
+/// on a non-finite value, but a value that cannot be written and read back as
+/// itself has no business reaching the model.
+fn color_finite(p: &ColorParams) -> bool {
+    p.brightness.is_finite()
+        && p.contrast.is_finite()
+        && p.saturation.is_finite()
+        && p.tint.is_finite()
+}
+
 fn sorted_disjoint(clips: &[Clip]) -> bool {
     clips.iter().all(|c| c.out_frame > c.in_frame)
         && clips.windows(2).all(|w| w[0].end() <= w[1].start)
@@ -1222,6 +1325,7 @@ mod tests {
             source,
             link: None,
             eq: None,
+            color: None,
         }
     }
 
@@ -1235,6 +1339,15 @@ mod tests {
                 q: 0.707,
                 kind: crate::eq::BandKind::Peak,
             }],
+        }
+    }
+
+    /// A recognisable colour grade, `n` telling two of them apart -- [`band_at`]
+    /// for the colour table.
+    fn grade_at(n: u32) -> ColorParams {
+        ColorParams {
+            brightness: f64::from(n) as f32 * 0.05,
+            ..Default::default()
         }
     }
 
@@ -1416,6 +1529,7 @@ mod tests {
         source: 0,
         link: None,
         eq: None,
+        color: None,
     };
 
     #[test]
@@ -1833,9 +1947,10 @@ mod tests {
         // Import a second file, undo it: source 1 is now an orphan.
         let mut p = two_sources();
         assert!(p.undo());
-        let (sources, lanes, eq) = p.without_orphan_sources();
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
         assert_eq!(sources, vec![Source::new(FILE, 0)], "the orphan is gone");
         assert!(eq.is_empty(), "and a project with no equalizer writes none");
+        assert!(color.is_empty(), "nor a colour it never graded with");
         assert_eq!(
             lanes,
             two(three().clips().to_vec(), three().lane(Lane::A1).to_vec()),
@@ -1848,7 +1963,7 @@ mod tests {
         assert_eq!(p.import(FILE2, 0), 1);
         assert_eq!(p.import("/nonexistent/c.mp4", 0), 2);
         assert!(p.append_clip(2, 4));
-        let (sources, lanes, eq) = p.without_orphan_sources();
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
         assert_eq!(
             sources,
             vec![Source::new(FILE, 0), Source::new("/nonexistent/c.mp4", 0)]
@@ -1858,7 +1973,7 @@ mod tests {
             [0, 1]
         );
         // ...and what comes out is loadable, with the same timeline.
-        let reloaded = Project::from_parts(sources, lanes, eq).expect("from_parts");
+        let reloaded = Project::from_parts(sources, lanes, eq, color).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
     }
@@ -1928,7 +2043,7 @@ mod tests {
         assert!(p.undo(), "back to the first setting");
         assert_eq!(p.eq_of(Lane::V1, 0), Some(&band_at(1)));
 
-        let (_, lanes, eq) = p.without_orphan_sources();
+        let (_, lanes, eq, _) = p.without_orphan_sources();
         assert_eq!(eq, vec![band_at(1)], "what nothing plays is not written");
         assert_eq!(lanes[0].1[0].eq, Some(0), "and the survivor renumbers");
         assert_eq!(lanes[0].1[1].eq, None);
@@ -1936,18 +2051,138 @@ mod tests {
         // One curve on three clips is one entry: settings that are equal share.
         assert!(p.set_eq(Lane::V1, 1, Some(band_at(1))));
         assert!(p.set_eq(Lane::A1, 2, Some(band_at(1))));
-        let (_, lanes, eq) = p.without_orphan_sources();
+        let (_, lanes, eq, _) = p.without_orphan_sources();
         assert_eq!(eq.len(), 1, "equal settings share their entry");
         assert_eq!(lanes[1].1[2].eq, Some(0));
         reloads(&p, "an equalizer that outlived an undo");
     }
 
+    /// [`an_equalizer_follows_the_clip_through_split_copy_and_undo`]'s twin: a
+    /// grade is the clip's, through every edit that copies a placement.
+    #[test]
+    fn a_colour_follows_the_clip_through_split_copy_and_undo() {
+        let mut p = three();
+        assert!(
+            p.color_of(Lane::V1, 0).is_none(),
+            "a fresh clip is ungraded"
+        );
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(2))));
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(2)));
+        assert!(
+            p.color_of(Lane::A1, 0).is_none(),
+            "one clip, not the lane below"
+        );
+        assert!(
+            p.eq_of(Lane::V1, 0).is_none(),
+            "and a grade is not an equalizer"
+        );
+
+        // Cutting a graded clip must not grade half of it: both halves inherit.
+        assert!(p.split(1));
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(2)));
+        assert_eq!(p.color_of(Lane::V1, 1), Some(&grade_at(2)));
+        assert!(
+            p.color_of(Lane::V1, 2).is_none(),
+            "the clip after it is ungraded"
+        );
+
+        // A clipboard copy carries it -- onto another lane, at that.
+        let copied = p.lane(Lane::V1)[1];
+        assert!(p.place(Lane::A1, 20, copied));
+        assert_eq!(p.color_of(Lane::A1, 4), Some(&grade_at(2)));
+        assert!(p.undo());
+        assert_eq!(p.lane(Lane::A1).len(), 4, "the placement came back off");
+
+        // ...and a change to one is one undo step, in both directions.
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(5))));
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(5)));
+        assert!(p.undo());
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(2)));
+        assert!(
+            p.set_color(Lane::V1, 0, None),
+            "and taking it off is an edit"
+        );
+        assert!(p.color_of(Lane::V1, 0).is_none());
+        assert!(p.undo());
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(2)));
+
+        // Two refusals, neither of which costs an undo step.
+        let nan = ColorParams {
+            contrast: f32::NAN,
+            ..grade_at(1)
+        };
+        assert!(
+            !p.set_color(Lane::V1, 99, Some(grade_at(1))),
+            "no clip there"
+        );
+        assert!(!p.set_color(Lane::V1, 0, Some(nan)), "not a finite value");
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(2)));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::V1).len(),
+            3,
+            "one step back is before the split"
+        );
+        assert!(p.undo());
+        assert!(
+            p.color_of(Lane::V1, 0).is_none(),
+            "and the next is before the grade: the refusals pushed none"
+        );
+    }
+
+    /// The colour table is append-only within a session, exactly as the eq one
+    /// is -- and a save is where an undone grade goes.
+    #[test]
+    fn an_undone_colour_is_pruned_when_the_project_is_saved() {
+        let mut p = three();
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(1))));
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(2))));
+        assert!(p.undo(), "back to the first grade");
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(1)));
+
+        let (_, lanes, _, color) = p.without_orphan_sources();
+        assert_eq!(
+            color,
+            vec![grade_at(1)],
+            "what nothing plays is not written"
+        );
+        assert_eq!(lanes[0].1[0].color, Some(0), "and the survivor renumbers");
+        assert_eq!(lanes[0].1[1].color, None);
+
+        // One grade on three clips is one entry: settings that are equal share.
+        assert!(p.set_color(Lane::V1, 1, Some(grade_at(1))));
+        assert!(p.set_color(Lane::A1, 2, Some(grade_at(1))));
+        let (_, lanes, _, color) = p.without_orphan_sources();
+        assert_eq!(color.len(), 1, "equal grades share their entry");
+        assert_eq!(lanes[1].1[2].color, Some(0));
+        reloads(&p, "a colour that outlived an undo");
+
+        // An equalizer and a grade on one clip are two independent tables.
+        assert!(p.set_eq(Lane::V1, 0, Some(band_at(3))));
+        let (_, lanes, eq, color) = p.without_orphan_sources();
+        assert_eq!((eq.len(), color.len()), (1, 1));
+        assert_eq!((lanes[0].1[0].eq, lanes[0].1[0].color), (Some(0), Some(0)));
+    }
+
+    /// Not a claim about correctness but about cost: a clip is copied on every
+    /// paste, every undo snapshot and every lane clone, so its size is worth
+    /// knowing. The eq index fit the padding a `Copy` clip already had; the
+    /// colour one did not, and the struct grew a word.
+    #[test]
+    fn a_clip_is_still_a_small_copy() {
+        assert_eq!(
+            std::mem::size_of::<Clip>(),
+            40,
+            "Clip changed size -- 32 before the colour index, 40 after"
+        );
+    }
+
     #[test]
     fn from_parts_has_no_history_and_checks_the_invariants() {
-        let (sources, lanes, eq) = three().without_orphan_sources();
+        let (sources, lanes, eq, color) = three().without_orphan_sources();
         let (video, audio) = (lanes[0].1.clone(), lanes[1].1.clone());
-        let mut p =
-            Project::from_parts(sources.clone(), lanes.clone(), eq.clone()).expect("valid parts");
+        let mut p = Project::from_parts(sources.clone(), lanes.clone(), eq.clone(), color.clone())
+            .expect("valid parts");
         assert_eq!(p.clips(), three().clips());
         assert!(!p.undo(), "a loaded project has nothing to undo");
         assert!(p.split(4), "...and is editable from there");
@@ -1955,13 +2190,24 @@ mod tests {
 
         // A lane may be empty; every lane may not, and neither may no lane.
         assert!(
-            Project::from_parts(sources.clone(), two(video.clone(), Vec::new()), Vec::new())
-                .is_ok()
+            Project::from_parts(
+                sources.clone(),
+                two(video.clone(), Vec::new()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_ok()
         );
         assert!(
-            Project::from_parts(sources.clone(), two(Vec::new(), Vec::new()), Vec::new()).is_err()
+            Project::from_parts(
+                sources.clone(),
+                two(Vec::new(), Vec::new()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
         );
-        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new()).is_err());
+        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
@@ -1971,15 +2217,21 @@ mod tests {
         ];
         for clips in bad {
             assert!(
-                Project::from_parts(sources.clone(), two(clips.clone(), Vec::new()), Vec::new())
-                    .is_err(),
+                Project::from_parts(
+                    sources.clone(),
+                    two(clips.clone(), Vec::new()),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .is_err(),
                 "{clips:?}"
             );
             assert!(
                 Project::from_parts(
                     sources.clone(),
                     two(video.clone(), clips.clone()),
-                    Vec::new()
+                    Vec::new(),
+                    Vec::new(),
                 )
                 .is_err()
             );
@@ -1992,7 +2244,8 @@ mod tests {
                         (LaneKind::Audio, audio.clone()),
                         (LaneKind::Video, clips),
                     ],
-                    Vec::new()
+                    Vec::new(),
+                    Vec::new(),
                 )
                 .is_err()
             );
@@ -2005,17 +2258,76 @@ mod tests {
                 ..video[0]
             }]
         };
-        assert!(Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), Vec::new()).is_err());
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                two(eqd(0), Vec::new()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err()
+        );
         let mut nan = band_at(1);
         nan.bands[0].freq_hz = f32::NAN;
-        assert!(Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), vec![nan]).is_err());
-        let loaded =
-            Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), vec![band_at(1)])
-                .expect("an eq the table holds");
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                two(eqd(0), Vec::new()),
+                vec![nan],
+                Vec::new(),
+            )
+            .is_err()
+        );
+        let loaded = Project::from_parts(
+            sources.clone(),
+            two(eqd(0), Vec::new()),
+            vec![band_at(1)],
+            Vec::new(),
+        )
+        .expect("an eq the table holds");
         assert_eq!(loaded.eq_of(Lane::V1, 0), Some(&band_at(1)));
 
+        // The same two refusals for a colour, at the same door.
+        let graded = |i: u16| {
+            vec![Clip {
+                color: Some(i),
+                ..video[0]
+            }]
+        };
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                two(graded(0), Vec::new()),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err(),
+            "a colour index no entry answers"
+        );
+        assert!(
+            Project::from_parts(
+                sources.clone(),
+                two(graded(0), Vec::new()),
+                Vec::new(),
+                vec![ColorParams {
+                    tint: f32::NAN,
+                    ..grade_at(1)
+                }],
+            )
+            .is_err(),
+            "a value the file format could not have written"
+        );
+        let loaded = Project::from_parts(
+            sources.clone(),
+            two(graded(0), Vec::new()),
+            Vec::new(),
+            vec![grade_at(1)],
+        )
+        .expect("a colour the table holds");
+        assert_eq!(loaded.color_of(Lane::V1, 0), Some(&grade_at(1)));
+
         // Group ids survive a load, and the next split gets a fresh one.
-        let mut p = Project::from_parts(sources, lanes, eq).expect("valid parts");
+        let mut p = Project::from_parts(sources, lanes, eq, color).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
     }
@@ -2038,11 +2350,12 @@ mod tests {
             source: 0,
             link: Some(link),
             eq: None,
+            color: None,
         };
 
         // The door: named errors, one per cause.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
-            Project::from_parts(sources.clone(), two(video, audio), Vec::new())
+            Project::from_parts(sources.clone(), two(video, audio), Vec::new(), Vec::new())
                 .expect_err("refused")
                 .to_string()
         };
@@ -2059,9 +2372,9 @@ mod tests {
         // A one-sided link is *not* an error: it is what a lift leaves behind.
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0));
-        let (sources, lanes, eq) = p.clone().without_orphan_sources();
+        let (sources, lanes, eq, color) = p.clone().without_orphan_sources();
         assert!(
-            Project::from_parts(sources, lanes, eq).is_ok(),
+            Project::from_parts(sources, lanes, eq, color).is_ok(),
             "a lifted lane's project has to load again"
         );
 
@@ -2163,7 +2476,7 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = if next(2) == 0 { Lane::V1 } else { Lane::A1 };
                 let idx = next(4) as usize;
-                let _ = match next(11) {
+                let _ = match next(13) {
                     0 => p.split(frame),
                     1 => p.regroup(frame),
                     2 => p.lift(lane, idx),
@@ -2177,6 +2490,10 @@ mod tests {
                     // orphans must not come back out of the prune.
                     8 => p.set_eq(lane, idx, Some(band_at(next(4)))),
                     9 => p.set_eq(lane, idx, None),
+                    // ...and a colour grade in the same mix, for the same
+                    // reason: it rides on the clip and its orphans must go.
+                    10 => p.set_color(lane, idx, Some(grade_at(next(4)))),
+                    11 => p.set_color(lane, idx, None),
                     _ => p.append_clip(0, 1 + next(9)),
                 };
                 reloads(&p, &format!("seed {seed}, step {step}"));
@@ -2188,8 +2505,8 @@ mod tests {
     /// handed back to the constructor a load goes through -- every lane of them,
     /// and the reloaded timeline has to be the same lanes in the same order.
     fn reloads(p: &Project, what: &str) {
-        let (sources, lanes, eq) = p.clone().without_orphan_sources();
-        match Project::from_parts(sources, lanes, eq) {
+        let (sources, lanes, eq, color) = p.clone().without_orphan_sources();
+        match Project::from_parts(sources, lanes, eq, color) {
             Err(e) => panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes),
             Ok(back) => {
                 assert_eq!(back.lanes(), p.lanes(), "{what}: the lane list changed");
@@ -2212,6 +2529,19 @@ mod tests {
                         .collect()
                 };
                 assert_eq!(eqs(&back), eqs(p), "{what}: the equalizers changed");
+                // The colour table renumbers in the same prune, so the same
+                // claim: the params a clip names, not the index it names them by.
+                let colors = |p: &Project| -> Vec<Vec<Option<ColorParams>>> {
+                    p.lanes()
+                        .into_iter()
+                        .map(|l| {
+                            (0..p.lane(l).len())
+                                .map(|i| p.color_of(l, i).copied())
+                                .collect()
+                        })
+                        .collect()
+                };
+                assert_eq!(colors(&back), colors(p), "{what}: the colours changed");
             }
         }
     }
@@ -2367,6 +2697,7 @@ mod tests {
             source: 0,
             link: Some(link),
             eq: None,
+            color: None,
         };
         let lanes = vec![
             LaneData {
@@ -2399,6 +2730,7 @@ mod tests {
             source: 0,
             link: Some(link),
             eq: None,
+            color: None,
         };
         // V1, A1, V2, A2 -- one take over [0, 4) on all four.
         let kinds = [
@@ -2446,7 +2778,7 @@ mod tests {
         let v2 = p.add_lane(LaneKind::Video);
         assert!(p.place(v2, 4, clip(0, 20, 32, 0)));
         let a2 = p.add_lane(LaneKind::Audio);
-        let (sources, lanes, eq) = p.without_orphan_sources();
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
         assert_eq!(
             lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [
@@ -2460,7 +2792,7 @@ mod tests {
         assert_eq!(lanes[2].1, p.lane(v2), "V2's clips are written");
         assert!(lanes[3].1.is_empty(), "and the empty A2 is still a lane");
         // ...and all four load again as the same four.
-        let back = Project::from_parts(sources, lanes, eq).expect("four lanes load");
+        let back = Project::from_parts(sources, lanes, eq, color).expect("four lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(back.lane(a2), p.lane(a2));
 
@@ -2542,7 +2874,7 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 5, 15, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, lanes, vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -2583,7 +2915,7 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 0, 10, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, holed, vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, holed, vec![], vec![]).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -2627,7 +2959,7 @@ mod tests {
             (LaneKind::Audio, vec![clip(15, 0, 15, 1)]),
             (LaneKind::Audio, Vec::new()),
         ];
-        let p = Project::from_parts(sources, lanes, vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
         let lists = p.audio_segments_from(0, FPS);
         assert_eq!(lists.len(), 2, "the empty lane is not mixed in");
         assert_eq!(lists[0], p.segments_from(0, FPS), "A1 is unchanged");
@@ -2642,6 +2974,7 @@ mod tests {
                 (LaneKind::Video, vec![clip(0, 0, 30, 0)]),
                 (LaneKind::Audio, Vec::new()),
             ],
+            vec![],
             vec![],
         )
         .expect("valid parts");

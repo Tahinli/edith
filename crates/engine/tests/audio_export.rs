@@ -65,6 +65,7 @@ fn mixed_project() -> Project {
         source,
         link: None,
         eq: None,
+        color: None,
     };
     Project::from_parts(
         vec![
@@ -84,10 +85,12 @@ fn mixed_project() -> Project {
                     source: 0,
                     link: None,
                     eq: None,
+                    color: None,
                 }],
             ),
             (LaneKind::Audio, vec![clip(0, 0), clip(60, 1)]),
         ],
+        Vec::new(),
         Vec::new(),
     )
     .expect("a two-source project with a hole in the audio lane")
