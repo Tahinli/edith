@@ -633,6 +633,24 @@ impl Project {
     /// (and no history) for an index that is not there or a value that is not
     /// finite, and equal settings share a table entry.
     pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.write_color(lane, idx, params, true)
+    }
+
+    /// [`set_color`](Self::set_color) without the undo step: the samples *inside*
+    /// one pointer drag, whose first write (a plain `set_color`) already took the
+    /// snapshot the gesture rolls back to. A drag across a slider is one undo,
+    /// not one per pixel -- and undoing it lands where the hand picked it up.
+    pub fn set_color_live(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.write_color(lane, idx, params, false)
+    }
+
+    fn write_color(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<ColorParams>,
+        snapshot: bool,
+    ) -> bool {
         if idx >= self.lane(lane).len() {
             return false;
         }
@@ -655,7 +673,9 @@ impl Project {
                 })
             }
         };
-        self.snapshot();
+        if snapshot {
+            self.snapshot();
+        }
         self.lane_mut(lane).expect("checked above")[idx].color = slot;
         true
     }
@@ -2511,6 +2531,42 @@ mod tests {
         assert!(
             p.color_of(Lane::V1, 0).is_none(),
             "and the next is before the grade: the refusals pushed none"
+        );
+    }
+
+    /// A slider drag is one gesture: the press snapshots, every sample after it
+    /// only regrades, and the single undo lands on what the clip was *before*
+    /// the hand touched it -- not one step back down the drag.
+    #[test]
+    fn a_whole_colour_drag_undoes_in_one_step() {
+        let mut p = three();
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(1))), "the press");
+        for n in 2..=8 {
+            assert!(p.set_color_live(Lane::V1, 0, Some(grade_at(n))), "a sample");
+        }
+        assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(8)));
+        assert!(p.undo());
+        assert!(
+            p.color_of(Lane::V1, 0).is_none(),
+            "one undo is the whole gesture, back to ungraded"
+        );
+
+        // The live write refuses what the snapshotting one refuses, and a
+        // refusal still costs no history either way.
+        assert!(!p.set_color_live(Lane::V1, 99, Some(grade_at(1))));
+        assert!(!p.set_color_live(
+            Lane::V1,
+            0,
+            Some(ColorParams {
+                contrast: f32::NAN,
+                ..grade_at(1)
+            })
+        ));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::V1).len(),
+            2,
+            "the next step back is the split before the drag: no sample pushed one"
         );
     }
 

@@ -624,6 +624,14 @@ impl PlaybackSession {
         self.edit(|p| p.set_color(lane, idx, params))
     }
 
+    /// The same grade and the same reseek without the undo step
+    /// ([`Project::set_color_live`]): what the samples inside one slider drag go
+    /// through, so the frame regrades under the hand and the whole gesture is
+    /// still a single `z`.
+    pub fn set_color_live(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.edit(|p| p.set_color_live(lane, idx, params))
+    }
+
     /// The project's resolution: what every clip is composed onto, what the
     /// window is sized to and what an export writes -- *not* any one file's.
     /// It starts as source 0's picture, which is what a project meant before it
