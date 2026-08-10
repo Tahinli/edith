@@ -45,8 +45,18 @@
 //! clipboard or inside an undo snapshot can never dangle. An index -- not an
 //! `Arc<Path>` -- because [`Clip`] is `Copy`, which is what makes copy/paste a
 //! plain assignment.
+//!
+//! A clip names its equalizer the same way, by index into a second append-only
+//! table ([`Clip::eq`], [`Project::set_eq`]): the params are a `Vec` of bands
+//! and a `Copy` clip cannot hold one. So an EQ'd clip that is split hands both
+//! halves the same settings, a copy carries them, and an undo restores whatever
+//! index the clip had. Only a *save* prunes the table
+//! ([`Project::without_orphan_sources`]), for the reason an undone import
+//! leaves its source entry behind: an index handed out is an index forever.
 
 use std::path::{Path, PathBuf};
+
+use crate::eq::EqParams;
 
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
@@ -64,6 +74,13 @@ pub struct Clip {
     /// Group id: clips sharing one were split from the same take. `None` for a
     /// clip that belongs to no group.
     pub link: Option<u32>,
+    /// Index into the project's equalizer table
+    /// ([`Project::eq_of`]/[`Project::set_eq`]), or `None` for a clip that plays
+    /// flat. An index -- not the params -- for [`Clip::source`]'s reason: this
+    /// stays `Copy`, so an EQ'd clip survives a copy, a paste and an undo as a
+    /// plain assignment. The table is append-only within a session, so an index
+    /// on a clipboard clip or inside an undo snapshot can never dangle.
+    pub eq: Option<u16>,
 }
 
 impl Clip {
@@ -194,6 +211,11 @@ impl Span {
     }
 }
 
+/// What a save writes and a load takes back: the sources, every lane in
+/// display order with its kind, and the equalizer table their clips index into
+/// -- [`Project::without_orphan_sources`] out, [`Project::from_parts`] in.
+pub type Parts = (Vec<Source>, Vec<(LaneKind, Vec<Clip>)>, Vec<EqParams>);
+
 /// The edit list plus its undo history.
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -202,6 +224,8 @@ pub struct Project {
     /// In display order, which is the order [`Lane::ord`] counts in: the nth
     /// lane of a kind here is that kind's `ord` n. Never empty.
     lanes: Vec<LaneData>,
+    /// Append-only, exactly as `sources` is: what [`Clip::eq`] indexes into.
+    eq: Vec<EqParams>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one. The
     /// whole lane list, so adding a lane undoes as well.
     history: Vec<Vec<LaneData>>,
@@ -222,12 +246,14 @@ impl Project {
             out_frame: frame_count.max(1),
             source: 0,
             link: Some(0),
+            eq: None,
         };
         Self {
             // A file is opened on its first audio stream: nothing has picked
             // one yet, and every file with audio at all has that one.
             sources: vec![Source::new(path, 0)],
             lanes: LaneData::two_lanes(vec![clip], vec![clip]),
+            eq: Vec::new(),
             history: Vec::new(),
             next_link: 1,
         }
@@ -240,13 +266,17 @@ impl Project {
     /// [`Project::undo`] is `false` until the first edit of the new session.
     /// This is the one door untrusted parts come in through, so every invariant
     /// every other constructor keeps is checked here, by name and in release:
-    /// every lane empty, an empty clip, a clip naming a source that is not
-    /// there, a clip whose end overflows, a lane that is unsorted or
+    /// every lane empty, an empty clip, a clip naming a source (or an equalizer)
+    /// that is not there, a clip whose end overflows, a lane that is unsorted or
     /// self-overlapping, and the grouping rules of [`Clip::link`] below.
     pub fn from_parts(
         sources: Vec<Source>,
         lanes: Vec<(LaneKind, Vec<Clip>)>,
+        eq: Vec<EqParams>,
     ) -> crate::Result<Self> {
+        if let Some(bad) = eq.iter().position(|p| !finite(p)) {
+            return Err(format!("eq {bad} holds a band that is not a finite number").into());
+        }
         if lanes.iter().all(|(_, clips)| clips.is_empty()) {
             return Err("every lane is empty: that is not a project".into());
         }
@@ -280,6 +310,15 @@ impl Project {
                     )
                     .into());
                 }
+                if c.eq.is_some_and(|i| usize::from(i) >= eq.len()) {
+                    return Err(format!(
+                        "{name} clip at {} names eq {} of {}",
+                        c.start,
+                        c.eq.unwrap_or_default(),
+                        eq.len()
+                    )
+                    .into());
+                }
             }
             if !sorted_disjoint(&data.clips) {
                 return Err(format!("the {name} lane is out of order or overlaps itself").into());
@@ -300,6 +339,7 @@ impl Project {
                 .map(|s| Source::new(&s.path, s.audio_stream))
                 .collect(),
             lanes,
+            eq,
             history: Vec::new(),
             next_link,
         })
@@ -410,6 +450,7 @@ impl Project {
             out_frame: frame_count.max(1),
             source,
             link: Some(self.new_link()),
+            eq: None,
         };
         for data in &mut self.lanes {
             data.clips.push(clip);
@@ -426,11 +467,18 @@ impl Project {
     /// emits the same bytes.
     ///
     /// Every lane comes out, in display order and with its kind: that is what a
-    /// v4 `.edith` holds (empty lanes included) and what [`Project::from_parts`]
+    /// v5 `.edith` holds (empty lanes included) and what [`Project::from_parts`]
     /// takes back.
-    pub fn without_orphan_sources(&self) -> (Vec<Source>, Vec<(LaneKind, Vec<Clip>)>) {
+    ///
+    /// The equalizer table is pruned the same way and for the same reason: an
+    /// undone [`set_eq`](Project::set_eq) leaves settings nothing plays behind,
+    /// and this is the one moment they can go -- the indexes that survive it are
+    /// only the ones a clip names.
+    pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
+        let mut moved_eq = vec![None; self.eq.len()];
+        let mut eq = Vec::new();
         let mut lanes = self.lanes.clone();
         for c in lanes.iter_mut().flat_map(|l| &mut l.clips) {
             let old = c.source;
@@ -442,11 +490,69 @@ impl Project {
                     sources.len() - 1
                 }
             };
+            if let Some(old) = c.eq.map(usize::from) {
+                c.eq = Some(match moved_eq[old] {
+                    Some(new) => new,
+                    None => {
+                        eq.push(self.eq[old].clone());
+                        let new = (eq.len() - 1) as u16;
+                        moved_eq[old] = Some(new);
+                        new
+                    }
+                });
+            }
         }
         (
             sources,
             lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
+            eq,
         )
+    }
+
+    /// What the clip at `idx` of `lane` plays through, or `None` for one that
+    /// plays flat (and for an index that is not there) -- what a feeder and an
+    /// export ask before they build an [`crate::eq::EqState`].
+    pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {
+        self.eq.get(usize::from(self.lane(lane).get(idx)?.eq?))
+    }
+
+    /// Give the clip at `idx` of `lane` these equalizer settings, or `None` to
+    /// take them off. One undo step, like every other edit. `false` -- and no
+    /// history -- for an index that is not there and for params holding a value
+    /// that is not finite, which is the one thing the file format could not
+    /// write and read back.
+    ///
+    /// Settings equal to ones already in the table share their entry, so a
+    /// project that puts the same curve on twenty clips writes it once.
+    pub fn set_eq(&mut self, lane: Lane, idx: usize, params: Option<EqParams>) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        let slot = match params {
+            None => None,
+            Some(params) => {
+                if !finite(&params) {
+                    return false;
+                }
+                Some(match self.eq.iter().position(|p| *p == params) {
+                    Some(at) => at as u16,
+                    // ponytail: the table is append-only within a session (see
+                    // the module docs) and `Clip::eq` is a u16, so the 65535th
+                    // *distinct* setting of one session is refused rather than
+                    // silently aliased. Upgrade path if a UI ever drags a slider
+                    // that far: widen `Clip::eq` to u32 (Clip has the room) or
+                    // snapshot the table into the history and compact it here.
+                    None if self.eq.len() >= usize::from(u16::MAX) => return false,
+                    None => {
+                        self.eq.push(params);
+                        (self.eq.len() - 1) as u16
+                    }
+                })
+            }
+        };
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].eq = slot;
+        true
     }
 
     /// Length of the timeline in frames: where the *last* lane runs out. A lane
@@ -857,6 +963,16 @@ fn joinable(clips: &[Clip], frame: u32) -> Option<usize> {
 /// The lane invariant: sorted by `start`, no two placements overlapping, no
 /// empty placement. Checked at every constructor and asserted after every
 /// mutation -- the offset model is only tractable while it holds.
+/// The one thing an equalizer setting may not be: a value the text format
+/// cannot write and read back as itself. Checked wherever params come in, so
+/// what an edit produces is always what a save writes and a load reads.
+fn finite(params: &EqParams) -> bool {
+    params
+        .bands
+        .iter()
+        .all(|b| b.freq_hz.is_finite() && b.gain_db.is_finite() && b.q.is_finite())
+}
+
 fn sorted_disjoint(clips: &[Clip]) -> bool {
     clips.iter().all(|c| c.out_frame > c.in_frame)
         && clips.windows(2).all(|w| w[0].end() <= w[1].start)
@@ -993,6 +1109,20 @@ mod tests {
             out_frame,
             source,
             link: None,
+            eq: None,
+        }
+    }
+
+    /// A recognisable equalizer setting: one peak band, `n` telling two of them
+    /// apart -- which is what makes the table's dedup and its prune visible.
+    fn band_at(n: u32) -> EqParams {
+        EqParams {
+            bands: vec![crate::eq::Band {
+                freq_hz: 1000.0,
+                gain_db: f64::from(n) as f32 * 1.5,
+                q: 0.707,
+                kind: crate::eq::BandKind::Peak,
+            }],
         }
     }
 
@@ -1173,6 +1303,7 @@ mod tests {
         out_frame: 102,
         source: 0,
         link: None,
+        eq: None,
     };
 
     #[test]
@@ -1590,8 +1721,9 @@ mod tests {
         // Import a second file, undo it: source 1 is now an orphan.
         let mut p = two_sources();
         assert!(p.undo());
-        let (sources, lanes) = p.without_orphan_sources();
+        let (sources, lanes, eq) = p.without_orphan_sources();
         assert_eq!(sources, vec![Source::new(FILE, 0)], "the orphan is gone");
+        assert!(eq.is_empty(), "and a project with no equalizer writes none");
         assert_eq!(
             lanes,
             two(three().clips().to_vec(), three().lane(Lane::A1).to_vec()),
@@ -1604,7 +1736,7 @@ mod tests {
         assert_eq!(p.import(FILE2, 0), 1);
         assert_eq!(p.import("/nonexistent/c.mp4", 0), 2);
         assert!(p.append_clip(2, 4));
-        let (sources, lanes) = p.without_orphan_sources();
+        let (sources, lanes, eq) = p.without_orphan_sources();
         assert_eq!(
             sources,
             vec![Source::new(FILE, 0), Source::new("/nonexistent/c.mp4", 0)]
@@ -1614,25 +1746,110 @@ mod tests {
             [0, 1]
         );
         // ...and what comes out is loadable, with the same timeline.
-        let reloaded = Project::from_parts(sources, lanes).expect("from_parts");
+        let reloaded = Project::from_parts(sources, lanes, eq).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
     }
 
+    /// A clip's equalizer is the clip's: it survives every edit that copies a
+    /// placement, and it comes back with an undo.
+    #[test]
+    fn an_equalizer_follows_the_clip_through_split_copy_and_undo() {
+        let mut p = three();
+        assert!(p.eq_of(Lane::V1, 0).is_none(), "a fresh clip plays flat");
+        assert!(p.set_eq(Lane::A1, 0, Some(band_at(2))));
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(2)));
+        assert!(
+            p.eq_of(Lane::V1, 0).is_none(),
+            "one clip, not the lane above"
+        );
+
+        // Cutting an EQ'd clip must not silence half of it: both halves inherit.
+        assert!(p.split(1));
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(2)));
+        assert_eq!(p.eq_of(Lane::A1, 1), Some(&band_at(2)));
+        assert!(p.eq_of(Lane::A1, 2).is_none(), "the clip after it is flat");
+
+        // A clipboard copy carries it -- onto another lane, at that.
+        let copied = p.lane(Lane::A1)[1];
+        assert!(p.place(Lane::V1, 20, copied));
+        assert_eq!(p.eq_of(Lane::V1, 4), Some(&band_at(2)));
+        assert!(p.undo());
+        assert_eq!(p.lane(Lane::V1).len(), 4, "the placement came back off");
+
+        // ...and a change to one is one undo step, in both directions.
+        assert!(p.set_eq(Lane::A1, 0, Some(band_at(5))));
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(5)));
+        assert!(p.undo());
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(2)));
+        assert!(p.set_eq(Lane::A1, 0, None), "and taking it off is an edit");
+        assert!(p.eq_of(Lane::A1, 0).is_none());
+        assert!(p.undo());
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(2)));
+
+        // Two refusals, neither of which costs an undo step.
+        let mut nan = band_at(1);
+        nan.bands[0].q = f32::INFINITY;
+        assert!(!p.set_eq(Lane::A1, 99, Some(band_at(1))), "no clip there");
+        assert!(!p.set_eq(Lane::A1, 0, Some(nan)), "not a finite band");
+        assert_eq!(p.eq_of(Lane::A1, 0), Some(&band_at(2)));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::A1).len(),
+            3,
+            "one step back is before the split"
+        );
+        assert!(p.undo());
+        assert!(
+            p.eq_of(Lane::A1, 0).is_none(),
+            "and the next is before the setting: the refusals pushed none"
+        );
+    }
+
+    /// The table is append-only within a session, exactly as the sources are, so
+    /// an undone setting is still in it -- and a save is where it goes.
+    #[test]
+    fn an_undone_equalizer_is_pruned_when_the_project_is_saved() {
+        let mut p = three();
+        assert!(p.set_eq(Lane::V1, 0, Some(band_at(1))));
+        assert!(p.set_eq(Lane::V1, 0, Some(band_at(2))));
+        assert!(p.undo(), "back to the first setting");
+        assert_eq!(p.eq_of(Lane::V1, 0), Some(&band_at(1)));
+
+        let (_, lanes, eq) = p.without_orphan_sources();
+        assert_eq!(eq, vec![band_at(1)], "what nothing plays is not written");
+        assert_eq!(lanes[0].1[0].eq, Some(0), "and the survivor renumbers");
+        assert_eq!(lanes[0].1[1].eq, None);
+
+        // One curve on three clips is one entry: settings that are equal share.
+        assert!(p.set_eq(Lane::V1, 1, Some(band_at(1))));
+        assert!(p.set_eq(Lane::A1, 2, Some(band_at(1))));
+        let (_, lanes, eq) = p.without_orphan_sources();
+        assert_eq!(eq.len(), 1, "equal settings share their entry");
+        assert_eq!(lanes[1].1[2].eq, Some(0));
+        reloads(&p, "an equalizer that outlived an undo");
+    }
+
     #[test]
     fn from_parts_has_no_history_and_checks_the_invariants() {
-        let (sources, lanes) = three().without_orphan_sources();
+        let (sources, lanes, eq) = three().without_orphan_sources();
         let (video, audio) = (lanes[0].1.clone(), lanes[1].1.clone());
-        let mut p = Project::from_parts(sources.clone(), lanes.clone()).expect("valid parts");
+        let mut p =
+            Project::from_parts(sources.clone(), lanes.clone(), eq.clone()).expect("valid parts");
         assert_eq!(p.clips(), three().clips());
         assert!(!p.undo(), "a loaded project has nothing to undo");
         assert!(p.split(4), "...and is editable from there");
         assert!(p.undo());
 
         // A lane may be empty; every lane may not, and neither may no lane.
-        assert!(Project::from_parts(sources.clone(), two(video.clone(), Vec::new())).is_ok());
-        assert!(Project::from_parts(sources.clone(), two(Vec::new(), Vec::new())).is_err());
-        assert!(Project::from_parts(sources.clone(), Vec::new()).is_err());
+        assert!(
+            Project::from_parts(sources.clone(), two(video.clone(), Vec::new()), Vec::new())
+                .is_ok()
+        );
+        assert!(
+            Project::from_parts(sources.clone(), two(Vec::new(), Vec::new()), Vec::new()).is_err()
+        );
+        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
@@ -1642,11 +1859,17 @@ mod tests {
         ];
         for clips in bad {
             assert!(
-                Project::from_parts(sources.clone(), two(clips.clone(), Vec::new())).is_err(),
+                Project::from_parts(sources.clone(), two(clips.clone(), Vec::new()), Vec::new())
+                    .is_err(),
                 "{clips:?}"
             );
             assert!(
-                Project::from_parts(sources.clone(), two(video.clone(), clips.clone())).is_err()
+                Project::from_parts(
+                    sources.clone(),
+                    two(video.clone(), clips.clone()),
+                    Vec::new()
+                )
+                .is_err()
             );
             // ...and on a third lane, which is checked by the same walk.
             assert!(
@@ -1656,13 +1879,31 @@ mod tests {
                         (LaneKind::Video, video.clone()),
                         (LaneKind::Audio, audio.clone()),
                         (LaneKind::Video, clips),
-                    ]
+                    ],
+                    Vec::new()
                 )
                 .is_err()
             );
         }
+        // An equalizer index no table entry answers, and a table entry the file
+        // format could not have written, are refused at this door too.
+        let eqd = |i: u16| {
+            vec![Clip {
+                eq: Some(i),
+                ..video[0]
+            }]
+        };
+        assert!(Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), Vec::new()).is_err());
+        let mut nan = band_at(1);
+        nan.bands[0].freq_hz = f32::NAN;
+        assert!(Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), vec![nan]).is_err());
+        let loaded =
+            Project::from_parts(sources.clone(), two(eqd(0), Vec::new()), vec![band_at(1)])
+                .expect("an eq the table holds");
+        assert_eq!(loaded.eq_of(Lane::V1, 0), Some(&band_at(1)));
+
         // Group ids survive a load, and the next split gets a fresh one.
-        let mut p = Project::from_parts(sources, lanes).expect("valid parts");
+        let mut p = Project::from_parts(sources, lanes, eq).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
     }
@@ -1684,11 +1925,12 @@ mod tests {
             out_frame,
             source: 0,
             link: Some(link),
+            eq: None,
         };
 
         // The door: named errors, one per cause.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
-            Project::from_parts(sources.clone(), two(video, audio))
+            Project::from_parts(sources.clone(), two(video, audio), Vec::new())
                 .expect_err("refused")
                 .to_string()
         };
@@ -1705,9 +1947,9 @@ mod tests {
         // A one-sided link is *not* an error: it is what a lift leaves behind.
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0));
-        let (sources, lanes) = p.clone().without_orphan_sources();
+        let (sources, lanes, eq) = p.clone().without_orphan_sources();
         assert!(
-            Project::from_parts(sources, lanes).is_ok(),
+            Project::from_parts(sources, lanes, eq).is_ok(),
             "a lifted lane's project has to load again"
         );
 
@@ -1776,7 +2018,7 @@ mod tests {
             &p,
             "a second audio stream of the same file, placed and split",
         );
-        let (sources, _) = p.without_orphan_sources();
+        let (sources, ..) = p.without_orphan_sources();
         assert_eq!(
             sources.iter().map(|s| s.audio_stream).collect::<Vec<_>>(),
             [0, 1],
@@ -1809,7 +2051,7 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = if next(2) == 0 { Lane::V1 } else { Lane::A1 };
                 let idx = next(4) as usize;
-                let _ = match next(9) {
+                let _ = match next(11) {
                     0 => p.split(frame),
                     1 => p.regroup(frame),
                     2 => p.lift(lane, idx),
@@ -1818,6 +2060,11 @@ mod tests {
                     5 => p.ripple_delete(frame, next(9)),
                     6 => p.delete(idx),
                     7 => p.undo(),
+                    // An equalizer put on and taken off in the mix: what a clip
+                    // carries has to reload with it, and the entries an undo
+                    // orphans must not come back out of the prune.
+                    8 => p.set_eq(lane, idx, Some(band_at(next(4)))),
+                    9 => p.set_eq(lane, idx, None),
                     _ => p.append_clip(0, 1 + next(9)),
                 };
                 reloads(&p, &format!("seed {seed}, step {step}"));
@@ -1829,8 +2076,8 @@ mod tests {
     /// handed back to the constructor a load goes through -- every lane of them,
     /// and the reloaded timeline has to be the same lanes in the same order.
     fn reloads(p: &Project, what: &str) {
-        let (sources, lanes) = p.clone().without_orphan_sources();
-        match Project::from_parts(sources, lanes) {
+        let (sources, lanes, eq) = p.clone().without_orphan_sources();
+        match Project::from_parts(sources, lanes, eq) {
             Err(e) => panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes),
             Ok(back) => {
                 assert_eq!(back.lanes(), p.lanes(), "{what}: the lane list changed");
@@ -1840,6 +2087,19 @@ mod tests {
                     p.lanes().into_iter().map(|l| p.lane_spans(l)).collect()
                 };
                 assert_eq!(spans(&back), spans(p), "{what}: the placements changed");
+                // The prune renumbers the eq table too, so what has to survive
+                // is the settings themselves, clip by clip.
+                let eqs = |p: &Project| -> Vec<Vec<Option<EqParams>>> {
+                    p.lanes()
+                        .into_iter()
+                        .map(|l| {
+                            (0..p.lane(l).len())
+                                .map(|i| p.eq_of(l, i).cloned())
+                                .collect()
+                        })
+                        .collect()
+                };
+                assert_eq!(eqs(&back), eqs(p), "{what}: the equalizers changed");
             }
         }
     }
@@ -1994,6 +2254,7 @@ mod tests {
             out_frame,
             source: 0,
             link: Some(link),
+            eq: None,
         };
         let lanes = vec![
             LaneData {
@@ -2025,6 +2286,7 @@ mod tests {
             out_frame: end,
             source: 0,
             link: Some(link),
+            eq: None,
         };
         // V1, A1, V2, A2 -- one take over [0, 4) on all four.
         let kinds = [
@@ -2072,7 +2334,7 @@ mod tests {
         let v2 = p.add_lane(LaneKind::Video);
         assert!(p.place(v2, 4, clip(0, 20, 32, 0)));
         let a2 = p.add_lane(LaneKind::Audio);
-        let (sources, lanes) = p.without_orphan_sources();
+        let (sources, lanes, eq) = p.without_orphan_sources();
         assert_eq!(
             lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [
@@ -2086,7 +2348,7 @@ mod tests {
         assert_eq!(lanes[2].1, p.lane(v2), "V2's clips are written");
         assert!(lanes[3].1.is_empty(), "and the empty A2 is still a lane");
         // ...and all four load again as the same four.
-        let back = Project::from_parts(sources, lanes).expect("four lanes load");
+        let back = Project::from_parts(sources, lanes, eq).expect("four lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(back.lane(a2), p.lane(a2));
 
@@ -2128,7 +2390,9 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = lanes[next(3) as usize];
                 let idx = next(4) as usize;
-                let _ = match next(10) {
+                let _ = match next(12) {
+                    10 => p.set_eq(lane, idx, Some(band_at(next(4)))),
+                    11 => p.set_eq(lane, idx, None),
                     0 => p.split(frame),
                     1 => p.regroup(frame),
                     2 => p.lift(lane, idx),
