@@ -15,7 +15,9 @@
 //! picture is re-encoded, so the frame walk honours a rate: it takes the source
 //! frame each timeline frame shows ([`crate::project::Speed::source_at`], the
 //! very frame preview holds there) and encodes a held one again rather than
-//! decoding it twice. The sound is *copied* unless a filter forces a decode, and
+//! decoding it twice. A clip whose *file* was shot at another rate than the
+//! timeline goes through the same walk with one more conversion on the end
+//! ([`crate::project::Rate`]), so it is encoded at the speed it was shot at. The sound is *copied* unless a filter forces a decode, and
 //! a packet carries no rate -- so a speeded clip on the one audio lane an mp4
 //! copies is refused by name ([`copy_audio`]) rather than written out at 1.00x
 //! under a re-timed picture.
@@ -44,7 +46,7 @@ use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Av1Params, MkvMuxer, Mp4Muxer, VideoParams};
-use crate::project::{LaneKind, Project};
+use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
@@ -467,6 +469,16 @@ fn run(
         chan_conf: track.chan_conf,
     });
 
+    // One header parse per source, before any of them is decoded: what rate
+    // each file was shot at against the timeline's ([`Rate`]), which is how the
+    // clip's timeline frames below become frames of the file. Real time for a
+    // still, a song and a single-rate project, where every conversion below is
+    // the identity.
+    let rates: Vec<Rate> = sources
+        .iter()
+        .map(|source| source_rate(&source.path, meta.frame_rate))
+        .collect();
+
     let mut encoder = Enc::open(meta, settings)?;
     let mut muxer = None;
     let mut done = 0u32;
@@ -481,14 +493,18 @@ fn run(
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
-        let mut pictures = match span.from {
+        let (mut pictures, rate, in_frame) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                Some(ClipDecoder::open(&entry.path, in_frame)?)
+                let rate = rates[source];
+                // Opened at the file's own frame, which is the only place the
+                // file's numbering is used -- the span's are the timeline's.
+                let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
+                (Some(pictures), rate, in_frame)
             }
-            None => None,
+            None => (None, Rate::REAL_TIME, 0),
         };
         // What this span is graded by -- the same answer playback's decoder
         // carries, so the export is the picture that was watched. `None` for a
@@ -519,10 +535,24 @@ fn run(
         let mut done_here = 0u32;
         // Source frames already taken out of this span's decoder.
         let mut taken = 0u32;
+        // The whole of the mapping, in the order it composes: the speed says
+        // which of the clip's (timeline-rate) frames a timeline frame shows,
+        // and the rate says which frame of the *file* that is -- counted from
+        // the one the decoder was opened at. At real time and at the timeline's
+        // own rate this is `Speed::source_at` and nothing else, which is the
+        // walk a single-rate project has always taken.
+        let opened_at = rate.source_at(in_frame);
+        let source_at =
+            |offset: u32| rate.source_at(in_frame + span.speed.source_at(offset)) - opened_at;
         while done_here < span.len {
             cancelled(shared)?;
-            let want = span.speed.source_at(done_here);
-            let repeats = span.speed.repeats(done_here, span.len);
+            let want = source_at(done_here);
+            // How many timeline frames from here show that same picture: one at
+            // real time, more when the clip is slowed or its file is slower
+            // than the timeline. Encoded again rather than decoded twice.
+            let repeats = (done_here..span.len)
+                .take_while(|&offset| source_at(offset) == want)
+                .count() as u32;
             let picture = match &mut pictures {
                 Some(pictures) => {
                     let mut ran_out = false;
@@ -618,6 +648,21 @@ fn run(
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
+}
+
+/// What rate `path` was shot at against a timeline at `timeline_fps`
+/// ([`Rate`]). [`Rate::REAL_TIME`] for the files that have no rate of their own
+/// -- a still, a song -- and for one that will not open here: the decoder is
+/// opened a few lines later and fails the export by name, which is a better
+/// error than this one could raise.
+fn source_rate(path: &Path, timeline_fps: f64) -> Rate {
+    if crate::is_image(path) || crate::is_audio(path) {
+        return Rate::REAL_TIME;
+    }
+    match Demuxer::open(path) {
+        Ok((meta, _)) => Rate::new(meta.frame_rate, timeline_fps),
+        Err(_) => Rate::REAL_TIME,
+    }
 }
 
 /// Where a clip sits on the timeline as a person reads it: `mm:ss`, short

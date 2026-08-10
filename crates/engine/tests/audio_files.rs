@@ -386,20 +386,21 @@ fn a_video_joins_a_timeline_a_song_started() {
     import_and_place(&mut session, &asset("test_av.mp4"));
     assert_eq!(session.lane_clips(Lane::V1).len(), 1, "a picture at last");
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
-    // And a file at another rate is refused in the timeline's own words rather
-    // than silently retiming the song already on the lane -- the sample rate at
-    // one door, the *frame* rate at the other: the canvas a song scaffolds has
-    // a frame rate of its own (30 fps), and a 25 fps picture cannot join it.
+    // A sample rate the device cannot have two of is still refused in the
+    // timeline's own words...
     let e = refusal(session.import(&asset("test_tone_48k.wav")));
     assert_eq!(
         e,
         "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
     );
-    assert_eq!(
-        refusal(session.import(&asset("test_25fps.mp4"))),
-        "25.000 fps does not match the timeline's 30.000 fps"
-    );
     assert_eq!(session.sources().len(), 2, "a refusal left a library row");
+    // ...but a *frame* rate of its own is not a refusal: the canvas a song
+    // scaffolds runs at 30 fps and a 25 fps picture joins it at the length it
+    // lasts in seconds (50 frames of file, 60 of timeline).
+    session
+        .import(&asset("test_25fps.mp4"))
+        .expect("25 fps joins the 30 fps canvas a song scaffolded");
+    assert_eq!(session.file_frames(&asset("test_25fps.mp4")), 60);
 }
 
 /// Blocks until the export settles, whichever way it settled.
