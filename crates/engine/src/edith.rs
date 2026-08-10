@@ -341,7 +341,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 }
                 let f = fields(rest, 2, "resolution", n)?;
                 let (width, height) = (number(f[0], n)?, number(f[1], n)?);
-                if width == 0 || height == 0 {
+                // The same bound the keystroke has (`crate::is_resolution`):
+                // unbounded here, this line reached `open_black` and panicked
+                // the open with a capacity overflow.
+                if !crate::is_resolution(width, height) {
                     return Err(format!("line {n}: {width}x{height} is not a picture").into());
                 }
                 doc.resolution = Some((width, height));

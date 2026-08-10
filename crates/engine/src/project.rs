@@ -994,28 +994,60 @@ impl Project {
     ///
     /// `V1` and `A1` and no other lane, because a take is one picture and one
     /// sound: copying it onto every lane there is would play the same audio
-    /// twice over (and leave an mp4 export with two tracks to copy). The room is
-    /// still opened everywhere, or the lanes it was not inserted into would slide
-    /// out of step with the ones it was.
+    /// twice over (and leave an mp4 export with two tracks to copy). A clip of a
+    /// source with no picture ([`crate::is_audio`]) reaches `A1` only -- on a
+    /// video lane it is a clip that decodes to nothing, and a save carrying one
+    /// does not open again. The room is still opened everywhere, or the lanes it
+    /// was not inserted into would slide out of step with the ones it was.
     ///
     /// Exactly one history snapshot, so one [`Project::undo`] takes it back.
-    /// Changes the timeline->source mapping: the caller must reseek. Refused
-    /// only for an empty `clip`, which the never-empty invariant forbids but the
-    /// public fields still allow a caller to build.
+    /// Changes the timeline->source mapping: the caller must reseek. Refused for
+    /// an empty `clip` and for one naming a source that is not there (both of
+    /// which the public fields let a caller build), and for a paste whose ripple
+    /// would push a clip past the last frame there is -- nothing is changed by
+    /// any of them.
     pub fn paste(&mut self, timeline_frame: u32, clip: Clip) -> bool {
+        let Some(source) = self.sources.get(clip.source) else {
+            return false;
+        };
         if clip.out_frame <= clip.in_frame {
             return false;
         }
-        self.snapshot();
+        let audio_only = crate::is_audio(&source.path);
         let at = timeline_frame.min(self.timeline_frames());
+        let len = clip.len();
+        // Room for it: `open_room` adds `len` to every start from `at` on, and a
+        // hand-written file may hold a clip that ends at the very last frame
+        // (`edith::check` permits `start + len == u32::MAX`). Refused here
+        // rather than wrapped there -- a wrapped start lands *behind* the clip
+        // it belongs after, which is an overlap no save will read back.
+        if at.checked_add(len).is_none()
+            || self
+                .lanes
+                .iter()
+                .flat_map(|l| &l.clips)
+                .any(|c| c.end() > at && c.end().checked_add(len).is_none())
+        {
+            return false;
+        }
+        self.snapshot();
         let clip = Clip {
             start: at,
             link: Some(self.new_link()),
             ..clip
         };
-        let takes: Vec<usize> = [LaneKind::Video, LaneKind::Audio]
-            .into_iter()
-            .filter_map(|kind| self.index(Lane::new(kind, 0)))
+        // Only lanes that can play the source: a file with no picture belongs on
+        // an audio lane and nowhere else, exactly as `place_stream_at` decides
+        // it for an import. On a video lane it would decode to nothing, and the
+        // save it wrote would not open again.
+        let kinds: &[LaneKind] = if audio_only {
+            &[LaneKind::Audio]
+        } else {
+            &[LaneKind::Video, LaneKind::Audio]
+        };
+        let takes: Vec<usize> = kinds
+            .iter()
+            .filter_map(|&kind| self.index(Lane::new(kind, 0)))
             .collect();
         for (i, data) in self.lanes.iter_mut().enumerate() {
             open_room(&mut data.clips, at, clip.len());
@@ -1738,6 +1770,71 @@ mod tests {
         let mut p = three();
         assert!(!p.paste(4, clip(0, 7, 7, 0)));
         assert_eq!(p.clips().len(), 3);
+    }
+
+    /// The data-loss paste: a clip of a source with no picture used to land on
+    /// `V1` as well as `A1`, where it decodes to nothing -- and the save that
+    /// carried it was refused on the way back in ("a box with a larger size").
+    #[test]
+    fn a_paste_of_a_source_with_no_picture_stays_off_the_video_lane() {
+        let mut p = three();
+        let wav = p.import("/nonexistent/song.wav", 0);
+        let copied = Clip {
+            source: wav,
+            ..PASTED
+        };
+        assert!(p.paste(3, copied));
+        // The room is opened on every lane, or the two would slide apart...
+        assert_eq!(p.timeline_frames(), 11);
+        assert_eq!(
+            shape(&p)[0],
+            vec![clip(0, 0, 3, 0), clip(5, 3, 5, 0), clip(7, 5, 9, 0)],
+            "the video lane got room and nothing else"
+        );
+        // ...but the clip itself only reaches the lane that can play it.
+        assert_eq!(
+            shape(&p)[1],
+            vec![
+                clip(0, 0, 3, 0),
+                clip(3, 100, 102, wav),
+                clip(5, 3, 5, 0),
+                clip(7, 5, 9, 0)
+            ]
+        );
+        // A source with a picture is unchanged: still the grouped pair.
+        let mut p = three();
+        assert!(p.paste(3, PASTED));
+        assert_eq!(shape(&p)[0], shape(&p)[1]);
+    }
+
+    /// A hand-written file may hold a clip that ends at the very last frame
+    /// (`edith::check` permits `start + len == u32::MAX`), and the ripple used
+    /// to wrap its start round to the front of the lane: an overlap in debug, a
+    /// project no reload would accept in release.
+    #[test]
+    fn a_paste_that_would_run_past_the_last_frame_is_refused() {
+        let far = clip(u32::MAX - 90, 0, 90, 0);
+        let parts = |c: Clip| {
+            Project::from_parts(
+                vec![Source::new(FILE, 0)],
+                two(vec![c], vec![c]),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("valid parts")
+        };
+        let mut p = parts(far);
+        assert!(!p.paste(0, PASTED), "no room for the two frames it adds");
+        assert_eq!(shape(&p)[0], vec![far], "a refusal changes nothing");
+        assert!(!p.undo(), "...and pushes no history either");
+        assert!(
+            !p.paste(u32::MAX, PASTED),
+            "appending has nowhere to go either: the timeline ends at the last frame"
+        );
+        // With room for exactly those frames the same paste is taken.
+        let mut p = parts(clip(u32::MAX - 92, 0, 90, 0));
+        assert!(p.paste(0, PASTED));
+        assert_eq!(p.lane(Lane::V1)[1].end(), u32::MAX);
     }
 
     #[test]
