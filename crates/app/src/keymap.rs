@@ -45,6 +45,9 @@ pub enum ActionId {
     Paste,
     Cut,
     Regroup,
+    Select,
+    SelectNext,
+    SelectPrev,
     Delete,
     Lift,
     Color,
@@ -63,7 +66,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 20] = [
+    pub const ALL: [ActionId; 23] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -71,6 +74,9 @@ impl ActionId {
         ActionId::Paste,
         ActionId::Cut,
         ActionId::Regroup,
+        ActionId::Select,
+        ActionId::SelectNext,
+        ActionId::SelectPrev,
         ActionId::Delete,
         ActionId::Lift,
         ActionId::Color,
@@ -96,6 +102,9 @@ impl ActionId {
             ActionId::Paste => "Paste",
             ActionId::Cut => "Cut",
             ActionId::Regroup => "Regroup",
+            ActionId::Select => "Select the clip under the playhead (again for the next lane)",
+            ActionId::SelectNext => "Select the next clip in the lane",
+            ActionId::SelectPrev => "Select the previous clip in the lane",
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Color => "Colour…",
@@ -123,6 +132,9 @@ impl ActionId {
             ActionId::Paste => "paste",
             ActionId::Cut => "cut",
             ActionId::Regroup => "regroup",
+            ActionId::Select => "select",
+            ActionId::SelectNext => "select-next",
+            ActionId::SelectPrev => "select-prev",
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Color => "color",
@@ -151,6 +163,9 @@ impl ActionId {
             ActionId::Play => Category::Playback,
             ActionId::Copy
             | ActionId::Paste
+            | ActionId::Select
+            | ActionId::SelectNext
+            | ActionId::SelectPrev
             | ActionId::Delete
             | ActionId::Lift
             | ActionId::Color
@@ -384,6 +399,14 @@ impl Keymap {
                 // The two lane keys, on the letters they are named after: both
                 // were free, and neither is next to a key that edits.
                 b(ActionId::Regroup, "g", false),
+                // Selection without a pointer. Tab is what a keyboard already
+                // means by "move on to the next thing", and the two brackets
+                // are the pair either side of it in the lane -- shift+tab is
+                // the obvious partner and is unspellable here, since a chord
+                // carries only ctrl and `parse` refuses an uppercase key.
+                b(ActionId::Select, "tab", false),
+                b(ActionId::SelectNext, "]", false),
+                b(ActionId::SelectPrev, "[", false),
                 b(ActionId::Delete, "x", false),
                 b(ActionId::Delete, "delete", false),
                 b(ActionId::Lift, "l", false),
@@ -640,7 +663,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 22);
+        assert_eq!(k.entries().len(), 25);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -648,6 +671,10 @@ mod tests {
         assert_eq!(k.lookup("v", true), Some(ActionId::Paste));
         assert_eq!(k.lookup("c", false), Some(ActionId::Cut));
         assert_eq!(k.lookup("g", false), Some(ActionId::Regroup));
+        // The keyboard's way onto a clip, and the pair that walks the lane.
+        assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
+        assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
+        assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
         assert_eq!(k.lookup("x", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
@@ -794,7 +821,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 20);
+        assert_eq!(ActionId::ALL.len(), 23);
     }
 
     #[test]

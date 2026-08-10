@@ -501,6 +501,9 @@ impl Player {
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),
             ActionId::Regroup => self.regroup(cx),
+            ActionId::Select => self.select_under_playhead(cx),
+            ActionId::SelectNext => self.select_step(true, cx),
+            ActionId::SelectPrev => self.select_step(false, cx),
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Color => self.open_color(cx),
@@ -516,6 +519,73 @@ impl Player {
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
+        }
+    }
+
+    /// The one place a clip becomes *the* selected one: a click, a right-click
+    /// that opens the menu, and every selection key go through here, so what a
+    /// keyboard marks and what a pointer marks are the same state marked the
+    /// same way (group and all -- see [`marked`]).
+    fn select(&mut self, target: (Lane, usize), cx: &mut Context<Self>) {
+        self.selected = Some(target);
+        cx.notify();
+    }
+
+    /// Every clip the playhead is over, one per lane, in the order the lanes are
+    /// drawn -- video first, which is the order [`PlaybackSession::lanes`] comes
+    /// in. What the select key walks.
+    fn under_playhead(&self) -> Vec<(Lane, usize)> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let now = session.now();
+        session
+            .lanes()
+            .into_iter()
+            .filter_map(|lane| Some((lane, session.lane_clip_at(lane, now)?)))
+            .collect()
+    }
+
+    /// Selects the clip under the playhead, and on a repeat press the next
+    /// lane's -- so one key reaches every clip the playhead is over, which is
+    /// what makes selection (and everything that acts on a selection: delete,
+    /// lift, the equalizer, the grade) reachable with no pointer at all.
+    fn select_under_playhead(&mut self, cx: &mut Context<Self>) {
+        let under = self.under_playhead();
+        let Some(&first) = under.first() else {
+            self.notice = Some("NOTHING UNDER THE PLAYHEAD — move it onto a clip first".into());
+            cx.notify();
+            return;
+        };
+        // Where the current selection sits in that walk decides what "again"
+        // means; a selection off the playhead starts the walk over.
+        let next = self
+            .selected
+            .and_then(|sel| under.iter().position(|&clip| clip == sel))
+            .map_or(first, |at| under[(at + 1) % under.len()]);
+        self.select(next, cx);
+    }
+
+    /// Walks the selection along its own lane, wrapping at either end. Nothing
+    /// selected means nothing to walk from, so it selects under the playhead
+    /// exactly as the select key does: either key can start as well as continue.
+    fn select_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let clips = self
+            .selected
+            .zip(self.session.as_ref())
+            .map_or(0, |((lane, _), session)| session.lane_clips(lane).len());
+        match (self.selected, clips) {
+            // An empty lane is a selection nothing can be stepped from -- as is
+            // no selection at all, and the playhead answers both.
+            (Some((lane, idx)), len) if len > 0 => {
+                let next = if forward {
+                    (idx + 1) % len
+                } else {
+                    (idx + len - 1) % len
+                };
+                self.select((lane, next), cx);
+            }
+            _ => self.select_under_playhead(cx),
         }
     }
 
@@ -580,9 +650,9 @@ impl Player {
     /// Opens the colour card on the clip a grade would go on: the clip that was
     /// clicked when it is a video one, and otherwise the clip the picture is
     /// coming from -- the one the engine's own compositing rule picks, which is
-    /// what a person means by "this shot". That fallback is also what makes the
-    /// card reachable with no pointer at all: clip selection is a click and
-    /// nothing else (ledger:182).
+    /// what a person means by "this shot". The fallback stands even now that a
+    /// selection key exists: a grade asked for with nothing selected still means
+    /// the shot on screen.
     fn open_color(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -669,10 +739,13 @@ impl Player {
             return;
         }
         let refusal = match (self.selected, &self.session) {
-            (_, None) => Some("NO TIMELINE — open a file first"),
-            (None, _) => Some("NOTHING SELECTED — click an audio clip, then ask again"),
+            (_, None) => Some("NO TIMELINE — open a file first".to_string()),
+            (None, _) => Some(format!(
+                "NOTHING SELECTED — click an audio clip or press {}, then ask again",
+                self.keymap.display(ActionId::Select)
+            )),
             (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
-                "NOT AN AUDIO CLIP — the equalizer works on the sound, so pick a clip in an audio lane",
+                "NOT AN AUDIO CLIP — the equalizer works on the sound, so pick a clip in an audio lane".to_string(),
             ),
             _ => None,
         };
@@ -3169,7 +3242,10 @@ impl Player {
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
         let tip: SharedString = format!(
-            "Select — {} removes the take, {} leaves a gap, {} rejoins a cut",
+            "Select (or {} under the playhead, {}/{} along the lane) — {} removes the take, {} leaves a gap, {} rejoins a cut",
+            self.keymap.display(ActionId::Select),
+            self.keymap.display(ActionId::SelectPrev),
+            self.keymap.display(ActionId::SelectNext),
             self.keymap.display(ActionId::Delete),
             self.keymap.display(ActionId::Lift),
             self.keymap.display(ActionId::Regroup)
@@ -3272,8 +3348,7 @@ impl Player {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    this.selected = Some((lane, i));
-                                    cx.notify();
+                                    this.select((lane, i), cx);
                                 }),
                             )
                             // The right button selects exactly as the left one
@@ -3286,7 +3361,7 @@ impl Player {
                                     if this.modal() {
                                         return;
                                     }
-                                    this.selected = Some((lane, i));
+                                    this.select((lane, i), cx);
                                     this.context_menu = Some(ContextMenu {
                                         lane,
                                         idx: i,
