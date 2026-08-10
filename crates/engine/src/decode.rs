@@ -446,6 +446,16 @@ impl Still {
     /// Decodes `path`. Refused by name for a picture that is not one
     /// ([`crate::is_resolution`]): an 8K limit that a keystroke and a project
     /// file are both held to cannot be walked around by a 30000-pixel-wide PNG.
+    ///
+    /// Alpha is *dropped*, not composited: `to_rgb8` discards the channel, so a
+    /// transparent PNG arrives fully opaque over its own colours rather than
+    /// over the clip beneath it. I420 has nowhere to carry it and this engine
+    /// composes one picture per frame (topmost lane wins), so there is nothing
+    /// for a blend to blend with.
+    ///
+    /// ponytail: the ceiling is a logo with a transparent background, which
+    /// lands as a rectangle. Upgrade path is keeping the alpha plane here and
+    /// giving `scale::Composer` a blend over the lane below.
     pub(crate) fn open(path: &Path) -> crate::Result<Self> {
         let reader = image::ImageReader::open(path)?.with_guessed_format()?;
         let rgb = reader
