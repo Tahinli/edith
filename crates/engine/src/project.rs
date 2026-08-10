@@ -15,8 +15,10 @@
 //!   splice of the list;
 //! * the lanes are independent and are peers: deleting audio under a picture is
 //!   one lane's business, and the picture does not shift. No lane is special
-//!   except by what a *caller* reads -- playback and export take `V1`, the audio
-//!   worker takes `A1`, until a compositing slice teaches them the rest.
+//!   except by what a *caller* reads -- and what playback and export read is the
+//!   whole stack: [`Project::composite_span_at`] resolves the video lanes to the
+//!   one picture that shows, [`Project::audio_segments_from`] hands every audio
+//!   lane over to be summed.
 //!
 //! The price is one invariant this module enforces at every mutation and every
 //! constructor: within a lane, clips are **sorted by `start` and never overlap**
@@ -638,6 +640,80 @@ impl Project {
         out
     }
 
+    /// What the *composite* shows from `timeline_frame` on -- the answer
+    /// [`span_at`](Project::span_at) gives for one lane, resolved across every
+    /// video lane by one rule: **the topmost lane with a clip there wins**, and
+    /// topmost is the *last* video lane in display order, so `V2` covers `V1`
+    /// (the usual overlay convention). A frame no video lane covers is a gap,
+    /// which is black however many lanes are above or below it.
+    ///
+    /// No blending, so exactly one lane is visible at a time and the composite
+    /// is itself a span list -- which is why one decoder plays it, the same one
+    /// a single-lane timeline uses, rather than N running at once.
+    ///
+    /// The span is cut short wherever a *higher* lane's clip starts, because
+    /// from that frame on a different lane wins; that is what makes walking
+    /// [`composite_spans_from`](Project::composite_spans_from) correct.
+    ///
+    /// ponytail: alpha, opacity or any blend mode makes this untrue -- two
+    /// lanes would then be visible in one frame and the caller needs a decoder
+    /// per lane plus a compositor. Upgrade path is a `Vec<Span>` per frame
+    /// (this same walk, per lane) feeding N decoders.
+    pub fn composite_span_at(&self, timeline_frame: u32) -> Option<Span> {
+        let total = self.timeline_frames();
+        if timeline_frame >= total {
+            return None;
+        }
+        let video: Vec<Lane> = self
+            .lanes()
+            .into_iter()
+            .filter(|l| l.kind == LaneKind::Video)
+            .collect();
+        // The last covering lane is the winner; only the lanes above it can
+        // interrupt what it shows.
+        let winner = video
+            .iter()
+            .rposition(|&lane| at(self.lane(lane), timeline_frame).is_some());
+        let (from, until) = match winner {
+            Some(i) => {
+                let clips = self.lane(video[i]);
+                let idx = at(clips, timeline_frame).expect("just found above");
+                (
+                    Some((
+                        clips[idx].source,
+                        clips[idx].in_frame + (timeline_frame - clips[idx].start),
+                    )),
+                    clips[idx].end(),
+                )
+            }
+            // Nothing covers it: black until something above the floor starts.
+            None => (None, total),
+        };
+        let takeover = video[winner.map_or(0, |i| i + 1)..]
+            .iter()
+            .filter_map(|&lane| self.lane(lane).iter().find(|c| c.start > timeline_frame))
+            .map(|c| c.start)
+            .min();
+        Some(Span {
+            start: timeline_frame,
+            len: takeover.map_or(until, |t| t.min(until)) - timeline_frame,
+            from,
+        })
+    }
+
+    /// [`spans_from`](Project::spans_from) over the composite: every stretch the
+    /// viewer sees from `timeline_frame` to the end, in order. What an export
+    /// encodes and what playback walks at a clip boundary.
+    pub fn composite_spans_from(&self, timeline_frame: u32) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut t = timeline_frame;
+        while let Some(span) = self.composite_span_at(t) {
+            t = span.end();
+            out.push(span);
+        }
+        out
+    }
+
     /// Split every lane at `timeline_frame`, so that frame becomes the first
     /// frame of a new clip, and hand the two sides two fresh group ids. Refused
     /// (`false`, no change) when no lane has a clip to split there -- at a
@@ -858,10 +934,20 @@ impl Project {
     /// The first entry is partial when the position is mid-clip. Empty when the
     /// position is past the end or `fps` is not usable.
     pub fn segments_from(&self, timeline_frame: u32, fps: f64) -> Vec<(Option<usize>, f64, f64)> {
+        self.lane_segments_from(Lane::A1, timeline_frame, fps)
+    }
+
+    /// [`segments_from`](Project::segments_from) for a named lane.
+    pub fn lane_segments_from(
+        &self,
+        lane: Lane,
+        timeline_frame: u32,
+        fps: f64,
+    ) -> Vec<(Option<usize>, f64, f64)> {
         if !(fps.is_finite() && fps > 0.0) {
             return Vec::new();
         }
-        self.spans_from(Lane::A1, timeline_frame)
+        self.spans_from(lane, timeline_frame)
             .iter()
             .map(|span| match span.from {
                 // A clip's window is in *source* seconds: where in the file it
@@ -875,6 +961,32 @@ impl Project {
                 None => (None, 0.0, f64::from(span.len) / fps),
             })
             .collect()
+    }
+
+    /// One play list per audio lane that *holds* something, in display order --
+    /// what the mixer sums ([`crate::AudioSession::open_mixed_streams`]) and
+    /// what an export asks how many lanes it would have to mix.
+    ///
+    /// Never empty: a timeline whose audio lanes are all empty (or which has no
+    /// audio lane at all) still yields one all-gap list, so it plays silence
+    /// against a master clock exactly as it did before there were lanes to
+    /// count. Lanes with nothing on them are left out rather than mixed in as
+    /// silence: they would cost a decode thread each and add zero.
+    pub fn audio_segments_from(
+        &self,
+        timeline_frame: u32,
+        fps: f64,
+    ) -> Vec<Vec<(Option<usize>, f64, f64)>> {
+        let lists: Vec<_> = self
+            .lanes()
+            .into_iter()
+            .filter(|l| l.kind == LaneKind::Audio && !self.lane(*l).is_empty())
+            .map(|lane| self.lane_segments_from(lane, timeline_frame, fps))
+            .collect();
+        match lists.is_empty() {
+            true => vec![self.lane_segments_from(Lane::A1, timeline_frame, fps)],
+            false => lists,
+        }
     }
 
     /// Pushes the undo snapshot. Every mutating method calls this once, *after*
@@ -2415,5 +2527,124 @@ mod tests {
                 reloads(&p, &format!("seed {seed}, step {step}"));
             }
         }
+    }
+
+    /// The compositing rule, in one walk: `V2` covers `V1` while it has a clip
+    /// there, `V1` shows again on either side of it, and a frame no video lane
+    /// covers is a gap however many lanes there are.
+    #[test]
+    fn the_composite_is_the_topmost_lane_with_a_clip() {
+        let sources = vec![Source::new(FILE, 0), Source::new(FILE2, 0)];
+        let lanes = vec![
+            // V1: the whole 30 frames of source 0.
+            (LaneKind::Video, vec![clip(0, 0, 30, 0)]),
+            // V2: source 1 over the middle third.
+            (LaneKind::Video, vec![clip(10, 5, 15, 1)]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
+        ];
+        let p = Project::from_parts(sources, lanes, vec![]).expect("valid parts");
+        assert_eq!(
+            p.composite_spans_from(0),
+            vec![
+                Span {
+                    start: 0,
+                    len: 10,
+                    from: Some((0, 0))
+                },
+                Span {
+                    start: 10,
+                    len: 10,
+                    from: Some((1, 5))
+                },
+                Span {
+                    start: 20,
+                    len: 10,
+                    from: Some((0, 20))
+                },
+            ],
+            "V2 takes over for its own span and hands V1 back"
+        );
+        // A mid-span ask resolves the same way, which is what a seek does.
+        assert_eq!(
+            p.composite_span_at(15),
+            Some(Span {
+                start: 15,
+                len: 5,
+                from: Some((1, 10))
+            })
+        );
+        assert_eq!(p.composite_span_at(30), None, "past the end");
+
+        // A hole in V1 under V2's clip: black between the two, and black after
+        // both run out (the audio lane is still holding the timeline open).
+        let sources = vec![Source::new(FILE, 0), Source::new(FILE2, 0)];
+        let holed = vec![
+            (LaneKind::Video, vec![clip(0, 0, 5, 0)]),
+            (LaneKind::Video, vec![clip(10, 0, 10, 1)]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
+        ];
+        let p = Project::from_parts(sources, holed, vec![]).expect("valid parts");
+        assert_eq!(
+            p.composite_spans_from(0),
+            vec![
+                Span {
+                    start: 0,
+                    len: 5,
+                    from: Some((0, 0))
+                },
+                Span {
+                    start: 5,
+                    len: 5,
+                    from: None
+                },
+                Span {
+                    start: 10,
+                    len: 10,
+                    from: Some((1, 0))
+                },
+                Span {
+                    start: 20,
+                    len: 10,
+                    from: None
+                },
+            ]
+        );
+
+        // One video lane: the composite *is* that lane, span for span -- the
+        // promise every existing two-lane project rests on.
+        let p = Project::single(FILE, 30);
+        assert_eq!(p.composite_spans_from(0), p.spans_from(Lane::V1, 0));
+        assert_eq!(p.composite_span_at(7), p.span_at(Lane::V1, 7));
+    }
+
+    /// Every audio lane holding something gets a play list, and only those.
+    #[test]
+    fn audio_segments_cover_every_lane_that_holds_something() {
+        let sources = vec![Source::new(FILE, 0), Source::new(FILE2, 0)];
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 30, 0)]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
+            (LaneKind::Audio, vec![clip(15, 0, 15, 1)]),
+            (LaneKind::Audio, Vec::new()),
+        ];
+        let p = Project::from_parts(sources, lanes, vec![]).expect("valid parts");
+        let lists = p.audio_segments_from(0, FPS);
+        assert_eq!(lists.len(), 2, "the empty lane is not mixed in");
+        assert_eq!(lists[0], p.segments_from(0, FPS), "A1 is unchanged");
+        // A2 is a gap up to frame 15, then the whole of source 1.
+        assert_eq!(lists[1], vec![(None, 0.0, 0.5), (Some(1), 0.0, 0.5)]);
+
+        // No audio lane holds anything: one all-gap list, so such a timeline
+        // still plays silence against a master clock.
+        let p = Project::from_parts(
+            vec![Source::new(FILE, 0)],
+            vec![
+                (LaneKind::Video, vec![clip(0, 0, 30, 0)]),
+                (LaneKind::Audio, Vec::new()),
+            ],
+            vec![],
+        )
+        .expect("valid parts");
+        assert_eq!(p.audio_segments_from(0, FPS), vec![vec![(None, 0.0, 1.0)]]);
     }
 }
