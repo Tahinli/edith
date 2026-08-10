@@ -246,7 +246,7 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.lanes)?;
+        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq)?;
         let span = project.span_at(Lane::V1, 0).expect("never empty");
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -300,10 +300,10 @@ impl PlaybackSession {
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
-        let (sources, lanes) = self.project.without_orphan_sources();
+        let (sources, lanes, eq) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
-        crate::edith::save(path, &sources, &lanes, playhead)
+        crate::edith::save(path, &sources, &lanes, &eq, playhead)
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a
@@ -537,6 +537,7 @@ impl PlaybackSession {
             out_frame: frames.max(1),
             source,
             link: None,
+            eq: None,
         };
         // Which lane a source may land on is decided here and only here, so a
         // front-end never has to make the same call twice: a file with no
@@ -643,6 +644,7 @@ impl PlaybackSession {
                 out_frame: frames,
                 source,
                 link: None,
+                eq: None,
             },
         );
         // Same reason as a video import: the running audio worker's segment

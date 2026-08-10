@@ -126,9 +126,9 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<Source>, f64
 
 /// The version-1 promise: a file written before the lanes existed still opens,
 /// as one grouped video+audio pair per clip laid end to end, and saving it
-/// again writes version 4 -- which reopens as the same timeline.
+/// again writes version 5 -- which reopens as the same timeline.
 #[test]
-fn a_version_1_project_loads_fully_grouped_and_saves_as_version_4() {
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_5() {
     let dir = scratch("v1");
     copy_in(&dir, "test_av.mp4");
     let path = dir.join("old.edith");
@@ -156,11 +156,11 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_4() {
         "playhead kept"
     );
 
-    // Saved again it is v4, and v4 round-trips to the same timeline.
+    // Saved again it is v5, and v5 round-trips to the same timeline.
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 4\n"), "{text}");
+    assert!(text.starts_with("edith 5\n"), "{text}");
     assert_eq!(
         text.lines().filter(|l| l.starts_with("video ")).count(),
         2,
@@ -237,14 +237,42 @@ fn a_version_4_project_holds_more_than_two_lanes() {
     );
     assert_eq!(loaded.timeline_duration(), 60.0 / loaded.meta().frame_rate);
 
-    // ...and saving it writes back the same bytes: the lane list, its order and
-    // the empty lane all survive the round trip.
+    // ...and saving it writes the v5 twin of what it read: the lane list, its
+    // order and the empty lane all survive, each clip now saying it plays flat.
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        "edith 5\nplayhead 0\nsource 0 test_av.mp4\n\
+         video 1 0 0 30 0 3 -\naudio 1\nvideo 2 40 0 20 0 - -\naudio 2 0 0 30 0 3 -\n",
+        "a four-lane project is written as it was read, one version on"
+    );
+}
+
+/// What version 5 is for: a clip carries equalizer settings, the file names
+/// them once for however many clips share them, and the whole thing survives
+/// the engine's own door -- open, save, byte for byte the file it read.
+#[test]
+fn a_version_5_project_carries_per_clip_equalizers() {
+    let dir = scratch("v5_eq");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("eq.edith");
+    // Two clips on one curve, one on another, one flat.
+    let text = "edith 5\nplayhead 0\nsource 0 test_av.mp4\n\
+                eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
+                eq 12000.0:6.25:0.5:hs\n\
+                video 1 0 0 30 0 - 0\nvideo 1 30 30 60 0 - 1\n\
+                audio 1 0 0 30 0 - 0\naudio 1 30 30 60 0 - -\n";
+    std::fs::write(&path, text).expect("write a v5 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a v5 project opens");
+    assert_eq!(loaded.lane_clips(engine::project::Lane::V1).len(), 2);
     let again = dir.join("again.edith");
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
         text,
-        "a four-lane project is written as it was read"
+        "the equalizer table and every clip's index survive a round trip"
     );
 }
 
@@ -459,8 +487,17 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 
     for (text, want) in [
         (
-            "edith 5\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 -\n",
+            "edith 6\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - -\n",
             "line 1",
+        ),
+        // An eq index the table does not hold, and a band shape there is none.
+        (
+            "edith 5\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - 0\n",
+            "line 3",
+        ),
+        (
+            "edith 5\nsource 0 test_av.mp4\neq 80.0:0.0:0.707:band\nvideo 1 0 0 30 0 - 0\n",
+            "line 3",
         ),
         // A lane number that skips one of its kind: V2 was never declared.
         (

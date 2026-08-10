@@ -191,6 +191,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
         out_frame: meta.frame_count,
         source: 0,
         link: Some(0),
+        eq: None,
     };
     // Stream 1 is the 22.05 kHz mono French track; stream 0 is 44.1 kHz
     // stereo. A project may only hold streams that agree, so this timeline is
@@ -204,6 +205,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
             (engine::project::LaneKind::Video, vec![whole]),
             (engine::project::LaneKind::Audio, vec![whole]),
         ],
+        Vec::new(),
     )
     .expect("a one-source project on stream 1");
     let out = out_path("stream1");
