@@ -116,6 +116,31 @@ mod tests {
         }
     }
 
+    /// A song's clip draws like any other: this goes through the same
+    /// `open_multi_streams` the timeline plays with, which reads a standalone
+    /// audio file on stream 0 as readily as an mp4's AAC track.
+    #[test]
+    fn a_standalone_audio_file_has_peaks_too() {
+        let peaks = peaks(asset("test_tone.mp3"), 0, BPS)
+            .expect("open")
+            .expect("test_tone.mp3 is audio");
+        let want = 3 * BPS as usize; // 3 s of tone, mp3 padding may spill one
+        assert!(
+            peaks.len().abs_diff(want) <= 2,
+            "{} buckets, want {want} +/-2",
+            peaks.len()
+        );
+        // The fixture carries the A/V one's 1 Hz envelope, so the middle second
+        // has a dip and a peak. As a ratio, and a looser one: the tone sits
+        // around an eighth of full scale and mp3 does not preserve a true zero.
+        let level = |&(lo, hi): &(f32, f32)| hi - lo;
+        let band = &peaks[BPS as usize..][..BPS as usize];
+        let dip = band.iter().map(level).fold(f32::MAX, f32::min);
+        let loudest = band.iter().map(level).fold(0.0, f32::max);
+        assert!(loudest > 0.05, "peak level only {loudest}");
+        assert!(dip < 0.2 * loudest, "dip {dip} against peak {loudest}");
+    }
+
     #[test]
     fn video_only_source_has_no_peaks() {
         assert!(
