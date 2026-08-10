@@ -13,12 +13,13 @@ use engine::audio::StreamInfo;
 use engine::color::ColorParams;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
-use engine::project::{Lane, LaneKind, Source};
+use engine::project::{Edge, Lane, LaneKind, Source};
 use engine::scale::FitPolicy;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point,
     RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds,
     WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
@@ -216,6 +217,31 @@ struct ClipDrag {
     idx: usize,
 }
 
+/// A clip edge being dragged: which end of which clip, and the timeline frame
+/// the pointer has pulled it to. The box on screen is drawn from `to` while this
+/// is set and the engine hears about it once, at the release
+/// ([`Player::commit_trim`]) -- one edit, one undo step for the whole gesture,
+/// exactly as an equalizer drag works.
+#[derive(Clone, Copy)]
+struct Trim {
+    lane: Lane,
+    idx: usize,
+    edge: Edge,
+    /// Already clamped by `PlaybackSession::trim_room`, so the width drawn from
+    /// it is the width the release commits -- an edge stops under the pointer
+    /// rather than snapping back after the fact.
+    to: u32,
+    /// The dragged clip's group, so its other halves' boxes follow the edge on
+    /// screen exactly as the engine will move them.
+    link: Option<u32>,
+}
+
+/// How wide a clip's edge is as a *target*: the strip at each end where a press
+/// means "make this longer or shorter" instead of "move this to another lane".
+/// Wide enough to hit, narrow enough that the middle of even a small box is
+/// still the body.
+const EDGE_W: f32 = 6.;
+
 /// An open clip menu: which clip it was opened on, where it hangs, and whether
 /// it has been turned over to show what that clip *is* instead of what can be
 /// done to it. The lane and index are the ones the same click selected, so
@@ -359,6 +385,10 @@ struct Player {
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
+    /// A drag that started on a clip's edge, tracked on the root for
+    /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
+    /// [`Trim`].
+    trim: Option<Trim>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -527,6 +557,11 @@ impl Player {
         self.eos = false;
         self.done = false;
         self.pending_seek = true;
+        // An edit moves the indices a drag in flight is holding -- a stroke
+        // during one is exactly that -- and an edge committed against a moved
+        // index would trim a clip nobody grabbed. Dropping it is the whole fix:
+        // nothing has been written yet.
+        self.trim = None;
     }
 
     /// What an action does, wherever it was asked for -- a stroke, or the clip
@@ -1168,6 +1203,135 @@ impl Player {
         cx.notify();
     }
 
+    /// Opens the clip menu on the box under the pointer, from the right button
+    /// wherever it was pressed on that box -- its middle or one of its edge
+    /// strips, which cover the middle's own listener. Selecting first is part of
+    /// it: every item acts on the clip the menu names.
+    fn open_menu(&mut self, lane: Lane, idx: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.select((lane, idx), cx);
+        self.context_menu = Some(ContextMenu {
+            lane,
+            idx,
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
+    /// A press on a clip's edge: the start of the drag that changes how much of
+    /// its source it plays. It selects the clip as a press anywhere else on the
+    /// box does -- the edge strip covers the box's own listener (`occlude`), so
+    /// this is the only one that fires there.
+    fn start_trim(&mut self, lane: Lane, idx: usize, edge: Edge, cx: &mut Context<Self>) {
+        if self.modal() || self.exporting().is_some() {
+            return;
+        }
+        let Some(clip) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+        else {
+            return;
+        };
+        self.select((lane, idx), cx);
+        self.trim = Some(Trim {
+            lane,
+            idx,
+            edge,
+            // Where the edge already is: a press that never moves is not an
+            // edit, and `Project::trim` refuses exactly that.
+            to: match edge {
+                Edge::Start => clip.start,
+                Edge::End => clip.end(),
+            },
+            link: clip.link,
+        });
+        cx.notify();
+    }
+
+    /// Where the pointer has pulled the edge to, clamped to the room the engine
+    /// says that edge has. Along the same bed the ruler is measured on and
+    /// against the same duration the boxes are drawn to, so the edge tracks the
+    /// pointer exactly.
+    fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let (duration, fps) = (self.drawn_duration(), self.fps);
+        let frac = frac_along(x, self.ruler.get());
+        let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
+            return;
+        };
+        let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
+            return;
+        };
+        trim.to = frame_at(f64::from(frac) * duration, fps).clamp(lo, hi);
+        cx.notify();
+    }
+
+    /// The release: the whole drag reaches the engine as one edit, so it is one
+    /// undo step. The selection survives it -- a trim inserts and removes
+    /// nothing, so every index a lane had still names the clip it named.
+    fn commit_trim(&mut self, cx: &mut Context<Self>) {
+        let Some(trim) = self.trim.take() else {
+            return;
+        };
+        let trimmed = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.trim_clip(trim.lane, trim.idx, trim.edge, trim.to));
+        if trimmed {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// The clip as the drag is showing it: an edge under the pointer moves its
+    /// own box, and the boxes of the halves linked to it, before anything is
+    /// committed. Display only -- the project is not touched until the release.
+    fn trimmed(&self, lane: Lane, idx: usize, clip: Clip) -> Clip {
+        let Some(trim) = self.trim.filter(|t| {
+            (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == clip.link)
+        }) else {
+            return clip;
+        };
+        match trim.edge {
+            // The in-point follows the head, exactly as `Project::trim` moves
+            // it: what stays on screen plays what it always played.
+            Edge::Start => Clip {
+                in_frame: (i64::from(clip.in_frame) + i64::from(trim.to) - i64::from(clip.start))
+                    .clamp(0, i64::from(clip.out_frame - 1)) as u32,
+                start: trim.to,
+                ..clip
+            },
+            Edge::End => Clip {
+                out_frame: clip.in_frame + trim.to.saturating_sub(clip.start).max(1),
+                ..clip
+            },
+        }
+    }
+
+    /// How long the timeline is *drawn* as: its own length, and while a tail is
+    /// being dragged the furthest that tail may reach. A bed that ends exactly
+    /// at the last frame has nowhere to put a pointer that means "longer", so
+    /// without this the last clip on the timeline could be pulled in and never
+    /// let back out.
+    fn drawn_duration(&self) -> f64 {
+        let Some(session) = &self.session else {
+            return 0.;
+        };
+        let duration = session.timeline_duration();
+        match self.trim {
+            Some(trim) if trim.edge == Edge::End => {
+                let (_, hi) = session
+                    .trim_room(trim.lane, trim.idx, trim.edge)
+                    .unwrap_or((0, 0));
+                duration.max(f64::from(hi) / self.fps)
+            }
+            _ => duration,
+        }
+    }
+
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
     /// "add this source" does. The whole source goes in at the playhead as one
@@ -1690,11 +1854,9 @@ impl Render for Player {
         }
 
         // Read per render, never cached: a delete shortens the timeline and the
-        // timecode, the ruler and the clamp below all have to follow it.
-        let duration = self
-            .session
-            .as_ref()
-            .map_or(0., PlaybackSession::timeline_duration);
+        // timecode, the ruler and the clamp below all have to follow it -- and
+        // so does the room a tail being dragged needs to grow into.
+        let duration = self.drawn_duration();
         // The clock keeps running after the last frame (wall time takes over at
         // audio EOF) while the picture is frozen, so the timeline the UI shows is
         // the clamped one, pinned to the out-point once playback is done.
@@ -1899,6 +2061,17 @@ impl Render for Player {
                     }
                     return;
                 }
+                // A clip edge is 6 px wide and the pointer leaves it on the
+                // first drag, so the gesture is tracked here for the same
+                // reason -- and it ends here too when the button came up
+                // outside the window, still owing its one edit.
+                if this.trim.is_some() {
+                    match event.pressed_button {
+                        Some(MouseButton::Left) => this.trim_to(event.position.x, cx),
+                        _ => this.commit_trim(cx),
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -1919,6 +2092,13 @@ impl Render for Player {
                         // once -- the append-only table's whole reason.
                         this.drag_band(event.position.y, cx);
                         this.commit_eq(cx);
+                        return;
+                    }
+                    if this.trim.is_some() {
+                        // The release lands exactly, then the gesture is
+                        // written once -- one edit, one undo step.
+                        this.trim_to(event.position.x, cx);
+                        this.commit_trim(cx);
                         return;
                     }
                     if std::mem::take(&mut this.scrubbing) {
@@ -3444,7 +3624,7 @@ impl Player {
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
         let tip: SharedString = format!(
-            "Select (or {} under the playhead, {}/{} along the lane) — {} removes the take, {} leaves a gap, {} rejoins a cut",
+            "Select (or {} under the playhead, {}/{} along the lane) — drag an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Select),
             self.keymap.display(ActionId::SelectPrev),
             self.keymap.display(ActionId::SelectNext),
@@ -3502,6 +3682,9 @@ impl Player {
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
+                        // What a drag on an edge is showing, which is the clip
+                        // itself while nothing is being dragged.
+                        let clip = &self.trimmed(lane, i, *clip);
                         let (start, len) = (
                             f64::from(clip.start) / self.fps,
                             f64::from(clip.len()) / self.fps,
@@ -3580,19 +3763,44 @@ impl Player {
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    if this.modal() {
-                                        return;
-                                    }
-                                    this.select((lane, i), cx);
-                                    this.context_menu = Some(ContextMenu {
-                                        lane,
-                                        idx: i,
-                                        at: event.position,
-                                        details: false,
-                                    });
-                                    cx.notify();
+                                    this.open_menu(lane, i, event.position, cx);
                                 }),
                             )
+                            // The two strips a drag *lengthens* the clip by,
+                            // one at each end. They occlude the box behind
+                            // them, which is what keeps one gesture one thing:
+                            // a press here trims, a press anywhere else on the
+                            // box still starts the move to another lane.
+                            .children([Edge::Start, Edge::End].map(|edge| {
+                                let mut zone = div()
+                                    .absolute()
+                                    .top_0()
+                                    .h_full()
+                                    .w(px(EDGE_W))
+                                    .occlude()
+                                    .cursor(CursorStyle::ResizeLeftRight)
+                                    .hover(|s| s.bg(rgb(ACCENT)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                            this.start_trim(lane, i, edge, cx);
+                                        }),
+                                    )
+                                    // Occluded, so the box's own right-button
+                                    // listener never fires here: the menu is
+                                    // the same menu, opened by the same call.
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.open_menu(lane, i, event.position, cx);
+                                        }),
+                                    );
+                                zone = match edge {
+                                    Edge::Start => zone.left_0(),
+                                    Edge::End => zone.right_0(),
+                                };
+                                zone
+                            }))
                             // Under the label row, never through it.
                             .children(wave.filter(|_| audio).and_then(|wave| {
                                 let inner: AnyElement = match wave {
@@ -5179,6 +5387,64 @@ mod tests {
         );
     }
 
+    /// The trim-a-clip path through the doors the edge drag uses:
+    /// [`Player::trim_to`] clamps the pointer with `trim_room` and
+    /// [`Player::commit_trim`] writes it with `trim_clip`. The clip plays less
+    /// of its file, the sound linked to it follows, the head trim moves the
+    /// in-point, and one undo takes a whole gesture back.
+    ///
+    /// The routing *to* these doors -- the 6 px edge strip claiming the press
+    /// the clip's own body-drag would otherwise take -- is gpui hitbox
+    /// behaviour (`occlude`) and is not reachable without a window.
+    #[test]
+    fn a_clip_trimmed_by_its_edge_plays_less_of_its_file() {
+        use engine::project::Edge;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let whole = session.lane_clips(Lane::V1)[0];
+        let full = session.timeline_duration();
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::End),
+            Some((whole.start + 1, whole.end())),
+            "the file's own last frame is how far the tail goes"
+        );
+        assert!(
+            !session.trim_clip(Lane::V1, 0, Edge::End, 9_999),
+            "it already plays all of it"
+        );
+
+        // Pulled in by a third: the timeline ends earlier and the sound with it.
+        let shorter = whole.end() - whole.len() / 3;
+        assert!(session.trim_clip(Lane::V1, 0, Edge::End, shorter));
+        assert_eq!(session.lane_clips(Lane::V1)[0].end(), shorter);
+        assert_eq!(
+            session.lane_clips(Lane::A1)[0].end(),
+            shorter,
+            "the linked sound was trimmed with the picture"
+        );
+        assert!(session.timeline_duration() < full, "and plays out earlier");
+
+        // ...and dragged back out, as far as the file goes and no further.
+        assert!(session.trim_clip(Lane::V1, 0, Edge::End, 9_999));
+        assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the whole take back");
+
+        // The head takes the in-point with it, so what plays at the new start
+        // is source frame 10 rather than source frame 0.
+        assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 10));
+        let head = session.lane_clips(Lane::V1)[0];
+        assert_eq!((head.start, head.in_frame), (10, 10));
+        assert_eq!(session.lane_clips(Lane::A1)[0].in_frame, 10, "sound too");
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::Start).map(|r| r.0),
+            Some(0),
+            "and it may be pulled back out to the file's first frame"
+        );
+
+        assert!(session.undo(), "one step for the whole drag");
+        assert_eq!(session.lane_clips(Lane::V1)[0], whole);
+    }
+
     /// The move-a-clip-between-tracks path through the door the drop uses
     /// ([`Player::move_clip`] calls exactly this): the clip changes row, the
     /// *picture* comes from the new row afterwards -- which is what "it plays
@@ -6226,6 +6492,7 @@ fn main() {
                     streams: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
+                    trim: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
