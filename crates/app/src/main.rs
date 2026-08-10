@@ -1638,42 +1638,84 @@ impl Player {
             ctrl: false,
         }
         .pretty();
-        // One row per action, not per binding: an action with two strokes reads
-        // as one line ("x or delete"), and a rebind replaces that whole set.
-        let rows: Vec<_> = ActionId::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(i, action)| {
+        // Every stroke that works, under its heading, and both halves of the
+        // list come from the registry: one row per action -- an action with two
+        // strokes reads as one line ("x or delete") and a rebind replaces that
+        // whole set -- then the strokes the modal cards answer to, which are
+        // shown but not offered, because nothing may unbind the way out.
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for category in keymap::Category::ALL {
+            let actions = ActionId::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(_, a)| a.category() == category);
+            let fixed = keymap::FIXED.iter().filter(|f| f.category == category);
+            let mut headed = false;
+            let mut head = |rows: &mut Vec<AnyElement>| {
+                if !std::mem::replace(&mut headed, true) {
+                    rows.push(
+                        div()
+                            .flex_none()
+                            .px(px(6.))
+                            .pt(px(4.))
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child(category.label())
+                            .into_any_element(),
+                    );
+                }
+            };
+            for (i, action) in actions {
+                head(&mut rows);
                 let capturing = self.rebinding == Some(action);
                 let out = out.clone();
-                div()
-                    .id(("bind", i))
-                    .flex()
-                    // The floor, not the height: a row that needed two lines
-                    // would otherwise paint over the one under it.
-                    .min_h(px(KEYS_ROW_H))
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.))
-                    .px(px(6.))
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(HOVER)))
-                    .when(capturing, |d| d.bg(rgb(SELECTED)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.rebinding = Some(action);
-                        cx.notify();
-                    }))
-                    .child(action.label())
-                    .child(if capturing {
-                        div()
-                            .text_color(rgb(INK_DIM))
-                            .child(format!("press a key — {out} cancels"))
-                    } else {
-                        div().child(self.keymap.display(action))
-                    })
-            })
-            .collect();
+                rows.push(
+                    div()
+                        .id(("bind", i))
+                        .flex()
+                        // The floor, not the height: a row that needed two lines
+                        // would otherwise paint over the one under it.
+                        .min_h(px(KEYS_ROW_H))
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .px(px(6.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .when(capturing, |d| d.bg(rgb(SELECTED)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.rebinding = Some(action);
+                            cx.notify();
+                        }))
+                        .child(action.label())
+                        .child(if capturing {
+                            div()
+                                .text_color(rgb(INK_DIM))
+                                .child(format!("press a key — {out} cancels"))
+                        } else {
+                            div().child(self.keymap.display(action))
+                        })
+                        .into_any_element(),
+                );
+            }
+            for f in fixed {
+                head(&mut rows);
+                rows.push(
+                    div()
+                        .flex()
+                        .min_h(px(KEYS_ROW_H))
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
+                        .px(px(6.))
+                        .child(f.label)
+                        // Dim, and no hover: this one is not a row you can click.
+                        .child(div().text_color(rgb(INK_DIM)).child(f.chord))
+                        .into_any_element(),
+                );
+            }
+        }
         Some(
             div()
                 .absolute()
@@ -2900,6 +2942,63 @@ mod tests {
         // An extension, never a bare name.
         assert!(!is_project(p("edith")));
         assert!(!is_project(p("a.edith.mp4")));
+    }
+
+    /// The keys menu is the registry drawn, so a *bindable* stroke cannot go
+    /// missing from it by construction. The strokes the modal cards read for
+    /// themselves are the ones that could: this reads the key handler's own
+    /// source and fails on any key it answers to that the menu never mentions.
+    #[test]
+    fn no_stroke_is_missing_from_the_keys_menu() {
+        use keymap::{ActionId, Keymap};
+        // Everything above the test module -- the handler, and the helpers it
+        // asks. The tests below compare keys too, and are not shortcuts.
+        let handler = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let keymap = Keymap::defaults();
+        let listed = |key: &str| {
+            let pretty = keymap::Chord {
+                key: key.to_string(),
+                ctrl: false,
+            }
+            .pretty();
+            keymap.lookup(key, false).is_some() || keymap::FIXED.iter().any(|f| f.chord == pretty)
+        };
+        let mut compared = 0;
+        for (at, needle) in handler.match_indices("key == ") {
+            let rest = &handler[at + needle.len()..];
+            let key = match rest.strip_prefix('"') {
+                Some(literal) => {
+                    literal[..literal.find('"').expect("unterminated key")].to_string()
+                }
+                // A named constant: the escape the cards get out by.
+                None if rest.starts_with("ESCAPE") => super::ESCAPE.to_string(),
+                None => panic!("a key compared against something this cannot read: {rest:.20}"),
+            };
+            assert!(
+                listed(&key),
+                "the handler answers to {key:?} and the keys menu never says so"
+            );
+            compared += 1;
+        }
+        // The scan is only a guard while it still finds the comparisons: a
+        // rewrite that spells them differently must come back here.
+        assert!(
+            compared >= 4,
+            "the key comparisons moved; this scan is blind"
+        );
+        // The one branch that is not a comparison -- any digit is a bitrate.
+        assert!(handler.contains("key.parse::<u32>()"));
+        assert!(keymap::FIXED.iter().any(|f| f.chord == "0–9"));
+        // And every entry of both halves lands under a heading the menu draws.
+        for action in ActionId::ALL {
+            assert!(keymap::Category::ALL.contains(&action.category()));
+        }
+        for fixed in &keymap::FIXED {
+            assert!(keymap::Category::ALL.contains(&fixed.category));
+        }
     }
 
     #[test]
