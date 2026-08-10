@@ -217,7 +217,7 @@ fn run(
     };
     if let Some((_, packets)) = audio {
         for packet in packets {
-            muxer.write_audio_packet(&packet.bytes, packet.samples)?;
+            muxer.write_audio_packet(&packet.bytes)?;
         }
     }
     cancelled(shared)?;

@@ -143,13 +143,10 @@ impl Mp4Muxer {
         Ok(())
     }
 
-    /// One raw AAC packet (no ADTS header), copied verbatim from the source.
-    /// `samples` is what the sample table says it occupies -- normally the
-    /// [`AAC_PACKET_SAMPLES`] the codec fixes, but longer for the packet that
-    /// carries a gap in the timeline's audio (see
-    /// [`AudioSession::copy_multi_segments`](crate::AudioSession::copy_multi_segments)),
-    /// where the extra duration is the silence a reader renders.
-    pub fn write_audio_packet(&mut self, bytes: &[u8], samples: u32) -> crate::Result<()> {
+    /// One raw AAC packet (no ADTS header), copied verbatim from the source --
+    /// or one of the hand-written silent ones a gap is filled with. Every AAC-LC
+    /// access unit is [`AAC_PACKET_SAMPLES`] frames, gap or not.
+    pub fn write_audio_packet(&mut self, bytes: &[u8]) -> crate::Result<()> {
         if !self.has_audio {
             return Err("audio packet written to a video-only file".into());
         }
@@ -157,7 +154,7 @@ impl Mp4Muxer {
             AUDIO_TRACK,
             &Mp4Sample {
                 start_time: 0,
-                duration: samples.max(AAC_PACKET_SAMPLES),
+                duration: AAC_PACKET_SAMPLES,
                 rendering_offset: 0,
                 // Every AAC packet is a sync point; saying so per-sample would emit
                 // an `stss` listing all of them, while no `stss` means the same thing.
@@ -391,14 +388,8 @@ mod tests {
         for unit in &units {
             muxer.write_video_au(unit).unwrap();
         }
-        muxer
-            .write_audio_packet(&[0x21, 0x22, 0x23], AAC_PACKET_SAMPLES)
-            .unwrap();
-        // The second packet carries a gap: 1024 of its own plus half a second
-        // of silence, which is what the sample table has to say.
-        muxer
-            .write_audio_packet(&[0x24, 0x25], AAC_PACKET_SAMPLES + 22_050)
-            .unwrap();
+        muxer.write_audio_packet(&[0x21, 0x22, 0x23]).unwrap();
+        muxer.write_audio_packet(&[0x24, 0x25]).unwrap();
         muxer.finish().unwrap();
 
         let file = File::open(&out).unwrap();
@@ -424,12 +415,11 @@ mod tests {
             [0x21, 0x22, 0x23],
             "audio packets copied verbatim"
         );
-        let with_gap = reader.read_sample(audio_id, 2).unwrap().unwrap();
-        assert_eq!(&with_gap.bytes[..], [0x24, 0x25], "gap or not, verbatim");
+        let second = reader.read_sample(audio_id, 2).unwrap().unwrap();
+        assert_eq!(&second.bytes[..], [0x24, 0x25], "verbatim");
         assert_eq!(
-            with_gap.duration,
-            AAC_PACKET_SAMPLES + 22_050,
-            "the gap is spent as duration, and the track ends half a second later"
+            second.duration, AAC_PACKET_SAMPLES,
+            "every AAC-LC packet is one 1024-frame stts entry"
         );
 
         let (meta, mut demuxer) = crate::demux::Demuxer::open(&out).unwrap();
