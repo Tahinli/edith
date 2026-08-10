@@ -46,13 +46,16 @@ pub enum ActionId {
     Cut,
     Delete,
     Undo,
+    ToggleMute,
+    VolumeUp,
+    VolumeDown,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 9] = [
+    pub const ALL: [ActionId; 12] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -61,6 +64,9 @@ impl ActionId {
         ActionId::Cut,
         ActionId::Delete,
         ActionId::Undo,
+        ActionId::ToggleMute,
+        ActionId::VolumeUp,
+        ActionId::VolumeDown,
         ActionId::CancelExport,
     ];
 
@@ -75,6 +81,9 @@ impl ActionId {
             ActionId::Cut => "Cut",
             ActionId::Delete => "Delete",
             ActionId::Undo => "Undo",
+            ActionId::ToggleMute => "Mute / Unmute",
+            ActionId::VolumeUp => "Volume up",
+            ActionId::VolumeDown => "Volume down",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -91,6 +100,9 @@ impl ActionId {
             ActionId::Cut => "cut",
             ActionId::Delete => "delete",
             ActionId::Undo => "undo",
+            ActionId::ToggleMute => "toggle-mute",
+            ActionId::VolumeUp => "volume-up",
+            ActionId::VolumeDown => "volume-down",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -199,6 +211,12 @@ impl Keymap {
                 b(ActionId::Delete, "delete", false),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
+                b(ActionId::ToggleMute, "m", false),
+                // The unshifted pair, which is what gpui reports for those two
+                // keys ("=" and "-", platform.rs:862): the volume keys every
+                // player has, without asking for shift to make the "+".
+                b(ActionId::VolumeUp, "=", false),
+                b(ActionId::VolumeDown, "-", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -425,7 +443,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 11);
+        assert_eq!(k.entries().len(), 14);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -436,6 +454,12 @@ mod tests {
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
+        assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
+        // The volume pair is the unshifted one, so neither needs a modifier
+        // and neither is the "+" gpui reports for shift+=.
+        assert_eq!(k.lookup("=", false), Some(ActionId::VolumeUp));
+        assert_eq!(k.lookup("-", false), Some(ActionId::VolumeDown));
+        assert_eq!(k.lookup("+", false), None);
         assert_eq!(k.lookup("escape", false), Some(ActionId::CancelExport));
         // The modifier is half the chord: ctrl+e is not e.
         assert_eq!(k.lookup("e", true), None);
@@ -564,7 +588,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 9);
+        assert_eq!(ActionId::ALL.len(), 12);
     }
 
     #[test]

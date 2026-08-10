@@ -91,6 +91,27 @@ impl Ring {
     }
 }
 
+/// Multiplies the little-endian f32 samples in `dst` by `gain`, in place.
+///
+/// This is how the editor's volume and mute are applied, rather than through
+/// the stream's PipeWire volume control: the session manager persists every
+/// change to a node's Props into its restore state (measured: WirePlumber
+/// writes the bucket ~2 s after the change), so a mute keypress here would
+/// become "edith is muted" in the system mixer tomorrow, and a quit while
+/// muted would come back muted with nothing in the app to explain it. Scaling
+/// the samples is invisible to the daemon, costs one multiply each, and --
+/// because the frames are still consumed and still handed over -- leaves the
+/// device clock, and so the whole A/V sync, exactly where it was.
+fn scale(dst: &mut [u8], gain: f32) {
+    if gain == 1.0 {
+        return;
+    }
+    for sample in dst.chunks_exact_mut(4) {
+        let scaled = f32::from_le_bytes(sample.try_into().unwrap_or([0; 4])) * gain;
+        sample.copy_from_slice(&scaled.to_le_bytes());
+    }
+}
+
 /// The consumer half of a flush: drops everything queued, then pops as usual.
 /// Doing it here rather than in `ao_flush` keeps the ring single-consumer --
 /// only the RT thread ever moves `read` -- and means a flush asked for while
@@ -132,6 +153,9 @@ struct Shared {
     /// graph clock keeps ticking while the stream is inactive, and that time
     /// was never played.
     resumed: AtomicBool,
+    /// Output gain as f32 bits, 1.0 until the caller says otherwise. Read once
+    /// per callback on the RT thread, so it is an atomic rather than a lock.
+    gain: AtomicU32,
     underruns: AtomicU64,
 }
 
@@ -228,6 +252,13 @@ fn run(
                             slice[got * 4..want * 4].fill(0);
                             shared.underruns.fetch_add(1, Ordering::Relaxed);
                         }
+                        // After the fill, so the silence stays silent whatever
+                        // the gain is, and the underrun count keeps meaning
+                        // "the decoder was late" rather than "the user muted".
+                        scale(
+                            &mut slice[..want * 4],
+                            f32::from_bits(shared.gain.load(Ordering::Relaxed)),
+                        );
                         frames
                     }
                     None => 0,
@@ -377,6 +408,7 @@ pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
             dead: AtomicBool::new(false),
             flush: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
+            gain: AtomicU32::new(1.0f32.to_bits()),
             underruns: AtomicU64::new(0),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -471,6 +503,32 @@ pub unsafe extern "C" fn ao_set_active(session: *mut c_void, active: u32) -> i32
     .unwrap_or(-1)
 }
 
+/// Sets the output gain: 0.0 is silence, 1.0 is the samples as written. One
+/// knob for both the editor's volume and its mute -- mute is a gain of 0.0
+/// pushed down, and which of the two the user is looking at is the caller's
+/// business. Takes effect on the next callback (~23 ms), and the position keeps
+/// advancing throughout: this silences the output, it does not pause it.
+/// 0 on success, negative on failure or a gain that is not in `0.0..=1.0`.
+///
+/// # Safety
+/// `session` must come from [`ao_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_set_volume(session: *mut c_void, gain: f32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        // A NaN would compare false against every bound and then multiply every
+        // sample into a NaN, which is a loud fault in a speaker: refuse it here,
+        // at the ABI, rather than let it reach the RT thread.
+        if session.is_null() || !(0.0..=1.0).contains(&gain) {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        session.shared.gain.store(gain.to_bits(), Ordering::Relaxed);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
 /// Drops every queued sample, so playback resumes from whatever is written
 /// next: what a seek needs. Takes effect on the next process callback (or the
 /// first one after a resume), and leaves the played position alone -- the
@@ -509,7 +567,35 @@ pub unsafe extern "C" fn ao_close(session: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicBool, Ordering, Ring, accept, consume};
+    use super::{AtomicBool, Ordering, Ring, accept, consume, scale};
+
+    /// The gain is applied to the bytes the device is about to play, so silence
+    /// really is silence and a partial gain really is quieter -- and 1.0 must
+    /// leave the samples bit-identical, since that is every callback's path.
+    #[test]
+    fn gain_scales_the_samples_the_device_sees() {
+        let sample =
+            |bytes: &[u8], i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+
+        let mut buf = Vec::new();
+        for v in [1.0f32, -0.5, 0.25] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Unity is the no-op the common case walks through.
+        let untouched = buf.clone();
+        scale(&mut buf, 1.0);
+        assert_eq!(buf, untouched);
+
+        // Half volume, sign kept.
+        scale(&mut buf, 0.5);
+        assert_eq!(sample(&buf, 0), 0.5);
+        assert_eq!(sample(&buf, 4), -0.25);
+
+        // Mute is a gain of zero: every sample gone, none left ringing.
+        scale(&mut buf, 0.0);
+        assert!(buf.chunks_exact(4).all(|s| sample(s, 0) == 0.0));
+    }
 
     /// The paused-seek ordering: a flush requested with no RT callbacks running
     /// must not let the writer queue new audio behind the pending discard.
