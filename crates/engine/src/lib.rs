@@ -3,6 +3,7 @@
 pub mod ao;
 pub mod audio;
 pub mod clock;
+pub mod color;
 pub mod convert;
 pub mod decode;
 pub mod demux;
