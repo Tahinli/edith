@@ -23,6 +23,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
+# The AAC-LC *encoder*, so an mp4's sound can be a mix rather than a copy: an
+# equalized (or otherwise processed) lane has to be decoded, and what is decoded
+# has to be encoded again. Pure Rust with no C or FFI, Apache-2.0, same family
+# as `rusty_h264` above. Nothing else in the ecosystem encodes AAC without
+# linking Fraunhofer's C library, which this project's no-install rule forbids.
+rusty_aac = "0.5"
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
