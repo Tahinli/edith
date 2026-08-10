@@ -179,3 +179,49 @@ fn an_impossible_stream_is_refused_not_guessed() {
     );
     assert!(AudioSession::open_multi_streams(&[(silent, 1)], &[(Some(0), 0.0, 1.0)]).is_err());
 }
+
+/// Where the stream picker meets a file that has no picture to pick against: a
+/// standalone audio file is one stream, so it lists as one and answers to 0
+/// alone. A picker that offered a second row here would be offering a track
+/// that does not exist.
+#[test]
+fn a_standalone_audio_file_is_exactly_one_stream() {
+    for (name, codec) in [("test_tone.mp3", "mp3"), ("test_tone.flac", "flac")] {
+        let streams = AudioSession::probe_streams(asset(name)).expect("probes");
+        assert_eq!(
+            streams,
+            vec![StreamInfo {
+                index: 0,
+                codec: codec.into(),
+                channels: 2,
+                sample_rate: 44100,
+                // No mdhd to carry an ISO-639 tag, and one track needs no
+                // telling apart.
+                lang: None,
+                decodable: true,
+            }],
+            "{name}"
+        );
+        // Stream 0 opens; anything above it is refused rather than quietly
+        // served the only track there is.
+        assert!(
+            AudioSession::open_multi_streams(&[(asset(name), 0)], &[(Some(0), 0.0, 1.0)])
+                .expect("stream 0 opens")
+                .is_some(),
+            "{name}"
+        );
+        let err = AudioSession::open_multi_streams(&[(asset(name), 1)], &[(Some(0), 0.0, 1.0)])
+            .expect_err("there is no stream 1");
+        assert!(
+            err.to_string().contains("audio stream 1 of 1 stream"),
+            "unhelpful refusal for {name}: {err}"
+        );
+    }
+    // The ALAC .m4a is the awkward one: it parses as an mp4 whose only audio
+    // track is not AAC, so the mp4 walk would call it "unknown" and undecodable
+    // where symphonia decodes it perfectly well.
+    let alac = AudioSession::probe_streams(asset("test_tone.m4a")).expect("probes");
+    assert_eq!(alac.len(), 1);
+    assert!(alac[0].decodable, "ALAC decodes: {alac:?}");
+    assert_eq!((alac[0].sample_rate, alac[0].channels), (44100, 2));
+}
