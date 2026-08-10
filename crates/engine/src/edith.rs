@@ -1,14 +1,15 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 5
+//! edith 6
 //! playhead 90
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
 //! eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk
-//! video 1 0 0 120 0 0 0
-//! audio 1 0 0 120 0 0 0
-//! video 2 120 0 120 1 - -
+//! color 0.1:1.2:0.9:-0.3
+//! video 1 0 0 120 0 0 0 0
+//! audio 1 0 0 120 0 0 0 -
+//! video 2 120 0 120 1 - - -
 //! audio 2
 //! ```
 //!
@@ -26,29 +27,35 @@
 //! setting like any other. The numbers are printed to round trip bit-exactly;
 //! anything not finite is refused, here and at [`crate::Project::set_eq`].
 //!
-//! A lane line is `<kind> <lane> <start> <in> <out> <source> <link> <eq>`:
-//! which lane the clip is on -- its kind and its 1-based number among the lanes
-//! of that kind, the [`crate::project::Lane::label`] a header column shows --
-//! then where the clip sits on the timeline, the half-open source range it
-//! plays, the file it plays from, its group id, and the eq line it plays
-//! through (`-` for neither). Timeline placement is explicit, so a *gap* is
-//! simply a stretch no line covers -- there is nothing to write for one, and
-//! nothing that can disagree about its length.
+//! A colour line is `color <brightness>:<contrast>:<saturation>:<tint>`
+//! ([`crate::color::ColorParams`]), named by position exactly as an eq line is
+//! -- the first colour line is color 0 -- printed and refused by the same rules.
+//!
+//! A lane line is `<kind> <lane> <start> <in> <out> <source> <link> <eq>
+//! <color>`: which lane the clip is on -- its kind and its 1-based number among
+//! the lanes of that kind, the [`crate::project::Lane::label`] a header column
+//! shows -- then where the clip sits on the timeline, the half-open source range
+//! it plays, the file it plays from, its group id, the eq line it plays through
+//! and the colour line it is graded by (`-` for none of them). Timeline
+//! placement is explicit, so a *gap* is simply a stretch no line covers -- there
+//! is nothing to write for one, and nothing that can disagree about its length.
 //!
 //! A lane is declared by the clips on it, in the order the lanes are displayed
 //! in; a lane holding *nothing* has a bare `<kind> <lane>` line instead, which
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 4** was this without the eq lines and without the clip's eq field.
-//! **Version 3** was that without the lane number, and held one video lane and
-//! one audio lane, no more. **Version 2** wrote `source <path>` as well, which
-//! is this file's stream 0 -- one per file, whichever audio track came first.
-//! **Version 1** wrote that and one lane, queued end to end: `clip <in> <out>
-//! <source>`. All four still load -- a v1 file's clips are laid out
+//! **Version 5** was this without the colour lines and without the clip's colour
+//! field. **Version 4** was that without the eq lines and without the clip's eq
+//! field. **Version 3** was that without the lane number, and held one video
+//! lane and one audio lane, no more. **Version 2** wrote `source <path>` as
+//! well, which is this file's stream 0 -- one per file, whichever audio track
+//! came first. **Version 1** wrote that and one lane, queued end to end: `clip
+//! <in> <out> <source>`. All five still load -- a v1 file's clips are laid out
 //! cumulatively and copied onto both lanes as one group each, which is exactly
-//! what a v1 timeline meant, and an older file simply equalizes nothing -- and
-//! saving any of them writes v5. An older reader refuses a newer file by name.
+//! what a v1 timeline meant, and an older file simply equalizes and grades
+//! nothing -- and saving any of them writes v6. An older reader refuses a newer
+//! file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -74,12 +81,14 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use crate::color::ColorParams;
 use crate::eq::{Band, BandKind, EqParams};
 use crate::project::{Clip, Lane, LaneKind, Source};
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 5";
+const MAGIC: &[u8] = b"edith 6";
+const MAGIC_V5: &[u8] = b"edith 5";
 const MAGIC_V4: &[u8] = b"edith 4";
 const MAGIC_V3: &[u8] = b"edith 3";
 const MAGIC_V2: &[u8] = b"edith 2";
@@ -99,16 +108,20 @@ pub struct Document {
     /// The equalizer table [`Clip::eq`] indexes into, in file order. Empty for
     /// every dialect before v5.
     pub eq: Vec<EqParams>,
+    /// The colour table [`Clip::color`] indexes into, in file order. Empty for
+    /// every dialect before v6.
+    pub color: Vec<ColorParams>,
     pub playhead: u32,
 }
 
-/// Writes the project to `path`, atomically. `sources` and `eq` should already
-/// be orphan-free ([`crate::Project::without_orphan_sources`]).
+/// Writes the project to `path`, atomically. `sources`, `eq` and `color` should
+/// already be orphan-free ([`crate::Project::without_orphan_sources`]).
 pub fn save(
     path: &Path,
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     eq: &[EqParams],
+    color: &[ColorParams],
     playhead: u32,
 ) -> crate::Result<()> {
     let dir = project_dir(path);
@@ -121,7 +134,7 @@ pub fn save(
     // the second one puts the name itself there.
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
-            f.write_all(&emit(&dir, sources, lanes, eq, playhead))?;
+            f.write_all(&emit(&dir, sources, lanes, eq, color, playhead))?;
             f.sync_all()
         })
         .and_then(|()| std::fs::rename(&part, path))
@@ -156,6 +169,7 @@ fn emit(
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     eq: &[EqParams],
+    color: &[ColorParams],
     playhead: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -186,6 +200,16 @@ fn emit(
         }
         out.push(b'\n');
     }
+    // ...and the colour table, for the same reason and by the same rules.
+    for p in color {
+        out.extend_from_slice(
+            format!(
+                "color {:?}:{:?}:{:?}:{:?}\n",
+                p.brightness, p.contrast, p.saturation, p.tint
+            )
+            .as_bytes(),
+        );
+    }
     // Lane by lane rather than interleaved by time: a lane reads as a list, the
     // parser gets its sortedness check for free from the order it is in, and
     // the lanes come back out in the order they are displayed in.
@@ -209,9 +233,10 @@ fn emit(
         for c in clips {
             let link = c.link.map_or("-".to_string(), |l| l.to_string());
             let eq = c.eq.map_or("-".to_string(), |e| e.to_string());
+            let color = c.color.map_or("-".to_string(), |e| e.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {ord} {} {} {} {} {link} {eq}\n",
+                    "{keyword} {ord} {} {} {} {} {link} {eq} {color}\n",
                     c.start, c.in_frame, c.out_frame, c.source
                 )
                 .as_bytes(),
@@ -231,8 +256,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries equalizer settings...
-    let v5 = first == MAGIC;
+    // The one that carries colour grades...
+    let v6 = first == MAGIC;
+    // ...the ones that carry equalizer settings...
+    let v5 = v6 || first == MAGIC_V5;
     // ...and the ones that number their lanes. Every older one held two.
     let numbered = v5 || first == MAGIC_V4;
     if !numbered && !streamless && first != MAGIC_V3 {
@@ -252,8 +279,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         } else {
             vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())]
         },
-        // Nothing before v5 equalizes anything.
+        // Nothing before v5 equalizes anything, and nothing before v6 grades.
         eq: Vec::new(),
+        color: Vec::new(),
         playhead: 0,
     };
     let mut playhead_seen = false;
@@ -324,6 +352,24 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 };
                 doc.eq.push(EqParams { bands });
             }
+            b"color" if v6 => {
+                if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
+                    return Err(format!("line {n}: color after a clip").into());
+                }
+                let f = fields(rest, 1, "color", n)?;
+                let parts: Vec<&[u8]> = f[0].split(|&b| b == b':').collect();
+                if parts.len() != 4 {
+                    return Err(
+                        format!("line {n}: color wants 4 fields, found {}", parts.len()).into(),
+                    );
+                }
+                doc.color.push(ColorParams {
+                    brightness: float(parts[0], n)?,
+                    contrast: float(parts[1], n)?,
+                    saturation: float(parts[2], n)?,
+                    tint: float(parts[3], n)?,
+                });
+            }
             // v1: one lane, no placement, no groups. Every clip becomes one
             // grouped video+audio pair laid where the queue reached, which is
             // what the file always meant.
@@ -337,6 +383,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         source: number(f[2], n)? as usize,
                         link: Some(doc.lanes[0].1.len() as u32),
                         eq: None,
+                        color: None,
                     },
                     &doc,
                     n,
@@ -366,8 +413,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if numbered && rest.is_empty() {
                     continue;
                 }
-                // v5 grew the eq field; every older dialect ends at the link.
-                let f = fields(rest, if v5 { 6 } else { 5 }, "clip", n)?;
+                // v6 grew the colour field and v5 the eq one; every older
+                // dialect ends at the link.
+                let want = 5 + usize::from(v5) + usize::from(v6);
+                let f = fields(rest, want, "clip", n)?;
                 let clip = check(
                     Clip {
                         start: number(f[0], n)?,
@@ -378,20 +427,8 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                             b"-" => None,
                             field => Some(number(field, n)?),
                         },
-                        eq: match f.get(5).copied() {
-                            None | Some(b"-") => None,
-                            Some(field) => {
-                                let i = number(field, n)?;
-                                if i as usize >= doc.eq.len() || i > u32::from(u16::MAX) {
-                                    return Err(format!(
-                                        "line {n}: clip names eq {i} of {}",
-                                        doc.eq.len()
-                                    )
-                                    .into());
-                                }
-                                Some(i as u16)
-                            }
-                        },
+                        eq: table_index(f.get(5).copied(), doc.eq.len(), "eq", n)?,
+                        color: table_index(f.get(6).copied(), doc.color.len(), "color", n)?,
                     },
                     &doc,
                     n,
@@ -507,6 +544,26 @@ fn check(clip: Clip, doc: &Document, line: usize) -> crate::Result<Clip> {
     Ok(clip)
 }
 
+/// A clip's `<eq>` or `<color>` field: `-` (or a dialect that has no such field
+/// at all), or a line of a table that is already declared. Refused by the name
+/// of what it points at, so the message reads as the file does.
+fn table_index(
+    field: Option<&[u8]>,
+    len: usize,
+    what: &str,
+    line: usize,
+) -> crate::Result<Option<u16>> {
+    let field = match field {
+        None | Some(b"-") => return Ok(None),
+        Some(field) => field,
+    };
+    let i = number(field, line)?;
+    if i as usize >= len || i > u32::from(u16::MAX) {
+        return Err(format!("line {line}: clip names {what} {i} of {len}").into());
+    }
+    Ok(Some(i as u16))
+}
+
 /// One `<frequency>:<gain>:<Q>:<shape>` field of an eq line.
 fn band(field: &[u8], line: usize) -> crate::Result<Band> {
     let parts: Vec<&[u8]> = field.split(|&b| b == b':').collect();
@@ -609,6 +666,7 @@ mod tests {
             source,
             link,
             eq: None,
+            color: None,
         }
     }
 
@@ -620,7 +678,7 @@ mod tests {
         lanes: &[(LaneKind, Vec<Clip>)],
         playhead: u32,
     ) -> Vec<u8> {
-        emit(dir, sources, lanes, &[], playhead)
+        emit(dir, sources, lanes, &[], &[], playhead)
     }
 
     /// Two sources, one under the project's own directory and one not, a clip
@@ -658,8 +716,8 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 5\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 -\nvideo 1 30 10 20 1 1 -\naudio 1 0 0 30 0 0 -\n",
+            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n",
             "the file under the project directory is written relative to it, \
              each with the audio stream it plays"
         );
@@ -693,8 +751,8 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 5\nplayhead 7\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 4 -\naudio 1\nvideo 2 40 0 10 0 - -\naudio 2 0 0 30 0 4 -\n",
+            "edith 6\nplayhead 7\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 4 - -\naudio 1\nvideo 2 40 0 10 0 - - -\naudio 2 0 0 30 0 4 - -\n",
             "an empty lane is a line of its own; everything else is its clips"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -800,15 +858,15 @@ mod tests {
                 },
             ],
         );
-        let bytes = emit(&dir, &sources, &lanes, &eq, 0);
+        let bytes = emit(&dir, &sources, &lanes, &eq, &[], 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 5\nplayhead 0\nsource 0 a.mp4\n\
+            "edith 6\nplayhead 0\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
-             video 1 0 0 30 0 0 0\nvideo 1 30 10 20 0 - 1\n\
-             audio 1 0 0 30 0 0 0\naudio 1 30 0 10 0 - 2\n",
+             video 1 0 0 30 0 0 0 -\nvideo 1 30 10 20 0 - 1 -\n\
+             audio 1 0 0 30 0 0 0 -\naudio 1 30 0 10 0 - 2 -\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -834,7 +892,177 @@ mod tests {
             }
         }
         assert_eq!(back.eq.len(), 3, "the empty cascade is an entry of its own");
-        assert_eq!(emit(&dir, &back.sources, &back.lanes, &back.eq, 0), bytes);
+        assert_eq!(
+            emit(&dir, &back.sources, &back.lanes, &back.eq, &back.color, 0),
+            bytes
+        );
+    }
+
+    /// The whole of the v6 bump, the eq test's twin: the clips name a shared
+    /// colour table, the bytes are the ones documented at the top of this file,
+    /// and every f32 comes back *bit* for bit, so a re-save is the same file.
+    #[test]
+    fn colours_round_trip_bit_exactly_and_are_shared() {
+        let dir = PathBuf::from("/proj");
+        let sources = vec![source("/proj/a.mp4", 0)];
+        let color = vec![
+            ColorParams {
+                brightness: 0.1,
+                contrast: 1.2,
+                saturation: 0.9,
+                tint: -0.3,
+            },
+            // The awkward ones again: all 24 mantissa bits, an exponential
+            // spelling, a subnormal and a negative zero -- and the identity,
+            // which is a setting like any other.
+            ColorParams {
+                brightness: -0.000_000_1,
+                contrast: 16_777_215.0,
+                saturation: f32::MIN_POSITIVE / 3.0,
+                tint: -0.0,
+            },
+            ColorParams::default(),
+        ];
+        // Two clips share entry 0, so it is written once; one clip is ungraded.
+        let lanes = two(
+            vec![
+                Clip {
+                    color: Some(0),
+                    ..clip(0, 0, 30, 0, Some(0))
+                },
+                Clip {
+                    color: Some(1),
+                    ..clip(30, 10, 20, 0, None)
+                },
+            ],
+            vec![
+                Clip {
+                    color: Some(0),
+                    ..clip(0, 0, 30, 0, Some(0))
+                },
+                Clip {
+                    color: Some(2),
+                    ..clip(30, 0, 10, 0, None)
+                },
+            ],
+        );
+        let bytes = emit(&dir, &sources, &lanes, &[], &color, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "edith 6\nplayhead 0\nsource 0 a.mp4\n\
+             color 0.1:1.2:0.9:-0.3\n\
+             color -1e-7:16777215.0:3.918315e-39:-0.0\n\
+             color 0.0:1.0:1.0:0.0\n\
+             video 1 0 0 30 0 0 - 0\nvideo 1 30 10 20 0 - - 1\n\
+             audio 1 0 0 30 0 0 - 0\naudio 1 30 0 10 0 - - 2\n",
+            "the table comes before the clips, and a clip names a line of it"
+        );
+
+        let back = parse(&bytes, &dir).expect("parse");
+        assert_eq!(back.lanes, lanes, "every clip keeps the colour it named");
+        for (i, (got, want)) in back.color.iter().zip(&color).enumerate() {
+            assert_eq!(
+                (
+                    got.brightness.to_bits(),
+                    got.contrast.to_bits(),
+                    got.saturation.to_bits(),
+                    got.tint.to_bits()
+                ),
+                (
+                    want.brightness.to_bits(),
+                    want.contrast.to_bits(),
+                    want.saturation.to_bits(),
+                    want.tint.to_bits()
+                ),
+                "color {i} came back as other bits"
+            );
+        }
+        assert_eq!(back.color.len(), 3);
+        assert_eq!(
+            emit(&dir, &back.sources, &back.lanes, &back.eq, &back.color, 0),
+            bytes
+        );
+    }
+
+    /// A v5 file is a v6 one that grades nothing: it loads with its equalizers
+    /// intact, and re-saving it writes the new magic and a `-` colour field.
+    #[test]
+    fn a_v5_file_grades_nothing() {
+        let dir = PathBuf::from("/proj");
+        let v5 = b"edith 5\nplayhead 3\nsource 0 a.mp4\neq 80.0:-3.0:0.707:ls\n\
+                   video 1 0 0 30 0 0 0\naudio 1 0 0 30 0 0 -\n";
+        let old = parse(v5, &dir).expect("v5 parses");
+        assert!(old.color.is_empty(), "nothing before v6 grades anything");
+        assert_eq!(old.eq.len(), 1, "...and its equalizers are untouched");
+        assert_eq!(old.lanes[0].1[0].eq, Some(0));
+        assert!(old.lanes[0].1[0].color.is_none());
+        assert_eq!(
+            String::from_utf8_lossy(&emit(
+                &dir,
+                &old.sources,
+                &old.lanes,
+                &old.eq,
+                &old.color,
+                old.playhead
+            )),
+            "edith 6\nplayhead 3\nsource 0 a.mp4\neq 80.0:-3.0:0.707:ls\n\
+             video 1 0 0 30 0 0 0 -\naudio 1 0 0 30 0 0 - -\n"
+        );
+    }
+
+    /// The refusals the colour grammar adds, each naming its line.
+    #[test]
+    fn a_malformed_colour_names_its_line() {
+        let dir = PathBuf::from("/proj");
+        let head = "edith 6\nsource 0 a.mp4\n";
+        for (file, want) in [
+            (
+                format!("{head}color 0.0:1.0:1.0\nvideo 1 0 0 5 0 - - 0\n"),
+                "line 3: color wants 4 fields, found 3",
+            ),
+            (
+                format!("{head}color 0.0:1.0:1.0:0.0 0.0:1.0:1.0:0.0\nvideo 1 0 0 5 0 - - 0\n"),
+                "line 3: color wants 1 fields, found 2",
+            ),
+            (
+                format!("{head}color 0.0:warm:1.0:0.0\nvideo 1 0 0 5 0 - - 0\n"),
+                "line 3: \"warm\" is not a number",
+            ),
+            // The two values the format cannot write and read back as itself.
+            (
+                format!("{head}color inf:1.0:1.0:0.0\nvideo 1 0 0 5 0 - - 0\n"),
+                "line 3: \"inf\" is not a number",
+            ),
+            (
+                format!("{head}color 0.0:1.0:1.0:NaN\nvideo 1 0 0 5 0 - - 0\n"),
+                "line 3: \"NaN\" is not a number",
+            ),
+            (
+                format!("{head}color 0.0:1.0:1.0:0.0\nvideo 1 0 0 5 0 - - 1\n"),
+                "line 4: clip names color 1 of 1",
+            ),
+            (
+                format!("{head}video 1 0 0 5 0 - - 0\n"),
+                "line 3: clip names color 0 of 0",
+            ),
+            // A clip's colour field is not optional in v6, and the table has to
+            // be declared before the clip that names it.
+            (
+                format!("{head}video 1 0 0 5 0 - -\n"),
+                "line 3: clip wants 7 fields, found 6",
+            ),
+            (
+                format!("{head}video 1 0 0 5 0 - - -\ncolor 0.0:1.0:1.0:0.0\n"),
+                "line 4: color after a clip",
+            ),
+            // ...and a colour line in a file that predates them is a corrupt one.
+            (
+                "edith 5\nsource 0 a.mp4\ncolor 0.0:1.0:1.0:0.0\nvideo 1 0 0 5 0 - -\n".to_string(),
+                "line 3: unknown keyword \"color\"",
+            ),
+        ] {
+            assert_eq!(parse(file.as_bytes(), &dir).unwrap_err().to_string(), want);
+        }
     }
 
     /// The refusals the eq grammar adds, each naming its line.
@@ -910,8 +1138,8 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 5\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 -\nvideo 1 30 10 20 1 1 -\naudio 1 0 0 30 0 0 -\n"
+            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n"
         );
         // An empty lane's line is still the whole of that lane, eq or no eq.
         let empty = parse(
@@ -961,8 +1189,8 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 5\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 -\nvideo 1 30 10 20 1 1 -\naudio 1 0 0 30 0 0 -\n",
+            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n",
             "a re-saved v2 project differs only by its version, the lane \
              numbers, the streams it always meant and an equalizer it has none of"
         );
@@ -990,7 +1218,7 @@ mod tests {
         assert_eq!(back.playhead, 5);
         // Saved again it is v5, and that round-trips to the same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 5\n"));
+        assert!(v5.starts_with(b"edith 6\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1079,11 +1307,19 @@ mod tests {
             path: source,
             audio_stream: 1,
         };
-        save(&path, &[entry], &two(one.to_vec(), one.to_vec()), &[], 0).expect("save");
+        save(
+            &path,
+            &[entry],
+            &two(one.to_vec(), one.to_vec()),
+            &[],
+            &[],
+            0,
+        )
+        .expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 5\nplayhead 0\nsource 1 a.mp4\nvideo 1 0 0 30 0 - -\naudio 1 0 0 30 0 - -\n"
+            "edith 6\nplayhead 0\nsource 1 a.mp4\nvideo 1 0 0 30 0 - - -\naudio 1 0 0 30 0 - - -\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
         // way the project was opened -- the same file, through the link, still
@@ -1127,10 +1363,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 6\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 7\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 6");
+        assert_eq!(err, "line 1: unsupported version 7");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
