@@ -1,7 +1,8 @@
 //! Standalone audio files as sources: every container we claim to read decodes
-//! to the same tone, a song joins a timeline of video on the audio lane, and
-//! the three things it cannot do -- start a timeline, play on the video lane,
-//! be copied into an mp4 -- are refusals that say so.
+//! to the same tone, a song joins a timeline of video on the audio lane, a song
+//! *is* a timeline on its own (canvas scaffolded, picture black, sound exported)
+//! and the two things it cannot do -- play on the video lane, be copied into an
+//! mp4 -- are refusals that say so.
 //!
 //! ```text
 //! cargo test -p engine --release --test audio_files
@@ -9,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
 use engine::{AudioSession, Clip, PlaybackSession};
 
@@ -154,13 +156,178 @@ fn a_rate_the_device_cannot_mix_is_refused_at_the_door() {
     assert_eq!(session.lane_clips(Lane::A1).len(), 1);
 }
 
+/// A song *is* a timeline: it scaffolds the canvas a video would have defined,
+/// its own length is the timeline's, the video lane starts empty and the picture
+/// is the black of an uncovered canvas.
 #[test]
-fn a_song_cannot_be_a_timeline_of_its_own() {
-    let e = refusal(PlaybackSession::open(asset("test_tone.mp3")));
-    assert!(
-        e.ends_with("has no picture: open a video first, then import it onto the audio lane"),
-        "{e}"
+fn a_song_is_a_timeline_of_its_own() {
+    let mut session = open(asset("test_tone.mp3"));
+    let meta = *session.meta();
+    assert_eq!(
+        (meta.width, meta.height),
+        (1920, 1080),
+        "the default canvas"
     );
+    assert_eq!(meta.frame_rate, 30.0);
+    // 3 s of tone at 30 fps, rounded up: the only frame count a file with no
+    // picture has, and it is the timeline's length too.
+    assert_eq!(meta.frame_count, 90);
+    assert!((session.timeline_duration() - 3.0).abs() < 0.05);
+    assert!(!session.is_empty(), "a song is not an empty timeline");
+    assert!(
+        session.lane_clips(Lane::V1).is_empty(),
+        "no picture anywhere"
+    );
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+    let clip = session.lane_clips(Lane::A1)[0];
+    assert_eq!((clip.source, clip.in_frame, clip.len()), (0, 0, 90));
+    assert_eq!(session.sources().len(), 1);
+
+    // And it shows black rather than nothing: the whole timeline is a gap, so
+    // the black worker feeds it at the canvas size.
+    session.seek(1.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let frame = loop {
+        if let Some(frame) = session.try_frame() {
+            break frame;
+        }
+        assert!(std::time::Instant::now() < deadline, "no frame at 1 s");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!((frame.width, frame.height), (1920, 1080));
+    assert_eq!(frame.index, 30, "the gap is indexed in timeline frames");
+    assert!(
+        frame.bgra.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]),
+        "the picture over a song is black"
+    );
+}
+
+/// A file that is neither a picture nor a sound this engine can play is not a
+/// timeline: refused at the door, in the words of whatever refused it.
+#[test]
+fn a_file_with_no_picture_and_no_sound_is_still_refused() {
+    let dir = std::env::temp_dir().join(format!("ve_audio_bad_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let fake = dir.join("not_really.mp3");
+    std::fs::write(&fake, b"this is not an mp3").expect("write");
+    let e = refusal(PlaybackSession::open(&fake));
+    assert!(e.starts_with(&fake.display().to_string()), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole audio-only round trip a user makes: open a song, place a second
+/// one, save, reopen, export the sound -- and be told, by name, that the one
+/// format that needs a picture cannot have one.
+#[test]
+fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
+    let dir = std::env::temp_dir().join(format!("ve_audio_only_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let mut session = open(asset("test_tone.mp3"));
+    // A second song joins it, the same way one joins a timeline of video: no
+    // picture is needed for the import to have something to hold it to.
+    session
+        .import(&asset("test_tone.flac"))
+        .expect("a song joins a song");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2);
+    assert!(session.lane_clips(Lane::V1).is_empty());
+    assert!((session.timeline_duration() - 6.0).abs() < 0.1);
+
+    // mp4 is refused by name, before a byte is written; WAV writes the sound.
+    let mp4 = dir.join("song.mp4");
+    let e = wait(&session.export_to_with(
+        &mp4,
+        &ExportSettings {
+            format: Format::Mp4,
+            ..ExportSettings::default()
+        },
+    ))
+    .expect_err("an audio-only timeline is not an mp4");
+    assert_eq!(
+        e.to_string(),
+        "the timeline has no picture: an mp4 would be black. \
+         Export WAV or FLAC, which are the sound itself"
+    );
+    assert!(!mp4.exists(), "the refusal wrote a file anyway");
+
+    let wav = dir.join("song.wav");
+    wait(&session.export_to_with(
+        &wav,
+        &ExportSettings {
+            format: Format::Wav,
+            ..ExportSettings::default()
+        },
+    ))
+    .expect("wav export of an audio-only timeline");
+    let (rate, channels, samples) = decode(&wav);
+    assert_eq!((rate, channels), (44100, 2));
+    let secs = samples.len() as f64 / f64::from(rate) / f64::from(channels);
+    assert!((secs - 6.0).abs() < 0.1, "{secs:.3} s of exported audio");
+    let peak = samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+    assert!(peak > 0.05, "the export is silent: peak {peak}");
+
+    // Saved and reopened: an .edith naming nothing but songs loads.
+    let project = dir.join("songs.edith");
+    let before = (
+        session.lane_spans_by_source(Lane::A1),
+        session.sources().to_vec(),
+        session.timeline_duration(),
+    );
+    session.save_project(&project).expect("save");
+    drop(session);
+    let reloaded = PlaybackSession::open_project(&project).expect("reload an audio-only project");
+    reloaded.set_gain(0.0);
+    assert_eq!(
+        (
+            reloaded.lane_spans_by_source(Lane::A1),
+            reloaded.sources().to_vec(),
+            reloaded.timeline_duration()
+        ),
+        before
+    );
+    assert_eq!(reloaded.meta().frame_rate, 30.0, "the canvas came back");
+    assert_eq!(
+        (reloaded.meta().width, reloaded.meta().height),
+        (1920, 1080)
+    );
+    assert!(reloaded.lane_clips(Lane::V1).is_empty());
+    drop(reloaded);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of the door: a *video* joining a timeline a song scaffolded.
+/// It is held to the canvas the song set (H.264, 30 fps), so a matching file
+/// brings its picture in -- and the timeline stops being audio-only, mp4 export
+/// included.
+#[test]
+fn a_video_joins_a_timeline_a_song_started() {
+    let mut session = open(asset("test_tone.mp3"));
+    session
+        .import(&asset("test_av.mp4"))
+        .expect("30 fps H.264 matches the audio-only canvas");
+    assert_eq!(session.lane_clips(Lane::V1).len(), 1, "a picture at last");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2);
+    // And a file at another rate is refused in the timeline's own words rather
+    // than silently retiming the song already on the lane.
+    let e = refusal(session.import(&asset("test_tone_48k.wav")));
+    assert_eq!(
+        e,
+        "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
+    );
+}
+
+/// Blocks until the export settles, whichever way it settled.
+fn wait(handle: &engine::ExportHandle) -> engine::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if let Some(result) = handle.result() {
+            return result;
+        }
+        assert!(std::time::Instant::now() < deadline, "export never settled");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// The export copies AAC packets and has no encoder, so a timeline carrying an
