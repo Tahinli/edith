@@ -1,6 +1,6 @@
-//! VA-API decode (H.264 and VP9) and H.264 encode, shipped as a `dlopen`-able
-//! plugin so the main binary never gets a DT_NEEDED on libva/gbm/drm. Every
-//! entry point is
+//! VA-API decode (H.264, HEVC and VP9) and H.264 encode, shipped as a
+//! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
+//! libva/gbm/drm. Every entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
 //! negative code: the caller's contract is "any failure means use the software
 //! codec".
@@ -19,6 +19,7 @@ use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
 use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
 use cros_codecs::decoder::stateless::h264::H264;
+use cros_codecs::decoder::stateless::h265::H265;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
@@ -45,17 +46,20 @@ type PooledFrame = PooledVideoFrame<GenericDmaVideoFrame>;
 type Dec<C> = StatelessDecoder<C, VaapiBackend<PooledFrame>>;
 type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 
-/// One decoder per codec the demuxer can hand us. Both share the VA-API backend
-/// and therefore the same [`Handle`], so everything past `decode` is common;
-/// which one exists is decided by the container, never by the caller -- which is
-/// why the plugin's C ABI is unchanged and an older `libengine_hw.so` still
-/// loads and still decodes H.264 (it simply refuses VP9 files at `Demuxer`).
+/// One decoder per codec the demuxer can hand us. They all share the VA-API
+/// backend and therefore the same [`Handle`], so everything past `decode` is
+/// common; which one exists is decided by the container, never by the caller --
+/// which is why the plugin's C ABI is unchanged and an older `libengine_hw.so`
+/// still loads and still decodes H.264 (it simply refuses the newer codecs'
+/// files at `Demuxer`).
 ///
-/// ponytail: VP9 profile 0 (8-bit 4:2:0) only. Profile 2 decodes 10-bit, which
-/// the NV12 pool and the `vaGetImage` read-back here cannot carry; the upgrade
+/// ponytail: 8-bit 4:2:0 only -- VP9 profile 0 and HEVC Main. VP9 profile 2 and
+/// HEVC Main 10 decode 10-bit, which the NV12 pool and the `vaGetImage`
+/// read-back here cannot carry (`Demuxer` refuses Main 10 by name); the upgrade
 /// path is a P010 pool selected from the stream info.
 enum Decoder {
     H264(Dec<H264>),
+    Hevc(Dec<H265>),
     Vp9(Dec<Vp9>),
 }
 
@@ -63,6 +67,7 @@ impl Decoder {
     fn get(&mut self) -> &mut dyn StatelessVideoDecoder<Handle = Handle> {
         match self {
             Self::H264(d) => d,
+            Self::Hevc(d) => d,
             Self::Vp9(d) => d,
         }
     }
@@ -177,6 +182,9 @@ impl Session {
         let decoder = match meta.codec {
             Codec::H264 => {
                 Decoder::H264(Dec::<H264>::new_vaapi(display, BlockingMode::Blocking).ok()?)
+            }
+            Codec::Hevc => {
+                Decoder::Hevc(Dec::<H265>::new_vaapi(display, BlockingMode::Blocking).ok()?)
             }
             Codec::Vp9 => {
                 Decoder::Vp9(Dec::<Vp9>::new_vaapi(display, BlockingMode::Blocking).ok()?)
