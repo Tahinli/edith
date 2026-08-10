@@ -10,6 +10,11 @@
 //! same samples either way; only the packet copy asks which reader it came from,
 //! because there is nothing to copy out of an mp3 that an mp4 can hold.
 //!
+//! One output, however many lanes: a timeline's audio lanes are decoded side by
+//! side and summed ([`AudioSession::open_mixed_streams`]), which is what both
+//! the device and an audio-only export are handed. One lane skips the mixer
+//! entirely and is the plain single-stream path it always was.
+//!
 //! Both readers are addressed as `(path, stream)`. An mp4 may carry several
 //! audio tracks and the caller picks one; a standalone audio file carries
 //! exactly one, so any stream above 0 there is an `Err` rather than a silent
@@ -289,6 +294,53 @@ impl AudioSession {
                     tx,
                 })
             })?;
+        Ok(Some((meta, rx)))
+    }
+
+    /// Every audio lane of a timeline, summed into one stream: `lanes` is one
+    /// play list per lane, each in the shape
+    /// [`open_multi_streams`](Self::open_multi_streams) takes, and what comes
+    /// out is what the device hears -- the lanes decoded side by side and added
+    /// sample for sample, clamped to `[-1, 1]` so a loud pair cannot wrap the
+    /// output.
+    ///
+    /// **One lane is not mixed at all**: it is `open_multi_streams` verbatim, so
+    /// a timeline with a single audio lane decodes exactly the samples it always
+    /// did, down to the bit and down to the thread count.
+    ///
+    /// Lengths need not agree: a lane that has run out contributes silence to
+    /// what is left, which is what a shorter lane means. Each lane keeps its own
+    /// gap rule -- a hole in it is real silence from its own worker, not a
+    /// skipped chunk -- so the sum feeds the master clock a sample per sample of
+    /// timeline however the lanes are arranged. `start_sample` numbers from the
+    /// first lane's own start (see [`AudioChunk`]).
+    pub fn open_mixed_streams(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        let [first, rest @ ..] = lanes else {
+            return Ok(None);
+        };
+        if rest.is_empty() {
+            return Self::open_multi_streams(sources, first);
+        }
+        let mut meta = None;
+        let mut rxs = Vec::with_capacity(lanes.len());
+        for segs in lanes {
+            // Every lane probes the same source 0, so the metas agree by
+            // construction; `None` from any of them is a silent timeline.
+            let Some((lane_meta, rx)) = Self::open_multi_streams(sources, segs)? else {
+                return Ok(None);
+            };
+            meta = Some(lane_meta);
+            rxs.push(rx);
+        }
+        let meta = meta.expect("at least two lanes opened above");
+        let (tx, rx) = sync_channel(32);
+        let channels = usize::from(meta.channels);
+        thread::Builder::new()
+            .name("audio-mix".into())
+            .spawn(move || mix(&rxs, channels, &tx))?;
         Ok(Some((meta, rx)))
     }
 
@@ -1168,6 +1220,72 @@ struct Worker {
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
+}
+
+/// Sums one worker per lane into one stream (see
+/// [`AudioSession::open_mixed_streams`]). Every lane starts at the same timeline
+/// position and synthesises its own gaps, so the lanes are sample-aligned by
+/// construction and a mix is an add: no resampling, no positioning, no drift to
+/// correct. What is emitted at each turn is the shortest block every still-live
+/// lane can supply, which keeps a slow lane from being outrun and never buffers
+/// more than the chunks already in flight.
+///
+/// A lane whose channel has closed has ended and simply stops being added --
+/// that is what "shorter lane" means here. The mix ends when all of them have.
+/// The accumulator is reused across turns; the one allocation per chunk is the
+/// buffer the channel takes ownership of, and none of this is the RT path (the
+/// device callback reads the ring the feeder has already filled).
+fn mix(rxs: &[Receiver<AudioChunk>], channels: usize, tx: &SyncSender<AudioChunk>) {
+    let mut pending: Vec<Vec<f32>> = rxs.iter().map(|_| Vec::new()).collect();
+    let mut live: Vec<bool> = rxs.iter().map(|_| true).collect();
+    // Numbering follows lane 0, whose first chunk says where it starts.
+    let mut base = 0;
+    let mut emitted = 0;
+    let mut out: Vec<f32> = Vec::new();
+    loop {
+        for (i, rx) in rxs.iter().enumerate() {
+            while live[i] && pending[i].is_empty() {
+                match rx.recv() {
+                    Ok(chunk) => {
+                        if i == 0 && emitted == 0 {
+                            base = chunk.start_sample;
+                        }
+                        pending[i] = chunk.samples;
+                    }
+                    Err(_) => live[i] = false,
+                }
+            }
+        }
+        // The block every lane still playing can cover; `None` once they are all
+        // done, which is the only way out of this loop besides a gone consumer.
+        let Some(frames) = pending
+            .iter()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.len() / channels)
+            .min()
+            .filter(|&f| f > 0)
+        else {
+            return;
+        };
+        let block = frames * channels;
+        out.clear();
+        out.resize(block, 0.0);
+        for lane in pending.iter_mut().filter(|p| !p.is_empty()) {
+            for (sum, sample) in out.iter_mut().zip(lane.drain(..block)) {
+                *sum += sample;
+            }
+        }
+        let chunk = AudioChunk {
+            start_sample: base + emitted,
+            // Clamped, not wrapped: two lanes at full scale are what a mix has
+            // to survive, and the device takes `[-1, 1]`.
+            samples: out.iter().map(|s| s.clamp(-1.0, 1.0)).collect(),
+        };
+        if tx.send(chunk).is_err() {
+            return; // caller moved on
+        }
+        emitted += frames as u64;
+    }
 }
 
 fn run(mut w: Worker) {
