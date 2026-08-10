@@ -626,6 +626,22 @@ fn edits_keep_the_audio_clock() {
     );
 }
 
+/// The two acts a second file on the timeline now takes, in the order a user
+/// does them: taken into the library, then dragged onto the end of the
+/// timeline. An import registers a source and places nothing
+/// (`PlaybackSession::import`), so every test that wants a second source *on*
+/// the lanes does both.
+fn import_and_place(session: &mut PlaybackSession, path: &Path) {
+    session.import(path).expect("the file joins this timeline");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, path, 0, None)
+            .expect("a file just imported is on this timeline"),
+        "the drag onto the end of the timeline"
+    );
+}
+
 /// Frame count straight from the container, without decoding anything.
 fn frame_count(path: &Path) -> u32 {
     engine::demux::Demuxer::open(path)
@@ -634,17 +650,28 @@ fn frame_count(path: &Path) -> u32 {
         .frame_count
 }
 
-/// Import: a second file appended to the timeline, played through as one
-/// stream. No audio needed for the pictures, so this runs anywhere.
+/// An imported file dragged onto the end of the timeline, played through as
+/// one stream. No audio needed for the pictures, so this runs anywhere.
 #[test]
-fn import_appends_a_second_source_and_plays_across_the_join() {
+fn a_placed_import_plays_across_the_join() {
     let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
     let mut session = open(&av);
     let (fps, first) = (session.meta().frame_rate, session.meta().frame_count);
     let second = frame_count(&av2);
     assert_eq!((first, second), (150, 120), "fixtures changed");
 
+    // The import alone fills the library: nothing on the lanes moved.
     session.import(&av2).expect("test_av2 matches test_av");
+    assert_eq!(session.clip_spans().len(), 1, "an import placed a clip");
+    assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
+    assert_eq!(session.file_frames(&av2), second, "its own length is noted");
+    // ...and the drag puts it at the end.
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &av2, 0, None)
+            .expect("a file just imported is on this timeline")
+    );
     assert_eq!(session.clip_spans().len(), 2);
     assert_eq!(
         session
@@ -653,7 +680,7 @@ fn import_appends_a_second_source_and_plays_across_the_join() {
             .map(|&(.., s)| s)
             .collect::<Vec<_>>(),
         vec![0, 1],
-        "the appended clip plays the imported file"
+        "the placed clip plays the imported file"
     );
     assert!(
         (session.timeline_duration() - 9.0).abs() < 1e-9,
@@ -721,6 +748,46 @@ fn import_appends_a_second_source_and_plays_across_the_join() {
     );
 }
 
+/// The first import into a window with nothing open: the file fills the library
+/// and the timeline stays *empty*, and the drag that follows is what puts it on
+/// a lane -- at the file's own length, which nothing on the timeline could have
+/// told the session. The whole point of an import that places nothing.
+#[test]
+fn the_first_import_opens_a_library_over_an_empty_timeline() {
+    let av = asset("test_av.mp4");
+    let mut session = PlaybackSession::open_library(&av).expect("open into the library");
+    session.set_gain(0.0);
+    assert!(session.is_empty(), "the timeline must start empty");
+    assert_eq!(session.timeline_duration(), 0.0);
+    assert!(session.clip_spans().is_empty());
+    // But it is a session: the file's own picture, rate and clock, and its row.
+    assert_eq!(session.sources().len(), 1, "the library row");
+    assert_eq!(session.resolution(), (1280, 720));
+    assert_eq!(session.meta().frame_rate, 30.0);
+    assert_eq!(session.file_frames(&av), 150, "5 s at 30 fps, never placed");
+    assert!(!session.undo(), "opening a library is not an undo step");
+
+    // The drag: the row goes onto the timeline whole, and it plays from there.
+    assert!(
+        session
+            .place_stream_at(0.0, &av, 0, None)
+            .expect("its own file is on this timeline")
+    );
+    assert!(!session.is_empty(), "the drag left the timeline empty");
+    assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
+    session.seek(0.0);
+    let landed = next_frame(&mut session, "the dragged clip");
+    assert_eq!(landed.index, 0);
+    assert!(
+        landed.bgra == source_frame(&av, 0),
+        "the placed clip is not playing its file"
+    );
+    // ...and it is an edit like any other, so one `z` takes it back to empty.
+    assert!(session.undo(), "undo the drag");
+    assert!(session.is_empty());
+    assert_eq!(session.sources().len(), 1, "the row survives the undo");
+}
+
 /// One timeline, one set of parameters: everything else is refused by name and
 /// changes nothing.
 #[test]
@@ -746,6 +813,15 @@ fn import_refuses_what_does_not_match() {
         "a resolution of its own is not a refusal any more: {err}"
     );
 
+    // Same codec, same audio, 25 fps: the one property left, named with both
+    // rates. Mixing rates would mean retiming the timeline itself, and there is
+    // no resampler for that, so the refusal is the honest answer.
+    let err = session
+        .import(&asset("test_25fps.mp4"))
+        .expect_err("25 fps must not join a 30 fps timeline")
+        .to_string();
+    assert_eq!(err, "25.000 fps does not match the timeline's 30.000 fps");
+
     // Same size and rate, no audio track: the timeline has one.
     let err = session
         .import(&asset("test_baseline.mp4"))
@@ -758,6 +834,7 @@ fn import_refuses_what_does_not_match() {
         "a missing file is an error, not a panic"
     );
     assert_eq!(session.clip_spans().len(), 1, "a refusal changes nothing");
+    assert_eq!(session.sources().len(), 1, "a refusal left a library row");
     assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
 
     // The mirror: audio into a silent timeline is refused just as loudly.
@@ -780,9 +857,7 @@ fn media_of_two_resolutions_share_one_timeline() {
     let mut session = open(asset("test_baseline.mp4"));
     assert_eq!(session.resolution(), (1280, 720), "source 0's picture");
     assert_eq!(session.native_resolution(), (1280, 720));
-    session
-        .import(&asset("test_mismatch.mp4"))
-        .expect("640x360 must join a 1280x720 timeline");
+    import_and_place(&mut session, &asset("test_mismatch.mp4"));
     // 150 frames of the first file, then 60 of the second, at 30 fps.
     assert_eq!(session.clip_spans().len(), 2);
     assert!((session.timeline_duration() - 7.0).abs() < 1e-9);
@@ -805,9 +880,7 @@ fn media_of_two_resolutions_share_one_timeline() {
 #[test]
 fn a_fitted_clip_is_letterboxed_and_a_filled_one_is_not() {
     let mut session = open(asset("test_baseline.mp4"));
-    session
-        .import(&asset("test_mismatch.mp4"))
-        .expect("640x360 joins");
+    import_and_place(&mut session, &asset("test_mismatch.mp4"));
     // A 4:3 project: both clips are 16:9, so both are letterboxed on it. 960x720
     // holds the whole 640x360 picture as 960x540 with 90 rows of bar either way
     // (fit_rect's own arithmetic, asserted in scale.rs).
@@ -860,14 +933,23 @@ fn a_project_at_the_media_size_is_the_decoder_untouched() {
     );
 }
 
-/// The same file twice is two clips of one source -- a source index is handed
-/// out once and reused, which is what keeps clipboard clips valid forever.
+/// The same file twice is one library row -- a source index is handed out once
+/// and reused, which is what keeps clipboard clips valid forever -- and two
+/// drags of that one row are two clips of it.
 #[test]
 fn importing_one_file_twice_reuses_its_source() {
     let mut session = open(asset("test_av.mp4"));
     let av2 = asset("test_av2.mp4");
-    session.import(&av2).expect("first import");
-    session.import(&av2).expect("second import");
+    assert_eq!(session.import(&av2).expect("first import"), 1);
+    assert_eq!(
+        session.import(&av2).expect("second import"),
+        1,
+        "the second import is the same row"
+    );
+    assert_eq!(session.sources().len(), 2, "one row for one file");
+    import_and_place(&mut session, &av2);
+    import_and_place(&mut session, &av2);
+    assert_eq!(session.sources().len(), 2, "and still one row");
     assert_eq!(
         session
             .clip_spans_by_source()
@@ -884,10 +966,15 @@ fn importing_one_file_twice_reuses_its_source() {
     );
 }
 
-/// Importing after the timeline has been played out revives the session at the
-/// join, not at wherever the free-running clock got to.
+/// A library row placed after the timeline has been played out revives the
+/// session: the placement reseeks like every other edit, and that is what
+/// clears `eos`. The import itself changes nothing, played out or not.
+///
+/// Where it resumes is not asserted, for the reason `paste_at_eos_revives_the_
+/// session` does not assert it either: an edit reseeks to `now()`, and at EOS
+/// the free-running clock has gone past the end.
 #[test]
-fn import_at_eos_resumes_into_the_new_clip() {
+fn a_placement_at_eos_revives_the_session() {
     let av2 = asset("test_av2.mp4");
     let mut session = open(asset("test_av.mp4"));
     let first = session.meta().frame_count;
@@ -897,18 +984,24 @@ fn import_at_eos_resumes_into_the_new_clip() {
     assert!(session.is_eos());
 
     session.import(&av2).expect("import at EOS");
-    assert!(!session.is_eos(), "the import did not revive the session");
-    let landed = next_frame(&mut session, "import at EOS");
-    assert_eq!(landed.index, first, "resumed at the join");
     assert!(
-        landed.bgra == source_frame(&av2, 0),
-        "the resume is not showing the imported file"
+        session.is_eos(),
+        "an import is not an edit: it cannot revive"
+    );
+    assert!(
+        session
+            .place_stream_at(session.timeline_duration(), &av2, 0, None)
+            .expect("a file just imported is on this timeline")
+    );
+    assert!(
+        !session.is_eos(),
+        "the placement did not revive the session"
     );
     assert_eq!(
-        drain_to_eof(&mut session).1,
-        Some(first + frame_count(&av2) - 1),
-        "the appended clip did not play out"
+        session.timeline_duration(),
+        f64::from(first + frame_count(&av2)) / session.meta().frame_rate
     );
+    assert_eq!(session.clip_spans().len(), 2);
 }
 
 /// A source deleted mid-session: the clip that names it contributes no pictures
@@ -920,7 +1013,7 @@ fn a_vanished_source_is_skipped() {
     std::fs::copy(asset("test_av2.mp4"), &scratch).expect("copy the fixture");
     let mut session = open(asset("test_av.mp4"));
     let first = session.meta().frame_count;
-    session.import(&scratch).expect("import the copy");
+    import_and_place(&mut session, &scratch);
     std::fs::remove_file(&scratch).expect("unlink");
 
     session.seek(0.0);
@@ -931,9 +1024,9 @@ fn a_vanished_source_is_skipped() {
     assert!(session.is_eos(), "the timeline still ends");
 }
 
-/// Importing while the device is running: the import reseeks under the
-/// playhead, so what must not happen is a stall -- the joined timeline still
-/// plays out whole. No audio needed, so this runs anywhere.
+/// Importing and placing while the device is running: the placement reseeks
+/// under the playhead, so what must not happen is a stall -- the joined
+/// timeline still plays out whole. No audio needed, so this runs anywhere.
 #[test]
 fn import_during_play_does_not_stall() {
     let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
@@ -945,9 +1038,9 @@ fn import_during_play_does_not_stall() {
     run_for(&mut session, &mut last_index, Duration::from_millis(300));
     assert!(last_index.is_some(), "no frames before the import");
 
-    session.import(&av2).expect("import while playing");
+    import_and_place(&mut session, &av2);
     assert_eq!(session.clip_spans().len(), 2);
-    assert!(session.is_playing(), "the import stopped the clock");
+    assert!(session.is_playing(), "the placement stopped the clock");
 
     // From here on the indices go *backwards* once: `run_for` decodes far ahead
     // of the clock (ledger), and the import reseeks to `now()` -- which is why
@@ -961,38 +1054,37 @@ fn import_during_play_does_not_stall() {
     );
 }
 
-/// An import is *one* undo step: the appended clip goes, the source entry stays
-/// behind (documented, harmless -- source indexes are forever), and the session
-/// is still playable on the restored timeline.
+/// An import is *not* an undo step -- a library row changes nothing playable,
+/// so there is nothing for `z` to take back -- and the placement that follows
+/// is one. Undoing it leaves the row in the library, where the user put it.
 #[test]
-fn undo_after_import_is_one_step() {
+fn an_import_is_not_an_undo_step_but_its_placement_is() {
     let av2 = asset("test_av2.mp4");
     let mut session = open(asset("test_av.mp4"));
     session.import(&av2).expect("import");
+    assert!(!session.undo(), "an import must not be undoable");
+    assert_eq!(session.sources().len(), 2, "and it is still in the library");
+
+    import_and_place(&mut session, &av2);
     assert_eq!(session.clip_spans().len(), 2);
     assert!((session.timeline_duration() - 9.0).abs() < 1e-9);
 
-    assert!(session.undo(), "undo the import");
+    assert!(session.undo(), "undo the placement");
     assert_eq!(session.clip_spans().len(), 1, "one step, back to one clip");
     assert!(
         (session.timeline_duration() - 5.0).abs() < 1e-9,
         "undo did not restore the duration: {}",
         session.timeline_duration()
     );
-
-    // The orphan source is only observable on the project -- `PlaybackSession`
-    // exposes sources through `clip_spans_by_source`, and the undone clip is
-    // exactly the one that named it.
-    let mut project = engine::Project::single(asset("test_av.mp4"), 150);
-    let source = project.import(&av2, 0);
-    assert!(project.append_clip(source, 120));
-    assert!(project.undo());
-    assert_eq!(project.clips().len(), 1);
-    assert_eq!(project.sources().len(), 2, "the source entry stays behind");
+    assert_eq!(
+        session.sources().len(),
+        2,
+        "the library row survives an undo of the clip that used it"
+    );
 
     // Still playable: the undo reseeked to the (paused) playhead at zero.
     session.play();
-    assert_eq!(next_index(&mut session, "undo of an import"), 0);
+    assert_eq!(next_index(&mut session, "undo of a placement"), 0);
 }
 
 /// The audio path across a source join: one worker spans both files, so the
@@ -1004,7 +1096,7 @@ fn undo_after_import_is_one_step() {
 #[ignore = "needs a running PipeWire daemon"]
 fn audio_runs_across_a_source_join() {
     let mut session = open(asset("test_av.mp4"));
-    session.import(&asset("test_av2.mp4")).expect("import");
+    import_and_place(&mut session, &asset("test_av2.mp4"));
     let first = session.meta().frame_count;
 
     session.seek(4.5); // half a second before the join

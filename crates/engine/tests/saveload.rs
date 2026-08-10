@@ -44,14 +44,13 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     let media = copy_in(&dir, "test_multilang.mp4");
     let mut session = PlaybackSession::open(&media).expect("open the fixture");
     session.set_gain(0.0); // silent like the rest of the suites
-    let frames = session.clip_at(0).expect("one clip").out_frame;
     let end = session.timeline_duration();
 
     // Stream 1 is the French track, same rate and layout as stream 0, so it
     // can join this timeline; it lands as a second source of the same file.
     assert!(
         session
-            .place_stream_at(end, &media, 1, frames, None)
+            .place_stream_at(end, &media, 1, None)
             .expect("stream 1 matches the timeline")
     );
     assert_eq!(
@@ -83,15 +82,14 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     let other = copy_in(&dir, "test_multiaudio.mp4");
     let mut session = PlaybackSession::open(&other).expect("open the fixture");
     session.set_gain(0.0);
-    let frames = session.clip_at(0).expect("one clip").out_frame;
     let err = session
-        .place_stream_at(0.0, &other, 1, frames, None)
+        .place_stream_at(0.0, &other, 1, None)
         .expect_err("22.05 kHz mono cannot join a 44.1 kHz stereo timeline")
         .to_string();
     assert!(err.contains("22050"), "unhelpful refusal: {err}");
     assert!(
         session
-            .place_stream_at(0.0, &media, 1, frames, None)
+            .place_stream_at(0.0, &media, 1, None)
             .expect_err("a file that is not a source")
             .to_string()
             .contains("not on this timeline")
@@ -120,7 +118,9 @@ fn a_trimmed_timeline_saves_and_opens_again() {
     session.save_project(&path).expect("save");
     let loaded = PlaybackSession::open_project(&path).expect("a trimmed project opens");
     assert_eq!(
-        loaded.clip_at(0).map(|c| (c.start, c.in_frame, c.out_frame)),
+        loaded
+            .clip_at(0)
+            .map(|c| (c.start, c.in_frame, c.out_frame)),
         Some((5, 5, whole.end() / 2)),
         "the trimmed range is what came back"
     );
@@ -142,9 +142,17 @@ fn a_trimmed_timeline_saves_and_opens_again() {
 /// with something to lose in every field.
 fn edited(dir: &Path) -> PlaybackSession {
     let mut session = PlaybackSession::open(copy_in(dir, "test_av.mp4")).expect("open");
-    session
-        .import(&copy_in(dir, "test_av2.mp4"))
-        .expect("import the second file");
+    // Imported into the library, then dragged onto the end -- the two acts a
+    // second file on the timeline takes.
+    let second = copy_in(dir, "test_av2.mp4");
+    session.import(&second).expect("import the second file");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &second, 0, None)
+            .expect("a file just imported is on this timeline"),
+        "drag it onto the end"
+    );
     assert!(session.cut_at(2.0), "cut inside the first file");
     assert!(session.cut_at(6.5), "cut inside the second file");
     assert!(
@@ -505,10 +513,12 @@ fn a_folder_of_media_and_its_project_can_be_moved() {
 fn orphan_sources_are_not_written() {
     let dir = scratch("orphans");
     let mut session = PlaybackSession::open(copy_in(&dir, "test_av.mp4")).expect("open");
+    // An import that was never dragged onto a lane *is* the orphan: a library
+    // row with no clip naming it. (So is one whose clip was undone -- the same
+    // entry, reached the other way.)
     session
         .import(&copy_in(&dir, "test_av2.mp4"))
         .expect("import");
-    assert!(session.undo(), "take the import back");
     assert_eq!(
         session.sources().len(),
         2,
