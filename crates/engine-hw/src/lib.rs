@@ -1,4 +1,5 @@
-//! VA-API decode (H.264, HEVC, VP9 and AV1) and H.264 encode, shipped as a
+//! VA-API decode (H.264, HEVC, VP9 and AV1) and encode (H.264, and AV1 where
+//! the GPU has an entrypoint for it), shipped as a
 //! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
 //! libva/gbm/drm. Every entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
@@ -17,6 +18,7 @@ use std::rc::Rc;
 
 use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
+use cros_codecs::codec::av1::parser::Profile as Av1Profile;
 use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
 use cros_codecs::decoder::stateless::av1::Av1;
 use cros_codecs::decoder::stateless::h264::H264;
@@ -24,7 +26,9 @@ use cros_codecs::decoder::stateless::h265::H265;
 use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
+use cros_codecs::encoder::av1::EncoderConfig as Av1Config;
 use cros_codecs::encoder::h264::EncoderConfig as H264Config;
+use cros_codecs::encoder::stateless::av1::StatelessEncoder as Av1StatelessEncoder;
 use cros_codecs::encoder::stateless::h264::StatelessEncoder;
 use cros_codecs::encoder::{
     FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder,
@@ -78,6 +82,10 @@ impl Decoder {
 }
 
 type Encoder = StatelessEncoder<
+    GenericDmaVideoFrame,
+    VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
+>;
+type Av1Encoder = Av1StatelessEncoder<
     GenericDmaVideoFrame,
     VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
 >;
@@ -517,7 +525,13 @@ fn fix_slice_nal_headers(au: &mut [u8]) {
 /// point polls it before returning, so the GPU is finished with the buffer
 /// before the next picture is written into it.
 struct EncSession {
-    encoder: Encoder,
+    /// Boxed because the two codecs are two types and everything past `encode`
+    /// is the same trait: one session type serves both, which is what keeps the
+    /// C ABI at one new symbol (the open) instead of four.
+    encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>>,
+    /// H.264 only: the byte the driver leaves at zero is a *NAL* header, and an
+    /// AV1 temporal unit has no such thing.
+    h264: bool,
     /// Owns the DRM node the buffer object below was allocated from.
     _gbm: gbm::Device<std::fs::File>,
     frame: GenericDmaVideoFrame,
@@ -537,6 +551,17 @@ struct EncSession {
 
 impl EncSession {
     fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
+        Self::open_codec(width, height, fps_num, fps_den, bitrate, false)
+    }
+
+    fn open_codec(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+        av1: bool,
+    ) -> Option<Self> {
         // NV12 chroma is half resolution, so odd dimensions have no packing;
         // and radeonsi refuses encode contexts below 64x64 (measured).
         if width < 64 || height < 64 || width % 2 != 0 || height % 2 != 0 {
@@ -551,40 +576,92 @@ impl EncSession {
             height: align16(height),
         };
         let framerate = ((fps_num as f64 / fps_den as f64).round() as i64).clamp(1, 240) as u32;
-        let low_power = display
-            .query_config_entrypoints(VAProfile::VAProfileH264Main)
-            .ok()?
-            .contains(&VAEntrypoint::VAEntrypointEncSliceLP);
-        let config = H264Config {
-            resolution: Resolution { width, height },
-            profile: H264Profile::Main,
-            level: Level::L4,
-            // No B-frames: coded order stays display order, which is what the
-            // muxer's duration-only timing assumes.
-            pred_structure: PredictionStructure::LowDelay {
-                limit: (framerate * 2) as u16,
-            },
-            initial_tunings: Tunings {
-                rate_control: RateControl::ConstantBitrate(bitrate),
-                framerate,
-                ..Default::default()
-            },
+        let profile = match av1 {
+            true => VAProfile::VAProfileAV1Profile0,
+            false => VAProfile::VAProfileH264Main,
         };
-        let encoder = Encoder::new_vaapi(
-            display,
-            config,
-            Fourcc::from(b"NV12"),
-            coded,
-            low_power,
-            BlockingMode::Blocking,
-        )
-        .ok()?;
+        // The driver's own answer to "can you encode this at all": a GPU with no
+        // AV1 encode entrypoint is what makes the caller fall back to `rav1e`,
+        // and asking here is what turns that into a null rather than a failed
+        // encode session halfway through an export.
+        let entrypoints = display.query_config_entrypoints(profile).ok()?;
+        if !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice)
+            && !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP)
+        {
+            return None;
+        }
+        let low_power = entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP);
+        // No B-frames on either codec: coded order stays display order, which is
+        // what both muxers' duration-only timing assumes.
+        let pred_structure = PredictionStructure::LowDelay {
+            limit: (framerate * 2) as u16,
+        };
+        let encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>> = match av1 {
+            true => {
+                // Constant quality, because that is the only rate control the
+                // vendored AV1 backend takes (`stateless/av1/vaapi.rs` refuses
+                // anything else outright); 128 of 255 is its own reference
+                // value. The caller's bitrate therefore does not reach this
+                // seat -- it reaches `rav1e`, which is the other one.
+                //
+                // ponytail: bitrate-driven AV1 on the GPU needs `VA_RC_CBR`
+                // wired through that backend, which is a change in the vendored
+                // crate rather than here.
+                let config = Av1Config {
+                    profile: Av1Profile::Profile0,
+                    resolution: Resolution { width, height },
+                    pred_structure,
+                    initial_tunings: Tunings {
+                        rate_control: RateControl::ConstantQuality(128),
+                        framerate,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                Box::new(
+                    Av1Encoder::new_vaapi(
+                        display,
+                        config,
+                        Fourcc::from(b"NV12"),
+                        coded,
+                        low_power,
+                        BlockingMode::Blocking,
+                    )
+                    .ok()?,
+                )
+            }
+            false => {
+                let config = H264Config {
+                    resolution: Resolution { width, height },
+                    profile: H264Profile::Main,
+                    level: Level::L4,
+                    pred_structure,
+                    initial_tunings: Tunings {
+                        rate_control: RateControl::ConstantBitrate(bitrate),
+                        framerate,
+                        ..Default::default()
+                    },
+                };
+                Box::new(
+                    Encoder::new_vaapi(
+                        display,
+                        config,
+                        Fourcc::from(b"NV12"),
+                        coded,
+                        low_power,
+                        BlockingMode::Blocking,
+                    )
+                    .ok()?,
+                )
+            }
+        };
         // Allocated at the aligned size, so the buffer's pitch is never smaller
         // than a padded row.
         let frame = alloc_nv12(&gbm, coded).ok()?;
         let layout = nv12_layout(coded, frame.get_plane_pitch()[0]);
         Some(Self {
             encoder,
+            h264: !av1,
             _gbm: gbm,
             frame,
             layout,
@@ -667,7 +744,9 @@ impl EncSession {
     fn collect(&mut self) -> Result<(), String> {
         while let Some(coded) = self.encoder.poll().map_err(|e| e.to_string())? {
             let mut au = coded.bitstream;
-            fix_slice_nal_headers(&mut au);
+            if self.h264 {
+                fix_slice_nal_headers(&mut au);
+            }
             self.ready.push_back(au);
         }
         Ok(())
@@ -703,6 +782,32 @@ pub extern "C" fn vh_enc_open(
 ) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
         match EncSession::open(width, height, fps_num, fps_den, bitrate) {
+            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
+            None => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// The same, coding AV1 instead of H.264: null unless this GPU has an AV1
+/// encode entrypoint, which is recent hardware -- the caller then encodes AV1 in
+/// software instead. `bitrate` is not used by this codec (see `EncSession::open`:
+/// the vendored backend is constant-quality only) and is taken all the same, so
+/// the two opens stay one signature.
+///
+/// The session it returns is fed, drained and closed through `vh_enc_frame`,
+/// `vh_enc_drain` and `vh_enc_close` exactly as an H.264 one is; what comes back
+/// out of them is AV1 temporal units rather than Annex-B access units.
+#[unsafe(no_mangle)]
+pub extern "C" fn vh_enc_av1_open(
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    bitrate: u64,
+) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, true) {
             Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
             None => std::ptr::null_mut(),
         }
