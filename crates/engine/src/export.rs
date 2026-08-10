@@ -179,7 +179,7 @@ fn run(
     // Spans, not clips: a gap in the video lane is part of the timeline and
     // gets encoded too, as black frames. The picture count is therefore
     // `timeline_frames` however the lane is arranged.
-    for span in project.spans_from(Lane::Video, 0) {
+    for span in project.spans_from(Lane::V1, 0) {
         // Every clip reopens its own source file at its own in point; the
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
