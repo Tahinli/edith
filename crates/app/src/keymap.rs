@@ -66,6 +66,8 @@ pub enum ActionId {
     Undo,
     AddVideoLane,
     AddAudioLane,
+    RemoveVideoLane,
+    RemoveAudioLane,
     ToggleMute,
     VolumeUp,
     VolumeDown,
@@ -78,7 +80,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 33] = [
+    pub const ALL: [ActionId; 35] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -105,6 +107,8 @@ impl ActionId {
         ActionId::Undo,
         ActionId::AddVideoLane,
         ActionId::AddAudioLane,
+        ActionId::RemoveVideoLane,
+        ActionId::RemoveAudioLane,
         ActionId::ToggleMute,
         ActionId::VolumeUp,
         ActionId::VolumeDown,
@@ -143,6 +147,8 @@ impl ActionId {
             ActionId::Undo => "Undo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
+            ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
+            ActionId::RemoveAudioLane => "Remove the last audio track (it must be empty)",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
@@ -183,6 +189,8 @@ impl ActionId {
             ActionId::Undo => "undo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
+            ActionId::RemoveVideoLane => "remove-video-lane",
+            ActionId::RemoveAudioLane => "remove-audio-lane",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
@@ -235,7 +243,9 @@ impl ActionId {
             | ActionId::Group
             | ActionId::Undo
             | ActionId::AddVideoLane
-            | ActionId::AddAudioLane => Category::Editing,
+            | ActionId::AddAudioLane
+            | ActionId::RemoveVideoLane
+            | ActionId::RemoveAudioLane => Category::Editing,
             ActionId::ToggleMute
             | ActionId::VolumeUp
             | ActionId::VolumeDown
@@ -291,7 +301,15 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 14] = [
+pub const FIXED: [Fixed; 16] = [
+    // Not a chord at all but a way of pressing one, and the only place the
+    // editor can say so: holding a key that moves a *value* runs it, and
+    // holding anything else still does what one press did.
+    Fixed {
+        chord: "hold ← → ↑ ↓",
+        label: "Run a card's slider, or the volume keys, while held",
+        category: Category::View,
+    },
     Fixed {
         chord: "esc",
         label: "Close this card or menu, or cancel a capture",
@@ -338,6 +356,11 @@ pub const FIXED: [Fixed; 14] = [
     Fixed {
         chord: "r",
         label: "Flatten every band",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "s",
+        label: "Show or hide the spectrum behind the curve",
         category: Category::Audio,
     },
     // The colour card's own three, which mean nothing outside it -- the same
@@ -528,6 +551,13 @@ impl Keymap {
                 // is added often enough to deserve a key that is one press.
                 b(ActionId::AddVideoLane, "v", false),
                 b(ActionId::AddAudioLane, "a", false),
+                // ...and the pair that takes one back, on ctrl chords: removing
+                // a track is not a stroke to hit by accident (the resolution key
+                // is out of the way for the same reason). Ctrl+v would be the
+                // matching initial and is the paste, so the video one takes the
+                // key beside it.
+                b(ActionId::RemoveVideoLane, "b", true),
+                b(ActionId::RemoveAudioLane, "a", true),
                 b(ActionId::ToggleMute, "m", false),
                 // The unshifted pair, which is what gpui reports for those two
                 // keys ("=" and "-", platform.rs:862): the volume keys every
@@ -809,7 +839,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 35);
+        assert_eq!(k.entries().len(), 37);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -843,6 +873,10 @@ mod tests {
         // The track keys are the bare letters; the ctrl ones stay copy/paste.
         assert_eq!(k.lookup("v", false), Some(ActionId::AddVideoLane));
         assert_eq!(k.lookup("a", false), Some(ActionId::AddAudioLane));
+        // ...and the ctrl ones take a track away, out of the way of a stray
+        // press. Ctrl+v is the paste, so the video one sits beside it.
+        assert_eq!(k.lookup("b", true), Some(ActionId::RemoveVideoLane));
+        assert_eq!(k.lookup("a", true), Some(ActionId::RemoveAudioLane));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
         assert_eq!(k.lookup("q", false), Some(ActionId::Equalizer));
         // The volume pair is the unshifted one, so neither needs a modifier
@@ -1038,7 +1072,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 33);
+        assert_eq!(ActionId::ALL.len(), 35);
     }
 
     #[test]

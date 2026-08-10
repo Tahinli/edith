@@ -657,8 +657,9 @@ impl AudioSession {
     /// The raw AAC packets covering `segs` — the same half-open source-second
     /// windows [`open_segments`](Self::open_segments) decodes — copied out
     /// byte for byte. Nothing is decoded and nothing is re-encoded: the bytes go
-    /// straight into an mp4 writer, which is the only way to keep audio in an
-    /// export at all (no pure-Rust AAC encoder exists).
+    /// straight into an mp4 writer, which is how an export keeps its sound exact
+    /// wherever the edit lets it (a lane carrying an equalizer cannot be copied
+    /// and is re-encoded instead -- `export::encode_audio`).
     ///
     /// Cut points do not land on 1024-sample boundaries, so each segment is
     /// rounded to whole packets against an error carried across the joins (see

@@ -95,6 +95,9 @@ const ROW_H: f32 = 32.;
 /// wear in the lanes, which is the whole of the panel<->timeline association.
 const SWATCH_W: f32 = 4.;
 const CONTROL_H: f32 = 28.;
+/// The volume slider beside its button: a hundred steps across it, so a pixel
+/// is finer than a step and the drag reads as continuous.
+const VOLUME_W: f32 = 110.;
 const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
 /// cannot push the layout around.
@@ -128,6 +131,18 @@ const ESCAPE: &str = "escape";
 /// as a program name rather than as a file name.
 const NO_FILE: &str = "no file open";
 
+/// What a press of play says when there is nothing to play: no timeline at all
+/// and an emptied one are the same answer to the user, so they are one line.
+const NOTHING_TO_PLAY: &str = "NOTHING TO PLAY — put a clip on the timeline first";
+
+/// Whether a press of play would have anything to play. No timeline at all and
+/// one every clip has been taken off are the same state to a transport, and the
+/// button and the key both have to give the same answer to it -- so there is
+/// one of them, and it is free of the window so it can be checked without one.
+fn nothing_to_play(session: Option<&PlaybackSession>) -> bool {
+    session.is_none_or(PlaybackSession::is_empty)
+}
+
 /// What the monitoring output is set to. Two things, not one: the level the
 /// user picked, and whether it is being held silent -- so unmuting comes back
 /// to the level rather than to a guess.
@@ -146,27 +161,43 @@ struct Volume {
 }
 
 impl Volume {
-    /// 5% a press: twenty of them across the range.
-    const MAX_STEPS: u8 = 20;
+    /// One step is one percent: fine enough that a drag along the slider reads
+    /// as continuous, and still a count rather than a float.
+    const MAX_STEPS: u8 = 100;
+
+    /// 5% a press: twenty presses across the range, which is what the keys have
+    /// always moved. The slider is what the finer grid is for.
+    const KEY_STEP: u8 = 5;
 
     /// What the device is set to: mute wins, and the level is what it returns
     /// to. `0.0..=1.0`, which is the range the plugin's ABI accepts.
     fn gain(self) -> f32 {
-        if self.muted {
-            0.
-        } else {
-            f32::from(self.steps) / f32::from(Self::MAX_STEPS)
-        }
+        if self.muted { 0. } else { self.along() }
     }
 
     /// One press up or down, clamped at both ends -- saturating, so the count
     /// cannot wrap past silence into full volume.
     fn step(&mut self, up: bool) {
         self.steps = if up {
-            self.steps.saturating_add(1).min(Self::MAX_STEPS)
+            self.steps.saturating_add(Self::KEY_STEP).min(Self::MAX_STEPS)
         } else {
-            self.steps.saturating_sub(1)
+            self.steps.saturating_sub(Self::KEY_STEP)
         };
+    }
+
+    /// Where the hand let go along the slider, 0..1 from silence to full. The
+    /// grid is the same one the keys land on, so a drag to the top and a key
+    /// held up reach the very same number -- and a drag never touches mute:
+    /// asking for a level while muted is not asking for sound.
+    fn set_along(&mut self, frac: f32) {
+        self.steps = (frac.clamp(0., 1.) * f32::from(Self::MAX_STEPS)).round() as u8;
+    }
+
+    /// How full the slider is drawn, 0..1. The level and not the gain: a muted
+    /// slider still shows what unmuting comes back to, exactly as the label
+    /// does.
+    fn along(self) -> f32 {
+        f32::from(self.steps) / f32::from(Self::MAX_STEPS)
     }
 
     /// What the button reads. The level shows while muted too: it is what the
@@ -358,9 +389,10 @@ fn speed_at(permille: i32) -> Speed {
 }
 
 /// The silence card's rows, in the order it lists them: how wide the apply
-/// reaches, the four settings a scan is told, and the rate the speed-up plays
-/// at. What `silence_field` indexes and what [`Player::nudge_silence`] moves.
-const SILENCE_ROWS: usize = 6;
+/// reaches, the threshold and the unit it is read in, the three durations a
+/// scan is told, and the rate the speed-up plays at. What `silence_field`
+/// indexes and what [`Player::nudge_silence`] moves.
+const SILENCE_ROWS: usize = 7;
 
 /// How wide a jumpcut reaches. A ripple used to be the whole timeline's
 /// business and nothing else; it is a *choice* now, because a podcast track's
@@ -408,9 +440,12 @@ const SILENCE_DB_STEP: f32 = 1.;
 const SILENCE_SECS_STEP: f64 = 0.05;
 
 /// How far each of them may be pushed. UI decisions, all of them: the engine
-/// takes any finite number, but a threshold at 0 dBFS calls a whole take silent
-/// and a forgiveness of ten seconds finds nothing in a talking head.
-const SILENCE_DB_RANGE: (f32, f32) = (-80., -10.);
+/// takes any finite number, but a forgiveness of ten seconds finds nothing in a
+/// talking head. The threshold reaches full scale, which calls a whole take
+/// silent -- that is a thing someone may want to ask for (the preview on the
+/// lane says what it would cost before anything is cut), so the top is 0 rather
+/// than a number this card picked for them.
+const SILENCE_DB_RANGE: (f32, f32) = (-80., 0.);
 const SILENCE_SECS_RANGE: (f64, f64) = (0., 5.);
 
 /// The speed-up rate is bounded *below* by real time: a "speed-up" that slows
@@ -450,6 +485,36 @@ const EQ_TICKS: [(f32, &str); 5] = [
     (10000., "10k"),
     (20000., "20k"),
 ];
+
+/// The gains the graph rules a line across, besides the 0 dB one it already
+/// had: half way to each limit, so a boost can be read as "about six" without
+/// counting pixels. The limits themselves are the box's own edges and are
+/// named at the corners instead.
+const EQ_DB_GRID: [f32; 2] = [6., -6.];
+
+/// The grid's ink: above the card's background and below everything drawn on
+/// it, so the lines are a ruling rather than a thing to look at.
+const EQ_GRID: u32 = 0x3a3a3a;
+
+/// How many played samples one spectrum frame is transformed from. A power of
+/// two ([`fft`] is radix-2) and the whole of the engine's tap: 1024 at 48 kHz
+/// is a 47 Hz bin, fine enough that the bass end is a shape and short enough
+/// (21 ms) that the analyser moves with the music.
+const EQ_FFT: usize = 1024;
+
+/// The level range the analyser is drawn across, floor to ceiling in dBFS: the
+/// bottom of the box is silence and the top is a bin at -12 dBFS, which is
+/// about where a mixed track's loudest band sits. A look, not a measurement --
+/// the numbers on the axis are the curve's dB, never the analyser's.
+const EQ_SPECTRUM_DB: (f32, f32) = (-96., -12.);
+
+/// The analyser's fill, behind the curve: a dim blue-grey with enough alpha to
+/// read as a haze the accent line sits on top of.
+const EQ_SPECTRUM_INK: u32 = 0x7f95ad66;
+
+/// The area under the response curve, same accent as the line at a tenth of
+/// its weight: it is what makes a boost read as a hill rather than as a wire.
+const EQ_FILL_INK: u32 = 0x4a9eff26;
 
 /// The colour card's four controls, in the order it lists them: what each is
 /// called and the range it moves in. The order is `ColorParams`' own, which is
@@ -584,6 +649,11 @@ struct Player {
     /// also why it is not written to the project file and cannot reach an
     /// export. [`Player::apply_volume`] is what pushes it at a session.
     volume: Volume,
+    /// Where the volume slider was last painted, and whether a hand is on it --
+    /// the speed bar's pair, for the speed bar's reason: the pointer moves
+    /// arrive at the root, so the bar's own geometry has to be readable there.
+    volume_bar: Rc<Cell<Bounds<Pixels>>>,
+    volume_dragging: bool,
     /// The keybindings overlay is up. While it is, it owns the keyboard and the
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
@@ -622,6 +692,11 @@ struct Player {
     /// window position only, so this is what a press and a drag are read
     /// against ([`frac_along`], [`frac_down`]).
     eq_graph: Rc<Cell<Bounds<Pixels>>>,
+    /// Whether the analyser is drawn behind the curve. On by default -- what
+    /// the curve is being *shaped against* is the point of drawing it -- and
+    /// off with one press for anyone who would rather read the curve alone.
+    /// Card state, not the project's: it changes nothing that plays.
+    eq_spectrum: bool,
     /// The colour card is up on this clip -- the lane it is on and its index
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
@@ -652,6 +727,14 @@ struct Player {
     /// Which of the card's [`SILENCE_ROWS`] the arrow keys move. The card's own
     /// focus, since nothing in it takes gpui's (ledger:182).
     silence_field: usize,
+    /// Whether the threshold is *labelled* dBFS or dB. Display only, and the
+    /// number is the same either way: the setting is a level below full scale,
+    /// so 0 is the loudest sample a file can hold and -40 is forty decibels
+    /// under it -- "dBFS" names that reference out loud, "dB" leaves it unsaid.
+    /// No conversion is hiding behind the row (there is no reference here worth
+    /// inventing, and a made-up SPL would be a lie about what was measured);
+    /// what it changes is which of the two spellings a person reads.
+    silence_dbfs: bool,
     /// What the last scan found, in timeline frames: what the lane draws marks
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
@@ -822,6 +905,11 @@ impl Player {
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
+            // The last track of that kind: the one the add key put there, so the
+            // two strokes undo each other press for press. Any other track goes
+            // through the × in its own header.
+            ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
+            ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
@@ -1314,9 +1402,12 @@ impl Player {
                     + steps as f32 * SILENCE_DB_STEP)
                     .clamp(SILENCE_DB_RANGE.0, SILENCE_DB_RANGE.1)
             }
-            2 => self.silence.min_silence = secs(self.silence.min_silence),
-            3 => self.silence.padding = secs(self.silence.padding),
-            4 => self.silence.min_keep = secs(self.silence.min_keep),
+            // Two spellings of the same level, so either arrow flips it -- a
+            // ring of two, like the scope row's.
+            2 => self.silence_dbfs = !self.silence_dbfs,
+            3 => self.silence.min_silence = secs(self.silence.min_silence),
+            4 => self.silence.padding = secs(self.silence.padding),
+            5 => self.silence.min_keep = secs(self.silence.min_keep),
             _ => {
                 self.silence_factor =
                     silence_rate(i32::from(self.silence_factor.permille()) + steps * SPEED_STEP)
@@ -1476,6 +1567,29 @@ impl Player {
             || self.speed_open.is_some()
             || self.silence_open.is_some()
             || self.exporting().is_some()
+    }
+
+    /// Which of [`Repeat`]'s three the window is in, for the hold gate at the
+    /// top of the key handler. Not [`Player::modal`]: that asks whether an
+    /// overlay is up at all, and here the cards with sliders in them are
+    /// exactly the ones that answer differently from the keys menu and the
+    /// export card.
+    fn repeat_scope(&self) -> Repeat {
+        if self.rebinding.is_some()
+            || self.keys_open
+            || self.export_open
+            || self.exporting().is_some()
+        {
+            Repeat::Nothing
+        } else if self.eq_open.is_some()
+            || self.color_open.is_some()
+            || self.speed_open.is_some()
+            || self.silence_open.is_some()
+        {
+            Repeat::Card
+        } else {
+            Repeat::Keymap
+        }
     }
 
     /// Opens the equalizer on the selected clip. Audio only, and it says so
@@ -2027,6 +2141,25 @@ impl Player {
             return clip;
         };
         match trim.edge {
+            // A still grows forward from source frame 0 instead, exactly as
+            // `Project::trim` writes it: with the in-point clamped at 0 the box
+            // below would slide left rather than stretch, and the release would
+            // then commit a wider clip than the drag drew.
+            Edge::Start
+                if self.session.as_ref().is_some_and(|session| {
+                    session
+                        .sources()
+                        .get(clip.source)
+                        .is_some_and(|s| engine::is_image(&s.path))
+                }) =>
+            {
+                Clip {
+                    in_frame: 0,
+                    out_frame: clip.end().saturating_sub(trim.to).max(1),
+                    start: trim.to,
+                    ..clip
+                }
+            }
             // The in-point follows the head, exactly as `Project::trim` moves
             // it: what stays on screen plays what it always played.
             Edge::Start => Clip {
@@ -2218,6 +2351,16 @@ impl Player {
         self.waves.clear();
         self.streams.clear();
         self.sizes.clear();
+        // Scanned off a source that is not in the library any more.
+        self.silence_levels = None;
+        // Every gesture in flight, dropped for `reset_after_reseek`'s reason
+        // (it drops the trim below): a drag holds a bar, a clip or a band of a
+        // timeline that has just stopped existing.
+        self.scrubbing = false;
+        self.volume_dragging = false;
+        self.eq_dragging = false;
+        self.speed_dragging = false;
+        self.color_dragging = false;
         self.displayed = 0;
         self.dropped = 0;
         self.started = None;
@@ -2488,6 +2631,64 @@ impl Player {
         cx.notify();
     }
 
+    /// The × in a track's header: the add taken back, one undo step, and the
+    /// engine's own words when it refuses -- those name the clips still on the
+    /// track, so the notice says what to delete first. A removal never deletes a
+    /// clip.
+    ///
+    /// Everything holding a `(lane, idx)` is dropped, because the tracks below
+    /// the one that went have just moved up an `ord`
+    /// ([`engine::Project::remove_lane`]): a selection or an open card kept
+    /// across it would be pointing at the *next* track's clip.
+    fn remove_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let removed = self
+            .session
+            .as_mut()
+            .map(|session| session.remove_lane(lane));
+        let text = match removed {
+            Some(Ok(())) => {
+                self.selected = None;
+                self.context_menu = None;
+                self.eq_open = None;
+                self.color_open = None;
+                self.speed_open = None;
+                self.close_silence();
+                format!(
+                    "{} REMOVED — {} brings it back",
+                    lane.label(),
+                    self.keymap.display(ActionId::Undo)
+                )
+            }
+            Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
+            None => "NO TRACK REMOVED — open a file first".to_string(),
+        };
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// What the remove keys act on: the last track of that kind, which is the
+    /// one the matching add key appended. Nothing at all before a file is open,
+    /// where the timeline drawn is a placeholder pair.
+    fn remove_last_lane(&mut self, kind: LaneKind, cx: &mut Context<Self>) {
+        let last = self.session.as_ref().and_then(|session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == kind)
+                .next_back()
+        });
+        match last {
+            Some(lane) => self.remove_lane(lane, cx),
+            None => {
+                self.notice = Some("NO TRACK REMOVED — open a file first".into());
+                cx.notify();
+            }
+        }
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
             self.reset_after_reseek();
@@ -2574,8 +2775,31 @@ impl Player {
         cx.notify();
     }
 
+    /// Where the pointer sits along the slider, as a level. The press and every
+    /// sample after it come here, so the sound follows the hand rather than the
+    /// release -- there is nothing to undo about a monitoring level, which is
+    /// why this writes live and keeps no gesture state beyond the flag.
+    fn drag_volume(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let along = frac_along(x, self.volume_bar.get());
+        self.set_volume(|volume| volume.set_along(along), cx);
+    }
+
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
+            return;
+        }
+        // Nothing to play is a message, not a transport state. An empty
+        // timeline is `done` from its one black frame onward, so the restart
+        // below would start a clock against a zero-length timeline -- and it is
+        // `done` again by the next repaint, so no later press could ever stop
+        // it: the button would read "Pause" and never pause. A delete can empty
+        // the timeline mid-play, and that press must still stop it.
+        if nothing_to_play(self.session.as_ref()) {
+            match self.session.as_mut().filter(|s| s.is_playing()) {
+                Some(session) => session.pause(),
+                None => self.notice = Some(NOTHING_TO_PLAY.into()),
+            }
+            cx.notify();
             return;
         }
         if self.done {
@@ -2805,9 +3029,19 @@ impl Render for Player {
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                // `is_held` filters auto-repeat, which would otherwise toggle
-                // playback -- or cut the timeline -- many times a second.
-                if event.is_held {
+                let key = event.keystroke.key.as_str();
+                let ctrl = event.keystroke.modifiers.control;
+                // `is_held` is the auto-repeat, and a value is the one thing
+                // worth running on it: a held arrow on a card moves the slider
+                // it picked, and a held volume key runs the volume. Everything
+                // else is filtered exactly as it always was -- a repeat that
+                // toggled playback, or cut the timeline, many times a second is
+                // what this guard is for, and a row waiting for a stroke takes
+                // none of it either (it would bind the key, then fire what it
+                // just bound). See [`repeats`].
+                if event.is_held
+                    && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl))
+                {
                     return;
                 }
                 // Any key retires the last message, whatever it was -- and owes
@@ -2817,7 +3051,6 @@ impl Render for Player {
                 if this.notice.take().is_some() {
                     cx.notify();
                 }
-                let key = event.keystroke.key.as_str();
                 // A row is waiting for a stroke, and while it is, that stroke is
                 // data: it means the binding and nothing else, which is why this
                 // answers before the export guard and before the keymap is
@@ -2826,7 +3059,7 @@ impl Render for Player {
                     if key == ESCAPE {
                         this.rebinding = None;
                     } else if !is_bare_modifier(key) {
-                        this.capture(action, key, event.keystroke.modifiers.control);
+                        this.capture(action, key, ctrl);
                     }
                     cx.notify();
                     return;
@@ -2835,7 +3068,7 @@ impl Render for Player {
                 // control modifier set (the control code is mapped back), which
                 // is why the keymap is keyed on the pair and never on the key
                 // alone.
-                let action = this.keymap.lookup(key, event.keystroke.modifiers.control);
+                let action = this.keymap.lookup(key, ctrl);
                 // An export is reading the edit list every other action here
                 // would change, so cancelling is the only one that means
                 // anything until it is over.
@@ -2907,6 +3140,11 @@ impl Render for Player {
                             band.gain_db = 0.;
                         }
                         this.commit_eq(cx);
+                    } else if key == "s" {
+                        // The analyser off and on. Nothing is committed: it is
+                        // what the card *shows*, so it survives no further than
+                        // this window.
+                        this.eq_spectrum = !this.eq_spectrum;
                     } else if let Ok(digit) = key.parse::<usize>() {
                         // 1-based, as the rows are numbered on screen; a digit
                         // past the last band picks nothing rather than panics.
@@ -3082,6 +3320,16 @@ impl Render for Player {
                     }
                     return;
                 }
+                // The volume slider, the same live writes: what the hand is on
+                // is what the speakers are doing, and there is nothing to undo.
+                if this.volume_dragging {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_volume(event.position.x, cx);
+                    } else {
+                        this.volume_dragging = false;
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -3120,6 +3368,10 @@ impl Render for Player {
                     }
                     if std::mem::take(&mut this.speed_dragging) {
                         this.drag_speed(event.position.x, false, cx);
+                        return;
+                    }
+                    if std::mem::take(&mut this.volume_dragging) {
+                        this.drag_volume(event.position.x, cx);
                         return;
                     }
                     if std::mem::take(&mut this.scrubbing) {
@@ -3544,8 +3796,17 @@ impl Player {
                         "transport",
                         Some(transport_glyph(playing).into_any_element()),
                         if playing { "Pause" } else { "Play" },
-                        key(ActionId::Play),
-                        live,
+                        if nothing_to_play(self.session.as_ref()) && !playing {
+                            format!("{} — put a clip on a lane first", key(ActionId::Play))
+                        } else {
+                            key(ActionId::Play)
+                        },
+                        // An empty timeline has nothing to play, so the button
+                        // says so by being dim rather than by starting a clock
+                        // against nothing (the key press answers with the
+                        // notice). Still live while it *is* playing: a delete
+                        // can empty the timeline mid-play and that has to stop.
+                        live && (playing || !nothing_to_play(self.session.as_ref())),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
                     .child(separator())
@@ -3619,6 +3880,15 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.set_volume(|volume| volume.muted = !volume.muted, cx)
                         }),
+                    ))
+                    // The level itself, to drag. The button beside it stays the
+                    // mute -- one gesture each -- and the label above is what
+                    // this writes, live, so the number follows the hand.
+                    .child(volume_slider(
+                        self.volume,
+                        self.volume_bar.clone(),
+                        live,
+                        cx,
                     ))
                     .child(separator())
                     // Import is not here: it belongs to the media list it adds
@@ -4187,6 +4457,18 @@ impl Player {
         // clip and a 48 kHz one are not the same shape.
         let sample_rate = self.timeline_audio().map_or(48_000, |(rate, _)| rate);
         let picked = self.eq_params.bands.get(self.eq_band);
+        // What is playing, drawn behind the curve -- and only while something
+        // *is* playing: the tap freezes with the device, and a still spectrum
+        // under a paused timeline would look like sound that is not there.
+        let spectrum = self
+            .eq_spectrum
+            .then_some(self.session.as_ref())
+            .flatten()
+            .filter(|session| session.is_playing())
+            .and_then(PlaybackSession::audio_tap)
+            .map(|(samples, rate)| eq_spectrum(&samples, rate))
+            .filter(|levels| !levels.is_empty())
+            .map(eq_spectrum_curve);
         let handles: Vec<_> = self
             .eq_params
             .bands
@@ -4232,6 +4514,44 @@ impl Player {
                 }),
             )
             .child(bounds_probe(self.eq_graph.clone()))
+            // The analyser first, so everything else is drawn on top of it.
+            .children(spectrum)
+            // The decades, so a hump can be read as "around 200 Hz" without
+            // dropping the eye to the labels along the bottom. The two ends
+            // are the box's own edges and rule nothing.
+            .children(
+                EQ_TICKS
+                    .iter()
+                    .filter(|(freq, _)| *freq > EQ_FREQ_LOW && *freq < EQ_FREQ_HIGH)
+                    .map(|(freq, _)| {
+                        div()
+                            .absolute()
+                            .left(relative(eq_x(*freq)))
+                            .w(px(1.))
+                            .h_full()
+                            .bg(rgb(EQ_GRID))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            // Half way to each limit, each carrying its own number: the curve
+            // is a curve of decibels, and until now only one of them was drawn.
+            .children(EQ_DB_GRID.map(|db| {
+                div()
+                    .absolute()
+                    .top(relative(eq_y(db)))
+                    .w_full()
+                    .h(px(1.))
+                    .bg(rgb(EQ_GRID))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(px(-11.))
+                            .text_size(px(9.))
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("{db:+.0}")),
+                    )
+            }))
             // 0 dB: the line a boost is a boost *from*.
             .child(
                 div()
@@ -4266,6 +4586,9 @@ impl Player {
                     .text_color(rgb(INK_DIM))
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
+        // The bottom of the axis is not named: -12 dB would land in the same
+        // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
+        // already say what the box is worth per pixel.
         Some(
             div()
                 .absolute()
@@ -4300,7 +4623,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag the curve, or 1–5 then up/down — esc closes".into()
+                                    "drag the curve, or 1–5 then up/down — s hides the spectrum, esc closes".into()
                                 })),
                         )
                         .child(graph)
@@ -4309,34 +4632,72 @@ impl Player {
                         // one pulling the other way is not readable off it.
                         .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
                             match picked {
+                                // Q as well as the two the curve shows: it is
+                                // how wide the hump under the handle is, and
+                                // nothing else on the card says so.
                                 Some(band) => format!(
-                                    "{} {} {:+.1} dB",
+                                    "{} {} {:+.1} dB — Q {:.2}",
                                     self.eq_band + 1,
                                     band_label(band),
-                                    band.gain_db
+                                    band.gain_db,
+                                    band.q
                                 ),
                                 None => "no bands".into(),
                             },
                         ))
                         .child(
                             div()
-                                .id("eq-reset")
                                 .mt(px(4.))
                                 .flex()
-                                .h(px(CONTROL_H))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(rgb(SELECTED))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    for band in &mut this.eq_params.bands {
-                                        band.gain_db = 0.;
-                                    }
-                                    this.commit_eq(cx);
-                                }))
-                                .child("Flatten"),
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .id("eq-reset")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(SELECTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            for band in &mut this.eq_params.bands {
+                                                band.gain_db = 0.;
+                                            }
+                                            this.commit_eq(cx);
+                                        }))
+                                        .child("Flatten"),
+                                )
+                                // The analyser's switch, next to the one other
+                                // button the card has: `s` does the same, and a
+                                // toggle only a keystroke can reach is one most
+                                // people never find.
+                                .child(
+                                    div()
+                                        .id("eq-spectrum")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(match self.eq_spectrum {
+                                            true => SELECTED,
+                                            false => HOVER_DIM,
+                                        }))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.eq_spectrum = !this.eq_spectrum;
+                                            cx.notify();
+                                        }))
+                                        .child(match self.eq_spectrum {
+                                            true => "Spectrum on",
+                                            false => "Spectrum off",
+                                        }),
+                                ),
                         ),
                 ),
         )
@@ -4639,9 +5000,19 @@ impl Player {
     fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let cfg = self.silence;
+        // The unit is a label, never a conversion: the threshold is a level
+        // below full scale whichever of the two the row says (`silence_dbfs`).
+        let unit = match self.silence_dbfs {
+            true => "dBFS",
+            false => "dB",
+        };
         let rows = [
             ("Apply to", self.silence_scope.label(&self.silence_lanes())),
-            ("Silence is under", format!("{:.0} dBFS", cfg.threshold_db)),
+            (
+                "Silence is under",
+                format!("{:.0} {unit}", cfg.threshold_db),
+            ),
+            ("Level read in", format!("{unit} (0 = full scale)")),
             (
                 "Forgive quiet shorter than",
                 format!("{:.2} s", cfg.min_silence),
@@ -4740,7 +5111,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "↑↓ picks a setting, ←→ moves it — the marks on the lane are what would go; esc closes",
+                                    "↑↓ picks a setting, ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
                                 ),
                         )
                         .children(rows)
@@ -5168,6 +5539,12 @@ impl Player {
         });
         let name = lane.label();
         let row_id: SharedString = format!("{name}-clip").into();
+        let remove_id: SharedString = format!("{name}-remove").into();
+        let remove_tip: SharedString = format!(
+            "Remove {name} — it must be empty first, and {} brings it back",
+            self.keymap.display(ActionId::Undo)
+        )
+        .into();
         let sources = self
             .session
             .as_ref()
@@ -5197,13 +5574,37 @@ impl Player {
                     .w(px(HEADER_W))
                     .h_full()
                     .flex()
+                    .flex_col()
                     .items_center()
                     .justify_center()
                     .rounded(px(3.))
                     .bg(rgb(SURFACE))
                     .text_size(px(11.))
                     .text_color(rgb(INK_DIM))
-                    .child(name),
+                    .child(div().flex_1().flex().items_center().child(name))
+                    // The one thing a header does: take this track away again.
+                    // A `HIT_MIN` target rather than a glyph-sized one, and it
+                    // stays put on a track holding clips instead of hiding --
+                    // the refusal names them, and a control that vanishes
+                    // teaches nothing.
+                    .child(
+                        div()
+                            .id(remove_id)
+                            .flex_none()
+                            .w_full()
+                            .h(px(HIT_MIN))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.remove_lane(lane, cx)
+                            }))
+                            .child("×"),
+                    ),
             )
             .child(
                 // Clips are placed at their own start rather than queued edge
@@ -6008,7 +6409,7 @@ impl Quality {
 /// that opens but never comes back out is exactly the gap a user would other-
 /// wise go looking for.
 const FORMATS: [(Option<Format>, &str, &str); 9] = [
-    (Some(Format::Mp4), "MP4", "H.264 picture + copied AAC"),
+    (Some(Format::Mp4), "MP4", "H.264 picture + AAC sound"),
     (
         Some(Format::Av1),
         "AV1",
@@ -6018,7 +6419,7 @@ const FORMATS: [(Option<Format>, &str, &str); 9] = [
     (Some(Format::Flac), "FLAC", "lossless — audio only"),
     (None, "MP3", "encoder is LGPL — licence decision pending"),
     (None, "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (None, "AAC", "no pure-Rust AAC encoder"),
+    (None, "AAC", "an MP4's sound here, not a file of its own"),
     (
         None,
         "HEVC",
@@ -6253,6 +6654,39 @@ fn push_digit(mbps: u32, digit: u32) -> u32 {
 /// always worked -- and that binding is still what the progress line shows.
 fn cancels_export(key: &str, action: Option<ActionId>) -> bool {
     key == ESCAPE || action == Some(ActionId::CancelExport)
+}
+
+/// Where a held key would land, which is the whole of what auto-repeat has to
+/// know. [`Player::repeat_scope`] answers it from the same state the handler
+/// walks below itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Repeat {
+    /// A card with values in it owns the keyboard: equalizer, colour, speed or
+    /// silence. Its arrows are sliders.
+    Card,
+    /// Nobody does, so the keymap answers -- and only one pair of its actions
+    /// is a value being moved rather than a thing being done once.
+    Keymap,
+    /// A stroke is being captured, an export is running, or an overlay with no
+    /// value in it is up. Nothing there is worth a repeat.
+    Nothing,
+}
+
+/// Whether a *held* stroke means it again. One press is always one action; a
+/// hold is only ever a value running, so this is what tells the two apart.
+///
+/// The cards' arrows, because that is what every one of them moves a slider
+/// with -- and only the arrows, so the equalizer's `r` cannot flatten five
+/// bands forty times a second and the silence card's `enter` cannot cut forty
+/// places again on the next tick. Outside a card the volume pair and nothing
+/// else: play, cut, delete, save, export and every other binding is a one-shot,
+/// exactly as it was when the handler filtered every held key alike.
+fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> bool {
+    match scope {
+        Repeat::Card => matches!(key, "up" | "down" | "left" | "right"),
+        Repeat::Keymap => matches!(action, Some(ActionId::VolumeUp | ActionId::VolumeDown)),
+        Repeat::Nothing => false,
+    }
 }
 
 /// The keys that are only ever half a chord. gpui delivers a lone modifier
@@ -6553,6 +6987,59 @@ fn control(
         })
 }
 
+/// The monitoring level as something to drag: 4 px of bar to look at and the
+/// whole control's height to hit (WCAG 2.5.8), the split the speed bar and the
+/// colour sliders both make. Only the level -- mute is the button beside it, so
+/// a muted slider still shows what unmuting comes back to, drawn dim.
+///
+/// Dimmed and inert without a timeline, like every other control that would
+/// have nothing to act on.
+fn volume_slider(
+    volume: Volume,
+    bar: Rc<Cell<Bounds<Pixels>>>,
+    enabled: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    div()
+        .id("volume-bar")
+        .relative()
+        .flex_none()
+        .w(px(VOLUME_W))
+        .h(px(CONTROL_H))
+        .flex()
+        .items_center()
+        .tooltip(|_, cx| {
+            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into()))
+                .into()
+        })
+        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.volume_dragging = true;
+                        this.drag_volume(event.position.x, cx);
+                    }),
+                )
+                .child(bounds_probe(bar))
+        })
+        .child(
+            div()
+                .w_full()
+                .h(px(4.))
+                .rounded(px(2.))
+                .bg(rgb(SURFACE))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(volume.along()))
+                        .rounded(px(2.))
+                        .bg(rgb(if volume.muted { INK_DIM } else { ACCENT })),
+                ),
+        )
+}
+
 /// The line between two groups of buttons.
 fn separator() -> impl IntoElement {
     div()
@@ -6712,6 +7199,131 @@ fn hist_curves(bins: [[u32; HIST_BINS]; 3]) -> impl IntoElement {
     .size_full()
 }
 
+/// In-place radix-2 FFT of `re`/`im`, whose length must be a power of two.
+///
+/// Hand-written, and deliberately: a 1024-point transform once a frame is a
+/// few tens of microseconds of plain arithmetic, and a dependency for it would
+/// be a build cost this editor pays on every compile for one card's backdrop.
+fn fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    // Decimation in time: the input is first put in bit-reversed order, after
+    // which the butterflies run over neighbours.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut span = 2;
+    while span <= n {
+        let step = std::f32::consts::TAU / span as f32;
+        for start in (0..n).step_by(span) {
+            for k in 0..span / 2 {
+                // e^{-i2πk/span}: the negative sign is the forward transform.
+                let (sin, cos) = (-step * k as f32).sin_cos();
+                let (a, b) = (start + k, start + k + span / 2);
+                let (tr, ti) = (cos * re[b] - sin * im[b], cos * im[b] + sin * re[b]);
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        span <<= 1;
+    }
+}
+
+/// The played signal as one height per curve point, 0 (silence) to 1 (the top
+/// of the box) -- the analyser the response curve is drawn on top of.
+///
+/// The newest [`EQ_FFT`] samples of the engine's tap, Hann-windowed so a tone
+/// that does not land on a bin centre is one hump rather than a smear across
+/// the axis. Each column takes the *loudest* bin between it and its
+/// neighbours: the axis is logarithmic, so one column near 20 Hz is a fraction
+/// of a bin while one near 20 kHz is hundreds, and averaging those would sink
+/// every peak up there into the noise beside it.
+///
+/// Empty -- nothing to draw -- for a tap too short to transform, which is what
+/// a session has just after a seek.
+///
+/// ponytail: one transform length for the whole axis, so the bass end is a bin
+/// (47 Hz at 48 kHz) wide however many columns are drawn across it -- a 60 Hz
+/// hum and an 80 Hz one are the same hump down there. Upgrade path is the
+/// analyser every mastering EQ uses: two or three transforms of different
+/// lengths, each drawn over the octaves it resolves.
+fn eq_spectrum(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.len() < EQ_FFT {
+        return Vec::new();
+    }
+    let tail = &samples[samples.len() - EQ_FFT..];
+    let mut re: Vec<f32> = tail
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let w = 0.5 * (1. - (std::f32::consts::TAU * i as f32 / EQ_FFT as f32).cos());
+            s * w
+        })
+        .collect();
+    let mut im = vec![0.; EQ_FFT];
+    fft(&mut re, &mut im);
+    // Magnitude per bin, scaled so a full-scale sine reads 0 dBFS: half the
+    // energy is in the mirrored half of the transform, and the Hann window
+    // takes another factor of two off.
+    let mags: Vec<f32> = (0..EQ_FFT / 2)
+        .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt() * 4. / EQ_FFT as f32)
+        .collect();
+    let bin_hz = sample_rate as f32 / EQ_FFT as f32;
+    let (floor, ceiling) = EQ_SPECTRUM_DB;
+    let at = |along: f32| EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+    (0..=EQ_CURVE_STEPS)
+        .map(|step| {
+            let along = step as f32 / EQ_CURVE_STEPS as f32;
+            let half = 0.5 / EQ_CURVE_STEPS as f32;
+            // Bin 0 is DC and means nothing here, so the low end starts at 1.
+            let low = (at(along - half) / bin_hz).round().max(1.) as usize;
+            let high = (at(along + half) / bin_hz).round().max(1.) as usize;
+            let peak = (low..=high)
+                .filter_map(|k| mags.get(k))
+                .fold(0f32, |a, &b| a.max(b));
+            let db = 20. * peak.max(1e-9).log10();
+            ((db - floor) / (ceiling - floor)).clamp(0., 1.)
+        })
+        .collect()
+}
+
+/// The analyser drawn as one filled shape from the floor of the box.
+fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let last = levels.len().saturating_sub(1).max(1) as f32;
+            let mut path = PathBuilder::fill();
+            path.move_to(point(o.x, o.y + s.height));
+            for (i, level) in levels.iter().enumerate() {
+                path.line_to(point(
+                    o.x + s.width * (i as f32 / last),
+                    o.y + s.height * (1. - level),
+                ));
+            }
+            path.line_to(point(o.x + s.width, o.y + s.height));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(EQ_SPECTRUM_INK));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// The cascade's frequency response, drawn as one line across the graph.
 ///
 /// Every point comes from `EqParams::response_db`, which reads the very
@@ -6726,14 +7338,31 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             let (o, s) = (bounds.origin, bounds.size);
+            let points: Vec<_> = (0..=EQ_CURVE_STEPS)
+                .map(|step| {
+                    let along = step as f32 / EQ_CURVE_STEPS as f32;
+                    let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+                    point(
+                        o.x + s.width * along,
+                        o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
+                    )
+                })
+                .collect();
+            // The area between the curve and 0 dB, closed along that line: a
+            // boost and a cut wind opposite ways around it, which is exactly
+            // what makes both of them fill and the flat parts stay empty.
+            let mut area = PathBuilder::fill();
+            area.move_to(point(o.x, o.y + s.height / 2.));
+            for at in &points {
+                area.line_to(*at);
+            }
+            area.line_to(point(o.x + s.width, o.y + s.height / 2.));
+            area.close();
+            if let Ok(area) = area.build() {
+                window.paint_path(area, rgba(EQ_FILL_INK));
+            }
             let mut path = PathBuilder::stroke(px(2.));
-            for step in 0..=EQ_CURVE_STEPS {
-                let along = step as f32 / EQ_CURVE_STEPS as f32;
-                let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
-                let at = point(
-                    o.x + s.width * along,
-                    o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
-                );
+            for (step, at) in points.into_iter().enumerate() {
                 match step {
                     0 => path.move_to(at),
                     _ => path.line_to(at),
@@ -6817,21 +7446,22 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_FREQ_HIGH,
-        EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_TICKS, EXPORT_ROWS_H, FORMATS,
-        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
-        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
-        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H,
-        Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave,
-        applicable, band_label, can_add, cancels_export, clipboard_after_remove, color_snap,
-        envelope, eq_x, eq_y, export_path, export_settings, format_key, format_line,
-        format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
-        keymap, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit, retarget,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
+        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
+        EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS,
+        HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
+        LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
+        MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
+        VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
+        cancels_export, clipboard_after_remove, color_snap, envelope, eq_spectrum, eq_x, eq_y,
+        export_path, export_settings, format_key, format_line, format_refusal, frac_along,
+        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
+        menu_at, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
         scrub_due, show_label, silence_rate, source_tint, span_partner, speed_at, start_frac,
         timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
-    use super::{LaneKind, file_name, file_uri, library_rows, unscannable};
+    use super::{LaneKind, Repeat, file_name, file_uri, library_rows, repeats, unscannable};
 
     /// What the file manager is handed: the parts a path keeps as they are, and
     /// the ones the bus would otherwise read as something else.
@@ -8085,6 +8715,86 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// The analyser drawn behind the curve: a tone has to land on its own
+    /// frequency, or the backdrop is a decoration rather than a reading of what
+    /// is playing -- and someone shaping a band against it would be aiming at
+    /// the wrong octave.
+    #[test]
+    fn the_spectrum_puts_a_tone_under_its_own_frequency() {
+        use std::f32::consts::TAU;
+        let rate = 48_000u32;
+        let sine = |hz: f32, amp: f32| -> Vec<f32> {
+            (0..EQ_FFT)
+                .map(|i| amp * (TAU * hz * i as f32 / rate as f32).sin())
+                .collect()
+        };
+
+        // Silence is the floor of the box everywhere, not a band of noise.
+        let quiet = eq_spectrum(&vec![0.; EQ_FFT], rate);
+        assert_eq!(quiet.len(), EQ_CURVE_STEPS + 1);
+        assert!(quiet.iter().all(|&l| l == 0.), "silence drew something");
+
+        // A tone peaks over its own frequency, and the columns two octaves
+        // either side of it are near the floor. "Over" to within a bin down low
+        // and a column up high, which is all a 1024-point transform on a log
+        // axis can promise: at 200 Hz a whole column is a fraction of a bin
+        // wide, so the peak sits on the bin the tone fell in.
+        let column = |freq: f32| (eq_x(freq) * EQ_CURVE_STEPS as f32).round() as usize;
+        let freq_at = |col: usize| {
+            let along = col as f32 / EQ_CURVE_STEPS as f32;
+            EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along)
+        };
+        for hz in [200., 1000., 5000.] {
+            let levels = eq_spectrum(&sine(hz, 0.05), rate);
+            let (at, top) =
+                levels
+                    .iter()
+                    .enumerate()
+                    .fold((0, 0f32), |best, (i, &l)| match l > best.1 {
+                        true => (i, l),
+                        false => best,
+                    });
+            let slack = 1.5 * rate as f32 / EQ_FFT as f32 + 0.04 * hz;
+            assert!(
+                (freq_at(at) - hz).abs() <= slack,
+                "{hz} Hz peaked at {:.0} Hz (column {at})",
+                freq_at(at)
+            );
+            // -26 dBFS, which is where a 0.05 tone sits on the axis.
+            let want =
+                (20. * 0.05f32.log10() - EQ_SPECTRUM_DB.0) / (EQ_SPECTRUM_DB.1 - EQ_SPECTRUM_DB.0);
+            assert!(
+                (top - want).abs() < 0.05,
+                "a -26 dBFS tone drew {top} of the box, not {want}"
+            );
+            // Two octaves off is far enough down the box that the hump reads as
+            // one hump: 0.4 of the axis is a little over 30 dB.
+            for off in [hz / 4., hz * 4.] {
+                let away = levels[column(off).min(EQ_CURVE_STEPS)];
+                assert!(
+                    top - away > 0.4,
+                    "{hz} Hz drew {top} but still {away} at {off} Hz"
+                );
+            }
+        }
+
+        // Level reads as level: 40 dB quieter sits lower by the fraction of the
+        // axis those 40 dB are.
+        let loud = eq_spectrum(&sine(1000., 0.05), rate);
+        let soft = eq_spectrum(&sine(1000., 0.0005), rate);
+        let at = column(1000.);
+        let drop = loud[at] - soft[at];
+        let (floor, ceiling) = EQ_SPECTRUM_DB;
+        assert!(
+            (drop - 40. / (ceiling - floor)).abs() < 0.05,
+            "40 dB quieter moved the analyser {drop} of the box"
+        );
+
+        // A tap the engine has not filled yet (right after a seek) draws
+        // nothing at all rather than a transform of half a window.
+        assert!(eq_spectrum(&[0.; 16], rate).is_empty());
+    }
+
     /// The speed bar is the same round trip -- pixels -> rate -> fill -- with
     /// one thing the colour sliders do not have to promise: **exactly 1.00x has
     /// to be reachable**, by a hand as well as by the reset. A grid that missed
@@ -8393,11 +9103,47 @@ mod tests {
         );
     }
 
+    /// The hold gate: a value runs, everything else still means one press one
+    /// action -- which is the whole invariant the blanket `is_held` filter used
+    /// to carry on its own.
+    #[test]
+    fn a_held_key_moves_a_value_and_nothing_else() {
+        use keymap::ActionId;
+        // A card's four arrows, whichever card it is.
+        for key in ["up", "down", "left", "right"] {
+            assert!(repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // The card's own one-shots: flatten every band, cut forty places, play
+        // them fast, close. None of them on a hold.
+        for key in ["r", "enter", "f", "1", "escape"] {
+            assert!(!repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // Outside a card the keymap answers, and only the volume pair is a
+        // value being moved.
+        assert!(repeats(Repeat::Keymap, "up", Some(ActionId::VolumeUp)));
+        assert!(repeats(Repeat::Keymap, "down", Some(ActionId::VolumeDown)));
+        for action in ActionId::ALL {
+            let held = repeats(Repeat::Keymap, "k", Some(action));
+            assert_eq!(
+                held,
+                matches!(action, ActionId::VolumeUp | ActionId::VolumeDown),
+                "{action:?} on a hold"
+            );
+        }
+        // An arrow with nothing bound to it moves nothing on the timeline.
+        assert!(!repeats(Repeat::Keymap, "left", None));
+        // And a stroke being captured, an export, or the overlays: nothing at
+        // all, or the hold would bind a key and then fire what it just bound.
+        for key in ["up", "left", "escape", "5"] {
+            assert!(!repeats(Repeat::Nothing, key, Some(ActionId::VolumeUp)));
+        }
+    }
+
     #[test]
     fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
         // The same 640x360 floor, and this card starts below the header: a
-        // title and a hint over its five rows, the count line and the two
-        // buttons.
+        // title and a hint over its [`SILENCE_ROWS`] rows, the count line and
+        // the two buttons.
         let (title, hint, count) = (17., 17., 17.);
         let gaps = 6. * 5.;
         let padding = 24.;
@@ -8728,6 +9474,116 @@ mod tests {
         assert_eq!(source_tint(9), source_tint(1));
         assert_eq!(source_tint(usize::MAX), SOURCE_TINTS[usize::MAX % 4]);
     }
+
+    /// The bug: an empty timeline is end-of-stream from its one black frame
+    /// onward, so the pump had `done` set before anything was ever pressed --
+    /// and the transport's restart branch read that as "played out, start from
+    /// the top". It started a clock against a zero-length timeline, which was
+    /// `done` again by the next repaint, so every further press restarted it
+    /// too: the button read "Pause" and no press of it ever paused.
+    ///
+    /// What holds it now is one predicate, checked here against real sessions
+    /// on both sides -- the emptied one refuses, a timeline with clips on it
+    /// does not.
+    #[test]
+    fn an_empty_timeline_has_nothing_to_play() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        // Silent like the engine suite: this opens the real device.
+        session.set_gain(0.0);
+        // A timeline with clips on it plays, and always did: the guard must not
+        // touch that side.
+        assert!(!session.is_empty());
+        assert!(!nothing_to_play(Some(&session)));
+
+        // Every clip taken off, which is a state and not a failure.
+        while session.delete_clip(Lane::V1, 0) {}
+        while session.delete_clip(Lane::A1, 0) {}
+        assert!(session.is_empty(), "the timeline is empty");
+        assert_eq!(session.timeline_duration(), 0.0);
+
+        // What the pump does every render, and what set `done` before the fix:
+        // the black frame goes by and the session is at its end at once.
+        for _ in 0..40 {
+            while session.try_frame().is_some() {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.is_eos(), "an empty timeline is done before it starts");
+
+        // So the press is refused rather than sent down the restart branch --
+        // and with no session at all it is the same refusal.
+        assert!(nothing_to_play(Some(&session)));
+        assert!(nothing_to_play(None));
+        assert!(!session.is_playing(), "and nothing was started");
+    }
+
+    /// The slider writes the same numbers the keys do, and mute is not one of
+    /// them: dragging while muted picks the level unmuting comes back to.
+    #[test]
+    fn the_slider_lands_on_the_grid_the_keys_move_on() {
+        let mut volume = Volume::default();
+        // Both ends exactly, and clamped past them.
+        volume.set_along(0.);
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Vol 0%");
+        volume.set_along(1.5);
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(volume.along(), 1.0);
+
+        // Halfway is 50%, and a key press from there is 5% -- the same step
+        // count as before, on a finer grid.
+        volume.set_along(0.5);
+        assert_eq!(volume.label(), "Vol 50%");
+        volume.step(true);
+        assert_eq!(volume.label(), "Vol 55%");
+        volume.step(false);
+        assert_eq!(volume.gain(), 0.5);
+
+        // A number no step lands on comes back as the nearest one, so the label
+        // and the fill are the same value the device was handed.
+        volume.set_along(0.333);
+        assert_eq!(volume.label(), "Vol 33%");
+        assert_eq!(volume.along(), 0.33);
+
+        // Muted, the drag moves the level and nothing comes out.
+        volume.muted = true;
+        volume.set_along(0.8);
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Muted 80%");
+        volume.muted = false;
+        assert_eq!(volume.gain(), 0.8);
+    }
+
+    /// The slider lands where it paints: the arithmetic `Player::drag_volume`
+    /// runs over the bar's own painted width, which is the one thing a test of
+    /// it can share without re-deriving it.
+    #[test]
+    fn the_volume_slider_lands_where_it_paints() {
+        let bar = Bounds {
+            origin: point(px(420.), px(508.)),
+            size: size(px(VOLUME_W), px(CONTROL_H)),
+        };
+        let at = |x: f32| {
+            let mut volume = Volume::default();
+            volume.set_along(frac_along(px(x), bar));
+            volume
+        };
+        assert_eq!(at(420.).gain(), 0.0, "the left end is silence");
+        assert_eq!(at(420. + VOLUME_W).gain(), 1.0, "the right end is full");
+        assert_eq!(at(-4000.).gain(), 0.0, "off the left clamps");
+        assert_eq!(at(9999.).gain(), 1.0, "off the right clamps");
+        // Every pixel along it: a level the keys could also reach, painted back
+        // where the hand pressed to within the half step the rounding costs.
+        for step in 0..=(VOLUME_W as u32) {
+            let along = step as f32 / VOLUME_W;
+            let volume = at(420. + along * VOLUME_W);
+            let painted = volume.along();
+            let slack = 0.5 / f32::from(Volume::MAX_STEPS) + 1e-4;
+            assert!(
+                (painted - along).abs() <= slack,
+                "pressed at {along}, paints at {painted}"
+            );
+        }
+    }
 }
 
 fn main() {
@@ -8848,6 +9704,8 @@ fn main() {
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
+                    volume_bar: Rc::default(),
+                    volume_dragging: false,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: meta.map_or(30., |meta| meta.frame_rate),
@@ -8883,6 +9741,7 @@ fn main() {
                     eq_band: 0,
                     eq_dragging: false,
                     eq_graph: Rc::default(),
+                    eq_spectrum: true,
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
@@ -8895,6 +9754,9 @@ fn main() {
                     // one a person can widen on purpose.
                     silence_scope: Scope::Take,
                     silence_field: 0,
+                    // The reference named, which is what the card said before
+                    // there was a choice about it.
+                    silence_dbfs: true,
                     silence_marks: Vec::new(),
                     silence_levels: None,
                     color_open: None,
