@@ -1130,8 +1130,13 @@ impl Project {
             let (member_lo, member_hi) = match edge {
                 Edge::Start => (
                     // Back to the source's own first frame, and never over the
-                    // clip in front of it.
-                    (c.start - c.in_frame).max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                    // clip in front of it. Saturating because a clip may hold
+                    // *more* head than the timeline has room for -- a ripple
+                    // delete slides a clip back to frame 0 with its in-point
+                    // wherever the cut left it -- and frame 0 is the other wall.
+                    c.start
+                        .saturating_sub(c.in_frame)
+                        .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
                     c.end() - 1,
                 ),
                 Edge::End => (
@@ -2301,6 +2306,30 @@ mod tests {
         assert!(p.lift(Lane::V1, 0), "nothing in front of it to stop it");
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC));
         assert_eq!(shape(&p)[0][0], clip(4, 0, 4, 0), "one frame of head left");
+    }
+
+    /// A clip whose in-point is *past* its own start -- what a ripple delete
+    /// leaves, the piece in front of it gone and this one slid back to frame 0
+    /// carrying the in-point the cut gave it. Its head has more source behind it
+    /// than the timeline has room for, and the timeline's own first frame is the
+    /// wall: asking is not an overflow, and the answer is 0.
+    #[test]
+    fn a_ripple_closed_clip_can_still_be_head_trimmed() {
+        let mut p = Project::single(FILE, 9);
+        assert!(p.split(5));
+        assert!(p.delete_in(Lane::V1, 0), "the first piece goes");
+        assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)], "start 0, in-point 5");
+
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, SRC),
+            Some((0, 3)),
+            "back to frame 0 at most, and one frame of clip always survives"
+        );
+        assert!(!p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "already there");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
+        assert_eq!(shape(&p)[0], vec![clip(2, 7, 9, 0)], "the in-point followed");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "and back out");
+        assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)]);
     }
 
     /// Linked halves trim as one: a link is one span on however many lanes, so
