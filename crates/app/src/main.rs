@@ -357,6 +357,33 @@ fn speed_at(permille: i32) -> Speed {
     Speed::from_permille(permille.clamp(0, i32::from(u16::MAX)) as u16)
 }
 
+/// The silence card's rows, in the order it lists them: the four settings a
+/// scan is told and the rate the speed-up plays at. What `silence_field`
+/// indexes and what [`Player::nudge_silence`] moves.
+const SILENCE_ROWS: usize = 5;
+
+/// One press of a nudge key on each kind of row: a dB on the threshold, a
+/// twentieth of a second on the three durations, and the speed card's own step
+/// on the rate.
+const SILENCE_DB_STEP: f32 = 1.;
+const SILENCE_SECS_STEP: f64 = 0.05;
+
+/// How far each of them may be pushed. UI decisions, all of them: the engine
+/// takes any finite number, but a threshold at 0 dBFS calls a whole take silent
+/// and a forgiveness of ten seconds finds nothing in a talking head.
+const SILENCE_DB_RANGE: (f32, f32) = (-80., -10.);
+const SILENCE_SECS_RANGE: (f64, f64) = (0., 5.);
+
+/// The speed-up rate is bounded *below* by real time: a "speed-up" that slows
+/// the silence down would make the timeline longer, which is the one thing
+/// neither button may do. The top is [`Speed::MAX`].
+fn silence_rate(permille: i32) -> Speed {
+    speed_at(permille.clamp(
+        i32::from(Speed::NORMAL.permille()) + SPEED_STEP,
+        i32::from(Speed::MAX.permille()),
+    ))
+}
+
 /// The graph's frequency axis: the range an ear works in, and the range every
 /// band a file can carry sits inside. Log-spaced, so an octave is an octave
 /// wherever it falls.
@@ -571,6 +598,25 @@ struct Player {
     /// The bar is being dragged. On the root like the colour card's, for the
     /// same reason: the pointer leaves a 4 px bar on the first move.
     speed_dragging: bool,
+    /// The silence card is up on this clip -- the lane it is on and its index
+    /// there, exactly as the speed card's handle is.
+    silence_open: Option<(Lane, usize)>,
+    /// What a scan is told to look for, and how fast the speed-up button plays
+    /// what it found. Kept across closes like the export card's quality: a
+    /// second run offers what the first one settled on.
+    silence: engine::silence::Settings,
+    silence_factor: Speed,
+    /// Which of the card's [`SILENCE_ROWS`] the arrow keys move. The card's own
+    /// focus, since nothing in it takes gpui's (ledger:182).
+    silence_field: usize,
+    /// What the last scan found, in timeline frames: what the lane draws marks
+    /// over and what an apply acts on -- *exactly* the previewed set, never a
+    /// second scan at the moment of the press.
+    silence_marks: Vec<(u32, u32)>,
+    /// The levels of the last source scanned, kept so moving a threshold is
+    /// arithmetic rather than another decode. One entry: a card is open on one
+    /// clip, and the next one it opens on is the next thing worth holding.
+    silence_levels: Option<(PathBuf, usize, Arc<Vec<f32>>)>,
     /// Which of the card's four sliders the arrow keys and a drag move. The
     /// card's own focus, since nothing in it takes gpui's (ledger:182).
     color_band: usize,
@@ -738,6 +784,7 @@ impl Player {
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
             ActionId::Equalizer => self.open_eq(cx),
             ActionId::Speed => self.open_speed(cx),
+            ActionId::Silence => self.open_silence(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -1004,11 +1051,12 @@ impl Player {
             Some(clip) => {
                 self.speed_open = Some(clip);
                 self.speed_dragging = false;
-                // One card at a time, the rule the other three follow.
+                // One card at a time, the rule the other four follow.
                 self.keys_open = false;
                 self.export_open = false;
                 self.eq_open = None;
                 self.color_open = None;
+                self.close_silence();
                 self.context_menu = None;
             }
             None => self.notice = Some("no clip under the playhead to re-time".into()),
@@ -1085,6 +1133,225 @@ impl Player {
         self.write_speed(speed_at(stepped), !first, cx);
     }
 
+    /// Opens the silence card on the clip to be scanned: the selected one, or
+    /// -- with nothing selected -- the clip the picture is coming from, which is
+    /// the rule the speed card follows and what a person means by "this shot".
+    /// Either half of a take will do: the scan reads the *source*, and both
+    /// halves of an A/V take name the same file.
+    ///
+    /// The scan runs at once, so the card is never up saying nothing: a clip
+    /// whose source has no audio track at all is refused by name instead, and
+    /// the card does not open on it.
+    fn open_silence(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.notice = Some("no timeline to scan — open a file first".into());
+            cx.notify();
+            return;
+        };
+        match self
+            .selected
+            .or_else(|| session.video_clip_at(session.now()))
+            .map(|clip| audio_half(session, clip))
+        {
+            Some(clip) => {
+                self.silence_open = Some(clip);
+                self.silence_field = 0;
+                // One card at a time, the rule the other four follow.
+                self.keys_open = false;
+                self.export_open = false;
+                self.eq_open = None;
+                self.color_open = None;
+                self.speed_open = None;
+                self.context_menu = None;
+                self.scan_silences();
+            }
+            None => self.notice = Some("no clip under the playhead to scan".into()),
+        }
+        cx.notify();
+    }
+
+    /// Closes it and drops the preview with it: marks left on the lane after
+    /// the card is gone would name frames the next edit has already moved.
+    fn close_silence(&mut self) {
+        self.silence_open = None;
+        self.silence_marks.clear();
+    }
+
+    /// Runs the scan and replaces the preview -- never stacks on it. The decode
+    /// happens once per source ([`engine::silence::levels`] is cached here), so
+    /// every later run is the settings applied to numbers already in hand,
+    /// which is what makes moving a threshold feel like moving a slider.
+    ///
+    /// Changes nothing about the project: a preview is not an edit, and no undo
+    /// step is spent until a button is pressed.
+    ///
+    /// ponytail: the first scan for a source runs on the render thread -- ~1700x
+    /// realtime, so a ten-minute take is well under a second and an hour-long
+    /// one would be felt. Upgrade path is the waveform's: hand it to
+    /// `cx.background_spawn` and repaint when it lands.
+    fn scan_silences(&mut self) {
+        let Some((lane, idx)) = self.silence_open else {
+            return;
+        };
+        self.silence_marks.clear();
+        // Copied out before anything is written back: the cache below lives on
+        // the same struct the session does.
+        let Some((clip, source)) = self.session.as_ref().and_then(|session| {
+            let clip = *session.lane_clips(lane).get(idx)?;
+            Some((clip, session.sources().get(clip.source)?.clone()))
+        }) else {
+            return;
+        };
+        let cached = self
+            .silence_levels
+            .as_ref()
+            .filter(|(path, stream, _)| *path == source.path && *stream == source.audio_stream)
+            .map(|(_, _, levels)| levels.clone());
+        let levels = match cached {
+            Some(levels) => levels,
+            None => match engine::silence::levels(&source.path, source.audio_stream) {
+                Ok(Some(levels)) => {
+                    let levels = Arc::new(levels);
+                    self.silence_levels =
+                        Some((source.path.clone(), source.audio_stream, levels.clone()));
+                    levels
+                }
+                // A source with no audio track is not one long silence: it is a
+                // clip this card has nothing to say about, named so the user
+                // knows which one it meant.
+                Ok(None) => {
+                    self.silence_open = None;
+                    self.notice = Some(
+                        format!(
+                            "{} clip {} has no audio to scan — {} is silent",
+                            lane.label(),
+                            idx + 1,
+                            file_name(&source.path)
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    self.silence_open = None;
+                    self.notice = Some(format!("SCAN FAILED: {e}").into());
+                    return;
+                }
+            },
+        };
+        self.silence_marks = engine::silence::timeline_regions(
+            &clip,
+            self.fps,
+            &engine::silence::regions(&levels, self.silence),
+        );
+    }
+
+    /// Moves the picked row by `steps` and re-runs the scan against it, so the
+    /// marks on the lane are always what the numbers on the card say.
+    fn nudge_silence(&mut self, steps: i32) {
+        let secs = |at: f64| {
+            (at + f64::from(steps) * SILENCE_SECS_STEP)
+                .clamp(SILENCE_SECS_RANGE.0, SILENCE_SECS_RANGE.1)
+        };
+        match self.silence_field {
+            0 => {
+                self.silence.threshold_db = (self.silence.threshold_db
+                    + steps as f32 * SILENCE_DB_STEP)
+                    .clamp(SILENCE_DB_RANGE.0, SILENCE_DB_RANGE.1)
+            }
+            1 => self.silence.min_silence = secs(self.silence.min_silence),
+            2 => self.silence.padding = secs(self.silence.padding),
+            3 => self.silence.min_keep = secs(self.silence.min_keep),
+            _ => {
+                self.silence_factor =
+                    silence_rate(i32::from(self.silence_factor.permille()) + steps * SPEED_STEP)
+            }
+        }
+        // The rate is not part of the scan, but re-running is cheap (the levels
+        // are cached) and one path is one place for the marks to come from.
+        self.scan_silences();
+    }
+
+    /// What an apply acts on: the previewed set, or nothing at all with a
+    /// notice saying so in the numbers that found nothing.
+    fn previewed(&mut self) -> Option<Vec<(u32, u32)>> {
+        if self.silence_marks.is_empty() {
+            self.notice = Some(
+                format!(
+                    "no silence under {:.0} dBFS lasting {:.2} s — raise the threshold or forgive less",
+                    self.silence.threshold_db, self.silence.min_silence
+                )
+                .into(),
+            );
+            return None;
+        }
+        Some(self.silence_marks.clone())
+    }
+
+    /// Cuts every previewed silence out of every lane, rippling each hole
+    /// closed -- one edit and **one** undo press however many there were
+    /// ([`engine::PlaybackSession::cut_regions`]). The linked picture slides
+    /// with its sound, because a ripple is uniform across the lanes.
+    fn cut_silences(&mut self, cx: &mut Context<Self>) {
+        let Some(regions) = self.previewed() else {
+            cx.notify();
+            return;
+        };
+        let saved = f64::from(regions.iter().map(|&(_, len)| len).sum::<u32>()) / self.fps;
+        let count = regions.len();
+        let cut = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.cut_regions(&regions));
+        if cut {
+            self.close_silence();
+            self.reset_after_reseek();
+            self.notice = Some(
+                format!(
+                    "{count} SILENCES CUT — {saved:.1}s shorter, {} takes it back",
+                    self.keymap.display(ActionId::Undo)
+                )
+                .into(),
+            );
+        }
+        cx.notify();
+    }
+
+    /// Plays them fast instead of cutting them, closing the room each one no
+    /// longer needs. One undo press like the cut; the refusal (a clip on
+    /// another lane lapping over a silence) comes back in the engine's own
+    /// words and names the lane and frame, and the card stays up so the numbers
+    /// that produced it are still on screen.
+    fn speed_silences(&mut self, cx: &mut Context<Self>) {
+        let Some(regions) = self.previewed() else {
+            cx.notify();
+            return;
+        };
+        let (count, rate) = (regions.len(), self.silence_factor);
+        let Some(session) = self.session.as_mut() else {
+            cx.notify();
+            return;
+        };
+        match session.speed_regions(&regions, rate) {
+            Ok(()) => {
+                self.close_silence();
+                self.reset_after_reseek();
+                self.notice = Some(
+                    format!(
+                        "{count} SILENCES AT {rate} — {} takes it back",
+                        self.keymap.display(ActionId::Undo)
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => self.notice = Some(e.to_string().into()),
+        }
+        cx.notify();
+    }
+
     /// Whether a card owns the window. While one does the timeline under it is
     /// out of reach, so a right-click there opens no menu -- the same rule the
     /// key handler and the drop target already follow.
@@ -1094,6 +1361,7 @@ impl Player {
             || self.eq_open.is_some()
             || self.color_open.is_some()
             || self.speed_open.is_some()
+            || self.silence_open.is_some()
             || self.exporting().is_some()
     }
 
@@ -1960,6 +2228,8 @@ impl Player {
                 self.context_menu = None;
                 self.eq_open = None;
                 self.color_open = None;
+                // Marks are timeline frames of the timeline that was.
+                self.close_silence();
                 // A different set of sources: the row that was picked is not
                 // the file that index names any more.
                 self.selected_asset = None;
@@ -2500,6 +2770,31 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The silence card, the same way again: the arrows pick one of
+                // its rows and move it, and its two apply keys are the two
+                // things it can do to the timeline. Card-local, every one of
+                // them -- and listed in the keys menu (keymap.rs `FIXED`),
+                // because a key that cuts forty places at once is not a secret.
+                if this.silence_open.is_some() {
+                    if key == ESCAPE {
+                        // Nothing to undo: a preview is not an edit.
+                        this.close_silence();
+                    } else if key == "down" {
+                        this.silence_field = (this.silence_field + 1) % SILENCE_ROWS;
+                    } else if key == "up" {
+                        this.silence_field = (this.silence_field + SILENCE_ROWS - 1) % SILENCE_ROWS;
+                    } else if key == "right" {
+                        this.nudge_silence(1);
+                    } else if key == "left" {
+                        this.nudge_silence(-1);
+                    } else if key == "enter" {
+                        this.cut_silences(cx);
+                    } else if key == "f" {
+                        this.speed_silences(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
@@ -2711,6 +3006,7 @@ impl Render for Player {
             .children(self.eq_card(cx))
             .children(self.color_card(cx))
             .children(self.speed_card(cx))
+            .children(self.silence_card(cx))
     }
 }
 
@@ -4137,6 +4433,147 @@ impl Player {
         )
     }
 
+    /// The silence card: what the scan is looking for, what it found, and the
+    /// two things that can be done about it.
+    ///
+    /// Its scrim is the lightest of the cards' on purpose. Every other card is
+    /// about the clip it names and can black the timeline out; this one is
+    /// *about* the timeline -- the marks under it are the whole preview -- so
+    /// the bed stays readable and the card sits up in the picture area rather
+    /// than over the lanes.
+    fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (lane, idx) = self.silence_open?;
+        let cfg = self.silence;
+        let rows = [
+            ("Silence is under", format!("{:.0} dBFS", cfg.threshold_db)),
+            (
+                "Forgive quiet shorter than",
+                format!("{:.2} s", cfg.min_silence),
+            ),
+            (
+                "Keep either side of speech",
+                format!("{:.2} s", cfg.padding),
+            ),
+            (
+                "Swallow kept slivers under",
+                format!("{:.2} s", cfg.min_keep),
+            ),
+            ("Speed-up plays at", format!("{}", self.silence_factor)),
+        ];
+        let found = self.silence_marks.len();
+        let secs =
+            f64::from(self.silence_marks.iter().map(|&(_, len)| len).sum::<u32>()) / self.fps;
+        let rows: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, (label, value))| {
+                div()
+                    .id(("silence-row", n))
+                    .flex()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .justify_between()
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .bg(rgb(match n == self.silence_field {
+                        true => SELECTED,
+                        false => CHROME,
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.silence_field = n;
+                        cx.notify();
+                    }))
+                    .child(div().text_color(rgb(INK_DIM)).child(label))
+                    .child(value)
+            })
+            .collect();
+        // The two buttons the ask names, side by side: a mode toggle would hide
+        // one of them behind the other, and there are only two.
+        let button = |n: usize, text: String, act: fn(&mut Self, &mut Context<Self>)| {
+            div()
+                .id(("silence-apply", n))
+                .flex_1()
+                .flex()
+                .min_h(px(KEYS_ROW_H))
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .bg(rgb(match found {
+                    0 => CHROME,
+                    _ => SELECTED,
+                }))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| act(this, cx)))
+                .child(text)
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(HEADER_H + 8.))
+                // Light enough to read the lanes and the marks on them through:
+                // the preview is the point of this card.
+                .bg(rgba(0x10101055))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(COLOR_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(div().flex_none().px(px(6.)).child(format!(
+                            "Silences — {} clip {}",
+                            lane.label(),
+                            idx + 1
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(
+                                    "↑↓ picks a setting, ←→ moves it — the marks on the lane are what would go; esc closes",
+                                ),
+                        )
+                        .children(rows)
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_color(rgb(match found {
+                                    0 => INK_DIM,
+                                    _ => ACCENT,
+                                }))
+                                .child(match found {
+                                    0 => "nothing quiet enough for long enough".to_string(),
+                                    1 => format!("1 silence, {secs:.1}s"),
+                                    n => format!("{n} silences, {secs:.1}s"),
+                                }),
+                        )
+                        .child(div().flex().gap(px(4.)).children([
+                            button(0, "Cut them out (enter)".into(), Self::cut_silences),
+                            button(
+                                1,
+                                format!("Play them at {} (f)", self.silence_factor),
+                                Self::speed_silences,
+                            ),
+                        ])),
+                ),
+        )
+    }
+
     /// The menu a right-click on a library row opens: what can be done with the
     /// *file* rather than with a clip of it, and a turn-over side saying what
     /// that file is. Built like [`Player::context_card`] down to the scrim, the
@@ -4783,6 +5220,25 @@ impl Player {
                                 )
                             })
                     }))
+                    // What the silence card found, over the clips it found them
+                    // in and over the waveform band that shows why: on the lane
+                    // the scan ran on and no other, because that is the only
+                    // lane whose sound was read. Drawn before anything is cut,
+                    // and replaced -- never stacked -- by every re-run.
+                    .children(
+                        self.silence_marks
+                            .iter()
+                            .filter(|_| self.silence_open.is_some_and(|(on, _)| on == lane))
+                            .map(|&(at, len)| {
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .h_full()
+                                    .left(relative(start_frac(f64::from(at) / self.fps, duration)))
+                                    .w(relative(width_frac(f64::from(len) / self.fps, duration)))
+                                    .bg(rgba(0x4a9effaa))
+                            }),
+                    )
                     // Last, so it is over the clips: the same fraction in both
                     // lanes, which is the playhead being one line.
                     .child(
@@ -5375,6 +5831,36 @@ enum ColorKey {
     /// Moves the picked slider, in [`COLOR_STEP`]s.
     Nudge(f32),
     Reset,
+}
+
+/// The half of a take whose *sound* the silence card scans: a link is one span
+/// on however many lanes, so a card opened on the picture opens on the sound it
+/// is grouped with. That is the lane the waveform is drawn on, and so the lane
+/// the marks have to land on to be read against it -- and the ranges agree,
+/// because a group is one span.
+///
+/// The clip itself for one already on an audio lane, for a detached picture,
+/// and for a take whose sound is not on any lane: there is nothing better to
+/// open on, and the refusal for a source with no audio at all is `scan`'s.
+fn audio_half(session: &PlaybackSession, (lane, idx): (Lane, usize)) -> (Lane, usize) {
+    if lane.kind == LaneKind::Audio {
+        return (lane, idx);
+    }
+    let Some(link) = session.lane_clips(lane).get(idx).and_then(|c| c.link) else {
+        return (lane, idx);
+    };
+    session
+        .lanes()
+        .into_iter()
+        .filter(|l| l.kind == LaneKind::Audio)
+        .find_map(|l| {
+            session
+                .lane_clips(l)
+                .iter()
+                .position(|c| c.link == Some(link))
+                .map(|i| (l, i))
+        })
+        .unwrap_or((lane, idx))
 }
 
 fn color_key(key: &str) -> Option<ColorKey> {
@@ -6094,16 +6580,17 @@ mod tests {
     use super::{
         ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_FREQ_HIGH,
         EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_TICKS, EXPORT_ROWS_H, FORMATS,
-        Format, HEADER_GAP, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM,
-        KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX,
-        LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
-        RULER_HIT_H, SELECTED, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
-        Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
-        cancels_export, color_snap, envelope, eq_x, eq_y, export_path, export_settings, format_key,
-        format_line, format_refusal, frac_along, frac_down, frame_at, histogram, is_bare_modifier,
-        is_project, keymap, lanes_h, marked, menu_at, normalise, panel_h, project_path, push_digit,
-        retarget, scrub_due, show_label, source_tint, span_partner, speed_at, start_frac, timecode,
-        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
+        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
+        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
+        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H,
+        Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
+        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave,
+        applicable, band_label, can_add, cancels_export, color_snap, envelope, eq_x, eq_y,
+        export_path, export_settings, format_key, format_line, format_refusal, frac_along,
+        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
+        menu_at, normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
+        silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
+        unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -7592,6 +8079,39 @@ mod tests {
     }
 
     #[test]
+    fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
+        // The same 640x360 floor, and this card starts below the header: a
+        // title and a hint over its five rows, the count line and the two
+        // buttons.
+        let (title, hint, count) = (17., 17., 17.);
+        let gaps = 6. * 5.;
+        let padding = 24.;
+        assert!(
+            HEADER_H
+                + 8.
+                + title
+                + hint
+                + SILENCE_ROWS as f32 * KEYS_ROW_H
+                + count
+                + KEYS_ROW_H
+                + gaps
+                + padding
+                <= 360.,
+            "card too tall"
+        );
+        // Its rows and buttons are clicked, so WCAG 2.5.8 binds them.
+        assert!(KEYS_ROW_H >= HIT_MIN);
+        // A "speed-up" is never a slow-down: the rate stops above real time at
+        // one end and at what a clip can hold at the other, whatever the keys
+        // ask for. A silence played *slower* would make the timeline longer,
+        // which is the one thing neither button may do.
+        assert!(silence_rate(0) > Speed::NORMAL);
+        assert!(silence_rate(1000) > Speed::NORMAL);
+        assert_eq!(silence_rate(i32::MAX), Speed::MAX);
+        assert_eq!(silence_rate(4000), Speed::MAX);
+    }
+
+    #[test]
     fn the_export_card_fits_the_smallest_window() {
         // Same 640x360 floor the keybindings card is measured against: the
         // capped row list, the fixed-format line and the confirm button, under
@@ -8051,6 +8571,14 @@ fn main() {
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
+                    silence_open: None,
+                    // The conservative defaults the engine documents: a first
+                    // scan that leaves a little too much is one nobody undoes.
+                    silence: engine::silence::Settings::default(),
+                    silence_factor: Speed::MAX,
+                    silence_field: 0,
+                    silence_marks: Vec::new(),
+                    silence_levels: None,
                     color_open: None,
                     color_band: 0,
                     color_dragging: false,

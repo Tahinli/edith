@@ -1306,6 +1306,13 @@ impl Project {
     ///
     /// Metadata only: no mapping changes, in any lane.
     pub fn split(&mut self, timeline_frame: u32) -> bool {
+        self.write_split(timeline_frame, true)
+    }
+
+    /// [`split`](Project::split), with the snapshot optional: a batch that has
+    /// already taken one ([`speed_regions`](Project::speed_regions)) splits at
+    /// two frames per region and must still be one undo press.
+    fn write_split(&mut self, timeline_frame: u32, snapshot: bool) -> bool {
         let cut: Vec<Option<Clip>> = self
             .lanes
             .iter()
@@ -1314,7 +1321,9 @@ impl Project {
         if cut.iter().all(Option::is_none) {
             return false;
         }
-        self.snapshot();
+        if snapshot {
+            self.snapshot();
+        }
         // Each side is its own question: two clips may start together and end
         // apart, and every lane whose halves do line up stays one take.
         let starts: Vec<Option<u32>> = cut.iter().map(|c| c.map(|c| c.start)).collect();
@@ -1861,14 +1870,156 @@ impl Project {
             return false;
         }
         self.snapshot();
-        for data in &mut self.lanes {
-            clear(&mut data.clips, at, at + len);
-            for c in data.clips.iter_mut().filter(|c| c.start >= at) {
-                c.start -= len;
-            }
-            debug_assert!(sorted_disjoint(&data.clips));
-        }
+        ripple(&mut self.lanes, at, len);
         true
+    }
+
+    /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
+    /// out of every lane and close each hole, as one edit: the jumpcut a
+    /// silence scan asks for ([`crate::silence`]).
+    ///
+    /// One [`snapshot`](Project::snapshot) for the lot, which is the whole
+    /// reason this exists rather than a caller's loop over
+    /// [`ripple_delete`](Project::ripple_delete): forty silences must be one
+    /// undo press, not forty. Cut back to front, so a region's frames still
+    /// mean what the caller measured while the ones before it are cut.
+    ///
+    /// The list is sorted and overlapping entries are merged before anything is
+    /// cut ([`tidy`]) -- two regions that overlap would otherwise cut each
+    /// other's frames -- and `false`, with no undo step, for a list with
+    /// nothing in it.
+    pub fn cut_regions(&mut self, regions: &[(u32, u32)]) -> bool {
+        let regions = tidy(regions);
+        if regions.is_empty() {
+            return false;
+        }
+        self.snapshot();
+        for &(at, len) in regions.iter().rev() {
+            ripple(&mut self.lanes, at, len);
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        true
+    }
+
+    /// Play every one of `regions` at `speed` instead of cutting it: each is
+    /// split out of whatever covers it, re-rated, and the room it no longer
+    /// needs closed up behind it -- [`set_speed`](Project::set_speed) alone
+    /// does not ripple, and a hole where a silence shrank is the one thing this
+    /// must not leave. One snapshot for the lot, like
+    /// [`cut_regions`](Project::cut_regions).
+    ///
+    /// The rate is **absolute**, not a multiplier on what is there: running it
+    /// twice over the same stretch leaves it at `speed`, not at `speed`
+    /// squared, so a second pass over an already-cut timeline changes nothing.
+    ///
+    /// Refused by name, with nothing changed and no undo step, when:
+    ///
+    /// * a clip on any lane covers only *part* of a region -- the lanes shrink
+    ///   by different amounts and the ripple would pull them apart, which is
+    ///   what cutting does not suffer and why delete mode has no such refusal;
+    /// * a rate cannot address a region's edge ([`Speed::split_at`]), so the
+    ///   piece could not be split out exactly;
+    /// * two lanes' pieces would end up different lengths, which is a group
+    ///   whose halves disagree about their span (the refusal
+    ///   [`write_speed`](Project::write_speed) already makes, in its words);
+    /// * the region would grow rather than shrink, i.e. it already plays faster
+    ///   than `speed`.
+    pub fn speed_regions(&mut self, regions: &[(u32, u32)], speed: Speed) -> crate::Result<()> {
+        let regions = tidy(regions);
+        if regions.is_empty() {
+            return Err("nothing to speed up".into());
+        }
+        let labels = handles(&self.lanes);
+        // Before anything is touched, because this is the refusal a person can
+        // act on: a clip that laps over the edge of a silence has to be trimmed
+        // (or the silences cut instead), and saying so after a rollback would
+        // be saying it about a timeline that already looks different.
+        for &(at, len) in &regions {
+            for (l, data) in self.lanes.iter().enumerate() {
+                for c in &data.clips {
+                    if c.end() > at && c.start < at + len && !(c.start <= at && c.end() >= at + len)
+                    {
+                        return Err(format!(
+                            "the {} clip at frame {} covers only part of the silence at [{at}, {}): \
+                             speeding it up would pull the lanes apart -- trim it first, or cut the \
+                             silences out instead",
+                            labels[l].label(),
+                            c.start,
+                            at + len
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        // The rest is checked as it is built: a split's own arithmetic is what
+        // says whether a rate can address an edge. So the snapshot is taken
+        // first and *rolled back* on a refusal -- one undo either way, and a
+        // refusal still costs no step (`undo` pops the one just pushed).
+        self.snapshot();
+        for &(at, len) in regions.iter().rev() {
+            self.write_split(at, false);
+            self.write_split(at + len, false);
+            let mut room: Option<(Lane, u32)> = None;
+            let mut refused = None;
+            for (l, data) in self.lanes.iter().enumerate() {
+                for c in data.clips.iter().filter(|c| c.end() > at && c.start < at + len) {
+                    if (c.start, c.end()) != (at, at + len) {
+                        refused = Some(format!(
+                            "the {} clip at frame {} plays at {} and cannot be cut at frame {at}: \
+                             detach it, or put it back to 1.00x first",
+                            labels[l].label(),
+                            c.start,
+                            c.speed
+                        ));
+                        continue;
+                    }
+                    let after = speed.frames(c.len());
+                    match room {
+                        None => room = Some((labels[l], after)),
+                        Some((first, n)) if n != after => {
+                            refused = Some(format!(
+                                "at {speed} the {} half of the silence at frame {at} would cover \
+                                 {after} frames and the {} half {n}: they are one take and a take \
+                                 is one span -- detach them first",
+                                labels[l].label(),
+                                first.label()
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            let shrunk = match (refused, room) {
+                (Some(e), _) => {
+                    self.undo();
+                    return Err(e.into());
+                }
+                // A gap on every lane: nothing to re-rate, and nothing to close.
+                (None, None) => continue,
+                (None, Some((_, after))) => after,
+            };
+            let Some(delta) = len.checked_sub(shrunk) else {
+                self.undo();
+                return Err(format!(
+                    "the silence at frame {at} already plays faster than {speed}: \
+                     at that rate it would be {shrunk} frames instead of {len}"
+                )
+                .into());
+            };
+            for data in &mut self.lanes {
+                for c in &mut data.clips {
+                    if c.start == at && c.end() == at + len {
+                        c.speed = speed;
+                    } else if c.start >= at + len {
+                        c.start -= delta;
+                    }
+                }
+                debug_assert!(sorted_disjoint(&data.clips));
+            }
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        Ok(())
     }
 
     /// Remove the `V1` clip at `idx` and everything under it, closing the gap
@@ -2305,6 +2456,41 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
         }
     }
     *clips = out;
+}
+
+/// Cuts `[at, at + len)` out of every lane and slides what is behind it back --
+/// the body of [`Project::ripple_delete`], and of every cut a batch
+/// ([`Project::cut_regions`]) makes. No snapshot of its own: whose undo step
+/// this is belongs to the caller.
+fn ripple(lanes: &mut [LaneData], at: u32, len: u32) {
+    for data in lanes {
+        clear(&mut data.clips, at, at + len);
+        for c in data.clips.iter_mut().filter(|c| c.start >= at) {
+            c.start -= len;
+        }
+        debug_assert!(sorted_disjoint(&data.clips));
+    }
+}
+
+/// A caller's region list as a batch may use it: sorted by start, empty entries
+/// dropped, and touching or overlapping entries merged into one.
+///
+/// Overlapping regions are the one thing a batch cannot take -- cutting the
+/// second would cut frames the first already moved -- and a detector handing
+/// back two that touch means one silence, not two cuts. Merged rather than
+/// refused: this is arithmetic on a preview, not a user's mistake.
+fn tidy(regions: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut sorted: Vec<(u32, u32)> = regions.iter().copied().filter(|&(_, l)| l > 0).collect();
+    sorted.sort_by_key(|&(at, _)| at);
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (at, len) in sorted {
+        let end = at.saturating_add(len);
+        match out.last_mut() {
+            Some(last) if at <= last.0 + last.1 => last.1 = end.saturating_sub(last.0).max(last.1),
+            _ => out.push((at, len)),
+        }
+    }
+    out
 }
 
 /// Slides everything from `at` on later by `len`, splitting a placement that

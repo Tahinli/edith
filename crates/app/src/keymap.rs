@@ -71,13 +71,14 @@ pub enum ActionId {
     VolumeDown,
     Equalizer,
     Speed,
+    Silence,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 32] = [
+    pub const ALL: [ActionId; 33] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -109,6 +110,7 @@ impl ActionId {
         ActionId::VolumeDown,
         ActionId::Equalizer,
         ActionId::Speed,
+        ActionId::Silence,
         ActionId::CancelExport,
     ];
 
@@ -146,6 +148,7 @@ impl ActionId {
             ActionId::VolumeDown => "Volume down",
             ActionId::Equalizer => "Equalizer",
             ActionId::Speed => "Speed (tape)…",
+            ActionId::Silence => "Silences: cut or speed up…",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -185,6 +188,7 @@ impl ActionId {
             ActionId::VolumeDown => "volume-down",
             ActionId::Equalizer => "equalizer",
             ActionId::Speed => "speed",
+            ActionId::Silence => "silence",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -217,7 +221,11 @@ impl ActionId {
             // A rate is the clip's, not the sound's: it re-times the picture
             // and the sound together, and the card opens on whichever half was
             // clicked.
-            | ActionId::Speed => Category::Clips,
+            | ActionId::Speed
+            // The scan reads a clip's sound, but what it does is edit the
+            // timeline the clip is on -- it is a clip card like the three
+            // above it, opened on whichever half was picked.
+            | ActionId::Silence => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
             ActionId::Resolution => Category::View,
@@ -283,7 +291,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 12] = [
+pub const FIXED: [Fixed; 14] = [
     Fixed {
         chord: "esc",
         label: "Close this card or menu, or cancel a capture",
@@ -347,6 +355,20 @@ pub const FIXED: [Fixed; 12] = [
     Fixed {
         chord: "r",
         label: "Take the colour grade off the clip",
+        category: Category::Clips,
+    },
+    // The silence card's two apply keys. Card-local like every stroke above --
+    // they mean nothing while it is closed -- but the card is the one place in
+    // this editor where a key rewrites forty places at once, so both of them
+    // are listed rather than hidden in the card's own hint line.
+    Fixed {
+        chord: "enter",
+        label: "Cut every silence the card found",
+        category: Category::Clips,
+    },
+    Fixed {
+        chord: "f",
+        label: "Speed the silences up instead of cutting them",
         category: Category::Clips,
     },
 ];
@@ -520,6 +542,11 @@ impl Keymap {
                 // right hand with the other clip keys (k grades, l lifts), and
                 // is not next to anything that deletes.
                 b(ActionId::Speed, "j", false),
+                // The silence card takes "u": free, sits with the other clip-card
+                // keys under the right hand, and is nowhere near the two that
+                // delete (x and delete) -- what it opens is a card that can cut
+                // forty places at once.
+                b(ActionId::Silence, "u", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -782,7 +809,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 34);
+        assert_eq!(k.entries().len(), 35);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -828,6 +855,7 @@ mod tests {
         assert_eq!(k.lookup("e", true), None);
         assert_eq!(k.lookup("space", true), None);
         assert_eq!(k.lookup("j", false), Some(ActionId::Speed));
+        assert_eq!(k.lookup("u", false), Some(ActionId::Silence));
         assert_eq!(k.lookup("j", true), None);
         // Nothing is bound twice, or lookup's first match would be a coin toss.
         for (i, a) in k.entries().iter().enumerate() {
@@ -1010,7 +1038,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 32);
+        assert_eq!(ActionId::ALL.len(), 33);
     }
 
     #[test]

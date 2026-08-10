@@ -1003,6 +1003,29 @@ impl PlaybackSession {
         Ok(())
     }
 
+    /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out
+    /// of every lane and closes each hole, as **one** edit
+    /// ([`Project::cut_regions`]): the jumpcut a silence scan
+    /// ([`crate::silence`]) asks for, one undo press however many silences it
+    /// found. Reseeks like every other edit, so what plays is the cut timeline
+    /// from the playhead on. `false`, and no undo step, for an empty list.
+    pub fn cut_regions(&mut self, regions: &[(u32, u32)]) -> bool {
+        self.edit(|p| p.cut_regions(regions))
+    }
+
+    /// Plays every one of those regions at `speed` instead of cutting them,
+    /// closing the room each one no longer needs ([`Project::speed_regions`]) --
+    /// one edit, one undo press. The `Err` names the lane and frame in the way
+    /// and nothing changes.
+    pub fn speed_regions(&mut self, regions: &[(u32, u32)], speed: Speed) -> crate::Result<()> {
+        // Spelled out rather than through `edit`, whose closure hands back a
+        // bool and would drop the refusal's own words.
+        self.project.speed_regions(regions, speed)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
+    }
+
     /// Where that edge may land, `(first, last)` timeline frame inclusive: what
     /// a drag clamps the pointer to so the box it draws is the box
     /// [`trim_clip`](Self::trim_clip) will commit. `None` for a bad index.
