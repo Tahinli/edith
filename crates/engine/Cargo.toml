@@ -23,6 +23,18 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
+# Both halves of AAC, and the only crate here that is asked for both. The
+# *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
+# otherwise processed) lane has to be decoded, and what is decoded has to be
+# encoded again. The *decoder*, because symphonia's own refuses anything wider
+# than stereo outright (`aac/mod.rs:93`, "aac: aac too complex") and a 5.1 film
+# soundtrack in an mkv is exactly that -- this one hands 5.1 back already
+# reordered into FL, FR, FC, LFE, BL, BR, which is the order the downmix in
+# `audio` folds. Pure Rust with no C or FFI, Apache-2.0, same family as
+# `rusty_h264` above. Nothing else in the ecosystem encodes AAC without linking
+# Fraunhofer's C library, which this project's no-install rule forbids. Built
+# from `vendor/rusty_aac` -- see the patch table in the workspace manifest.
+rusty_aac = "0.5"
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
@@ -47,12 +59,6 @@ symphonia = { version = "0.6", default-features = false, features = [
     "vorbis",
     "wav",
 ] }
-# The AAC decoder symphonia is not: its own refuses anything wider than stereo
-# outright (`aac/mod.rs:93`, "aac: aac too complex"), and a 5.1 film soundtrack
-# in an mkv is exactly that. Pure Rust with no dependencies of its own, from the
-# same family as `rusty_h264`, and it hands 5.1 back already reordered into
-# FL, FR, FC, LFE, BL, BR -- which is the order the downmix here folds.
-rusty_aac = "0.5"
 oxideav-ac3 = "=0.0.10"
 oxideav-core = "0.1.34"
 # The software AV1 encoder, and the only new name in this list that was already
