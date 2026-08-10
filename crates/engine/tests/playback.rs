@@ -343,7 +343,7 @@ fn edits_traverse_cuts() {
     assert!((session.timeline_duration() - whole).abs() < 1e-9);
 
     let (cut, hole_end) = ((2.0 * fps) as u32, (3.5 * fps) as u32);
-    assert!(session.delete_clip(1), "drop the middle clip");
+    assert!(session.delete_clip(Lane::V1, 1), "drop the middle clip");
     let kept = total - (hole_end - cut);
     assert_eq!(session.clip_spans().len(), 2);
     assert!(
@@ -597,7 +597,7 @@ fn edits_keep_the_audio_clock() {
     // Deleting the head clip moves everything after it, so the session reseeks
     // under the playhead: same timeline position, new source frame, and the
     // frame numbering restarts at the landing frame.
-    assert!(session.delete_clip(0), "drop the head clip");
+    assert!(session.delete_clip(Lane::V1, 0), "drop the head clip");
     let landed = session.now();
     assert!(
         (landed - after_cut).abs() < 0.2,
@@ -695,7 +695,7 @@ fn import_appends_a_second_source_and_plays_across_the_join() {
     // second into the imported clip, then drop the whole original.
     assert!(session.cut_at(6.0), "cut 1 s into the imported clip");
     assert_eq!(session.clip_spans().len(), 3);
-    assert!(session.delete_clip(0), "drop the first source");
+    assert!(session.delete_clip(Lane::V1, 0), "drop the first source");
     assert_eq!(session.clip_spans_by_source()[0].2, 1);
     assert!(
         (session.timeline_duration() - f64::from(second) / fps).abs() < 1e-9,
