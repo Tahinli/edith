@@ -19,7 +19,7 @@ use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    RenderImage, SharedString, Size, Stateful, TitlebarOptions, Window, WindowBounds,
+    RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds,
     WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
@@ -248,8 +248,33 @@ const EQ_GAIN_LIMIT: f32 = 12.;
 /// single band.
 const EQ_STEP: f32 = 1.;
 
-/// The gain bar's height inside a band row.
-const EQ_BAR_H: f32 = 6.;
+/// The graph's frequency axis: the range an ear works in, and the range every
+/// band a file can carry sits inside. Log-spaced, so an octave is an octave
+/// wherever it falls.
+const EQ_FREQ_LOW: f32 = 20.;
+const EQ_FREQ_HIGH: f32 = 20_000.;
+
+/// The curve box. Tall enough that 1 dB is a visible move at the ±12 dB axis,
+/// and short enough that the card still fits a 360 px window.
+const EQ_GRAPH_H: f32 = 132.;
+
+/// How many points the curve is drawn from. One per ~3 px across the card:
+/// past that the line is smooth and the extra biquad evaluations are wasted.
+const EQ_CURVE_STEPS: usize = 96;
+
+/// A band's handle on the curve. Only the dot -- what is *grabbed* is the whole
+/// graph (the nearest band along the frequency axis), so the target is the box.
+const EQ_HANDLE: f32 = 10.;
+
+/// The frequencies the graph names, so the curve can be read as a curve *of
+/// something*. The two ends label themselves at the edges.
+const EQ_TICKS: [(f32, &str); 5] = [
+    (20., "20 Hz"),
+    (100., "100"),
+    (1000., "1k"),
+    (10000., "10k"),
+    (20000., "20k"),
+];
 
 /// The colour card's four controls, in the order it lists them: what each is
 /// called and the range it moves in. The order is `ColorParams`' own, which is
@@ -379,13 +404,14 @@ struct Player {
     eq_params: EqParams,
     /// Which band the keyboard moves, and which one a drag is holding.
     eq_band: usize,
-    /// A band's bar is being dragged. Tracked on the root like `scrubbing`, for
-    /// the same reason: the pointer leaves the 6 px bar immediately.
+    /// A handle on the curve is being dragged. Tracked on the root like
+    /// `scrubbing`, for the same reason: a hand pulling a band to +12 dB runs
+    /// off the top of the graph long before it lets go.
     eq_dragging: bool,
-    /// A band bar's own box, recorded at prepaint. One probe for five rows:
-    /// they are laid out identically and only the *x* of a click is read
-    /// ([`frac_along`]), so whichever row painted last answers for all of them.
-    eq_bar: Rc<Cell<Bounds<Pixels>>>,
+    /// The curve box, recorded at prepaint: gpui hands a mouse listener the
+    /// window position only, so this is what a press and a drag are read
+    /// against ([`frac_along`], [`frac_down`]).
+    eq_graph: Rc<Cell<Bounds<Pixels>>>,
     /// The colour card is up on this clip -- the lane it is on and its index
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
@@ -832,13 +858,32 @@ impl Player {
         }
     }
 
-    /// Where the pointer sits along a band's bar, as a gain: the middle is flat
-    /// and the two ends are the limit either way.
-    fn drag_band(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let gain = (frac_along(x, self.eq_bar.get()) * 2. - 1.) * EQ_GAIN_LIMIT;
+    /// Where the pointer sits down the graph, as a gain on the picked band: the
+    /// middle is flat and the top and bottom edges are the limit either way.
+    /// Called on every pointer sample, so the curve bends under the hand; the
+    /// write is the release's ([`commit_eq`](Player::commit_eq)).
+    fn drag_band(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let gain = (0.5 - frac_down(y, self.eq_graph.get())) * 2. * EQ_GAIN_LIMIT;
         if self.set_band(self.eq_band, gain) {
             cx.notify();
         }
+    }
+
+    /// Which band a press on the graph grabs: the nearest one along the
+    /// frequency axis, so the whole box is the handle rather than a 10 px dot
+    /// -- and a press that misses every dot still moves the band it is under.
+    fn nearest_band(&self, x: Pixels) -> usize {
+        let at = frac_along(x, self.eq_graph.get());
+        self.eq_params
+            .bands
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (eq_x(a.freq_hz) - at)
+                    .abs()
+                    .total_cmp(&(eq_x(b.freq_hz) - at).abs())
+            })
+            .map_or(0, |(i, _)| i)
     }
 
     /// Jumps the timeline.
@@ -1783,11 +1828,11 @@ impl Render for Player {
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                // A band's bar is 6 px tall and the pointer leaves it at once,
-                // so the equalizer drag is tracked here for the ruler's reason.
+                // A handle is 10 px across and the pointer leaves it at once, so
+                // the equalizer drag is tracked here for the ruler's reason.
                 if this.eq_dragging {
                     if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_band(event.position.x, cx);
+                        this.drag_band(event.position.y, cx);
                     } else {
                         // Released outside the window: the up below never came,
                         // so this is where the gesture ends -- and it still owes
@@ -1815,7 +1860,7 @@ impl Render for Player {
                     if std::mem::take(&mut this.eq_dragging) {
                         // The release lands exactly, then the gesture is written
                         // once -- the append-only table's whole reason.
-                        this.drag_band(event.position.x, cx);
+                        this.drag_band(event.position.y, cx);
                         this.commit_eq(cx);
                         return;
                     }
@@ -2798,11 +2843,15 @@ impl Player {
         )
     }
 
-    /// The equalizer of one audio clip: a row per band, each a bar that reads
-    /// flat in the middle and is dragged either way, and a row that flattens
-    /// them all. The same scrim, width and rows as the other two cards, and the
-    /// same plain divs -- nothing here takes focus, so the root keeps the
-    /// keyboard and the card's own strokes (`1`–`5`, up, down, `r`) reach it.
+    /// The equalizer of one audio clip: its frequency response drawn as a
+    /// curve, a handle per band sitting on it, and a row that flattens them
+    /// all. The curve is the clip's actual filter (`EqParams::response_db`
+    /// reads the coefficients the samples go through), and it is redrawn on
+    /// every pointer sample of a drag, so the shape bends under the hand.
+    ///
+    /// The same scrim and width as the other two cards, and the same plain divs
+    /// -- nothing here takes focus, so the root keeps the keyboard and the
+    /// card's own strokes (`1`–`5`, up, down, `r`) reach it.
     ///
     /// Every change is written at the clip as it is made
     /// ([`Player::commit_eq`]), so what the card shows is always what is
@@ -2810,72 +2859,90 @@ impl Player {
     /// nothing. What takes a curve back off is undo, like every other edit.
     fn eq_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.eq_open?;
-        let rows: Vec<_> = self
+        // The rate the engine filters this timeline at, so the drawn curve is
+        // the one those coefficients make -- near the top of the axis a 44.1 kHz
+        // clip and a 48 kHz one are not the same shape.
+        let sample_rate = self.timeline_audio().map_or(48_000, |(rate, _)| rate);
+        let picked = self.eq_params.bands.get(self.eq_band);
+        let handles: Vec<_> = self
             .eq_params
             .bands
             .iter()
             .enumerate()
             .map(|(i, band)| {
-                let (left, width) = eq_fill(band.gain_db);
                 div()
-                    .id(("eq-band", i))
-                    .flex()
-                    .min_h(px(KEYS_ROW_H))
-                    .items_center()
-                    .gap(px(12.))
-                    .px(px(6.))
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .when(i == self.eq_band, |d| d.bg(rgb(SELECTED)))
-                    .hover(|s| s.bg(rgb(HOVER)))
-                    // The press picks the band *and* is already the first
-                    // sample of the drag, so a plain click sets a value.
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.eq_band = i;
-                            this.eq_dragging = true;
-                            this.drag_band(event.position.x, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            // Wide enough for "12 kHz high shelf", so the bars
-                            // below each other all start at the same pixel.
-                            .w(px(112.))
-                            .text_size(px(11.))
-                            .child(format!("{} {}", i + 1, band_label(band))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(px(EQ_BAR_H))
-                            .rounded(px(3.))
-                            .bg(rgb(SURFACE))
-                            .child(bounds_probe(self.eq_bar.clone()))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(relative(left))
-                                    .w(relative(width))
-                                    .h_full()
-                                    .rounded(px(3.))
-                                    .bg(rgb(ACCENT)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            // Fixed, so a sign or a second digit appearing does
-                            // not shift the bar beside it mid-drag.
-                            .w(px(56.))
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(format!("{:+.1} dB", band.gain_db)),
-                    )
+                    .absolute()
+                    .left(relative(eq_x(band.freq_hz)))
+                    .top(relative(eq_y(band.gain_db)))
+                    // Centred on its own point: it hangs off the graph's corner,
+                    // so it is pulled back by half of itself both ways.
+                    .ml(px(-EQ_HANDLE / 2.))
+                    .mt(px(-EQ_HANDLE / 2.))
+                    .w(px(EQ_HANDLE))
+                    .h(px(EQ_HANDLE))
+                    .rounded(px(EQ_HANDLE / 2.))
+                    .bg(rgb(match i == self.eq_band {
+                        true => ACCENT,
+                        false => INK_DIM,
+                    }))
             })
             .collect();
+        let graph = div()
+            // Ided like the band rows it replaces: what the pointer presses on
+            // is one element with its own hitbox, which is what a drag is
+            // tracked from.
+            .id("eq-graph")
+            .relative()
+            .flex_none()
+            .h(px(EQ_GRAPH_H))
+            .rounded(px(3.))
+            .bg(rgb(HOVER_DIM))
+            .cursor_pointer()
+            // The press picks the band under it *and* is already the first
+            // sample of the drag, so a plain click sets a value.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.eq_band = this.nearest_band(event.position.x);
+                    this.eq_dragging = true;
+                    this.drag_band(event.position.y, cx);
+                }),
+            )
+            .child(bounds_probe(self.eq_graph.clone()))
+            // 0 dB: the line a boost is a boost *from*.
+            .child(
+                div()
+                    .absolute()
+                    .top(relative(0.5))
+                    .w_full()
+                    .h(px(1.))
+                    .bg(rgb(HOVER)),
+            )
+            .child(eq_curve(self.eq_params.clone(), sample_rate))
+            .children(handles)
+            .children(EQ_TICKS.map(|(freq, label)| {
+                div()
+                    .absolute()
+                    .left(relative(eq_x(freq)))
+                    // Pulled back so the mark reads as sitting *at* its
+                    // frequency; the two ends then hug the corners.
+                    .ml(px(-12.))
+                    .bottom(px(1.))
+                    .w(px(24.))
+                    .text_align(TextAlign::Center)
+                    .text_size(px(9.))
+                    .text_color(rgb(INK_DIM))
+                    .child(label)
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .left(px(4.))
+                    .text_size(px(9.))
+                    .text_color(rgb(INK_DIM))
+                    .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
+            );
         Some(
             div()
                 .absolute()
@@ -2910,22 +2977,24 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag a band, or 1–5 then up/down — esc closes".into()
+                                    "drag the curve, or 1–5 then up/down — esc closes".into()
                                 })),
                         )
-                        // Five rows fit a 360 px window, but the layout is data
-                        // (a file may carry any number of bands), so the list
-                        // scrolls like the other two cards' do.
-                        .child(
-                            div()
-                                .id("eq-rows")
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.))
-                                .max_h(px(EXPORT_ROWS_H))
-                                .overflow_y_scroll()
-                                .children(rows),
-                        )
+                        .child(graph)
+                        // Which band the keyboard is holding and what it is set
+                        // to: the curve shows the sum, and a band pushed against
+                        // one pulling the other way is not readable off it.
+                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
+                            match picked {
+                                Some(band) => format!(
+                                    "{} {} {:+.1} dB",
+                                    self.eq_band + 1,
+                                    band_label(band),
+                                    band.gain_db
+                                ),
+                                None => "no bands".into(),
+                            },
+                        ))
                         .child(
                             div()
                                 .id("eq-reset")
@@ -3737,18 +3806,22 @@ fn frame_at(secs: f64, fps: f64) -> u32 {
     (secs * fps + 1e-6).floor().max(0.) as u32
 }
 
-/// A band's bar as `(left, width)` in fractions of the track: the fill grows
-/// out of the *middle*, which is flat, towards whichever end the gain went --
-/// a bar that filled from the left would read a -12 dB cut as an empty control
-/// and 0 dB as a half-off one. The inverse of [`Player::drag_band`]'s reading
-/// of a click, and clamped like it, so a curve loaded from a file with a gain
-/// past the card's limit paints at the end of the bar rather than outside it.
-fn eq_fill(gain_db: f32) -> (f32, f32) {
-    let at = (gain_db / EQ_GAIN_LIMIT).clamp(-1., 1.) / 2. + 0.5;
-    match at >= 0.5 {
-        true => (0.5, at - 0.5),
-        false => (at, 0.5 - at),
-    }
+/// Where a frequency sits across the graph, 0..1. Log, because an octave is an
+/// octave whether it is 40 Hz wide or 10 kHz wide -- a linear axis would spend
+/// three quarters of the card on the top two octaves and squeeze the bass, the
+/// half of the range people actually reach for, into nothing.
+fn eq_x(freq_hz: f32) -> f32 {
+    let span = (EQ_FREQ_HIGH / EQ_FREQ_LOW).log10();
+    ((freq_hz.max(1.) / EQ_FREQ_LOW).log10() / span).clamp(0., 1.)
+}
+
+/// Where a gain sits *down* the graph, 0..1 from the top: flat is the middle,
+/// so a cut reads as a dip below the line it is a cut from. The inverse of
+/// [`Player::drag_band`]'s reading of the pointer, and clamped like it, so a
+/// curve loaded from a file with a gain past the card's limit paints on the
+/// edge of the box rather than outside it.
+fn eq_y(gain_db: f32) -> f32 {
+    0.5 - (gain_db / EQ_GAIN_LIMIT).clamp(-1., 1.) / 2.
 }
 
 /// What a band row calls itself: the corner or centre frequency, and for a
@@ -4522,6 +4595,53 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
 }
 
+/// Where down an element a pointer sits, 0..1 from the top: the vertical twin
+/// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
+/// element that was never painted reads as its middle -- flat, the one answer
+/// that changes nothing -- rather than as a full boost.
+fn frac_down(y: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    if bounds.size.height <= px(0.) {
+        return 0.5;
+    }
+    ((y - bounds.top()) / bounds.size.height).clamp(0., 1.)
+}
+
+/// The cascade's frequency response, drawn as one line across the graph.
+///
+/// Every point comes from `EqParams::response_db`, which reads the very
+/// coefficients the samples are filtered through: the curve cannot drift from
+/// what is heard, because there is no second copy of the maths.
+///
+/// ponytail: bands that overlap can sum past the ±`EQ_GAIN_LIMIT` axis and the
+/// curve then rides the edge of the box; upgrade = a wider dB axis with the
+/// handles and [`Player::drag_band`] rescaled to it.
+fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let mut path = PathBuilder::stroke(px(2.));
+            for step in 0..=EQ_CURVE_STEPS {
+                let along = step as f32 / EQ_CURVE_STEPS as f32;
+                let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+                let at = point(
+                    o.x + s.width * along,
+                    o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
+                );
+                match step {
+                    0 => path.move_to(at),
+                    _ => path.line_to(at),
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(ACCENT));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// What a window with no file open is waiting for. Both ways in are already
 /// built -- the whole window is the drop target and the Import chooser takes a
 /// project as readily as media -- so this only has to say so.
@@ -4591,16 +4711,17 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, CONTROL_H, Clip, EQ_BAR_H, EQ_GAIN_LIMIT, EXPORT_ROWS_H, FORMATS, Format,
-        HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
-        LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
-        MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE,
-        SWATCH_W, Source, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label,
-        can_add, cancels_export, envelope, eq_fill, export_path, export_settings, format_line,
-        frac_along, frame_at, is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked,
-        menu_at, mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources,
-        whole_take, width_frac, window_title,
+        ACCENT, CONTROL_H, Clip, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE,
+        EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM,
+        KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX,
+        LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
+        RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
+        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, envelope, eq_x,
+        eq_y, export_path, export_settings, format_line, frac_along, frac_down, frame_at,
+        is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked, menu_at, mp4_refusal,
+        normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
+        source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources, whole_take,
+        width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -5149,6 +5270,18 @@ mod tests {
         assert_eq!(frac_along(px(9999.), bar), 1.);
         // Never painted: no division by zero, no NaN reaching seek().
         assert_eq!(frac_along(px(50.), Bounds::default()), 0.);
+
+        // The equalizer's axis is the other one, and reads the same way.
+        let graph: Bounds<Pixels> = Bounds {
+            origin: point(px(12.), px(60.)),
+            size: size(px(296.), px(EQ_GRAPH_H)),
+        };
+        assert_eq!(frac_down(px(60.), graph), 0.);
+        assert_eq!(frac_down(px(60. + EQ_GRAPH_H / 2.), graph), 0.5);
+        assert_eq!(frac_down(px(9999.), graph), 1.);
+        // Never painted reads as flat: an unpainted graph must not slam a band
+        // to +12 dB on the first press.
+        assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
     }
 
     #[test]
@@ -5354,34 +5487,58 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
-    /// The equalizer card: what its bars paint, and that it fits the window the
-    /// other two cards are sized for. The bar is the one bit of geometry in the
-    /// card, and it is signed -- a fill that grew from the left would read a cut
-    /// as an empty control -- so it is checked against the reading of a click,
-    /// which is the same mapping backwards ([`Player::drag_band`]).
+    /// The equalizer card's graph: where a band lands on it, that a drag reads
+    /// back as the gain it painted -- the two are one mapping and its inverse,
+    /// which is what makes a handle follow the pointer -- and that the card
+    /// still fits the window the other two are sized for.
     #[test]
-    fn the_equalizer_bar_grows_out_of_flat_and_the_card_fits_the_smallest_window() {
+    fn the_equalizer_graph_puts_a_band_where_a_drag_reads_it_and_fits_the_smallest_window() {
         use engine::eq::{Band, BandKind, EqParams};
-        // Flat is the middle and paints nothing: a band nobody has touched must
-        // not look like one that has been turned down.
-        assert_eq!(eq_fill(0.), (0.5, 0.));
-        // Full boost fills the right half, full cut the left one.
-        assert_eq!(eq_fill(EQ_GAIN_LIMIT), (0.5, 0.5));
-        assert_eq!(eq_fill(-EQ_GAIN_LIMIT), (0., 0.5));
-        assert_eq!(eq_fill(EQ_GAIN_LIMIT / 2.), (0.5, 0.25));
-        assert_eq!(eq_fill(-EQ_GAIN_LIMIT / 2.), (0.25, 0.25));
+        // Flat is the middle of the box: a band nobody has touched must not
+        // look like one that has been turned down.
+        assert_eq!(eq_y(0.), 0.5);
+        // Full boost is the top edge, full cut the bottom one -- y grows down.
+        assert_eq!(eq_y(EQ_GAIN_LIMIT), 0.);
+        assert_eq!(eq_y(-EQ_GAIN_LIMIT), 1.);
+        assert_eq!(eq_y(EQ_GAIN_LIMIT / 2.), 0.25);
         // A file may carry a gain past what this card offers (the format writes
-        // any finite value): it paints at the end, never off the track.
-        assert_eq!(eq_fill(400.), (0.5, 0.5));
-        assert_eq!(eq_fill(-400.), (0., 0.5));
+        // any finite value): it paints on the edge, never off the box.
+        assert_eq!(eq_y(400.), 0.);
+        assert_eq!(eq_y(-400.), 1.);
 
-        // A click reads back as the gain that paints where it landed, which is
-        // what makes a drag land where the pointer is.
+        // A pointer reads back as the gain that paints where it landed, which
+        // is what makes a drag land under the hand ([`Player::drag_band`]).
         for gain in [-12., -6., 0., 6., 12.] {
-            let (left, width) = eq_fill(gain);
-            let at = if gain >= 0. { left + width } else { left };
-            let read = (at * 2. - 1.) * EQ_GAIN_LIMIT;
+            let read = (0.5 - eq_y(gain)) * 2. * EQ_GAIN_LIMIT;
             assert!((read - gain).abs() < 1e-4, "{gain} read back as {read}");
+        }
+
+        // The frequency axis is logarithmic and spans the audible range: the
+        // ends are the ends, and the decade at 200 Hz is as wide as the one at
+        // 2 kHz -- the whole reason a bass band is reachable at all.
+        assert_eq!(eq_x(EQ_FREQ_LOW), 0.);
+        assert_eq!(eq_x(EQ_FREQ_HIGH), 1.);
+        assert!((eq_x(200.) - 1. / 3.).abs() < 1e-4);
+        assert!(((eq_x(2000.) - eq_x(200.)) - (eq_x(20000.) - eq_x(2000.))).abs() < 1e-4);
+        // Off either end clamps rather than painting outside the box.
+        assert_eq!(eq_x(1.), 0.);
+        assert_eq!(eq_x(96_000.), 1.);
+        // Every tick the card names is on the axis it is drawn against.
+        for (freq, label) in EQ_TICKS {
+            assert!(
+                (EQ_FREQ_LOW..=EQ_FREQ_HIGH).contains(&freq),
+                "tick {label} is off the axis"
+            );
+        }
+        // The default bands all land inside it too, spread out enough that the
+        // nearest-band pick (`Player::nearest_band`) has something to pick.
+        let xs: Vec<f32> = EqParams::default_layout()
+            .bands
+            .iter()
+            .map(|b| eq_x(b.freq_hz))
+            .collect();
+        for pair in xs.windows(2) {
+            assert!(pair[1] - pair[0] > 0.1, "bands too close to aim at: {xs:?}");
         }
 
         // Every default band says what it is, and a shelf says so: "12 kHz"
@@ -5412,17 +5569,28 @@ mod tests {
             "rounded, because a band label is not a measurement"
         );
 
-        // The same shape as the other two cards, so it fits where they do.
-        let (title, status, gaps, padding) = (17., 28., 3. * 2., 24.);
+        // The same shape as the other two cards, so it fits where they do: the
+        // graph stands where the export card's rows do, and is shorter than
+        // they are.
+        let (title, status, readout, gaps, padding) = (17., 28., 17., 4. * 2., 24.);
         assert!(
-            title + status + EXPORT_ROWS_H + gaps + padding + CONTROL_H <= 360.,
+            title + status + EQ_GRAPH_H + readout + gaps + padding + CONTROL_H <= 360.,
             "card too tall"
         );
+        assert!(
+            EQ_GRAPH_H <= EXPORT_ROWS_H,
+            "graph taller than a card of rows"
+        );
         assert!(KEYS_W <= 640., "card too wide");
-        // The rows are dragged, so WCAG 2.5.8 binds them like every other
-        // target in this window -- the 6 px bar is inside a full-height row.
+        // What is dragged is the whole graph -- the handle is a 10 px dot, but
+        // a press anywhere in the box takes the band nearest it -- so WCAG
+        // 2.5.8 is satisfied by the box, which is far past the minimum.
+        assert!(EQ_GRAPH_H >= HIT_MIN);
+        assert!(
+            EQ_HANDLE < HIT_MIN,
+            "a dot that size would want its own hitbox"
+        );
         assert!(KEYS_ROW_H >= HIT_MIN);
-        assert!(EQ_BAR_H < KEYS_ROW_H);
     }
 
     /// Mute and level are one control with two states, and the whole point is
@@ -5954,7 +6122,7 @@ fn main() {
                     eq_params: EqParams::default(),
                     eq_band: 0,
                     eq_dragging: false,
-                    eq_bar: Rc::default(),
+                    eq_graph: Rc::default(),
                     color_open: None,
                     color_band: 0,
                     // What an export is until someone says otherwise: the
