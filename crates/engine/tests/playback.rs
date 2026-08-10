@@ -928,7 +928,7 @@ fn audio_runs_across_a_source_join() {
 #[test]
 fn a_video_gap_plays_black_without_shortening_the_timeline() {
     let path = asset("test_baseline.mp4");
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
     let whole = session.timeline_duration();
 
@@ -985,10 +985,15 @@ fn a_video_gap_plays_black_without_shortening_the_timeline() {
 /// samples the device has been fed, so silence has to be fed as real chunks or
 /// the timeline would stall on the hole. Needs a PipeWire daemon and the output
 /// plugin next to the test binary (`LD_LIBRARY_PATH=target/release`).
+///
+/// Muted like every other device test: what it asserts is the clock and the
+/// frame numbering, both of which count fed samples and not their loudness. The
+/// silence of a gap is proved off the decoder instead, with no device involved,
+/// in `audio_segments::a_gap_segment_is_silence_of_its_own_length`.
 #[test]
 #[ignore = "needs a running PipeWire daemon"]
 fn an_audio_gap_is_silent_and_the_clock_keeps_counting() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     assert!(session.cut_at(1.0), "split at 1 s");
     assert!(session.cut_at(2.0), "split at 2 s");
     // Silence over [1, 2) s while the picture plays on -- the two lanes part.

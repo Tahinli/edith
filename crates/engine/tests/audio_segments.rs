@@ -238,15 +238,22 @@ fn a_copied_gap_is_packets_of_hand_written_silence() {
         "and they are one interior run, at {run:?}"
     );
 
-    // A gap at the *head* is packets of its own: nothing rides on a neighbour,
-    // so there is no leading misplacement left to document.
+    // A gap at the *head* is packets of its own -- its own length plus the one
+    // more a reader drops as priming. Without that one the drop would come out
+    // of the hole and everything after it would play a packet early.
     let (_, leading) =
         AudioSession::copy_multi_segments(&sources, &[(None, 0.0, 0.5), (Some(0), 0.0, 1.0)])
             .unwrap()
             .unwrap();
     let head = leading.iter().take_while(|p| silent(p)).count() as u64;
     assert!(
-        (head * PACKET).abs_diff(RATE / 2) <= PACKET,
-        "{head} silent packets for half a second of leading hole"
+        (head * PACKET).abs_diff(RATE / 2 + PACKET) <= PACKET / 2,
+        "{head} silent packets for half a second of leading hole plus priming"
+    );
+    // ...and only a *leading* hole gets it: the interior one above did not.
+    assert_eq!(
+        run.len() as u64 * PACKET,
+        gap,
+        "an interior gap is its own length exactly"
     );
 }
