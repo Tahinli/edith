@@ -16,8 +16,8 @@ use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    RenderImage, SharedString, Size, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
+    RenderImage, SharedString, Size, Stateful, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -2023,9 +2023,7 @@ impl Player {
         // an inapplicable item in the clip menu is: it still says its piece.
         let live = |d: Stateful<Div>, enabled: bool| {
             d.when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
-                .when(enabled, |d| {
-                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER)))
-                })
+                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
         };
         // The formats first: the quality rows below are *video* bitrate, so
         // which file is being written decides whether they mean anything.
@@ -4147,7 +4145,10 @@ mod tests {
         // a number typed against the custom row must not leak into it.
         let mp4 = Format::Mp4;
         assert_eq!(export_settings(Quality::Auto, 7, mp4).bitrate, None);
-        assert_eq!(export_settings(Quality::Low, 0, mp4).bitrate, Some(2_000_000));
+        assert_eq!(
+            export_settings(Quality::Low, 0, mp4).bitrate,
+            Some(2_000_000)
+        );
         assert_eq!(
             export_settings(Quality::Medium, 0, mp4).bitrate,
             Some(6_000_000)

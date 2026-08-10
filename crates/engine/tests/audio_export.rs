@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
+use engine::project::LaneKind;
 use engine::project::Source;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
@@ -29,8 +30,7 @@ fn asset(name: &str) -> PathBuf {
 /// Per-run unique, like the mp4 suite's: two suites at once must not delete
 /// each other's output.
 fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("ve_audio_{name}_{}.{ext}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("ve_audio_{name}_{}.{ext}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(part_path(&path));
     path
@@ -43,7 +43,10 @@ fn part_path(out: &Path) -> PathBuf {
 fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
     let started = Instant::now();
     while !handle.is_finished() {
-        assert!(started.elapsed() < limit, "export did not finish in {limit:?}");
+        assert!(
+            started.elapsed() < limit,
+            "export did not finish in {limit:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     handle.result().expect("a finished export has an outcome")
@@ -70,14 +73,19 @@ fn mixed_project() -> Project {
         // The picture is beside the point here, but a project has two lanes and
         // the timeline's length is the longer of them: three seconds of video
         // is what makes the third second of audio part of the timeline.
-        vec![Clip {
-            start: 0,
-            in_frame: 0,
-            out_frame: 90,
-            source: 0,
-            link: None,
-        }],
-        vec![clip(0, 0), clip(60, 1)],
+        vec![
+            (
+                LaneKind::Video,
+                vec![Clip {
+                    start: 0,
+                    in_frame: 0,
+                    out_frame: 90,
+                    source: 0,
+                    link: None,
+                }],
+            ),
+            (LaneKind::Audio, vec![clip(0, 0), clip(60, 1)]),
+        ],
     )
     .expect("a two-source project with a hole in the audio lane")
 }
@@ -107,7 +115,12 @@ fn rms(samples: &[f32], channels: usize, from: f64, to: f64) -> f64 {
     let at = |secs: f64| (secs * f64::from(RATE)) as usize * channels;
     let window = &samples[at(from).min(samples.len())..at(to).min(samples.len())];
     assert!(!window.is_empty(), "no samples in [{from}, {to})");
-    (window.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>() / window.len() as f64).sqrt()
+    (window
+        .iter()
+        .map(|s| f64::from(*s) * f64::from(*s))
+        .sum::<f64>()
+        / window.len() as f64)
+        .sqrt()
 }
 
 /// What every audio export must be, whatever encoded it: exactly as long as the
@@ -121,7 +134,11 @@ fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32]) {
     // windows and the mp3 need not end where the second does, so this is the
     // export's own trim/pad and not an accident of the sources.
     let frames = (3.0 * f64::from(RATE)) as usize;
-    assert_eq!(samples.len(), frames * channels, "timeline length in samples");
+    assert_eq!(
+        samples.len(),
+        frames * channels,
+        "timeline length in samples"
+    );
 
     // Second 0 is test_av, second 2 is the mp3; both carry the tone.
     let av = rms(samples, channels, 0.05, 0.95);
@@ -138,7 +155,10 @@ fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32]) {
     // t = 0.25 and the dip at t = 0.75. Ratio, never an absolute level.
     let peak = rms(samples, channels, 0.2, 0.3);
     let dip = rms(samples, channels, 0.7, 0.8);
-    println!("pulse: peak {peak:.4}  dip {dip:.4}  ratio {:.1}", peak / dip);
+    println!(
+        "pulse: peak {peak:.4}  dip {dip:.4}  ratio {:.1}",
+        peak / dip
+    );
     assert!(
         peak > dip * 4.0,
         "the 1 Hz pulse survived: peak {peak:.4} vs dip {dip:.4}"
@@ -151,7 +171,8 @@ fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32]) {
 fn assert_wav_header(path: &Path, frames: usize) {
     let bytes = std::fs::read(path).expect("read the wav back");
     let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-    let u32_at = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let u32_at =
+        |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     assert_eq!(&bytes[0..4], b"RIFF");
     assert_eq!(&bytes[8..12], b"WAVE");
     assert_eq!(&bytes[12..16], b"fmt ");
@@ -270,5 +291,8 @@ fn a_silent_timeline_refuses_an_audio_export() {
         .expect_err("no audio to export")
         .to_string();
     assert!(text.contains("no audio"), "{text}");
-    assert!(!out.exists() && !part_path(&out).exists(), "nothing written");
+    assert!(
+        !out.exists() && !part_path(&out).exists(),
+        "nothing written"
+    );
 }

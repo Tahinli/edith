@@ -134,12 +134,7 @@ fn project_dir(path: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
-fn emit(
-    dir: &Path,
-    sources: &[Source],
-    lanes: &[(LaneKind, Vec<Clip>)],
-    playhead: u32,
-) -> Vec<u8> {
+fn emit(dir: &Path, sources: &[Source], lanes: &[(LaneKind, Vec<Clip>)], playhead: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(b'\n');
