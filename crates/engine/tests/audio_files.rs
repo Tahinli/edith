@@ -32,6 +32,20 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The two acts a file on the timeline now takes, in the order a user does
+/// them: taken into the library (`PlaybackSession::import` places nothing),
+/// then dragged onto the end of the timeline.
+fn import_and_place(session: &mut PlaybackSession, path: &Path) {
+    session.import(path).expect("the file joins this timeline");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, path, 0, None)
+            .expect("a file just imported is on this timeline"),
+        "the drag onto the end of the timeline"
+    );
+}
+
 /// The message of a call that had to be refused. Not `expect_err`: that wants
 /// `Debug` on the success side, and neither a session nor a packet has it.
 fn refusal<T>(result: engine::Result<T>) -> String {
@@ -119,11 +133,24 @@ fn duration_comes_from_the_header_or_the_decode() {
 fn a_song_joins_a_video_timeline_on_the_audio_lane() {
     let mut session = open(asset("test_av.mp4"));
     let before = session.timeline_duration();
+    // The import alone is a library row: the lanes are untouched until it is
+    // dragged onto one.
     session
         .import(&asset("test_tone.mp3"))
         .expect("import the song");
+    assert_eq!(session.sources().len(), 2, "the library grew");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 1, "an import placed it");
+    assert_eq!(session.timeline_duration(), before);
+    assert_eq!(session.file_frames(&asset("test_tone.mp3")), 90);
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &asset("test_tone.mp3"), 0, None)
+            .expect("a song just imported is on this timeline")
+    );
 
-    // 3 s at 30 fps, appended: the audio lane runs 90 frames past the video.
+    // 3 s at 30 fps, placed at the end: the audio lane runs 90 frames past the
+    // video.
     assert!(
         (session.timeline_duration() - (before + 3.0)).abs() < 0.05,
         "{} s of timeline, want {}",
@@ -151,7 +178,7 @@ fn a_rate_the_device_cannot_mix_is_refused_at_the_door() {
         refusal(session.import(&asset("test_tone_48k.wav"))),
         "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
     );
-    // Refused means unchanged: no source, no clip, no length.
+    // Refused means unchanged: no library row, no clip, no length.
     assert_eq!(session.sources().len(), 1);
     assert_eq!(session.lane_clips(Lane::A1).len(), 1);
 }
@@ -228,9 +255,7 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
     let mut session = open(asset("test_tone.mp3"));
     // A second song joins it, the same way one joins a timeline of video: no
     // picture is needed for the import to have something to hold it to.
-    session
-        .import(&asset("test_tone.flac"))
-        .expect("a song joins a song");
+    import_and_place(&mut session, &asset("test_tone.flac"));
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
     assert!(session.lane_clips(Lane::V1).is_empty());
     assert!((session.timeline_duration() - 6.0).abs() < 0.1);
@@ -304,18 +329,23 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
 #[test]
 fn a_video_joins_a_timeline_a_song_started() {
     let mut session = open(asset("test_tone.mp3"));
-    session
-        .import(&asset("test_av.mp4"))
-        .expect("30 fps H.264 matches the audio-only canvas");
+    import_and_place(&mut session, &asset("test_av.mp4"));
     assert_eq!(session.lane_clips(Lane::V1).len(), 1, "a picture at last");
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
     // And a file at another rate is refused in the timeline's own words rather
-    // than silently retiming the song already on the lane.
+    // than silently retiming the song already on the lane -- the sample rate at
+    // one door, the *frame* rate at the other: the canvas a song scaffolds has
+    // a frame rate of its own (30 fps), and a 25 fps picture cannot join it.
     let e = refusal(session.import(&asset("test_tone_48k.wav")));
     assert_eq!(
         e,
         "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
     );
+    assert_eq!(
+        refusal(session.import(&asset("test_25fps.mp4"))),
+        "25.000 fps does not match the timeline's 30.000 fps"
+    );
+    assert_eq!(session.sources().len(), 2, "a refusal left a library row");
 }
 
 /// Blocks until the export settles, whichever way it settled.
@@ -362,7 +392,7 @@ fn a_song_survives_a_save_and_a_reload() {
     };
 
     let mut session = open(copy("test_av.mp4"));
-    session.import(&copy("test_tone.flac")).expect("import");
+    import_and_place(&mut session, &copy("test_tone.flac"));
     // And one placed at the playhead, the way a library row dropped on the
     // audio lane arrives -- so the reload has both doors to restore.
     let song = session.lane_clips(Lane::A1)[1];
@@ -430,7 +460,7 @@ fn a_pasted_song_never_lands_on_the_video_lane() {
     };
 
     let mut session = open(copy("test_av.mp4"));
-    session.import(&copy("test_tone.flac")).expect("import");
+    import_and_place(&mut session, &copy("test_tone.flac"));
     let song = session.lane_clips(Lane::A1)[1];
     let video_before = session.lane_clips(Lane::V1).to_vec();
     assert!(session.paste_at(0.0, song), "paste the copied song");

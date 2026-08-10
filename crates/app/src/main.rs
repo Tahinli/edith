@@ -19,9 +19,9 @@ use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point,
-    RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
+    Point, RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba,
+    size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -1446,17 +1446,13 @@ impl Player {
             cx.notify();
             return;
         }
-        let frames = self.session.as_ref().map_or(0, |session| {
-            source_frames(lane_clips(session), session.sources(), path)
-        });
-        // Zero means nothing on the timeline plays from that file any more
-        // -- an undone import leaves the source entry behind (project.rs:264)
-        // -- so there is no length to insert and no file to ask for one.
-        let placed = match (&mut self.session, frames) {
-            (Some(session), 1..) => {
-                session.place_stream_at(session.now(), path, stream, frames, onto)
-            }
-            _ => Ok(false),
+        // The engine's own length for the file, noted when the import took it
+        // in: a row that has never been on a lane is placeable at its full
+        // length, which is the whole point of an import that only fills the
+        // library.
+        let placed = match &mut self.session {
+            Some(session) => session.place_stream_at(session.now(), path, stream, onto),
+            None => Ok(false),
         };
         match placed {
             Ok(true) => {
@@ -1467,9 +1463,7 @@ impl Player {
             // says which property disagrees, exactly as a refused import does.
             Err(e) => self.notice = Some(format!("NOTHING ADDED — {e}").into()),
             Ok(false) => {
-                self.notice = Some(
-                    "NOTHING ADDED — no clip on the timeline plays from that file any more".into(),
-                )
+                self.notice = Some("NOTHING ADDED — that file could not be placed here".into())
             }
         }
         cx.notify();
@@ -1488,37 +1482,48 @@ impl Player {
         Some((info.sample_rate, info.channels))
     }
 
-    /// Appends a file to the end of the timeline. A drop is not a key press, so
-    /// the export guard on the key handler does not cover it and this checks for
-    /// itself. The engine reseeks, so like a delete it owes the flag reset; a
-    /// refusal is shown as the engine worded it and changes nothing.
+    /// Takes a file into the library and nowhere else: the timeline is not
+    /// touched, and the row is dragged onto a lane when it is wanted there. A
+    /// drop is not a key press, so the export guard on the key handler does not
+    /// cover it and this checks for itself. Nothing moves, so nothing reseeks;
+    /// a refusal is shown as the engine worded it and changes nothing.
     fn import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
-        // An empty window has nothing to append to: there the first file *is*
-        // the timeline and is opened as one, which is the same fork a launch
-        // makes between its first argument and the rest.
+        // An empty window has no library to add to yet: the file opens one, and
+        // the timeline under it stays empty, because an import is an import
+        // whether or not a session was already up. A file *named at launch* is
+        // the other fork -- that one is an open, and it does become the
+        // timeline (`main`).
         let text = match self.session.as_mut().map(|session| session.import(path)) {
-            Some(Ok(())) => {
-                self.reset_after_reseek();
-                format!("IMPORTED {}", file_name(path))
-            }
+            Some(Ok(_)) => format!(
+                "IMPORTED {} to the library — drag it onto a lane to place it",
+                file_name(path)
+            ),
             Some(Err(e)) => format!("IMPORT FAILED: {e}"),
-            None => self.open_media(path),
+            None => self.open_media(path, false),
         };
         eprintln!("{text}");
         self.notice = Some(text.into());
         cx.notify();
     }
 
-    /// Takes a file as the whole timeline, which is what an empty window is
-    /// waiting for. Everything derived from the media -- the clock, the title,
-    /// where an export and a save go -- is set here, exactly as a launch with a
-    /// file argument sets it. Paused with its first frame showing, like every
-    /// other way a timeline arrives.
-    fn open_media(&mut self, path: &std::path::Path) -> String {
-        match PlaybackSession::open(path) {
+    /// Takes a file as the session an empty window is waiting for. Everything
+    /// derived from the media -- the clock, the title, where an export and a
+    /// save go -- is set here, exactly as a launch with a file argument sets
+    /// it. Paused with its first frame showing, like every other way a timeline
+    /// arrives.
+    ///
+    /// `place` is the difference between the two doors that come here: a file
+    /// *opened* is the timeline, one *imported* into an empty window fills the
+    /// library and leaves the lanes empty for a drag.
+    fn open_media(&mut self, path: &std::path::Path, place: bool) -> String {
+        let opened = match place {
+            true => PlaybackSession::open(path),
+            false => PlaybackSession::open_library(path),
+        };
+        match opened {
             Ok(session) => {
                 self.fps = session.meta().frame_rate;
                 // Read before the session moves: a file that plays silent says
@@ -1534,7 +1539,16 @@ impl Player {
                 self.project_path = project_path(path);
                 self.name = file_name(path).into();
                 self.reset_after_reseek();
-                format!("OPENED {}{}", file_name(path), silent.unwrap_or_default())
+                let name = file_name(path);
+                // The library is filled and the timeline is empty; the only
+                // thing that says so is this line, so it says what to do next.
+                let what = match place {
+                    true => format!("OPENED {name}"),
+                    false => {
+                        format!("IMPORTED {name} to the library — drag it onto a lane to place it")
+                    }
+                };
+                format!("{what}{}", silent.unwrap_or_default())
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         }
@@ -1553,7 +1567,7 @@ impl Player {
             let picked = picked.await;
             this.update(cx, |this, cx| match picked {
                 // The same fork the drop handler makes: a project replaces the
-                // timeline, media is appended to it.
+                // timeline, media joins the library.
                 Ok(Some(path)) if is_project(&path) => this.load_project(&path, cx),
                 Ok(Some(path)) => this.import(&path, cx),
                 // Cancelled: the user already knows what happened.
@@ -2141,7 +2155,7 @@ impl Render for Player {
                     return;
                 }
                 for path in paths.paths() {
-                    // A project replaces the timeline, media is appended to it.
+                    // A project replaces the timeline, media joins the library.
                     if is_project(path) {
                         this.load_project(path, cx);
                     } else {
@@ -2324,12 +2338,13 @@ impl Player {
         // the door (the import policy, ledger:436), so the session's own meta
         // describes every row and nothing has to be probed to say so.
         let meta = self.session.as_ref().map(PlaybackSession::meta);
-        let clips: Vec<Clip> = self
-            .session
-            .as_ref()
-            .map_or_else(Vec::new, |session| lane_clips(session).copied().collect());
+        // Its own length, not one derived from what is on the lanes: a row
+        // imported and never placed is a row with a length, and it is the
+        // length a drag would put down.
         let rows: Vec<_> = library_rows(sources, &self.streams, self.timeline_audio(), |path| {
-            source_frames(clips.iter(), sources, path)
+            self.session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path))
         })
         .into_iter()
         .enumerate()
@@ -2461,7 +2476,7 @@ impl Player {
                         "import",
                         None,
                         "Import",
-                        "opens a file chooser — or drop a file on the window".to_string(),
+                        "adds a file to this list — or drop one on the window".to_string(),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
                     )),
@@ -2824,8 +2839,10 @@ impl Player {
                 .id("notice")
                 .when(exported.is_some(), |d| {
                     d.tooltip(|_, cx| {
-                        cx.new(|_| Tip("Open file location — shows the export in the file manager".into()))
-                            .into()
+                        cx.new(|_| {
+                            Tip("Open file location — shows the export in the file manager".into())
+                        })
+                        .into()
                     })
                 })
                 .flex_none()
@@ -3581,14 +3598,7 @@ impl Player {
                     format!("{} – {}", secs(clip.in_frame), secs(clip.out_frame)),
                 ),
                 ("This clip", secs(clip.len())),
-                (
-                    "Source duration",
-                    secs(source_frames(
-                        lane_clips(session),
-                        session.sources(),
-                        &source.path,
-                    )),
-                ),
+                ("Source duration", secs(session.file_frames(&source.path))),
             ] {
                 rows.push(
                     row(rows.len())
@@ -4188,41 +4198,6 @@ fn unseen_paths(sources: &[Source], streams: &HashMap<PathBuf, Vec<StreamInfo>>)
         }
     }
     out
-}
-
-/// Every lane's clips, which is everything the timeline knows about its sources.
-/// Every lane, not the first two: a clip that plays only on `V2` is still a clip
-/// the source is used by, and a walk that missed it would call the file unused.
-fn lane_clips(session: &PlaybackSession) -> impl Iterator<Item = &Clip> {
-    session
-        .lanes()
-        .into_iter()
-        .flat_map(|lane| session.lane_clips(lane))
-}
-
-/// How long a source is, as the timeline knows it: the furthest frame any clip
-/// plays from *the file*. Exact for a source the timeline still holds whole --
-/// which is every source the moment it is imported -- and never longer than the
-/// file, since every clip was checked against it, so a clip built from this can
-/// always be played. Zero for a file nothing plays from any more.
-///
-/// By file rather than by source entry, because a second audio stream of a file
-/// already on the timeline is a row that has no clips of its own yet, and every
-/// stream of a file is the same length -- the picture is what the length is.
-///
-/// ponytail: a source trimmed on the timeline reads as its trimmed length. The
-/// file's own length would need a `Demuxer::open` probe per source, off the
-/// render path like the peak decode is -- that is the upgrade path.
-fn source_frames<'a>(
-    clips: impl Iterator<Item = &'a Clip>,
-    sources: &[Source],
-    path: &Path,
-) -> u32 {
-    clips
-        .filter(|clip| sources.get(clip.source).is_some_and(|s| s.path == path))
-        .map(|clip| clip.out_frame)
-        .max()
-        .unwrap_or(0)
 }
 
 /// Which timeline frame the playhead is on, by the rule the engine's own edits
@@ -5226,10 +5201,10 @@ mod tests {
         RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
         WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add, cancels_export, color_snap,
         envelope, eq_x, eq_y, export_path, export_settings, format_line, frac_along, frac_down,
-        frame_at, histogram, is_bare_modifier, is_project, keymap, lane_clips, lanes_h, marked,
-        menu_at, mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources,
-        whole_take, width_frac, window_title,
+        frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at,
+        mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
+        source_tint, start_frac, timecode, unseen_paths, unseen_sources, whole_take, width_frac,
+        window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -5237,7 +5212,10 @@ mod tests {
     /// the ones the bus would otherwise read as something else.
     #[test]
     fn file_uri_encodes_what_a_path_carries() {
-        assert_eq!(file_uri(std::path::Path::new("/a/b.mp4")), "file:///a/b.mp4");
+        assert_eq!(
+            file_uri(std::path::Path::new("/a/b.mp4")),
+            "file:///a/b.mp4"
+        );
         assert_eq!(
             file_uri(std::path::Path::new("/home/x/out dir/my export.mp4")),
             "file:///home/x/out%20dir/my%20export.mp4"
@@ -5260,21 +5238,6 @@ mod tests {
             .join(name)
     }
 
-    /// A clip of `source`, `frames` long, at the top of the timeline. Only the
-    /// two fields the library reads are meant to be looked at.
-    fn clip(source: usize, frames: u32) -> Clip {
-        Clip {
-            start: 0,
-            in_frame: 0,
-            out_frame: frames,
-            source,
-            link: None,
-            eq: None,
-            color: None,
-            fit: FitPolicy::default(),
-        }
-    }
-
     /// A source entry for `path` on `stream`, as the project keeps them.
     fn source(path: &str, stream: usize) -> Source {
         Source {
@@ -5283,46 +5246,51 @@ mod tests {
         }
     }
 
-    /// The whole of the library's row data comes off the clips: which files
-    /// there are, how long each one is, and therefore which tint each row wears
-    /// -- one index into one list, so a swatch cannot name a different file from
-    /// the boxes it is meant to point at.
+    /// An import fills the *library* and nothing else -- the whole point of
+    /// this door: the row is there at the file's own length before any clip
+    /// plays it, wearing the tint the lanes will tint that clip with, and the
+    /// timeline is exactly as long as it was. Placing it is the drag, and the
+    /// drag is a separate act.
     #[test]
-    fn a_rows_swatch_and_duration_come_off_the_clips_that_name_it() {
-        // Source 0 whole, source 1 trimmed to half of what it was, source 2 on
-        // the audio lane only (its picture was lifted), source 3 imported and
-        // then undone -- an entry with nothing playing from it.
-        let sources: Vec<Source> = (0..4).map(|i| source(&format!("/m/{i}.mp4"), 0)).collect();
-        let video = [clip(0, 150), clip(1, 60)];
-        let audio = [clip(0, 150), clip(1, 30), clip(2, 90)];
-        for (row, frames) in [(0, 150), (1, 60), (2, 90), (3, 0)] {
-            assert_eq!(
-                source_frames(video.iter().chain(&audio), &sources, &sources[row].path),
-                frames,
-                "row {row}"
-            );
-            // The swatch is the clip colour, by the same index and the same
-            // function -- what makes the panel and the lanes one association.
+    fn an_import_adds_a_row_at_its_own_length_and_leaves_the_lanes_alone() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let before = session.timeline_duration();
+        let clips: Vec<usize> = session
+            .lanes()
+            .into_iter()
+            .map(|lane| session.lane_clips(lane).len())
+            .collect();
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        assert_eq!(session.sources().len(), 2, "the library grew");
+        assert_eq!(
+            session.timeline_duration(),
+            before,
+            "an import must not place a clip"
+        );
+        assert_eq!(
+            session
+                .lanes()
+                .into_iter()
+                .map(|lane| session.lane_clips(lane).len())
+                .collect::<Vec<_>>(),
+            clips,
+            "no lane moved"
+        );
+        // The rows the panel draws: one per source, each its file's own length
+        // -- source 1 has no clip anywhere and is still 4 s at 30 fps.
+        let rows = library_rows(session.sources(), &HashMap::new(), None, |path| {
+            session.file_frames(path)
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].frames, 150, "5 s at 30 fps");
+        assert_eq!(rows[1].frames, 120, "4 s at 30 fps, never placed");
+        // The swatch is the clip colour, by the same index and the same
+        // function -- what makes the panel and the lanes one association.
+        for row in 0..rows.len() {
+            assert_eq!(rows[row].tint, row);
             assert_eq!(source_tint(row), SOURCE_TINTS[row % SOURCE_TINTS.len()]);
         }
-        // The longest clip of a file wins, whichever lane it is in and
-        // whatever order the lanes are read in.
-        let one = [source("/m/0.mp4", 0)];
-        let path = &one[0].path;
-        assert_eq!(
-            source_frames([clip(0, 10), clip(0, 90)].iter(), &one, path),
-            90
-        );
-        assert_eq!(
-            source_frames([clip(0, 90), clip(0, 10)].iter(), &one, path),
-            90
-        );
-        assert_eq!(source_frames([].iter(), &one, path), 0);
-        // Two audio streams of one file are two source entries and one length:
-        // the second stream's row is placeable the moment the file is there,
-        // before any clip names that entry.
-        let two = [source("/m/0.mp4", 0), source("/m/0.mp4", 1)];
-        assert_eq!(source_frames([clip(0, 90)].iter(), &two, &two[1].path), 90);
     }
 
     /// The window opened on a song and nothing else -- the launch argument, the
@@ -5351,7 +5319,7 @@ mod tests {
             .iter()
             .find(|s| s.index == session.sources()[0].audio_stream)
             .map(|s| (s.sample_rate, s.channels));
-        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        let frames = session.file_frames(&path);
         let rows = library_rows(session.sources(), &streams, rate, |_| frames);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "test_tone.mp3");
@@ -5363,7 +5331,7 @@ mod tests {
         session.seek(1.0);
         assert!(
             session
-                .place_stream_at(1.0, &path, 0, frames, Some(Lane::A1))
+                .place_stream_at(1.0, &path, 0, Some(Lane::A1))
                 .expect("its own file is on this timeline")
         );
         assert_eq!(session.lane_clips(Lane::A1).len(), 2);
@@ -5588,14 +5556,11 @@ mod tests {
         assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
         assert_eq!(session.sources().len(), 1, "a refusal added a row");
         // An accepted one does add a row, and it reads as the whole file: 4 s
-        // at 30 fps, exactly what was appended.
+        // at 30 fps, its own length and not one taken off the lanes.
         session.import(&asset("test_av2.mp4")).expect("av2 matches");
         assert_eq!(session.sources().len(), 2);
         let second = session.sources()[1].path.clone();
-        assert_eq!(
-            source_frames(lane_clips(&session), session.sources(), &second),
-            120
-        );
+        assert_eq!(session.file_frames(&second), 120);
         assert_eq!(timecode(120. / 30., 30.), "00:00:04:00");
     }
 
@@ -5607,21 +5572,22 @@ mod tests {
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
         session.set_gain(0.0);
         session.import(&asset("test_av2.mp4")).expect("av2 matches");
-        assert_eq!(session.timeline_duration(), 9.0);
+        // In the library only: the 5 s the fixture is, still.
+        assert_eq!(session.timeline_duration(), 5.0);
         // Two seconds in, which is inside the first take: the insert splits it.
         session.seek(2.0);
         let second = session.sources()[1].path.clone();
-        let frames = source_frames(lane_clips(&session), session.sources(), &second);
+        let frames = session.file_frames(&second);
         // Through the engine door `insert_source` uses, with the row's own
         // stream: the button, the drop and this are one call.
         assert!(
             session
-                .place_stream_at(2.0, &second, 0, frames, None)
+                .place_stream_at(2.0, &second, 0, None)
                 .expect("av2 is already on the timeline")
         );
         // The whole of source 1 went in and nothing was painted over: the
         // timeline is longer by exactly that file.
-        assert_eq!(session.timeline_duration(), 13.0);
+        assert_eq!(session.timeline_duration(), 9.0);
         let (video, audio) = (session.lane_clips(Lane::V1), session.lane_clips(Lane::A1));
         // One take, not a video clip with no sound under it: both lanes hold
         // the same clip at the same place, in the same group.
@@ -5644,21 +5610,18 @@ mod tests {
             PlaybackSession::open(asset("test_multilang.mp4")).expect("open the fixture");
         session.set_gain(0.0);
         let path = session.sources()[0].path.clone();
-        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        let frames = session.file_frames(&path);
         let end = session.timeline_duration();
         assert!(
             session
-                .place_stream_at(end, &path, 1, frames, None)
+                .place_stream_at(end, &path, 1, None)
                 .expect("the French track shares the timeline's parameters")
         );
         assert_eq!(session.sources()[1].audio_stream, 1);
         assert_eq!(session.timeline_duration(), end * 2.0);
         // Both rows are the same file, so both rows are that file's length --
         // the second one before any clip of its own existed.
-        assert_eq!(
-            source_frames(lane_clips(&session), session.sources(), &path),
-            frames
-        );
+        assert_eq!(session.file_frames(&path), frames);
     }
 
     /// The trim-a-clip path through the doors the edge drag uses:
@@ -5701,7 +5664,11 @@ mod tests {
 
         // ...and dragged back out, as far as the file goes and no further.
         assert!(session.trim_clip(Lane::V1, 0, Edge::End, 9_999));
-        assert_eq!(session.lane_clips(Lane::V1)[0], whole, "the whole take back");
+        assert_eq!(
+            session.lane_clips(Lane::V1)[0],
+            whole,
+            "the whole take back"
+        );
 
         // The head takes the in-point with it, so what plays at the new start
         // is source frame 10 rather than source frame 0.
@@ -5780,10 +5747,9 @@ mod tests {
         // A library row let go over that row: the same door the Add button
         // uses, told which lane it was let go over.
         let path = session.sources()[0].path.clone();
-        let frames = source_frames(lane_clips(&session), session.sources(), &path);
         assert!(
             session
-                .place_stream_at(1.0, &path, 0, frames, Some(v2))
+                .place_stream_at(1.0, &path, 0, Some(v2))
                 .expect("its own file is on this timeline")
         );
         assert_eq!(session.lane_clips(v2).len(), 1, "the drop landed on V2");
@@ -5809,7 +5775,7 @@ mod tests {
         assert_eq!(mp4_refusal(&session), None, "an empty lane carries nothing");
         assert!(
             session
-                .place_stream_at(0.0, &path, 0, frames, Some(a2))
+                .place_stream_at(0.0, &path, 0, Some(a2))
                 .expect("its own file is on this timeline")
         );
         assert_eq!(
@@ -6761,8 +6727,8 @@ mod tests {
 fn main() {
     let arg = std::env::args().nth(1).map(PathBuf::from);
     // A `.edith` restores a whole timeline, anything else *is* the timeline.
-    // Either way the rest of argv is appended to what comes out. No argument at
-    // all opens the window empty -- the timeline then arrives by drop or by the
+    // Either way the rest of argv is imported into its library. No argument at
+    // all opens the window empty -- the library then arrives by drop or by the
     // Import button, and everything below is derived from it at that point
     // instead.
     let mut session = match &arg {
@@ -6792,8 +6758,10 @@ fn main() {
     if let Some(text) = &notice {
         eprintln!("{text}");
     }
-    // The first file makes the timeline, the rest are appended to it. A refusal
-    // is not fatal -- the others still load -- but the window must not open
+    // The first file makes the timeline -- naming a file to open is a decision
+    // about what to watch -- and the rest are imports like any other: rows in
+    // the library, dragged onto a lane when they are wanted there. A refusal is
+    // not fatal -- the others still load -- but the window must not open
     // silently pretending the file was taken, so the first one seeds the notice.
     for extra in std::env::args().skip(2) {
         // Only reachable with a first argument, so there is a timeline.
