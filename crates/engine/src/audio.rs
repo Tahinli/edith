@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track};
+use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known::CODEC_ID_AAC,
@@ -73,6 +73,34 @@ pub struct AudioProbe {
     pub channels: u16,
 }
 
+/// One audio stream of a file as its header describes it. Every audio track is
+/// described, decodable or not: a picker shows the ones we refuse greyed out
+/// rather than pretending a BluRay remux has fewer streams than it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// Position among this file's audio tracks in file order — the `stream`
+    /// [`AudioSession::open_multi_streams`] takes.
+    pub index: usize,
+    /// Container codec.
+    ///
+    /// ponytail: mp4 0.14 parses `mp4a` sample entries and silently drops every
+    /// other kind (`stsd.rs` `_ => {}`), keeping no fourcc, so an AC-3/DTS/PCM
+    /// stream can only be `"unknown"` here — enough to grey a row out, not
+    /// enough to name the codec. Upgrade path is reading the sample entry's
+    /// fourcc out of the file ourselves.
+    pub codec: String,
+    /// `0` for a stream whose sample entry mp4 0.14 does not parse.
+    pub channels: u16,
+    /// `0` for a stream whose sample entry mp4 0.14 does not parse.
+    pub sample_rate: u32,
+    /// ISO-639-2 from the mdhd, `None` for the `und` most muxers write.
+    pub lang: Option<String>,
+    /// Whether opening this stream would decode: AAC-LC, mono or stereo. The
+    /// grey-out rule, mirroring the refusals `Track::open` and `Track::channels`
+    /// make one file at a time.
+    pub decodable: bool,
+}
+
 pub struct AudioSession;
 
 impl AudioSession {
@@ -132,10 +160,24 @@ impl AudioSession {
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        let Some(first) = sources.first() else {
+        let sources: Vec<_> = sources.iter().map(|p| (p.clone(), 0)).collect();
+        Self::open_multi_streams(&sources, segs)
+    }
+
+    /// [`open_multi_segments`](Self::open_multi_segments) with each source
+    /// naming *which* of its audio streams to decode — files carrying several
+    /// (a remux with one track per language) are otherwise stuck on their first.
+    /// The index counts audio tracks in file order, as
+    /// [`probe_streams`](Self::probe_streams) lists them; a stream that does not
+    /// exist or does not decode is an `Err` here, never a panic.
+    pub fn open_multi_streams(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        let Some((path, stream)) = sources.first() else {
             return Ok(None);
         };
-        let Some(first) = Track::open(first)? else {
+        let Some(first) = Track::open(path, *stream)? else {
             return Ok(None);
         };
         // The timeline's meta is the first source's: policy makes every other
@@ -161,7 +203,8 @@ impl AudioSession {
             if slot.is_some() {
                 continue; // already opened, and the checks below already ran
             }
-            let track = Track::open(&sources[source])?
+            let (path, stream) = &sources[source];
+            let track = Track::open(path, *stream)?
                 .ok_or_else(|| format!("source {source} has no audio track"))?;
             if (track.sample_rate, track.channels()?) != (meta.sample_rate, meta.channels) {
                 return Err(format!(
@@ -221,13 +264,49 @@ impl AudioSession {
     /// `Ok(None)` means no AAC track — an audio-less file, which import pairs
     /// only with other audio-less files.
     pub fn probe(path: impl AsRef<Path>) -> crate::Result<Option<AudioProbe>> {
-        let Some(track) = Track::open(path.as_ref())? else {
+        let Some(track) = Track::open(path.as_ref(), 0)? else {
             return Ok(None);
         };
         Ok(Some(AudioProbe {
             params: track.track_params(),
             channels: track.channels()?,
         }))
+    }
+
+    /// Every audio stream of `path`, in file order: an entry's `index` is the
+    /// stream number [`open_multi_streams`](Self::open_multi_streams) takes.
+    /// Header only, no decoder and no worker — and no filtering either, so a
+    /// stream this engine cannot decode is listed with `decodable: false`
+    /// instead of vanishing.
+    ///
+    /// An empty list means the file has no audio at all, which is a valid
+    /// silent source.
+    pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
+        let file = File::open(path.as_ref())?;
+        let size = file.metadata()?.len();
+        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+        Ok(audio_track_ids(&reader)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let track = &reader.tracks()[&id];
+                let aac = matches!(track.media_type(), Ok(MediaType::AAC));
+                let lang = track.language();
+                StreamInfo {
+                    index,
+                    codec: if aac { "aac" } else { "unknown" }.into(),
+                    channels: track.channel_config().map_or(0, channel_count),
+                    sample_rate: track.sample_freq_index().map_or(0, |f| f.freq()),
+                    lang: (!lang.is_empty() && lang != "und").then(|| lang.to_string()),
+                    decodable: aac
+                        && matches!(track.audio_profile(), Ok(AudioObjectType::AacLowComplexity))
+                        && matches!(
+                            track.channel_config(),
+                            Ok(ChannelConfig::Mono | ChannelConfig::Stereo)
+                        ),
+                }
+            })
+            .collect())
     }
 
     /// The raw AAC packets covering `segs` — the same half-open source-second
@@ -284,7 +363,7 @@ impl AudioSession {
         let path = sources
             .get(first)
             .ok_or_else(|| format!("segment names source {first} of {}", sources.len()))?;
-        let Some(track) = Track::open(path)? else {
+        let Some(track) = Track::open(path, 0)? else {
             return Ok(None); // silent source, silent export
         };
         let params = track.track_params();
@@ -375,6 +454,11 @@ fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
 
 /// The source at `index`, opened on first use. Sources a segment list never
 /// names are never touched: a project's list only grows.
+///
+/// ponytail: the copy path is still stream 0 of every source — an export of a
+/// timeline playing stream 1 would carry stream 0's audio. Upgrade path is the
+/// `(PathBuf, usize)` list [`AudioSession::open_multi_streams`] already takes,
+/// which is S4b's job once a stream can be picked at all.
 fn source_at<'a>(
     tracks: &'a mut [Option<Track>],
     sources: &[PathBuf],
@@ -385,7 +469,7 @@ fn source_at<'a>(
         .ok_or_else(|| format!("segment names source {index} of {}", sources.len()))?;
     if slot.is_none() {
         *slot = Some(
-            Track::open(&sources[index])?
+            Track::open(&sources[index], 0)?
                 .ok_or_else(|| format!("source {index} has no audio track"))?,
         );
     }
@@ -415,19 +499,37 @@ struct Track {
 }
 
 impl Track {
-    /// `Ok(None)` for a file with no AAC track, which is a valid silent source.
-    fn open(path: &Path) -> crate::Result<Option<Self>> {
+    /// The `stream`-th audio track of `path`, counted in file order over *all*
+    /// audio tracks — the numbering [`AudioSession::probe_streams`] hands out.
+    ///
+    /// Stream 0 is best effort: `Ok(None)` when there is no audio there at all
+    /// or the codec is one we do not decode, which is a valid silent source (a
+    /// file whose audio is AC-3 still has a picture worth editing). A stream the
+    /// caller *named* is a promise instead, so out of range or undecodable
+    /// there is an `Err` rather than silence the caller did not ask for.
+    fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
 
-        let Some(track) = reader
-            .tracks()
-            .values()
-            .find(|t| matches!(t.media_type(), Ok(MediaType::AAC)))
-        else {
-            return Ok(None);
+        let ids = audio_track_ids(&reader);
+        let Some(track) = ids.get(stream).map(|id| &reader.tracks()[id]) else {
+            return match stream {
+                0 => Ok(None),
+                n => Err(format!(
+                    "{}: audio stream {n} of {} streams",
+                    path.display(),
+                    ids.len()
+                )
+                .into()),
+            };
         };
+        if !matches!(track.media_type(), Ok(MediaType::AAC)) {
+            return match stream {
+                0 => Ok(None),
+                n => Err(format!("{}: audio stream {n} is not AAC", path.display()).into()),
+            };
+        }
         // Refuse early with a message instead of failing packet by packet — and
         // a copy carries no profile of its own: the writer rebuilds the
         // AudioSpecificConfig from `freq_index`/`chan_conf` and calls it LC, so a
@@ -527,6 +629,34 @@ fn packet_run(err: &mut i64, ideal: i64, available: u32) -> u32 {
     let n = (want.round().max(0.0) as i64).min(i64::from(available)) as u32;
     *err += i64::from(n) * packet - ideal;
     n
+}
+
+/// This file's audio tracks in file order — the order a stream index counts in.
+/// It comes out of `moov.traks` and not `Mp4Reader::tracks`, which is a
+/// `HashMap`: iterating that would make "stream 0" a different track from one
+/// run to the next on any file carrying more than one.
+fn audio_track_ids<R>(reader: &Mp4Reader<R>) -> Vec<u32> {
+    reader
+        .moov
+        .traks
+        .iter()
+        .filter(|trak| {
+            matches!(
+                TrackType::try_from(&trak.mdia.hdlr.handler_type),
+                Ok(TrackType::Audio)
+            )
+        })
+        .map(|trak| trak.tkhd.track_id)
+        .collect()
+}
+
+/// Channels in an AAC channel configuration. The config number *is* the channel
+/// count up to 5.1; 7.1 is the one that is not.
+fn channel_count(config: ChannelConfig) -> u16 {
+    match config {
+        ChannelConfig::SevenOne => 8,
+        other => other as u16,
+    }
 }
 
 /// `(profile, freq_index, chan_conf)` out of the esds descriptor. Returned as a
