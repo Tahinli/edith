@@ -126,9 +126,9 @@ fn shape(session: &PlaybackSession) -> (Vec<(f64, f64, usize)>, Vec<Source>, f64
 
 /// The version-1 promise: a file written before the lanes existed still opens,
 /// as one grouped video+audio pair per clip laid end to end, and saving it
-/// again writes version 3 -- which reopens as the same timeline.
+/// again writes version 4 -- which reopens as the same timeline.
 #[test]
-fn a_version_1_project_loads_fully_grouped_and_saves_as_version_3() {
+fn a_version_1_project_loads_fully_grouped_and_saves_as_version_4() {
     let dir = scratch("v1");
     copy_in(&dir, "test_av.mp4");
     let path = dir.join("old.edith");
@@ -156,11 +156,11 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_3() {
         "playhead kept"
     );
 
-    // Saved again it is v3, and v3 round-trips to the same timeline.
+    // Saved again it is v4, and v4 round-trips to the same timeline.
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 3\n"), "{text}");
+    assert!(text.starts_with("edith 4\n"), "{text}");
     assert_eq!(
         text.lines().filter(|l| l.starts_with("video ")).count(),
         2,
@@ -195,6 +195,56 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_3() {
             .expect("read back")
             .contains("source 0 test_av.mp4"),
         "a re-saved v2 project says the stream it always meant"
+    );
+}
+
+/// What version 4 is for: a project file holds any number of lanes, in the
+/// order they are displayed in, and one holding nothing is still a lane. The
+/// timeline is built by hand because the format is what this checks -- no UI
+/// adds a lane yet -- and the file it writes back has to be the one it read.
+#[test]
+fn a_version_4_project_holds_more_than_two_lanes() {
+    use engine::project::{Lane, LaneKind};
+
+    let dir = scratch("v4_lanes");
+    copy_in(&dir, "test_av.mp4");
+    let path = dir.join("many.edith");
+    // V1, A1, V2, A2 in display order: a take grouped across V1 and A2 (link 3,
+    // one span on two lanes that are not a pair), a lone clip on V2, and an
+    // empty A1 that has only its own line to say it is there.
+    let text = "edith 4\nplayhead 0\nsource 0 test_av.mp4\n\
+                video 1 0 0 30 0 3\naudio 1\nvideo 2 40 0 20 0 -\naudio 2 0 0 30 0 3\n";
+    std::fs::write(&path, text).expect("write a v4 file");
+
+    let loaded = PlaybackSession::open_project(&path).expect("a four-lane project opens");
+    let v2 = Lane::new(LaneKind::Video, 1);
+    let a2 = Lane::new(LaneKind::Audio, 1);
+    assert_eq!(loaded.lane_clips(Lane::V1).len(), 1);
+    assert!(loaded.lane_clips(Lane::A1).is_empty(), "A1 holds nothing");
+    assert_eq!(
+        loaded
+            .lane_clips(v2)
+            .iter()
+            .map(|c| (c.start, c.end()))
+            .collect::<Vec<_>>(),
+        vec![(40, 60)],
+        "V2 is a lane of its own, gap and all"
+    );
+    assert_eq!(
+        loaded.lane_clips(a2)[0].link,
+        loaded.lane_clips(Lane::V1)[0].link,
+        "the group spans V1 and A2, which are not a pair"
+    );
+    assert_eq!(loaded.timeline_duration(), 60.0 / loaded.meta().frame_rate);
+
+    // ...and saving it writes back the same bytes: the lane list, its order and
+    // the empty lane all survive the round trip.
+    let again = dir.join("again.edith");
+    loaded.save_project(&again).expect("save");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read back"),
+        text,
+        "a four-lane project is written as it was read"
     );
 }
 
@@ -409,8 +459,13 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 
     for (text, want) in [
         (
-            "edith 4\nsource 0 test_av.mp4\nvideo 0 0 30 0 -\n",
+            "edith 5\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 -\n",
             "line 1",
+        ),
+        // A lane number that skips one of its kind: V2 was never declared.
+        (
+            "edith 4\nsource 0 test_av.mp4\nvideo 2 0 0 30 0 -\n",
+            "line 3",
         ),
         // A v2 source line in a v3 file: the stream field is not optional.
         ("edith 3\nsource test_av.mp4\nvideo 0 0 30 0 -\n", "line 2"),

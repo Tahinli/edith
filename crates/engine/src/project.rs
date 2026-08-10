@@ -157,9 +157,8 @@ struct LaneData {
 }
 
 impl LaneData {
-    /// The two lanes a project starts with and the only two a `.edith` file
-    /// holds: `V1` then `A1`, in display order. One place, because every door
-    /// that builds a project from the outside builds exactly this pair.
+    /// The two lanes a project starts with: `V1` then `A1`, in display order.
+    /// One place, because a freshly opened file is exactly this pair.
     fn two_lanes(video: Vec<Clip>, audio: Vec<Clip>) -> Vec<LaneData> {
         vec![
             LaneData {
@@ -235,24 +234,26 @@ impl Project {
     }
 
     /// A project rebuilt from a saved edit list -- the load half of
-    /// [`crate::edith`], which is a two-lane format, so this door takes `V1` and
-    /// `A1` and nothing else (see [`Project::without_orphan_sources`], which
-    /// refuses to *write* more). History is *not* saved, so [`Project::undo`] is
-    /// `false` until the first edit of the new session. This is the one door
-    /// untrusted parts come in through, so every invariant every other
-    /// constructor keeps is checked here, by name and in release: both lanes
-    /// empty, an empty clip, a clip naming a source that is not there, a clip
-    /// whose end overflows, a lane that is unsorted or self-overlapping, and
-    /// the grouping rules of [`Clip::link`] below.
+    /// [`crate::edith`]. The lanes come in display order, each with its kind, and
+    /// an `ord` is a lane's position among the lanes of that kind, exactly as
+    /// [`Project::lanes`] hands them back. History is *not* saved, so
+    /// [`Project::undo`] is `false` until the first edit of the new session.
+    /// This is the one door untrusted parts come in through, so every invariant
+    /// every other constructor keeps is checked here, by name and in release:
+    /// every lane empty, an empty clip, a clip naming a source that is not
+    /// there, a clip whose end overflows, a lane that is unsorted or
+    /// self-overlapping, and the grouping rules of [`Clip::link`] below.
     pub fn from_parts(
         sources: Vec<Source>,
-        video: Vec<Clip>,
-        audio: Vec<Clip>,
+        lanes: Vec<(LaneKind, Vec<Clip>)>,
     ) -> crate::Result<Self> {
-        if video.is_empty() && audio.is_empty() {
-            return Err("both lanes are empty: that is not a project".into());
+        if lanes.iter().all(|(_, clips)| clips.is_empty()) {
+            return Err("every lane is empty: that is not a project".into());
         }
-        let lanes = LaneData::two_lanes(video, audio);
+        let lanes: Vec<LaneData> = lanes
+            .into_iter()
+            .map(|(kind, clips)| LaneData { kind, clips })
+            .collect();
         for (data, lane) in lanes.iter().zip(handles(&lanes)) {
             let name = lane.label();
             for c in &data.clips {
@@ -421,29 +422,13 @@ impl Project {
     /// [`Project::append_clip`]), so an undone import leaves an orphan source
     /// entry behind; writing that orphan to a project file would let a file
     /// nothing plays refuse a future load. New indexes are assigned in order of
-    /// first use -- video lane first, then audio -- so the same project always
+    /// first use -- lane by lane, in display order -- so the same project always
     /// emits the same bytes.
     ///
-    /// Refused, by name, for a timeline with more than one lane of a kind: the
-    /// `.edith` format has one line keyword per kind, so writing a third lane
-    /// would silently drop it. The model runs ahead of the format here on
-    /// purpose -- the bump is its own slice -- and a refused save is the one
-    /// answer that loses nothing.
-    pub fn without_orphan_sources(&self) -> crate::Result<(Vec<Source>, Vec<Clip>, Vec<Clip>)> {
-        for kind in [LaneKind::Video, LaneKind::Audio] {
-            let n = self.lane_count(kind);
-            if n > 1 {
-                let name = match kind {
-                    LaneKind::Video => "video",
-                    LaneKind::Audio => "audio",
-                };
-                return Err(format!(
-                    "this timeline has {n} {name} lanes; a project file holds one of each -- \
-                     saving more than two lanes needs a newer format"
-                )
-                .into());
-            }
-        }
+    /// Every lane comes out, in display order and with its kind: that is what a
+    /// v4 `.edith` holds (empty lanes included) and what [`Project::from_parts`]
+    /// takes back.
+    pub fn without_orphan_sources(&self) -> (Vec<Source>, Vec<(LaneKind, Vec<Clip>)>) {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
         let mut lanes = self.lanes.clone();
@@ -458,14 +443,10 @@ impl Project {
                 }
             };
         }
-        let (mut video, mut audio) = (Vec::new(), Vec::new());
-        for data in lanes {
-            match data.kind {
-                LaneKind::Video => video = data.clips,
-                LaneKind::Audio => audio = data.clips,
-            }
-        }
-        Ok((sources, video, audio))
+        (
+            sources,
+            lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
+        )
     }
 
     /// Length of the timeline in frames: where the *last* lane runs out. A lane
@@ -1013,6 +994,11 @@ mod tests {
             source,
             link: None,
         }
+    }
+
+    /// The `V1`, `A1` lane list a two-lane load hands [`Project::from_parts`].
+    fn two(video: Vec<Clip>, audio: Vec<Clip>) -> Vec<(LaneKind, Vec<Clip>)> {
+        vec![(LaneKind::Video, video), (LaneKind::Audio, audio)]
     }
 
     /// Every lane with its group ids blanked, for comparing shape.
@@ -1604,10 +1590,13 @@ mod tests {
         // Import a second file, undo it: source 1 is now an orphan.
         let mut p = two_sources();
         assert!(p.undo());
-        let (sources, video, audio) = p.without_orphan_sources().expect("two lanes");
+        let (sources, lanes) = p.without_orphan_sources();
         assert_eq!(sources, vec![Source::new(FILE, 0)], "the orphan is gone");
-        assert_eq!(video, three().clips(), "the clips are untouched");
-        assert_eq!(audio, three().lane(Lane::A1));
+        assert_eq!(
+            lanes,
+            two(three().clips().to_vec(), three().lane(Lane::A1).to_vec()),
+            "the clips are untouched"
+        );
 
         // Three sources where only the middle one is orphaned: the survivors
         // renumber, and the clips follow.
@@ -1615,31 +1604,35 @@ mod tests {
         assert_eq!(p.import(FILE2, 0), 1);
         assert_eq!(p.import("/nonexistent/c.mp4", 0), 2);
         assert!(p.append_clip(2, 4));
-        let (sources, video, audio) = p.without_orphan_sources().expect("two lanes");
+        let (sources, lanes) = p.without_orphan_sources();
         assert_eq!(
             sources,
             vec![Source::new(FILE, 0), Source::new("/nonexistent/c.mp4", 0)]
         );
-        assert_eq!(video.iter().map(|c| c.source).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            lanes[0].1.iter().map(|c| c.source).collect::<Vec<_>>(),
+            [0, 1]
+        );
         // ...and what comes out is loadable, with the same timeline.
-        let reloaded = Project::from_parts(sources, video, audio).expect("from_parts");
+        let reloaded = Project::from_parts(sources, lanes).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
     }
 
     #[test]
     fn from_parts_has_no_history_and_checks_the_invariants() {
-        let (sources, video, audio) = three().without_orphan_sources().expect("two lanes");
-        let mut p = Project::from_parts(sources.clone(), video.clone(), audio.clone())
-            .expect("valid parts");
+        let (sources, lanes) = three().without_orphan_sources();
+        let (video, audio) = (lanes[0].1.clone(), lanes[1].1.clone());
+        let mut p = Project::from_parts(sources.clone(), lanes.clone()).expect("valid parts");
         assert_eq!(p.clips(), three().clips());
         assert!(!p.undo(), "a loaded project has nothing to undo");
         assert!(p.split(4), "...and is editable from there");
         assert!(p.undo());
 
-        // A lane may be empty; both may not.
-        assert!(Project::from_parts(sources.clone(), video.clone(), Vec::new()).is_ok());
-        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new()).is_err());
+        // A lane may be empty; every lane may not, and neither may no lane.
+        assert!(Project::from_parts(sources.clone(), two(video.clone(), Vec::new())).is_ok());
+        assert!(Project::from_parts(sources.clone(), two(Vec::new(), Vec::new())).is_err());
+        assert!(Project::from_parts(sources.clone(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
@@ -1649,13 +1642,27 @@ mod tests {
         ];
         for clips in bad {
             assert!(
-                Project::from_parts(sources.clone(), clips.clone(), Vec::new()).is_err(),
+                Project::from_parts(sources.clone(), two(clips.clone(), Vec::new())).is_err(),
                 "{clips:?}"
             );
-            assert!(Project::from_parts(sources.clone(), video.clone(), clips).is_err());
+            assert!(
+                Project::from_parts(sources.clone(), two(video.clone(), clips.clone())).is_err()
+            );
+            // ...and on a third lane, which is checked by the same walk.
+            assert!(
+                Project::from_parts(
+                    sources.clone(),
+                    vec![
+                        (LaneKind::Video, video.clone()),
+                        (LaneKind::Audio, audio.clone()),
+                        (LaneKind::Video, clips),
+                    ]
+                )
+                .is_err()
+            );
         }
         // Group ids survive a load, and the next split gets a fresh one.
-        let mut p = Project::from_parts(sources, video, audio).expect("valid parts");
+        let mut p = Project::from_parts(sources, lanes).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
     }
@@ -1681,7 +1688,7 @@ mod tests {
 
         // The door: named errors, one per cause.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
-            Project::from_parts(sources.clone(), video, audio)
+            Project::from_parts(sources.clone(), two(video, audio))
                 .expect_err("refused")
                 .to_string()
         };
@@ -1698,9 +1705,9 @@ mod tests {
         // A one-sided link is *not* an error: it is what a lift leaves behind.
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0));
-        let (sources, video, audio) = p.clone().without_orphan_sources().expect("two lanes");
+        let (sources, lanes) = p.clone().without_orphan_sources();
         assert!(
-            Project::from_parts(sources, video, audio).is_ok(),
+            Project::from_parts(sources, lanes).is_ok(),
             "a lifted lane's project has to load again"
         );
 
@@ -1769,7 +1776,7 @@ mod tests {
             &p,
             "a second audio stream of the same file, placed and split",
         );
-        let (sources, ..) = p.without_orphan_sources().expect("two lanes");
+        let (sources, _) = p.without_orphan_sources();
         assert_eq!(
             sources.iter().map(|s| s.audio_stream).collect::<Vec<_>>(),
             [0, 1],
@@ -1819,18 +1826,27 @@ mod tests {
     }
 
     /// The save/load round trip a project must survive: the parts a save writes,
-    /// handed back to the constructor a load goes through.
+    /// handed back to the constructor a load goes through -- every lane of them,
+    /// and the reloaded timeline has to be the same lanes in the same order.
     fn reloads(p: &Project, what: &str) {
-        let (sources, video, audio) = p.clone().without_orphan_sources().expect("two lanes");
-        if let Err(e) = Project::from_parts(sources, video, audio) {
-            panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes);
+        let (sources, lanes) = p.clone().without_orphan_sources();
+        match Project::from_parts(sources, lanes) {
+            Err(e) => panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes),
+            Ok(back) => {
+                assert_eq!(back.lanes(), p.lanes(), "{what}: the lane list changed");
+                // Placements, not whole clips: an orphan prune renumbers the
+                // sources a clip names, which is the point of it.
+                let spans = |p: &Project| -> Vec<Vec<(u32, u32)>> {
+                    p.lanes().into_iter().map(|l| p.lane_spans(l)).collect()
+                };
+                assert_eq!(spans(&back), spans(p), "{what}: the placements changed");
+            }
         }
     }
 
-    /// What [`reloads`] proves for a timeline the file format cannot hold yet:
-    /// the two invariants [`Project::from_parts`] checks that are about *lanes*
+    /// The two invariants [`Project::from_parts`] checks that are about *lanes*
     /// -- each one sorted and disjoint, and one span per group id -- asserted
-    /// directly, since a save of more than two lanes is refused on purpose.
+    /// directly, where the point is the invariant rather than the round trip.
     fn invariants_hold(p: &Project, what: &str) {
         for lane in p.lanes() {
             assert!(
@@ -2045,44 +2061,51 @@ mod tests {
         );
     }
 
-    /// The model runs ahead of the file format on purpose, so a save of what the
-    /// format cannot hold is refused by name rather than silently dropping a
-    /// lane -- and a two-lane project still writes exactly the parts it always
-    /// did.
+    /// Every lane a save writes comes out, in display order and with its kind --
+    /// an empty one included, since it is state a front-end shows -- and a
+    /// two-lane project still writes exactly the parts it always did.
     #[test]
-    fn a_save_refuses_more_lanes_than_the_format_holds() {
+    fn a_save_writes_every_lane_it_has() {
         let mut p = three();
-        let before = p.without_orphan_sources().expect("two lanes save");
+        let before = p.without_orphan_sources();
+        assert_eq!(before.1.len(), 2, "V1 and A1");
         let v2 = p.add_lane(LaneKind::Video);
-        let err = p.without_orphan_sources().expect_err("refused").to_string();
-        assert!(
-            err.contains("2 video lanes") && err.contains("newer format"),
-            "{err}"
-        );
-        // Even empty: what cannot be written must not be quietly left behind.
-        assert!(p.lane(v2).is_empty());
-        assert!(p.undo(), "and the lane undoes");
+        assert!(p.place(v2, 4, clip(0, 20, 32, 0)));
+        let a2 = p.add_lane(LaneKind::Audio);
+        let (sources, lanes) = p.without_orphan_sources();
         assert_eq!(
-            p.without_orphan_sources().expect("saveable again"),
+            lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [
+                LaneKind::Video,
+                LaneKind::Audio,
+                LaneKind::Video,
+                LaneKind::Audio
+            ],
+            "display order, not video-then-audio"
+        );
+        assert_eq!(lanes[2].1, p.lane(v2), "V2's clips are written");
+        assert!(lanes[3].1.is_empty(), "and the empty A2 is still a lane");
+        // ...and all four load again as the same four.
+        let back = Project::from_parts(sources, lanes).expect("four lanes load");
+        assert_eq!(back.lanes(), p.lanes());
+        assert_eq!(back.lane(a2), p.lane(a2));
+
+        // Taking the lanes back leaves exactly what a two-lane save wrote.
+        for _ in 0..3 {
+            assert!(p.undo());
+        }
+        assert_eq!(
+            p.without_orphan_sources(),
             before,
             "byte for byte the same parts a two-lane save always wrote"
-        );
-
-        let mut p = three();
-        p.add_lane(LaneKind::Audio);
-        assert!(
-            p.without_orphan_sources()
-                .unwrap_err()
-                .to_string()
-                .contains("2 audio lanes")
         );
     }
 
     /// [`random_edit_sequences_reload`]'s sweep on a timeline that starts with
-    /// three lanes and may grow more: every lane's own order and the one
-    /// span-per-id rule, after every op. Amended rather than merged into that
-    /// test because a >2-lane project cannot round-trip through the v2 file
-    /// format -- [`invariants_hold`] checks what a reload would have checked.
+    /// three lanes and grows more: every lane's own order and the one
+    /// span-per-id rule after every op, *and* the reload the v4 format restored
+    /// as the oracle -- with `add_lane` in the op mix, so what is reloaded is a
+    /// project of any number of lanes.
     #[test]
     fn random_edit_sequences_keep_many_lanes_consistent() {
         for seed in 0..200u64 {
@@ -2125,6 +2148,7 @@ mod tests {
                     _ => p.append_clip(0, 1 + next(9)),
                 };
                 invariants_hold(&p, &format!("seed {seed}, step {step}"));
+                reloads(&p, &format!("seed {seed}, step {step}"));
             }
         }
     }
