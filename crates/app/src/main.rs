@@ -3460,6 +3460,7 @@ mod tests {
             source,
             link: None,
             eq: None,
+            color: None,
         }
     }
 
@@ -3650,6 +3651,7 @@ mod tests {
             source: 0,
             link: None,
             eq: None,
+            color: None,
         };
         assert_eq!(clip.end(), 90);
         // Cut splits from inside only: neither edge has anything to split off.
