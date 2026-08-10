@@ -291,7 +291,15 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 14] = [
+pub const FIXED: [Fixed; 15] = [
+    // Not a chord at all but a way of pressing one, and the only place the
+    // editor can say so: holding a key that moves a *value* runs it, and
+    // holding anything else still does what one press did.
+    Fixed {
+        chord: "hold ← → ↑ ↓",
+        label: "Run a card's slider, or the volume keys, while held",
+        category: Category::View,
+    },
     Fixed {
         chord: "esc",
         label: "Close this card or menu, or cancel a capture",
