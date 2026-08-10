@@ -459,6 +459,12 @@ struct Player {
     /// presence means "asked" -- and an empty list is a silent file, which is
     /// exactly one row and no stream tags.
     streams: HashMap<PathBuf, Vec<StreamInfo>>,
+    /// How big each still source's picture is, read from its header once and
+    /// kept -- what a library row and its card say about a file that has no
+    /// streams to describe. Filled like `streams`: presence means "asked", and
+    /// `None` is a file with no picture to report (every source that is not an
+    /// image, and one whose header would not read).
+    sizes: HashMap<PathBuf, Option<(u32, u32)>>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -1286,6 +1292,15 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
+        // How big each still is, for the row that has to say so. Inline, unlike
+        // the two below: an image header is a few bytes off the front of the
+        // file, where a sample table is a parse and a decode is a second.
+        for path in unseen_paths(session.sources(), &self.sizes) {
+            let size = engine::is_image(&path)
+                .then(|| engine::image_size(&path).ok())
+                .flatten();
+            self.sizes.insert(path, size);
+        }
         // Which audio streams each file has, for the library's rows. Header
         // only, but a big file's sample tables are not free to parse, so it
         // goes off the render thread like the peaks do.
@@ -1560,6 +1575,18 @@ impl Player {
             let lane = onto.expect("checked above").label();
             self.notice = Some(
                 format!("NOT ON {lane} — {name} has no picture; drop it on an audio lane").into(),
+            );
+            cx.notify();
+            return;
+        }
+        // ...and the mirror of it: a still is silent, so an audio lane is the
+        // one place it cannot go. The engine puts it on `V1` regardless
+        // (`place_stream_at`); this is the word that says why it moved.
+        if engine::is_image(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Audio) {
+            let name = file_name(path);
+            let lane = onto.expect("checked above").label();
+            self.notice = Some(
+                format!("NOT ON {lane} — {name} is a still image; drop it on a video lane").into(),
             );
             cx.notify();
             return;
@@ -2561,6 +2588,17 @@ impl Player {
                     "{} — audio only · drag onto the audio lane, or Add at playhead",
                     row.path.display()
                 ),
+                // A still is the mirror: its own size (the timeline's meta
+                // describes video, and a picture placed on that canvas is not
+                // the same shape), no frame rate, and one kind of lane.
+                (None, _) if engine::is_image(&row.path) => format!(
+                    "{} — still image{} · drag onto a video lane, or Add at playhead",
+                    row.path.display(),
+                    match self.sizes.get(&row.path).copied().flatten() {
+                        Some((w, h)) => format!(" · {w}x{h}"),
+                        None => String::new(),
+                    }
+                ),
                 (None, Some(meta)) => format!(
                     "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
                     row.path.display(),
@@ -2578,6 +2616,16 @@ impl Player {
             // the reason it cannot be used.
             let under = match &row.unusable {
                 Some(why) => join_detail(&row.detail, why),
+                // A still has no length to report -- the ten minutes it is
+                // *held* to is a wall, not a duration -- so the line says what
+                // it is and how big it is instead.
+                None if engine::is_image(&row.path) => join_detail(
+                    &row.detail,
+                    &match self.sizes.get(&row.path).copied().flatten() {
+                        Some((w, h)) => format!("still image · {w}x{h}"),
+                        None => "still image".to_string(),
+                    },
+                ),
                 None => join_detail(
                     &row.detail,
                     &timecode(f64::from(row.frames) / self.fps, self.fps),
@@ -3829,14 +3877,32 @@ impl Player {
                         .count()
                 })
             });
+            // A still is described by what it has -- a picture, a size, and a
+            // longest it may be held for -- where a media file is described by
+            // its streams and its length. Same card, the rows that mean
+            // something for this kind of source.
+            let image = engine::is_image(&path);
+            let kind = match self.sizes.get(&path).copied().flatten() {
+                Some((w, h)) => format!("still image · {w}x{h}"),
+                None => "still image".to_string(),
+            };
             for (label, value) in [
                 ("File", file_name(&path)),
                 ("Path", path.display().to_string()),
-                (
-                    "Audio",
-                    info.map_or_else(|| "no track of its own".to_string(), stream_detail),
-                ),
-                ("Length", timecode(f64::from(frames) / self.fps, self.fps)),
+                match image {
+                    true => ("Picture", kind),
+                    false => (
+                        "Audio",
+                        info.map_or_else(|| "no track of its own".to_string(), stream_detail),
+                    ),
+                },
+                match image {
+                    true => (
+                        "Longest hold",
+                        timecode(f64::from(frames) / self.fps, self.fps),
+                    ),
+                    false => ("Length", timecode(f64::from(frames) / self.fps, self.fps)),
+                },
                 ("On the timeline", format!("{placed} clips")),
             ] {
                 rows.push(
@@ -4571,12 +4637,14 @@ fn unseen_sources(
         .collect()
 }
 
-/// The same, for the per-file stream probe: one entry per *file*, however many
-/// of its streams the timeline plays.
-fn unseen_paths(sources: &[Source], streams: &HashMap<PathBuf, Vec<StreamInfo>>) -> Vec<PathBuf> {
+/// The same, for the per-file caches: one entry per *file*, however many of its
+/// streams the timeline plays. Generic in the value, because the stream probe
+/// and the still's own size are both asked once per file and answered by
+/// presence in a map.
+fn unseen_paths<V>(sources: &[Source], seen: &HashMap<PathBuf, V>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for s in sources {
-        if !streams.contains_key(&s.path) && !out.contains(&s.path) {
+        if !seen.contains_key(&s.path) && !out.contains(&s.path) {
             out.push(s.path.clone());
         }
     }
@@ -7453,6 +7521,7 @@ fn main() {
                     selected_asset: None,
                     waves: HashMap::new(),
                     streams: HashMap::new(),
+                    sizes: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
