@@ -291,7 +291,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 14] = [
+pub const FIXED: [Fixed; 15] = [
     Fixed {
         chord: "esc",
         label: "Close this card or menu, or cancel a capture",
@@ -338,6 +338,11 @@ pub const FIXED: [Fixed; 14] = [
     Fixed {
         chord: "r",
         label: "Flatten every band",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "s",
+        label: "Show or hide the spectrum behind the curve",
         category: Category::Audio,
     },
     // The colour card's own three, which mean nothing outside it -- the same
