@@ -23,14 +23,28 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
 use crate::decode::{DecodeSession, Frame, Worker};
-use crate::demux::{Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Lane, LaneKind, Project, Source, Span};
+use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span};
 use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
 const RING_FULL_WAIT: Duration = Duration::from_millis(10);
+
+/// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
+/// nothing was shot on it, so it is the canvas a *later* import meets rather
+/// than a description of the song. H.264 because it is the one codec that
+/// decodes without the plugin, 30 fps because a rounded-up audio length is what
+/// the frame count means and a whole number of frames per second keeps it
+/// honest; both are what a video imported onto such a timeline is held to
+/// ([`matches_timeline`]).
+///
+/// ponytail: a 25 fps video refused by an audio-only timeline it could have
+/// defined is the ceiling here. Upgrade path is adopting the first *picture's*
+/// rate and codec on import, which means retiming every audio clip already
+/// placed in frames.
+const AUDIO_ONLY_CANVAS: (u32, u32, f64) = (1920, 1080, 30.0);
 
 /// The output half of a session: the device, plus what the feeder has handed it.
 /// Cloned into the feeder thread; every field that matters is shared.
@@ -122,13 +136,29 @@ pub struct PlaybackSession {
     /// The edit list. Everything a caller says in seconds is a *timeline*
     /// position; only this maps it onto the file.
     project: Project,
+    /// How many frames each source actually holds, indexed exactly as
+    /// [`Project::sources`] is and grown with it. The project itself does not
+    /// know -- a clip names a source by index and carries its own range -- and
+    /// [`Self::trim_clip`] is the one edit that could ask for frames past the
+    /// end of a file, which is a save that would not open again
+    /// ([`Self::open_project`] refuses one by name). Append-only for
+    /// `sources`'s reason: an index handed out stays valid, undone import or
+    /// not -- with the single exception `sources` itself has,
+    /// [`Self::remove_source`], which takes the same entry out of both.
+    counts: Vec<u32>,
     /// What the current video worker was opened for: where it sits on the
     /// timeline, how long it runs, and which source frame it started at --
     /// together they rewrite a source frame index into a timeline one. Not a
     /// clip index: a `split` cuts the clip under a running worker, and only the
     /// mapping survives that. A span with no source is a *gap*, and the worker
     /// feeding it emits black frames indexed from zero.
-    span: Span,
+    ///
+    /// `None` is the *emptied* timeline -- no clip on any lane, so there is no
+    /// stretch to be inside of. It is a state, not a failure: the picture is
+    /// black ([`start_span`](Self::start_span) feeds one black frame for it),
+    /// the sound is silence, the duration is zero, and placing anything reseeks
+    /// straight back out of it.
+    span: Option<Span>,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
 }
@@ -138,16 +168,12 @@ impl PlaybackSession {
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        // A timeline is scaffolded from source 0's picture -- its size, its
-        // frame rate, its clock. A song has none of that, so it joins a
-        // timeline (`import`) rather than starting one, and saying so beats
-        // failing in the demuxer's words.
+        // A timeline is normally scaffolded from source 0's picture -- its size,
+        // its frame rate, its clock. A song has none of that, so it scaffolds
+        // the *canvas* instead and its own sound keeps the clock: an audio-only
+        // project is a project like any other, it simply plays black.
         if crate::is_audio(&path) {
-            return Err(format!(
-                "{} has no picture: open a video first, then import it onto the audio lane",
-                path.display()
-            )
-            .into());
+            return Self::open_audio_only(&path);
         }
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
@@ -174,7 +200,7 @@ impl PlaybackSession {
         // One clip per lane covering the file, so timeline == source until the
         // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
-        let span = project.composite_span_at(0).expect("never empty");
+        let span = project.composite_span_at(0);
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
@@ -185,6 +211,79 @@ impl PlaybackSession {
             audio,
             audio_disabled,
             project,
+            counts: vec![meta.frame_count],
+            span,
+            eos: false,
+        })
+    }
+
+    /// Opens a standalone audio file ([`crate::is_audio`]) as a timeline of its
+    /// own: one clip on `A1`, nothing on the video lane, and a picture that is
+    /// the black of an uncovered canvas ([`AUDIO_ONLY_CANVAS`]) for as long as
+    /// the song runs. Its own sound keeps the clock, exactly as a video's does.
+    ///
+    /// Refused when the file has no sound to time it by: a source with neither a
+    /// picture nor a playable length is not a timeline, and that is what
+    /// [`audio_frames`] answers -- the *device* is a different question, and a
+    /// machine without one opens this like any other session, silently.
+    fn open_audio_only(path: &Path) -> crate::Result<Self> {
+        let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+        let meta = VideoMeta {
+            width,
+            height,
+            frame_rate,
+            // Rounded up to whole frames, which is the only frame count a
+            // source with no picture has -- the same length `import_audio`
+            // gives a song joining a timeline of video. The demuxer's words are
+            // named with the file, since this is the door a file that is not
+            // really audio at all comes to.
+            frame_count: audio_frames(path, frame_rate)
+                .map_err(|e| format!("{}: {e}", path.display()))?,
+            codec: Codec::H264,
+        };
+        let (audio, audio_disabled) = open_audio(path, 0);
+        // Through `from_parts` rather than `Project::single`, which is the
+        // *video* open's pair of grouped clips: here there is no picture to
+        // group the sound with, so the video lane starts empty.
+        let clip = Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: meta.frame_count,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+        };
+        let project = Project::from_parts(
+            vec![Source::new(path, 0)],
+            vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, vec![clip])],
+            Vec::new(),
+            Vec::new(),
+        )?;
+        // Every frame of this timeline is a gap, since no video lane covers
+        // anything: `composite_span_at` says so and the black worker
+        // `start_span` would open is opened here instead, for the reason `open`
+        // opens its decoder inline -- the field has to exist for the first seek.
+        let span = project.composite_span_at(0);
+        let stream = DecodeSession::open_black(width, height, span.map_or(1, |s| s.len));
+        Ok(Self {
+            meta,
+            native: (width, height),
+            frames: stream.frames,
+            worker: stream.worker,
+            retired: Vec::new(),
+            // The song keeps the clock, as a video's own sound does -- and wall
+            // time keeps it on a machine with no device, where the picture
+            // (black) still has to move at some rate.
+            clock: PlaybackClock::new(match audio {
+                Some(_) => ClockSource::Audio,
+                None => ClockSource::Wall,
+            }),
+            audio,
+            audio_disabled,
+            project,
+            counts: vec![meta.frame_count],
             span,
             eos: false,
         })
@@ -223,14 +322,33 @@ impl PlaybackSession {
         // Ungraded, and superseded before a frame of it is shown: the `seek` at
         // the end of this function reopens the playhead's span through
         // `start_span`, which is where a saved grade reaches the picture.
-        let (mut meta, stream) = DecodeSession::open_worker(
-            &first.path,
-            0,
-            u32::MAX,
-            ColorParams::default(),
-            Composer::passthrough(),
-        )
-        .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        // ...unless it has no picture to open: a project whose source 0 is a
+        // song scaffolds the canvas the same way a fresh audio-only open does
+        // ([`open_audio_only`](Self::open_audio_only)), and the placeholder
+        // black stream is superseded by the `seek` at the end of this function
+        // like every other worker opened here.
+        let (mut meta, stream) = match crate::is_audio(&first.path) {
+            true => {
+                let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+                let meta = VideoMeta {
+                    width,
+                    height,
+                    frame_rate,
+                    frame_count: audio_frames(&first.path, frame_rate)
+                        .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+                    codec: Codec::H264,
+                };
+                (meta, DecodeSession::open_black(width, height, 1))
+            }
+            false => DecodeSession::open_worker(
+                &first.path,
+                0,
+                u32::MAX,
+                ColorParams::default(),
+                Composer::passthrough(),
+            )
+            .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+        };
         // The project's own resolution, which is source 0's picture unless the
         // file says otherwise -- every dialect before v7 had no way to say it,
         // and that default is exactly what those projects meant.
@@ -290,7 +408,7 @@ impl PlaybackSession {
 
         let playhead = doc.playhead;
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?;
-        let span = project.composite_span_at(0).expect("never empty");
+        let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
@@ -310,6 +428,7 @@ impl PlaybackSession {
             audio,
             audio_disabled,
             project,
+            counts,
             span,
             eos: false,
         };
@@ -370,9 +489,12 @@ impl PlaybackSession {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
                     // A gap's worker indexes from zero, a decoder's from its in
-                    // point: `base` is whichever this span started at.
-                    let base = self.span.from.map_or(0, |(_, in_frame)| in_frame);
-                    frame.index = self.span.start + frame.index.saturating_sub(base);
+                    // point: `base` is whichever this span started at. An empty
+                    // timeline has no span, and its one black frame is frame 0.
+                    let (start, base) = self
+                        .span
+                        .map_or((0, 0), |s| (s.start, s.from.map_or(0, |(_, i)| i)));
+                    frame.index = start + frame.index.saturating_sub(base);
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -415,35 +537,47 @@ impl PlaybackSession {
     /// than remembered as a clip index, because a `split` while playing cuts the
     /// clip under the running worker and only the mapping stays true.
     fn next_clip(&mut self) -> bool {
-        let next = self.span.end();
+        // No span is the emptied timeline: it was played out the moment its one
+        // black frame went by, and there is no "next" to walk to.
+        let next = match self.span {
+            Some(span) => span.end(),
+            None => return false,
+        };
         let Some(span) = self.project.composite_span_at(next) else {
             return false;
         };
         // We only get here on a disconnect, so the old worker has already
         // returned; cancel anyway, so `retire` treats every path alike.
         self.worker.cancel();
-        self.start_span(span);
+        self.start_span(Some(span));
         true
     }
 
     /// Points the video worker at `span`: a decoder over its source range, or a
-    /// black-frame generator for a gap. The old worker must already have been
-    /// cancelled -- this is the half both `seek` and `next_clip` share.
+    /// black-frame generator for a gap -- and for `None`, the emptied timeline,
+    /// which is one frame of black so the viewer shows the nothing that is
+    /// there rather than the last picture of the clip that was deleted. The old
+    /// worker must already have been cancelled -- this is the half both `seek`
+    /// and `next_clip` share.
     ///
     /// A source that will not open leaves the *span* installed anyway: the
     /// timeline still moves, there are simply no more pictures, and the
     /// disconnected receiver carries the session on to the next span.
-    fn start_span(&mut self, span: Span) {
-        let opened = match span.from {
+    fn start_span(&mut self, span: Option<Span>) {
+        let opened = match span {
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
             // the worker carries it and every frame it converts wears it.
-            Some((source, in_frame)) => DecodeSession::open_worker(
+            Some(Span {
+                start,
+                len,
+                from: Some((source, in_frame)),
+            }) => DecodeSession::open_worker(
                 &self.project.sources()[source].path,
                 in_frame,
-                in_frame + span.len,
+                in_frame + len,
                 self.project
-                    .composite_color_at(span.start)
+                    .composite_color_at(start)
                     .copied()
                     .unwrap_or_default(),
                 // ...and the canvas it is placed on: the project's resolution
@@ -452,15 +586,18 @@ impl PlaybackSession {
                 Composer::new(
                     self.meta.width,
                     self.meta.height,
-                    self.project.composite_fit_at(span.start),
+                    self.project.composite_fit_at(start),
                 ),
             )
             .map(|(_, stream)| stream)
-            .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
-            None => Ok(DecodeSession::open_black(
+            .inspect_err(|e| eprintln!("timeline frame {start}: video open failed: {e}")),
+            // A gap: black for as long as it runs. An emptied timeline has no
+            // span at all and gets one frame of it -- enough to put black on
+            // screen, and it ends where the timeline does, at once.
+            gap => Ok(DecodeSession::open_black(
                 self.meta.width,
                 self.meta.height,
-                span.len,
+                gap.map_or(1, |s| s.len),
             )),
         };
         if let Ok(stream) = opened {
@@ -478,6 +615,14 @@ impl PlaybackSession {
     /// shrinks with every delete.
     pub fn timeline_duration(&self) -> f64 {
         f64::from(self.project.timeline_frames()) / self.meta.frame_rate
+    }
+
+    /// Whether no lane holds anything: the emptied timeline, which plays black
+    /// and silent and is zero seconds long. A state, not a failure -- but the
+    /// one a caller with nothing to render (an export) has to refuse by name
+    /// rather than write a file of no frames.
+    pub fn is_empty(&self) -> bool {
+        self.project.timeline_frames() == 0
     }
 
     /// `(start, len)` per clip in timeline seconds, in order: what a clips lane
@@ -552,6 +697,21 @@ impl PlaybackSession {
             .regroup(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// Takes that clip out of its group, so its picture and its sound are edited
+    /// apart from here on. Metadata only like a cut -- no reseek -- and one undo
+    /// step. `false` for a bad index and for a clip that is not grouped with
+    /// anything, which is already detached.
+    pub fn ungroup(&mut self, lane: Lane, idx: usize) -> bool {
+        self.project.ungroup(lane, idx)
+    }
+
+    /// Puts two clips covering the same frames back into one group: the regroup
+    /// of what [`ungroup`](Self::ungroup) took apart. Metadata only, one undo
+    /// step, and the error says why when it refuses.
+    pub fn group(&mut self, a: Lane, a_idx: usize, b: Lane, b_idx: usize) -> crate::Result<()> {
+        self.project.group(a, a_idx, b, b_idx)
+    }
+
     /// What the clip at `idx` of `lane` is equalized with, or `None` for one
     /// that plays flat -- what a card shows before it lets anyone drag a band.
     pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {
@@ -575,8 +735,9 @@ impl PlaybackSession {
 
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
     /// silence on the audio one, and nothing else moves. Reseeks, because what
-    /// the playhead sits on has changed. `false` for a bad index and for the
-    /// lift that would leave the whole timeline empty.
+    /// the playhead sits on has changed. `false` for a bad index -- the lift of
+    /// the last placement there is empties the timeline, which is a state
+    /// ([`is_empty`](Self::is_empty)) and one undo away.
     pub fn lift_clip(&mut self, lane: Lane, idx: usize) -> bool {
         self.edit(|p| p.lift(lane, idx))
     }
@@ -589,6 +750,45 @@ impl PlaybackSession {
     /// would land on another clip; nothing changes.
     pub fn move_clip_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
         self.edit(|p| p.move_to_lane(from, idx, to))
+    }
+
+    /// Drags one end of that clip to timeline frame `to`, changing how much of
+    /// its source it plays and nothing else on the lane -- see [`Project::trim`]
+    /// for the walls it is clamped by, which this fills the source lengths in
+    /// for. One undo step per call, so a front-end calls it once, at the release
+    /// of the drag. Reseeks like every other edit, which is what makes the
+    /// picture (and the sound) follow a new in-point straight away. `false` for
+    /// a bad index and for an edge already where it was asked to go.
+    ///
+    /// A *frame*, where the rest of this type takes seconds: a drag has already
+    /// asked [`trim_room`](Self::trim_room) where the edge may land, and that
+    /// answer is in frames -- converting it back through seconds would be a
+    /// rounding step between the width drawn and the width committed.
+    pub fn trim_clip(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> bool {
+        // Spelled out rather than through `edit`, whose closure cannot hold a
+        // second borrow of the session while it has the project.
+        if !self.project.trim(lane, idx, edge, to, &self.counts) {
+            return false;
+        }
+        let now = self.now();
+        self.seek(now);
+        true
+    }
+
+    /// Where that edge may land, `(first, last)` timeline frame inclusive: what
+    /// a drag clamps the pointer to so the box it draws is the box
+    /// [`trim_clip`](Self::trim_clip) will commit. `None` for a bad index.
+    pub fn trim_room(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(u32, u32)> {
+        self.project.trim_room(lane, idx, edge, &self.counts)
+    }
+
+    /// Records how long a source is, for a source index that may be one
+    /// `Project::import` just made or one it handed back. See [`Self::counts`].
+    fn note_frames(&mut self, source: usize, frames: u32) {
+        if source == self.counts.len() {
+            self.counts.push(frames);
+        }
+        debug_assert_eq!(self.counts.len(), self.project.sources().len());
     }
 
     /// The clip the picture is coming from at `timeline_secs`: the lane it sits
@@ -622,6 +822,14 @@ impl PlaybackSession {
     /// index that is not there and for a value that is not finite.
     pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
         self.edit(|p| p.set_color(lane, idx, params))
+    }
+
+    /// The same grade and the same reseek without the undo step
+    /// ([`Project::set_color_live`]): what the samples inside one slider drag go
+    /// through, so the frame regrades under the hand and the whole gesture is
+    /// still a single `z`.
+    pub fn set_color_live(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
+        self.edit(|p| p.set_color_live(lane, idx, params))
     }
 
     /// The project's resolution: what every clip is composed onto, what the
@@ -729,6 +937,7 @@ impl PlaybackSession {
         let first = self.first_audio()?;
         audio_matches(&wanted, &first)?;
         let source = self.project.import(path, stream);
+        self.note_frames(source, frames.max(1));
         let clip = Clip {
             start: 0,
             in_frame: 0,
@@ -782,6 +991,14 @@ impl PlaybackSession {
             .position(|s| *s == wanted)
             .ok_or_else(|| format!("{} is not on this timeline", path.display()))?;
         self.project.remove_source(idx)?;
+        // The one thing that shortens the source list, so the one place
+        // [`Self::counts`] shortens with it: left behind, the gone file's length
+        // would become the wall a *surviving* source is trimmed against
+        // ([`trim_room`](Self::trim_room)) and the next import would land its
+        // count one index late.
+        if idx < self.counts.len() {
+            self.counts.remove(idx);
+        }
         let now = self.now();
         self.seek(now);
         Ok(())
@@ -808,7 +1025,8 @@ impl PlaybackSession {
     /// on every lane. Unlike a split this *does* move every following frame, so
     /// the session reseeks to wherever the playhead now points.
     /// [`lift_clip`](Self::lift_clip) is the one that leaves a hole instead.
-    /// `false` for a bad index or the last remaining clip.
+    /// `false` for a bad index; the last remaining clip goes like any other and
+    /// leaves the timeline empty ([`is_empty`](Self::is_empty)).
     ///
     /// The lane travels because the index is a lane's own: `V2`'s third clip is
     /// not `V1`'s, and a front-end that could only say "the third clip" would
@@ -843,6 +1061,7 @@ impl PlaybackSession {
 
         let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
+        self.note_frames(source, meta.frame_count);
         // Refused only for an unknown index, and this one just came from `import`.
         self.project.append_clip(source, meta.frame_count);
         // Reseek like any other edit, even though nothing before the playhead
@@ -875,6 +1094,7 @@ impl PlaybackSession {
 
         let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
+        self.note_frames(source, frames);
         let at = self.project.timeline_frames();
         self.project.place(
             Lane::A1,
@@ -999,12 +1219,10 @@ impl PlaybackSession {
         // [`retire`](Self::retire), which is what keeps a scrub off the price
         // of a VA-API init.
         self.worker.cancel();
-        // `target` is inside the timeline (never empty), so this always spans;
-        // the span runs from there to the end of whatever it landed in -- a
-        // clip, or a gap, which starts a black-frame worker instead.
-        if let Some(span) = self.project.composite_span_at(target) {
-            self.start_span(span);
-        }
+        // The span runs from `target` to the end of whatever it landed in -- a
+        // clip, or a gap, which starts a black-frame worker instead. `None` is
+        // the emptied timeline, black too, and `start_span` says so.
+        self.start_span(self.project.composite_span_at(target));
         self.eos = false;
 
         let mut audio_running = false;
@@ -1318,7 +1536,59 @@ fn secs_to_frame(secs: f64, fps: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::secs_to_frame;
+    use super::{Edge, Lane, PlaybackSession, secs_to_frame};
+    use std::path::PathBuf;
+
+    fn asset(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    }
+
+    /// The seam between the two lists a source index reaches: dropping a file
+    /// from the library shortens `sources`, and `counts` -- the frame length
+    /// per source, which is what a trim is walled by -- has to lose the same
+    /// entry. Left behind, the dead file's length would wall the survivor.
+    #[test]
+    fn removing_a_source_takes_its_frame_count_with_it() {
+        // Source 0 is 5 s, source 1 is 4 s: two different walls, so a stale
+        // count cannot pass for the right one.
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let (long, short) = (session.counts[0], session.counts[1]);
+        assert!(long > short, "{long} vs {short}");
+
+        // Clear source 0's take, then take the file itself out: av2's clip is
+        // the only one left and it is source 0 now.
+        assert!(session.delete_clip(Lane::V1, 0));
+        session
+            .remove_source(&asset("test_av.mp4"), 0)
+            .expect("nothing plays it any more");
+        assert_eq!(session.counts, vec![short], "the dead length went with it");
+        assert_eq!(session.sources().len(), session.counts.len());
+
+        // The wall is the surviving file's own length, not the gone one's: a
+        // whole-file clip cannot be dragged out any further at all.
+        let clip = session.lane_clips(Lane::V1)[0];
+        assert_eq!(clip.len(), short, "av2's take, whole");
+        assert_eq!(
+            session.trim_room(Lane::V1, 0, Edge::End),
+            Some((clip.start + 1, clip.end()))
+        );
+        assert!(
+            !session.trim_clip(Lane::V1, 0, Edge::End, clip.end() + 30),
+            "past the file's last frame is refused, by ITS length"
+        );
+
+        // ...and the next import still lines the two lists up, which is the
+        // alignment `note_frames` asserts on.
+        session
+            .import(&asset("test_av.mp4"))
+            .expect("it may come back");
+        assert_eq!(session.counts, vec![short, long]);
+        assert_eq!(session.sources().len(), session.counts.len());
+    }
 
     #[test]
     fn boundary_seconds_round_trip_to_their_own_frame() {
