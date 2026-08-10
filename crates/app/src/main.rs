@@ -14,6 +14,7 @@ use engine::color::ColorParams;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source};
+use engine::scale::FitPolicy;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Div, FocusHandle, KeyDownEvent,
@@ -221,15 +222,21 @@ struct ContextMenu {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 7] = [
+const MENU_ITEMS: [ActionId; 8] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
     ActionId::Equalizer,
     ActionId::Color,
+    ActionId::Fit,
     ActionId::ToggleMute,
 ];
+
+/// The project resolutions [`Player::cycle_resolution`] offers, largest first.
+/// A short list of the sizes people name; the media's own is cycled in beside
+/// them, which is what makes the trip round come back to where it started.
+const RESOLUTIONS: [(u32, u32); 4] = [(3840, 2160), (1920, 1080), (1280, 720), (854, 480)];
 
 /// How far a band may be pushed either way, in dB. The engine clamps nothing
 /// here -- it will filter whatever it is given -- so this is a UI decision:
@@ -497,6 +504,8 @@ impl Player {
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Color => self.open_color(cx),
+            ActionId::Fit => self.cycle_fit(cx),
+            ActionId::Resolution => self.cycle_resolution(cx),
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
@@ -508,6 +517,64 @@ impl Player {
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
         }
+    }
+
+    /// Cycles the fit policy of the clip the picture is coming from -- the
+    /// clicked one when it is a video clip, else the composite's own, exactly as
+    /// the colour card picks its target. A whole card for one four-valued
+    /// setting would be a card to close; a stroke that cycles it and says what
+    /// it landed on is the same setting with nothing to dismiss.
+    ///
+    /// Only means anything when the clip is not the project's size -- a clip
+    /// that already fills the canvas looks the same under all four -- so the
+    /// notice says the size it is placing, not just the word.
+    fn cycle_fit(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            self.notice = Some("no timeline to fit — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let target = self
+            .selected
+            .filter(|(lane, _)| lane.kind == LaneKind::Video)
+            .or_else(|| session.video_clip_at(session.now()));
+        let Some((lane, idx)) = target else {
+            self.notice = Some("no clip under the playhead to fit".into());
+            cx.notify();
+            return;
+        };
+        let next = next_fit(session.fit_of(lane, idx));
+        if session.set_fit(lane, idx, next) {
+            let (w, h) = session.resolution();
+            self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(next)).into());
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// Cycles the *project's* resolution through [`RESOLUTIONS`], starting from
+    /// the media's own -- the one size that must stay reachable, since a project
+    /// moved off it has no other way back (the resolution is not an undo step).
+    /// Every clip is recomposed onto it, so this is what makes "the project
+    /// resolution and the media's are different things" a thing a user can see.
+    fn cycle_resolution(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            self.notice = Some("no timeline to resize — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let (width, height) = next_resolution(session.resolution(), session.native_resolution());
+        if session.set_resolution(width, height) {
+            self.notice = Some(format!("PROJECT: {width}x{height}").into());
+            self.reset_after_reseek();
+        }
+        cx.notify();
     }
 
     /// Opens the colour card on the clip a grade would go on: the clip that was
@@ -2546,14 +2613,18 @@ impl Player {
                         )
                         // What the picked row really writes. `moov` last is the
                         // muxer's own shape -- an mp4 is playable only once it
-                        // is finished.
+                        // is finished. The project's resolution is on the same
+                        // line because it *is* what the file comes out at,
+                        // whatever size the media on the timeline are: this is
+                        // the one place the number is shown, and ctrl+r is what
+                        // changes it.
                         .child(
                             div()
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(format_line(self.format)),
+                                .child(export_line(self.format, self.session.as_ref())),
                         )
                         .child(
                             div()
@@ -3500,7 +3571,8 @@ fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool 
         ActionId::Equalizer => lane.kind == LaneKind::Audio,
         // A grade is a picture setting and an audio clip has no picture: the
         // item is there on every clip, and dimmed where it would mean nothing.
-        ActionId::Color => lane.kind == LaneKind::Video,
+        // A fit policy is a picture setting for the same reason.
+        ActionId::Color | ActionId::Fit => lane.kind == LaneKind::Video,
         // Splits this clip only from inside it: at either edge there is nothing
         // to split off (project.rs `splittable`).
         ActionId::Cut => clip.start < playhead && playhead < clip.end(),
@@ -3829,6 +3901,63 @@ fn band_mut(params: &mut ColorParams, band: usize) -> &mut f32 {
 
 /// The line under the rows: what the picked format really writes, in the terms
 /// a file is judged by afterwards.
+/// The next policy round the cycle, in the order the action's label reads.
+fn next_fit(fit: FitPolicy) -> FitPolicy {
+    match fit {
+        FitPolicy::Fit => FitPolicy::Fill,
+        FitPolicy::Fill => FitPolicy::Stretch,
+        FitPolicy::Stretch => FitPolicy::Center,
+        FitPolicy::Center => FitPolicy::Fit,
+    }
+}
+
+/// What a person calls one, said as what it does to the picture.
+fn fit_label(fit: FitPolicy) -> &'static str {
+    match fit {
+        FitPolicy::Fit => "fit (whole picture, bars)",
+        FitPolicy::Fill => "fill (cropped, no bars)",
+        FitPolicy::Stretch => "stretch (aspect broken)",
+        FitPolicy::Center => "centre (1:1, no resample)",
+    }
+}
+
+/// The next project resolution after `current`, over [`RESOLUTIONS`] with the
+/// media's own size cycled in at its place by size -- so the trip round always
+/// comes back to the media, whatever odd shape it is, and a project already at a
+/// listed size does not see it twice.
+fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
+    let mut sizes: Vec<(u32, u32)> = RESOLUTIONS.to_vec();
+    if !sizes.contains(&native) {
+        // By area, descending, like the list itself: the cycle then reads as one
+        // ladder rather than a list with a stray rung at the end.
+        let at = sizes
+            .iter()
+            .position(|&(w, h)| {
+                u64::from(w) * u64::from(h) < u64::from(native.0) * u64::from(native.1)
+            })
+            .unwrap_or(sizes.len());
+        sizes.insert(at, native);
+    }
+    let at = sizes.iter().position(|&s| s == current);
+    // A project at a size nobody listed (a hand-edited file) joins the cycle at
+    // the top rather than being stuck.
+    sizes[at.map_or(0, |at| (at + 1) % sizes.len())]
+}
+
+/// [`format_line`] plus the project's resolution, which is what a video export
+/// is written at however many sizes the media on the timeline are. Only for the
+/// formats that carry a picture -- a WAV has no resolution to state.
+fn export_line(format: Format, session: Option<&PlaybackSession>) -> String {
+    let line = format_line(format);
+    match session.filter(|_| format.has_video()) {
+        Some(session) => {
+            let (w, h) = session.resolution();
+            format!("{line} · project {w}x{h}")
+        }
+        None => line.to_string(),
+    }
+}
+
 fn format_line(format: Format) -> &'static str {
     match format {
         Format::Mp4 => "H.264 · MP4 · moov at end",
@@ -4269,6 +4398,7 @@ mod tests {
     };
     use super::{file_name, library_rows};
     use engine::PlaybackSession;
+    use engine::scale::FitPolicy;
     use gpui::{Bounds, Pixels, point, px, size};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -4291,6 +4421,7 @@ mod tests {
             link: None,
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         }
     }
 
@@ -4482,6 +4613,7 @@ mod tests {
             link: None,
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         assert_eq!(clip.end(), 90);
         // Cut splits from inside only: neither edge has anything to split off.
@@ -4546,11 +4678,13 @@ mod tests {
         // Silent like the engine suite: this opens the real device.
         session.set_gain(0.0);
         assert_eq!(session.sources().len(), 1);
+        // 640x360 would join now (the project canvas places it); this file is
+        // also silent, and a silent file cannot join a timeline with sound.
         let refusal = session
             .import(&asset("test_mismatch.mp4"))
-            .expect_err("640x360 must not join a 1280x720 timeline")
+            .expect_err("a silent file must not join a timeline with audio")
             .to_string();
-        assert!(refusal.contains("640"), "refusal must name it: {refusal}");
+        assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
         assert_eq!(session.sources().len(), 1, "a refusal added a row");
         // An accepted one does add a row, and it reads as the whole file: 4 s
         // at 30 fps, exactly what was appended.

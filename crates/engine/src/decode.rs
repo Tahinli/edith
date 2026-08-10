@@ -10,9 +10,10 @@ use std::thread;
 use rusty_h264::Decoder;
 
 use crate::color::ColorParams;
-use crate::convert::i420_to_bgra_with;
+use crate::convert::{i420_to_bgra, i420_to_bgra_with};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
+use crate::scale::Composer;
 
 /// One decoded picture, ready to hand to a renderer.
 pub struct Frame {
@@ -122,8 +123,15 @@ impl DecodeSession {
     ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
         // Ungraded: the public API opens a *file*, and a colour grade belongs to
         // a clip of a timeline. `PlaybackSession` is what has one to pass.
-        let (meta, stream) =
-            Self::open_worker(path, start_frame, end_frame, ColorParams::default())?;
+        let (meta, stream) = Self::open_worker(
+            path,
+            start_frame,
+            end_frame,
+            ColorParams::default(),
+            // No project, no canvas: the file-level API hands back the
+            // pictures the file holds, at the size it holds them.
+            Composer::passthrough(),
+        )?;
         // The public API hands out the flag alone, so the worker is detached and
         // the receiver goes to the caller: nothing here joins anything.
         Ok((meta, stream.frames, stream.worker.detach()))
@@ -185,11 +193,17 @@ impl DecodeSession {
     ///
     /// In-process only: a caller that outlives its workers has to be able to
     /// join them at exit.
+    ///
+    /// `canvas` is the project's own resolution and this clip's fit policy: the
+    /// frames come out at *that* size, whatever the file's is. A
+    /// [`Composer::passthrough`] (or one already the source's size) leaves every
+    /// picture exactly as it was decoded.
     pub(crate) fn open_worker(
         path: impl AsRef<Path>,
         start_frame: u32,
         end_frame: u32,
         color: ColorParams,
+        canvas: Composer,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
@@ -231,6 +245,7 @@ impl DecodeSession {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
+                let mut render = Render::new(color, canvas);
                 // The plugin has to be opened on the thread that uses it: its
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
@@ -240,7 +255,7 @@ impl DecodeSession {
                         return;
                     }
                     eprintln!("decode backend: hardware (VA-API plugin)");
-                    if run_hw(hw, &tx, start_frame, end_frame, &color, &worker_cancel) {
+                    if run_hw(hw, &tx, start_frame, end_frame, &mut render, &worker_cancel) {
                         return;
                     }
                     // A driver that opens but cannot decode a single frame is
@@ -254,7 +269,14 @@ impl DecodeSession {
                     return;
                 }
                 eprintln!("decode backend: software (rusty_h264)");
-                run(demuxer, tx, start_frame, end_frame, &color, &worker_cancel)
+                run(
+                    demuxer,
+                    tx,
+                    start_frame,
+                    end_frame,
+                    &mut render,
+                    &worker_cancel,
+                )
             })?;
         Ok((
             meta,
@@ -266,6 +288,77 @@ impl DecodeSession {
                 },
             },
         ))
+    }
+}
+
+/// One clip's pictures on their way to the renderer: graded, placed on the
+/// project canvas, converted. Both decode loops go through it, so hardware and
+/// software cannot show two different pictures.
+///
+/// The order is grade, then place (see [`Composer`]): a grade is the clip's own,
+/// applied at the resolution it was shot at, and the letterbox bars around it
+/// are not the clip -- a brightness grade must not lift them off black.
+///
+/// A project at the media's own resolution never reaches any of that: it takes
+/// the fused graded conversion, the one path this engine had before there was a
+/// project resolution, byte for byte and allocation for allocation.
+struct Render {
+    color: ColorParams,
+    canvas: Composer,
+    /// The graded copy of the source planes, refilled per frame and kept across
+    /// the worker's whole range. Empty unless the clip is both graded *and*
+    /// placed, which is the only case that needs it.
+    graded: (Vec<u8>, Vec<u8>, Vec<u8>),
+}
+
+impl Render {
+    fn new(color: ColorParams, canvas: Composer) -> Self {
+        Self {
+            color,
+            canvas,
+            graded: (Vec::new(), Vec::new(), Vec::new()),
+        }
+    }
+
+    fn frame(
+        &mut self,
+        index: u32,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Frame {
+        if self.canvas.is_passthrough(width, height) {
+            return Frame {
+                index,
+                width,
+                height,
+                bgra: i420_to_bgra_with(&self.color, y, u, v, width as usize, height as usize),
+            };
+        }
+        let (gy, gu, gv) = &mut self.graded;
+        let (y, u, v) = if self.color.is_identity() {
+            (y, u, v)
+        } else {
+            gy.clear();
+            gy.extend_from_slice(y);
+            gu.clear();
+            gu.extend_from_slice(u);
+            gv.clear();
+            gv.extend_from_slice(v);
+            crate::color::apply_yuv(&self.color, gy, gu, gv);
+            (&gy[..], &gu[..], &gv[..])
+        };
+        let (y, u, v, width, height) = self.canvas.place(y, u, v, width, height);
+        Frame {
+            index,
+            width,
+            height,
+            // Ungraded on purpose: the grade is already in the pixels above and
+            // the canvas around them must stay the black it was filled with.
+            bgra: i420_to_bgra(y, u, v, width as usize, height as usize),
+        }
     }
 }
 
@@ -289,7 +382,7 @@ fn run_hw(
     tx: &SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
-    color: &ColorParams,
+    render: &mut Render,
     cancel: &AtomicBool,
 ) -> bool {
     let mut index = start_frame;
@@ -299,12 +392,7 @@ fn run_hw(
         }
         match hw.next_frame() {
             Ok(Some((y, u, v, width, height))) => {
-                let frame = Frame {
-                    index,
-                    width,
-                    height,
-                    bgra: i420_to_bgra_with(color, y, u, v, width as usize, height as usize),
-                };
+                let frame = render.frame(index, y, u, v, width, height);
                 index += 1;
                 if tx.send(frame).is_err() {
                     return true; // consumer went away
@@ -353,6 +441,7 @@ mod tests {
             0,
             u32::MAX,
             ColorParams::default(),
+            Composer::passthrough(),
         )
         .expect("open");
         // Nothing is ever received: two frames fill the channel and the next
@@ -377,7 +466,7 @@ fn run(
     tx: SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
-    color: &ColorParams,
+    render: &mut Render,
     cancel: &AtomicBool,
 ) {
     let mut decoder = Decoder::new();
@@ -413,12 +502,14 @@ fn run(
             index += 1;
             continue;
         }
-        let frame = Frame {
-            index: index as u32,
-            width: yuv.width as u32,
-            height: yuv.height as u32,
-            bgra: i420_to_bgra_with(color, &yuv.y, &yuv.u, &yuv.v, yuv.width, yuv.height),
-        };
+        let frame = render.frame(
+            index as u32,
+            &yuv.y,
+            &yuv.u,
+            &yuv.v,
+            yuv.width as u32,
+            yuv.height as u32,
+        );
         index += 1;
         if tx.send(frame).is_err() {
             break; // consumer went away

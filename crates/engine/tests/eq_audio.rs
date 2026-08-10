@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source};
+use engine::scale::FitPolicy;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
@@ -59,6 +60,7 @@ fn clip(start: u32, source: usize, frames: u32) -> Clip {
         link: None,
         eq: None,
         color: None,
+        fit: FitPolicy::default(),
     }
 }
 
