@@ -1306,17 +1306,24 @@ impl Project {
     ///
     /// Metadata only: no mapping changes, in any lane.
     pub fn split(&mut self, timeline_frame: u32) -> bool {
-        self.write_split(timeline_frame, true)
+        self.write_split(timeline_frame, true, &all_lanes(&self.lanes))
     }
 
-    /// [`split`](Project::split), with the snapshot optional: a batch that has
-    /// already taken one ([`speed_regions`](Project::speed_regions)) splits at
-    /// two frames per region and must still be one undo press.
-    fn write_split(&mut self, timeline_frame: u32, snapshot: bool) -> bool {
+    /// [`split`](Project::split), with the snapshot optional and the lanes
+    /// named: a batch that has already taken a snapshot
+    /// ([`speed_regions`](Project::speed_regions)) splits at two frames per
+    /// region and must still be one undo press, and a *scoped* batch must not
+    /// cut a lane it was told to leave alone.
+    fn write_split(&mut self, timeline_frame: u32, snapshot: bool, on: &[usize]) -> bool {
         let cut: Vec<Option<Clip>> = self
             .lanes
             .iter()
-            .map(|l| splittable(&l.clips, timeline_frame).map(|idx| l.clips[idx]))
+            .enumerate()
+            .map(|(i, l)| {
+                on.contains(&i)
+                    .then(|| splittable(&l.clips, timeline_frame).map(|idx| l.clips[idx]))
+                    .flatten()
+            })
             .collect();
         if cut.iter().all(Option::is_none) {
             return false;
@@ -1330,8 +1337,16 @@ impl Project {
         let ends: Vec<Option<u32>> = cut.iter().map(|c| c.map(|c| c.end())).collect();
         let left = self.group_ids(&starts);
         let right = self.group_ids(&ends);
-        for ((data, left), right) in self.lanes.iter_mut().zip(left).zip(right) {
-            let Some(idx) = splittable(&data.clips, timeline_frame) else {
+        for (((data, left), right), cut) in self
+            .lanes
+            .iter_mut()
+            .zip(left)
+            .zip(right)
+            .zip(cut.iter().map(Option::is_some))
+        {
+            // The lanes this call was not scoped to are not cut, whatever their
+            // own clips would allow.
+            let Some(idx) = splittable(&data.clips, timeline_frame).filter(|_| cut) else {
                 continue;
             };
             let mut tail = data.clips[idx];
@@ -1870,13 +1885,21 @@ impl Project {
             return false;
         }
         self.snapshot();
-        ripple(&mut self.lanes, at, len);
+        let on = all_lanes(&self.lanes);
+        ripple(&mut self.lanes, &on, at, len);
         true
     }
 
     /// Cut **every** one of `regions` -- `(start, len)` in timeline frames --
-    /// out of every lane and close each hole, as one edit: the jumpcut a
-    /// silence scan asks for ([`crate::silence`]).
+    /// out of the lanes in `scope` and close each hole, as one edit: the
+    /// jumpcut a silence scan asks for ([`crate::silence`]).
+    ///
+    /// A lane that is not in `scope` **does not move**, which is the whole
+    /// point of the parameter: the silences of a podcast track come out
+    /// without the music track under it sliding. `scope` is an arbitrary set of
+    /// lanes and not a kind or a range, so a caller with its own idea of what
+    /// is selected (a take, a track, everything) says it in lanes and nothing
+    /// here has to learn about selection.
     ///
     /// One [`snapshot`](Project::snapshot) for the lot, which is the whole
     /// reason this exists rather than a caller's loop over
@@ -1886,19 +1909,74 @@ impl Project {
     ///
     /// The list is sorted and overlapping entries are merged before anything is
     /// cut ([`tidy`]) -- two regions that overlap would otherwise cut each
-    /// other's frames -- and `false`, with no undo step, for a list with
-    /// nothing in it.
-    pub fn cut_regions(&mut self, regions: &[(u32, u32)]) -> bool {
+    /// other's frames. Refused, with no undo step, for an empty list, for a
+    /// scope naming no lane that is there, and -- by name -- when the scope
+    /// would take one half of a take with it
+    /// ([`scope_holds_takes_whole`](Project::scope_holds_takes_whole)).
+    pub fn cut_regions(&mut self, regions: &[(u32, u32)], scope: &[Lane]) -> crate::Result<()> {
         let regions = tidy(regions);
-        if regions.is_empty() {
-            return false;
-        }
+        let on = self.scoped(scope)?;
+        let Some(&(first, _)) = regions.first() else {
+            return Err("nothing to cut".into());
+        };
+        self.scope_holds_takes_whole(&on, first)?;
         self.snapshot();
         for &(at, len) in regions.iter().rev() {
-            ripple(&mut self.lanes, at, len);
+            ripple(&mut self.lanes, &on, at, len);
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
-        true
+        Ok(())
+    }
+
+    /// The storage indices of `scope`, which is what every batch below walks.
+    /// `Err` for a scope that names nothing there rather than a silent no-op:
+    /// an edit asked for on a lane that is not there did not happen, and the
+    /// caller has to hear so.
+    fn scoped(&self, scope: &[Lane]) -> crate::Result<Vec<usize>> {
+        let on: Vec<usize> = scope.iter().filter_map(|&l| self.index(l)).collect();
+        match on.is_empty() {
+            true => Err("no track to work on".into()),
+            false => Ok(on),
+        }
+    }
+
+    /// The law a scoped ripple lives under: **a link is one span on however
+    /// many lanes**, so a batch that moves one half of a take and not the other
+    /// would leave a group whose halves disagree -- a project no save could
+    /// load ([`links_are_consistent`]).
+    ///
+    /// Refused by name rather than widened silently. Widening would edit a
+    /// track the user did not scope, which is exactly the surprise scoping
+    /// exists to end; a front-end that wants the take is free to *say* the
+    /// take's lanes, and to name them in what it tells the user afterwards.
+    ///
+    /// Only from `from` on: a take sitting entirely before the first cut does
+    /// not move, so it is not this rule's business.
+    fn scope_holds_takes_whole(&self, on: &[usize], from: u32) -> crate::Result<()> {
+        let labels = handles(&self.lanes);
+        for &i in on {
+            for c in self.lanes[i].clips.iter().filter(|c| c.end() > from) {
+                let Some(id) = c.link else { continue };
+                for (j, data) in self.lanes.iter().enumerate() {
+                    if on.contains(&j) {
+                        continue;
+                    }
+                    if let Some(half) = data.clips.iter().find(|o| o.link == Some(id)) {
+                        return Err(format!(
+                            "the {} clip at frame {} is one take with the {} clip at frame {}: \
+                             moving one track of a take would pull it apart -- take the whole take, \
+                             or detach them first",
+                            labels[i].label(),
+                            c.start,
+                            labels[j].label(),
+                            half.start
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Play every one of `regions` at `speed` instead of cutting it: each is
@@ -1912,11 +1990,17 @@ impl Project {
     /// twice over the same stretch leaves it at `speed`, not at `speed`
     /// squared, so a second pass over an already-cut timeline changes nothing.
     ///
+    /// Scoped exactly as [`cut_regions`](Project::cut_regions) is, and under
+    /// the same take law: a lane outside `scope` is neither re-rated nor moved.
+    ///
     /// Refused by name, with nothing changed and no undo step, when:
     ///
-    /// * a clip on any lane covers only *part* of a region -- the lanes shrink
-    ///   by different amounts and the ripple would pull them apart, which is
-    ///   what cutting does not suffer and why delete mode has no such refusal;
+    /// * the scope would take one half of a take with it
+    ///   ([`scope_holds_takes_whole`](Project::scope_holds_takes_whole));
+    /// * a clip on a scoped lane covers only *part* of a region -- the lanes
+    ///   shrink by different amounts and the ripple would pull them apart,
+    ///   which is what cutting does not suffer and why delete mode has no such
+    ///   refusal;
     /// * a rate cannot address a region's edge ([`Speed::split_at`]), so the
     ///   piece could not be split out exactly;
     /// * two lanes' pieces would end up different lengths, which is a group
@@ -1924,19 +2008,26 @@ impl Project {
     ///   [`write_speed`](Project::write_speed) already makes, in its words);
     /// * the region would grow rather than shrink, i.e. it already plays faster
     ///   than `speed`.
-    pub fn speed_regions(&mut self, regions: &[(u32, u32)], speed: Speed) -> crate::Result<()> {
+    pub fn speed_regions(
+        &mut self,
+        regions: &[(u32, u32)],
+        speed: Speed,
+        scope: &[Lane],
+    ) -> crate::Result<()> {
         let regions = tidy(regions);
-        if regions.is_empty() {
+        let on = self.scoped(scope)?;
+        let Some(&(first, _)) = regions.first() else {
             return Err("nothing to speed up".into());
-        }
+        };
+        self.scope_holds_takes_whole(&on, first)?;
         let labels = handles(&self.lanes);
         // Before anything is touched, because this is the refusal a person can
         // act on: a clip that laps over the edge of a silence has to be trimmed
         // (or the silences cut instead), and saying so after a rollback would
         // be saying it about a timeline that already looks different.
         for &(at, len) in &regions {
-            for (l, data) in self.lanes.iter().enumerate() {
-                for c in &data.clips {
+            for &l in &on {
+                for c in &self.lanes[l].clips {
                     if c.end() > at && c.start < at + len && !(c.start <= at && c.end() >= at + len)
                     {
                         return Err(format!(
@@ -1958,12 +2049,13 @@ impl Project {
         // refusal still costs no step (`undo` pops the one just pushed).
         self.snapshot();
         for &(at, len) in regions.iter().rev() {
-            self.write_split(at, false);
-            self.write_split(at + len, false);
+            self.write_split(at, false, &on);
+            self.write_split(at + len, false, &on);
             let mut room: Option<(Lane, u32)> = None;
             let mut refused = None;
-            for (l, data) in self.lanes.iter().enumerate() {
-                for c in data.clips.iter().filter(|c| c.end() > at && c.start < at + len) {
+            for &l in &on {
+                let clips = &self.lanes[l].clips;
+                for c in clips.iter().filter(|c| c.end() > at && c.start < at + len) {
                     if (c.start, c.end()) != (at, at + len) {
                         // *Which* edge did not come off: a rate that cannot
                         // address the end of the silence is not a rate that
@@ -2015,15 +2107,15 @@ impl Project {
                 )
                 .into());
             };
-            for data in &mut self.lanes {
-                for c in &mut data.clips {
+            for &l in &on {
+                for c in &mut self.lanes[l].clips {
                     if c.start == at && c.end() == at + len {
                         c.speed = speed;
                     } else if c.start >= at + len {
                         c.start -= delta;
                     }
                 }
-                debug_assert!(sorted_disjoint(&data.clips));
+                debug_assert!(sorted_disjoint(&self.lanes[l].clips));
             }
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
@@ -2466,18 +2558,27 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
     *clips = out;
 }
 
-/// Cuts `[at, at + len)` out of every lane and slides what is behind it back --
-/// the body of [`Project::ripple_delete`], and of every cut a batch
-/// ([`Project::cut_regions`]) makes. No snapshot of its own: whose undo step
-/// this is belongs to the caller.
-fn ripple(lanes: &mut [LaneData], at: u32, len: u32) {
-    for data in lanes {
-        clear(&mut data.clips, at, at + len);
-        for c in data.clips.iter_mut().filter(|c| c.start >= at) {
+/// Cuts `[at, at + len)` out of the lanes at indices `on` and slides what is
+/// behind it back -- the body of [`Project::ripple_delete`] (which passes every
+/// lane) and of every cut a batch ([`Project::cut_regions`]) makes on the lanes
+/// it was scoped to. No snapshot of its own: whose undo step this is belongs to
+/// the caller.
+fn ripple(lanes: &mut [LaneData], on: &[usize], at: u32, len: u32) {
+    for &i in on {
+        let clips = &mut lanes[i].clips;
+        clear(clips, at, at + len);
+        for c in clips.iter_mut().filter(|c| c.start >= at) {
             c.start -= len;
         }
-        debug_assert!(sorted_disjoint(&data.clips));
+        debug_assert!(sorted_disjoint(clips));
     }
+}
+
+/// Every lane, as the index list the two above take: what "the whole timeline"
+/// is spelled as, and the scope [`Project::ripple_delete`] and
+/// [`Project::split`] have always had.
+fn all_lanes(lanes: &[LaneData]) -> Vec<usize> {
+    (0..lanes.len()).collect()
 }
 
 /// A caller's region list as a batch may use it: sorted by start, empty entries

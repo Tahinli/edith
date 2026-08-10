@@ -357,10 +357,49 @@ fn speed_at(permille: i32) -> Speed {
     Speed::from_permille(permille.clamp(0, i32::from(u16::MAX)) as u16)
 }
 
-/// The silence card's rows, in the order it lists them: the four settings a
-/// scan is told and the rate the speed-up plays at. What `silence_field`
-/// indexes and what [`Player::nudge_silence`] moves.
-const SILENCE_ROWS: usize = 5;
+/// The silence card's rows, in the order it lists them: how wide the apply
+/// reaches, the four settings a scan is told, and the rate the speed-up plays
+/// at. What `silence_field` indexes and what [`Player::nudge_silence`] moves.
+const SILENCE_ROWS: usize = 6;
+
+/// How wide a jumpcut reaches. A ripple used to be the whole timeline's
+/// business and nothing else; it is a *choice* now, because a podcast track's
+/// silences are not the music track's business -- and the choice has to be on
+/// screen, because "everything after this moved" is not a thing to discover
+/// afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    /// The lanes of the take the scanned clip belongs to: its picture and its
+    /// sound stay one take, and nothing else moves. The default, because a clip
+    /// picked on screen is what a person means by "this".
+    Take,
+    /// That clip's lane, alone. Refused by the engine, by name, while the take
+    /// has a half elsewhere -- detaching is how a person says they mean it.
+    Track,
+    /// Every lane, which is what a ripple always was and what the timeline-wide
+    /// jumpcut still is.
+    Everything,
+}
+
+/// The order the card cycles them in.
+const SCOPES: [Scope; 3] = [Scope::Take, Scope::Track, Scope::Everything];
+
+impl Scope {
+    /// What the row says, given the lanes it works out to: the *names* of the
+    /// tracks, because "this take" means nothing until it says which two.
+    fn label(self, lanes: &[Lane]) -> String {
+        let named = lanes
+            .iter()
+            .map(|l| l.label())
+            .collect::<Vec<_>>()
+            .join("+");
+        match self {
+            Scope::Take => format!("this take ({named})"),
+            Scope::Track => format!("this track ({named})"),
+            Scope::Everything => "every track".to_string(),
+        }
+    }
+}
 
 /// One press of a nudge key on each kind of row: a dB on the threshold, a
 /// twentieth of a second on the three durations, and the speed card's own step
@@ -606,6 +645,10 @@ struct Player {
     /// second run offers what the first one settled on.
     silence: engine::silence::Settings,
     silence_factor: Speed,
+    /// How wide the apply reaches ([`Scope`]). Kept across closes for the same
+    /// reason, and never *widened* on anyone's behalf: the whole point of it is
+    /// that a track nobody named does not move.
+    silence_scope: Scope,
     /// Which of the card's [`SILENCE_ROWS`] the arrow keys move. The card's own
     /// focus, since nothing in it takes gpui's (ledger:182).
     silence_field: usize,
@@ -1259,27 +1302,65 @@ impl Player {
                 .clamp(SILENCE_SECS_RANGE.0, SILENCE_SECS_RANGE.1)
         };
         match self.silence_field {
+            // Round either way, like the fit policy's cycle: three choices are
+            // a ring, not a range.
             0 => {
+                let at = SCOPES.iter().position(|&s| s == self.silence_scope);
+                let step = steps.rem_euclid(SCOPES.len() as i32) as usize;
+                self.silence_scope = SCOPES[(at.unwrap_or(0) + step) % SCOPES.len()];
+            }
+            1 => {
                 self.silence.threshold_db = (self.silence.threshold_db
                     + steps as f32 * SILENCE_DB_STEP)
                     .clamp(SILENCE_DB_RANGE.0, SILENCE_DB_RANGE.1)
             }
-            1 => self.silence.min_silence = secs(self.silence.min_silence),
-            2 => self.silence.padding = secs(self.silence.padding),
-            3 => self.silence.min_keep = secs(self.silence.min_keep),
+            2 => self.silence.min_silence = secs(self.silence.min_silence),
+            3 => self.silence.padding = secs(self.silence.padding),
+            4 => self.silence.min_keep = secs(self.silence.min_keep),
             _ => {
                 self.silence_factor =
                     silence_rate(i32::from(self.silence_factor.permille()) + steps * SPEED_STEP)
             }
         }
-        // The rate is not part of the scan, but re-running is cheap (the levels
-        // are cached) and one path is one place for the marks to come from.
+        // Neither the scope nor the rate is part of the scan, but re-running is
+        // cheap (the levels are cached) and one path is one place for the marks
+        // to come from.
         self.scan_silences();
     }
 
-    /// What an apply acts on: the previewed set, or nothing at all with a
-    /// notice saying so in the numbers that found nothing.
-    fn previewed(&mut self) -> Option<Vec<(u32, u32)>> {
+    /// Which lanes an apply reaches, as the card's scope row says it: the
+    /// lanes of the take the scanned clip belongs to, that clip's lane alone,
+    /// or every lane there is.
+    ///
+    /// The take's lanes are the ones carrying its group id -- a link is one
+    /// span on however many lanes, so "the take" is exactly the set of lanes
+    /// that would otherwise be pulled apart. Nothing widens behind the user's
+    /// back: [`Project::cut_regions`] refuses a scope that would split a take,
+    /// and this row is how the user says the take instead.
+    fn silence_lanes(&self) -> Vec<Lane> {
+        let (Some((lane, idx)), Some(session)) = (self.silence_open, self.session.as_ref()) else {
+            return Vec::new();
+        };
+        match self.silence_scope {
+            Scope::Track => vec![lane],
+            Scope::Everything => session.lanes(),
+            Scope::Take => match session.lane_clips(lane).get(idx).and_then(|c| c.link) {
+                None => vec![lane],
+                Some(id) => session
+                    .lanes()
+                    .into_iter()
+                    .filter(|&l| {
+                        l == lane || session.lane_clips(l).iter().any(|c| c.link == Some(id))
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// What an apply acts on: the previewed set and the lanes it reaches, or
+    /// nothing at all with a notice saying so in the numbers that found
+    /// nothing.
+    fn previewed(&mut self) -> Option<(Vec<(u32, u32)>, Vec<Lane>)> {
         if self.silence_marks.is_empty() {
             self.notice = Some(
                 format!(
@@ -1290,60 +1371,81 @@ impl Player {
             );
             return None;
         }
-        Some(self.silence_marks.clone())
+        Some((self.silence_marks.clone(), self.silence_lanes()))
     }
 
-    /// Cuts every previewed silence out of every lane, rippling each hole
-    /// closed -- one edit and **one** undo press however many there were
-    /// ([`engine::PlaybackSession::cut_regions`]). The linked picture slides
-    /// with its sound, because a ripple is uniform across the lanes.
+    /// What an apply says afterwards: which tracks it reached, and -- when that
+    /// was not all of them -- that the rest were left where they were. The
+    /// scope is a choice, so the confirmation has to name the choice.
+    fn silence_reach(&self, lanes: &[Lane]) -> String {
+        let named = lanes
+            .iter()
+            .map(|l| l.label())
+            .collect::<Vec<_>>()
+            .join("+");
+        match self.silence_scope {
+            Scope::Everything => "on every track".to_string(),
+            _ => format!("on {named} — other tracks untouched"),
+        }
+    }
+
+    /// Cuts every previewed silence out of the lanes the scope names, rippling
+    /// each hole closed -- one edit and **one** undo press however many there
+    /// were ([`engine::PlaybackSession::cut_regions`]). Tracks outside the
+    /// scope do not move; a scope that would take half a take with it comes
+    /// back refused in the engine's own words, naming both halves.
     fn cut_silences(&mut self, cx: &mut Context<Self>) {
-        let Some(regions) = self.previewed() else {
+        let Some((regions, lanes)) = self.previewed() else {
             cx.notify();
             return;
         };
         let saved = f64::from(regions.iter().map(|&(_, len)| len).sum::<u32>()) / self.fps;
-        let count = regions.len();
-        let cut = self
-            .session
-            .as_mut()
-            .is_some_and(|session| session.cut_regions(&regions));
-        if cut {
-            self.close_silence();
-            self.reset_after_reseek();
-            self.notice = Some(
-                format!(
-                    "{count} SILENCES CUT — {saved:.1}s shorter, {} takes it back",
-                    self.keymap.display(ActionId::Undo)
-                )
-                .into(),
-            );
-        }
-        cx.notify();
-    }
-
-    /// Plays them fast instead of cutting them, closing the room each one no
-    /// longer needs. One undo press like the cut; the refusal (a clip on
-    /// another lane lapping over a silence) comes back in the engine's own
-    /// words and names the lane and frame, and the card stays up so the numbers
-    /// that produced it are still on screen.
-    fn speed_silences(&mut self, cx: &mut Context<Self>) {
-        let Some(regions) = self.previewed() else {
-            cx.notify();
-            return;
-        };
-        let (count, rate) = (regions.len(), self.silence_factor);
+        let (count, reach) = (regions.len(), self.silence_reach(&lanes));
         let Some(session) = self.session.as_mut() else {
             cx.notify();
             return;
         };
-        match session.speed_regions(&regions, rate) {
+        match session.cut_regions(&regions, &lanes) {
             Ok(()) => {
                 self.close_silence();
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
-                        "{count} SILENCES AT {rate} — {} takes it back",
+                        "{count} SILENCES CUT {reach} — {saved:.1}s shorter, {} takes it back",
+                        self.keymap.display(ActionId::Undo)
+                    )
+                    .into(),
+                );
+            }
+            Err(e) => self.notice = Some(e.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    /// Plays them fast instead of cutting them, closing the room each one no
+    /// longer needs. One undo press like the cut, and the same scope; the
+    /// refusals (a clip lapping over a silence, a scope that would split a
+    /// take) come back in the engine's own words and name the lane and frame,
+    /// and the card stays up so the numbers that produced it are still on
+    /// screen.
+    fn speed_silences(&mut self, cx: &mut Context<Self>) {
+        let Some((regions, lanes)) = self.previewed() else {
+            cx.notify();
+            return;
+        };
+        let (count, rate) = (regions.len(), self.silence_factor);
+        let reach = self.silence_reach(&lanes);
+        let Some(session) = self.session.as_mut() else {
+            cx.notify();
+            return;
+        };
+        match session.speed_regions(&regions, rate, &lanes) {
+            Ok(()) => {
+                self.close_silence();
+                self.reset_after_reseek();
+                self.notice = Some(
+                    format!(
+                        "{count} SILENCES AT {rate} {reach} — {} takes it back",
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -4447,6 +4549,7 @@ impl Player {
         let (lane, idx) = self.silence_open?;
         let cfg = self.silence;
         let rows = [
+            ("Apply to", self.silence_scope.label(&self.silence_lanes())),
             ("Silence is under", format!("{:.0} dBFS", cfg.threshold_db)),
             (
                 "Forgive quiet shorter than",
@@ -8621,6 +8724,9 @@ fn main() {
                     // scan that leaves a little too much is one nobody undoes.
                     silence: engine::silence::Settings::default(),
                     silence_factor: Speed::MAX,
+                    // The take, not the timeline: the narrower answer is the
+                    // one a person can widen on purpose.
+                    silence_scope: Scope::Take,
                     silence_field: 0,
                     silence_marks: Vec::new(),
                     silence_levels: None,

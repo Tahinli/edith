@@ -1004,23 +1004,32 @@ impl PlaybackSession {
     }
 
     /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out
-    /// of every lane and closes each hole, as **one** edit
+    /// of the lanes in `scope` and closes each hole, as **one** edit
     /// ([`Project::cut_regions`]): the jumpcut a silence scan
     /// ([`crate::silence`]) asks for, one undo press however many silences it
-    /// found. Reseeks like every other edit, so what plays is the cut timeline
-    /// from the playhead on. `false`, and no undo step, for an empty list.
-    pub fn cut_regions(&mut self, regions: &[(u32, u32)]) -> bool {
-        self.edit(|p| p.cut_regions(regions))
+    /// found. A lane outside `scope` does not move. Reseeks like every other
+    /// edit, so what plays is the cut timeline from the playhead on. The `Err`
+    /// names what is in the way and nothing changes.
+    pub fn cut_regions(&mut self, regions: &[(u32, u32)], scope: &[Lane]) -> crate::Result<()> {
+        // Spelled out rather than through `edit`, whose closure hands back a
+        // bool and would drop the refusal's own words.
+        self.project.cut_regions(regions, scope)?;
+        let now = self.now();
+        self.seek(now);
+        Ok(())
     }
 
     /// Plays every one of those regions at `speed` instead of cutting them,
     /// closing the room each one no longer needs ([`Project::speed_regions`]) --
-    /// one edit, one undo press. The `Err` names the lane and frame in the way
-    /// and nothing changes.
-    pub fn speed_regions(&mut self, regions: &[(u32, u32)], speed: Speed) -> crate::Result<()> {
-        // Spelled out rather than through `edit`, whose closure hands back a
-        // bool and would drop the refusal's own words.
-        self.project.speed_regions(regions, speed)?;
+    /// one edit, one undo press, and the same scope rule. The `Err` names the
+    /// lane and frame in the way and nothing changes.
+    pub fn speed_regions(
+        &mut self,
+        regions: &[(u32, u32)],
+        speed: Speed,
+        scope: &[Lane],
+    ) -> crate::Result<()> {
+        self.project.speed_regions(regions, speed, scope)?;
         let now = self.now();
         self.seek(now);
         Ok(())
