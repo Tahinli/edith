@@ -68,17 +68,17 @@ fn probe_streams_lists_every_audio_track_in_file_order() {
                 lang: Some("fra".into()),
                 decodable: true,
             },
-            // The one we cannot play is listed all the same, so a picker can
-            // grey it rather than pretend the file has two streams. mp4 0.14
-            // keeps no fourcc for a sample entry it does not parse, hence the
-            // blanks — the row exists, which is the point.
+            // mp4 0.14 parses no sample entry for AC-3 and keeps no fourcc, so
+            // this row is described by the AC-3 reader itself: the codec by the
+            // stsd fourcc read by hand, the rate and the layout by the first
+            // syncframe. Stereo, because that is what the downmix hands out.
             StreamInfo {
                 index: 2,
-                codec: "unknown".into(),
-                channels: 0,
-                sample_rate: 0,
+                codec: "ac-3".into(),
+                channels: 2,
+                sample_rate: 44100,
                 lang: None,
-                decodable: false,
+                decodable: true,
             },
         ]
     );
@@ -152,15 +152,14 @@ fn an_impossible_stream_is_refused_not_guessed() {
         err.to_string().contains("audio stream 3 of 3"),
         "unhelpful refusal: {err}"
     );
-    // Stream 2 exists but is AC-3: refused with its own message, not decoded
-    // into noise and not silently swapped for a stream that does decode.
+    // Stream 2 is AC-3, and a *named* stream is opened by its own reader: it
+    // decodes to the same 44.1 kHz stereo the AAC stream 0 does, which is what
+    // lets it share this timeline at all.
     let ac3 = [(asset(MULTI), 2)];
-    let err = AudioSession::open_multi_streams(&ac3, &[(Some(0), 0.0, 1.0)])
-        .expect_err("AC-3 does not decode here");
-    assert!(
-        err.to_string().contains("audio stream 2 is not AAC"),
-        "unhelpful refusal: {err}"
-    );
+    let (meta, _rx) = AudioSession::open_multi_streams(&ac3, &[(Some(0), 0.0, 1.0)])
+        .expect("AC-3 decodes now")
+        .expect("the stream is there");
+    assert_eq!((meta.sample_rate, meta.channels), (44100, 2));
     // A source a *segment* names, opened lazily, refuses just the same.
     let sources = [(asset(MULTI), 0), (asset(MULTI), 9)];
     assert!(
