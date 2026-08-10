@@ -348,11 +348,11 @@ fn run(
     cancel: &AtomicBool,
 ) {
     let mut decoder = Decoder::new();
-    // Sample ids are 1-based, frame indices 0-based. Decoding has to restart at
-    // a sync sample, so pictures between it and `start_frame` are decoded (the
-    // target frame references them) but never converted or sent.
-    let sync = demuxer.seek_to_sync_at_or_before(start_frame.saturating_add(1));
-    let mut index = sync - 1;
+    // Decoding has to restart at a sync sample, so pictures between it and
+    // `start_frame` are decoded (the target frame references them) but never
+    // converted or sent. Signed, because the landing sync sample can sit inside
+    // what the file's edit list trims, i.e. *before* frame 0.
+    let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
 
     // ponytail: emits pictures in decode order. Fine for Baseline (no B-frames);
     // reordering streams need POC-sorted output before display.
@@ -376,12 +376,12 @@ fn run(
                 break;
             }
         };
-        if index < start_frame {
+        if index < i64::from(start_frame) {
             index += 1;
             continue;
         }
         let frame = Frame {
-            index,
+            index: index as u32,
             width: yuv.width as u32,
             height: yuv.height as u32,
             bgra: i420_to_bgra(&yuv.y, &yuv.u, &yuv.v, yuv.width, yuv.height),
@@ -390,7 +390,7 @@ fn run(
         if tx.send(frame).is_err() {
             break; // consumer went away
         }
-        if index >= end_frame {
+        if index >= i64::from(end_frame) {
             break; // end of the requested range
         }
     }

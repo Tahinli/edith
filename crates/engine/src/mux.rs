@@ -10,15 +10,14 @@ use mp4::{
     Mp4Sample, Mp4Writer, SampleFreqIndex, TrackConfig, TrackType,
 };
 
-/// 90 kHz is the H.264 convention; frame durations round to well under a
-/// microsecond of error at every fps we care about.
+/// 90 kHz is the H.264 convention, and it divides exactly at every *integer*
+/// fps (3000 ticks at 30, 3600 at 25). The NTSC rates do not divide into it at
+/// all -- 24000/1001 wants 3753.75 -- so those get their own clock; see
+/// [`frame_timing`].
 const VIDEO_TIMESCALE: u32 = 90_000;
-/// The same as the video's, deliberately: `mp4` converts every sample duration
-/// into the movie timescale with an integer division of its own (track.rs:752),
-/// so a coarser movie clock loses a fraction of a millisecond *per frame* --
-/// 1 kHz makes a 4.000 s export announce itself as 3.960 s. Equal timescales
-/// make the video conversion exact.
-const MOVIE_TIMESCALE: u32 = VIDEO_TIMESCALE;
+/// Ticks per frame for a rate the 90 kHz clock cannot express: every NTSC rate
+/// is `n/1001`, so 1001 ticks a frame makes the timescale a whole `n`.
+const NTSC_TICKS: u32 = 1001;
 /// An AAC-LC packet is always 1024 samples, so with timescale == sample rate the
 /// per-packet duration is this constant.
 const AAC_PACKET_SAMPLES: u32 = 1024;
@@ -78,6 +77,7 @@ impl Mp4Muxer {
             return Err("no usable SPS/PPS for the video track".into());
         }
 
+        let (timescale, frame_duration) = frame_timing(video.frame_rate)?;
         let mut writer = Mp4Writer::write_start(
             BufWriter::new(File::create(path)?),
             &Mp4Config {
@@ -89,12 +89,18 @@ impl Mp4Muxer {
                     FourCC::from(*b"avc1"),
                     FourCC::from(*b"mp41"),
                 ],
-                timescale: MOVIE_TIMESCALE,
+                // The video track's own, deliberately: `mp4` converts every
+                // sample duration into the movie timescale with an integer
+                // division of its own (track.rs:752), so a coarser movie clock
+                // loses a fraction of a millisecond *per frame* -- 1 kHz makes a
+                // 4.000 s export announce itself as 3.960 s. Equal timescales
+                // make the video conversion exact.
+                timescale,
             },
         )?;
         writer.add_track(&TrackConfig {
             track_type: TrackType::Video,
-            timescale: VIDEO_TIMESCALE,
+            timescale,
             language: "und".to_string(),
             media_conf: MediaConfig::AvcConfig(AvcConfig {
                 width: video.width as u16,
@@ -121,7 +127,7 @@ impl Mp4Muxer {
 
         Ok(Self {
             writer,
-            frame_duration: (VIDEO_TIMESCALE as f64 / video.frame_rate).round() as u32,
+            frame_duration,
             has_audio: audio.is_some(),
         })
     }
@@ -169,6 +175,25 @@ impl Mp4Muxer {
         self.writer.write_end()?;
         Ok(())
     }
+}
+
+/// `(timescale, ticks per frame)` for `fps`, chosen so one frame is a *whole*
+/// number of ticks: 90 kHz wherever it divides exactly (every integer rate, so
+/// those exports stay byte for byte what they were), and `round(fps * 1001)`
+/// over [`NTSC_TICKS`] otherwise, which is exact for the whole `n/1001` family.
+/// A fixed 90 kHz clock leaves 24000/1001 a quarter tick short *per frame* --
+/// half a second of drift against the audio track by the end of a two-hour
+/// export, which is this bug's own truncation reborn at the writing end.
+pub(crate) fn frame_timing(fps: f64) -> crate::Result<(u32, u32)> {
+    let ticks = f64::from(VIDEO_TIMESCALE) / fps;
+    if (ticks - ticks.round()).abs() < 1e-9 && (1.0..=f64::from(u32::MAX)).contains(&ticks.round()) {
+        return Ok((VIDEO_TIMESCALE, ticks.round() as u32));
+    }
+    let timescale = (fps * f64::from(NTSC_TICKS)).round();
+    if !(1.0..=f64::from(u32::MAX)).contains(&timescale) {
+        return Err(format!("frame rate {fps} has no usable timescale").into());
+    }
+    Ok((timescale as u32, NTSC_TICKS))
 }
 
 /// SPS and PPS of an Annex-B access unit, for the `avcC` box. `None` when the
@@ -318,6 +343,26 @@ mod tests {
         );
     }
 
+    /// Every frame must be a whole number of ticks, or the video track drifts
+    /// against the audio one over a long export -- the truncation this bug is.
+    #[test]
+    fn frame_timing_is_exact_at_ntsc_and_unchanged_at_integer_rates() {
+        assert_eq!(frame_timing(30.0).unwrap(), (90_000, 3_000), "was 90k/3000");
+        assert_eq!(frame_timing(25.0).unwrap(), (90_000, 3_600));
+        assert_eq!(frame_timing(24_000.0 / 1001.0).unwrap(), (24_000, 1_001));
+        // 29.97 is the one NTSC rate 90 kHz already counts exactly (3003 ticks),
+        // so it keeps the conventional clock rather than growing its own.
+        assert_eq!(frame_timing(30_000.0 / 1001.0).unwrap(), (90_000, 3_003));
+        // And the pair plays back as the rate it came from, to the last bit.
+        for fps in [30.0, 25.0, 24_000.0 / 1001.0, 30_000.0 / 1001.0, 60.0] {
+            let (ts, ticks) = frame_timing(fps).unwrap();
+            let played = f64::from(ts) / f64::from(ticks);
+            assert!((played - fps).abs() < 1e-9, "{fps} writes back as {played}");
+        }
+        // Rate so low the 90 kHz clock cannot count it: refused, not truncated.
+        assert!(frame_timing(1e-9).is_err());
+    }
+
     #[test]
     fn create_rejects_unusable_config() {
         let out = std::env::temp_dir().join("ve_mux_never_written.mp4");
@@ -435,6 +480,46 @@ mod tests {
         }
         assert!(demuxer.next_access_unit().unwrap().is_none());
 
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    /// The whole pipe at an NTSC rate: what we write is what we read back, to
+    /// the ninth decimal. Before this bug was fixed the same round trip lost
+    /// 23.976 on the way out (a rounded frame duration) *and* on the way back
+    /// in (`mp4`'s integer `frame_rate`), and an hour of export drifted a second.
+    #[test]
+    fn an_ntsc_rate_survives_the_round_trip() {
+        const NTSC: f64 = 24_000.0 / 1001.0;
+        let out = std::env::temp_dir().join(format!("ve_mux_ntsc_{}.mp4", std::process::id()));
+        let mut muxer = Mp4Muxer::create(
+            &out,
+            &VideoParams {
+                width: 640,
+                height: 360,
+                frame_rate: NTSC,
+                sps: SPS,
+                pps: PPS,
+            },
+            None,
+        )
+        .unwrap();
+        muxer.write_video_au(&au(&[SPS, PPS, &[0x65, 0x01]])).unwrap();
+        muxer.write_video_au(&au(&[&[0x41, 0x02]])).unwrap();
+        muxer.finish().unwrap();
+
+        let file = File::open(&out).unwrap();
+        let size = file.metadata().unwrap().len();
+        let mut reader = mp4::Mp4Reader::read_header(BufReader::new(file), size).unwrap();
+        assert_eq!(reader.tracks()[&VIDEO_TRACK].timescale(), 24_000);
+        let first = reader.read_sample(VIDEO_TRACK, 1).unwrap().unwrap();
+        assert_eq!(first.duration, 1_001, "one frame is a whole 1001 ticks");
+
+        let (meta, _) = crate::demux::Demuxer::open(&out).unwrap();
+        assert!(
+            (meta.frame_rate - NTSC).abs() < 1e-9,
+            "read back as {} fps, not {NTSC}",
+            meta.frame_rate
+        );
         std::fs::remove_file(&out).unwrap();
     }
 }
