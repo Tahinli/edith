@@ -46,6 +46,14 @@ symphonia = { version = "0.6", default-features = false, features = [
 ] }
 oxideav-ac3 = "=0.0.10"
 oxideav-core = "0.1.34"
+# The software AV1 encoder, and the only new name in this list that was already
+# in the lock file: `ravif` pulls the very same rav1e 0.8.1 in through the image
+# crate, so this links what the build already compiled. BSD-2 with the AOM
+# patent grant, and pure Rust with `asm` *off*: that feature wants `nasm`, which
+# this project's build does not have and will not require. `threading` is rayon
+# inside rav1e itself and is what keeps an export minutes rather than tens of
+# minutes; the cost of no assembly is measured in `export::Enc::open_av1`.
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 
 [dev-dependencies]
 # The still-image suite compares what the timeline shows against the file's own
