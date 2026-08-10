@@ -3416,12 +3416,18 @@ impl Player {
                         None => String::new(),
                     }
                 ),
+                // The file's *own* frame rate, not the timeline's: a clip shot
+                // at another rate plays at the speed it was shot at, and the
+                // row that says where it came from has to say which rate that
+                // was.
                 (None, Some(meta)) => format!(
                     "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
                     row.path.display(),
                     meta.width,
                     meta.height,
-                    meta.frame_rate
+                    self.session
+                        .as_ref()
+                        .map_or(meta.frame_rate, |session| session.file_fps(&row.path))
                 ),
                 (None, None) => row.path.display().to_string(),
             };
