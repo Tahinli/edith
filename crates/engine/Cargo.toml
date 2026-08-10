@@ -28,7 +28,9 @@ symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
 # seven, and its `default::get_probe`/`get_codecs` are the registries this would
 # otherwise hand-build. Explicit feature list rather than the default one -- no
-# mkv, no ape, no adpcm: what is listed here is exactly what `is_audio` admits.
+# ape, no adpcm: what is listed here is exactly what `is_audio` admits, plus
+# `mkv`, which is not an `is_audio` container at all -- it is how the *sound* of
+# a Matroska video file is read, the picture having its own demuxer here.
 # There is no opus/ac3/dts feature at any symphonia version, which is why those
 # are refused rather than promised.
 symphonia = { version = "0.6", default-features = false, features = [
@@ -38,12 +40,19 @@ symphonia = { version = "0.6", default-features = false, features = [
     "id3v1",
     "id3v2",
     "isomp4",
+    "mkv",
     "mp3",
     "ogg",
     "pcm",
     "vorbis",
     "wav",
 ] }
+# The AAC decoder symphonia is not: its own refuses anything wider than stereo
+# outright (`aac/mod.rs:93`, "aac: aac too complex"), and a 5.1 film soundtrack
+# in an mkv is exactly that. Pure Rust with no dependencies of its own, from the
+# same family as `rusty_h264`, and it hands 5.1 back already reordered into
+# FL, FR, FC, LFE, BL, BR -- which is the order the downmix here folds.
+rusty_aac = "0.5"
 oxideav-ac3 = "=0.0.10"
 oxideav-core = "0.1.34"
 # The software AV1 encoder, and the only new name in this list that was already
