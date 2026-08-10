@@ -185,11 +185,12 @@ fn a_gap_segment_is_silence_of_its_own_length() {
     );
 }
 
-/// The copy side of a gap: there is no AAC encoder here to make silence with,
-/// so the hole is spent as *duration* on the packet in front of it. Every
-/// packet after the gap therefore still lands at its timeline position.
+/// The copy side of a gap: there is no AAC encoder here, so the hole is copied
+/// as hand-written silent packets -- real access units, one 1024-frame stts
+/// entry each, the rounding debt carried through them like any other segment.
+/// Every packet after the gap therefore still lands at its timeline position.
 #[test]
-fn a_copied_gap_becomes_the_duration_of_the_packet_before_it() {
+fn a_copied_gap_is_packets_of_hand_written_silence() {
     let sources = [asset()];
     let plain = [(Some(0), 0.0, 1.0), (Some(0), 2.0, 3.0)];
     let gapped = [(Some(0), 0.0, 1.0), (None, 0.0, 1.0), (Some(0), 2.0, 3.0)];
@@ -200,48 +201,52 @@ fn a_copied_gap_becomes_the_duration_of_the_packet_before_it() {
     let (_, with) = AudioSession::copy_multi_segments(&sources, &gapped)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        with.len(),
-        without.len(),
-        "a gap copies no packets: there is nothing in it"
-    );
     let total = |p: &[engine::AacPacket]| p.iter().map(|p| u64::from(p.samples)).sum::<u64>();
-    assert_eq!(
-        total(&with) - total(&without),
-        RATE,
-        "...it costs exactly its own second of stts duration"
+    assert!(
+        with.iter().all(|p| u64::from(p.samples) == PACKET),
+        "gap or not, every AAC-LC packet is 1024 frames"
     );
-    // Exactly one packet grew, and it is an interior one -- the last before
-    // the hole -- so every packet after the hole is pushed to where the
-    // timeline wants it rather than the whole tail drifting early.
-    let grown: Vec<usize> = with
+    let gap = total(&with) - total(&without);
+    assert!(
+        gap.abs_diff(RATE) <= PACKET / 2,
+        "the hole is {gap} frames of silence for a second of timeline"
+    );
+    // The audible packets are the same bytes in the same order: the silence was
+    // inserted between them, not spliced through them.
+    let audible: Vec<&Vec<u8>> = with
         .iter()
-        .zip(&without)
+        .map(|p| &p.bytes)
+        .filter(|b| b.len() > 7)
+        .collect();
+    let want: Vec<&Vec<u8>> = without.iter().map(|p| &p.bytes).collect();
+    assert_eq!(audible, want, "not one byte of audio moved");
+    // Stereo silence is the 7-byte block, and it sits where the hole is.
+    let silent = |p: &engine::AacPacket| p.bytes == [0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E];
+    let run: Vec<usize> = with
+        .iter()
         .enumerate()
-        .filter(|(_, (a, b))| a.samples != b.samples)
+        .filter(|(_, p)| silent(p))
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(grown.len(), 1, "one packet carries the whole gap");
-    assert!(
-        grown[0] > 0 && grown[0] < with.len() - 1,
-        "the gap rides on an interior packet, at {} of {}",
-        grown[0],
-        with.len()
+    assert_eq!(
+        run.len() as u64,
+        gap / PACKET,
+        "the gap is that many silent packets"
     );
     assert!(
-        with.iter().zip(&without).all(|(a, b)| a.bytes == b.bytes),
-        "and not one byte of audio moved"
+        run.windows(2).all(|w| w[1] == w[0] + 1) && run[0] > 0,
+        "and they are one interior run, at {run:?}"
     );
 
-    // A gap at the *head* has no packet before it: the first one picks it up
-    // (the documented ponytail), so nothing but that packet is misplaced.
+    // A gap at the *head* is packets of its own: nothing rides on a neighbour,
+    // so there is no leading misplacement left to document.
     let (_, leading) =
         AudioSession::copy_multi_segments(&sources, &[(None, 0.0, 0.5), (Some(0), 0.0, 1.0)])
             .unwrap()
             .unwrap();
-    assert_eq!(
-        u64::from(leading[0].samples),
-        1024 + RATE / 2,
-        "the head gap rides on the first packet"
+    let head = leading.iter().take_while(|p| silent(p)).count() as u64;
+    assert!(
+        (head * PACKET).abs_diff(RATE / 2) <= PACKET,
+        "{head} silent packets for half a second of leading hole"
     );
 }

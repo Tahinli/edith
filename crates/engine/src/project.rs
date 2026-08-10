@@ -145,30 +145,61 @@ impl Project {
 
     /// A project rebuilt from a saved edit list -- the load half of
     /// [`crate::edith`]. History is *not* saved, so [`Project::undo`] is
-    /// `false` until the first edit of the new session. `None` when the parts
-    /// would break an invariant every other constructor keeps: both lanes
-    /// empty, an empty clip, a clip naming a source that is not there, or a
-    /// lane that is unsorted or self-overlapping.
-    pub fn from_parts(sources: Vec<PathBuf>, video: Vec<Clip>, audio: Vec<Clip>) -> Option<Self> {
+    /// `false` until the first edit of the new session. This is the one door
+    /// untrusted parts come in through, so every invariant every other
+    /// constructor keeps is checked here, by name and in release: both lanes
+    /// empty, an empty clip, a clip naming a source that is not there, a clip
+    /// whose end overflows, a lane that is unsorted or self-overlapping, and
+    /// the grouping rules of [`Clip::link`] below.
+    pub fn from_parts(
+        sources: Vec<PathBuf>,
+        video: Vec<Clip>,
+        audio: Vec<Clip>,
+    ) -> crate::Result<Self> {
         if video.is_empty() && audio.is_empty() {
-            return None;
+            return Err("both lanes are empty: that is not a project".into());
         }
         let lanes = [video, audio];
-        if lanes.iter().any(|lane| {
-            !sorted_disjoint(lane)
-                || lane
-                    .iter()
-                    .any(|c| c.source >= sources.len() || c.out_frame <= c.in_frame)
-        }) {
-            return None;
+        for (lane, name) in lanes.iter().zip(["video", "audio"]) {
+            for c in lane {
+                if c.out_frame <= c.in_frame {
+                    return Err(format!(
+                        "{name} clip at {} plays the empty range [{}, {})",
+                        c.start, c.in_frame, c.out_frame
+                    )
+                    .into());
+                }
+                if c.source >= sources.len() {
+                    return Err(format!(
+                        "{name} clip at {} names source {} of {}",
+                        c.start,
+                        c.source,
+                        sources.len()
+                    )
+                    .into());
+                }
+                if c.start.checked_add(c.len()).is_none() {
+                    return Err(format!(
+                        "{name} clip at {} runs past the last frame there is",
+                        c.start
+                    )
+                    .into());
+                }
+            }
+            if !sorted_disjoint(lane) {
+                return Err(format!("the {name} lane is out of order or overlaps itself").into());
+            }
         }
+        links_are_consistent(&lanes)?;
         let next_link = lanes
             .iter()
             .flatten()
             .filter_map(|c| c.link)
             .max()
-            .map_or(0, |m| m + 1);
-        Some(Self {
+            // Saturating so a crafted file cannot make the counter wrap: at the
+            // ceiling ids stop being fresh, which loses grouping, not memory.
+            .map_or(0, |m| m.saturating_add(1));
+        Ok(Self {
             sources: sources.iter().map(|s| canonical(s)).collect(),
             lanes,
             history: Vec::new(),
@@ -404,6 +435,14 @@ impl Project {
     /// if `clip` lands inside it), which is what keeps the lane sorted and
     /// disjoint; nothing ripples, so a gap before the placement simply stays a
     /// gap. Refused only for an empty `clip`.
+    ///
+    /// The placement belongs to no group: a clipboard clip carries the link id
+    /// of the take it was copied from, and placing it twice -- or placing a copy
+    /// back over the clip it came from -- would put that id on two clips of one
+    /// lane, which is what a link may never mean (see [`links_are_consistent`]).
+    /// `None` rather than a fresh id because a one-lane placement has nothing on
+    /// the other lane to be grouped *with*; [`Project::regroup`] is how clips
+    /// become a group again.
     pub fn place(&mut self, lane: Lane, timeline_frame: u32, clip: Clip) -> bool {
         if clip.out_frame <= clip.in_frame {
             return false;
@@ -411,6 +450,7 @@ impl Project {
         self.snapshot();
         let clip = Clip {
             start: timeline_frame,
+            link: None,
             ..clip
         };
         let lane = &mut self.lanes[lane.index()];
@@ -553,8 +593,9 @@ impl Project {
     }
 
     fn new_link(&mut self) -> u32 {
-        self.next_link += 1;
-        self.next_link - 1
+        let id = self.next_link;
+        self.next_link = self.next_link.saturating_add(1);
+        id
     }
 }
 
@@ -591,10 +632,50 @@ fn sorted_disjoint(clips: &[Clip]) -> bool {
         && clips.windows(2).all(|w| w[0].end() <= w[1].start)
 }
 
+/// The grouping invariant, checked in release at [`Project::from_parts`]: a link
+/// id names **at most one** clip per lane, and when it names one in each, the two
+/// cover the same timeline span -- that is all "these move together" can mean.
+///
+/// A link the *other* lane does not carry is legal and is not an error: lifting
+/// one half of a group ([`Project::lift`]) leaves exactly that, and a save of
+/// that timeline has to load again.
+fn links_are_consistent(lanes: &[Vec<Clip>; 2]) -> crate::Result<()> {
+    let find = |lane: &Vec<Clip>, id: u32| lane.iter().find(|c| c.link == Some(id)).copied();
+    for (lane, name) in lanes.iter().zip(["video", "audio"]) {
+        for (i, c) in lane.iter().enumerate() {
+            let Some(id) = c.link else { continue };
+            if lane[..i].iter().any(|prev| prev.link == Some(id)) {
+                return Err(format!("link {id} names two clips in the {name} lane").into());
+            }
+        }
+    }
+    for a in lanes[0].iter().filter(|c| c.link.is_some()) {
+        let id = a.link.expect("filtered");
+        let Some(b) = find(&lanes[1], id) else {
+            continue;
+        };
+        if (a.start, a.end()) != (b.start, b.end()) {
+            return Err(format!(
+                "link {id} covers [{}, {}) in video and [{}, {}) in audio",
+                a.start,
+                a.end(),
+                b.start,
+                b.end()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Removes the timeline frames `[start, end)` from `clips`: placements inside
 /// it go, one straddling it is split in two, one overlapping an edge is
 /// trimmed. Source frames follow the trim, so what is left plays what it always
 /// played. Leaves the lane sorted and disjoint.
+///
+/// A piece the hole cut is no longer the take its group id names -- and both
+/// halves of a straddled placement carrying that id would be the same id twice
+/// in one lane -- so what is cut loses its link (see [`links_are_consistent`]).
 fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
     let mut out = Vec::with_capacity(clips.len() + 1);
     for c in clips.drain(..) {
@@ -607,6 +688,7 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
         if c.start < start {
             out.push(Clip {
                 out_frame: c.in_frame + (start - c.start),
+                link: None,
                 ..c
             });
         }
@@ -615,6 +697,7 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             out.push(Clip {
                 start: end,
                 in_frame: c.in_frame + (end - c.start),
+                link: None,
                 ..c
             });
         }
@@ -624,13 +707,16 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
 
 /// Slides everything from `at` on later by `len`, splitting a placement that
 /// straddles `at` so the two halves end up on either side of the hole. The
-/// insert half of a rippling paste.
+/// insert half of a rippling paste. The two halves lose the group id for the
+/// reason [`clear`] gives.
 fn open_room(clips: &mut Vec<Clip>, at: u32, len: u32) {
     if let Some(idx) = splittable(clips, at) {
         let mut tail = clips[idx];
         tail.in_frame += at - tail.start;
         tail.start = at;
+        tail.link = None;
         clips[idx].out_frame = tail.in_frame;
+        clips[idx].link = None;
         clips.insert(idx + 1, tail);
     }
     for c in clips.iter_mut().filter(|c| c.start >= at) {
@@ -1274,24 +1360,100 @@ mod tests {
         assert!(p.undo());
 
         // A lane may be empty; both may not.
-        assert!(Project::from_parts(sources.clone(), video.clone(), Vec::new()).is_some());
-        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new()).is_none());
-        let bad: [Vec<Clip>; 4] = [
+        assert!(Project::from_parts(sources.clone(), video.clone(), Vec::new()).is_ok());
+        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new()).is_err());
+        let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
             vec![clip(3, 0, 3, 0), clip(0, 3, 5, 0)], // out of order
             vec![clip(0, 0, 5, 0), clip(3, 3, 5, 0)], // overlapping
+            vec![clip(u32::MAX - 1, 0, 3, 0)],        // end past the last frame
         ];
         for clips in bad {
             assert!(
-                Project::from_parts(sources.clone(), clips.clone(), Vec::new()).is_none(),
+                Project::from_parts(sources.clone(), clips.clone(), Vec::new()).is_err(),
                 "{clips:?}"
             );
-            assert!(Project::from_parts(sources.clone(), video.clone(), clips).is_none());
+            assert!(Project::from_parts(sources.clone(), video.clone(), clips).is_err());
         }
         // Group ids survive a load, and the next split gets a fresh one.
         let mut p = Project::from_parts(sources, video, audio).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
+    }
+
+    /// The grouping rules, at the untrusted door and after every edit that can
+    /// touch a link. A link id is at most one clip per lane and, when both lanes
+    /// carry it, one span -- and no sequence of edits may produce otherwise,
+    /// because what an edit produces is what a save writes and a load reads.
+    #[test]
+    fn a_link_id_is_never_two_clips_of_one_lane() {
+        let sources = vec![PathBuf::from(FILE)];
+        let linked = |start, in_frame, out_frame, link| Clip {
+            start,
+            in_frame,
+            out_frame,
+            source: 0,
+            link: Some(link),
+        };
+
+        // The door: named errors, one per cause.
+        let err = |video: Vec<Clip>, audio: Vec<Clip>| {
+            Project::from_parts(sources.clone(), video, audio)
+                .expect_err("refused")
+                .to_string()
+        };
+        assert!(
+            err(vec![linked(0, 0, 3, 7), linked(3, 3, 5, 7)], Vec::new())
+                .contains("link 7 names two clips in the video lane"),
+            "a duplicate id inside one lane is refused by name"
+        );
+        assert!(
+            err(vec![linked(0, 0, 5, 2)], vec![linked(0, 0, 3, 2)])
+                .contains("link 2 covers [0, 5) in video and [0, 3) in audio"),
+            "a pair that does not cover one span is refused by name"
+        );
+        // A one-sided link is *not* an error: it is what a lift leaves behind.
+        let mut p = Project::single(FILE, 9);
+        assert!(p.lift(Lane::Audio, 0));
+        let (sources, video, audio) = p.clone().without_orphan_sources();
+        assert!(
+            Project::from_parts(sources, video, audio).is_ok(),
+            "a lifted lane's project has to load again"
+        );
+
+        // The edits: nothing below may break either rule.
+        let consistent = |p: &Project, what: &str| {
+            let lanes = Lane::ALL.map(|l| p.lane(l).to_vec());
+            assert!(links_are_consistent(&lanes).is_ok(), "{what}: {lanes:?}");
+        };
+        let mut p = three();
+        let copied = p.clips()[0];
+        assert!(
+            copied.link.is_some(),
+            "the clipboard clip carries its group"
+        );
+        assert!(p.lift(Lane::Video, 0));
+        assert!(p.place(Lane::Video, 0, copied));
+        assert!(p.place(Lane::Video, 20, copied), "and again, further out");
+        assert_eq!(
+            p.clips().iter().filter(|c| c.link == copied.link).count(),
+            0,
+            "a placement belongs to no group, so it cannot duplicate one"
+        );
+        consistent(&p, "lift + place twice");
+        assert!(
+            p.place(Lane::Audio, 4, copied),
+            "over a linked clip's middle"
+        );
+        consistent(&p, "place through a grouped clip");
+        assert!(p.paste(6, copied), "a rippling paste through another");
+        consistent(&p, "paste");
+        assert!(p.split(2));
+        consistent(&p, "split");
+        assert!(p.ripple_delete(1, 3));
+        consistent(&p, "ripple_delete");
+        assert!(p.undo());
+        consistent(&p, "undo");
     }
 }

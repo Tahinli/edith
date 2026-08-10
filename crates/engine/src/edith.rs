@@ -300,6 +300,16 @@ fn check(clip: Clip, doc: &Document, line: usize) -> crate::Result<Clip> {
         )
         .into());
     }
+    // Everything downstream -- `Clip::end`, the overlap check, the v1 queue --
+    // adds `start + len` as plain `u32`, which panics in debug and wraps in
+    // release on a crafted file. Bound it here, at the door.
+    if clip.start.checked_add(clip.len()).is_none() {
+        return Err(format!(
+            "line {line}: clip at {} runs past the last frame there is",
+            clip.start
+        )
+        .into());
+    }
     Ok(clip)
 }
 
@@ -460,6 +470,27 @@ mod tests {
         // ...and a lane may be empty as long as the other one is not.
         let only_audio = parse(b"edith 2\nsource a.mp4\naudio 0 0 30 0 -\n", &dir).expect("parse");
         assert!(only_audio.video.is_empty());
+    }
+
+    /// A `start` near the top of `u32` used to make `Clip::end` panic in debug
+    /// and wrap in release, and a wrapped end passes the overlap check --
+    /// crafted numbers must be refused by name, in both dialects.
+    #[test]
+    fn a_clip_whose_end_overflows_is_refused() {
+        let dir = PathBuf::from("/proj");
+        for bytes in [
+            &b"edith 2\nsource a.mp4\nvideo 4294967290 0 30 0 -\naudio 0 0 30 0 -\n"[..],
+            // Two of them: the second would land *before* the first once wrapped.
+            b"edith 2\nsource a.mp4\nvideo 4294967290 0 30 0 -\nvideo 4294967295 0 30 0 -\n",
+            // v1 has no `start` field, but its queue reaches the same ceiling.
+            b"edith 1\nsource a.mp4\nclip 0 4294967295 0\nclip 0 4294967295 0\n",
+        ] {
+            let err = parse(bytes, &dir).unwrap_err().to_string();
+            assert!(
+                err.contains("runs past the last frame there is"),
+                "not refused by name: {err}"
+            );
+        }
     }
 
     /// The relocatability promise, from the two directions a project path
