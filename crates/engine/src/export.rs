@@ -328,12 +328,14 @@ impl Enc {
         let bitrate = settings
             .bitrate
             .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE));
-        // The plugin wants an exact rational; a thousandth of a frame per second
-        // is finer than any container fps we can read back.
-        let fps_num = (meta.frame_rate * 1_000.0).round().max(1.0) as u32;
+        // The plugin wants an exact rational, and the muxer already picks one
+        // that is exact at every rate we can read -- `fps * 1000 / 1000` would
+        // hand 24000/1001 over as a rounded 23.976, which is the same
+        // truncation the container timing had.
+        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
         if !settings.force_sw
             && !forced("VE_SW_ENC")
-            && let Some(hw) = HwEncoder::open(meta.width, meta.height, fps_num, 1_000, bitrate)
+            && let Some(hw) = HwEncoder::open(meta.width, meta.height, fps_num, fps_den, bitrate)
         {
             eprintln!("export encoder: hardware (VA-API plugin)");
             return Ok(Self::Hw(hw));
@@ -458,8 +460,9 @@ impl ClipDecoder {
 struct SwDecoder {
     demuxer: Demuxer,
     decoder: Decoder,
-    /// Display index of the next picture the decoder will produce.
-    index: u32,
+    /// Display index of the next picture the decoder will produce. Signed: a
+    /// sync sample inside what the edit list trims is before frame 0.
+    index: i64,
     start: u32,
     frame: Option<YuvFrame>,
 }
@@ -469,12 +472,11 @@ impl SwDecoder {
         let (_, mut demuxer) = Demuxer::open(path)?;
         // Decoding restarts at a sync sample, so pictures between it and the in
         // point are decoded (the target references them) and then dropped.
-        // Sample ids are 1-based, frame indices 0-based.
-        let sync = demuxer.seek_to_sync_at_or_before(start_frame.saturating_add(1));
+        let index = demuxer.seek_to_sync_at_or_before(start_frame);
         Ok(Self {
             demuxer,
             decoder: Decoder::new(),
-            index: sync - 1,
+            index,
             start: start_frame,
             frame: None,
         })
@@ -492,7 +494,7 @@ impl SwDecoder {
                 .decode(&au)
                 .map_err(|e| format!("decode at picture {}: {e}", self.index))?;
             let Some(yuv) = decoded else { continue };
-            let wanted = self.index >= self.start;
+            let wanted = self.index >= i64::from(self.start);
             self.index += 1;
             if wanted {
                 self.frame = Some(yuv);
