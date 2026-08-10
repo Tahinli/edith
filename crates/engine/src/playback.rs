@@ -590,6 +590,15 @@ impl PlaybackSession {
             .composite_clip_at(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// Which clip of `lane` sits at `timeline_secs`, by the same rule
+    /// [`video_clip_at`](Self::video_clip_at) picks the picture's with -- per
+    /// lane, so a keyboard walking the lanes for something to select asks the
+    /// engine rather than re-deriving where a clip ends.
+    pub fn lane_clip_at(&self, lane: Lane, timeline_secs: f64) -> Option<usize> {
+        self.project
+            .lane_clip_at(lane, secs_to_frame(timeline_secs, self.meta.frame_rate))
+    }
+
     /// How the clip at `idx` of `lane` is graded, or `None` for one that plays
     /// as it was shot -- what a colour card reads when it opens.
     pub fn color_of(&self, lane: Lane, idx: usize) -> Option<&ColorParams> {

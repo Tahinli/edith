@@ -842,6 +842,14 @@ impl Project {
         Some((video[winner], at(self.lane(video[winner]), timeline_frame)?))
     }
 
+    /// Which clip of *one* lane `timeline_frame` falls on, or `None` over a gap
+    /// and past that lane's end. [`composite_clip_at`](Project::composite_clip_at)
+    /// answers "the clip on screen"; this answers it per lane, which is what
+    /// walking the lanes for something to select needs.
+    pub fn lane_clip_at(&self, lane: Lane, timeline_frame: u32) -> Option<usize> {
+        at(self.lane(lane), timeline_frame)
+    }
+
     /// How the composite is graded at `timeline_frame`, so the picture playback
     /// converts and the one an export encodes are graded from one answer.
     /// `None` over a gap (black is black) and for a clip nobody has graded,
@@ -1845,6 +1853,26 @@ mod tests {
         assert!(!p.lift(Lane::V1, 0), "an empty one is not");
         assert!(!p.lift(Lane::A1, 0), "index past the end");
         assert_eq!(p.timeline_frames(), 9);
+    }
+
+    /// What a keyboard selection walks: one answer per lane, gaps included --
+    /// the composite's own answer is one lane's and cannot say what the audio
+    /// lane holds under the same playhead.
+    #[test]
+    fn lane_clip_at_answers_for_each_lane_separately() {
+        let mut p = Project::single(FILE, 9);
+        assert!(p.split(3), "both lanes split");
+        assert_eq!(p.lane_clip_at(Lane::V1, 0), Some(0));
+        assert_eq!(p.lane_clip_at(Lane::V1, 3), Some(1));
+        assert_eq!(p.lane_clip_at(Lane::A1, 3), Some(1));
+        assert_eq!(p.lane_clip_at(Lane::V1, 9), None, "past the end");
+        // A gap on one lane leaves the other's clip selectable there.
+        assert!(p.lift(Lane::A1, 0));
+        assert_eq!(p.lane_clip_at(Lane::A1, 0), None, "the gap holds nothing");
+        assert_eq!(p.lane_clip_at(Lane::A1, 3), Some(0), "indices moved with it");
+        assert_eq!(p.lane_clip_at(Lane::V1, 0), Some(0));
+        // A lane that is not there is not a panic.
+        assert_eq!(p.lane_clip_at(Lane::new(LaneKind::Video, 1), 0), None);
     }
 
     #[test]
