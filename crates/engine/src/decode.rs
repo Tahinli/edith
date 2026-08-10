@@ -10,7 +10,7 @@ use std::thread;
 use rusty_h264::Decoder;
 
 use crate::convert::i420_to_bgra;
-use crate::demux::{Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
 
 /// One decoded picture, ready to hand to a renderer.
@@ -181,6 +181,14 @@ impl DecodeSession {
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
+        // No software VP9 decoder exists, so a VP9 file the plugin will not take
+        // is refused *here*, where the caller still has somewhere to show it --
+        // a worker that opened and then produced nothing is a black screen with
+        // no explanation. The probe session is opened and dropped: it costs one
+        // extra VA-API init (~90 ms) and only on the VP9 path.
+        if meta.codec != Codec::H264 && open_hw(&path, start_frame).is_none() {
+            return Err(crate::demux::VP9_NEEDS_PLUGIN.into());
+        }
         let end_frame = end_frame.min(meta.frame_count);
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
         // decoder run ahead of the display without limit.
@@ -226,6 +234,12 @@ impl DecodeSession {
                     // A driver that opens but cannot decode a single frame is
                     // still a fallback case, not a dead session.
                     eprintln!("hardware decode failed before any frame, falling back to software");
+                }
+                // ...except where there is nothing to fall back to. Feeding VP9
+                // bytes to `rusty_h264` would be garbage, not a fallback.
+                if meta.codec != Codec::H264 {
+                    eprintln!("{}", crate::demux::VP9_NEEDS_PLUGIN);
+                    return;
                 }
                 eprintln!("decode backend: software (rusty_h264)");
                 run(demuxer, tx, start_frame, end_frame, &worker_cancel)

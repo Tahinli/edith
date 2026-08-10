@@ -1,4 +1,6 @@
-//! MP4 demux: pulls the H.264 track out as Annex-B access units.
+//! MP4 demux: pulls the video track out as access units the decoders take --
+//! Annex-B for H.264, the sample bytes untouched for VP9 (an mp4 VP9 sample is
+//! a self-contained superframe already).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -10,12 +12,38 @@ use crate::audio::{edit_media_time, packet_at, stts_pairs};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// What the video track is coded with. Not a decoder choice by itself: VP9 has
+/// no software decoder at all, which is what [`VP9_NEEDS_PLUGIN`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    H264,
+    Vp9,
+}
+
+impl Codec {
+    /// How a refusal names it, and how a mismatch reads to a user.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Vp9 => "VP9",
+        }
+    }
+}
+
+/// Why a VP9 file can be refused outright: `rusty_h264` is the only software
+/// decoder in the project and there is no pure-Rust VP9 one to fall back to, so
+/// without the plugin there is nothing to decode with. Shared so playback and
+/// export refuse in the same words.
+pub const VP9_NEEDS_PLUGIN: &str =
+    "VP9 needs the VA-API plugin (libengine_hw.so) — there is no software VP9 decoder";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoMeta {
     pub width: u32,
     pub height: u32,
     pub frame_rate: f64,
     pub frame_count: u32,
+    pub codec: Codec,
 }
 
 pub struct Demuxer {
@@ -26,7 +54,9 @@ pub struct Demuxer {
     /// a couple of frames into the media, exactly as it does for audio priming
     /// (`audio::priming_samples`), and frame indices count from there.
     first_sample: u32,
-    /// Annex-B SPS+PPS, re-injected ahead of every sync sample.
+    codec: Codec,
+    /// Annex-B SPS+PPS, re-injected ahead of every sync sample. Empty for VP9,
+    /// which carries no out-of-band parameter sets.
     parameter_sets: Vec<u8>,
     /// `stss` entries, ascending 1-based sample ids. Empty means no `stss` box
     /// at all, i.e. every sample is a sync sample.
@@ -43,8 +73,13 @@ impl Demuxer {
         let track = reader
             .tracks()
             .values()
-            .find(|t| matches!(t.media_type(), Ok(MediaType::H264)))
-            .ok_or("no H.264 video track in file")?;
+            .find_map(|t| match t.media_type() {
+                Ok(MediaType::H264) => Some((t, Codec::H264)),
+                Ok(MediaType::VP9) => Some((t, Codec::Vp9)),
+                _ => None,
+            })
+            .ok_or("no H.264 or VP9 video track in file")?;
+        let (track, codec) = track;
 
         let track_id = track.track_id();
         let meta = VideoMeta {
@@ -52,13 +87,16 @@ impl Demuxer {
             height: track.height() as u32,
             frame_rate: frame_rate(track),
             frame_count: 0,
+            codec,
         };
         let first_sample = first_frame_sample(stts_pairs(track), trim_ticks(track));
         let mut parameter_sets = Vec::new();
-        parameter_sets.extend_from_slice(&START_CODE);
-        parameter_sets.extend_from_slice(track.sequence_parameter_set()?);
-        parameter_sets.extend_from_slice(&START_CODE);
-        parameter_sets.extend_from_slice(track.picture_parameter_set()?);
+        if codec == Codec::H264 {
+            parameter_sets.extend_from_slice(&START_CODE);
+            parameter_sets.extend_from_slice(track.sequence_parameter_set()?);
+            parameter_sets.extend_from_slice(&START_CODE);
+            parameter_sets.extend_from_slice(track.picture_parameter_set()?);
+        }
         let sync_samples = track
             .trak
             .mdia
@@ -85,6 +123,7 @@ impl Demuxer {
                 track_id,
                 sample_count,
                 first_sample,
+                codec,
                 parameter_sets,
                 sync_samples,
                 next_sample,
@@ -92,7 +131,8 @@ impl Demuxer {
         ))
     }
 
-    /// Next access unit in decode order, Annex-B framed. `None` at end of track.
+    /// Next access unit in decode order: Annex-B framed for H.264, the mp4
+    /// sample verbatim for VP9. `None` at end of track.
     pub fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
         if self.next_sample > self.sample_count {
             return Ok(None);
@@ -102,6 +142,11 @@ impl Demuxer {
         let Some(sample) = sample else {
             return Ok(None);
         };
+        // A VP9 mp4 sample is one (super)frame the decoder parses on its own:
+        // no length prefixes to strip, no parameter sets to re-inject.
+        if self.codec == Codec::Vp9 {
+            return Ok(Some(sample.bytes.to_vec()));
+        }
 
         let mut au = Vec::with_capacity(self.parameter_sets.len() + sample.bytes.len() + 16);
         if sample.is_sync {
