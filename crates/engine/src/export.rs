@@ -286,6 +286,13 @@ fn run(
             }
             None => None,
         };
+        // What this span is graded by -- the same answer playback's decoder
+        // carries, so the export is the picture that was watched. `None` for a
+        // gap and for an ungraded clip, and that is the path where not a byte
+        // is touched. Scratch outside the frame loop: it is refilled per frame
+        // and its allocation survives the whole span.
+        let grade = project.composite_color_at(span.start).copied();
+        let mut graded = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..span.len {
             cancelled(shared)?;
             let picture = match &mut pictures {
@@ -294,6 +301,24 @@ fn run(
             };
             let Some((y, u, v, width, height)) = picture else {
                 break; // source ran out early; the clip list outlives the file
+            };
+            // The planes are borrowed from the decoder (and `Black::picture`
+            // hands the same slice as both u and v), so a grade cannot be
+            // applied in place: it goes onto a copy, which the encoder then
+            // reads instead.
+            let (y, u, v) = match grade.filter(|p| !p.is_identity()) {
+                Some(params) => {
+                    let (gy, gu, gv) = &mut graded;
+                    gy.clear();
+                    gy.extend_from_slice(y);
+                    gu.clear();
+                    gu.extend_from_slice(u);
+                    gv.clear();
+                    gv.extend_from_slice(v);
+                    crate::color::apply_yuv(&params, gy, gu, gv);
+                    (&gy[..], &gu[..], &gv[..])
+                }
+                None => (y, u, v),
             };
             if let Some(au) = encoder.encode(y, u, v, width, height)? {
                 write_video(&mut muxer, out, meta, audio_params.as_ref(), au)?;
