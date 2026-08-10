@@ -186,7 +186,8 @@ impl Mp4Muxer {
 /// export, which is this bug's own truncation reborn at the writing end.
 pub(crate) fn frame_timing(fps: f64) -> crate::Result<(u32, u32)> {
     let ticks = f64::from(VIDEO_TIMESCALE) / fps;
-    if (ticks - ticks.round()).abs() < 1e-9 && (1.0..=f64::from(u32::MAX)).contains(&ticks.round()) {
+    if (ticks - ticks.round()).abs() < 1e-9 && (1.0..=f64::from(u32::MAX)).contains(&ticks.round())
+    {
         return Ok((VIDEO_TIMESCALE, ticks.round() as u32));
     }
     let timescale = (fps * f64::from(NTSC_TICKS)).round();
@@ -503,7 +504,9 @@ mod tests {
             None,
         )
         .unwrap();
-        muxer.write_video_au(&au(&[SPS, PPS, &[0x65, 0x01]])).unwrap();
+        muxer
+            .write_video_au(&au(&[SPS, PPS, &[0x65, 0x01]]))
+            .unwrap();
         muxer.write_video_au(&au(&[&[0x41, 0x02]])).unwrap();
         muxer.finish().unwrap();
 

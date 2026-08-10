@@ -6,21 +6,28 @@ use std::path::Path;
 
 use crate::AudioSession;
 
-/// `(min, max)` of every sample in each `1 / buckets_per_sec` window of `path`'s
-/// audio, from media time 0 (priming already trimmed by the decoder). Channels
-/// are folded together: one envelope per clip, not per channel.
+/// `(min, max)` of every sample in each `1 / buckets_per_sec` window of
+/// `stream` of `path`'s audio, from media time 0 (priming already trimmed by
+/// the decoder). Channels are folded together: one envelope per clip, not per
+/// channel.
 ///
 /// `Ok(None)` for a file with no audio track — a silent source is valid, not a
 /// failure. Values are clamped to `[-1.0, 1.0]`, and a bucket's pair always
 /// straddles zero, so silence draws as a flat line.
 ///
 /// Decoding the whole file runs at ~1700x realtime, but it is still linear in
-/// source length: callers cache the result per source, never per repaint.
+/// source length: callers cache the result per source *and stream* — two
+/// streams of one file are two different envelopes, and a cache keyed on the
+/// path alone would draw the first one under both.
 pub fn peaks(
     path: impl AsRef<Path>,
+    stream: usize,
     buckets_per_sec: u32,
 ) -> crate::Result<Option<Vec<(f32, f32)>>> {
-    let Some((meta, rx)) = AudioSession::open(path)? else {
+    let sources = [(path.as_ref().to_path_buf(), stream)];
+    let Some((meta, rx)) =
+        AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])?
+    else {
         return Ok(None);
     };
     // Kept fractional: 44100 / 30 is not whole, and rounding it would drift a
@@ -62,7 +69,7 @@ mod tests {
 
     #[test]
     fn peaks_follow_the_1hz_volume_pulse() {
-        let peaks = peaks(asset("test_av.mp4"), BPS)
+        let peaks = peaks(asset("test_av.mp4"), 0, BPS)
             .expect("open")
             .expect("test_av.mp4 has an audio track");
         // 5 s of source; the container's tail padding may spill one bucket.
@@ -112,9 +119,28 @@ mod tests {
     #[test]
     fn video_only_source_has_no_peaks() {
         assert!(
-            peaks(asset("test_baseline.mp4"), BPS)
+            peaks(asset("test_baseline.mp4"), 0, BPS)
                 .expect("open")
                 .is_none()
         );
+    }
+
+    /// Two streams of one file are two envelopes: the lane draws what the clip
+    /// actually plays, so a cache keyed on the path alone would be a lie the
+    /// user can see. Stream 1 of the fixture is 2 s of 220 Hz mono against
+    /// stream 0's 4-second-long pulsed stereo pair.
+    #[test]
+    fn each_stream_of_a_file_has_its_own_envelope() {
+        let multi = asset("test_multiaudio.mp4");
+        let zero = peaks(&multi, 0, BPS).expect("open").expect("stream 0");
+        let one = peaks(&multi, 1, BPS).expect("open").expect("stream 1");
+        assert!(!zero.is_empty() && !one.is_empty());
+        // Bucket for bucket, not merely somewhere: a cache keyed on the path
+        // alone would hand the lane the *first* stream's shape for both, and
+        // that is what this refuses.
+        assert_ne!(zero, one, "both streams drew the same envelope");
+        assert_ne!(zero[0], one[0], "...and they differ from the first bucket");
+        // A stream that does not decode is refused, not drawn as silence.
+        assert!(peaks(&multi, 2, BPS).is_err(), "AC-3 has no envelope");
     }
 }
