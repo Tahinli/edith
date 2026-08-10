@@ -1619,6 +1619,15 @@ impl Player {
             cx.notify();
             return;
         }
+        // The format row can be refused *after* it was picked -- mp4 is the
+        // default and an audio-only timeline (or a second audio lane) is one
+        // edit away -- so the button asks again rather than starting a worker
+        // that will only settle with the same refusal minutes later.
+        if let (Format::Mp4, Some(why)) = (self.format, mp4_refusal(session)) {
+            self.notice = Some(format!("NOT EXPORTED — {why}").into());
+            cx.notify();
+            return;
+        }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
         // The card has been answered; the progress line takes the panel from
@@ -4403,7 +4412,19 @@ fn is_bare_modifier(key: &str) -> bool {
 /// timeline whose sound is spread over more than one audio lane is refused by
 /// the engine (`export::run`). Said on the row, before a destination has been
 /// picked, rather than after the write has started.
+///
+/// An audio-only timeline is the other one: every frame of it is a gap, so the
+/// mp4 would be a black picture over the sound. The engine refuses it too
+/// (`export::start`); this is what greys the row before a destination has been
+/// picked.
 fn mp4_refusal(session: &PlaybackSession) -> Option<String> {
+    let picture = session
+        .lanes()
+        .into_iter()
+        .any(|lane| lane.kind == LaneKind::Video && !session.lane_clips(lane).is_empty());
+    if !picture {
+        return Some("no picture — an mp4 would be black; export WAV or FLAC".to_string());
+    }
     let lanes = session
         .lanes()
         .into_iter()
@@ -4902,6 +4923,57 @@ mod tests {
         // before any clip names that entry.
         let two = [source("/m/0.mp4", 0), source("/m/0.mp4", 1)];
         assert_eq!(source_frames([clip(0, 90)].iter(), &two, &two[1].path), 90);
+    }
+
+    /// The window opened on a song and nothing else -- the launch argument, the
+    /// drop on an empty window and the Import button all end in the same
+    /// `PlaybackSession::open`. The library lists it placeable, the lane door
+    /// the Add button and a drag share puts it on `A1`, and the one format that
+    /// needs a picture says so on its own row instead of failing at the end of
+    /// an export.
+    #[test]
+    fn a_song_opens_the_window_by_itself() {
+        let mut session =
+            PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
+        session.set_gain(0.0);
+        // The source's own path, which is the canonical one a row carries.
+        let path = session.sources()[0].path.clone();
+        assert!(session.lane_clips(Lane::V1).is_empty(), "no picture");
+        assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+
+        // The library row: probed like any other source, and not greyed --
+        // `unusable` is what the panel dims a row with.
+        let streams = HashMap::from([(
+            path.clone(),
+            engine::AudioSession::probe_streams(&path).expect("probe the song"),
+        )]);
+        let rate = streams[&path]
+            .iter()
+            .find(|s| s.index == session.sources()[0].audio_stream)
+            .map(|s| (s.sample_rate, s.channels));
+        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        let rows = library_rows(session.sources(), &streams, rate, |_| frames);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "test_tone.mp3");
+        assert_eq!(rows[0].unusable, None, "the row is placeable");
+        assert_eq!(rows[0].frames, 90, "3 s at the audio-only 30 fps");
+
+        // ...and it places, on the audio lane, through the door `insert_source`
+        // uses: a second copy of the song at the playhead.
+        session.seek(1.0);
+        assert!(
+            session
+                .place_stream_at(1.0, &path, 0, frames, Some(Lane::A1))
+                .expect("its own file is on this timeline")
+        );
+        assert_eq!(session.lane_clips(Lane::A1).len(), 2);
+        assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
+
+        // The mp4 row carries the reason rather than the format's detail line.
+        assert_eq!(
+            mp4_refusal(&session).as_deref(),
+            Some("no picture — an mp4 would be black; export WAV or FLAC")
+        );
     }
 
     fn info(
