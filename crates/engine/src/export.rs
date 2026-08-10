@@ -1,9 +1,13 @@
-//! Export: the edit list rendered back out as one mp4.
+//! Export: the edit list rendered back out as one mp4 — or, picture left
+//! behind, as one WAV or FLAC of the timeline's audio alone.
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
 //! is impossible — while audio is copied packet for packet, because there is no
-//! pure-Rust AAC encoder to re-encode with. The worker owns everything: the
-//! caller gets an [`ExportHandle`] and polls it from its render loop.
+//! pure-Rust AAC encoder to re-encode with. The audio-only formats have no such
+//! trouble: `hound` writes PCM and `flacenc` encodes FLAC, both pure Rust, so
+//! those are *decoded* out of the timeline instead of copied. The worker owns
+//! everything: the caller gets an [`ExportHandle`] and polls it from its render
+//! loop.
 //!
 //! Nothing partial survives a failure: the worker writes to `<out>.part` and
 //! renames it onto `out` only once the file is closed and complete, so the
@@ -20,7 +24,10 @@ use std::thread;
 
 use rusty_h264::{Decoder, Encoder, EncoderConfig, Preset, YuvFrame};
 
-use crate::audio::AudioSession;
+use flacenc::component::BitRepr;
+use flacenc::error::Verify;
+
+use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
@@ -36,18 +43,55 @@ const BITS_PER_PIXEL: f64 = 0.1;
 const MIN_BITRATE: u64 = 1_000_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
-/// What the caller gets to decide about the output. The codec and container are
-/// not among it: H.264 in mp4 is the only pair with both an encoder and a
-/// decoder under this project's no-install rule, so offering a choice would be
-/// offering files we cannot read back.
+/// What an export writes. Three, not more: H.264-in-mp4 is the only *video*
+/// pair with both an encoder and a decoder under this project's no-install
+/// rule, and WAV and FLAC are the only audio formats with a pure-Rust encoder
+/// at all. MP3 has one (`shine-rs`) under LGPL-2.0, which is a licensing
+/// decision this project has not taken; Vorbis, Opus and AAC have none. A
+/// front-end says so rather than hiding the rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Format {
+    /// Picture and sound: video re-encoded, AAC copied.
+    #[default]
+    Mp4,
+    /// The audio lane alone, 16-bit PCM.
+    Wav,
+    /// The audio lane alone, losslessly compressed.
+    Flac,
+}
+
+impl Format {
+    /// The extension a file of this format is named with -- a front-end builds
+    /// the destination path from it, so the name never disagrees with the bytes.
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Wav => "wav",
+            Self::Flac => "flac",
+        }
+    }
+
+    /// Whether this format carries the picture. The bitrate settings are video
+    /// settings and mean nothing to the other two.
+    pub fn has_video(self) -> bool {
+        matches!(self, Self::Mp4)
+    }
+}
+
+/// What the caller gets to decide about the output. The codec is not among it:
+/// [`Format`] names a container *and* what goes in it, because every pair we
+/// can write is a pair we can also read back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExportSettings {
     /// Bits per second, clamped to the same sane range the automatic value uses.
-    /// `None` picks it from the picture size and frame rate.
+    /// `None` picks it from the picture size and frame rate. Video only.
     pub bitrate: Option<u64>,
     /// Skip the hardware encoder even where it is available -- an escape hatch
     /// for a driver that encodes badly, matching the `VE_SW_ENC` env pin.
     pub force_sw: bool,
+    /// The file to write. Defaults to [`Format::Mp4`], which is what every
+    /// caller wrote before there was a choice.
+    pub format: Format,
 }
 
 struct Shared {
@@ -118,8 +162,11 @@ pub fn start(
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
-        let result = run(&project, &meta, &part, &worker, &settings)
-            .and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
+        let written = match settings.format {
+            Format::Mp4 => run(&project, &meta, &part, &worker, &settings),
+            format => run_audio(&project, &meta, &part, &worker, format),
+        };
+        let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
             // The muxer -- and with it the file handle -- died with `run`.
             let _ = std::fs::remove_file(&part);
@@ -229,6 +276,127 @@ fn run(
     cancelled(shared)?;
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The audio lane alone, as a WAV or a FLAC.
+///
+/// Nothing here re-derives the edit: the play list is
+/// [`Project::segments_from`] and it is handed to the very
+/// [`AudioSession::open_multi_streams`] playback feeds from, so what is written
+/// is what was heard -- gaps included, which arrive as real silence from that
+/// choke point rather than as a hole this would have to invent.
+///
+/// The length is the *timeline's*: each segment resolves its window to whole
+/// samples on its own, so the sum can miss the timeline by a sample or two, and
+/// a source that runs out early would leave the file short. Both are settled by
+/// one `resize` at the end -- padding with silence, trimming what overshot --
+/// so an exported file is exactly as long as what was edited.
+fn run_audio(
+    project: &Project,
+    meta: &VideoMeta,
+    out: &Path,
+    shared: &Shared,
+    format: Format,
+) -> crate::Result<()> {
+    let sources = project.audio_sources();
+    let segs = project.segments_from(0, meta.frame_rate);
+    let Some((audio, chunks)) = AudioSession::open_multi_streams(&sources, &segs)? else {
+        return Err("this timeline has no audio to export".into());
+    };
+    let channels = usize::from(audio.channels);
+    let frames = (f64::from(project.timeline_frames()) / meta.frame_rate
+        * f64::from(audio.sample_rate))
+    .round() as u64;
+    let total = frames as usize * channels;
+    // ponytail: the whole export sits in memory (4 bytes a sample, so ~23 MB
+    // per minute of 48 kHz stereo). `flacenc::MemSource` wants it that way and
+    // the mp4 path already collects its copied AAC track the same. Upgrade path
+    // is hound's incremental writer plus flacenc's `Source` trait.
+    let mut samples: Vec<i32> = Vec::with_capacity(total);
+    for chunk in chunks {
+        cancelled(shared)?;
+        // ponytail: the per-segment EQ goes here -- `EqState::process` on this
+        // same interleaved f32 buffer, before the quantisation below, which is
+        // the point playback's feeder will call it from too. Not wired: the EQ
+        // slice owns that, this is only the seat kept for it.
+        samples.extend(
+            chunk
+                .samples
+                .iter()
+                .map(|s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i32),
+        );
+        let done = samples.len().min(total) * PROGRESS_SCALE as usize / total.max(1);
+        shared.progress.store(done as u32, Ordering::Relaxed);
+    }
+    samples.resize(total, 0);
+    // Written in one go and still cancellable up to here, exactly as the mp4
+    // path is up to its `finish`: the `.part` is what either gets renamed or
+    // deleted.
+    cancelled(shared)?;
+    match format {
+        Format::Wav => write_wav(out, &samples, &audio)?,
+        Format::Flac => write_flac(out, &samples, &audio)?,
+        Format::Mp4 => unreachable!("the mp4 path is `run`"),
+    }
+    shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
+    Ok(())
+}
+
+/// 16-bit PCM at the timeline's own rate and layout: no resampling anywhere in
+/// this engine, so what the decoder handed over is what the header says.
+fn write_wav(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()> {
+    let mut writer = hound::WavWriter::create(
+        out,
+        hound::WavSpec {
+            channels: audio.channels,
+            sample_rate: audio.sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )?;
+    for &sample in samples {
+        writer.write_sample(sample as i16)?;
+    }
+    // Not `drop`: this is what rewrites the RIFF sizes in the header, and its
+    // failure is the difference between a finished file and a truncated one.
+    writer.finalize()?;
+    Ok(())
+}
+
+/// The same samples, losslessly compressed. `flacenc`'s errors are flattened to
+/// text: they are not `Send + Sync`, and every one of them fails the export the
+/// same way.
+fn write_flac(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()> {
+    let config = flacenc::config::Encoder::default()
+        .into_verified()
+        .map_err(|(_, e)| format!("flac encoder config: {e}"))?;
+    let source = flacenc::source::MemSource::from_samples(
+        samples,
+        usize::from(audio.channels),
+        16,
+        audio.sample_rate as usize,
+    );
+    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|e| format!("flac encode: {e}"))?;
+    // The block sizes are stated fixed, which is what the frames themselves say
+    // (they are numbered, not sample-addressed). flacenc's single-threaded path
+    // instead writes the *last* frame's length as the minimum, and a short final
+    // frame is the normal case -- a stream whose `streaminfo` then disagrees
+    // with its own blocking strategy. ffmpeg shrugs and plays it; symphonia,
+    // which is this engine's own reader, rejects every frame header and reads
+    // to EOF looking for a good one. Written this way the file reopens here,
+    // which is the only test of an export that counts. (Same value flacenc's
+    // own `par` path writes; the reference encoder does it too.)
+    stream
+        .stream_info_mut()
+        .set_block_sizes(config.block_size, config.block_size)
+        .map_err(|e| format!("flac block size: {e}"))?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| format!("flac write: {e}"))?;
+    std::fs::write(out, sink.as_slice())?;
     Ok(())
 }
 
