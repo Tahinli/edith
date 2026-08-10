@@ -1299,6 +1299,17 @@ impl Player {
             key: key.to_string(),
             ctrl,
         };
+        // Only a stroke the file can spell and read back as itself: gpui reports
+        // "+" for shift+=, which is the chord grammar's separator, so binding it
+        // would write a line the next load would have to drop. Refused here, in
+        // front of the user, rather than silently costing that binding later.
+        // The row keeps waiting, as it does for a stroke already taken.
+        if !chord.bindable() {
+            let text = format!("THAT KEY CANNOT BE BOUND — {}", chord.pretty());
+            eprintln!("{text}");
+            self.notice = Some(text.into());
+            return;
+        }
         let text = match self.keymap.rebind_action(action, chord.clone()) {
             Ok(()) => {
                 self.rebinding = None;
