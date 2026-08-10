@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::export::ExportSettings;
-use engine::project::Lane;
+use engine::project::{Lane, LaneKind};
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
@@ -424,10 +424,10 @@ impl Player {
             return;
         }
         let deleted = match (&mut self.session, self.selected.take()) {
-            (Some(session), Some((Lane::Video, idx))) => session.delete_clip(idx),
-            (Some(session), Some((Lane::Audio, idx))) => match video_half(session, idx) {
+            (Some(session), Some((Lane::V1, idx))) => session.delete_clip(idx),
+            (Some(session), Some((Lane::A1, idx))) => match video_half(session, idx) {
                 Some(video) => session.delete_clip(video),
-                None => session.lift_clip(Lane::Audio, idx),
+                None => session.lift_clip(Lane::A1, idx),
             },
             _ => false,
         };
@@ -1582,8 +1582,8 @@ impl Player {
                             ),
                     ),
             )
-            .child(self.lane_row(Lane::Video, "V1", duration, filled, cx))
-            .child(self.lane_row(Lane::Audio, "A1", duration, filled, cx))
+            .child(self.lane_row(Lane::V1, "V1", duration, filled, cx))
+            .child(self.lane_row(Lane::A1, "A1", duration, filled, cx))
     }
 
     /// A notice holds its own bar, full width, until it is answered: any key
@@ -1887,9 +1887,10 @@ impl Player {
         let (clips, others) = match &self.session {
             Some(session) => (
                 session.lane_clips(lane),
-                session.lane_clips(match lane {
-                    Lane::Video => Lane::Audio,
-                    Lane::Audio => Lane::Video,
+                session.lane_clips(if lane.kind == LaneKind::Video {
+                    Lane::A1
+                } else {
+                    Lane::V1
                 }),
             ),
             None => (&[][..], &[][..]),
@@ -1899,7 +1900,7 @@ impl Player {
             .as_ref()
             .map_or(&[][..], PlaybackSession::sources);
         let (sel, sel_link) = (self.selected, self.selected_link());
-        let audio = lane == Lane::Audio;
+        let audio = lane.kind == LaneKind::Audio;
         let tip: SharedString = format!(
             "Select — {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Delete),
@@ -2169,9 +2170,9 @@ fn unseen_sources(sources: &[PathBuf], waves: &HashMap<PathBuf, Wave>) -> Vec<Pa
 /// Both lanes' clips, which is everything the timeline knows about its sources.
 fn lane_clips(session: &PlaybackSession) -> impl Iterator<Item = &Clip> {
     session
-        .lane_clips(Lane::Video)
+        .lane_clips(Lane::V1)
         .iter()
-        .chain(session.lane_clips(Lane::Audio))
+        .chain(session.lane_clips(Lane::A1))
 }
 
 /// How long a source is, as the timeline knows it: the furthest frame any clip
@@ -2343,9 +2344,9 @@ fn start_frac(start: f64, total: f64) -> f32 {
 /// still holds that half. `None` for a half whose picture was lifted -- which is
 /// what makes it a thing of its own to delete.
 fn video_half(session: &PlaybackSession, audio: usize) -> Option<usize> {
-    let link = session.lane_clips(Lane::Audio).get(audio)?.link?;
+    let link = session.lane_clips(Lane::A1).get(audio)?.link?;
     session
-        .lane_clips(Lane::Video)
+        .lane_clips(Lane::V1)
         .iter()
         .position(|clip| clip.link == Some(link))
 }
@@ -2739,8 +2740,8 @@ mod tests {
         // timeline is longer by exactly that file.
         assert_eq!(session.timeline_duration(), 13.0);
         let (video, audio) = (
-            session.lane_clips(Lane::Video),
-            session.lane_clips(Lane::Audio),
+            session.lane_clips(Lane::V1),
+            session.lane_clips(Lane::A1),
         );
         // One take, not a video clip with no sound under it: both lanes hold
         // the same clip at the same place, in the same group.
@@ -3131,13 +3132,13 @@ mod tests {
 
     #[test]
     fn a_click_marks_the_whole_group_and_nothing_else() {
-        let (v, a) = ((Lane::Video, 0), (Lane::Audio, 0));
+        let (v, a) = ((Lane::V1, 0), (Lane::A1, 0));
         // Clicking the video half of group 1 marks the audio half with it.
         assert!(marked(v, Some(1), Some(v), Some(1)));
         assert!(marked(a, Some(1), Some(v), Some(1)));
         // Another group's clips stay unmarked, in either lane.
-        assert!(!marked((Lane::Video, 1), Some(2), Some(v), Some(1)));
-        assert!(!marked((Lane::Audio, 1), Some(2), Some(v), Some(1)));
+        assert!(!marked((Lane::V1, 1), Some(2), Some(v), Some(1)));
+        assert!(!marked((Lane::A1, 1), Some(2), Some(v), Some(1)));
         // A half a lift left behind has no group: it marks itself only, which
         // is what makes it separately deletable. Two ungrouped clips must not
         // mark each other by both being ungrouped.

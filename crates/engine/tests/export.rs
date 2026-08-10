@@ -563,7 +563,7 @@ fn a_leading_audio_gap_keeps_the_sound_after_it_in_place() {
     let source = asset("test_av.mp4");
     let mut session = PlaybackSession::open(&source).expect("open source");
     assert!(session.cut_at(1.0), "cut at 1 s");
-    assert!(session.lift_clip(Lane::Audio, 0), "lift the first second");
+    assert!(session.lift_clip(Lane::A1, 0), "lift the first second");
     session.pause();
     let out = out_path("leading_gap");
     let handle = session.export_to(&out);
@@ -614,8 +614,8 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
     assert!(session.cut_at(2.0), "split at 2 s");
     // Lift the middle out of *both* lanes: one second of black and silence in
     // the middle of a five-second timeline, with the length unchanged.
-    assert!(session.lift_clip(Lane::Video, 1));
-    assert!(session.lift_clip(Lane::Audio, 1));
+    assert!(session.lift_clip(Lane::V1, 1));
+    assert!(session.lift_clip(Lane::A1, 1));
     session.pause();
     let timeline = session.timeline_duration();
     let frames = (timeline * FPS).round() as u32;
