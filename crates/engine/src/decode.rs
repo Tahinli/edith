@@ -9,7 +9,8 @@ use std::thread;
 
 use rusty_h264::Decoder;
 
-use crate::convert::i420_to_bgra;
+use crate::color::ColorParams;
+use crate::convert::i420_to_bgra_with;
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
 
@@ -119,7 +120,10 @@ impl DecodeSession {
         start_frame: u32,
         end_frame: u32,
     ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
-        let (meta, stream) = Self::open_worker(path, start_frame, end_frame)?;
+        // Ungraded: the public API opens a *file*, and a colour grade belongs to
+        // a clip of a timeline. `PlaybackSession` is what has one to pass.
+        let (meta, stream) =
+            Self::open_worker(path, start_frame, end_frame, ColorParams::default())?;
         // The public API hands out the flag alone, so the worker is detached and
         // the receiver goes to the caller: nothing here joins anything.
         Ok((meta, stream.frames, stream.worker.detach()))
@@ -172,12 +176,20 @@ impl DecodeSession {
     }
 
     /// As [`DecodeSession::open_range`], but the caller gets the whole
-    /// [`Worker`] and can therefore *wait* for it. In-process only: a caller
-    /// that outlives its workers has to be able to join them at exit.
+    /// [`Worker`] and can therefore *wait* for it, and the range is graded by
+    /// `color` -- the clip's own setting, folded into the conversion the frames
+    /// go through anyway (see [`i420_to_bgra_with`]). It is captured here rather
+    /// than read per frame because a worker *is* one clip's range: a grade
+    /// changed while this one runs reaches the picture when the session reseeks
+    /// onto the new one, which every edit does.
+    ///
+    /// In-process only: a caller that outlives its workers has to be able to
+    /// join them at exit.
     pub(crate) fn open_worker(
         path: impl AsRef<Path>,
         start_frame: u32,
         end_frame: u32,
+        color: ColorParams,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
@@ -228,7 +240,7 @@ impl DecodeSession {
                         return;
                     }
                     eprintln!("decode backend: hardware (VA-API plugin)");
-                    if run_hw(hw, &tx, start_frame, end_frame, &worker_cancel) {
+                    if run_hw(hw, &tx, start_frame, end_frame, &color, &worker_cancel) {
                         return;
                     }
                     // A driver that opens but cannot decode a single frame is
@@ -242,7 +254,7 @@ impl DecodeSession {
                     return;
                 }
                 eprintln!("decode backend: software (rusty_h264)");
-                run(demuxer, tx, start_frame, end_frame, &worker_cancel)
+                run(demuxer, tx, start_frame, end_frame, &color, &worker_cancel)
             })?;
         Ok((
             meta,
@@ -277,6 +289,7 @@ fn run_hw(
     tx: &SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
+    color: &ColorParams,
     cancel: &AtomicBool,
 ) -> bool {
     let mut index = start_frame;
@@ -290,7 +303,7 @@ fn run_hw(
                     index,
                     width,
                     height,
-                    bgra: i420_to_bgra(y, u, v, width as usize, height as usize),
+                    bgra: i420_to_bgra_with(color, y, u, v, width as usize, height as usize),
                 };
                 index += 1;
                 if tx.send(frame).is_err() {
@@ -335,8 +348,13 @@ mod tests {
     /// regression fails in ten seconds instead of hanging the suite forever.
     #[test]
     fn dropping_a_frame_stream_never_waits_for_an_undrained_channel() {
-        let (_meta, stream) =
-            DecodeSession::open_worker(&asset("test_baseline.mp4"), 0, u32::MAX).expect("open");
+        let (_meta, stream) = DecodeSession::open_worker(
+            &asset("test_baseline.mp4"),
+            0,
+            u32::MAX,
+            ColorParams::default(),
+        )
+        .expect("open");
         // Nothing is ever received: two frames fill the channel and the next
         // send parks the decode thread, exactly as a refused project load does.
         thread::sleep(Duration::from_millis(500));
@@ -359,6 +377,7 @@ fn run(
     tx: SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
+    color: &ColorParams,
     cancel: &AtomicBool,
 ) {
     let mut decoder = Decoder::new();
@@ -398,7 +417,7 @@ fn run(
             index: index as u32,
             width: yuv.width as u32,
             height: yuv.height as u32,
-            bgra: i420_to_bgra(&yuv.y, &yuv.u, &yuv.v, yuv.width, yuv.height),
+            bgra: i420_to_bgra_with(color, &yuv.y, &yuv.u, &yuv.v, yuv.width, yuv.height),
         };
         index += 1;
         if tx.send(frame).is_err() {

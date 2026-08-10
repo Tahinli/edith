@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::audio::StreamInfo;
+use engine::color::ColorParams;
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source};
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
@@ -219,13 +220,35 @@ struct ContextMenu {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 5] = [
+const MENU_ITEMS: [ActionId; 6] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
+    ActionId::Color,
     ActionId::ToggleMute,
 ];
+
+/// The colour card's four controls, in the order it lists them: what each is
+/// called and the range it moves in. The order is `ColorParams`' own, which is
+/// what [`color_band`] indexes.
+const COLOR_BANDS: [(&str, f32, f32); 4] = [
+    ("Brightness", -1., 1.),
+    ("Contrast", 0., 2.),
+    ("Saturation", 0., 2.),
+    ("Tint (cool–warm)", -1., 1.),
+];
+
+/// A press of a nudge key or button: a fortieth of a band's range, so a slider
+/// crosses it in forty presses and every stop is a number the file can write.
+const COLOR_STEP: f32 = 0.05;
+
+/// The card's width: a slider row is a label, two buttons, the bar and the
+/// value, and the longest label has to fit beside all four without truncating
+/// (measured against "Tint (cool–warm)" at 460).
+const COLOR_W: f32 = 460.;
+/// How much of a slider row the bar itself gets.
+const COLOR_BAR_W: f32 = 140.;
 
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
@@ -321,6 +344,13 @@ struct Player {
     /// Which file the card will write. Kept across closes like the quality, and
     /// what [`Player::export_path`](Player) is named after.
     format: Format,
+    /// The colour card is up on this clip -- the lane it is on and its index
+    /// there. `None` when it is closed, which is the only place that state
+    /// lives: the grade itself is the project's.
+    color_open: Option<(Lane, usize)>,
+    /// Which of the card's four sliders the arrow keys and the buttons move.
+    /// The card's own focus, since nothing in it takes gpui's (ledger:182).
+    color_band: usize,
     /// The action whose row is waiting for a stroke. The next key that is
     /// neither escape nor a lone modifier becomes the whole of what reaches it.
     rebinding: Option<ActionId>,
@@ -431,6 +461,7 @@ impl Player {
             ActionId::Regroup => self.regroup(cx),
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
+            ActionId::Color => self.open_color(cx),
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
@@ -443,11 +474,86 @@ impl Player {
         }
     }
 
+    /// Opens the colour card on the clip a grade would go on: the clip that was
+    /// clicked when it is a video one, and otherwise the clip the picture is
+    /// coming from -- the one the engine's own compositing rule picks, which is
+    /// what a person means by "this shot". That fallback is also what makes the
+    /// card reachable with no pointer at all: clip selection is a click and
+    /// nothing else (ledger:182).
+    fn open_color(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.notice = Some("no timeline to grade — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let target = self
+            .selected
+            .filter(|(lane, _)| lane.kind == LaneKind::Video)
+            .or_else(|| session.video_clip_at(session.now()));
+        match target {
+            Some(clip) => {
+                self.color_open = Some(clip);
+                self.color_band = 0;
+                // One card at a time, the rule both the others already follow.
+                self.keys_open = false;
+                self.export_open = false;
+                self.context_menu = None;
+            }
+            None => self.notice = Some("no clip under the playhead to grade".into()),
+        }
+        cx.notify();
+    }
+
+    /// What the card's clip is graded by right now -- the identity for one
+    /// nobody has graded, which is what the sliders start at.
+    fn color_params(&self) -> ColorParams {
+        self.color_open
+            .zip(self.session.as_ref())
+            .and_then(|((lane, idx), session)| session.color_of(lane, idx).copied())
+            .unwrap_or_default()
+    }
+
+    /// Puts `params` on the card's clip, or takes the grade off when they are
+    /// the identity -- a slider walked back to the middle leaves the clip
+    /// ungraded rather than carrying a do-nothing entry, which is what keeps an
+    /// untouched project byte-identical. The engine reseeks on the edit, so the
+    /// frame on screen repaints through the new grade; this only owes the flags
+    /// that reseek clears.
+    fn set_color(&mut self, params: ColorParams, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.color_open else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let grade = Some(params).filter(|p| !p.is_identity());
+        if session.set_color(lane, idx, grade) {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// Moves the picked slider by `steps` of [`COLOR_STEP`], clamped to that
+    /// band's range. One edit, so one undo step per press.
+    fn nudge_color(&mut self, steps: f32, cx: &mut Context<Self>) {
+        let mut params = self.color_params();
+        let (_, low, high) = COLOR_BANDS[self.color_band];
+        let value = band_mut(&mut params, self.color_band);
+        *value = (*value + steps * COLOR_STEP).clamp(low, high);
+        self.set_color(params, cx);
+    }
+
     /// Whether a card owns the window. While one does the timeline under it is
     /// out of reach, so a right-click there opens no menu -- the same rule the
     /// key handler and the drop target already follow.
     fn modal(&self) -> bool {
-        self.keys_open || self.export_open || self.exporting().is_some()
+        self.keys_open
+            || self.export_open
+            || self.color_open.is_some()
+            || self.exporting().is_some()
     }
 
     /// Jumps the timeline.
@@ -1259,6 +1365,26 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The colour card owns the keyboard the same way the export
+                // card does, and its keys mean nothing outside it: the arrows
+                // pick a slider and move it, and `r` takes the grade off. Not
+                // keymap bindings for exactly that reason -- see `FIXED`, where
+                // the keys menu still lists them.
+                if this.color_open.is_some() {
+                    match color_key(key) {
+                        Some(ColorKey::Close) => this.color_open = None,
+                        Some(ColorKey::Band(step)) => {
+                            this.color_band = (this.color_band + step) % COLOR_BANDS.len();
+                        }
+                        Some(ColorKey::Nudge(steps)) => this.nudge_color(steps, cx),
+                        Some(ColorKey::Reset) => {
+                            this.set_color(ColorParams::default(), cx);
+                        }
+                        None => {}
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
@@ -1387,6 +1513,7 @@ impl Render for Player {
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
             .children(self.export_card(cx))
+            .children(self.color_card(cx))
     }
 }
 
@@ -2261,6 +2388,141 @@ impl Player {
         )
     }
 
+    /// The colour card: a row per control, each showing where in its range it
+    /// stands and carrying the pair of buttons that move it -- the same move the
+    /// arrow keys make, because a control only the pointer can reach is not one
+    /// everyone can reach. Same scrim, surface and row shape as the other two
+    /// cards, and the same plain divs, so the root keeps the keyboard.
+    ///
+    /// The values are read from the project every render: what is drawn is what
+    /// the decoder is grading with, never a copy that could drift from it.
+    fn color_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (lane, idx) = self.color_open?;
+        let params = self.color_params();
+        let rows: Vec<_> = COLOR_BANDS
+            .iter()
+            .enumerate()
+            .map(|(i, &(label, low, high))| {
+                let mut read = params;
+                let value = *band_mut(&mut read, i);
+                let frac = ((value - low) / (high - low)).clamp(0., 1.);
+                let picked = i == self.color_band;
+                // Both buttons of a row do what the arrows do, so there is one
+                // rule for what a press is worth and one place it is clamped.
+                let step = |name: &'static str, steps: f32| {
+                    div()
+                        .id((name, i))
+                        .w(px(CONTROL_H))
+                        .h(px(CONTROL_H))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.))
+                        .bg(rgb(CHROME))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(HOVER)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.color_band = i;
+                            this.nudge_color(steps, cx);
+                        }))
+                        .child(if steps < 0. { "–" } else { "+" })
+                };
+                div()
+                    .id(("color-row", i))
+                    .flex()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .when(picked, |d| d.bg(rgb(SELECTED)))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.color_band = i;
+                        cx.notify();
+                    }))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(step("color-down", -1.))
+                    .child(
+                        div()
+                            .w(px(COLOR_BAR_W))
+                            .h(px(4.))
+                            .rounded(px(2.))
+                            .bg(rgb(CHROME))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(frac))
+                                    .rounded(px(2.))
+                                    .bg(rgb(ACCENT)),
+                            ),
+                    )
+                    .child(step("color-up", 1.))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("{value:.2}")),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(COLOR_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(div().flex_none().px(px(6.)).child(format!(
+                            "Colour — {} clip {}",
+                            lane.label(),
+                            idx + 1
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child("↑↓ picks a slider, ←→ moves it, r resets — esc closes"),
+                        )
+                        .children(rows)
+                        .child(
+                            div()
+                                .id("color-reset")
+                                .mt(px(4.))
+                                .flex()
+                                .h(px(CONTROL_H))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(rgb(SELECTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_color(ColorParams::default(), cx);
+                                }))
+                                .child("Reset"),
+                        ),
+                ),
+        )
+    }
+
     /// The menu a right-click on a clip opens: what that clip can be given,
     /// each item beside the stroke that does the very same thing, and a
     /// turn-over side that says what the clip *is*. An item that would do
@@ -2336,7 +2598,7 @@ impl Player {
             }
         } else {
             for action in MENU_ITEMS {
-                let enabled = applicable(&clip, action, playhead);
+                let enabled = applicable(&clip, menu.lane, action, playhead);
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
@@ -2859,8 +3121,11 @@ fn frame_at(secs: f64, fps: f64) -> u32 {
 /// Whether the clip menu offers `action` on the clip it was opened on. Two of
 /// the items act on the *playhead* rather than on the clip, so a menu opened
 /// away from it dims them instead of looking broken when they are clicked.
-fn applicable(clip: &Clip, action: ActionId, playhead: u32) -> bool {
+fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool {
     match action {
+        // A grade is a picture setting and an audio clip has no picture: the
+        // item is there on every clip, and dimmed where it would mean nothing.
+        ActionId::Color => lane.kind == LaneKind::Video,
         // Splits this clip only from inside it: at either edge there is nothing
         // to split off (project.rs `splittable`).
         ActionId::Cut => clip.start < playhead && playhead < clip.end(),
@@ -3149,6 +3414,42 @@ fn format_key(key: &str) -> Option<Format> {
         .filter_map(|(format, label, _)| format.zip(label.get(..1)))
         .find(|(_, initial)| initial.eq_ignore_ascii_case(key))
         .map(|(format, _)| format)
+}
+
+/// What one of the colour card's own strokes does. Its keys are card-local --
+/// they mean nothing outside it -- so they are a table here rather than keymap
+/// bindings, exactly as the export card's format initials are. Listed in
+/// `keymap::FIXED` all the same, which is how the keys menu still says so.
+enum ColorKey {
+    Close,
+    /// Steps down the four sliders, wrapping.
+    Band(usize),
+    /// Moves the picked slider, in [`COLOR_STEP`]s.
+    Nudge(f32),
+    Reset,
+}
+
+fn color_key(key: &str) -> Option<ColorKey> {
+    Some(match key {
+        ESCAPE => ColorKey::Close,
+        "down" => ColorKey::Band(1),
+        "up" => ColorKey::Band(COLOR_BANDS.len() - 1),
+        "right" => ColorKey::Nudge(1.),
+        "left" => ColorKey::Nudge(-1.),
+        "r" => ColorKey::Reset,
+        _ => return None,
+    })
+}
+
+/// The band'th control of a grade, to read or to write. The order is
+/// [`COLOR_BANDS`]', which is the order the card lists them in.
+fn band_mut(params: &mut ColorParams, band: usize) -> &mut f32 {
+    match band {
+        0 => &mut params.brightness,
+        1 => &mut params.contrast,
+        2 => &mut params.saturation,
+        _ => &mut params.tint,
+    }
 }
 
 /// The line under the rows: what the picked format really writes, in the terms
@@ -3808,21 +4109,25 @@ mod tests {
         };
         assert_eq!(clip.end(), 90);
         // Cut splits from inside only: neither edge has anything to split off.
-        assert!(applicable(&clip, ActionId::Cut, 31));
-        assert!(applicable(&clip, ActionId::Cut, 89));
-        assert!(!applicable(&clip, ActionId::Cut, 30));
-        assert!(!applicable(&clip, ActionId::Cut, 90));
-        assert!(!applicable(&clip, ActionId::Cut, 200));
+        assert!(applicable(&clip, Lane::V1, ActionId::Cut, 31));
+        assert!(applicable(&clip, Lane::V1, ActionId::Cut, 89));
+        assert!(!applicable(&clip, Lane::V1, ActionId::Cut, 30));
+        assert!(!applicable(&clip, Lane::V1, ActionId::Cut, 90));
+        assert!(!applicable(&clip, Lane::V1, ActionId::Cut, 200));
         // Regroup is the other way round: only where this clip meets another.
-        assert!(applicable(&clip, ActionId::Regroup, 30));
-        assert!(applicable(&clip, ActionId::Regroup, 90));
-        assert!(!applicable(&clip, ActionId::Regroup, 60));
+        assert!(applicable(&clip, Lane::V1, ActionId::Regroup, 30));
+        assert!(applicable(&clip, Lane::V1, ActionId::Regroup, 90));
+        assert!(!applicable(&clip, Lane::V1, ActionId::Regroup, 60));
         // The rest act on the clip that was clicked, so they always mean
         // something -- the engine words its own refusals.
         for action in [ActionId::Delete, ActionId::Lift, ActionId::ToggleMute] {
-            assert!(applicable(&clip, action, 0));
-            assert!(applicable(&clip, action, 60));
+            assert!(applicable(&clip, Lane::V1, action, 0));
+            assert!(applicable(&clip, Lane::V1, action, 60));
         }
+        // Except the grade, which is a picture setting: offered on a video
+        // clip wherever the playhead is, dimmed on a waveform.
+        assert!(applicable(&clip, Lane::V1, ActionId::Color, 0));
+        assert!(!applicable(&clip, Lane::A1, ActionId::Color, 60));
         // The playhead frame is the engine's own rule, boundary included.
         assert_eq!(frame_at(1.0, 30.), 30);
         assert_eq!(frame_at(0.0, 30.), 0);
@@ -4834,6 +5139,8 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     export_open: false,
+                    color_open: None,
+                    color_band: 0,
                     // What an export is until someone says otherwise: the
                     // bitrate the picture asks for.
                     quality: Quality::Auto,

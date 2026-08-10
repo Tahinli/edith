@@ -757,11 +757,7 @@ impl Project {
         if timeline_frame >= total {
             return None;
         }
-        let video: Vec<Lane> = self
-            .lanes()
-            .into_iter()
-            .filter(|l| l.kind == LaneKind::Video)
-            .collect();
+        let video = self.video_lanes();
         // The last covering lane is the winner; only the lanes above it can
         // interrupt what it shows.
         let winner = video
@@ -792,6 +788,36 @@ impl Project {
             len: takeover.map_or(until, |t| t.min(until)) - timeline_frame,
             from,
         })
+    }
+
+    /// The video lanes in display order, topmost last -- the order the composite
+    /// rule counts in.
+    fn video_lanes(&self) -> Vec<Lane> {
+        self.lanes()
+            .into_iter()
+            .filter(|l| l.kind == LaneKind::Video)
+            .collect()
+    }
+
+    /// *Which* clip the composite shows at `timeline_frame`, named: the winner
+    /// of [`composite_span_at`](Project::composite_span_at)'s own rule and its
+    /// index on that lane. `None` over a gap and past the end. What a front-end
+    /// asks to act on "the clip on screen" without re-deriving the rule.
+    pub fn composite_clip_at(&self, timeline_frame: u32) -> Option<(Lane, usize)> {
+        let video = self.video_lanes();
+        let winner = video
+            .iter()
+            .rposition(|&lane| at(self.lane(lane), timeline_frame).is_some())?;
+        Some((video[winner], at(self.lane(video[winner]), timeline_frame)?))
+    }
+
+    /// How the composite is graded at `timeline_frame`, so the picture playback
+    /// converts and the one an export encodes are graded from one answer.
+    /// `None` over a gap (black is black) and for a clip nobody has graded,
+    /// which is the byte-identical path everywhere.
+    pub fn composite_color_at(&self, timeline_frame: u32) -> Option<&ColorParams> {
+        let (lane, idx) = self.composite_clip_at(timeline_frame)?;
+        self.color_of(lane, idx)
     }
 
     /// [`spans_from`](Project::spans_from) over the composite: every stretch the
