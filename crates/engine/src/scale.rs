@@ -330,6 +330,164 @@ pub fn compose_i420(
     }
 }
 
+/// One clip's pictures placed on the project canvas: the geometry, plus the
+/// buffers it composes into so a frame costs no allocation.
+///
+/// This is the *one* definition of what a mixed-resolution timeline looks like:
+/// playback ([`crate::decode`]) and export ([`crate::export`]) both hand their
+/// decoded planes to [`place`](Composer::place), so what is watched and what is
+/// written cannot drift apart.
+///
+/// **Order against the colour grade: grade first, place second.** A grade
+/// belongs to the clip's own pixels -- it is graded at the resolution it was
+/// shot at, which is also the cheaper end of a downscale -- and, decisively, the
+/// letterbox bars are *not* the clip: a brightness grade that reached them would
+/// lift the black frame around the picture. Callers therefore grade the source
+/// planes and place the result; the bars stay exactly [`black_i420`].
+///
+/// A canvas of the picture's own size is a pass-through: [`place`](Composer::place)
+/// hands the caller's own planes straight back, allocates nothing and touches no
+/// byte, which is what keeps a project at its media's resolution the byte-for-byte
+/// path it was before there was a project resolution at all.
+///
+/// [`place`]: Composer::place
+pub struct Composer {
+    width: u32,
+    height: u32,
+    policy: FitPolicy,
+    /// The `src` rect of [`fit_rect`], gathered tightly packed. Only `Fill` and
+    /// `Center` ever crop, so this stays empty for a letterboxed project.
+    crop: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The crop resampled to the placement rect.
+    scaled: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// The canvas itself, refilled with black every frame -- a memset against a
+    /// decode, and the only way a policy change cannot leave last frame's bars
+    /// showing through.
+    canvas: (Vec<u8>, Vec<u8>, Vec<u8>),
+}
+
+impl Composer {
+    pub fn new(width: u32, height: u32, policy: FitPolicy) -> Self {
+        let empty = || (Vec::new(), Vec::new(), Vec::new());
+        Self {
+            width,
+            height,
+            policy,
+            crop: empty(),
+            scaled: empty(),
+            canvas: empty(),
+        }
+    }
+
+    /// A composer that places nothing: every picture passes through at its own
+    /// size. What the file-level decode API opens with, where there is no
+    /// project and therefore no canvas.
+    pub fn passthrough() -> Self {
+        Self::new(0, 0, FitPolicy::Fit)
+    }
+
+    /// Whether a `src_w` x `src_h` picture is already the canvas, i.e. this
+    /// composer would hand it back untouched. What lets a caller keep a fused
+    /// fast path (the graded conversion) for the common case.
+    pub fn is_passthrough(&self, src_w: u32, src_h: u32) -> bool {
+        self.width == 0 || self.height == 0 || (src_w, src_h) == (self.width, self.height)
+    }
+
+    /// The picture as the project sees it: `(y, u, v, width, height)`, either the
+    /// caller's own planes (pass-through) or the canvas with the fitted picture
+    /// composed onto it. The dimensions come back because those two differ.
+    ///
+    /// Panics on a plane that is not exactly `src_w` x `src_h` (chroma at
+    /// `(w + 1) / 2`), as [`scale_i420`] does and for its reason.
+    pub fn place<'a>(
+        &'a mut self,
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        src_w: u32,
+        src_h: u32,
+    ) -> (&'a [u8], &'a [u8], &'a [u8], u32, u32) {
+        if self.is_passthrough(src_w, src_h) {
+            return (y, u, v, src_w, src_h);
+        }
+        let (dst, src) = fit_rect(src_w, src_h, self.width, self.height, self.policy);
+        let (sw, sh) = (src_w as usize, src_h as usize);
+
+        // Crop first, so the scaler only ever sees a tightly packed plane. Fit
+        // and Stretch never crop, which is the whole cost of the common case.
+        let (src_y, src_u, src_v) = if (src.w, src.h) == (src_w, src_h) {
+            (y, u, v)
+        } else {
+            crop_i420(&mut self.crop, y, u, v, sw, sh, src);
+            (&self.crop.0[..], &self.crop.1[..], &self.crop.2[..])
+        };
+        // ...then resample it to the placement, unless it already is that size
+        // (`Center` never resamples, and neither does an exact-fit upscale).
+        let (cw, ch) = (src.w as usize, src.h as usize);
+        let (dw, dh) = (dst.w as usize, dst.h as usize);
+        let (pic_y, pic_u, pic_v) = if (cw, ch) == (dw, dh) {
+            (src_y, src_u, src_v)
+        } else {
+            let (ccw, cch) = chroma_dims(dw, dh);
+            let (sy, su, sv) = &mut self.scaled;
+            sy.resize(dw * dh, 0);
+            su.resize(ccw * cch, 0);
+            sv.resize(ccw * cch, 0);
+            scale_i420(src_y, src_u, src_v, cw, ch, sy, su, sv, dw, dh);
+            (&sy[..], &su[..], &sv[..])
+        };
+
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (canvas_cw, canvas_ch) = chroma_dims(w, h);
+        let (ky, ku, kv) = &mut self.canvas;
+        fill(ky, w * h, BLACK_Y);
+        fill(ku, canvas_cw * canvas_ch, NEUTRAL_C);
+        fill(kv, canvas_cw * canvas_ch, NEUTRAL_C);
+        compose_i420(ky, ku, kv, w, h, pic_y, pic_u, pic_v, dst);
+        (ky, ku, kv, self.width, self.height)
+    }
+}
+
+/// Resizes `plane` to `len` and sets every byte to `value` -- a canvas reused
+/// across frames is refilled, not reallocated.
+fn fill(plane: &mut Vec<u8>, len: usize, value: u8) {
+    plane.clear();
+    plane.resize(len, value);
+}
+
+/// Gathers `rect` out of a tightly packed I420 frame into another tightly packed
+/// one. `rect` comes from [`fit_rect`], so its offsets are even and the chroma
+/// crop is exactly half of it.
+fn crop_i420(
+    out: &mut (Vec<u8>, Vec<u8>, Vec<u8>),
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    src_w: usize,
+    src_h: usize,
+    rect: Rect,
+) {
+    let (w, h) = (rect.w as usize, rect.h as usize);
+    let (x, cy0) = (rect.x as usize, rect.y as usize);
+    let (src_cw, _) = chroma_dims(src_w, src_h);
+    let (cw, ch) = chroma_dims(w, h);
+    let (oy, ou, ov) = out;
+    oy.clear();
+    ou.clear();
+    ov.clear();
+    for row in 0..h {
+        oy.extend_from_slice(&y[(cy0 + row) * src_w + x..][..w]);
+    }
+    let (cx, cy0) = (x / 2, cy0 / 2);
+    for row in 0..ch {
+        let at = (cy0 + row) * src_cw + cx;
+        ou.extend_from_slice(&u[at..][..cw]);
+        ov.extend_from_slice(&v[at..][..cw]);
+    }
+    debug_assert_eq!(oy.len(), w * h);
+    debug_assert_eq!(ou.len(), cw * ch);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +872,155 @@ mod tests {
         );
     }
 
+    /// The wiring invariant: a project at its media's own resolution hands the
+    /// decoder's own slices back, not a copy that happens to be equal. Asserted
+    /// on the pointer, because "identical bytes" is cheap and "no work at all"
+    /// is what the common case is promised.
+    #[test]
+    fn a_canvas_of_the_source_size_is_a_pass_through() {
+        let (w, h) = (64usize, 48usize);
+        let src = gradient(w, h);
+        for mut canvas in [
+            Composer::new(w as u32, h as u32, FitPolicy::Fit),
+            Composer::new(w as u32, h as u32, FitPolicy::Fill),
+            Composer::new(w as u32, h as u32, FitPolicy::Center),
+            Composer::passthrough(),
+        ] {
+            let (y, u, v, cw, ch) = canvas.place(&src.0, &src.1, &src.2, w as u32, h as u32);
+            assert_eq!(y.as_ptr(), src.0.as_ptr(), "luma was copied");
+            assert_eq!(u.as_ptr(), src.1.as_ptr());
+            assert_eq!(v.as_ptr(), src.2.as_ptr());
+            assert_eq!((cw, ch), (w as u32, h as u32));
+        }
+    }
+
+    /// 4:3 media on a 16:9 project: the picture lands where `fit_rect` says and
+    /// the pillarbox columns are limited-range black, exactly -- a bar that is
+    /// merely dark is a bar the grade reached.
+    #[test]
+    fn fit_pillarboxes_with_exact_black_bars() {
+        let (sw, sh) = (640u32, 480u32);
+        let (dw, dh) = (1920u32, 1080u32);
+        let src = (
+            vec![200u8; (sw * sh) as usize],
+            vec![70u8; (sw * sh / 4) as usize],
+            vec![30u8; (sw * sh / 4) as usize],
+        );
+        let mut canvas = Composer::new(dw, dh, FitPolicy::Fit);
+        let (y, u, v, w, h) = canvas.place(&src.0, &src.1, &src.2, sw, sh);
+        assert_eq!((w, h), (dw, dh));
+        let (rect, _) = fit_rect(sw, sh, dw, dh, FitPolicy::Fit);
+        assert_eq!(
+            rect,
+            Rect {
+                x: 240,
+                y: 0,
+                w: 1440,
+                h: 1080
+            },
+            "geometry moved"
+        );
+        let (w, h) = (w as usize, h as usize);
+        let row = &y[(h / 2) * w..][..w];
+        let x = rect.x as usize;
+        assert!(row[..x].iter().all(|&s| s == BLACK_Y), "left bar not black");
+        assert!(
+            row[x + rect.w as usize..].iter().all(|&s| s == BLACK_Y),
+            "right bar not black"
+        );
+        assert!(
+            row[x..x + rect.w as usize].iter().all(|&s| s == 200),
+            "picture"
+        );
+        // ...and the bars are neutral in chroma too, or they would be a colour.
+        let (cw, _) = chroma_dims(w, h);
+        let crow = &u[(h / 4) * cw..][..cw];
+        assert!(
+            crow[..x / 2].iter().all(|&s| s == NEUTRAL_C),
+            "bar has colour"
+        );
+        assert!(crow[x / 2 + 8].abs_diff(70) <= 1, "picture chroma");
+        assert_eq!(v[(h / 4) * cw], NEUTRAL_C);
+    }
+
+    /// The other three policies, on the same pair: `Fill` and `Stretch` cover
+    /// the canvas (no bar anywhere), `Center` pads without resampling.
+    #[test]
+    fn fill_and_stretch_leave_no_bars_and_center_pads_1_to_1() {
+        let (sw, sh) = (640u32, 480u32);
+        let (dw, dh) = (1920u32, 1080u32);
+        let src = (
+            vec![200u8; (sw * sh) as usize],
+            vec![70u8; (sw * sh / 4) as usize],
+            vec![30u8; (sw * sh / 4) as usize],
+        );
+        for policy in [FitPolicy::Fill, FitPolicy::Stretch] {
+            let mut canvas = Composer::new(dw, dh, policy);
+            let (y, ..) = canvas.place(&src.0, &src.1, &src.2, sw, sh);
+            assert!(
+                y.iter().all(|&s| s == 200),
+                "{policy:?} left a bar: the canvas is not covered"
+            );
+        }
+        let mut canvas = Composer::new(dw, dh, FitPolicy::Center);
+        let (y, _, _, w, h) = canvas.place(&src.0, &src.1, &src.2, sw, sh);
+        let (rect, _) = fit_rect(sw, sh, dw, dh, FitPolicy::Center);
+        assert_eq!(rect.w, sw, "Center resampled the picture");
+        let (w, h) = (w as usize, h as usize);
+        let row = &y[(h / 2) * w..][..w];
+        assert!(row[..rect.x as usize].iter().all(|&s| s == BLACK_Y));
+        assert!(
+            row[rect.x as usize..][..sw as usize]
+                .iter()
+                .all(|&s| s == 200)
+        );
+    }
+
+    /// A crop (`Fill` on a wider source) must gather the *middle* of the
+    /// picture, chroma with it: a marked band at a known column has to come out
+    /// at the column the geometry puts it at.
+    #[test]
+    fn fill_crops_about_the_centre() {
+        let (sw, sh) = (32usize, 8usize);
+        let (dw, dh) = (8u32, 8u32);
+        // Column 16 (the centre) is bright, everything else is dark.
+        let y: Vec<u8> = (0..sw * sh)
+            .map(|i| if i % sw == 16 { 240 } else { 40 })
+            .collect();
+        let (cw, ch) = chroma_dims(sw, sh);
+        let src = (y, vec![100u8; cw * ch], vec![150u8; cw * ch]);
+        let mut canvas = Composer::new(dw, dh, FitPolicy::Fill);
+        let (y, u, _, w, h) = canvas.place(&src.0, &src.1, &src.2, sw as u32, sh as u32);
+        assert_eq!((w, h), (dw, dh));
+        let (dst, crop) = fit_rect(sw as u32, sh as u32, dw, dh, FitPolicy::Fill);
+        assert_eq!(
+            dst,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            "Fill must cover"
+        );
+        assert_eq!(
+            crop,
+            Rect {
+                x: 12,
+                y: 0,
+                w: 8,
+                h: 8
+            },
+            "crop off centre"
+        );
+        // The bright column is crop-relative column 4 of 8, untouched by the
+        // 1:1 scale, and no sample of the canvas is black: nothing is a bar.
+        let row = &y[..8];
+        assert_eq!(row[4], 240, "the marked column moved: {row:?}");
+        assert!(y.iter().all(|&s| s != BLACK_Y), "Fill left a bar");
+        assert!(u.iter().all(|&s| s == 100), "chroma crop lost its plane");
+    }
+
     /// Not asserted: only the release number means anything. Run with
     /// `cargo test -p engine --release scale::tests::perf -- --nocapture`.
     #[test]
@@ -734,5 +1041,21 @@ mod tests {
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
         println!("scale::scale_i420 1280x720 -> 1920x1080: {ms:.3} ms/frame");
+    }
+
+    /// The whole per-frame cost of a mixed-resolution timeline -- black fill,
+    /// scale and blit -- which is what the playback budget has to hold. Printed,
+    /// not asserted, like every other perf test here.
+    #[test]
+    fn perf_compose_720p_onto_1080p() {
+        let src = gradient(1280, 720);
+        let mut canvas = Composer::new(1920, 1080, FitPolicy::Fit);
+        let runs = 30;
+        let t = std::time::Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(canvas.place(&src.0, &src.1, &src.2, 1280, 720));
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+        println!("scale::Composer::place 1280x720 onto 1920x1080 Fit: {ms:.3} ms/frame");
     }
 }
