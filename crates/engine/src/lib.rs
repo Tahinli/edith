@@ -14,7 +14,9 @@ pub mod playback;
 pub mod project;
 pub mod waveform;
 
-pub use audio::{AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession};
+pub use audio::{
+    AacPacket, AacTrackParams, AudioChunk, AudioMeta, AudioProbe, AudioSession, StreamInfo,
+};
 pub use clock::PlaybackClock;
 pub use decode::{DecodeSession, Frame};
 pub use demux::VideoMeta;
