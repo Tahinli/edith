@@ -216,6 +216,33 @@ impl PlaybackSession {
         })
     }
 
+    /// Opens `path` into the **library alone**: everything
+    /// [`open`](Self::open) scaffolds from it -- the resolution, the frame
+    /// rate, the clock, the source entry and its length -- over an *empty*
+    /// timeline. What an import into a window that has no session yet makes,
+    /// since an import registers a source and never places a clip
+    /// ([`import`](Self::import)); the file reaches a lane when it is dragged
+    /// there.
+    ///
+    /// Nothing to undo, like the import it stands in for: the lanes start
+    /// empty rather than being emptied, so no snapshot is pushed.
+    pub fn open_library(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let mut session = Self::open(path)?;
+        // The pair of lanes an opened file comes up with (`Project::single`,
+        // `open_audio_only`), emptied -- the source list and so the noted
+        // counts are carried over untouched, which is what keeps a library row
+        // placeable at its full length.
+        session.project = Project::from_parts(
+            session.project.sources().to_vec(),
+            vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())],
+            Vec::new(),
+            Vec::new(),
+        )?;
+        // Onto the emptied mapping: black picture, silence, zero duration.
+        session.seek(0.);
+        Ok(session)
+    }
+
     /// Opens a standalone audio file ([`crate::is_audio`]) as a timeline of its
     /// own: one clip on `A1`, nothing on the video lane, and a picture that is
     /// the black of an uncovered canvas ([`AUDIO_ONLY_CANVAS`]) for as long as
@@ -775,6 +802,25 @@ impl PlaybackSession {
         debug_assert_eq!(self.counts.len(), self.project.sources().len());
     }
 
+    /// How long the whole of `path` is, in timeline frames: the length noted
+    /// when it became a source, so a file sitting in the library with no clip
+    /// anywhere still knows how much of itself there is to place. `0` for a
+    /// file this session has never taken in.
+    ///
+    /// By path and not by stream, because a file is one length however many
+    /// audio tracks it carries -- the picture's frame count for an mp4, the
+    /// playing time for a song.
+    pub fn file_frames(&self, path: &Path) -> u32 {
+        let at = |wanted: &Path| self.project.sources().iter().position(|s| s.path == wanted);
+        // A source's own path is canonical ([`Source::new`]), so a caller
+        // handing one back from [`sources`](Self::sources) -- which is every
+        // library row -- hits on the first walk and never pays for the
+        // `canonicalize` syscall the second one makes.
+        at(path)
+            .or_else(|| at(&Source::new(path, 0).path))
+            .map_or(0, |i| self.counts[i])
+    }
+
     /// The clip the picture is coming from at `timeline_secs`: the lane it sits
     /// on and its index there, by the same topmost-lane-wins rule the decoder
     /// follows. `None` over a gap and past the end. What a card that grades
@@ -880,7 +926,7 @@ impl PlaybackSession {
         self.edit(|p| p.paste(at, clip))
     }
 
-    /// Places `frames` of `path` played on its audio `stream` at
+    /// Places the whole of `path` played on its audio `stream` at
     /// `timeline_secs`, the way [`paste_at`](Self::paste_at) places a copy --
     /// the door a library row goes through, and the only way a stream other
     /// than the one an import brought in reaches the timeline. The `(file,
@@ -908,20 +954,22 @@ impl PlaybackSession {
         timeline_secs: f64,
         path: &Path,
         stream: usize,
-        frames: u32,
         onto: Option<Lane>,
     ) -> crate::Result<bool> {
         let wanted = Source::new(path, stream);
-        // Another stream of a file whose picture is *already* on the timeline:
-        // that is what a library row is, and it is why nothing here has to
-        // check dimensions or frame rate -- the file passed that at import.
-        if !self.project.sources().iter().any(|s| s.path == wanted.path) {
+        // Another stream of a file this session has taken in: that is what a
+        // library row is, and it is why nothing here has to check dimensions or
+        // frame rate -- the file passed that at import. Its length is the one
+        // the import noted, so a source that has never been placed is as
+        // placeable as one that is already on a lane.
+        let frames = self.file_frames(&wanted.path);
+        if frames == 0 {
             return Err(format!("{} is not on this timeline", path.display()).into());
         }
         let first = self.first_audio()?;
         audio_matches(&wanted, &first)?;
         let source = self.project.import(path, stream);
-        self.note_frames(source, frames.max(1));
+        self.note_frames(source, frames);
         let clip = Clip {
             start: 0,
             in_frame: 0,
@@ -993,15 +1041,24 @@ impl PlaybackSession {
         self.edit(Project::undo)
     }
 
-    /// Appends the whole of `path` to the end of the timeline. One undo step,
-    /// and the file becomes a source only if it is not one already.
+    /// Takes `path` into the **library**: it becomes a source of this session,
+    /// with its length noted ([`file_frames`](Self::file_frames)), and nothing
+    /// is placed on any lane. What reaches the timeline is decided afterwards,
+    /// by dragging the row onto a lane
+    /// ([`place_stream_at`](Self::place_stream_at)) -- importing a file is not
+    /// a decision about where it plays.
+    ///
+    /// The source index, new or the one this file already had: importing twice
+    /// registers once. *Not* an undo step -- a source entry alone changes
+    /// nothing playable, so there is nothing for [`undo`](Self::undo) to take
+    /// back, and nothing reseeks.
     ///
     /// Refused unless it can join the timeline -- same codec, same frame rate,
     /// same audio parameters or both silent; the `Err` names the property that
     /// disagrees, for a caller to show. Nothing is changed by a refusal. A
     /// *resolution* of its own is not a refusal: the clip is placed on the
     /// project canvas by its fit policy ([`PlaybackSession::set_fit`]).
-    pub fn import(&mut self, path: &Path) -> crate::Result<()> {
+    pub fn import(&mut self, path: &Path) -> crate::Result<usize> {
         if crate::is_audio(path) {
             return self.import_audio(path);
         }
@@ -1011,64 +1068,29 @@ impl PlaybackSession {
         // [`place_stream_at`](Self::place_stream_at) is how any other one of
         // its streams reaches the timeline afterwards.
         matches_timeline(&Source::new(path, 0), &meta, &self.meta, &first)?;
-
-        let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
         self.note_frames(source, meta.frame_count);
-        // Refused only for an unknown index, and this one just came from `import`.
-        self.project.append_clip(source, meta.frame_count);
-        // Reseek like any other edit, even though nothing before the playhead
-        // moved: the running audio worker's segment list stops at the old end,
-        // so without this the appended clip would play silent. At EOS the wall
-        // clock has run on past the timeline, so resume from the join instead
-        // of wherever it got to -- and the seek is what clears `eos`.
-        let at = if self.eos { old_end } else { self.now() };
-        self.seek(at);
-        Ok(())
+        Ok(source)
     }
 
-    /// Appends a standalone audio file to the end of the timeline, on the
-    /// **audio lane alone**: a song has no picture, so there is nothing to put
-    /// on the video lane and the timeline shows black under it. Its length is
-    /// its playing time rounded up to whole frames, which is the only frame
-    /// count such a source has.
+    /// The same registration for a standalone audio file: a song has no
+    /// picture, so the length noted for it is its playing time rounded up to
+    /// whole frames, which is the only frame count such a source has.
     ///
     /// Refused in the same words as any other import when its rate or layout
     /// disagrees with the timeline's -- one output device, one set of
     /// parameters -- and refused outright on a silent timeline, which has no
     /// device open at all. Nothing is changed by a refusal.
-    fn import_audio(&mut self, path: &Path) -> crate::Result<()> {
+    fn import_audio(&mut self, path: &Path) -> crate::Result<usize> {
         let first = self.first_audio()?;
         // Stream 0, and there is no other: a standalone audio file carries one
         // track (`AudioSession::probe_streams`), so nothing here has a stream
         // to pick the way `place_stream_at` does for an mp4.
         audio_matches(&Source::new(path, 0), &first)?;
         let frames = audio_frames(path, self.meta.frame_rate)?;
-
-        let old_end = self.timeline_duration();
         let source = self.project.import(path, 0);
         self.note_frames(source, frames);
-        let at = self.project.timeline_frames();
-        self.project.place(
-            Lane::A1,
-            at,
-            Clip {
-                start: at,
-                in_frame: 0,
-                out_frame: frames,
-                source,
-                link: None,
-                eq: None,
-                color: None,
-                fit: FitPolicy::default(),
-            },
-        );
-        // Same reason as a video import: the running audio worker's segment
-        // list stops at the old end, so without a reseek the appended clip
-        // would play silent.
-        let at = if self.eos { old_end } else { self.now() };
-        self.seek(at);
-        Ok(())
+        Ok(source)
     }
 
     /// Applies an edit and, if it took, reseeks onto the new mapping. `seek`
