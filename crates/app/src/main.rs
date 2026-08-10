@@ -2018,6 +2018,25 @@ impl Player {
             return clip;
         };
         match trim.edge {
+            // A still grows forward from source frame 0 instead, exactly as
+            // `Project::trim` writes it: with the in-point clamped at 0 the box
+            // below would slide left rather than stretch, and the release would
+            // then commit a wider clip than the drag drew.
+            Edge::Start
+                if self.session.as_ref().is_some_and(|session| {
+                    session
+                        .sources()
+                        .get(clip.source)
+                        .is_some_and(|s| engine::is_image(&s.path))
+                }) =>
+            {
+                Clip {
+                    in_frame: 0,
+                    out_frame: clip.end().saturating_sub(trim.to).max(1),
+                    start: trim.to,
+                    ..clip
+                }
+            }
             // The in-point follows the head, exactly as `Project::trim` moves
             // it: what stays on screen plays what it always played.
             Edge::Start => Clip {
