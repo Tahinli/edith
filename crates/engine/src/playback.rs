@@ -90,7 +90,17 @@ struct Audio {
     /// Bumped by every seek. A feeder only owns the device while this still
     /// matches the value it started with; see [`feed`].
     epoch: Arc<AtomicU64>,
+    /// The last [`TAP_SAMPLES`] mono samples handed to the device, oldest
+    /// first: what a meter or an analyser draws. Written by the feeder, which
+    /// is not the device's own callback -- the plugin's RT thread never sees
+    /// this lock, and the feeder holds it for one memcpy per write.
+    tap: Arc<Mutex<Vec<f32>>>,
 }
+
+/// How much of the played signal the tap keeps. A power of two, because what
+/// reads it transforms it, and long enough that the lowest band the editor
+/// draws (20 Hz) has a whole cycle in the window at any rate we open.
+const TAP_SAMPLES: usize = 2048;
 
 impl Audio {
     /// Whether the device has played everything there will ever be, i.e. the
@@ -98,6 +108,21 @@ impl Audio {
     fn played_out(&self, position: i64) -> bool {
         self.fed_all.load(Ordering::Acquire)
             && position as u64 * self.channels >= self.fed.load(Ordering::Relaxed)
+    }
+
+    /// Keeps the newest [`TAP_SAMPLES`] of what was just queued, downmixed to
+    /// mono. Called from the feeder only, once per accepted write.
+    fn note_tap(&self, accepted: &[f32]) {
+        let channels = self.channels.max(1) as usize;
+        let mut tap = self.tap.lock().unwrap();
+        // Only the tail can survive anyway: a big write replaces the window
+        // outright rather than being summed into it and then thrown away.
+        let from = accepted.len().saturating_sub(TAP_SAMPLES * channels);
+        for frame in accepted[from..].chunks_exact(channels) {
+            tap.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+        let over = tap.len().saturating_sub(TAP_SAMPLES);
+        tap.drain(..over);
     }
 
     /// Starts a feeder for the current epoch, draining `rx` into the device.
@@ -417,10 +442,12 @@ impl PlaybackSession {
     ///
     /// A *new* session rather than a reload of this one, so a load that fails
     /// leaves the caller's current session untouched -- atomic by
-    /// construction. Every named file is opened and checked here: source 0
-    /// defines the timeline exactly as `open` does, every other source has to
-    /// match it the way [`import`](Self::import) demands, and every clip has to
-    /// still be inside the file it plays from. A source that vanished or
+    /// construction. Every named file is opened and checked here: the
+    /// *scaffolding* source -- the first that is not a still, since a picture
+    /// carries no rate -- defines the timeline exactly as `open` does, every
+    /// other source has to match it the way [`import`](Self::import) demands
+    /// (a save renumbers, so which index that is says nothing), and every clip
+    /// has to still be inside the file it plays from. A source that vanished or
     /// shrank since the save is a refusal naming it, not a silently shorter
     /// timeline -- the disappearing-file tolerance elsewhere in this type
     /// applies only *after* a project has loaded.
@@ -428,15 +455,35 @@ impl PlaybackSession {
     /// The undo history is not saved: `undo` is `false` on a fresh load.
     pub fn open_project(path: &Path) -> crate::Result<Self> {
         let doc = crate::edith::load(path)?;
+        // *Which* source scaffolds it: the first that is not a still, and index
+        // 0 only when there is no other. A still defines no frame rate -- it is
+        // given [`IMAGE_ONLY_RATE`] -- so scaffolding a timeline of 24 fps
+        // footage off a PNG that a save happened to renumber to index 0
+        // (`Project::without_orphan_sources` numbers by first use, and a
+        // library removal moves indexes too) reads the timeline as 30 fps and
+        // then refuses every file on it for not matching. The rule this and
+        // [`audio_source_of`] share: nothing may assume what source 0 *is*.
+        //
+        // ponytail: a timeline of nothing but stills, or of stills and songs,
+        // still comes back at the rate its scaffold implies rather than the one
+        // it was cut at -- the rate is written nowhere in the file. The upgrade
+        // path is a dialect that writes it (`crate::edith`), which is also what
+        // a project naming no file at all would need.
+        let scaffold = doc
+            .sources
+            .iter()
+            .position(|s| !crate::is_image(&s.path))
+            .unwrap_or(0);
         // Owned: the sources move into the `Project` below, and the device is
         // opened after that (see the comment there).
         let first = doc
             .sources
-            .first()
+            .get(scaffold)
             .cloned()
             .ok_or("the project names no sources")?;
-        // Source 0 both scaffolds the session and defines the timeline, so it
-        // is opened for playback rather than merely probed.
+        // The scaffolding source both defines the timeline and is what the
+        // playhead's first picture comes from, so it is opened for playback
+        // rather than merely probed.
         // One value, not two locals: everything below this line can refuse, and
         // locals drop in reverse declaration order -- a bare worker would join
         // its decode thread while the receiver next to it was still holding
@@ -503,8 +550,15 @@ impl PlaybackSession {
         }
         let first_audio = first_audio_of(&doc.sources)?;
 
-        let mut counts = vec![meta.frame_count];
-        for source in &doc.sources[1..] {
+        // In source order, with the scaffold's own count in its own slot: the
+        // clip check below indexes this list by source, so it must line up with
+        // `doc.sources` whichever entry the scaffolding came from.
+        let mut counts = Vec::with_capacity(doc.sources.len());
+        for (i, source) in doc.sources.iter().enumerate() {
+            if i == scaffold {
+                counts.push(meta.frame_count);
+                continue;
+            }
             // A still has neither a rate to match nor a track to match with:
             // its length is the one it is held to, recomputed exactly as the
             // import that first noted it did ([`image_frames`]), which is what
@@ -579,7 +633,15 @@ impl PlaybackSession {
         // only a session's `drop` retires it, so a refusal above this line would
         // leave a PipeWire stream and a thread behind for a project that never
         // opened. Nothing before it needs the device.
-        let (audio, audio_disabled) = open_audio(&first.path, first.audio_stream);
+        //
+        // On the source the timeline's *sound* is defined by, which is the
+        // scaffold unless that one is a still ([`audio_source_of`]): opening a
+        // PNG as the device is a session with no audio at all, however many
+        // clips with sound are on its lanes.
+        let (audio, audio_disabled) = match audio_source_of(project.sources()) {
+            Some(source) => open_audio(&source.path, source.audio_stream),
+            None => (None, None),
+        };
         let mut session = Self {
             meta,
             native,
@@ -627,7 +689,16 @@ impl PlaybackSession {
     /// Writes the timeline to `path` as a `.edith`, atomically (see
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
+    ///
+    /// Refused, writing nothing, for a session whose library is empty (every
+    /// row removed, [`Project::remove_source`]): a file naming no source has no
+    /// timeline in it and [`open_project`](Self::open_project) could only
+    /// refuse it, so the refusal belongs here, where nothing has been
+    /// overwritten yet.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
+        if self.project.sources().is_empty() {
+            return Err("this project names no file: there is nothing to save".into());
+        }
         let (sources, lanes, eq, color) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
@@ -874,6 +945,13 @@ impl PlaybackSession {
     /// that plays until something is placed on it.
     pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
         self.project.add_lane(kind)
+    }
+
+    /// Drops that empty lane again, in [`Project::remove_lane`]'s words when it
+    /// refuses. One undo step, and no reseek for the same reason the add needs
+    /// none: an empty lane was playing nothing.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        self.project.remove_lane(lane)
     }
 
     /// Splits every lane at `timeline_secs`, so the two sides become two
@@ -1186,7 +1264,7 @@ impl PlaybackSession {
     /// [`import`](Self::import) refuses a file with. One output device and one
     /// copied AAC track mean one set of audio parameters for the whole
     /// timeline, so a 22 kHz mono track cannot join a 44.1 kHz stereo one --
-    /// there is no resampler here, and no AAC encoder to write the join with.
+    /// there is no resampler here to make one rate of two.
     /// A front-end greys such a row out; this is the backstop that keeps a
     /// stale one from making the whole timeline silent.
     ///
@@ -1286,7 +1364,14 @@ impl PlaybackSession {
     /// Reseeks like an edit even though nothing playable changed: the clip
     /// indexes into the source list have just moved, and the running workers
     /// were opened against the old numbering.
-    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<()> {
+    ///
+    /// The index that went, because everything past it moved down: a caller
+    /// holding a source index of its own (a clipboard) has to fix it up or drop
+    /// it, or it names a different file afterwards. The **last** row goes like
+    /// any other and leaves a session with an empty library -- silent, empty of
+    /// clips, and unsaveable ([`save_project`](Self::save_project)); a
+    /// front-end showing one is showing an empty window.
+    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<usize> {
         let wanted = Source::new(path, stream);
         let idx = self
             .project
@@ -1305,11 +1390,12 @@ impl PlaybackSession {
         }
         let now = self.now();
         self.seek(now);
-        Ok(())
+        Ok(idx)
     }
 
-    /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
-    /// other source is held to it.
+    /// What the timeline's audio *is*: the chosen stream of the first source
+    /// that could have any ([`audio_source_of`]), probed. Every other source is
+    /// held to it.
     fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
         first_audio_of(self.project.sources())
     }
@@ -1493,6 +1579,21 @@ impl PlaybackSession {
         }
     }
 
+    /// A copy of the most recent mono samples the device was handed, and the
+    /// rate they play at: the signal *after* every clip's equalizer, speed and
+    /// the mix, which is what an analyser drawn behind an EQ curve has to show.
+    /// `None` with no audio output at all, and empty until the feeder has
+    /// written once (right after a seek, for instance).
+    ///
+    /// Never blocks anything that matters: the feeder holds this lock for one
+    /// memcpy and the device's own callback lives in the plugin, on the far
+    /// side of a ring buffer, where it cannot see this at all.
+    pub fn audio_tap(&self) -> Option<(Vec<f32>, u32)> {
+        let audio = self.audio.as_ref()?;
+        let tap = audio.tap.lock().unwrap().clone();
+        Some((tap, audio.sample_rate))
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
@@ -1515,6 +1616,9 @@ impl PlaybackSession {
             // carrying can no longer reach the ring after this point.
             audio.epoch.fetch_add(1, Ordering::Release);
             ao.flush();
+            // The flushed samples are not being played any more, so nothing may
+            // still be drawn from them.
+            audio.tap.lock().unwrap().clear();
         }
 
         // Cancel first, drop second: the old worker may be parked in `send` on
@@ -1729,10 +1833,24 @@ fn matches_timeline(
 /// source 0 has always given. This function widens which source is asked, not
 /// what the answer means.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
-    match sources.iter().find(|s| !crate::is_image(&s.path)) {
+    match audio_source_of(sources) {
         Some(first) => AudioSession::probe(&first.path, first.audio_stream),
         None => Ok(None),
     }
+}
+
+/// *Which* source that is: the first one that is not a still. The single answer
+/// to "what does this timeline's sound come from", so that probing it
+/// ([`first_audio_of`]) and opening the device on it
+/// ([`PlaybackSession::open_project`]) can never disagree -- source 0 is only
+/// the scaffolding file until a save renumbers it or a library removal takes it
+/// away ([`crate::Project::remove_source`]), and a PNG at index 0 opened as the
+/// device is a timeline that plays silent although every clip on it has sound.
+///
+/// `None` for a library of nothing but stills, and for one with no file at all:
+/// both are silent timelines.
+fn audio_source_of(sources: &[Source]) -> Option<&Source> {
+    sources.iter().find(|s| !crate::is_image(&s.path))
 }
 
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
@@ -1832,6 +1950,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         fed_all: Arc::new(AtomicBool::new(false)),
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
+        tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
 }
@@ -1866,6 +1985,7 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             }
         };
         audio.fed.fetch_add(accepted as u64, Ordering::Relaxed);
+        audio.note_tap(&pending[..accepted]);
         pending.drain(..accepted);
         if !pending.is_empty() {
             // Ring full: nothing to do but let the device drain it.
@@ -1885,13 +2005,34 @@ fn secs_to_frame(secs: f64, fps: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Lane, PlaybackSession, secs_to_frame};
+    use super::{Edge, Lane, PlaybackSession, Source, audio_source_of, secs_to_frame};
     use std::path::PathBuf;
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// Which source the timeline's sound is opened on -- the one rule
+    /// [`open_project`](PlaybackSession::open_project), the probe every import
+    /// is held to and the audio worker all read through. A still at index 0 is
+    /// a picture, not a silent timeline: opening the device on it is a project
+    /// that plays silent although every clip on it has sound.
+    #[test]
+    fn the_audio_reference_is_never_a_still() {
+        let (video, still) = (asset("test_av.mp4"), asset("test_still.png"));
+        let sources = [Source::new(&still, 0), Source::new(&video, 3)];
+        assert_eq!(
+            audio_source_of(&sources).map(|s| (&s.path, s.audio_stream)),
+            Some((&sources[1].path, 3)),
+            "the first source that could have a track, with its own stream"
+        );
+        assert!(
+            audio_source_of(&sources[..1]).is_none(),
+            "nothing but stills"
+        );
+        assert!(audio_source_of(&[]).is_none(), "and no file at all");
     }
 
     /// The seam between the two lists a source index reaches: dropping a file
