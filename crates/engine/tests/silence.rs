@@ -165,6 +165,34 @@ fn speed_mode_refuses_a_clip_that_laps_over_a_silence() {
     loadable(&p);
 }
 
+/// A rate that cannot address an edge of a silence is refused naming **that**
+/// edge -- not the region's start, which at a slow rate is often the one frame
+/// that *was* addressable. A cut at the wrong frame is a user sent to look in
+/// the wrong place.
+///
+/// At a quarter speed one source frame is four timeline frames, so only every
+/// fourth frame is a cut the clip's own arithmetic can make.
+#[test]
+fn an_unaddressable_edge_is_named_where_it_actually_is() {
+    let mut p = fixture();
+    p.set_speed(Lane::V1, 0, Speed::MIN).expect("nothing after it");
+    let before = spans(&p);
+    // Starts where the clip starts -- no split needed there -- and ends at a
+    // frame a quarter-speed clip cannot be cut at.
+    let err = p
+        .speed_regions(&[(0, 5)], Speed::MAX)
+        .expect_err("frame 5 is not a cut this rate can make")
+        .to_string();
+    assert!(err.contains("frame 5"), "{err}");
+    assert!(!err.contains("frame 0:"), "it named the region's start: {err}");
+    // Rolled back whole, and the refusal cost no undo step: the press below is
+    // the `set_speed` above.
+    assert_eq!(spans(&p), before);
+    assert!(p.undo());
+    assert_eq!(p.lane(Lane::V1)[0].speed, Speed::NORMAL);
+    assert!(!p.undo());
+}
+
 /// The whole chain a person presses one key for: the fixture is scanned, its
 /// silences come back as timeline frames, and cutting them shortens the
 /// timeline by exactly what was found -- with the scan itself having changed

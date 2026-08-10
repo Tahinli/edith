@@ -1965,8 +1965,16 @@ impl Project {
             for (l, data) in self.lanes.iter().enumerate() {
                 for c in data.clips.iter().filter(|c| c.end() > at && c.start < at + len) {
                     if (c.start, c.end()) != (at, at + len) {
+                        // *Which* edge did not come off: a rate that cannot
+                        // address the end of the silence is not a rate that
+                        // cannot address its start, and naming the wrong frame
+                        // sends the user looking in the wrong place.
+                        let edge = match c.start == at {
+                            true => at + len,
+                            false => at,
+                        };
                         refused = Some(format!(
-                            "the {} clip at frame {} plays at {} and cannot be cut at frame {at}: \
+                            "the {} clip at frame {} plays at {} and cannot be cut at frame {edge}: \
                              detach it, or put it back to 1.00x first",
                             labels[l].label(),
                             c.start,
