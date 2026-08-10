@@ -666,6 +666,67 @@ impl Project {
         Lane::new(kind, self.lane_count(kind) - 1)
     }
 
+    /// Drops an *empty* lane -- [`add_lane`](Project::add_lane) taken back, and
+    /// one undo step like it, which restores the lane where it stood.
+    ///
+    /// Refused, changing nothing, while the lane holds anything: the refusal
+    /// names the clips (file and first frame), because a track removal that
+    /// deleted takes with it would be the one edit nobody sees coming. Refused
+    /// too for the last lane of its kind, which is `V1` or `A1`: those two are
+    /// where an import and a paste land ([`Project::paste`] takes lane 0 of each
+    /// kind and *skips* a kind that is not there), so a project without one
+    /// would swallow half of every file dropped on it, silently.
+    ///
+    /// The lanes below it move up one `ord`, so a handle a caller was holding
+    /// (a selection, an open card) names the lane after it from here on -- the
+    /// one thing a front-end owes this call.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        let Some(i) = self.index(lane) else {
+            return Err(format!("there is no {} to remove", lane.label()).into());
+        };
+        if self.lane_count(lane.kind) == 1 {
+            return Err(format!(
+                "{} is the only {} track: every import lands on it",
+                lane.label(),
+                match lane.kind {
+                    LaneKind::Video => "video",
+                    LaneKind::Audio => "audio",
+                }
+            )
+            .into());
+        }
+        let clips = &self.lanes[i].clips;
+        if !clips.is_empty() {
+            // Three names and a count: a lane can hold forty clips and a
+            // refusal nobody reads to the end says nothing at all.
+            let named: Vec<String> = clips
+                .iter()
+                .take(3)
+                .map(|c| {
+                    let name = self.sources.get(c.source).map_or_else(
+                        || format!("source {}", c.source),
+                        |s| s.path.display().to_string(),
+                    );
+                    format!("{name} at frame {}", c.start)
+                })
+                .collect();
+            let rest = match clips.len().saturating_sub(named.len()) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            return Err(format!(
+                "{} still holds {}{rest}: delete those clips (or drag them to \
+                 another track) first",
+                lane.label(),
+                named.join(", ")
+            )
+            .into());
+        }
+        self.snapshot();
+        self.lanes.remove(i);
+        Ok(())
+    }
+
     /// Where `lane` sits in [`Project::lanes`], or `None` for a lane that is
     /// not there. The one place a handle becomes a position.
     fn index(&self, lane: Lane) -> Option<usize> {
@@ -4781,6 +4842,53 @@ mod tests {
         assert!(p.undo(), "and one more step takes the lane itself back");
         assert_eq!(p.lane_count(LaneKind::Video), 1);
         assert_eq!(shape(&p), shape(&three()));
+    }
+
+    /// The add taken back: an empty lane comes off, a lane holding clips never
+    /// does (and says which clips), the last lane of a kind never does, the
+    /// lanes below the one that went move up an `ord`, and one undo puts it
+    /// back where it stood.
+    #[test]
+    fn an_empty_lane_comes_off_again() {
+        let mut p = three();
+        let v2 = p.add_lane(LaneKind::Video);
+        let v3 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v3, 0, clip(0, 0, 3, 0)));
+        let why = |r: crate::Result<()>| r.expect_err("refused").to_string();
+        let history = p.history.len();
+
+        // The last lane of its kind stays: `V1`/`A1` are where an import and a
+        // paste land, and a project missing one would swallow half of a file
+        // dropped on it.
+        assert!(why(p.remove_lane(Lane::A1)).contains("only audio track"));
+        assert_eq!(
+            why(p.remove_lane(Lane::new(LaneKind::Video, 9))),
+            "there is no V10 to remove"
+        );
+
+        // A lane with clips on it refuses and names them: a track removal never
+        // deletes a take.
+        let refusal = why(p.remove_lane(v3));
+        assert!(refusal.contains("V3 still holds"), "{refusal}");
+        assert!(refusal.contains(FILE), "{refusal}");
+        assert!(refusal.contains("at frame 0"), "{refusal}");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)], "the clip is still there");
+        assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
+
+        // The empty one in the middle goes, and `V3` becomes `V2` -- clip and
+        // all.
+        p.remove_lane(v2).expect("V2 is empty");
+        assert_eq!(p.lane_count(LaneKind::Video), 2);
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2]);
+        assert_eq!(p.lane_spans(v2), vec![(0, 3)], "the lane below moved up");
+        assert_eq!(p.history.len(), history + 1, "one snapshot per removal");
+        invariants_hold(&p, "remove V2");
+
+        // ...and one stroke puts the empty lane back above it.
+        assert!(p.undo());
+        assert_eq!(p.lane_count(LaneKind::Video), 3);
+        assert!(p.lane(v2).is_empty(), "back where it stood, still empty");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)]);
     }
 
     /// The grouping rule across more than two lanes: a link id is one *span*,
