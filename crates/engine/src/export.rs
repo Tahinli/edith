@@ -235,6 +235,28 @@ fn run(
         )
         .into());
     };
+    // ...and the same list decides which clips this would be copying, which is
+    // the only way to ask whether any of them carries an equalizer. An EQ is
+    // sample math and a copy never decodes: exporting it here would write the
+    // clip flat, silently -- the same failure a missing audio track is. Named by
+    // where it sits on the timeline, because "some clip" is not a thing a user
+    // can go and fix.
+    let lane = project.audio_lanes()[0];
+    if let Some((at, _)) = project
+        .lane(lane)
+        .iter()
+        .enumerate()
+        .find(|(idx, _)| project.eq_of(lane, *idx).is_some())
+        .map(|(idx, clip)| (clip.start, idx))
+    {
+        return Err(format!(
+            "the clip at {} has an equalizer and an mp4 export copies AAC packets, \
+             which no filter can reach: export WAV or FLAC, which are decoded and \
+             mixed, or clear the equalizer",
+            timecode(at, meta.frame_rate)
+        )
+        .into());
+    }
     let audio = AudioSession::copy_multi_streams(&project.audio_sources(), segments)?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
@@ -303,6 +325,18 @@ fn run(
     Ok(())
 }
 
+/// Where a clip sits on the timeline as a person reads it: `mm:ss`, short
+/// enough to sit inside a refusal and exact enough to go and find the clip.
+/// Not the app's frame-accurate timecode -- an engine refusal is prose, and a
+/// `00:00:12:07` in the middle of a sentence is a serial number.
+fn timecode(frame: u32, fps: f64) -> String {
+    let secs = match fps.is_finite() && fps > 0.0 {
+        true => (f64::from(frame) / fps) as u32,
+        false => 0,
+    };
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
 /// The audio lanes alone, summed, as a WAV or a FLAC.
 ///
 /// Nothing here re-derives the edit: the play lists are
@@ -326,7 +360,13 @@ fn run_audio(
 ) -> crate::Result<()> {
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams(&sources, &segs)? else {
+    // The equalizers with them, so what is written is what is heard down to the
+    // filter: the worker applies them per segment before the lanes are summed
+    // ([`AudioSession::open_mixed_streams_eq`]), which is the same choke point
+    // playback's feeder reads from -- there is no second place here that could
+    // apply them differently.
+    let eqs = project.audio_eqs_from(0, meta.frame_rate);
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_eq(&sources, &segs, &eqs)? else {
         return Err("this timeline has no audio to export".into());
     };
     let channels = usize::from(audio.channels);
@@ -341,10 +381,8 @@ fn run_audio(
     let mut samples: Vec<i32> = Vec::with_capacity(total);
     for chunk in chunks {
         cancelled(shared)?;
-        // ponytail: the per-segment EQ goes here -- `EqState::process` on this
-        // same interleaved f32 buffer, before the quantisation below, which is
-        // the point playback's feeder will call it from too. Not wired: the EQ
-        // slice owns that, this is only the seat kept for it.
+        // Already equalized: the chunks come out of the per-lane workers, which
+        // filter each segment before the mix (`open_mixed_streams_eq` above).
         samples.extend(
             chunk
                 .samples
