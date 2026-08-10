@@ -1071,8 +1071,11 @@ impl Player {
                 self.selected = None;
                 // A menu can be up while a project is dropped on the window --
                 // the scrim swallows clicks, never a drop -- and its index
-                // would name some other timeline's clip.
+                // would name some other timeline's clip. The two clip cards
+                // hold a (lane, idx) of the old timeline for the same reason.
                 self.context_menu = None;
+                self.eq_open = None;
+                self.color_open = None;
                 // A different set of sources: the row that was picked is not
                 // the file that index names any more.
                 self.selected_asset = None;
@@ -1575,7 +1578,7 @@ impl Render for Player {
                 // sibling it can stop. The export card is over the timeline for
                 // the same reason: importing under it would change the very
                 // edit list the card is about to write out.
-                if this.keys_open || this.export_open || this.eq_open.is_some() {
+                if this.modal() {
                     return;
                 }
                 for path in paths.paths() {
