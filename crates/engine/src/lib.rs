@@ -14,6 +14,7 @@ pub mod hw;
 pub mod mux;
 pub mod playback;
 pub mod project;
+pub mod scale;
 pub mod waveform;
 
 pub use audio::{
