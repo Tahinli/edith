@@ -165,7 +165,18 @@ pub fn start(
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
+        //
+        // An emptied timeline is a legal project and an illegal file: no
+        // picture, no sound, and a muxer that is never created because no coded
+        // frame arrives. Refused by name here -- before the format is even
+        // looked at, so an mp4 and a WAV refuse in the same words -- rather than
+        // left to write a file of no frames that nothing opens. Every caller of
+        // `start` comes through this, the app's own door
+        // (`PlaybackSession::is_empty`) being only the first fence.
         let written = match settings.format {
+            _ if project.timeline_frames() == 0 => {
+                Err("the timeline is empty: there is nothing to export".into())
+            }
             Format::Mp4 => run(&project, &meta, &part, &worker, &settings),
             format => run_audio(&project, &meta, &part, &worker, format),
         };

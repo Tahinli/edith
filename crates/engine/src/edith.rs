@@ -504,9 +504,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
         }
     }
-    if doc.lanes.iter().all(|(_, clips)| clips.is_empty()) {
-        return Err("no clips: an empty timeline is not a project".into());
-    }
+    // A file whose lanes are all empty *is* a project -- the emptied timeline,
+    // saved. What it may not be is laneless; [`crate::Project::from_parts`]
+    // refuses that one, by the name it has there.
     Ok(doc)
 }
 
@@ -870,13 +870,10 @@ mod tests {
         ] {
             assert_eq!(parse(file.as_bytes(), &dir).unwrap_err().to_string(), want);
         }
-        // Lanes and nothing on them is not a project.
-        assert_eq!(
-            parse(b"edith 4\nsource 0 a.mp4\nvideo 1\naudio 1\n", &dir)
-                .unwrap_err()
-                .to_string(),
-            "no clips: an empty timeline is not a project"
-        );
+        // Lanes and nothing on them is the emptied timeline, saved: a project.
+        let empty = parse(b"edith 4\nsource 0 a.mp4\nvideo 1\naudio 1\n", &dir).expect("parse");
+        assert!(empty.lanes.iter().all(|(_, clips)| clips.is_empty()));
+        assert_eq!(empty.lanes.len(), 2, "and its lanes survive the round trip");
     }
 
     /// One band, spelled the way an eq line spells it.
@@ -1539,19 +1536,28 @@ mod tests {
         }
     }
 
+    /// The emptied timeline writes and reads back: every lane declared, no clip
+    /// on any of them, and the source that gave the project its frame rate still
+    /// named. Nothing about the format changes for it -- an empty lane already
+    /// had a line of its own.
     #[test]
-    fn a_project_without_clips_is_not_a_project() {
+    fn a_project_without_clips_round_trips() {
         let dir = PathBuf::from("/proj");
+        let source = Source {
+            path: PathBuf::from("/proj/a.mp4"),
+            audio_stream: 0,
+        };
+        let bytes = flat(&dir, &[source.clone()], &two(Vec::new(), Vec::new()), 0);
+        let back = parse(&bytes, &dir).expect("an emptied timeline is a project");
+        assert_eq!(back.sources, vec![source]);
+        assert_eq!(back.lanes, two(Vec::new(), Vec::new()));
+        assert_eq!(back.playhead, 0);
+        // Older dialects, where the two lanes are implied rather than declared.
         assert_eq!(
-            parse(b"edith 1\nsource a.mp4\n", &dir)
-                .unwrap_err()
-                .to_string(),
-            "no clips: an empty timeline is not a project"
+            parse(b"edith 1\nsource a.mp4\n", &dir).expect("v1").lanes,
+            two(Vec::new(), Vec::new())
         );
-        assert_eq!(
-            parse(b"edith 1\n", &dir).unwrap_err().to_string(),
-            "no clips: an empty timeline is not a project"
-        );
+        assert!(parse(b"edith 1\n", &dir).expect("a project of nothing").sources.is_empty());
     }
 
     /// Every truncation of a good file either parses or refuses; none panics.
