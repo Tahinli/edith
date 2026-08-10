@@ -4885,17 +4885,24 @@ fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> bool {
 /// notice says so.
 fn span_partner(session: &PlaybackSession, lane: Lane, idx: usize) -> Option<(Lane, usize)> {
     let clip = *session.lane_clips(lane).get(idx)?;
-    session
+    let matches = |other: Lane| {
+        let i = session.lane_clips(other).iter().position(|c| {
+            (c.start, c.end()) == (clip.start, clip.end())
+                && !(c.link.is_some() && c.link == clip.link)
+        })?;
+        Some((other, i))
+    };
+    // Sound before picture (and picture before sound): "group this" means the
+    // other half of the take, and a project whose audio lane was added after a
+    // second video one has that half *after* the layer in storage order -- which
+    // is the order the lanes come in. A same-kind lane is still groupable (V1
+    // and V2 may be one take), but only where no opposite one covers the span.
+    let (opposite, same): (Vec<Lane>, Vec<Lane>) = session
         .lanes()
         .into_iter()
         .filter(|&other| other != lane)
-        .find_map(|other| {
-            let i = session.lane_clips(other).iter().position(|c| {
-                (c.start, c.end()) == (clip.start, clip.end())
-                    && !(c.link.is_some() && c.link == clip.link)
-            })?;
-            Some((other, i))
-        })
+        .partition(|other| other.kind != lane.kind);
+    opposite.into_iter().chain(same).find_map(matches)
 }
 
 /// Whether a click marks this clip: the clip that was clicked always, and the
@@ -5649,6 +5656,65 @@ mod tests {
             span_partner(&session, Lane::V1, 0),
             None,
             "and nothing left on another track to group with"
+        );
+    }
+
+    /// Which clip Group reaches when more than one covers the span: the sound,
+    /// whatever order the lanes are stored in. A project file may hold them in
+    /// any order -- a video layer *before* the audio lane among them -- and
+    /// "group this" means the other half of the take, never the layer above it.
+    #[test]
+    fn group_reaches_the_sound_before_a_video_layer_over_it() {
+        use engine::project::LaneKind;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let v2 = session.add_lane(LaneKind::Video);
+        let path = session.sources()[0].path.clone();
+        let frames = source_frames(lane_clips(&session), session.sources(), &path);
+        assert!(
+            session
+                .place_stream_at(0.0, &path, 0, frames, Some(v2))
+                .expect("its own file is on this timeline"),
+            "a layer covering the same frames as the take"
+        );
+
+        // Saved and loaded back with the lanes in the order a hand-written
+        // project may hold them: the sound last, behind the layer.
+        let dir = std::env::temp_dir().join(format!("ve_group_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let file = dir.join("lanes.edith");
+        session.save_project(&file).expect("save the project");
+        let text = std::fs::read_to_string(&file).expect("read it back");
+        let (sound, rest): (Vec<&str>, Vec<&str>) =
+            text.lines().partition(|l| l.starts_with("audio "));
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n", rest.join("\n"), sound.join("\n")),
+        )
+        .expect("write the reordered project");
+        let mut session = PlaybackSession::open_project(&file).expect("it loads as it stands");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            session.lanes(),
+            vec![Lane::V1, v2, Lane::A1],
+            "the sound is the last lane there"
+        );
+
+        // Detached, so Group has a choice to get wrong: the layer covers these
+        // frames too, and it is the lane the walk meets first.
+        assert!(session.ungroup(Lane::V1, 0));
+        // Group on the picture reaches the sound, not that layer.
+        assert_eq!(span_partner(&session, Lane::V1, 0), Some((Lane::A1, 0)));
+        session
+            .group(Lane::V1, 0, Lane::A1, 0)
+            .expect("the two halves cover the same frames");
+        // ...and a lane of its own kind is still groupable, once the sound is
+        // spoken for: two video lanes may be one take.
+        assert_eq!(
+            span_partner(&session, Lane::V1, 0),
+            Some((v2, 0)),
+            "the layer is what is left to group with"
         );
     }
 
