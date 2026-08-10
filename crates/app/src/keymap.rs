@@ -48,6 +48,8 @@ pub enum ActionId {
     Delete,
     Lift,
     Color,
+    Fit,
+    Resolution,
     Undo,
     AddVideoLane,
     AddAudioLane,
@@ -61,7 +63,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 18] = [
+    pub const ALL: [ActionId; 20] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -72,6 +74,8 @@ impl ActionId {
         ActionId::Delete,
         ActionId::Lift,
         ActionId::Color,
+        ActionId::Fit,
+        ActionId::Resolution,
         ActionId::Undo,
         ActionId::AddVideoLane,
         ActionId::AddAudioLane,
@@ -95,6 +99,8 @@ impl ActionId {
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Color => "Colour…",
+            ActionId::Fit => "Fit policy: fit → fill → stretch → centre",
+            ActionId::Resolution => "Project resolution: source → 2160p → 1080p → 720p → 480p",
             ActionId::Undo => "Undo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
@@ -120,6 +126,8 @@ impl ActionId {
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Color => "color",
+            ActionId::Fit => "fit",
+            ActionId::Resolution => "resolution",
             ActionId::Undo => "undo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
@@ -145,7 +153,11 @@ impl ActionId {
             | ActionId::Paste
             | ActionId::Delete
             | ActionId::Lift
-            | ActionId::Color => Category::Clips,
+            | ActionId::Color
+            | ActionId::Fit => Category::Clips,
+            // The project's own picture size is not a clip's business, and not
+            // a file operation either: it is what the viewer is looking at.
+            ActionId::Resolution => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Undo
@@ -379,6 +391,13 @@ impl Keymap {
                 // k: free, next to nothing that edits, and one press like the
                 // rest of the clip keys.
                 b(ActionId::Color, "k", false),
+                // The fit policy is a clip key like the grade beside it: "p" for
+                // policy, free, and one press like the rest of them. The project
+                // resolution is not a clip key and takes a ctrl chord, next to
+                // nothing that edits and out of the way of a stray press --
+                // it changes what every clip is composed onto.
+                b(ActionId::Fit, "p", false),
+                b(ActionId::Resolution, "r", true),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
                 // The unshifted initials of what they add. Both were free --
@@ -621,7 +640,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 20);
+        assert_eq!(k.entries().len(), 22);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -633,6 +652,8 @@ mod tests {
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
         assert_eq!(k.lookup("k", false), Some(ActionId::Color));
+        assert_eq!(k.lookup("p", false), Some(ActionId::Fit));
+        assert_eq!(k.lookup("r", true), Some(ActionId::Resolution));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
         // The track keys are the bare letters; the ctrl ones stay copy/paste.
@@ -773,7 +794,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 18);
+        assert_eq!(ActionId::ALL.len(), 20);
     }
 
     #[test]
