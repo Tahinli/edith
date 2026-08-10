@@ -2,20 +2,23 @@
 //! or, picture left behind, as one WAV or FLAC of the timeline's audio alone.
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
-//! is impossible — while audio is copied packet for packet, because there is no
-//! pure-Rust AAC encoder to re-encode with. The audio-only formats have no such
-//! trouble: `hound` writes PCM and `flacenc` encodes FLAC, both pure Rust, so
-//! those are *decoded* out of the timeline instead of copied. The worker owns
-//! everything: the caller gets an [`ExportHandle`] and polls it from its render
-//! loop.
+//! is impossible — while audio is copied packet for packet wherever a copy can
+//! say what the timeline says: a copy is exact, free and never a generation of
+//! loss. Where it *cannot* — an equalized lane, which is sample math no packet
+//! copy can reach — that lane is decoded, mixed and encoded again with
+//! `rusty_aac` ([`encode_audio`]). The audio-only formats have no such split:
+//! `hound` writes PCM and `flacenc` encodes FLAC, so those are always *decoded*
+//! out of the timeline. The worker owns everything: the caller gets an
+//! [`ExportHandle`] and polls it from its render loop.
 //!
 //! A **speeded** clip splits along the same line, and for the same reason. The
 //! picture is re-encoded, so the frame walk honours a rate: it takes the source
 //! frame each timeline frame shows ([`crate::project::Speed::source_at`], the
 //! very frame preview holds there) and encodes a held one again rather than
-//! decoding it twice. The sound is *copied*, and a packet carries no rate -- so
-//! a speeded clip on the one audio lane an mp4 copies is refused by name
-//! ([`copy_audio`]) rather than written out at 1.00x under a re-timed picture.
+//! decoding it twice. The sound is *copied* unless a filter forces a decode, and
+//! a packet carries no rate -- so a speeded clip on the one audio lane an mp4
+//! copies is refused by name ([`copy_audio`]) rather than written out at 1.00x
+//! under a re-timed picture.
 //! AV1 carries no audio at all and never meets that refusal; WAV and FLAC are
 //! decoded and resampled, so they honour a rate like the picture does.
 //!
@@ -60,21 +63,26 @@ const AV1_SPEED: u8 = 10;
 
 /// What an export writes. Four, not more: H.264-in-mp4 and AV1-in-Matroska are
 /// the only *video* pairs with both an encoder and a decoder under this
-/// project's no-install rule, and WAV and FLAC are the only audio formats with
-/// a pure-Rust encoder at all. MP3 has one (`shine-rs`) under LGPL-2.0, which is
-/// a licensing decision this project has not taken; Vorbis, Opus and AAC have
-/// none. HEVC and VP9 have no encoder here at all (`hevc`/`vp9` import through
-/// the plugin and stop there). A front-end says so rather than hiding the rows.
+/// project's no-install rule, and WAV and FLAC are the only *standalone* audio
+/// formats with a pure-Rust encoder at all. MP3 has one (`shine-rs`) under
+/// LGPL-2.0, which is a licensing decision this project has not taken; Vorbis
+/// and Opus have none. (AAC does -- `rusty_aac`, which is what an equalized mp4
+/// track is encoded with -- but AAC is an mp4's own audio, never a file of its
+/// own here.) HEVC and VP9 have no encoder here at all (`hevc`/`vp9` import
+/// through the plugin and stop there). A front-end says so rather than hiding
+/// the rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
-    /// Picture and sound: video re-encoded, AAC copied. Copied, so it carries
-    /// **one** audio lane: a timeline whose sound is spread over two is refused
-    /// by name here and mixed by the other two formats, which decode.
+    /// Picture and sound: video re-encoded, AAC copied -- or re-encoded too,
+    /// where a copy could not carry the edit (an equalized lane). Either way it
+    /// carries **one** audio lane: a timeline whose sound is spread over two is
+    /// refused by name here and mixed by the other two formats, which decode.
     #[default]
     Mp4,
     /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
-    /// this project can write: there is no AAC or Opus encoder here, and an AAC
-    /// track copied in would be one *this engine's own reader* leaves silent
+    /// this project can write: this engine's Matroska writer has no audio track
+    /// at all, and an AAC track written into one would be one *this engine's own
+    /// reader* leaves silent
     /// (`audio::AudioSession::open` refuses Matroska audio). The sound of an AV1
     /// export is a WAV or FLAC beside it, which a front-end says up front.
     Av1,
@@ -256,7 +264,9 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
 }
 
 /// The timeline's one audio lane, copied packet for packet: the mp4 path's
-/// sound, and the reason that path carries only one lane of it.
+/// sound, and the reason that path carries only one lane of it. A lane an
+/// equalizer has been put on cannot be *copied* at all and leaves through
+/// [`encode_audio`] instead; every other timeline keeps this copy, bit for bit.
 ///
 /// ponytail: this holds the whole exported AAC track in memory (~3 kB per
 /// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
@@ -277,10 +287,15 @@ fn copy_audio(
     // of a timeline playing a file's second audio track carries *that* track.
     //
     // One lane, because this path *copies* AAC packets and a mix is not a copy:
-    // summing two lanes means decoding both and encoding the result, and there
-    // is no AAC encoder here to encode it with. Refused by name rather than
-    // silently exporting the first lane -- a file missing half its sound is the
-    // one failure a user would not notice.
+    // summing two lanes means decoding both, and only the one thing a copy
+    // cannot express at all -- an equalizer -- is decoded here today. Refused by
+    // name rather than silently exporting the first lane, which is a file
+    // missing half its sound: the one failure a user would not notice.
+    //
+    // ponytail: the ceiling is this routing, not the codec any more.
+    // [`encode_audio`] already mixes *every* audio lane (it is the WAV path's
+    // own opener), so lifting this refusal is routing a second case to it --
+    // deliberately not done here, where the change under test is the equalizer.
     //
     // *Which* lane is the same question `audio_segments_from` answers for
     // playback, and it is asked here rather than assumed: the lane that holds
@@ -292,32 +307,29 @@ fn copy_audio(
     let [segments] = &lanes[..] else {
         return Err(format!(
             "this timeline has {} audio lanes and an mp4 export copies one: \
-             there is no AAC encoder here to mix them with. Export WAV or FLAC, \
-             which are mixed, or put the sound on one lane",
+             export WAV or FLAC, which are mixed, or put the sound on one lane",
             lanes.len()
         )
         .into());
     };
-    // ...and the same list decides which clips this would be copying, which is
-    // the only way to ask whether any of them carries an equalizer. An EQ is
-    // sample math and a copy never decodes: exporting it here would write the
-    // clip flat, silently -- the same failure a missing audio track is. Named by
-    // where it sits on the timeline, because "some clip" is not a thing a user
-    // can go and fix.
+    // ...and the same list names *which* lane those clips sit on, which is the
+    // only way to ask what has been done to them.
     let lane = project.audio_lanes()[0];
     // ...and the same list decides whether any clip this would copy plays at a
     // rate other than the one it was recorded at. A copy hands the mp4 the very
     // AAC packets the source holds and there is no rate inside a packet to
     // change: the picture would come out re-timed (the walk in [`run`] honours
     // it) over sound at 1.00x, which is the drift a person finds only after the
-    // file has gone somewhere. Refused by name, exactly as the equalizer below
-    // is -- and only *here*, on the lane being copied: AV1 carries no audio at
-    // all and never reaches this, so it honours a speed like WAV and FLAC do.
+    // file has gone somewhere. Refused by name -- and only *here*, on the lane
+    // being copied: AV1 carries no audio at all and never reaches this, so it
+    // honours a speed like WAV and FLAC do.
     //
-    // ponytail: the ceiling is the packet copy itself, not the rate. Upgrade
-    // path is the same one the equalizer below wants -- an AAC encoder (or a
-    // decode-and-re-encode of this lane) -- at which point the resample the WAV
-    // path already runs feeds it and this refusal goes.
+    // ponytail: the ceiling is the packet copy itself, not the rate, and the way
+    // off it is now next door -- [`encode_audio`] resamples exactly as the WAV
+    // path does, so routing a speeded lane there is the one line the equalizer
+    // below takes. Left refused because this change is the equalizer's, and a
+    // speeded export turning silently from a copy into a re-encode is a change
+    // of its own to make on purpose.
     if let Some((at, speed)) = project
         .lane(lane)
         .iter()
@@ -331,26 +343,104 @@ fn copy_audio(
         )
         .into());
     }
-    if let Some((at, _)) = project
-        .lane(lane)
-        .iter()
-        .enumerate()
-        .find(|(idx, _)| {
-            project
-                .eq_of(lane, *idx)
-                .is_some_and(|eq| !eq.is_identity())
-        })
-        .map(|(idx, clip)| (clip.start, idx))
-    {
-        return Err(format!(
-            "the clip at {} has an equalizer and an mp4 export copies AAC packets, \
-             which no filter can reach: export WAV or FLAC, which are decoded and \
-             mixed, or clear the equalizer",
-            timecode(at, meta.frame_rate)
-        )
-        .into());
+    // ...and last, whether any clip on it carries an equalizer. An EQ is sample
+    // math and a copy never decodes, so copying such a lane would write the clip
+    // *flat*, silently -- the failure a missing audio track is. This lane is
+    // decoded, filtered, mixed and encoded again instead ([`encode_audio`]), and
+    // only this case is: a timeline nobody has equalized still leaves through
+    // the copy below, packet for packet, so no passthrough quietly becomes a
+    // generation of loss.
+    let equalized = (0..project.lane(lane).len())
+        .any(|idx| project.eq_of(lane, idx).is_some_and(|eq| !eq.is_identity()));
+    if equalized {
+        return encode_audio(project, meta);
     }
     AudioSession::copy_multi_streams(&project.audio_sources(), segments)
+}
+
+/// The same lane, *decoded*: what a packet copy cannot carry comes out here as
+/// AAC written by this project's own encoder.
+///
+/// The samples are the very ones [`run_audio`] would put in a WAV -- the same
+/// opener with the same equalizers, the same rates and the same resize onto the
+/// timeline's own length -- so an mp4 and a WAV of one timeline are one mix,
+/// not two that could disagree.
+///
+/// AAC-LC's encoder delay is one 1024-frame block, which is exactly the priming
+/// a reader drops when the file carries no edit list (`audio::DEFAULT_PRIMING`,
+/// and [`crate::mux::Mp4Muxer`] writes none): the first packet is that delay, so
+/// the sound starts at timeline frame 0 as a copied track's does.
+///
+/// ponytail: the mix sits in memory as f32 before it is encoded (~46 MB a
+/// minute of 48 kHz stereo), for [`run_audio`]'s reason -- `rusty_aac` buffers
+/// the whole stream anyway, since it encodes its frames in parallel. Upgrade
+/// path is a chunked push once that encoder streams.
+#[allow(clippy::type_complexity)]
+fn encode_audio(
+    project: &Project,
+    meta: &VideoMeta,
+) -> crate::Result<Option<(crate::AacTrackParams, Vec<crate::AacPacket>)>> {
+    let sources = project.audio_sources();
+    let segs = project.audio_segments_from(0, meta.frame_rate);
+    let eqs = project.audio_eqs_from(0, meta.frame_rate);
+    let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    let Some((audio, chunks)) =
+        AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds)?
+    else {
+        return Ok(None); // no audio to write, exactly as a copy of nothing is
+    };
+    let freq_index = rusty_aac::sf_index_for_rate(audio.sample_rate).ok_or_else(|| {
+        format!(
+            "{} Hz is not an AAC sample rate: export WAV or FLAC, which write it as it is",
+            audio.sample_rate
+        )
+    })?;
+    let channels = usize::from(audio.channels.max(1));
+    // The timeline's length, not the mix's: a segment resolves its window to
+    // whole samples on its own, so the sum can miss by a sample or two and a
+    // source that ran out early would leave the track short under a picture
+    // that is not. One resize settles both, as [`run_audio`]'s does.
+    let total = (f64::from(project.timeline_frames()) / meta.frame_rate
+        * f64::from(audio.sample_rate))
+    .round() as usize
+        * channels;
+    let mut samples: Vec<f32> = Vec::with_capacity(total);
+    for chunk in chunks {
+        samples.extend(chunk.samples);
+    }
+    samples.resize(total, 0.0);
+
+    // 256 kbps, not the encoder's 128 default: this is a *second* generation of
+    // lossy coding over a source that was already AAC, and the export is a
+    // master a person edits from again, not a delivery file. Measured on the
+    // suite's fixtures, an untouched clip re-encoded here moves 0.15 dB at this
+    // rate against 0.46 dB at 128 -- and 32 KB/s beside a 2.76 Mbps picture is
+    // not a size anyone is counting.
+    let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
+        bitrate_bps: 256_000,
+        ..Default::default()
+    });
+    encoder.push_pcm(&samples, audio.channels.max(1), audio.sample_rate)?;
+    encoder.finish();
+    let mut packets = Vec::new();
+    // `next_packet` after `finish` yields packets until `Eof` and nothing else,
+    // so the loop ends on the only error it can see.
+    while let Ok(packet) = encoder.next_packet() {
+        packets.push(crate::AacPacket {
+            bytes: packet.data,
+            samples: packet.duration,
+        });
+    }
+    Ok(Some((
+        crate::AacTrackParams {
+            freq_index,
+            // 1 and 2 are the ISO channel configurations for mono and stereo,
+            // and the opener refuses anything wider than stereo already.
+            chan_conf: audio.channels.max(1) as u8,
+            sample_rate: audio.sample_rate,
+        },
+        packets,
+    )))
 }
 
 fn run(

@@ -1638,6 +1638,7 @@ dependencies = [
  "oxideav-ac3",
  "oxideav-core",
  "rav1e",
+ "rusty_aac",
  "rusty_h264",
  "symphonia",
  "symphonia-codec-aac",
@@ -4879,6 +4880,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty_aac"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ab980ffb66a559565d09dd6727ff2da7d2a39d2e8b6149e48af6908caa99b5"
 
 [[package]]
 name = "rusty_h264"
