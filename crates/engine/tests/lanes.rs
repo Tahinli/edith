@@ -198,6 +198,81 @@ fn export_writes_the_same_composite() {
     std::fs::remove_file(&out).unwrap();
 }
 
+/// Every sample of `path`'s first audio stream, interleaved -- what the export
+/// wrote, read back through the engine's own decoder.
+fn decoded_audio(path: &Path) -> Vec<f32> {
+    let sources = [(path.to_path_buf(), 0)];
+    let (_, chunks) =
+        engine::AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])
+            .expect("open the audio")
+            .expect("there is an audio track");
+    chunks.into_iter().flat_map(|c| c.samples).collect()
+}
+
+fn rms(samples: &[f32]) -> f64 {
+    assert!(!samples.is_empty(), "no samples to measure");
+    (samples
+        .iter()
+        .map(|s| f64::from(*s) * f64::from(*s))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt()
+}
+
+/// The sound need not be on `A1`: a project that leaves `A1` empty and places
+/// everything on `A2` is still *one* audio lane, so the mp4 export copies it
+/// rather than refusing -- and rather than writing a file with no audio track
+/// at all, which is what pinning the copy to `A1` did (verifier's repro: the
+/// export succeeded, ffprobe showed video only, and nobody would notice until
+/// they played it).
+#[test]
+fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
+    pin_software();
+    let source = asset("test_av.mp4");
+    let clip = Clip {
+        start: 0,
+        in_frame: 0,
+        out_frame: TOTAL,
+        source: 0,
+        link: None,
+    };
+    let project = Project::from_parts(
+        vec![Source::new(&source, 0)],
+        vec![
+            (LaneKind::Video, vec![clip]),
+            (LaneKind::Audio, Vec::new()),
+            (LaneKind::Audio, vec![clip]),
+        ],
+    )
+    .expect("valid parts");
+    assert_eq!(
+        project.audio_segments_from(0, FPS).len(),
+        1,
+        "one lane holds sound, so this is not a mix"
+    );
+
+    let out = out_path("a2_only", "mp4");
+    let (meta, _) = engine::demux::Demuxer::open(&source).unwrap();
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    wait(&handle, Duration::from_secs(300)).expect("export the A2-only timeline");
+
+    let written = decoded_audio(&out);
+    let played = decoded_audio(&source);
+    println!(
+        "A2-only export: {} samples rms {:.4}, source {} samples rms {:.4}",
+        written.len(),
+        rms(&written),
+        played.len(),
+        rms(&played)
+    );
+    assert!(rms(&written) > 0.001, "the export has to carry the sound");
+    assert!(
+        (rms(&written) / rms(&played) - 1.0).abs() < 0.05,
+        "the exported audio is not the lane's content"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// `A1` and `A2` playing the *same* source range at the same place: over that
 /// stretch the mix is that audio twice over, so it measures at exactly double
 /// the level the one-lane export of the same timeline has there -- and outside

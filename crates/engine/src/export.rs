@@ -218,8 +218,15 @@ fn run(
     // is no AAC encoder here to encode it with. Refused by name rather than
     // silently exporting the first lane -- a file missing half its sound is the
     // one failure a user would not notice.
+    //
+    // *Which* lane is the same question `audio_segments_from` answers for
+    // playback, and it is asked here rather than assumed: the lane that holds
+    // the sound need not be `A1` (a project may leave `A1` empty and place
+    // everything on `A2`), and copying `A1`'s list in that case would write a
+    // file with no audio track at all -- silently, which is the failure this
+    // whole comment is about.
     let lanes = project.audio_segments_from(0, meta.frame_rate);
-    if lanes.len() > 1 {
+    let [segments] = &lanes[..] else {
         return Err(format!(
             "this timeline has {} audio lanes and an mp4 export copies one: \
              there is no AAC encoder here to mix them with. Export WAV or FLAC, \
@@ -227,11 +234,8 @@ fn run(
             lanes.len()
         )
         .into());
-    }
-    let audio = AudioSession::copy_multi_streams(
-        &project.audio_sources(),
-        &project.segments_from(0, meta.frame_rate),
-    )?;
+    };
+    let audio = AudioSession::copy_multi_streams(&project.audio_sources(), segments)?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
