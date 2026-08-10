@@ -282,6 +282,7 @@ impl PlaybackSession {
             audio,
             audio_disabled,
             project,
+            counts: vec![meta.frame_count],
             span,
             eos: false,
         })
