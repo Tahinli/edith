@@ -254,15 +254,70 @@ struct ContextMenu {
     details: bool,
 }
 
+/// An open library menu: which row it was opened on -- the file and the stream,
+/// the pair [`Player::selected_asset`] holds, so a list rebuilt under it (a
+/// probe landing, a source going) cannot slide another row beneath the menu the
+/// way a row *index* would -- where it hangs, and whether it has been turned
+/// over to show what the file *is*.
+#[derive(Clone)]
+struct LibraryMenu {
+    path: PathBuf,
+    stream: usize,
+    at: Point<Pixels>,
+    details: bool,
+}
+
+/// What a library row's menu offers, in the order it lists them. Unlike the clip
+/// menu's items none of these is a stroke -- there is no keyboard way to a row --
+/// so the label and the hint are written here rather than read off the keymap.
+#[derive(Clone, Copy, PartialEq)]
+enum RowItem {
+    Add,
+    Remove,
+    Reveal,
+    Properties,
+}
+
+const ROW_ITEMS: [RowItem; 4] = [
+    RowItem::Add,
+    RowItem::Remove,
+    RowItem::Reveal,
+    RowItem::Properties,
+];
+
+impl RowItem {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "Add at playhead",
+            Self::Remove => "Remove from library",
+            Self::Reveal => "Reveal in files",
+            Self::Properties => "Properties",
+        }
+    }
+
+    /// The dim right-hand column, where the clip menu prints the stroke: what
+    /// the item will do to the timeline, so nothing here is a surprise.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Add => "inserts the whole file",
+            Self::Remove => "only if nothing plays it",
+            Self::Reveal => "file manager",
+            Self::Properties => "…",
+        }
+    }
+}
+
 /// What the menu offers, in the order it lists them. Every one of these is an
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 8] = [
+const MENU_ITEMS: [ActionId; 10] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
+    ActionId::Detach,
+    ActionId::Group,
     ActionId::Equalizer,
     ActionId::Color,
     ActionId::Fit,
@@ -385,6 +440,10 @@ struct Player {
     /// `selected` does, so it is closed by anything that can move indices --
     /// every stroke, and every item of its own.
     context_menu: Option<ContextMenu>,
+    /// The library menu a right-click on a row opened, if one is up. Names its
+    /// row by file and stream rather than by position, so it acts on the row it
+    /// was opened on however the list is rebuilt under it.
+    library_menu: Option<LibraryMenu>,
     /// Which library row is picked: the file and the audio stream that row
     /// names, which is what an insert needs and what survives a row list being
     /// rebuilt. Its own selection and not the timeline's: Delete keeps acting
@@ -626,6 +685,8 @@ impl Player {
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),
             ActionId::Regroup => self.regroup(cx),
+            ActionId::Detach => self.detach(cx),
+            ActionId::Group => self.group(cx),
             ActionId::Select => self.select_under_playhead(cx),
             ActionId::SelectNext => self.select_step(true, cx),
             ActionId::SelectPrev => self.select_step(false, cx),
@@ -1084,6 +1145,63 @@ impl Player {
         cx.notify();
     }
 
+    /// Takes the selected clip out of its group, so the picture and the sound
+    /// under it are edited apart from here on: each half selects, moves, trims
+    /// and is removed alone, and both draw outlined instead of tinted. The
+    /// selection stays -- the half that was clicked is still the half in hand.
+    fn detach(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match (&mut self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => {
+                if !session.ungroup(lane, idx) {
+                    self.notice =
+                        Some("NOTHING DETACHED — that clip is not grouped with another".into());
+                }
+            }
+            (Some(_), None) => {
+                self.notice = Some("NOTHING DETACHED — click the take to take apart first".into())
+            }
+            (None, _) => {}
+        }
+        cx.notify();
+    }
+
+    /// Puts the selected clip back in a group with the clip covering exactly the
+    /// same frames on another track -- the way back from [`Player::detach`], and
+    /// the way to group a picture with sound it was never opened with. The
+    /// partner is not clicked because there is nothing to choose: a group id
+    /// names one span, so only a clip covering these very frames could join it,
+    /// and the engine words what to do when none does.
+    fn group(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let partner = match (&self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => span_partner(session, lane, idx),
+            _ => None,
+        };
+        match (&mut self.session, self.selected, partner) {
+            (Some(session), Some((lane, idx)), Some((other, o_idx))) => {
+                if let Err(e) = session.group(lane, idx, other, o_idx) {
+                    self.notice = Some(format!("NOT GROUPED — {e}").into());
+                }
+            }
+            (Some(_), Some(_), None) => {
+                self.notice = Some(
+                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these frames"
+                        .into(),
+                )
+            }
+            (Some(_), None, _) => {
+                self.notice = Some("NOTHING GROUPED — click one of the halves first".into())
+            }
+            (None, ..) => {}
+        }
+        cx.notify();
+    }
+
     /// Drops the selected clip and closes the hole: a whole take goes, both
     /// lanes of it, and everything after it moves up. A half with no take under
     /// it in the video lane -- what a lift leaves behind -- has nothing to
@@ -1464,6 +1582,75 @@ impl Player {
             Err(e) => self.notice = Some(format!("NOTHING ADDED — {e}").into()),
             Ok(false) => {
                 self.notice = Some("NOTHING ADDED — that file could not be placed here".into())
+            }
+        }
+        cx.notify();
+    }
+
+    /// Takes a library row's file out of the list, which is the one thing a row
+    /// can lose. Refused in the engine's own words while clips still play from
+    /// it -- and those words name the lanes holding them, so the refusal says
+    /// what to delete first. The list itself is the report that it worked: the
+    /// row is gone from it.
+    fn remove_source(&mut self, path: &Path, stream: usize, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let removed = self
+            .session
+            .as_mut()
+            .map(|session| session.remove_source(path, stream));
+        let text = match removed {
+            Some(Ok(())) => {
+                // The picked row may be the one that just went, and the engine
+                // reseeks, so this owes the flag reset like every other edit.
+                if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
+                    self.selected_asset = None;
+                }
+                self.reset_after_reseek();
+                // The undo stack goes with it (`Project::remove_source`): said
+                // here, because a `z` that does nothing afterwards would
+                // otherwise read as a bug.
+                format!(
+                    "REMOVED {} — there is nothing left to undo",
+                    file_name(path)
+                )
+            }
+            Some(Err(e)) => format!("NOT REMOVED — {e}"),
+            None => "NO TIMELINE — open a file first".to_string(),
+        };
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// One item of a library row's menu, done. Every one of them closes the
+    /// menu first -- the list under it is about to be rebuilt -- except the one
+    /// that turns the card over.
+    fn act_on_row(&mut self, item: RowItem, cx: &mut Context<Self>) {
+        let Some(menu) = self.library_menu.clone() else {
+            return;
+        };
+        match item {
+            RowItem::Properties => {
+                if let Some(open) = &mut self.library_menu {
+                    open.details = true;
+                }
+            }
+            RowItem::Add => {
+                self.library_menu = None;
+                self.insert_source(&menu.path, menu.stream, None, cx);
+            }
+            RowItem::Remove => {
+                self.library_menu = None;
+                self.remove_source(&menu.path, menu.stream, cx);
+            }
+            RowItem::Reveal => {
+                self.library_menu = None;
+                // Another process starting: off the UI thread, exactly as the
+                // export notice's own click starts it.
+                cx.background_executor()
+                    .spawn(async move { show_in_file_manager(&menu.path) })
+                    .detach();
             }
         }
         cx.notify();
@@ -2130,7 +2317,12 @@ impl Render for Player {
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
                 // already lists (keymap.rs `FIXED`).
-                if this.context_menu.take().is_some() {
+                // Both menus, taken rather than short-circuited: the library's
+                // one names a row the edits below can remove, so it closes on a
+                // stroke exactly as the clip menu does.
+                let clip_menu = this.context_menu.take().is_some();
+                let row_menu = this.library_menu.take().is_some();
+                if clip_menu || row_menu {
                     cx.notify();
                     if key == ESCAPE {
                         return;
@@ -2307,6 +2499,10 @@ impl Render for Player {
             // Over the panel it was opened on, and under the cards: it is only
             // ever up while neither of them is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
+            // The library's own menu, the same way and for the same reason:
+            // over the panel it was opened on, under the cards, and never up
+            // while one of them is.
+            .children(self.library_card(window.viewport_size(), cx))
             // Last, so they are over everything -- they take no room in the
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
@@ -2354,7 +2550,7 @@ impl Player {
                 .as_ref()
                 .is_some_and(|p| *p == (row.path.clone(), row.stream));
             let name: SharedString = row.name.clone().into();
-            let tip: SharedString = match (&row.unusable, meta) {
+            let says: String = match (&row.unusable, meta) {
                 // A greyed row says why in full, where its length would be:
                 // the list is the one place the file's own tracks are named.
                 (Some(why), _) => format!("{} — {why}", row.path.display()),
@@ -2373,8 +2569,10 @@ impl Player {
                     meta.frame_rate
                 ),
                 (None, None) => row.path.display().to_string(),
-            }
-            .into();
+            };
+            // The menu is the third way into a row, after the click and the
+            // drag, and a right-click nothing advertises is one nobody finds.
+            let tip: SharedString = format!("{says} · right-click for more").into();
             let ghost = name.clone();
             // What the second line says: the stream, then either its length or
             // the reason it cannot be used.
@@ -2388,6 +2586,7 @@ impl Player {
             let usable = row.unusable.is_none();
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);
+            let menu_path = path.clone();
             div()
                 .id(("asset", i))
                 .flex_none()
@@ -2415,6 +2614,33 @@ impl Player {
                             cx.new(|_| Tip(ghost.clone()))
                         })
                 })
+                // The right button hangs the row's own menu at the pointer.
+                // Every row takes it, greyed ones included: a file that cannot
+                // join this timeline can still be revealed, described and taken
+                // out of the list, and Add is the one item that then refuses --
+                // in the engine's words, where the row's grey already says why.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        if this.modal() {
+                            return;
+                        }
+                        // Picked as a left-click would pick it, so the row the
+                        // menu is about is the row that reads as chosen -- but
+                        // only a row that *can* be picked, which is what keeps
+                        // the Add button under the list honest.
+                        if usable {
+                            this.selected_asset = Some((menu_path.clone(), stream));
+                        }
+                        this.library_menu = Some(LibraryMenu {
+                            path: menu_path.clone(),
+                            stream,
+                            at: event.position,
+                            details: false,
+                        });
+                        cx.notify();
+                    }),
+                )
                 .when(picked, |d| d.bg(rgb(SELECTED)).border_1())
                 .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                 // Full height and hard against the edge: the tint reads as
@@ -3551,6 +3777,163 @@ impl Player {
         )
     }
 
+    /// The menu a right-click on a library row opens: what can be done with the
+    /// *file* rather than with a clip of it, and a turn-over side saying what
+    /// that file is. Built like [`Player::context_card`] down to the scrim, the
+    /// row height and the clamp, because it is the same menu on the other panel
+    /// -- a click away or any stroke closes it.
+    fn library_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let menu = self.library_menu.clone()?;
+        let path = menu.path.clone();
+        let row = |n: usize| {
+            div()
+                .id(("library-menu", n))
+                .flex()
+                .min_h(px(MENU_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if menu.details {
+            // What the library knows about this row and nothing probed for the
+            // card: the streams table is filled once per file at import.
+            let info = self
+                .streams
+                .get(&path)
+                .and_then(|of_file| of_file.iter().find(|s| s.index == menu.stream));
+            let frames = self
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(&path));
+            // How many clips play from this exact row -- the number that
+            // decides whether Remove is refused, so the card answers the
+            // question the refusal would otherwise raise.
+            let placed = self.session.as_ref().map_or(0, |session| {
+                let of_row = session
+                    .sources()
+                    .iter()
+                    .position(|s| s.path == path && s.audio_stream == menu.stream);
+                of_row.map_or(0, |idx| {
+                    session
+                        .lanes()
+                        .into_iter()
+                        .flat_map(|lane| session.lane_clips(lane))
+                        .filter(|c| c.source == idx)
+                        .count()
+                })
+            });
+            for (label, value) in [
+                ("File", file_name(&path)),
+                ("Path", path.display().to_string()),
+                (
+                    "Audio",
+                    info.map_or_else(|| "no track of its own".to_string(), stream_detail),
+                ),
+                ("Length", timecode(f64::from(frames) / self.fps, self.fps)),
+                ("On the timeline", format!("{placed} clips")),
+            ] {
+                rows.push(
+                    row(rows.len())
+                        .child(label)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(value),
+                        )
+                        .into_any_element(),
+                );
+            }
+        } else {
+            // Everything but Add works without a timeline open -- and with no
+            // timeline there are no rows to right-click at all, so this is the
+            // export guard's shape and not a second policy.
+            let live = self.session.is_some() && self.exporting().is_none();
+            for item in ROW_ITEMS {
+                let enabled = match item {
+                    RowItem::Add | RowItem::Remove => live,
+                    RowItem::Reveal | RowItem::Properties => true,
+                };
+                rows.push(
+                    row(rows.len())
+                        .child(item.label())
+                        .child(div().text_color(rgb(INK_DIM)).child(item.hint()))
+                        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+                        .when(enabled, |d| {
+                            d.cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.act_on_row(item, cx);
+                                }))
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
+        let (x, y) = menu_at(
+            menu.at,
+            viewport,
+            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+        );
+        let full: SharedString = path.display().to_string().into();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.library_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.library_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("library-menu-card")
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(MENU_W))
+                        .flex()
+                        .flex_col()
+                        .p(px(MENU_PAD))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        // Painted after the scrim, so this listener runs first
+                        // and a press meant for an item never closes the menu
+                        // out from under its own click (`context_card`).
+                        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .when(menu.details, |d| {
+                            d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
+                        })
+                        .children(rows),
+                ),
+        )
+    }
+
     /// The menu a right-click on a clip opens: what that clip can be given,
     /// each item beside the stroke that does the very same thing, and a
     /// turn-over side that says what the clip *is*. An item that would do
@@ -4262,6 +4645,10 @@ fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool 
         // at an edge of this clip. Whether those two halves were ever one take
         // is the engine's question, and it words that refusal itself.
         ActionId::Regroup => playhead == clip.start || playhead == clip.end(),
+        // Nothing to take apart in a clip that names no group at all. Whether
+        // the group it names still has another half is the engine's question,
+        // like the regroup above, and it words that refusal itself.
+        ActionId::Detach => clip.link.is_some(),
         _ => true,
     }
 }
@@ -4785,18 +5172,55 @@ fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> bool {
     let Some(clip) = session.lane_clips(lane).get(idx) else {
         return false;
     };
-    match (lane.kind, lane.ord) {
-        (_, 1..) => false,
-        (LaneKind::Video, _) => true,
-        // The sound of a take, only while the take is still there: its group is
-        // carried by a clip on some other lane.
-        (LaneKind::Audio, _) => session
+    let paired = || {
+        session
             .lanes()
             .into_iter()
             .filter(|&other| other != lane)
             .flat_map(|other| session.lane_clips(other))
-            .any(|o| o.link.is_some() && o.link == clip.link),
+            .any(|o| o.link.is_some() && o.link == clip.link)
+    };
+    match (lane.kind, lane.ord) {
+        (_, 1..) => false,
+        // The picture of a take -- unless the take has been taken apart: a
+        // detached picture (a group id no other lane carries, which is also what
+        // a lift of the sound leaves) is a half like the sound is, and a ripple
+        // under it would drag away the very half it was detached from. A clip in
+        // no group at all is not a half but a placement, and on `V1` a placement
+        // is the take there is.
+        (LaneKind::Video, _) => clip.link.is_none() || paired(),
+        // The sound of a take, only while the take is still there: its group is
+        // carried by a clip on some other lane.
+        (LaneKind::Audio, _) => paired(),
     }
+}
+
+/// The clip a Group would pair this one with: the first clip on another track,
+/// in the order the lanes are drawn, covering exactly the same frames and not in
+/// this clip's group already. Exactly the same frames because that is all a
+/// group id can mean (engine `links_are_consistent`), which is what leaves
+/// nothing for a second click to choose. `None` when no track has one, and the
+/// notice says so.
+fn span_partner(session: &PlaybackSession, lane: Lane, idx: usize) -> Option<(Lane, usize)> {
+    let clip = *session.lane_clips(lane).get(idx)?;
+    let matches = |other: Lane| {
+        let i = session.lane_clips(other).iter().position(|c| {
+            (c.start, c.end()) == (clip.start, clip.end())
+                && !(c.link.is_some() && c.link == clip.link)
+        })?;
+        Some((other, i))
+    };
+    // Sound before picture (and picture before sound): "group this" means the
+    // other half of the take, and a project whose audio lane was added after a
+    // second video one has that half *after* the layer in storage order -- which
+    // is the order the lanes come in. A same-kind lane is still groupable (V1
+    // and V2 may be one take), but only where no opposite one covers the span.
+    let (opposite, same): (Vec<Lane>, Vec<Lane>) = session
+        .lanes()
+        .into_iter()
+        .filter(|&other| other != lane)
+        .partition(|other| other.kind != lane.kind);
+    opposite.into_iter().chain(same).find_map(matches)
 }
 
 /// Whether a click marks this clip: the clip that was clicked always, and the
@@ -5203,8 +5627,8 @@ mod tests {
         envelope, eq_x, eq_y, export_path, export_settings, format_line, frac_along, frac_down,
         frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at,
         mp4_refusal, normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        source_tint, start_frac, timecode, unseen_paths, unseen_sources, whole_take, width_frac,
-        window_title,
+        source_tint, span_partner, start_frac, timecode, unseen_paths, unseen_sources, whole_take,
+        width_frac, window_title,
     };
     use super::{file_name, file_uri, library_rows};
 
@@ -5497,6 +5921,16 @@ mod tests {
         assert!(applicable(&clip, v1, ActionId::Regroup, 30));
         assert!(applicable(&clip, v1, ActionId::Regroup, 90));
         assert!(!applicable(&clip, v1, ActionId::Regroup, 60));
+        // Detach is the clip's own business: nothing to take apart in one that
+        // names no group, and whether the group still has another half is the
+        // engine's question. Group is offered on every clip, for that reason.
+        assert!(!applicable(&clip, v1, ActionId::Detach, 0));
+        let grouped = Clip {
+            link: Some(3),
+            ..clip
+        };
+        assert!(applicable(&grouped, v1, ActionId::Detach, 60));
+        assert!(applicable(&clip, a1, ActionId::Group, 0));
         // The equalizer is the one item the *lane* decides: it filters samples,
         // and a video clip has none of its own. Never the playhead's business.
         assert!(applicable(&clip, a1, ActionId::Equalizer, 0));
@@ -5536,6 +5970,113 @@ mod tests {
             assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
         }
+    }
+
+    /// What the Detach and Group items do to a real timeline: a music video's
+    /// sound comes off its picture, Delete on the loose half takes that half
+    /// only, undo puts both back, and Group makes the two one take again --
+    /// whole-take delete and all.
+    #[test]
+    fn a_detached_half_is_removed_alone_and_groups_again() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        assert!(whole_take(&session, Lane::V1, 0), "one take to start with");
+        assert!(whole_take(&session, Lane::A1, 0));
+        let frames = session.lane_clips(Lane::V1)[0].len();
+
+        // Detach audio: neither half is a whole take any more, so Delete on
+        // either leaves the other exactly where it is.
+        assert!(session.ungroup(Lane::V1, 0));
+        assert!(
+            !whole_take(&session, Lane::A1, 0),
+            "the sound is a half now"
+        );
+        assert!(!whole_take(&session, Lane::V1, 0), "and so is the picture");
+        assert!(session.lift_clip(Lane::A1, 0));
+        assert!(session.lane_clips(Lane::A1).is_empty(), "the sound went");
+        assert_eq!(session.lane_clips(Lane::V1).len(), 1, "the picture stayed");
+        assert_eq!(session.lane_clips(Lane::V1)[0].len(), frames, "untrimmed");
+
+        // One undo per edit, the removal then the detach.
+        assert!(session.undo());
+        assert_eq!(session.lane_clips(Lane::A1).len(), 1, "the sound is back");
+        assert!(session.undo());
+        assert!(whole_take(&session, Lane::A1, 0), "one take again");
+
+        // Group: the partner is the clip covering these very frames on the
+        // other track, which is what the item hands the engine.
+        assert!(session.ungroup(Lane::V1, 0));
+        assert_eq!(span_partner(&session, Lane::V1, 0), Some((Lane::A1, 0)));
+        session
+            .group(Lane::V1, 0, Lane::A1, 0)
+            .expect("both halves still cover the same frames");
+        assert!(
+            whole_take(&session, Lane::A1, 0),
+            "a take that ripples again"
+        );
+        assert_eq!(
+            span_partner(&session, Lane::V1, 0),
+            None,
+            "and nothing left on another track to group with"
+        );
+    }
+
+    /// Which clip Group reaches when more than one covers the span: the sound,
+    /// whatever order the lanes are stored in. A project file may hold them in
+    /// any order -- a video layer *before* the audio lane among them -- and
+    /// "group this" means the other half of the take, never the layer above it.
+    #[test]
+    fn group_reaches_the_sound_before_a_video_layer_over_it() {
+        use engine::project::LaneKind;
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        let v2 = session.add_lane(LaneKind::Video);
+        let path = session.sources()[0].path.clone();
+        assert!(
+            session
+                .place_stream_at(0.0, &path, 0, Some(v2))
+                .expect("its own file is on this timeline"),
+            "a layer covering the same frames as the take"
+        );
+
+        // Saved and loaded back with the lanes in the order a hand-written
+        // project may hold them: the sound last, behind the layer.
+        let dir = std::env::temp_dir().join(format!("ve_group_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let file = dir.join("lanes.edith");
+        session.save_project(&file).expect("save the project");
+        let text = std::fs::read_to_string(&file).expect("read it back");
+        let (sound, rest): (Vec<&str>, Vec<&str>) =
+            text.lines().partition(|l| l.starts_with("audio "));
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n", rest.join("\n"), sound.join("\n")),
+        )
+        .expect("write the reordered project");
+        let mut session = PlaybackSession::open_project(&file).expect("it loads as it stands");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            session.lanes(),
+            vec![Lane::V1, v2, Lane::A1],
+            "the sound is the last lane there"
+        );
+
+        // Detached, so Group has a choice to get wrong: the layer covers these
+        // frames too, and it is the lane the walk meets first.
+        assert!(session.ungroup(Lane::V1, 0));
+        // Group on the picture reaches the sound, not that layer.
+        assert_eq!(span_partner(&session, Lane::V1, 0), Some((Lane::A1, 0)));
+        session
+            .group(Lane::V1, 0, Lane::A1, 0)
+            .expect("the two halves cover the same frames");
+        // ...and a lane of its own kind is still groupable, once the sound is
+        // spoken for: two video lanes may be one take.
+        assert_eq!(
+            span_partner(&session, Lane::V1, 0),
+            Some((v2, 0)),
+            "the layer is what is left to group with"
+        );
     }
 
     /// The refusal path, end to end against the real files: an incompatible
@@ -5622,6 +6163,61 @@ mod tests {
         // Both rows are the same file, so both rows are that file's length --
         // the second one before any clip of its own existed.
         assert_eq!(session.file_frames(&path), frames);
+    }
+
+    /// Remove from library, through the door the menu item uses
+    /// ([`Player::remove_source`] calls exactly this): refused by name while
+    /// clips play from the file, and once they do not the row leaves the list.
+    #[test]
+    fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Imported, then dragged onto the end: an import alone fills the
+        // library, and a row with no clip is removable without any refusal to
+        // test. This one has to have a take on the timeline.
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let second = session.sources()[1].path.clone();
+        let end = session.timeline_duration();
+        assert!(
+            session
+                .place_stream_at(end, &second, 0, None)
+                .expect("a file just imported is on this timeline")
+        );
+        let streams = HashMap::new();
+        let rows = |session: &PlaybackSession| {
+            library_rows(session.sources(), &streams, None, |_| 0).len()
+        };
+        assert_eq!(rows(&session), 2, "a row per source");
+
+        let refusal = session
+            .remove_source(&second, 0)
+            .expect_err("its take is still on the timeline")
+            .to_string();
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert!(
+            refusal.contains("V1 (1 clip)") && refusal.contains("A1 (1 clip)"),
+            "the refusal names the lanes to clear: {refusal}"
+        );
+        assert_eq!(rows(&session), 2, "and the row is still there");
+
+        // Delete that take -- the whole group, from either half -- and the file
+        // can go. The list is what says so.
+        let last = session.lane_clips(Lane::V1).len() - 1;
+        assert!(session.delete_clip(Lane::V1, last));
+        session
+            .remove_source(&second, 0)
+            .expect("nothing plays av2 any more");
+        assert_eq!(rows(&session), 1, "the row went with it");
+        assert_eq!(session.sources().len(), 1);
+        // The one file left cannot go: a project that names none is not one
+        // that reopens.
+        let refusal = session
+            .remove_source(&session.sources()[0].path.clone(), 0)
+            .expect_err("the last file stays")
+            .to_string();
+        assert!(refusal.contains("only file"), "{refusal}");
+        // A row this timeline never had is refused, not panicked on.
+        assert!(session.remove_source(&second, 0).is_err());
     }
 
     /// The trim-a-clip path through the doors the edge drag uses:
@@ -6853,6 +7449,7 @@ fn main() {
                     ruler: Rc::default(),
                     selected: None,
                     context_menu: None,
+                    library_menu: None,
                     selected_asset: None,
                     waves: HashMap::new(),
                     streams: HashMap::new(),
