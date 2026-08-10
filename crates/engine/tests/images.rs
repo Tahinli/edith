@@ -1,0 +1,341 @@
+//! Still images as clips: imported into the library, placed on a video lane,
+//! shown at the project's resolution, trimmed against the length a still is
+//! held to, saved, reopened and exported.
+//!
+//! Every picture assertion is against the *file's own pixels* (read here with
+//! the `image` crate) rather than against a constant, so a channel swap, a
+//! vertical flip and a wrong colour matrix all fail rather than agreeing with
+//! a hard-coded red.
+//!
+//! ```text
+//! cargo test -p engine --test images -- --test-threads=1 --nocapture
+//! ```
+
+use std::path::PathBuf;
+use std::sync::Once;
+use std::time::{Duration, Instant};
+
+use engine::project::{Edge, Lane, LaneKind};
+use engine::{DecodeSession, ExportHandle, PlaybackSession};
+
+/// test_av.mp4's rate, which every fixture here shares.
+const FPS: f64 = 30.0;
+/// [`playback::IMAGE_MAX_SECS`] at that rate: ten minutes.
+const CAP: u32 = 18_000;
+/// What a placed still is five seconds of.
+const PLACED: u32 = 150;
+
+fn asset(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets")
+        .join(name)
+}
+
+/// Software everywhere, so the suite proves the path every machine has.
+fn pin_software() {
+    static PIN: Once = Once::new();
+    PIN.call_once(|| unsafe {
+        std::env::set_var("VE_SW", "1");
+        std::env::set_var("VE_SW_ENC", "1");
+    });
+}
+
+/// The fixture's own pixel at `(x, y)` as RGB -- what the timeline has to show
+/// there, whatever it scaled the picture to on the way.
+fn source_rgb(x: u32, y: u32) -> [u8; 3] {
+    let img = image::open(asset("test_still.png"))
+        .expect("the still fixture (scripts/gen_fixtures.sh)")
+        .to_rgb8();
+    img.get_pixel(x, y).0
+}
+
+/// One BGRA pixel of a frame as RGB, so both sides of a comparison read alike.
+fn frame_rgb(bgra: &[u8], width: u32, x: u32, y: u32) -> [u8; 3] {
+    let at = ((y * width + x) * 4) as usize;
+    [bgra[at + 2], bgra[at + 1], bgra[at]]
+}
+
+/// BT.601 is lossy in both directions and the chroma is subsampled, so a
+/// colour survives to within a few counts rather than exactly.
+fn close(got: [u8; 3], want: [u8; 3], what: &str) {
+    let off = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(off <= 6, "{what}: showed {got:?}, the file has {want:?}");
+}
+
+/// The frame the playhead is on, decoded: a paused seek still decodes, so this
+/// is what the viewer would be showing.
+fn frame_at(session: &mut PlaybackSession, secs: f64) -> engine::Frame {
+    session.seek(secs);
+    let target = (secs * FPS) as u32;
+    let started = Instant::now();
+    loop {
+        if let Some(frame) = session.try_frame()
+            && frame.index >= target
+        {
+            return frame;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "no frame at {secs} s (timeline frame {target})"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < limit,
+            "export did not finish in {limit:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.result().expect("a finished export has an outcome")
+}
+
+/// An import is a library entry and nothing else -- the same promise every
+/// other source makes, kept by the one with no length of its own.
+#[test]
+fn importing_a_still_fills_the_library_and_places_nothing() {
+    pin_software();
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let before = session.clip_spans();
+
+    let source = session.import(&asset("test_still.png")).expect("a picture");
+    assert_eq!(source, 1, "a second source");
+    assert_eq!(session.clip_spans(), before, "nothing was placed");
+    // Ten minutes: the length a still is *held* to, which is what a trim is
+    // walled by and what a reload recomputes.
+    assert_eq!(session.file_frames(&asset("test_still.png")), CAP);
+
+    // A file that is not a picture at all is refused at the same door, by name.
+    let broken = std::env::temp_dir().join(format!("ve_not_a_png_{}.png", std::process::id()));
+    std::fs::write(&broken, b"this is not a PNG").expect("write the decoy");
+    let refused = session.import(&broken).expect_err("not a picture");
+    assert!(
+        refused.to_string().contains("not_a_png"),
+        "the refusal names the file: {refused}"
+    );
+    assert_eq!(session.sources().len(), 2, "a refusal registers nothing");
+    let _ = std::fs::remove_file(&broken);
+}
+
+/// The picture itself: placed on a canvas twice its size, the still comes back
+/// scaled to that canvas with its own colours, the right way up.
+#[test]
+fn a_placed_still_shows_its_own_pixels_on_the_canvas() {
+    pin_software();
+    let still = asset("test_still.png");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&still).expect("a picture");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &still, 0, Some(Lane::V1))
+            .expect("a still joins any timeline")
+    );
+
+    // Placed for five seconds on the video lane, and on no other: a still is
+    // silent, so nothing of it belongs on an audio lane.
+    let placed = *session.lane_clips(Lane::V1).last().expect("the still clip");
+    assert_eq!(placed.len(), PLACED, "five seconds at 30 fps");
+    assert_eq!(
+        session.lane_clips(Lane::A1).len(),
+        1,
+        "no audio clip for it"
+    );
+
+    // Half a second into the still, and the picture is the file's: the canvas
+    // is 1280x720 and the image 640x360, so this is also the scaler's answer.
+    let frame = frame_at(&mut session, end + 0.5);
+    assert_eq!((frame.width, frame.height), session.resolution());
+    let (w, h) = (frame.width, frame.height);
+    close(
+        frame_rgb(&frame.bgra, w, w / 2, h / 4),
+        source_rgb(320, 90),
+        "the top band",
+    );
+    close(
+        frame_rgb(&frame.bgra, w, w / 2, h * 3 / 4),
+        source_rgb(320, 270),
+        "the bottom band",
+    );
+
+    // ...and the frame before the cut is still the video, which is what makes
+    // this a cut rather than a still that swallowed the timeline.
+    let video = frame_at(&mut session, end - 1.0 / FPS);
+    assert_ne!(
+        frame_rgb(&video.bgra, w, w / 2, h / 4),
+        frame_rgb(&frame.bgra, w, w / 2, h / 4),
+        "the video frame before the cut is not the still"
+    );
+}
+
+/// A still has no length, so the wall is the one the engine gives it: a trim
+/// may drag the tail out to ten minutes and not one frame further.
+#[test]
+fn a_still_trims_out_to_its_cap_and_no_further() {
+    pin_software();
+    let still = asset("test_still.png");
+    let mut session = PlaybackSession::open(&still).expect("open the still itself");
+    // Opened on its own: its own picture is the canvas, and the clip is the
+    // same five seconds a placement makes.
+    assert_eq!(session.resolution(), (640, 360));
+    assert_eq!(session.lane_clips(Lane::V1)[0].len(), PLACED);
+    assert!(session.lane_clips(Lane::A1).is_empty(), "silent");
+
+    let clip = session.lane_clips(Lane::V1)[0];
+    assert_eq!(
+        session.trim_room(Lane::V1, 0, Edge::End),
+        Some((clip.start + 1, clip.start + CAP)),
+        "the tail may go out to the cap"
+    );
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, clip.start + CAP));
+    assert_eq!(session.lane_clips(Lane::V1)[0].len(), CAP);
+    assert!(
+        !session.trim_clip(Lane::V1, 0, Edge::End, clip.start + CAP + 1),
+        "past the cap is refused"
+    );
+    // ...and back in, which is the half a five-second title card actually uses.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, clip.start + 60));
+    assert_eq!(session.lane_clips(Lane::V1)[0].len(), 60);
+}
+
+/// Saved and reopened: the clip that comes back plays the same picture for the
+/// same frames. The reload recomputes the still's length, so a clip trimmed out
+/// to the cap has to still be inside it -- `open_project` refuses one that is
+/// not, by name.
+#[test]
+fn a_still_survives_the_project_round_trip() {
+    pin_software();
+    let dir = std::env::temp_dir().join(format!("ve_images_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let media = dir.join("test_av.mp4");
+    let still = dir.join("test_still.png");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the video");
+    std::fs::copy(asset("test_still.png"), &still).expect("copy the still");
+
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&still).expect("a picture");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &still, 0, Some(Lane::V1))
+            .expect("a still joins any timeline")
+    );
+    // Trimmed well past the five seconds it went down as, so the reload's own
+    // length check has something to be wrong about.
+    let clip = *session.lane_clips(Lane::V1).last().expect("the still clip");
+    let idx = session.lane_clips(Lane::V1).len() - 1;
+    assert!(session.trim_clip(Lane::V1, idx, Edge::End, clip.start + 900));
+    let before: Vec<_> = session.lane_clips(Lane::V1).to_vec();
+
+    let project = dir.join("stills.edith");
+    session.save_project(&project).expect("save");
+    let reopened = PlaybackSession::open_project(&project).expect("reopen");
+    assert_eq!(reopened.lane_clips(Lane::V1), &before[..]);
+    assert_eq!(reopened.file_frames(&still), CAP, "the cap came back");
+
+    // The one thing a hand-written project could say that no edit can: a still
+    // on an audio lane, which the audio worker would open a PNG for.
+    let text = std::fs::read_to_string(&project).expect("read the project");
+    let hacked = text.replace("V1", "A2");
+    let bad = dir.join("hacked.edith");
+    std::fs::write(&bad, &hacked).expect("write the hacked project");
+    if hacked != text {
+        let Err(refused) = PlaybackSession::open_project(&bad) else {
+            panic!("a still cannot be heard: the audio lane took it");
+        };
+        assert!(
+            refused.to_string().contains("still image"),
+            "the refusal says what it is: {refused}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The export is what was watched: a timeline of video then still comes back
+/// out of the mp4 as video then still, with the still's own colours in it.
+#[test]
+fn a_mixed_timeline_exports_the_still_at_the_cut() {
+    pin_software();
+    let still = asset("test_still.png");
+    // The silent 640x360 fixture: no AAC track to copy and no scaling to do,
+    // so what this measures is the still in the encoder and nothing else.
+    let mut session = PlaybackSession::open(asset("test_mismatch.mp4")).expect("open the fixture");
+    session.import(&still).expect("a picture");
+    // One second of video, then one second of still: 60 frames to encode.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::End, 30));
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &still, 0, Some(Lane::V1))
+            .expect("a still joins any timeline")
+    );
+    assert!(session.trim_clip(Lane::V1, 1, Edge::End, 60));
+    assert_eq!(session.lane_clips(Lane::V1).len(), 2);
+    assert_eq!(session.resolution(), (640, 360));
+
+    let out = std::env::temp_dir().join(format!("ve_images_export_{}.mp4", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    wait(&session.export_to(&out), Duration::from_secs(300)).expect("export");
+
+    let (meta, frames) = DecodeSession::open(&out).expect("reopen the export");
+    assert_eq!((meta.width, meta.height), (640, 360));
+    let decoded: Vec<_> = frames.into_iter().collect();
+    assert_eq!(decoded.len(), 60, "one second of video, one of still");
+    // Well inside the still half, so no GOP smear from the cut reaches it.
+    let frame = &decoded[50];
+    close(
+        frame_rgb(&frame.bgra, 640, 320, 90),
+        source_rgb(320, 90),
+        "the exported top band",
+    );
+    close(
+        frame_rgb(&frame.bgra, 640, 320, 270),
+        source_rgb(320, 270),
+        "the exported bottom band",
+    );
+    // ...and the video half is still the video: the cut is in the file.
+    assert_ne!(
+        frame_rgb(&decoded[10].bgra, 640, 320, 90),
+        frame_rgb(&frame.bgra, 640, 320, 90),
+        "the video half is not the still"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Which lane a still may land on is the engine's answer, not a caller's: a
+/// picture asked for on an audio lane goes on the video one instead, exactly as
+/// a song asked for on a video lane goes on `A1`.
+#[test]
+fn a_still_asked_for_on_an_audio_lane_lands_on_the_video_one() {
+    pin_software();
+    let still = asset("test_still.png");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    session.import(&still).expect("a picture");
+    let a2 = session.add_lane(LaneKind::Audio);
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &still, 0, Some(a2))
+            .expect("a still joins any timeline")
+    );
+    assert!(session.lane_clips(a2).is_empty(), "not on the audio lane");
+    assert_eq!(
+        session.lane_clips(Lane::V1).len(),
+        2,
+        "on the video lane instead"
+    );
+}

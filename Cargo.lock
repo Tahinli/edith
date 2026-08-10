@@ -1632,6 +1632,7 @@ version = "0.1.0"
 dependencies = [
  "flacenc",
  "hound",
+ "image",
  "libloading",
  "mp4",
  "oxideav-ac3",

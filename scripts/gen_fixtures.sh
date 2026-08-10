@@ -148,6 +148,15 @@ for fmt in mp3 wav flac ogg m4a aac; do
         -filter_complex "$tone" -map "[a]" -ar 44100 "${codec[@]}" \
         "assets/test_tone.$fmt"
 done
+# Still-image fixture: the source with a picture and no timeline in it. Two
+# bands rather than one colour, so a test can tell top from bottom (a flipped
+# decode) and red from blue (a swapped channel order); 640x360, which is 16:9
+# like the video fixtures, so a Fit onto 1280x720 covers the canvas with no
+# bars and every pixel of the exported frame is the image.
+ffmpeg -y -f lavfi -i "color=c=red:s=640x180,format=rgb24" \
+    -f lavfi -i "color=c=blue:s=640x180,format=rgb24" \
+    -filter_complex "[0:v][1:v]vstack=inputs=2,format=rgb24" \
+    -frames:v 1 assets/test_still.png
 # The refusal fixture: same tone at 48k, which one output device cannot mix
 # with a 44.1k timeline.
 ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \

@@ -183,6 +183,71 @@ impl DecodeSession {
         }
     }
 
+    /// A worker for a still image ([`crate::is_image`]): the file is decoded
+    /// *once* and the same picture goes down the channel `len` times, indexed
+    /// from `start_frame` exactly as a decoder's pictures are -- so a placed
+    /// image is a clip like any other to everything downstream (`try_frame`
+    /// rewrites those indices, `next_clip` walks off the end of the range).
+    ///
+    /// Graded and placed on the canvas once too, before the repeat: a still is
+    /// the same pixels every frame, so the whole cost of one is one conversion
+    /// plus a memcpy per frame -- what [`open_black`](Self::open_black) pays.
+    pub(crate) fn open_still(
+        path: &Path,
+        start_frame: u32,
+        len: u32,
+        color: ColorParams,
+        canvas: Composer,
+    ) -> crate::Result<FrameStream> {
+        let still = Still::open(path)?;
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if len == 0 {
+            return Ok(FrameStream {
+                frames: rx,
+                worker: Worker {
+                    cancel,
+                    handle: None,
+                },
+            });
+        }
+        // The one conversion, on this thread: it is a few milliseconds and the
+        // error it could raise has already been raised by `Still::open`.
+        let first = Render::new(color, canvas).frame(
+            start_frame,
+            &still.y,
+            &still.u,
+            &still.v,
+            still.width,
+            still.height,
+        );
+        let worker_cancel = Arc::clone(&cancel);
+        let handle = thread::Builder::new()
+            .name("still".into())
+            .spawn(move || {
+                let (width, height, bgra) = (first.width, first.height, first.bgra);
+                for index in 0..len {
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let frame = Frame {
+                        index: start_frame + index,
+                        width,
+                        height,
+                        bgra: bgra.clone(),
+                    };
+                    if tx.send(frame).is_err() {
+                        return; // caller moved on
+                    }
+                }
+            })
+            .ok();
+        Ok(FrameStream {
+            frames: rx,
+            worker: Worker { cancel, handle },
+        })
+    }
+
     /// As [`DecodeSession::open_range`], but the caller gets the whole
     /// [`Worker`] and can therefore *wait* for it, and the range is graded by
     /// `color` -- the clip's own setting, folded into the conversion the frames
@@ -360,6 +425,105 @@ impl Render {
             bgra: i420_to_bgra(y, u, v, width as usize, height as usize),
         }
     }
+}
+
+/// One still image, decoded to tightly packed I420 -- the shape every other
+/// source arrives in, so a placed image goes through the same grade, the same
+/// canvas and the same conversion as a decoded picture and there is no second
+/// pixel path to keep in step.
+///
+/// Held whole rather than streamed: an image *is* one picture, and the file is
+/// read once per span that plays it.
+pub(crate) struct Still {
+    pub(crate) y: Vec<u8>,
+    pub(crate) u: Vec<u8>,
+    pub(crate) v: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl Still {
+    /// Decodes `path`. Refused by name for a picture that is not one
+    /// ([`crate::is_resolution`]): an 8K limit that a keystroke and a project
+    /// file are both held to cannot be walked around by a 30000-pixel-wide PNG.
+    pub(crate) fn open(path: &Path) -> crate::Result<Self> {
+        let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+        let rgb = reader
+            .decode()
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .to_rgb8();
+        let (width, height) = rgb.dimensions();
+        if !crate::is_resolution(width, height) {
+            return Err(format!(
+                "{} is {width}x{height}, which is not a picture this engine composes",
+                path.display()
+            )
+            .into());
+        }
+        let (y, u, v) = rgb_to_i420(&rgb, width as usize, height as usize);
+        Ok(Self {
+            y,
+            u,
+            v,
+            width,
+            height,
+        })
+    }
+
+    /// The planes as an export's decoder hands them over, so a still and a
+    /// decoded picture are the same value to `export::run`.
+    pub(crate) fn picture(&self) -> (&[u8], &[u8], &[u8], u32, u32) {
+        (&self.y, &self.u, &self.v, self.width, self.height)
+    }
+}
+
+/// How big the picture in `path` is, from its header alone -- what a library row
+/// says about a file it has not placed anywhere. The whole file is not decoded.
+pub fn image_size(path: &Path) -> crate::Result<(u32, u32)> {
+    Ok(image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()
+        .map_err(|e| format!("{}: {e}", path.display()))?)
+}
+
+/// Packed RGB8 -> tightly packed I420, BT.601 limited range: the exact inverse
+/// of [`crate::convert::i420_to_bgra`], so a still round-trips to the colour it
+/// was authored in (`images::still_pixels_match_the_source_image` measures it).
+///
+/// Chroma is the 2x2 box average, and an odd edge averages the samples it has --
+/// the planes come out `(w + 1) / 2` by `(h + 1) / 2`, which is the shape
+/// [`crate::scale::Composer::place`] panics on anything else for.
+fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (cw, ch) = crate::scale::chroma_dims(width, height);
+    let mut y = vec![0u8; width * height];
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    for row in 0..height {
+        for col in 0..width {
+            let p = (row * width + col) * 3;
+            let (r, g, b) = (rgb[p] as i32, rgb[p + 1] as i32, rgb[p + 2] as i32);
+            y[row * width + col] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+        }
+    }
+    for crow in 0..ch {
+        for ccol in 0..cw {
+            let (mut sr, mut sg, mut sb, mut n) = (0i32, 0i32, 0i32, 0i32);
+            for row in crow * 2..(crow * 2 + 2).min(height) {
+                for col in ccol * 2..(ccol * 2 + 2).min(width) {
+                    let p = (row * width + col) * 3;
+                    sr += rgb[p] as i32;
+                    sg += rgb[p + 1] as i32;
+                    sb += rgb[p + 2] as i32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            let (r, g, b) = (sr / n, sg / n, sb / n);
+            u[crow * cw + ccol] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+            v[crow * cw + ccol] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+        }
+    }
+    (y, u, v)
 }
 
 /// `None` when the software path must be used: forced by `VE_SW=1`, or the
