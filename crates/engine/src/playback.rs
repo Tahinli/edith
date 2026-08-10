@@ -581,6 +581,16 @@ impl PlaybackSession {
         self.edit(|p| p.lift(lane, idx))
     }
 
+    /// Moves that clip onto another lane of the same kind, keeping the frames it
+    /// covers -- the drag between tracks. One undo step, and it reseeks like
+    /// every other edit: which lane a clip sits on is what the compositor's
+    /// topmost-lane-wins rule reads, so the frame on screen is recomposed at
+    /// once. `false` for a bad index, for a move across kinds and for one that
+    /// would land on another clip; nothing changes.
+    pub fn move_clip_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
+        self.edit(|p| p.move_to_lane(from, idx, to))
+    }
+
     /// The clip the picture is coming from at `timeline_secs`: the lane it sits
     /// on and its index there, by the same topmost-lane-wins rule the decoder
     /// follows. `None` over a gap and past the end. What a card that grades
