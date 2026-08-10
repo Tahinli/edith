@@ -935,7 +935,7 @@ fn a_video_gap_plays_black_without_shortening_the_timeline() {
     assert!(session.cut_at(2.0), "split at 2 s");
     assert!(session.cut_at(3.5), "split at 3.5 s");
     assert!(
-        session.lift_clip(Lane::Video, 1),
+        session.lift_clip(Lane::V1, 1),
         "lift the middle picture out"
     );
     assert_eq!(
@@ -998,7 +998,7 @@ fn an_audio_gap_is_silent_and_the_clock_keeps_counting() {
     assert!(session.cut_at(2.0), "split at 2 s");
     // Silence over [1, 2) s while the picture plays on -- the two lanes part.
     assert!(
-        session.lift_clip(Lane::Audio, 1),
+        session.lift_clip(Lane::A1, 1),
         "lift the middle sound out"
     );
     assert_eq!(session.clip_spans().len(), 3, "the video lane is untouched");
