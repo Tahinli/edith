@@ -476,11 +476,11 @@ struct SwDecoder {
 impl SwDecoder {
     fn open(path: &Path, start_frame: u32) -> crate::Result<Self> {
         let (meta, mut demuxer) = Demuxer::open(path)?;
-        // The software decoder is H.264-only; a VP9 source that got this far
-        // means the plugin refused it, and the export says so instead of
-        // handing VP9 bytes to `rusty_h264`.
+        // The software decoder is H.264-only; an HEVC or VP9 source that got
+        // this far means the plugin refused it, and the export says so instead
+        // of handing those bytes to `rusty_h264`.
         if meta.codec != crate::demux::Codec::H264 {
-            return Err(crate::demux::VP9_NEEDS_PLUGIN.into());
+            return Err(meta.codec.needs_plugin().into());
         }
         // Decoding restarts at a sync sample, so pictures between it and the in
         // point are decoded (the target references them) and then dropped.
