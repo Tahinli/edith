@@ -870,6 +870,11 @@ impl Player {
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
+            // The last track of that kind: the one the add key put there, so the
+            // two strokes undo each other press for press. Any other track goes
+            // through the × in its own header.
+            ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
+            ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
@@ -2488,6 +2493,64 @@ impl Player {
             None => self.notice = Some("NO TRACK ADDED — open a file first".into()),
         }
         cx.notify();
+    }
+
+    /// The × in a track's header: the add taken back, one undo step, and the
+    /// engine's own words when it refuses -- those name the clips still on the
+    /// track, so the notice says what to delete first. A removal never deletes a
+    /// clip.
+    ///
+    /// Everything holding a `(lane, idx)` is dropped, because the tracks below
+    /// the one that went have just moved up an `ord`
+    /// ([`engine::Project::remove_lane`]): a selection or an open card kept
+    /// across it would be pointing at the *next* track's clip.
+    fn remove_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let removed = self
+            .session
+            .as_mut()
+            .map(|session| session.remove_lane(lane));
+        let text = match removed {
+            Some(Ok(())) => {
+                self.selected = None;
+                self.context_menu = None;
+                self.eq_open = None;
+                self.color_open = None;
+                self.speed_open = None;
+                self.close_silence();
+                format!(
+                    "{} REMOVED — {} brings it back",
+                    lane.label(),
+                    self.keymap.display(ActionId::Undo)
+                )
+            }
+            Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
+            None => "NO TRACK REMOVED — open a file first".to_string(),
+        };
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// What the remove keys act on: the last track of that kind, which is the
+    /// one the matching add key appended. Nothing at all before a file is open,
+    /// where the timeline drawn is a placeholder pair.
+    fn remove_last_lane(&mut self, kind: LaneKind, cx: &mut Context<Self>) {
+        let last = self.session.as_ref().and_then(|session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == kind)
+                .next_back()
+        });
+        match last {
+            Some(lane) => self.remove_lane(lane, cx),
+            None => {
+                self.notice = Some("NO TRACK REMOVED — open a file first".into());
+                cx.notify();
+            }
+        }
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
@@ -5244,6 +5307,12 @@ impl Player {
         });
         let name = lane.label();
         let row_id: SharedString = format!("{name}-clip").into();
+        let remove_id: SharedString = format!("{name}-remove").into();
+        let remove_tip: SharedString = format!(
+            "Remove {name} — it must be empty first, and {} brings it back",
+            self.keymap.display(ActionId::Undo)
+        )
+        .into();
         let sources = self
             .session
             .as_ref()
@@ -5273,13 +5342,37 @@ impl Player {
                     .w(px(HEADER_W))
                     .h_full()
                     .flex()
+                    .flex_col()
                     .items_center()
                     .justify_center()
                     .rounded(px(3.))
                     .bg(rgb(SURFACE))
                     .text_size(px(11.))
                     .text_color(rgb(INK_DIM))
-                    .child(name),
+                    .child(div().flex_1().flex().items_center().child(name))
+                    // The one thing a header does: take this track away again.
+                    // A `HIT_MIN` target rather than a glyph-sized one, and it
+                    // stays put on a track holding clips instead of hiding --
+                    // the refusal names them, and a control that vanishes
+                    // teaches nothing.
+                    .child(
+                        div()
+                            .id(remove_id)
+                            .flex_none()
+                            .w_full()
+                            .h(px(HIT_MIN))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.remove_lane(lane, cx)
+                            }))
+                            .child("×"),
+                    ),
             )
             .child(
                 // Clips are placed at their own start rather than queued edge
