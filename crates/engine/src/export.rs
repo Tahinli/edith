@@ -317,6 +317,42 @@ fn copy_audio(
     AudioSession::copy_multi_streams(&project.audio_sources(), segments)
 }
 
+/// The picture formats' answer to a speeded clip: **refused, by name**.
+///
+/// A clip at another rate is a clip whose pictures have to be picked out of its
+/// source at that rate and whose sound has to be resampled. The sound alone
+/// settles it here: this path *copies* AAC packets ([`copy_audio`]) and a
+/// resample is not a copy -- exporting it anyway would write the picture at one
+/// speed and the sound at another, which is the one failure a user would not
+/// notice until the file was somewhere else. So the whole export is refused
+/// rather than half-honoured, and the refusal says which clip and what to do:
+/// WAV and FLAC are decoded and mixed, and they honour it.
+///
+/// AV1 carries no sound at all and could honour the picture on its own, and is
+/// refused with the rest: a video export that silently dropped the rate on one
+/// format and kept it on another would be worse than one rule.
+///
+/// ponytail: the ceiling is the packet copy and the frame walk in [`run`], which
+/// steps its decoder once per output picture. Upgrade path is a `skip(n)` on
+/// [`ClipDecoder`] for a rate above real time, a held picture below it, and an
+/// AAC encoder (or a decode-and-re-encode) for the sound -- at which point this
+/// check becomes the `Format::Av1` arm alone.
+fn speeds_refused(project: &Project, meta: &VideoMeta) -> crate::Result<()> {
+    for lane in project.lanes() {
+        if let Some(clip) = project.lane(lane).iter().find(|c| !c.speed.is_normal()) {
+            return Err(format!(
+                "the {} clip at {} plays at {} and a picture export cannot re-time it: \
+                 export WAV or FLAC, which are resampled, or set that clip back to 1.00x",
+                lane.label(),
+                timecode(clip.start, meta.frame_rate),
+                clip.speed
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn run(
     project: &Project,
     meta: &VideoMeta,
@@ -325,6 +361,7 @@ fn run(
     settings: &ExportSettings,
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
+    speeds_refused(project, meta)?;
     let sources = project.sources();
     // Audio first: a track has to be declared when the muxer is created, which
     // happens as soon as the first coded picture arrives. None of it for AV1 --
@@ -502,7 +539,14 @@ fn run_audio(
     // playback's feeder reads from -- there is no second place here that could
     // apply them differently.
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_eq(&sources, &segs, &eqs)? else {
+    // ...and the rates with them, for exactly the same reason: a speeded clip is
+    // resampled inside the worker playback feeds from, so a WAV of a timeline at
+    // 2x is half as long and holds the samples that were heard -- not a
+    // second pass here that could disagree with what the ear got.
+    let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    let Some((audio, chunks)) =
+        AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds)?
+    else {
         return Err("this timeline has no audio to export".into());
     };
     let channels = usize::from(audio.channels);

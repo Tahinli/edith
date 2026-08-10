@@ -246,6 +246,28 @@ impl AudioSession {
         segs: &[(Option<usize>, f64, f64)],
         eqs: &[Option<EqParams>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_multi_streams_speed(sources, segs, eqs, &[])
+    }
+
+    /// [`open_multi_streams_eq`](Self::open_multi_streams_eq) with a *rate* per
+    /// segment as well: `speeds[i]` says how fast segment `i` is read and how
+    /// much timeline it owes ([`crate::project::Stretch`]), `None` for one at
+    /// real time. [`crate::Project::audio_speeds_from`] is what builds it, beside
+    /// the very list the segments come from.
+    ///
+    /// Resampling happens **per segment**, inside the worker and before the mix,
+    /// for the equalizer's reasons: two clips at two speeds must not be read
+    /// into one another, and the interpolator's memory dies with the segment. A
+    /// list shorter than `segs` (the empty one every plain caller passes) means
+    /// the rest play at real time, so nothing here can shift a rate onto the
+    /// wrong clip and a project with no speeds decodes exactly the samples it
+    /// always did.
+    pub fn open_multi_streams_speed(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+        eqs: &[Option<EqParams>],
+        speeds: &[Option<crate::project::Stretch>],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let Some((path, stream)) = sources.first() else {
             return Ok(None);
         };
@@ -330,6 +352,23 @@ impl AudioSession {
             })
             .collect();
 
+        // One resampler per speeded segment, built where the sample rate is
+        // known: what the timeline owes it is seconds there and frames here.
+        let speeds: Vec<Option<Resample>> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                speeds.get(i).and_then(Option::as_ref).map(|s| {
+                    Resample::new(
+                        s.step,
+                        (s.timeline_secs * f64::from(meta.sample_rate))
+                            .round()
+                            .max(0.) as u64,
+                    )
+                })
+            })
+            .collect();
+
         let (tx, rx) = sync_channel(32);
         thread::Builder::new()
             .name("audio-decode".into())
@@ -339,6 +378,7 @@ impl AudioSession {
                     channels: meta.channels as usize,
                     segments,
                     eqs,
+                    speeds,
                     timeline,
                     tx,
                 })
@@ -385,12 +425,36 @@ impl AudioSession {
         lanes: &[Vec<(Option<usize>, f64, f64)>],
         eqs: &[Vec<Option<EqParams>>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_speed(sources, lanes, eqs, &[])
+    }
+
+    /// [`open_mixed_streams_eq`](Self::open_mixed_streams_eq) with
+    /// [`open_multi_streams_speed`](Self::open_multi_streams_speed)'s per-segment
+    /// rates, one list per lane -- [`crate::Project::audio_speeds_from`] is what
+    /// shapes them, off the same walk the segments come from.
+    ///
+    /// A resample is each lane's worker's own business and happens **before**
+    /// the sum, exactly as the filtering does: every lane still hands the mixer
+    /// as many samples as the timeline says, so the lanes stay sample-aligned by
+    /// construction and a mix is still an add.
+    pub fn open_mixed_streams_speed(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, rest @ ..] = lanes else {
             return Ok(None);
         };
         if rest.is_empty() {
             let flat = Vec::new();
-            return Self::open_multi_streams_eq(sources, first, eqs.first().unwrap_or(&flat));
+            let plain = Vec::new();
+            return Self::open_multi_streams_speed(
+                sources,
+                first,
+                eqs.first().unwrap_or(&flat),
+                speeds.first().unwrap_or(&plain),
+            );
         }
         let mut meta = None;
         let mut rxs = Vec::with_capacity(lanes.len());
@@ -398,8 +462,13 @@ impl AudioSession {
             // Every lane probes the same source 0, so the metas agree by
             // construction; `None` from any of them is a silent timeline.
             let flat = Vec::new();
-            let Some((lane_meta, rx)) =
-                Self::open_multi_streams_eq(sources, segs, eqs.get(i).unwrap_or(&flat))?
+            let plain = Vec::new();
+            let Some((lane_meta, rx)) = Self::open_multi_streams_speed(
+                sources,
+                segs,
+                eqs.get(i).unwrap_or(&flat),
+                speeds.get(i).unwrap_or(&plain),
+            )?
             else {
                 return Ok(None);
             };
@@ -1511,6 +1580,104 @@ impl Segment {
     }
 }
 
+/// One speeded segment's resampler: the tape effect, done by reading the
+/// decoded samples at a rate other than the one they were written at, so the
+/// pitch moves with the speed. Linear interpolation between the two frames a
+/// fractional position falls between -- one multiply-add per channel, which is
+/// nothing beside the decode that produced them, and enough that a 2x clip is
+/// not the aliasing mess plain sample-dropping would give.
+///
+/// It lives across the whole segment: `pos` carries the fraction over a packet
+/// boundary and `tail` keeps the frame before the buffer, so the interpolation
+/// at the seam is the same one it would have been inside a buffer. A segment
+/// starts one clean and drops it at the end, which is what makes a seek a reset
+/// for free -- exactly as the equalizer's state does.
+///
+/// `owed` is what the timeline gives the segment, in frames per channel:
+/// resampling resolves to whole samples and a clip's own window resolves to
+/// whole *source* frames, so the two miss each other by a sample or two per
+/// clip. Truncating and padding to what is owed keeps that from accumulating
+/// into audible drift over a timeline of speeded cuts -- the picture's clip
+/// boundaries are exact by construction, and this makes the sound's exact too.
+struct Resample {
+    /// Source frames per output frame: the speed itself.
+    step: f64,
+    /// Where the next output frame reads, relative to the current buffer's
+    /// first frame. Negative means it reads across the seam, into `tail`.
+    pos: f64,
+    /// The last frame of the buffer before this one, one sample per channel.
+    tail: Vec<f32>,
+    /// Output frames per channel still to be emitted for this segment.
+    owed: u64,
+}
+
+impl Resample {
+    fn new(step: f64, owed: u64) -> Self {
+        Self {
+            step,
+            pos: 0.,
+            tail: Vec::new(),
+            owed,
+        }
+    }
+
+    /// Rewrites `buf` in place as the frames this rate reads out of it. Never
+    /// more than is owed, so the segment cannot overrun the room the timeline
+    /// gave it.
+    fn process(&mut self, buf: &mut Vec<f32>, channels: usize) {
+        let frames = buf.len() / channels;
+        if frames == 0 || channels == 0 {
+            return;
+        }
+        let mut out: Vec<f32> = Vec::with_capacity(buf.len());
+        while self.owed > (out.len() / channels) as u64 {
+            let left = self.pos.floor();
+            let right = left as i64 + 1;
+            if right > frames as i64 - 1 {
+                break; // the frame it would interpolate towards is not here yet
+            }
+            let frac = (self.pos - left) as f32;
+            let (left, right) = (left as i64, right as usize);
+            for c in 0..channels {
+                // Before the buffer means the previous one's last frame; at the
+                // very first buffer of a segment `pos` is 0, so this cannot be
+                // asked for an empty tail.
+                let a = match left < 0 {
+                    true => self.tail.get(c).copied().unwrap_or(0.),
+                    false => buf[left as usize * channels + c],
+                };
+                let b = buf[right * channels + c];
+                out.push(a + (b - a) * frac);
+            }
+            self.pos += self.step;
+        }
+        self.tail.clear();
+        self.tail.extend_from_slice(&buf[(frames - 1) * channels..]);
+        self.pos -= frames as f64;
+        self.owed -= (out.len() / channels) as u64;
+        *buf = out;
+    }
+
+    /// The silence the segment still owes when its source ran out before the
+    /// timeline did -- a rounding frame or two, or a clip whose file is shorter
+    /// than the edit says. `false` means the consumer went away.
+    fn flush(&mut self, channels: usize, timeline: &mut u64, tx: &SyncSender<AudioChunk>) -> bool {
+        while self.owed > 0 {
+            let frames = self.owed.min(u64::from(SAMPLES_PER_PACKET));
+            let chunk = AudioChunk {
+                start_sample: *timeline,
+                samples: vec![0.0; frames as usize * channels],
+            };
+            if tx.send(chunk).is_err() {
+                return false;
+            }
+            *timeline += frames;
+            self.owed -= frames;
+        }
+        true
+    }
+}
+
 struct Worker {
     /// Indexed by [`Segment::source`]; only the sources some segment names are
     /// `Some`, the rest were never opened.
@@ -1522,6 +1689,10 @@ struct Worker {
     /// Beside the segments rather than inside them so the emit path can hold the
     /// window rules and the filter memory at once without splitting a borrow.
     eqs: Vec<Option<EqState>>,
+    /// One per entry of `segments` again: the rate that segment is read at, or
+    /// `None` for one at real time -- which is every segment of a project nobody
+    /// has speeded, and the path that emits the decoder's own samples untouched.
+    speeds: Vec<Option<Resample>>,
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
@@ -1603,8 +1774,11 @@ fn run(mut w: Worker) {
     // A short list is "flat from here on" (`open_multi_streams_eq`), which this
     // pads out so the zip below still walks every segment.
     eqs.resize_with(segments.len(), || None);
+    let mut speeds = std::mem::take(&mut w.speeds);
+    // ...and a short rate list is "real time from here on", for the same reason.
+    speeds.resize_with(segments.len(), || None);
 
-    for (seg, eq) in segments.iter().zip(eqs.iter_mut()) {
+    for ((seg, eq), speed) in segments.iter().zip(eqs.iter_mut()).zip(speeds.iter_mut()) {
         let Some(source) = seg.source else {
             // A gap: hand the device real silence rather than nothing at all,
             // in the same packet-sized chunks decoding produces, so `fed` and
@@ -1629,13 +1803,31 @@ fn run(mut w: Worker) {
         };
         let track = match track {
             Track::Sym(track) => {
-                if !run_sym(track, seg, eq.as_mut(), channels, &mut timeline, &w.tx) {
+                if !run_sym(
+                    track,
+                    seg,
+                    eq.as_mut(),
+                    speed,
+                    channels,
+                    &mut timeline,
+                    &w.tx,
+                ) || !settle(speed, channels, &mut timeline, &w.tx)
+                {
                     return; // consumer went away
                 }
                 continue;
             }
             Track::Ac3(track) => {
-                if !run_ac3(track, seg, eq.as_mut(), channels, &mut timeline, &w.tx) {
+                if !run_ac3(
+                    track,
+                    seg,
+                    eq.as_mut(),
+                    speed,
+                    channels,
+                    &mut timeline,
+                    &w.tx,
+                ) || !settle(speed, channels, &mut timeline, &w.tx)
+                {
                     return; // consumer went away
                 }
                 continue;
@@ -1684,6 +1876,7 @@ fn run(mut w: Worker) {
                 channels,
                 seg,
                 eq.as_mut(),
+                speed.as_mut(),
                 pos,
                 next,
                 &mut timeline,
@@ -1693,6 +1886,24 @@ fn run(mut w: Worker) {
             }
             pos = next;
         }
+        if !settle(speed, channels, &mut timeline, &w.tx) {
+            return; // consumer went away
+        }
+    }
+}
+
+/// Pays out whatever silence a speeded segment still owes the timeline (see
+/// [`Resample::flush`]). Nothing at all at real time, where a segment owes the
+/// timeline only the samples it decoded.
+fn settle(
+    speed: &mut Option<Resample>,
+    channels: usize,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    match speed {
+        Some(speed) => speed.flush(channels, timeline, tx),
+        None => true,
     }
 }
 
@@ -1717,6 +1928,7 @@ fn emit(
     channels: usize,
     seg: &Segment,
     eq: Option<&mut EqState>,
+    speed: Option<&mut Resample>,
     pos: u64,
     next: u64,
     timeline: &mut u64,
@@ -1735,6 +1947,16 @@ fn emit(
     }
     if interleaved.is_empty() {
         return true; // nothing left of it; the loop head ends the segment
+    }
+    // The rate first, the filter second: what the equalizer's bands are set in
+    // is the frequency a listener hears, and after a resample that is not the
+    // frequency the file was written at. A segment at real time has no
+    // resampler at all and reaches the filter with the decoder's own samples.
+    if let Some(speed) = speed {
+        speed.process(interleaved, channels);
+        if interleaved.is_empty() {
+            return true; // this buffer resolved to no output frame of its own
+        }
     }
     if let Some(eq) = eq {
         eq.process(interleaved);
@@ -1755,6 +1977,7 @@ fn run_ac3(
     track: &mut Ac3Track,
     seg: &Segment,
     mut eq: Option<&mut EqState>,
+    speed: &mut Option<Resample>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -1794,6 +2017,7 @@ fn run_ac3(
             channels,
             seg,
             eq.as_deref_mut(),
+            speed.as_mut(),
             pos,
             next,
             timeline,
@@ -1819,6 +2043,7 @@ fn run_sym(
     track: &mut SymTrack,
     seg: &Segment,
     mut eq: Option<&mut EqState>,
+    speed: &mut Option<Resample>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -1876,6 +2101,7 @@ fn run_sym(
             channels,
             seg,
             eq.as_deref_mut(),
+            speed.as_mut(),
             pos,
             next,
             timeline,
