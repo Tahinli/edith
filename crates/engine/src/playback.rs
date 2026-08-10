@@ -90,7 +90,17 @@ struct Audio {
     /// Bumped by every seek. A feeder only owns the device while this still
     /// matches the value it started with; see [`feed`].
     epoch: Arc<AtomicU64>,
+    /// The last [`TAP_SAMPLES`] mono samples handed to the device, oldest
+    /// first: what a meter or an analyser draws. Written by the feeder, which
+    /// is not the device's own callback -- the plugin's RT thread never sees
+    /// this lock, and the feeder holds it for one memcpy per write.
+    tap: Arc<Mutex<Vec<f32>>>,
 }
+
+/// How much of the played signal the tap keeps. A power of two, because what
+/// reads it transforms it, and long enough that the lowest band the editor
+/// draws (20 Hz) has a whole cycle in the window at any rate we open.
+const TAP_SAMPLES: usize = 2048;
 
 impl Audio {
     /// Whether the device has played everything there will ever be, i.e. the
@@ -98,6 +108,21 @@ impl Audio {
     fn played_out(&self, position: i64) -> bool {
         self.fed_all.load(Ordering::Acquire)
             && position as u64 * self.channels >= self.fed.load(Ordering::Relaxed)
+    }
+
+    /// Keeps the newest [`TAP_SAMPLES`] of what was just queued, downmixed to
+    /// mono. Called from the feeder only, once per accepted write.
+    fn note_tap(&self, accepted: &[f32]) {
+        let channels = self.channels.max(1) as usize;
+        let mut tap = self.tap.lock().unwrap();
+        // Only the tail can survive anyway: a big write replaces the window
+        // outright rather than being summed into it and then thrown away.
+        let from = accepted.len().saturating_sub(TAP_SAMPLES * channels);
+        for frame in accepted[from..].chunks_exact(channels) {
+            tap.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+        let over = tap.len().saturating_sub(TAP_SAMPLES);
+        tap.drain(..over);
     }
 
     /// Starts a feeder for the current epoch, draining `rx` into the device.
@@ -1500,6 +1525,21 @@ impl PlaybackSession {
         }
     }
 
+    /// A copy of the most recent mono samples the device was handed, and the
+    /// rate they play at: the signal *after* every clip's equalizer, speed and
+    /// the mix, which is what an analyser drawn behind an EQ curve has to show.
+    /// `None` with no audio output at all, and empty until the feeder has
+    /// written once (right after a seek, for instance).
+    ///
+    /// Never blocks anything that matters: the feeder holds this lock for one
+    /// memcpy and the device's own callback lives in the plugin, on the far
+    /// side of a ring buffer, where it cannot see this at all.
+    pub fn audio_tap(&self) -> Option<(Vec<f32>, u32)> {
+        let audio = self.audio.as_ref()?;
+        let tap = audio.tap.lock().unwrap().clone();
+        Some((tap, audio.sample_rate))
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
@@ -1522,6 +1562,9 @@ impl PlaybackSession {
             // carrying can no longer reach the ring after this point.
             audio.epoch.fetch_add(1, Ordering::Release);
             ao.flush();
+            // The flushed samples are not being played any more, so nothing may
+            // still be drawn from them.
+            audio.tap.lock().unwrap().clear();
         }
 
         // Cancel first, drop second: the old worker may be parked in `send` on
@@ -1839,6 +1882,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         fed_all: Arc::new(AtomicBool::new(false)),
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
+        tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
 }
@@ -1873,6 +1917,7 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             }
         };
         audio.fed.fetch_add(accepted as u64, Ordering::Relaxed);
+        audio.note_tap(&pending[..accepted]);
         pending.drain(..accepted);
         if !pending.is_empty() {
             // Ring full: nothing to do but let the device drain it.

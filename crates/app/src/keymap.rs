@@ -301,7 +301,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 15] = [
+pub const FIXED: [Fixed; 16] = [
     // Not a chord at all but a way of pressing one, and the only place the
     // editor can say so: holding a key that moves a *value* runs it, and
     // holding anything else still does what one press did.
@@ -356,6 +356,11 @@ pub const FIXED: [Fixed; 15] = [
     Fixed {
         chord: "r",
         label: "Flatten every band",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "s",
+        label: "Show or hide the spectrum behind the curve",
         category: Category::Audio,
     },
     // The colour card's own three, which mean nothing outside it -- the same
