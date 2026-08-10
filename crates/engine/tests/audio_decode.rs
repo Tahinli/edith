@@ -109,4 +109,32 @@ fn video_only_file_has_no_audio() {
             .expect("open")
             .is_none()
     );
+    assert!(
+        AudioSession::unsupported(asset("test_baseline.mp4"))
+            .expect("probe")
+            .is_none(),
+        "a file with no audio track is not a complaint"
+    );
+}
+
+/// Sound we cannot decode must not be silence we say nothing about: the AC-3
+/// fixture opens as picture-only and the session carries the reason a
+/// front-end shows (`Player::open_media`).
+#[test]
+fn an_undecodable_audio_track_is_named() {
+    let path = asset("test_ac3.mp4");
+    assert!(
+        AudioSession::open(&path).expect("open").is_none(),
+        "AC-3 is not decodable here"
+    );
+    let reason = AudioSession::unsupported(&path)
+        .expect("probe")
+        .expect("the file has an audio track, so it owes a reason");
+    assert!(reason.contains("decode"), "unhelpful reason: {reason}");
+    let session = engine::PlaybackSession::open(&path).expect("open for playback");
+    assert_eq!(
+        session.audio_disabled_reason(),
+        Some(reason.as_str()),
+        "the session must carry it to the front-end"
+    );
 }
