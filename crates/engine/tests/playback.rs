@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
 use engine::{DecodeSession, Frame, PlaybackSession};
 
@@ -1121,4 +1122,103 @@ fn an_audio_gap_is_silent_and_the_clock_keeps_counting() {
         "pictures stopped over the silence: {last_index:?}"
     );
     eprintln!("audio gap: clock at {now:.3}s of {duration:.3}s, frame {last_index:?}");
+}
+
+/// The emptied timeline, end to end: the last clip deletes like any other, what
+/// is left plays as black and silence with a duration of zero, it saves and
+/// loads back as the project it is, and one undo brings the clip back. Silent
+/// fixture, so this runs anywhere.
+#[test]
+fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
+    let path = asset("test_baseline.mp4");
+    let mut session = open(&path);
+    let whole = session.timeline_duration();
+    assert!(whole > 0.0);
+
+    // The sole take goes -- picture and sound of it, on every lane at once.
+    assert!(
+        session.delete_clip(Lane::V1, 0),
+        "the last clip deletes like any other"
+    );
+    assert!(session.is_empty(), "and the timeline is empty");
+    assert_eq!(session.timeline_duration(), 0.0);
+    assert!(session.clip_spans().is_empty());
+    assert_eq!(session.lanes().len(), 2, "the lanes are still there");
+
+    // It scrubs: every seek lands at zero and shows black rather than the
+    // picture of the clip that was deleted.
+    for t in [0.0, -1.0, whole, 1e9] {
+        session.seek(t);
+        assert_eq!(session.now(), 0.0, "seek to {t} on an empty timeline");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut black = None;
+        while black.is_none() && Instant::now() < deadline {
+            session.tick();
+            black = session.try_frame();
+            sleep(Duration::from_millis(4));
+        }
+        let frame = black.expect("an empty timeline shows one black frame");
+        assert_eq!(frame.index, 0);
+        assert!(
+            frame.bgra.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]),
+            "and it is black"
+        );
+    }
+    // It plays: nothing to show, so it is at its end at once, and nothing hangs.
+    session.play();
+    let mut last_index = None;
+    run_for(&mut session, &mut last_index, Duration::from_millis(200));
+    assert!(session.is_eos(), "an empty timeline is played out at once");
+    session.pause();
+
+    // Exporting nothing is a refusal in words, not a file of no frames -- and
+    // in the *same* words whichever format asked, because the fence sits in
+    // `export::start` ahead of the format, not in the mp4 path alone.
+    for format in [Format::Mp4, Format::Wav, Format::Flac] {
+        let out = std::env::temp_dir().join(format!("ve_nothing_{}", std::process::id()));
+        let handle = session.export_to_with(
+            &out,
+            &ExportSettings {
+                format,
+                ..ExportSettings::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            if let Some(result) = handle.result() {
+                break result.expect_err("an empty timeline cannot be exported");
+            }
+            assert!(Instant::now() < deadline, "{format:?} export never settled");
+            sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            err.to_string(),
+            "the timeline is empty: there is nothing to export",
+            "{format:?}"
+        );
+        assert!(!out.exists(), "{format:?} wrote a file anyway");
+    }
+
+    // It saves and loads back -- still a project, still two lanes, and still
+    // naming the file whose frame rate the timeline counts in.
+    let dir = std::env::temp_dir().join(format!("ve_empty_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let project = dir.join("empty.edith");
+    session
+        .save_project(&project)
+        .expect("save an empty timeline");
+    let loaded = PlaybackSession::open_project(&project).expect("load it back");
+    assert!(loaded.is_empty(), "what came back is the empty timeline");
+    assert_eq!(loaded.lanes().len(), 2);
+    assert_eq!(loaded.sources().len(), 1, "source 0 is kept, orphan or not");
+    assert_eq!(loaded.meta().frame_rate, session.meta().frame_rate);
+    drop(loaded);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // ...and one gesture is one undo: the take comes back whole.
+    assert!(session.undo(), "the delete undoes");
+    assert!(!session.is_empty());
+    assert!((session.timeline_duration() - whole).abs() < 1e-9);
+    assert_eq!(session.clip_spans().len(), 1);
 }
