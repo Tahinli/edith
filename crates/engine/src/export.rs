@@ -3,7 +3,7 @@
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
 //! is impossible — while audio is copied packet for packet, because there is no
-//! pure-Rust AAC encoder to re-encode with. The audio-only formats have no such
+//! AAC encoder wired here to re-encode with. The audio-only formats have no such
 //! trouble: `hound` writes PCM and `flacenc` encodes FLAC, both pure Rust, so
 //! those are *decoded* out of the timeline instead of copied. The worker owns
 //! everything: the caller gets an [`ExportHandle`] and polls it from its render
@@ -73,10 +73,12 @@ pub enum Format {
     #[default]
     Mp4,
     /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
-    /// this project can write: there is no AAC or Opus encoder here, and an AAC
-    /// track copied in would be one *this engine's own reader* leaves silent
-    /// (`audio::AudioSession::open` refuses Matroska audio). The sound of an AV1
-    /// export is a WAV or FLAC beside it, which a front-end says up front.
+    /// this project can *write*: there is no AAC or Opus encoder here, and the
+    /// copy path walks an mp4 sample table, which a Matroska file has none of.
+    /// (Reading one's AAC is a different question and the answer is yes --
+    /// `audio::Track::open` does it through symphonia's mkv reader.) The sound
+    /// of an AV1 export is a WAV or FLAC beside it, which a front-end says up
+    /// front.
     Av1,
     /// The audio lane alone, 16-bit PCM.
     Wav,

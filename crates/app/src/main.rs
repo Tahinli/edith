@@ -5905,7 +5905,7 @@ const FORMATS: [(Option<Format>, &str, &str); 9] = [
     (Some(Format::Flac), "FLAC", "lossless — audio only"),
     (None, "MP3", "encoder is LGPL — licence decision pending"),
     (None, "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (None, "AAC", "no pure-Rust AAC encoder"),
+    (None, "AAC", "encoder exists (rusty_aac) but is not wired here yet"),
     (
         None,
         "HEVC",
