@@ -1091,16 +1091,70 @@ impl Project {
         timeline_frame: u32,
         fps: f64,
     ) -> Vec<Vec<(Option<usize>, f64, f64)>> {
-        let lists: Vec<_> = self
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| self.lane_segments_from(lane, timeline_frame, fps))
+            .collect()
+    }
+
+    /// *Which* lanes [`audio_segments_from`](Project::audio_segments_from)
+    /// builds a play list for, in the same order. Public because everything
+    /// asked per audio lane -- which clip a segment's equalizer belongs to,
+    /// which lane an mp4 export would copy -- has to read the very list the
+    /// sound comes off, or the two answers drift apart (which is exactly how an
+    /// `A2`-only project once exported silently, ledger).
+    pub fn audio_lanes(&self) -> Vec<Lane> {
+        let lanes: Vec<Lane> = self
             .lanes()
             .into_iter()
             .filter(|l| l.kind == LaneKind::Audio && !self.lane(*l).is_empty())
-            .map(|lane| self.lane_segments_from(lane, timeline_frame, fps))
             .collect();
-        match lists.is_empty() {
-            true => vec![self.lane_segments_from(Lane::A1, timeline_frame, fps)],
-            false => lists,
+        match lanes.is_empty() {
+            // The all-gap fallback: `A1`'s own (empty) list, so a timeline with
+            // no sound still plays silence against the master clock.
+            true => vec![Lane::A1],
+            false => lanes,
         }
+    }
+
+    /// The equalizer each of [`audio_segments_from`](Project::audio_segments_from)'s
+    /// segments plays through: the same lanes in the same order, one entry per
+    /// segment, `None` where the segment is a gap or its clip plays flat.
+    ///
+    /// A parallel list rather than a fourth element of the segment tuple: that
+    /// tuple is what every opener, the packet-copy path and a dozen tests speak,
+    /// and an effect is not part of *which samples* a segment names. A short
+    /// list therefore means "flat from here on" rather than a length mismatch --
+    /// see [`crate::AudioSession::open_mixed_streams_eq`].
+    pub fn audio_eqs_from(&self, timeline_frame: u32, fps: f64) -> Vec<Vec<Option<EqParams>>> {
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| self.lane_eqs_from(lane, timeline_frame, fps))
+            .collect()
+    }
+
+    /// [`audio_eqs_from`](Project::audio_eqs_from) for one lane, matching
+    /// [`lane_segments_from`](Project::lane_segments_from) entry for entry --
+    /// same walk, same `fps` refusal, so the two lists cannot come out different
+    /// lengths.
+    pub fn lane_eqs_from(
+        &self,
+        lane: Lane,
+        timeline_frame: u32,
+        fps: f64,
+    ) -> Vec<Option<EqParams>> {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Vec::new();
+        }
+        self.spans_from(lane, timeline_frame)
+            .iter()
+            // A span off a clip covers that clip's frames and no others, so its
+            // own start names the clip -- the index a [`Span`] does not carry.
+            .map(|span| {
+                self.map(lane, span.start)
+                    .and_then(|(idx, _)| self.eq_of(lane, idx).cloned())
+            })
+            .collect()
     }
 
     /// Pushes the undo snapshot. Every mutating method calls this once, *after*
