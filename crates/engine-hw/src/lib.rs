@@ -1,5 +1,6 @@
-//! VA-API H.264 decode and encode, shipped as a `dlopen`-able plugin so the main
-//! binary never gets a DT_NEEDED on libva/gbm/drm. Every entry point is
+//! VA-API decode (H.264 and VP9) and H.264 encode, shipped as a `dlopen`-able
+//! plugin so the main binary never gets a DT_NEEDED on libva/gbm/drm. Every
+//! entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
 //! negative code: the caller's contract is "any failure means use the software
 //! codec".
@@ -18,6 +19,7 @@ use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
 use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
 use cros_codecs::decoder::stateless::h264::H264;
+use cros_codecs::decoder::stateless::vp9::Vp9;
 use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVideoDecoder};
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
 use cros_codecs::encoder::h264::EncoderConfig as H264Config;
@@ -36,12 +38,36 @@ use cros_codecs::video_frame::{UV_PLANE, Y_PLANE};
 use cros_codecs::{Fourcc, FrameLayout, PlaneLayout, Resolution};
 use gbm::{BufferObjectFlags, Format as GbmFormat};
 
-use engine::demux::Demuxer;
+use engine::demux::{Codec, Demuxer};
 use engine::hw::{VhFrame, VhMeta};
 
 type PooledFrame = PooledVideoFrame<GenericDmaVideoFrame>;
-type Decoder = StatelessDecoder<H264, VaapiBackend<PooledFrame>>;
-type Handle = <Decoder as StatelessVideoDecoder>::Handle;
+type Dec<C> = StatelessDecoder<C, VaapiBackend<PooledFrame>>;
+type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
+
+/// One decoder per codec the demuxer can hand us. Both share the VA-API backend
+/// and therefore the same [`Handle`], so everything past `decode` is common;
+/// which one exists is decided by the container, never by the caller -- which is
+/// why the plugin's C ABI is unchanged and an older `libengine_hw.so` still
+/// loads and still decodes H.264 (it simply refuses VP9 files at `Demuxer`).
+///
+/// ponytail: VP9 profile 0 (8-bit 4:2:0) only. Profile 2 decodes 10-bit, which
+/// the NV12 pool and the `vaGetImage` read-back here cannot carry; the upgrade
+/// path is a P010 pool selected from the stream info.
+enum Decoder {
+    H264(Dec<H264>),
+    Vp9(Dec<Vp9>),
+}
+
+impl Decoder {
+    fn get(&mut self) -> &mut dyn StatelessVideoDecoder<Handle = Handle> {
+        match self {
+            Self::H264(d) => d,
+            Self::Vp9(d) => d,
+        }
+    }
+}
+
 type Encoder = StatelessEncoder<
     GenericDmaVideoFrame,
     VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
@@ -148,7 +174,14 @@ impl Session {
             .ok()?
             .into_iter()
             .find(|f| f.fourcc == VA_FOURCC_NV12)?;
-        let decoder = Decoder::new_vaapi(display, BlockingMode::Blocking).ok()?;
+        let decoder = match meta.codec {
+            Codec::H264 => {
+                Decoder::H264(Dec::<H264>::new_vaapi(display, BlockingMode::Blocking).ok()?)
+            }
+            Codec::Vp9 => {
+                Decoder::Vp9(Dec::<Vp9>::new_vaapi(display, BlockingMode::Blocking).ok()?)
+            }
+        };
         let pool = FramePool::new(move |info: &StreamInfo| {
             alloc_nv12(&gbm, info.coded_resolution).expect("output frame allocation failed")
         });
@@ -195,11 +228,12 @@ impl Session {
             // Stop draining as soon as we have a picture: every handle we hold
             // keeps a pool buffer out of circulation.
             while self.ready.is_empty() {
-                match self.decoder.next_event() {
+                match self.decoder.get().next_event() {
                     Some(DecoderEvent::FrameReady(handle)) => self.ready.push_back(handle),
                     Some(DecoderEvent::FormatChanged) => {
                         let info = self
                             .decoder
+                            .get()
                             .stream_info()
                             .ok_or("format changed without stream info")?
                             .clone();
@@ -226,7 +260,7 @@ impl Session {
                 match self.demuxer.next_access_unit() {
                     Ok(Some(au)) => self.pending = au,
                     Ok(None) => {
-                        self.decoder.flush().map_err(|e| e.to_string())?;
+                        self.decoder.get().flush().map_err(|e| e.to_string())?;
                         self.flushed = true;
                         continue;
                     }
@@ -241,7 +275,10 @@ impl Session {
                 timestamp,
                 ..
             } = self;
-            match decoder.decode(*timestamp, pending, &mut || pool.alloc()) {
+            match decoder
+                .get()
+                .decode(*timestamp, pending, &mut || pool.alloc())
+            {
                 Ok(0) => return Err("decoder consumed no input".into()),
                 Ok(n) => {
                     pending.drain(..n.min(pending.len()));

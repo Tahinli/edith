@@ -65,6 +65,15 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
     -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -ar 44100 -ac 2 \
     -metadata:s:a:1 language=fra assets/test_multilang.mp4
+# VP9 fixture: the same A/V shape as test_av.mp4 (1280x720@30, AAC-LC 44.1k
+# stereo) with a VP9 picture, so what the tests measure is the codec and
+# nothing else. 2 s, because VP9 only ever decodes on the hardware path.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libvpx-vp9 -b:v 2M -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_vp9.mp4
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
