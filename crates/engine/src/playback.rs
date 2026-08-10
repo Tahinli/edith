@@ -23,7 +23,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
-use crate::project::{Clip, Lane, Project, Source, Span};
+use crate::project::{Clip, Lane, LaneKind, Project, Source, Span};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -219,16 +219,21 @@ impl PlaybackSession {
         // (or hand-edited) project files are the one door this can come in
         // through, so it is refused by name here rather than becoming a clip
         // that decodes to nothing.
-        for clip in &doc.video {
+        for clip in doc
+            .lanes
+            .iter()
+            .filter(|(kind, _)| *kind == LaneKind::Video)
+            .flat_map(|(_, clips)| clips)
+        {
             if crate::is_audio(&doc.sources[clip.source].path) {
                 return Err(format!(
-                    "{} has no picture: it can only play on the audio lane",
+                    "{} has no picture: it can only play on an audio lane",
                     doc.sources[clip.source].path.display()
                 )
                 .into());
             }
         }
-        for (i, clip) in doc.video.iter().chain(&doc.audio).enumerate() {
+        for (i, clip) in doc.lanes.iter().flat_map(|(_, clips)| clips).enumerate() {
             if clip.out_frame > counts[clip.source] {
                 return Err(format!(
                     "clip {i} ends at frame {} but {} has {} frames",
@@ -241,7 +246,7 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.video, doc.audio)?;
+        let project = Project::from_parts(doc.sources, doc.lanes)?;
         let span = project.span_at(Lane::V1, 0).expect("never empty");
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -295,10 +300,10 @@ impl PlaybackSession {
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
-        let (sources, video, audio) = self.project.without_orphan_sources()?;
+        let (sources, lanes) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
-        crate::edith::save(path, &sources, &video, &audio, playhead)
+        crate::edith::save(path, &sources, &lanes, playhead)
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a

@@ -200,8 +200,10 @@ fn exports_the_audio_stream_the_timeline_plays() {
             path: multi.clone(),
             audio_stream: 1,
         }],
-        vec![whole],
-        vec![whole],
+        vec![
+            (engine::project::LaneKind::Video, vec![whole]),
+            (engine::project::LaneKind::Audio, vec![whole]),
+        ],
     )
     .expect("a one-source project on stream 1");
     let out = out_path("stream1");
