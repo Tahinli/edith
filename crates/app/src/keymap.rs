@@ -118,7 +118,84 @@ impl ActionId {
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|a| a.name() == name)
     }
+
+    /// Which heading the keys menu files it under. Every action has one, so a
+    /// new action is listed the moment it exists -- there is no second list to
+    /// forget.
+    pub fn category(self) -> Category {
+        match self {
+            ActionId::Play => Category::Playback,
+            ActionId::Copy | ActionId::Paste | ActionId::Delete | ActionId::Lift => Category::Clips,
+            ActionId::Cut | ActionId::Regroup | ActionId::Undo => Category::Editing,
+            ActionId::ToggleMute | ActionId::VolumeUp | ActionId::VolumeDown => Category::Audio,
+            ActionId::Save | ActionId::Export | ActionId::CancelExport => Category::File,
+        }
+    }
 }
+
+/// A heading in the keys menu, and the order the headings come in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Category {
+    Playback,
+    Editing,
+    Clips,
+    Audio,
+    File,
+    View,
+}
+
+impl Category {
+    pub const ALL: [Category; 6] = [
+        Category::Playback,
+        Category::Editing,
+        Category::Clips,
+        Category::Audio,
+        Category::File,
+        Category::View,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Playback => "Playback",
+            Category::Editing => "Editing",
+            Category::Clips => "Clips",
+            Category::Audio => "Audio",
+            Category::File => "File",
+            Category::View => "View",
+        }
+    }
+}
+
+/// A stroke that works but nobody may rebind: the modal cards read the keyboard
+/// themselves, and what closes a card must not be a thing a user can take away.
+/// Listed here anyway, because the keys menu shows every stroke that works --
+/// `no_stroke_is_missing_from_the_keys_menu` reads the key handler's own source
+/// and fails on any key that reaches neither this table nor a binding.
+pub struct Fixed {
+    /// As a person reads it, which for a single key is [`Chord::pretty`]'s
+    /// spelling and for a family of keys is the family (`0–9`).
+    pub chord: &'static str,
+    pub label: &'static str,
+    pub category: Category,
+}
+
+pub const FIXED: [Fixed; 3] = [
+    Fixed {
+        chord: "esc",
+        label: "Close this card, or cancel a capture",
+        category: Category::View,
+    },
+    Fixed {
+        chord: "0–9",
+        label: "Type a custom export bitrate",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "backspace",
+        label: "Erase a bitrate digit",
+        category: Category::File,
+    },
+];
 
 /// A stroke as the key handler sees it: gpui's key name plus the one modifier
 /// this editor binds. Nothing else is a chord here -- shift and alt are part of
