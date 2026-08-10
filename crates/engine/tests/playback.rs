@@ -879,7 +879,7 @@ fn undo_after_import_is_one_step() {
     // exposes sources through `clip_spans_by_source`, and the undone clip is
     // exactly the one that named it.
     let mut project = engine::Project::single(asset("test_av.mp4"), 150);
-    let source = project.import(&av2);
+    let source = project.import(&av2, 0);
     assert!(project.append_clip(source, 120));
     assert!(project.undo());
     assert_eq!(project.clips().len(), 1);

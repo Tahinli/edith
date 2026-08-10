@@ -141,14 +141,15 @@ fn frame_rate(track: &Mp4Track) -> f64 {
 /// to average 3753.75 averages instead of truncating. All of it in `f64`, which
 /// is the bug the caller above exists to avoid.
 fn fps_from_stts(entries: impl IntoIterator<Item = (u32, u32)>, timescale: u32) -> f64 {
-    let (samples, ticks) = entries
-        .into_iter()
-        .fold((0u64, 0u64), |(samples, ticks), (count, delta)| {
-            (
-                samples + u64::from(count),
-                ticks + u64::from(count) * u64::from(delta),
-            )
-        });
+    let (samples, ticks) =
+        entries
+            .into_iter()
+            .fold((0u64, 0u64), |(samples, ticks), (count, delta)| {
+                (
+                    samples + u64::from(count),
+                    ticks + u64::from(count) * u64::from(delta),
+                )
+            });
     match ticks {
         // No timing in the header at all; `mp4`'s own answer for that is 0.0 too.
         0 => 0.0,
@@ -261,7 +262,10 @@ mod tests {
         );
         // Constant delta stays an exact division, not an average.
         assert_eq!(fps_from_stts([(300u32, 3000u32)], 90_000), 30.0);
-        assert_eq!(fps_from_stts([(120u32, 1001u32)], 30_000), 30_000.0 / 1001.0);
+        assert_eq!(
+            fps_from_stts([(120u32, 1001u32)], 30_000),
+            30_000.0 / 1001.0
+        );
         assert_eq!(fps_from_stts([(0u32, 0u32)], 90_000), 0.0, "no timing");
     }
 
@@ -277,7 +281,11 @@ mod tests {
         assert_eq!(first_frame_sample(entries, Some(7507 - 7507)), 1);
         // Two frames genuinely cut off the front.
         assert_eq!(first_frame_sample(entries, Some(7507)), 3);
-        assert_eq!(first_frame_sample(entries, None), 1, "no edit list, no trim");
+        assert_eq!(
+            first_frame_sample(entries, None),
+            1,
+            "no edit list, no trim"
+        );
         assert_eq!(first_frame_sample(entries, Some(0)), 1, "zero is no trim");
     }
 

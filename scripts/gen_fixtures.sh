@@ -48,6 +48,23 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a ac3 -b:a 192k assets/test_ac3.mp4
+# Multi-language fixture: the shape real media has — one video and two AAC
+# streams that *agree* on rate and layout (44.1k stereo) and differ only in
+# language and content, 440/880 Hz undefined and 220/330 Hz French. One
+# timeline means one set of audio parameters, so this is the file where the
+# second stream can actually be put on the timeline; test_multiaudio.mp4 is the
+# file where it cannot, and both cases have to be shown.
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -f lavfi -i "sine=frequency=220:duration=2" \
+    -f lavfi -i "sine=frequency=330:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a0];\
+[3:a][4:a]join=inputs=2:channel_layout=stereo[a1]" \
+    -map 0:v -map "[a0]" -map "[a1]" \
+    -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -ar 44100 -ac 2 \
+    -metadata:s:a:1 language=fra assets/test_multilang.mp4
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
