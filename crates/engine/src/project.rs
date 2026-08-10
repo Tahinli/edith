@@ -376,18 +376,43 @@ impl Project {
     /// placement's own start, in a gap, and past the end -- all of which would
     /// produce an empty clip or nothing at all.
     ///
+    /// The two lanes' halves share an id only where they are the *same* span:
+    /// the lanes are edited apart, so the clip being cut here may start (or
+    /// end) somewhere else in the other lane, and a group id whose two clips
+    /// disagree about their span is not one take (see [`links_are_consistent`],
+    /// which refuses to load one).
+    ///
     /// Metadata only: no mapping changes, in any lane.
     pub fn split(&mut self, timeline_frame: u32) -> bool {
-        if !self
-            .lanes
-            .iter()
-            .any(|lane| splittable(lane, timeline_frame).is_some())
-        {
+        let cut = Lane::ALL
+            .map(|l| splittable(self.lane(l), timeline_frame).map(|idx| self.lane(l)[idx]));
+        if cut.iter().all(Option::is_none) {
             return false;
         }
         self.snapshot();
+        let same = |f: fn(&Clip) -> u32| match cut {
+            [Some(a), Some(b)] => f(&a) == f(&b),
+            _ => false,
+        };
         let (left, right) = (self.new_link(), self.new_link());
-        for lane in &mut self.lanes {
+        // Each side is its own question: two clips may start together and end
+        // apart, and the halves that do line up stay one take.
+        let ids = [
+            (left, right),
+            (
+                if same(|c| c.start) {
+                    left
+                } else {
+                    self.new_link()
+                },
+                if same(Clip::end) {
+                    right
+                } else {
+                    self.new_link()
+                },
+            ),
+        ];
+        for (lane, (left, right)) in self.lanes.iter_mut().zip(ids) {
             let Some(idx) = splittable(lane, timeline_frame) else {
                 continue;
             };
@@ -407,18 +432,28 @@ impl Project {
     /// Only what a split could have produced is rejoined -- the two sides must
     /// touch on the timeline *and* be consecutive frames of the same source --
     /// so the clip list comes back exactly as it was and traversal with it.
-    /// `false` when no lane has such a pair.
+    /// `false` when no lane has such a pair. The rejoined clips share one id
+    /// only when they rejoin into the same span, for [`split`](Project::split)'s
+    /// reason.
     pub fn regroup(&mut self, timeline_frame: u32) -> bool {
-        if !self
-            .lanes
-            .iter()
-            .any(|lane| joinable(lane, timeline_frame).is_some())
-        {
+        // What each lane would end up covering, if it joins here at all.
+        let joined = Lane::ALL.map(|l| {
+            joinable(self.lane(l), timeline_frame)
+                .map(|idx| (self.lane(l)[idx].start, self.lane(l)[idx + 1].end()))
+        });
+        if joined.iter().all(Option::is_none) {
             return false;
         }
         self.snapshot();
         let link = self.new_link();
-        for lane in &mut self.lanes {
+        let ids = [
+            link,
+            match joined {
+                [Some(a), Some(b)] if a == b => link,
+                _ => self.new_link(),
+            },
+        ];
+        for (lane, link) in self.lanes.iter_mut().zip(ids) {
             let Some(idx) = joinable(lane, timeline_frame) else {
                 continue;
             };
@@ -1455,5 +1490,82 @@ mod tests {
         consistent(&p, "ripple_delete");
         assert!(p.undo());
         consistent(&p, "undo");
+    }
+
+    /// What an edit produces is what a save writes, so *every* state the public
+    /// API can reach has to load again. The two the verifier panel found where
+    /// it did not: a split and a regroup handed one group id to two clips that
+    /// were not the same span, because the lanes had been edited apart.
+    #[test]
+    fn every_reachable_state_reloads() {
+        let mut p = Project::single(FILE, 150);
+        assert!(p.place(Lane::Audio, 3, clip(0, 0, 50, 0)));
+        assert!(p.split(10), "the lanes are cut apart at 10");
+        reloads(&p, "place on one lane, then split");
+
+        let mut p = Project::single(FILE, 150);
+        assert!(p.split(30));
+        assert!(p.lift(Lane::Video, 0), "the picture goes, the sound stays");
+        assert!(p.regroup(30), "only the audio lane can rejoin");
+        assert!(p.split(60));
+        reloads(&p, "lift, regroup one lane, split");
+    }
+
+    /// The same claim, swept: random op sequences off the public surface, the
+    /// project reloaded after every one of them. A failure prints its seed, and
+    /// the seed replays the whole sequence.
+    #[test]
+    fn random_edit_sequences_reload() {
+        for seed in 0..200u64 {
+            let mut rng = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let mut next = move |n: u32| {
+                // xorshift64*: no dependency, and the seed replays it exactly.
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 33) as u32 % n
+            };
+            let mut p = Project::single(FILE, 40);
+            for step in 0..24 {
+                let frame = next(44);
+                // A clipboard copy carries the group id of the take it came from
+                // -- the input that made a placement duplicate an id.
+                let copied = *p
+                    .lane(if next(2) == 0 {
+                        Lane::Video
+                    } else {
+                        Lane::Audio
+                    })
+                    .get(next(4) as usize)
+                    .unwrap_or(&clip(0, 0, 5, 0));
+                let lane = if next(2) == 0 {
+                    Lane::Video
+                } else {
+                    Lane::Audio
+                };
+                let idx = next(4) as usize;
+                let _ = match next(9) {
+                    0 => p.split(frame),
+                    1 => p.regroup(frame),
+                    2 => p.lift(lane, idx),
+                    3 => p.place(lane, frame, copied),
+                    4 => p.paste(frame, copied),
+                    5 => p.ripple_delete(frame, next(9)),
+                    6 => p.delete(idx),
+                    7 => p.undo(),
+                    _ => p.append_clip(0, 1 + next(9)),
+                };
+                reloads(&p, &format!("seed {seed}, step {step}"));
+            }
+        }
+    }
+
+    /// The save/load round trip a project must survive: the parts a save writes,
+    /// handed back to the constructor a load goes through.
+    fn reloads(p: &Project, what: &str) {
+        let (sources, video, audio) = p.clone().without_orphan_sources();
+        if let Err(e) = Project::from_parts(sources, video, audio) {
+            panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes);
+        }
     }
 }

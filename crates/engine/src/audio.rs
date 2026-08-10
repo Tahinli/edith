@@ -272,7 +272,8 @@ impl AudioSession {
     /// A segment naming **no** source is a gap, and is copied as that many
     /// packets of [`silent_packet`] silence — the rounding debt carried through
     /// it like any other, so the hole occupies its exact duration and the audio
-    /// after it stays in sync with the picture.
+    /// after it stays in sync with the picture. A gap the track *opens* on gets
+    /// one silent packet more, which is the priming a reader drops.
     pub fn copy_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -297,7 +298,14 @@ impl AudioSession {
             let Some(source) = source else {
                 let ideal = ((end_secs - start_secs).max(0.0) * f64::from(sample_rate)) as i64;
                 let bytes = silent_packet(params.chan_conf)?;
-                for _ in 0..packet_run(&mut err, ideal, u32::MAX) {
+                // A reader drops the first packet of an AAC track as the
+                // encoder's priming. When the track opens on a hole, that has to
+                // come out of one *extra* packet of silence: dropped out of the
+                // hole itself it would shorten it, and everything after the hole
+                // would play a packet early. It is not part of the run, so it
+                // owes the rounding debt nothing.
+                let priming = u32::from(packets.is_empty());
+                for _ in 0..packet_run(&mut err, ideal, u32::MAX) + priming {
                     packets.push(AacPacket {
                         bytes: bytes.clone(),
                         samples: SAMPLES_PER_PACKET,
@@ -318,7 +326,9 @@ impl AudioSession {
             let ideal = ((end_secs - start_secs).max(0.0) * f64::from(track.sample_rate)) as i64;
             let available = track.sample_count.saturating_sub(start_id - 1);
             // The head packet is the priming of the first segment only: a reader
-            // drops exactly one, so an interior join must not add another.
+            // drops exactly one, so an interior join must not add another --
+            // and neither must a segment behind a leading gap, which already
+            // paid the priming in silence.
             let head = (packets.is_empty() && start_id > 1).then(|| start_id - 1);
             let ids = head
                 .into_iter()
