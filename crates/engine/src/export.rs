@@ -31,7 +31,7 @@ use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
-use crate::project::{Lane, Project};
+use crate::project::Project;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -51,7 +51,9 @@ const MAX_BITRATE: u64 = 20_000_000;
 /// front-end says so rather than hiding the rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
-    /// Picture and sound: video re-encoded, AAC copied.
+    /// Picture and sound: video re-encoded, AAC copied. Copied, so it carries
+    /// **one** audio lane: a timeline whose sound is spread over two is refused
+    /// by name here and mixed by the other two formats, which decode.
     #[default]
     Mp4,
     /// The audio lane alone, 16-bit PCM.
@@ -210,10 +212,30 @@ fn run(
     // The stream each source is copied from is the one it plays: `audio_sources`
     // is the same list `PlaybackSession::seek` hands the decoder, so an export
     // of a timeline playing a file's second audio track carries *that* track.
-    let audio = AudioSession::copy_multi_streams(
-        &project.audio_sources(),
-        &project.segments_from(0, meta.frame_rate),
-    )?;
+    //
+    // One lane, because this path *copies* AAC packets and a mix is not a copy:
+    // summing two lanes means decoding both and encoding the result, and there
+    // is no AAC encoder here to encode it with. Refused by name rather than
+    // silently exporting the first lane -- a file missing half its sound is the
+    // one failure a user would not notice.
+    //
+    // *Which* lane is the same question `audio_segments_from` answers for
+    // playback, and it is asked here rather than assumed: the lane that holds
+    // the sound need not be `A1` (a project may leave `A1` empty and place
+    // everything on `A2`), and copying `A1`'s list in that case would write a
+    // file with no audio track at all -- silently, which is the failure this
+    // whole comment is about.
+    let lanes = project.audio_segments_from(0, meta.frame_rate);
+    let [segments] = &lanes[..] else {
+        return Err(format!(
+            "this timeline has {} audio lanes and an mp4 export copies one: \
+             there is no AAC encoder here to mix them with. Export WAV or FLAC, \
+             which are mixed, or put the sound on one lane",
+            lanes.len()
+        )
+        .into());
+    };
+    let audio = AudioSession::copy_multi_streams(&project.audio_sources(), segments)?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
@@ -223,10 +245,12 @@ fn run(
     let mut muxer = None;
     let mut done = 0u32;
     let black = Black::new(meta);
-    // Spans, not clips: a gap in the video lane is part of the timeline and
-    // gets encoded too, as black frames. The picture count is therefore
-    // `timeline_frames` however the lane is arranged.
-    for span in project.spans_from(Lane::V1, 0) {
+    // Spans, not clips: a gap in the video is part of the timeline and gets
+    // encoded too, as black frames. The picture count is therefore
+    // `timeline_frames` however the lanes are arranged -- and *which* lane a
+    // span comes from is `composite_spans_from`'s answer, the same one playback
+    // shows, so an export is what was watched.
+    for span in project.composite_spans_from(0) {
         // Every clip reopens its own source file at its own in point; the
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
@@ -279,13 +303,14 @@ fn run(
     Ok(())
 }
 
-/// The audio lane alone, as a WAV or a FLAC.
+/// The audio lanes alone, summed, as a WAV or a FLAC.
 ///
-/// Nothing here re-derives the edit: the play list is
-/// [`Project::segments_from`] and it is handed to the very
-/// [`AudioSession::open_multi_streams`] playback feeds from, so what is written
-/// is what was heard -- gaps included, which arrive as real silence from that
-/// choke point rather than as a hole this would have to invent.
+/// Nothing here re-derives the edit: the play lists are
+/// [`Project::audio_segments_from`] and they are handed to the very
+/// [`AudioSession::open_mixed_streams`] playback feeds from, so what is written
+/// is what was heard -- every lane, mixed the same way, gaps included, which
+/// arrive as real silence from that choke point rather than as a hole this would
+/// have to invent.
 ///
 /// The length is the *timeline's*: each segment resolves its window to whole
 /// samples on its own, so the sum can miss the timeline by a sample or two, and
@@ -300,8 +325,8 @@ fn run_audio(
     format: Format,
 ) -> crate::Result<()> {
     let sources = project.audio_sources();
-    let segs = project.segments_from(0, meta.frame_rate);
-    let Some((audio, chunks)) = AudioSession::open_multi_streams(&sources, &segs)? else {
+    let segs = project.audio_segments_from(0, meta.frame_rate);
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams(&sources, &segs)? else {
         return Err("this timeline has no audio to export".into());
     };
     let channels = usize::from(audio.channels);

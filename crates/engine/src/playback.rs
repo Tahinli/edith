@@ -149,7 +149,7 @@ impl PlaybackSession {
         // One clip per lane covering the file, so timeline == source until the
         // first edit -- and the range opened above is exactly that clip's.
         let project = Project::single(&path, meta.frame_count);
-        let span = project.span_at(Lane::V1, 0).expect("never empty");
+        let span = project.composite_span_at(0).expect("never empty");
         Ok(Self {
             meta,
             frames: stream.frames,
@@ -247,7 +247,7 @@ impl PlaybackSession {
 
         let playhead = doc.playhead;
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq)?;
-        let span = project.span_at(Lane::V1, 0).expect("never empty");
+        let span = project.composite_span_at(0).expect("never empty");
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
@@ -364,7 +364,7 @@ impl PlaybackSession {
     /// clip under the running worker and only the mapping stays true.
     fn next_clip(&mut self) -> bool {
         let next = self.span.end();
-        let Some(span) = self.project.span_at(Lane::V1, next) else {
+        let Some(span) = self.project.composite_span_at(next) else {
             return false;
         };
         // We only get here on a disconnect, so the old worker has already
@@ -759,7 +759,7 @@ impl PlaybackSession {
         // `target` is inside the timeline (never empty), so this always spans;
         // the span runs from there to the end of whatever it landed in -- a
         // clip, or a gap, which starts a black-frame worker instead.
-        if let Some(span) = self.project.span_at(Lane::V1, target) {
+        if let Some(span) = self.project.composite_span_at(target) {
             self.start_span(span);
         }
         self.eos = false;
@@ -777,11 +777,14 @@ impl PlaybackSession {
             // between clips are gapless: the video reopens at a boundary, the
             // ear never hears it -- and a join between two *files* is just
             // another segment, because every segment names its own source.
-            let segs = self.project.segments_from(target, fps);
+            // One play list per audio lane, summed by the mixer: what the ear
+            // hears is every lane at once, and a lane's own gaps are silence in
+            // it rather than a hole in the count the master clock keeps.
+            let segs = self.project.audio_segments_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
-            audio_running = match AudioSession::open_multi_streams(&sources, &segs) {
+            audio_running = match AudioSession::open_mixed_streams(&sources, &segs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };
