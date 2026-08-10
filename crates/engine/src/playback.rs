@@ -876,6 +876,13 @@ impl PlaybackSession {
         self.project.add_lane(kind)
     }
 
+    /// Drops that empty lane again, in [`Project::remove_lane`]'s words when it
+    /// refuses. One undo step, and no reseek for the same reason the add needs
+    /// none: an empty lane was playing nothing.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        self.project.remove_lane(lane)
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
