@@ -212,6 +212,17 @@ impl LaneData {
     }
 }
 
+/// Which end of a clip a [`Project::trim`] moves: the one the pointer grabbed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    /// Its first timeline frame; moving it changes where in the source the clip
+    /// starts reading, so the picture behind the edge slides with it.
+    Start,
+    /// One past its last timeline frame; moving it only says how much of the
+    /// source to keep.
+    End,
+}
+
 /// What a lane holds over one stretch of the timeline: either a placed clip or
 /// a gap. Returned already trimmed to the position it was asked about, so a
 /// caller can hand `len` straight to a decoder (or to a black-frame generator).
@@ -1029,6 +1040,140 @@ impl Project {
         clips.insert(at, clip);
         debug_assert!(sorted_disjoint(clips));
         true
+    }
+
+    /// Move one `edge` of the clip at `idx` of `lane` to timeline frame `to` --
+    /// the drag on a clip's end that makes it play more or less of its source.
+    /// The rest of the lane stays exactly where it is (nothing ripples), so what
+    /// a shortened clip leaves behind is a gap and what a lengthened one takes
+    /// is room that was already empty. One snapshot, so a whole drag is one
+    /// [`Project::undo`] -- commit once, at the release, rather than per pointer
+    /// sample. Changes the timeline->source mapping: the caller must reseek.
+    ///
+    /// [`Edge::Start`] moves the in-point with it: the frames that stay play
+    /// exactly what they played before, which is what makes this a trim and not
+    /// a slip.
+    ///
+    /// `to` is **clamped**, never refused -- a hand pulling an edge past what is
+    /// legal means "as far as it goes", and stopping the box there is the
+    /// affordance. The walls are: one frame of clip always survives, an edge
+    /// never crosses the neighbouring clip on its own lane, an in-point never
+    /// walks back past the source's first frame, and an out-point never runs
+    /// past `source_frames[clip.source]` -- the caller's table of how long each
+    /// source actually is ([`Project`] does not know, and a clip ending past its
+    /// file's last frame is a save that will not open again; see
+    /// `PlaybackSession::trim_clip`, which fills it in). A source with no entry
+    /// there may not grow at all.
+    ///
+    /// Linked clips trim *together*, to one clamped edge: a link is one span on
+    /// however many lanes ([`links_are_consistent`]), so a picture trimmed away
+    /// from its sound would be a group no save could load. The room is therefore
+    /// what every member of the group has -- the tightest wall wins.
+    ///
+    /// `false`, changing nothing and costing no undo step, for an index that is
+    /// not there and for an edge that is already where it was asked to go.
+    pub fn trim(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        to: u32,
+        source_frames: &[u32],
+    ) -> bool {
+        let (Some((lo, hi)), Some(clip)) = (
+            self.trim_room(lane, idx, edge, source_frames),
+            self.lane(lane).get(idx).copied(),
+        ) else {
+            return false;
+        };
+        let to = to.clamp(lo, hi);
+        let at = match edge {
+            Edge::Start => clip.start,
+            Edge::End => clip.end(),
+        };
+        if to == at {
+            return false;
+        }
+        self.snapshot();
+        for (l, i) in self.group_of(lane, idx).expect("checked above") {
+            let c = &mut self.lanes[l].clips[i];
+            match edge {
+                Edge::Start => {
+                    // Non-negative by `lo`, which is what keeps the in-point on
+                    // the source.
+                    c.in_frame = (i64::from(c.in_frame) + i64::from(to) - i64::from(c.start)) as u32;
+                    c.start = to;
+                }
+                Edge::End => c.out_frame = c.in_frame + (to - c.start),
+            }
+            debug_assert!(sorted_disjoint(&self.lanes[l].clips));
+        }
+        true
+    }
+
+    /// How far that edge may travel, `(first, last)` timeline frame inclusive --
+    /// the walls [`trim`](Project::trim) clamps to, without moving anything.
+    /// What a front-end drawing the box *during* a drag asks, so the live width
+    /// is the width the release will commit and an edge stops under the pointer
+    /// rather than snapping back. `None` for an index that is not there.
+    pub fn trim_room(
+        &self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        source_frames: &[u32],
+    ) -> Option<(u32, u32)> {
+        let (mut lo, mut hi) = (u32::MIN, u32::MAX);
+        for (l, i) in self.group_of(lane, idx)? {
+            let clips = &self.lanes[l].clips;
+            let c = clips[i];
+            let (member_lo, member_hi) = match edge {
+                Edge::Start => (
+                    // Back to the source's own first frame, and never over the
+                    // clip in front of it.
+                    (c.start - c.in_frame).max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                    c.end() - 1,
+                ),
+                Edge::End => (
+                    c.start + 1,
+                    // Out to whatever is left of the source, and never over the
+                    // clip behind it.
+                    c.start
+                        .saturating_add(
+                            source_frames
+                                .get(c.source)
+                                .copied()
+                                .unwrap_or(c.out_frame)
+                                .saturating_sub(c.in_frame),
+                        )
+                        .min(clips.get(i + 1).map_or(u32::MAX, |n| n.start)),
+                ),
+            };
+            lo = lo.max(member_lo);
+            hi = hi.min(member_hi);
+        }
+        // `hi.max(lo)`: for a clip the invariants hold for, the range always
+        // contains the edge's own place, and a caller's wrong `source_frames`
+        // must not become an empty range (or a panicking `clamp`) here.
+        Some((lo, hi.max(lo)))
+    }
+
+    /// The clips that move as one with the clip at `idx` of `lane` -- itself and
+    /// whatever carries its link on the other lanes -- as `(lane storage index,
+    /// clip index)` pairs. `None` for an index that is not there.
+    fn group_of(&self, lane: Lane, idx: usize) -> Option<Vec<(usize, usize)>> {
+        let clip = *self.lane(lane).get(idx)?;
+        Some(match clip.link {
+            Some(link) => self
+                .lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(l, data)| {
+                    Some((l, data.clips.iter().position(|c| c.link == Some(link))?))
+                })
+                .collect(),
+            None => vec![(self.index(lane).expect("the clip was found on it"), idx)],
+        })
     }
 
     /// Insert `clip` into the first lane of each kind at `timeline_frame` as one
@@ -2091,6 +2236,115 @@ mod tests {
         assert!(p.move_to_lane(Lane::V1, 0, v2), "[0,3) merely abuts it");
         assert_eq!(shape(&p)[0], vec![clip(3, 3, 5, 0), clip(5, 5, 9, 0)]);
         assert_eq!(shape(&p)[2], vec![clip(0, 0, 3, 0), clip(3, 100, 101, 0)]);
+    }
+
+    /// How long `FILE` is, which is what a trim's tail is allowed to reach:
+    /// [`three`] cuts up all nine of its frames.
+    const SRC: &[u32] = &[9];
+
+    /// The drag on a clip's tail: it plays less (or more) of its source, nothing
+    /// else on the lane moves, and every wall stops the edge rather than
+    /// refusing the gesture.
+    #[test]
+    fn trimming_the_tail_stops_at_every_wall() {
+        let mut p = three();
+
+        // Pulled in: a gap opens behind it and the clip after it stays put.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 4, SRC));
+        assert_eq!(
+            shape(&p)[0],
+            vec![clip(0, 0, 3, 0), clip(3, 3, 4, 0), clip(5, 5, 9, 0)]
+        );
+        assert_eq!(p.timeline_frames(), 9, "a trim ripples nothing");
+        assert_eq!(p.map(Lane::V1, 4), None, "the frame it gave up is a gap");
+
+        // ...and back out, no further than the clip behind it.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 8, SRC));
+        assert_eq!(shape(&p)[0][1], clip(3, 3, 5, 0), "stopped at the neighbour");
+        assert!(!p.trim(Lane::V1, 1, Edge::End, 8, SRC), "already at the wall");
+
+        // One frame of clip always survives, however far back the pointer went.
+        assert!(p.trim(Lane::V1, 1, Edge::End, 0, SRC));
+        assert_eq!(shape(&p)[0][1], clip(3, 3, 4, 0));
+
+        // The last clip has no neighbour, so what stops it is the file: nine
+        // frames is nine frames.
+        assert!(p.trim(Lane::V1, 2, Edge::End, 7, SRC));
+        assert!(p.trim(Lane::V1, 2, Edge::End, 9999, SRC));
+        assert_eq!(shape(&p)[0][2], clip(5, 5, 9, 0), "back to the whole take");
+        assert!(!p.trim(Lane::V1, 2, Edge::End, 9999, SRC), "and no further");
+        // A source nobody told us the length of may not grow at all -- an
+        // out-point past the end of a file is a save that will not open again.
+        assert!(p.trim(Lane::V1, 2, Edge::End, 7, &[]));
+        assert!(!p.trim(Lane::V1, 2, Edge::End, 9, &[]), "length unknown");
+    }
+
+    /// The head pulled in takes the in-point with it -- what stays plays what it
+    /// always played -- and stops at the source's own first frame.
+    #[test]
+    fn trimming_the_head_moves_the_in_point() {
+        let mut p = three();
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
+        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0), "two frames off the front");
+        assert_eq!(p.map(Lane::V1, 2), Some((0, 2)), "frame 2 still plays 2");
+        assert_eq!(p.map(Lane::V1, 1), None, "and the front is a gap");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "back out again");
+        assert_eq!(shape(&p)[0][0], clip(0, 0, 3, 0));
+        // One frame survives here too.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 9, SRC));
+        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0));
+
+        // A clip that does not begin at its source's first frame: its head goes
+        // back to source frame 0 and not one frame further.
+        let mut p = Project::single(FILE, 9);
+        assert!(p.place(Lane::V1, 5, clip(0, 1, 4, 0)));
+        assert!(p.lift(Lane::V1, 0), "nothing in front of it to stop it");
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC));
+        assert_eq!(shape(&p)[0][0], clip(4, 0, 4, 0), "one frame of head left");
+    }
+
+    /// Linked halves trim as one: a link is one span on however many lanes, so
+    /// the sound follows the picture's edge -- and the tightest wall of the two
+    /// is what stops both.
+    #[test]
+    fn linked_halves_trim_together() {
+        let mut p = three();
+        let link = p.lane(Lane::V1)[2].link.expect("a split hands out ids");
+        assert_eq!(p.lane(Lane::A1)[2].link, Some(link), "both halves grouped");
+
+        assert!(p.trim(Lane::V1, 2, Edge::Start, 7, SRC));
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0));
+        assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0), "the sound followed");
+        assert!(p.trim(Lane::A1, 2, Edge::End, 8, SRC), "either half drags it");
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 8, 0), "and the picture follows");
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+
+        // Something in the way on the *audio* lane stops the picture's tail as
+        // well: the group can only go as far as its tightest member.
+        assert!(p.place(Lane::A1, 9, clip(0, 0, 1, 0)));
+        assert!(p.trim(Lane::V1, 2, Edge::End, 9999, SRC));
+        assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0), "stopped by A1's clip");
+        assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0));
+        links_are_consistent(&p.lanes).expect("still one span");
+    }
+
+    /// A whole drag is one undo step -- the front-end commits once, at the
+    /// release -- and an edge asked to stay where it is costs none at all.
+    #[test]
+    fn a_trim_is_one_undo_step() {
+        let mut p = three();
+        let before = shape(&p);
+        let history = p.history.len();
+
+        assert!(p.trim(Lane::V1, 1, Edge::End, 4, SRC));
+        assert_eq!(p.history.len(), history + 1, "one snapshot per gesture");
+        assert!(!p.trim(Lane::V1, 1, Edge::End, 4, SRC), "already there");
+        assert!(!p.trim(Lane::V1, 9, Edge::End, 4, SRC), "no such clip");
+        assert!(!p.trim(Lane::new(LaneKind::Video, 7), 0, Edge::End, 4, SRC));
+        assert_eq!(p.history.len(), history + 1, "a refusal snapshots nothing");
+
+        assert!(p.undo());
+        assert_eq!(shape(&p), before, "both halves back, in one step");
     }
 
     /// A moved half stays in its group: a link names a span, not a lane, so the
