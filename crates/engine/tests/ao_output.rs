@@ -28,6 +28,23 @@ fn tone() -> Vec<f32> {
     samples
 }
 
+/// Opens the device the way this suite wants it: connected for real, and
+/// silent. Everything these tests assert -- that the clock runs, at the right
+/// rate, and stops when the stream is paused -- is measured from the device's
+/// own position, which the gain does not touch: the frames are still consumed,
+/// only the last multiply before the speaker is zero.
+///
+/// ponytail: it does mean the suite is deaf, so a plugin that shipped with the
+/// gain stuck at zero would pass it. Nothing here could ever hear that -- the
+/// checks that can are `scale`'s unit test in engine-audio (unity leaves the
+/// bytes alone) and a person with the app open. The upgrade path is recording
+/// a null sink and asserting on the samples that come back.
+fn open_silent() -> AoSession {
+    let ao = AoSession::open(RATE, CHANNELS).expect("no PipeWire playback available");
+    assert!(ao.set_volume(0.0), "mute rejected");
+    ao
+}
+
 /// Waits up to `limit` for the clock to report a played position past zero.
 fn wait_for_playback(ao: &AoSession, limit: Duration) -> i64 {
     let start = Instant::now();
@@ -46,7 +63,7 @@ fn wait_for_playback(ao: &AoSession, limit: Duration) -> i64 {
 #[ignore = "needs libengine_audio.so and a PipeWire daemon"]
 fn plays_and_tracks_position() {
     assert!(AoSession::probe(), "plugin not loadable");
-    let mut ao = AoSession::open(RATE, CHANNELS).expect("no PipeWire playback available");
+    let mut ao = open_silent();
 
     // The ring holds a second, so two halves go in whole -- enough real audio
     // to cover the measurement below without starving.
@@ -96,14 +113,13 @@ fn plays_and_tracks_position() {
 #[ignore = "needs libengine_audio.so and a PipeWire daemon"]
 fn muting_silences_without_stopping_the_clock() {
     assert!(AoSession::probe(), "plugin not loadable");
-    let mut ao = AoSession::open(RATE, CHANNELS).expect("no PipeWire playback available");
+    let mut ao = open_silent();
 
     let samples = tone();
     assert_eq!(ao.write(&samples), Some(samples.len()), "short write");
     let first = wait_for_playback(&ao, Duration::from_secs(2));
 
-    // Mute, then keep it fed: the position must move exactly as it would have.
-    assert!(ao.set_volume(0.0), "mute rejected");
+    // Muted and fed: the position must move exactly as it would have.
     assert_eq!(ao.write(&samples), Some(samples.len()), "short write");
     std::thread::sleep(Duration::from_millis(300));
     let muted = ao.position().expect("position went unknown");
@@ -115,8 +131,15 @@ fn muting_silences_without_stopping_the_clock() {
         "the clock stalled while muted: {advanced} samples in 300 ms"
     );
 
-    // Every level in range is taken, and the two ends are in range.
-    for gain in [0.0, 0.5, 1.0] {
+    // Every level in range is taken, and the two ends are in range. Done on an
+    // emptied ring and left back at zero, so that the audible gains this walks
+    // through have nothing but the underrun fill to be applied to: whoever runs
+    // the suite should not have to hear it prove that 1.0 is a legal number.
+    assert!(ao.flush(), "flush rejected");
+    // A flush lands on the next callback and the ring refuses writes until it
+    // does, so give it a couple of quanta before asking for anything else.
+    std::thread::sleep(Duration::from_millis(50));
+    for gain in [0.5, 1.0, 0.0] {
         assert!(ao.set_volume(gain), "gain {gain} rejected");
     }
     // Out of range is refused at the ABI rather than multiplied into the

@@ -19,6 +19,22 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Opens a session the way every test here wants one: silent. The suite plays
+/// real files through the real device, so without this a `cargo test` is two
+/// minutes of noise out of the speakers of whoever ran it.
+///
+/// Muting is the gain knob, not a pause and not a fake device: the stream is
+/// still connected, the daemon still schedules it, the samples are still
+/// decoded, written, and handed over -- only the last multiply before the
+/// device is zero. Every clock, `fed` and `played_out` assertion below is
+/// therefore measuring exactly what it measured when this was audible.
+fn open(path: impl AsRef<Path>) -> PlaybackSession {
+    let session = PlaybackSession::open(path).expect("open");
+    // False for the silent fixtures, which have no device to quieten.
+    session.set_gain(0.0);
+    session
+}
+
 /// One render tick of a front-end: advance the clock, take whatever frames are
 /// due. Returns the highest frame index seen so far.
 fn pump(session: &mut PlaybackSession, last_index: &mut Option<u32>) {
@@ -52,7 +68,7 @@ fn run_for(session: &mut PlaybackSession, last_index: &mut Option<u32>, duration
 
 fn plays_at_real_speed(name: &str) {
     let path = asset(name);
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     assert_eq!(session.now(), 0.0, "a fresh session starts at zero");
     assert!(!session.is_playing(), "a fresh session starts paused");
     let mut last_index = None;
@@ -160,7 +176,7 @@ fn threads() -> usize {
 /// Wall-clock seek: no audio track, so this runs anywhere.
 #[test]
 fn seek_repositions_video_and_clock() {
-    let mut session = PlaybackSession::open(asset("test_baseline.mp4")).expect("open");
+    let mut session = open(asset("test_baseline.mp4"));
     let fps = session.meta().frame_rate;
     let mut last_index = None;
 
@@ -194,7 +210,7 @@ fn seek_repositions_video_and_clock() {
 /// device is never fed another sample.
 #[test]
 fn seek_past_the_end_clamps() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let meta = *session.meta();
     let duration = f64::from(meta.frame_count) / meta.frame_rate;
 
@@ -223,7 +239,7 @@ fn seek_past_the_end_clamps() {
 /// abandoned workers behind, and the last one still wins.
 #[test]
 fn rapid_seeks_settle_on_the_last_one() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let fps = session.meta().frame_rate;
     let mut last_index = None;
 
@@ -253,7 +269,7 @@ fn rapid_seeks_settle_on_the_last_one() {
 #[test]
 #[ignore = "needs a running PipeWire daemon"]
 fn seek_keeps_the_audio_clock() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let meta = *session.meta();
     let mut last_index = None;
 
@@ -308,7 +324,7 @@ fn seek_keeps_the_audio_clock() {
 #[test]
 fn edits_traverse_cuts() {
     let path = asset("test_baseline.mp4");
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
     let whole = f64::from(total) / fps;
     assert!((session.timeline_duration() - whole).abs() < 1e-9);
@@ -406,7 +422,7 @@ fn edits_traverse_cuts() {
 #[test]
 fn paste_duplicates_a_clip_at_the_playhead() {
     let path = asset("test_baseline.mp4");
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
     let whole = f64::from(total) / fps;
 
@@ -480,7 +496,7 @@ fn paste_duplicates_a_clip_at_the_playhead() {
 #[test]
 fn paste_while_playing_does_not_stall() {
     let path = asset("test_baseline.mp4");
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
     let mut last_index = None;
 
@@ -518,7 +534,7 @@ fn paste_while_playing_does_not_stall() {
 #[test]
 fn paste_at_eos_revives_the_session() {
     let path = asset("test_baseline.mp4");
-    let mut session = PlaybackSession::open(&path).expect("open");
+    let mut session = open(&path);
     let total = session.meta().frame_count;
 
     assert!(session.cut_at(2.0), "cut at 2 s");
@@ -554,7 +570,7 @@ fn paste_at_eos_revives_the_session() {
 #[test]
 #[ignore = "needs a running PipeWire daemon"]
 fn edits_keep_the_audio_clock() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let fps = session.meta().frame_rate;
     let mut last_index = None;
 
@@ -621,7 +637,7 @@ fn frame_count(path: &Path) -> u32 {
 #[test]
 fn import_appends_a_second_source_and_plays_across_the_join() {
     let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
-    let mut session = PlaybackSession::open(&av).expect("open");
+    let mut session = open(&av);
     let (fps, first) = (session.meta().frame_rate, session.meta().frame_count);
     let second = frame_count(&av2);
     assert_eq!((first, second), (150, 120), "fixtures changed");
@@ -707,7 +723,7 @@ fn import_appends_a_second_source_and_plays_across_the_join() {
 /// changes nothing.
 #[test]
 fn import_refuses_what_does_not_match() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
 
     let err = session
         .import(&asset("test_mismatch.mp4"))
@@ -730,7 +746,7 @@ fn import_refuses_what_does_not_match() {
     assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
 
     // The mirror: audio into a silent timeline is refused just as loudly.
-    let mut silent = PlaybackSession::open(asset("test_baseline.mp4")).expect("open");
+    let mut silent = open(asset("test_baseline.mp4"));
     let err = silent
         .import(&asset("test_av.mp4"))
         .expect_err("audio into a silent timeline")
@@ -742,7 +758,7 @@ fn import_refuses_what_does_not_match() {
 /// out once and reused, which is what keeps clipboard clips valid forever.
 #[test]
 fn importing_one_file_twice_reuses_its_source() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let av2 = asset("test_av2.mp4");
     session.import(&av2).expect("first import");
     session.import(&av2).expect("second import");
@@ -767,7 +783,7 @@ fn importing_one_file_twice_reuses_its_source() {
 #[test]
 fn import_at_eos_resumes_into_the_new_clip() {
     let av2 = asset("test_av2.mp4");
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let first = session.meta().frame_count;
 
     session.play();
@@ -796,7 +812,7 @@ fn a_vanished_source_is_skipped() {
     let scratch =
         std::env::temp_dir().join(format!("video_editor_vanish_{}.mp4", std::process::id()));
     std::fs::copy(asset("test_av2.mp4"), &scratch).expect("copy the fixture");
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     let first = session.meta().frame_count;
     session.import(&scratch).expect("import the copy");
     std::fs::remove_file(&scratch).expect("unlink");
@@ -815,7 +831,7 @@ fn a_vanished_source_is_skipped() {
 #[test]
 fn import_during_play_does_not_stall() {
     let (av, av2) = (asset("test_av.mp4"), asset("test_av2.mp4"));
-    let mut session = PlaybackSession::open(&av).expect("open");
+    let mut session = open(&av);
     let first = session.meta().frame_count;
     let mut last_index = None;
 
@@ -845,7 +861,7 @@ fn import_during_play_does_not_stall() {
 #[test]
 fn undo_after_import_is_one_step() {
     let av2 = asset("test_av2.mp4");
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     session.import(&av2).expect("import");
     assert_eq!(session.clip_spans().len(), 2);
     assert!((session.timeline_duration() - 9.0).abs() < 1e-9);
@@ -881,7 +897,7 @@ fn undo_after_import_is_one_step() {
 #[test]
 #[ignore = "needs a running PipeWire daemon"]
 fn audio_runs_across_a_source_join() {
-    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+    let mut session = open(asset("test_av.mp4"));
     session.import(&asset("test_av2.mp4")).expect("import");
     let first = session.meta().frame_count;
 
