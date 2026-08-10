@@ -70,6 +70,21 @@ impl Drop for Worker {
     }
 }
 
+/// A running worker and the frames it is sending, handed out as one value
+/// because they must be *dropped* as one, in this order: the receiver
+/// disconnects first, which is the only thing that wakes a worker parked in a
+/// full `send`, and the join inside [`Worker::drop`] runs second.
+///
+/// Rust drops fields in declaration order, so this struct *is* that rule, and
+/// it holds wherever the value goes: an early return out of a half-built
+/// session, an unwind, a caller not written yet. Two separate locals do not
+/// hold it -- they drop in reverse order of declaration, so the worker there
+/// joins a thread nobody will ever drain, which is a hang and not a slow path.
+pub(crate) struct FrameStream {
+    pub(crate) frames: Receiver<Frame>,
+    pub(crate) worker: Worker,
+}
+
 pub struct DecodeSession;
 
 impl DecodeSession {
@@ -104,8 +119,10 @@ impl DecodeSession {
         start_frame: u32,
         end_frame: u32,
     ) -> crate::Result<(VideoMeta, Receiver<Frame>, Arc<AtomicBool>)> {
-        let (meta, rx, worker) = Self::open_worker(path, start_frame, end_frame)?;
-        Ok((meta, rx, worker.detach()))
+        let (meta, stream) = Self::open_worker(path, start_frame, end_frame)?;
+        // The public API hands out the flag alone, so the worker is detached and
+        // the receiver goes to the caller: nothing here joins anything.
+        Ok((meta, stream.frames, stream.worker.detach()))
     }
 
     /// A worker that decodes nothing and emits `len` black frames, indexed from
@@ -113,17 +130,17 @@ impl DecodeSession {
     /// channel as decoded frames, so a gap costs the caller no branch at all
     /// beyond choosing this opener: same bounded channel, same backpressure,
     /// same cancel, same retire path.
-    pub(crate) fn open_black(width: u32, height: u32, len: u32) -> (Receiver<Frame>, Worker) {
+    pub(crate) fn open_black(width: u32, height: u32, len: u32) -> FrameStream {
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
         if len == 0 {
-            return (
-                rx,
-                Worker {
+            return FrameStream {
+                frames: rx,
+                worker: Worker {
                     cancel,
                     handle: None,
                 },
-            );
+            };
         }
         let worker_cancel = Arc::clone(&cancel);
         // One buffer, cloned per frame: opaque black is a constant, and the
@@ -148,7 +165,10 @@ impl DecodeSession {
                 }
             })
             .ok();
-        (rx, Worker { cancel, handle })
+        FrameStream {
+            frames: rx,
+            worker: Worker { cancel, handle },
+        }
     }
 
     /// As [`DecodeSession::open_range`], but the caller gets the whole
@@ -158,7 +178,7 @@ impl DecodeSession {
         path: impl AsRef<Path>,
         start_frame: u32,
         end_frame: u32,
-    ) -> crate::Result<(VideoMeta, Receiver<Frame>, Worker)> {
+    ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
         let end_frame = end_frame.min(meta.frame_count);
@@ -171,10 +191,12 @@ impl DecodeSession {
             // so the caller sees an immediate end of stream rather than an error.
             return Ok((
                 meta,
-                rx,
-                Worker {
-                    cancel,
-                    handle: None,
+                FrameStream {
+                    frames: rx,
+                    worker: Worker {
+                        cancel,
+                        handle: None,
+                    },
                 },
             ));
         }
@@ -210,10 +232,12 @@ impl DecodeSession {
             })?;
         Ok((
             meta,
-            rx,
-            Worker {
-                cancel,
-                handle: Some(handle),
+            FrameStream {
+                frames: rx,
+                worker: Worker {
+                    cancel,
+                    handle: Some(handle),
+                },
             },
         ))
     }
@@ -271,6 +295,48 @@ fn run_hw(
                 return true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
+
+    fn asset(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    }
+
+    /// Dropping a [`FrameStream`] whose frames nobody ever took must not wait.
+    /// The channel is bounded, so such a worker is parked in `send` within a
+    /// few frames, and the only thing that can wake it is its receiver going
+    /// away -- which is why the receiver is the first field and the join inside
+    /// `Worker::drop` is the second. Swap those two fields and this hangs.
+    ///
+    /// This is the whole basis of every teardown path in the engine, so it is
+    /// asserted rather than commented: the drop runs on a second thread and a
+    /// regression fails in ten seconds instead of hanging the suite forever.
+    #[test]
+    fn dropping_a_frame_stream_never_waits_for_an_undrained_channel() {
+        let (_meta, stream) =
+            DecodeSession::open_worker(&asset("test_baseline.mp4"), 0, u32::MAX).expect("open");
+        // Nothing is ever received: two frames fill the channel and the next
+        // send parks the decode thread, exactly as a refused project load does.
+        thread::sleep(Duration::from_millis(500));
+
+        let (done_tx, done_rx) = sync_channel(1);
+        thread::spawn(move || {
+            drop(stream);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)) != Err(RecvTimeoutError::Timeout),
+            "dropping a parked stream deadlocked: it joined a decode thread \
+             while still holding the receiver that thread is waiting on"
+        );
     }
 }
 

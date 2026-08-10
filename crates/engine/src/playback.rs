@@ -122,7 +122,7 @@ impl PlaybackSession {
         let path = path.as_ref().to_path_buf();
         // `open_worker` rather than `open` purely for the worker handle: the
         // field has to exist from the start for the first seek to use it.
-        let (meta, frames, worker) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
+        let (meta, stream) = DecodeSession::open_worker(&path, 0, u32::MAX)?;
         let audio = open_audio(&path);
         let source = match audio {
             Some(_) => ClockSource::Audio,
@@ -134,8 +134,8 @@ impl PlaybackSession {
         let span = project.span_at(Lane::Video, 0).expect("never empty");
         Ok(Self {
             meta,
-            frames,
-            worker,
+            frames: stream.frames,
+            worker: stream.worker,
             retired: Vec::new(),
             clock: PlaybackClock::new(source),
             audio,
@@ -162,13 +162,22 @@ impl PlaybackSession {
     /// The undo history is not saved: `undo` is `false` on a fresh load.
     pub fn open_project(path: &Path) -> crate::Result<Self> {
         let doc = crate::edith::load(path)?;
-        let first = doc.sources.first().ok_or("the project names no sources")?;
+        // Owned: the sources move into the `Project` below, and the device is
+        // opened after that (see the comment there).
+        let first = doc
+            .sources
+            .first()
+            .cloned()
+            .ok_or("the project names no sources")?;
         // Source 0 both scaffolds the session and defines the timeline, so it
         // is opened for playback rather than merely probed.
-        let (meta, frames, worker) = DecodeSession::open_worker(first, 0, u32::MAX)
+        // One value, not two locals: everything below this line can refuse, and
+        // locals drop in reverse declaration order -- a bare worker would join
+        // its decode thread while the receiver next to it was still holding
+        // that thread parked in `send`, which is a hang (see [`FrameStream`]).
+        let (meta, stream) = DecodeSession::open_worker(&first, 0, u32::MAX)
             .map_err(|e| format!("source {}: {e}", first.display()))?;
-        let audio = open_audio(first);
-        let first_audio = AudioSession::probe(first)?;
+        let first_audio = AudioSession::probe(&first)?;
 
         let mut counts = vec![meta.frame_count];
         for source in &doc.sources[1..] {
@@ -193,10 +202,16 @@ impl PlaybackSession {
         let playhead = doc.playhead;
         let project = Project::from_parts(doc.sources, doc.video, doc.audio)?;
         let span = project.span_at(Lane::Video, 0).expect("never empty");
+        // Last, because it is the one thing here that cannot be taken back: the
+        // feeder thread outlives the `Audio` value (it holds its own clones) and
+        // only a session's `drop` retires it, so a refusal above this line would
+        // leave a PipeWire stream and a thread behind for a project that never
+        // opened. Nothing before it needs the device.
+        let audio = open_audio(&first);
         let mut session = Self {
             meta,
-            frames,
-            worker,
+            frames: stream.frames,
+            worker: stream.worker,
             retired: Vec::new(),
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
@@ -318,7 +333,7 @@ impl PlaybackSession {
                 in_frame,
                 in_frame + span.len,
             )
-            .map(|(_, frames, worker)| (frames, worker))
+            .map(|(_, stream)| stream)
             .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
             None => Ok(DecodeSession::open_black(
                 self.meta.width,
@@ -326,12 +341,13 @@ impl PlaybackSession {
                 span.len,
             )),
         };
-        if let Ok((frames, worker)) = opened {
-            // Receiver first, worker second: the drop of the old receiver is
-            // what wakes a worker parked in `send`, and only then can it return
-            // and be reaped by a later sweep.
-            self.frames = frames;
-            self.retire(worker);
+        if let Ok(stream) = opened {
+            // Receiver first, worker second: the drop of the *old* receiver is
+            // what wakes the outgoing worker if it is parked in `send`, and only
+            // then can it return and be reaped by a later sweep. Nothing here
+            // joins, so this ordering costs the seek nothing.
+            self.frames = stream.frames;
+            self.retire(stream.worker);
         }
         self.span = span;
     }
