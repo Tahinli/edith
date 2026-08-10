@@ -495,6 +495,14 @@ impl Player {
     fn act(&mut self, action: ActionId, cx: &mut Context<Self>) {
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
+            ActionId::StepBack => self.step(-1, cx),
+            ActionId::StepForward => self.step(1, cx),
+            // A second is however many frames this timeline runs at.
+            ActionId::JumpBack => self.step(-(self.fps.round() as i64), cx),
+            ActionId::JumpForward => self.step(self.fps.round() as i64, cx),
+            // The ends, as a step nothing can be far enough from.
+            ActionId::GoStart => self.step(i64::MIN, cx),
+            ActionId::GoEnd => self.step(i64::MAX, cx),
             ActionId::Export => self.open_export(cx),
             ActionId::Save => self.save_project(cx),
             ActionId::Copy => self.copy_selected(),
@@ -840,6 +848,27 @@ impl Player {
         session.seek(t);
         self.reset_after_reseek();
         cx.notify();
+    }
+
+    /// The keyboard's seek: whole frames along the timeline, through the same
+    /// door a ruler click uses -- so a step while playing keeps playing, exactly
+    /// as a click does. It starts from the frame the transport is showing, which
+    /// past the end is the last one, and that is what lets a step back off EOS
+    /// revive the picture ([`Player::reset_after_reseek`] clears `done`). Both
+    /// ends clamp, so the two go-to actions are this same step asked for more
+    /// frames than the timeline has. Selection is untouched: a seek is not an
+    /// edit, and nothing it does moves a clip index.
+    fn step(&mut self, frames: i64, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let last = ((session.timeline_duration() * self.fps).round() as i64 - 1).max(0);
+        let now = match self.done {
+            true => last,
+            false => i64::from(frame_at(session.now(), self.fps)),
+        };
+        let target = now.saturating_add(frames).clamp(0, last);
+        self.seek(target as f64 / self.fps, cx);
     }
 
     /// Splits the clip under the playhead. Metadata only: the timeline->source
