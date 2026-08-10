@@ -3,18 +3,20 @@ mod keymap;
 use keymap::{ActionId, Keymap};
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::export::ExportSettings;
+use engine::project::Lane;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, RenderImage,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point,
-    prelude::*, px, relative, rgb, rgba, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div,
+    img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -48,6 +50,25 @@ const HEADER_H: f32 = 32.;
 // off the bottom.
 const PANEL_H: f32 = 220.;
 const LANE_H: f32 = 48.;
+/// The lane header column: wide enough for `V1`/`A1` and fixed, so both lanes
+/// and the ruler above them start at the same pixel and are the same width --
+/// one x-to-time mapping for the whole timeline. `HEADER_GAP` is part of that
+/// offset and is therefore shared by all three rows.
+const HEADER_W: f32 = 40.;
+const HEADER_GAP: f32 = 4.;
+/// The label row inside a clip; a waveform paints under it, never through it.
+const LABEL_H: f32 = 15.;
+/// A clip narrower than this shows no name: two characters and an ellipsis say
+/// nothing that the tint has not already said, and cost the picture a smear.
+const LABEL_MIN_W: f32 = 36.;
+/// Peak buckets per second of source. Fixed and modest on purpose: `peaks`
+/// allocates one bucket per window, so a rate taken from anything the user can
+/// influence is an allocation bomb -- and 40 is already finer than the pixels a
+/// clip is ever given.
+const WAVE_BPS: u32 = 40;
+/// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
+/// and a path with a point per pixel is a path per repaint.
+const WAVE_COL: f32 = 2.;
 /// WCAG 2.5.8: nothing clickable is smaller than this. The scrub bar stays 6 px
 /// to look at -- `RULER_HIT_H` is the strip that has to be hit.
 const HIT_MIN: f32 = 24.;
@@ -155,9 +176,15 @@ struct Player {
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
-    /// Which clip the edit keys act on. Indices move under every edit, so this
-    /// is cleared by all of them.
-    selected: Option<usize>,
+    /// Which clip the edit keys act on: the lane it is in and its index there.
+    /// The *clicked* half, not the group -- a group is what gets marked on
+    /// screen, but Lift has to know which half it was aimed at. Indices move
+    /// under every edit, so this is cleared by all of them.
+    selected: Option<(Lane, usize)>,
+    /// Peaks per source file, taken once and kept. `None` is a source with no
+    /// audio track, which is an answer and not a miss: it must not be asked
+    /// again every repaint.
+    waves: HashMap<PathBuf, Option<Arc<Vec<(f32, f32)>>>>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -321,14 +348,43 @@ impl Player {
         cx.notify();
     }
 
-    /// Drops the selected clip. The engine reseeks itself, so all this owes is
-    /// the flag reset.
+    /// Rejoins whatever meets under the playhead and puts it back in one group
+    /// -- the inverse of [`Player::cut`], and metadata only like it. The engine
+    /// decides what is joinable; a refusal is worded here, because `false` is
+    /// all it says and a key that looks broken is worse than one that explains
+    /// itself.
+    fn regroup(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        if let Some(session) = &mut self.session {
+            if session.regroup_at(session.now()) {
+                self.selected = None;
+            } else {
+                self.notice = Some(
+                    "NOTHING TO REGROUP — put the playhead where two clips meet, on frames that were cut apart"
+                        .into(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drops the selected clip and closes the hole: a whole take goes, both
+    /// lanes of it, and everything after it moves up. A half with no take under
+    /// it in the video lane -- what a lift leaves behind -- has nothing to
+    /// ripple, so that one is lifted instead. The engine reseeks itself, so all
+    /// this owes is the flag reset.
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
         let deleted = match (&mut self.session, self.selected.take()) {
-            (Some(session), Some(i)) => session.delete_clip(i),
+            (Some(session), Some((Lane::Video, idx))) => session.delete_clip(idx),
+            (Some(session), Some((Lane::Audio, idx))) => match video_half(session, idx) {
+                Some(video) => session.delete_clip(video),
+                None => session.lift_clip(Lane::Audio, idx),
+            },
             _ => false,
         };
         if deleted {
@@ -337,12 +393,75 @@ impl Player {
         cx.notify();
     }
 
+    /// Lifts the selected half out and leaves the hole: black picture there if
+    /// it was the video lane, silence if it was the audio one, and nothing else
+    /// moves. What Delete is not.
+    fn lift_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match (&mut self.session, self.selected.take()) {
+            (Some(session), Some((lane, idx))) => {
+                if session.lift_clip(lane, idx) {
+                    self.reset_after_reseek();
+                } else {
+                    self.notice = Some("NOTHING LIFTED — the timeline cannot be emptied".into());
+                }
+            }
+            (Some(_), None) => {
+                self.notice = Some("NOTHING LIFTED — click the half to remove first".into())
+            }
+            (None, _) => {}
+        }
+        cx.notify();
+    }
+
     /// Copies the selected clip. Nothing on screen changes, so no notify.
     fn copy_selected(&mut self) {
         let session = self.session.as_ref();
-        if let Some(clip) = self.selected.and_then(|i| session?.clip_at(i)) {
+        // Out of the lane it was clicked in: the audio half of a group is a
+        // different clip from the video one, and copying the wrong lane's
+        // frames is a paste of the wrong thing.
+        if let Some(clip) = self
+            .selected
+            .and_then(|(lane, idx)| session?.lane_clips(lane).get(idx).copied())
+        {
             self.clipboard = Some(clip);
         }
+    }
+
+    /// Fills the peak cache for every source that has arrived since the last
+    /// repaint. One call from the render rather than three at the doors,
+    /// because argv, an import and a project load are all doors and only this
+    /// one is guaranteed to run after each of them.
+    ///
+    /// ponytail: the decode is synchronous, so the first repaint after a long
+    /// file arrives waits on it -- ~0.3 s for ten minutes at the decoder's
+    /// ~1700x realtime. Upgrade path is `cx.background_executor().spawn` with
+    /// the peaks posted back, the way the file chooser already runs off-thread.
+    fn cache_waves(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let sources: Vec<PathBuf> = session
+            .sources()
+            .iter()
+            .filter(|path| !self.waves.contains_key(*path))
+            .cloned()
+            .collect();
+        for path in sources {
+            let peaks = engine::waveform::peaks(&path, WAVE_BPS)
+                .ok()
+                .flatten()
+                .map(|peaks| Arc::new(normalise(peaks)));
+            self.waves.insert(path, peaks);
+        }
+    }
+
+    /// The group id of the clicked clip, which is what marks the other half.
+    fn selected_link(&self) -> Option<u32> {
+        let (lane, idx) = self.selected?;
+        self.session.as_ref()?.lane_clips(lane).get(idx)?.link
     }
 
     /// Drops the copied clip in at the playhead. The engine reseeks itself, so
@@ -709,6 +828,10 @@ impl Render for Player {
         }
         self.pump(window);
         self.poll_export();
+        // Every way a source can arrive -- argv, an import, a project load --
+        // has been through a repaint by the time its clips are drawn, so this
+        // is the one place that has to notice a new one.
+        self.cache_waves();
         // No shadow flag: the clock is the only truth about play state.
         let playing = self
             .session
@@ -823,7 +946,9 @@ impl Render for Player {
                     Some(ActionId::Copy) => this.copy_selected(),
                     Some(ActionId::Paste) => this.paste(cx),
                     Some(ActionId::Cut) => this.cut(cx),
+                    Some(ActionId::Regroup) => this.regroup(cx),
                     Some(ActionId::Delete) => this.delete_selected(cx),
+                    Some(ActionId::Lift) => this.lift_selected(cx),
                     Some(ActionId::Undo) => this.undo(cx),
                     Some(ActionId::ToggleMute) => {
                         this.set_volume(|volume| volume.muted = !volume.muted, cx)
@@ -1125,43 +1250,54 @@ impl Player {
             // it can be hit without aiming (WCAG 2.5.8).
             .child(
                 div()
-                    .id("ruler")
                     .flex_none()
-                    .h(px(RULER_HIT_H))
                     .flex()
-                    .flex_col()
-                    .justify_center()
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(HOVER_DIM)))
-                    // The strip carries no text, so the tooltip is the only
-                    // place it can say what it is.
-                    .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.scrubbing = true;
-                            this.scrub_to(event.position.x, true, cx);
-                        }),
-                    )
+                    .gap(px(HEADER_GAP))
+                    // The lanes' header column, empty here: the ruler's own bar
+                    // has to start where their beds start, or the playhead
+                    // would point at a different moment in each row.
+                    .child(div().flex_none().w(px(HEADER_W)))
                     .child(
                         div()
-                            .w_full()
-                            .h(px(6.))
+                            .id("ruler")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(RULER_HIT_H))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
                             .rounded(px(3.))
-                            .bg(rgb(SURFACE))
-                            .child(bounds_probe(self.ruler.clone()))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER_DIM)))
+                            // The strip carries no text, so the tooltip is the only
+                            // place it can say what it is.
+                            .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.scrubbing = true;
+                                    this.scrub_to(event.position.x, true, cx);
+                                }),
+                            )
                             .child(
                                 div()
-                                    .h_full()
-                                    .w(relative(filled))
+                                    .w_full()
+                                    .h(px(6.))
                                     .rounded(px(3.))
-                                    .bg(rgb(ACCENT)),
+                                    .bg(rgb(SURFACE))
+                                    .child(bounds_probe(self.ruler.clone()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(filled))
+                                            .rounded(px(3.))
+                                            .bg(rgb(ACCENT)),
+                                    ),
                             ),
                     ),
             )
-            .child(self.clips_lane(duration, cx))
-            .child(track_lane())
+            .child(self.lane_row(Lane::Video, "V1", duration, filled, cx))
+            .child(self.lane_row(Lane::Audio, "A1", duration, filled, cx))
     }
 
     /// A notice holds its own bar, full width, until it is answered: any key
@@ -1442,50 +1578,169 @@ impl Player {
         )
     }
 
-    /// The edit list made visible: one box per clip, sized by its share of the
-    /// timeline. A cut adds a box without moving anything, a delete closes the
-    /// gap. A box has no room for a label at four clips, so the tooltip is where
-    /// it says what clicking it does. Never focusable, so the root keeps focus
-    /// and the play binding still works after a click (ledger:182).
-    fn clips_lane(&self, duration: f64, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One lane of the edit list made visible: a fixed header saying which lane
+    /// it is, then a bed with a box per clip, placed and sized by its share of
+    /// the timeline. A cut adds a box without moving anything, a delete closes
+    /// the hole, a lift leaves one. A clip too narrow for its name says what it
+    /// is by its tint, and the tooltip is where every box says what clicking it
+    /// does. Never focusable, so the root keeps focus and the play binding still
+    /// works after a click (ledger:182).
+    fn lane_row(
+        &self,
+        lane: Lane,
+        name: &'static str,
+        duration: f64,
+        filled: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // The bed's own width, measured last repaint off the ruler's bar: the
+        // two are laid out identically (same header offset, same `flex_1`), so
+        // one probe answers for both. Zero before the first paint, which only
+        // costs the labels one frame.
+        let bed_w = f32::from(self.ruler.get().size.width);
+        let (clips, others) = match &self.session {
+            Some(session) => (
+                session.lane_clips(lane),
+                session.lane_clips(match lane {
+                    Lane::Video => Lane::Audio,
+                    Lane::Audio => Lane::Video,
+                }),
+            ),
+            None => (&[][..], &[][..]),
+        };
+        let sources = self
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        let (sel, sel_link) = (self.selected, self.selected_link());
+        let audio = lane == Lane::Audio;
+        let tip: SharedString = format!(
+            "Select — {} removes the take, {} leaves a gap, {} rejoins a cut",
+            self.keymap.display(ActionId::Delete),
+            self.keymap.display(ActionId::Lift),
+            self.keymap.display(ActionId::Regroup)
+        )
+        .into();
         div()
             .flex_none()
             .h(px(LANE_H))
             .flex()
-            .gap(px(1.))
-            .overflow_hidden()
-            .children(
-                self.session
-                    .as_ref()
-                    .map(PlaybackSession::clip_spans_by_source)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (_, len, source))| {
-                        let selected = self.selected == Some(i);
-                        let tint = source_tint(source);
+            .gap(px(HEADER_GAP))
+            // The fixed column the ruler above is offset by as well. Full lane
+            // height, so it reads as the bed continuing rather than as a chip.
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(HEADER_W))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(rgb(SURFACE))
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_DIM))
+                    .child(name),
+            )
+            .child(
+                // Clips are placed at their own start rather than queued edge
+                // to edge: a lift leaves a hole in the lane, and the bare bed
+                // showing through it *is* how a gap looks.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .rounded(px(3.))
+                    .bg(rgb(LETTERBOX))
+                    .overflow_hidden()
+                    .children(clips.iter().enumerate().map(|(i, clip)| {
+                        let (start, len) = (
+                            f64::from(clip.start) / self.fps,
+                            f64::from(clip.len()) / self.fps,
+                        );
+                        let on = marked((lane, i), clip.link, sel, sel_link);
+                        // A group with a half in the other lane wears its tint;
+                        // one without is outlined, so a detached half is visible
+                        // as detached before anyone clicks it.
+                        let grouped =
+                            clip.link.is_some() && others.iter().any(|o| o.link == clip.link);
+                        let tint = source_tint(clip.source);
+                        let width = width_frac(len, duration);
+                        let label = sources.get(clip.source).map(|path| file_name(path));
+                        let peaks = sources
+                            .get(clip.source)
+                            .and_then(|path| self.waves.get(path))
+                            .cloned()
+                            .flatten();
+                        let tip = tip.clone();
                         div()
-                            .id(("clip", i))
+                            .id((if audio { "aclip" } else { "vclip" }, i))
+                            .absolute()
+                            .top_0()
                             .h_full()
-                            .w(relative(width_frac(len, duration)))
+                            .left(relative(start_frac(start, duration)))
+                            .w(relative(width))
+                            .overflow_hidden()
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(rgb(if selected { ACCENT } else { tint }))
-                            .bg(rgb(if selected { SELECTED } else { tint }))
+                            .border_color(rgb(if on {
+                                ACCENT
+                            } else if grouped {
+                                tint
+                            } else {
+                                INK_DIM
+                            }))
+                            .bg(rgb(if on { SELECTED } else { tint }))
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Tip("Select clip — Delete removes it".into()))
-                                    .into()
-                            })
+                            .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                    this.selected = Some(i);
+                                    this.selected = Some((lane, i));
                                     cx.notify();
                                 }),
                             )
-                    }),
+                            // Under the label row, never through it.
+                            .when_some(peaks.filter(|_| audio), |d, peaks| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top(px(LABEL_H))
+                                        .bottom_0()
+                                        .child(waveform(
+                                            peaks,
+                                            f64::from(clip.in_frame) / self.fps,
+                                            f64::from(clip.out_frame) / self.fps,
+                                        )),
+                                )
+                            })
+                            .when_some(label.filter(|_| show_label(bed_w * width)), |d, label| {
+                                d.child(
+                                    div()
+                                        .relative()
+                                        .h(px(LABEL_H))
+                                        .px(px(4.))
+                                        .truncate()
+                                        .text_size(px(10.))
+                                        .child(label),
+                                )
+                            })
+                    }))
+                    // Last, so it is over the clips: the same fraction in both
+                    // lanes, which is the playhead being one line.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(filled))
+                            .w(px(1.))
+                            .bg(rgb(ACCENT)),
+                    ),
             )
     }
 }
@@ -1698,6 +1953,120 @@ fn width_frac(len: f64, total: f64) -> f32 {
     if total > 0. { (len / total) as f32 } else { 1. }
 }
 
+/// Where along the lane a clip starts, 0..1. Unlike [`width_frac`] a timeline
+/// with no length pins this to the left edge -- a full-width offset would push
+/// the box out of the lane it belongs to.
+fn start_frac(start: f64, total: f64) -> f32 {
+    if total > 0. {
+        (start / total).clamp(0., 1.) as f32
+    } else {
+        0.
+    }
+}
+
+/// The video-lane index of the take an audio clip belongs to, if the video lane
+/// still holds that half. `None` for a half whose picture was lifted -- which is
+/// what makes it a thing of its own to delete.
+fn video_half(session: &PlaybackSession, audio: usize) -> Option<usize> {
+    let link = session.lane_clips(Lane::Audio).get(audio)?.link?;
+    session
+        .lane_clips(Lane::Video)
+        .iter()
+        .position(|clip| clip.link == Some(link))
+}
+
+/// Whether a click marks this clip: the clip that was clicked always, and the
+/// other lane's clip of the same group with it. A clip whose group has no other
+/// half -- what a lift leaves behind -- marks only itself, which is what makes a
+/// detached half separately deletable.
+fn marked(
+    here: (Lane, usize),
+    link: Option<u32>,
+    sel: Option<(Lane, usize)>,
+    sel_link: Option<u32>,
+) -> bool {
+    sel == Some(here) || (link.is_some() && link == sel_link)
+}
+
+/// Whether a clip is wide enough to be worth naming.
+fn show_label(w: f32) -> bool {
+    w >= LABEL_MIN_W
+}
+
+/// Scales an envelope to its own loudest sample, so a quietly mastered source
+/// still draws as a shape. The fixtures peak around an eighth of full scale, and
+/// an eighth of a 30 px lane is a flat line -- which says "silent" about a file
+/// that is not.
+fn normalise(mut peaks: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    let loudest = peaks.iter().fold(0f32, |m, &(lo, hi)| m.max(-lo).max(hi));
+    if loudest > 0. {
+        for (lo, hi) in &mut peaks {
+            *lo /= loudest;
+            *hi /= loudest;
+        }
+    }
+    peaks
+}
+
+/// The min/max envelope of `peaks` over the source seconds `from..to`, as
+/// `(x, top, bottom)` columns of a `w` x `h` box. Every point is inside that box
+/// -- a clip's waveform cannot paint over its neighbour -- and every column is
+/// at least a pixel tall, so silence reads as a line through the middle rather
+/// than as a polygon with no area.
+fn envelope(peaks: &[(f32, f32)], from: f64, to: f64, w: f32, h: f32) -> Vec<(f32, f32, f32)> {
+    if peaks.is_empty() || w <= 0. || h <= 0. {
+        return Vec::new();
+    }
+    let cols = (w / WAVE_COL).ceil().max(1.) as usize;
+    let mid = h / 2.;
+    (0..=cols)
+        .map(|col| {
+            let along = col as f64 / cols as f64;
+            let at = from + (to - from) * along;
+            // Casting a float to an integer saturates in Rust, so a source
+            // second past the end of the peaks clamps rather than wrapping.
+            let bucket = ((at * f64::from(WAVE_BPS)) as usize).min(peaks.len() - 1);
+            let (lo, hi) = peaks[bucket];
+            let top = (mid - hi.clamp(0., 1.) * mid).min(mid - 0.5);
+            let bottom = (mid - lo.clamp(-1., 0.) * mid).max(mid + 0.5);
+            (w * along as f32, top.max(0.), bottom.min(h))
+        })
+        .collect()
+}
+
+/// One clip's audio, drawn as a filled min/max envelope inside whatever box it
+/// is given. Peaks are the source's whole envelope; `from`/`to` are the source
+/// seconds this clip plays, so a cut clip shows its own stretch of the file.
+fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let cols = envelope(&peaks, from, to, f32::from(s.width), f32::from(s.height));
+            if cols.len() < 2 {
+                return;
+            }
+            // Down the tops and back along the bottoms: one closed outline of
+            // the whole envelope, which is one path rather than a path a column.
+            let mut points: Vec<Point<Pixels>> = cols
+                .iter()
+                .map(|&(x, top, _)| point(o.x + px(x), o.y + px(top)))
+                .collect();
+            points.extend(
+                cols.iter()
+                    .rev()
+                    .map(|&(x, _, bottom)| point(o.x + px(x), o.y + px(bottom))),
+            );
+            let mut path = PathBuilder::fill();
+            path.add_polygon(&points, true);
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(INK_DIM));
+            }
+        },
+    )
+    .size_full()
+}
+
 /// A toolbar button: its glyph, its name, and its key on hover. `id` only buys
 /// `on_click` and the tooltip -- it is still not focusable, so the root's own
 /// key listener keeps working after a press, and the click lands on mouse-up
@@ -1835,15 +2204,6 @@ fn empty_hint() -> impl IntoElement {
         )
 }
 
-/// The second lane: still a placeholder, deliberately empty.
-fn track_lane() -> impl IntoElement {
-    div()
-        .flex_none()
-        .h(px(LANE_H))
-        .rounded(px(3.))
-        .bg(rgb(SURFACE))
-}
-
 /// Two bars while playing, a triangle while paused. Drawn, so there is no icon
 /// font and no glyph coverage to depend on.
 fn transport_glyph(playing: bool) -> impl IntoElement {
@@ -1895,9 +2255,11 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LANE_H, Quality, RULER_HIT_H,
-        SOURCE_TINTS, SURFACE, Volume, cancels_export, export_path, export_settings, frac_along,
-        is_bare_modifier, is_project, keymap, project_path, push_digit, scrub_due, source_tint,
+        ACCENT, CONTROL_H, HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H,
+        KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX, Lane, PANEL_H, Quality, RULER_HIT_H,
+        SELECTED, SOURCE_TINTS, SURFACE, Volume, WAVE_BPS, WAVE_COL, cancels_export, envelope,
+        export_path, export_settings, frac_along, is_bare_modifier, is_project, keymap, marked,
+        normalise, project_path, push_digit, scrub_due, show_label, source_tint, start_frac,
         timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
@@ -2187,6 +2549,181 @@ mod tests {
         assert!(LANE_H >= HIT_MIN);
     }
 
+    /// WCAG 2.1 relative luminance of a packed `0xRRGGBB`.
+    fn luminance(colour: u32) -> f64 {
+        let channel = |shift: u32| {
+            let s = f64::from((colour >> shift) & 0xff) / 255.;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    /// WCAG 2.1 contrast ratio, 1..=21.
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
+        // The header column is what the ruler is offset by as well, so both
+        // numbers are shared rather than repeated per row (A-MUST1/A-MUST2).
+        assert!(HEADER_W > 0. && HEADER_GAP >= 0.);
+        // Two lanes, a ruler, a button row and the timecode line, inside the
+        // panel the window is sized for.
+        assert!(
+            CONTROL_H + RULER_HIT_H + 2. * LANE_H + 17. + 4. * 8. + 16. <= PANEL_H,
+            "the second lane does not fit the panel"
+        );
+        // Headers and clip boxes are as tall as the lane, and the lane is a
+        // click target (WCAG 2.5.8).
+        assert!(LANE_H >= HIT_MIN);
+        // A label row that ate the whole lane would leave no waveform.
+        assert!(LABEL_H < LANE_H / 2.);
+    }
+
+    #[test]
+    fn a_click_marks_the_whole_group_and_nothing_else() {
+        let (v, a) = ((Lane::Video, 0), (Lane::Audio, 0));
+        // Clicking the video half of group 1 marks the audio half with it.
+        assert!(marked(v, Some(1), Some(v), Some(1)));
+        assert!(marked(a, Some(1), Some(v), Some(1)));
+        // Another group's clips stay unmarked, in either lane.
+        assert!(!marked((Lane::Video, 1), Some(2), Some(v), Some(1)));
+        assert!(!marked((Lane::Audio, 1), Some(2), Some(v), Some(1)));
+        // A half a lift left behind has no group: it marks itself only, which
+        // is what makes it separately deletable. Two ungrouped clips must not
+        // mark each other by both being ungrouped.
+        assert!(marked(a, None, Some(a), None));
+        assert!(!marked(v, None, Some(a), None));
+        // Nothing selected marks nothing.
+        assert!(!marked(v, Some(1), None, None));
+    }
+
+    #[test]
+    fn a_name_is_dropped_rather_than_smeared_across_a_thin_clip() {
+        assert!(show_label(LABEL_MIN_W));
+        assert!(show_label(400.));
+        assert!(!show_label(LABEL_MIN_W - 0.1));
+        // A timeline with no length must not put a box outside its lane.
+        assert_eq!(start_frac(3., 0.), 0.);
+        assert_eq!(start_frac(1., 4.), 0.25);
+        // Past the end clamps rather than running off the bed.
+        assert_eq!(start_frac(8., 4.), 1.);
+    }
+
+    #[test]
+    fn an_envelope_stays_inside_the_box_it_is_drawn_in() {
+        // A ramp: silence at the start, full scale at the end.
+        let peaks: Vec<(f32, f32)> = (0..40)
+            .map(|i| (-(i as f32) / 39., i as f32 / 39.))
+            .collect();
+        let (w, h) = (100., 30.);
+        let cols = envelope(&peaks, 0., 1., w, h);
+        assert_eq!(cols.len(), (w / WAVE_COL) as usize + 1);
+        for &(x, top, bottom) in &cols {
+            assert!((0. ..=w).contains(&x), "x {x} outside 0..{w}");
+            assert!((0. ..=h).contains(&top), "top {top} outside 0..{h}");
+            assert!(
+                (0. ..=h).contains(&bottom),
+                "bottom {bottom} outside 0..{h}"
+            );
+            // Never inverted, and never a polygon with no area: silence has to
+            // read as a line rather than as nothing at all.
+            assert!(
+                bottom - top >= 1.,
+                "column {top}..{bottom} is thinner than a pixel"
+            );
+        }
+        // The ramp is drawn as a ramp: the last column is taller than the first.
+        let height = |&(_, top, bottom): &(f32, f32, f32)| bottom - top;
+        assert!(height(cols.last().unwrap()) > height(cols.first().unwrap()) + 5.);
+        // Degenerate inputs draw nothing rather than panicking.
+        assert!(envelope(&[], 0., 1., w, h).is_empty());
+        assert!(envelope(&peaks, 0., 1., 0., h).is_empty());
+        // A clip whose range runs past the peaks clamps to the last bucket.
+        assert!(!envelope(&peaks, 0., 99., w, h).is_empty());
+    }
+
+    #[test]
+    fn a_quiet_source_still_draws_as_a_shape() {
+        // An eighth of full scale, which is about where the fixtures sit.
+        let quiet: Vec<(f32, f32)> = vec![(-0.125, 0.125), (-0.0625, 0.0625)];
+        let loud = normalise(quiet.clone());
+        assert_eq!(loud[0], (-1., 1.));
+        assert_eq!(loud[1], (-0.5, 0.5));
+        // Digital silence has no loudest sample to scale to; it must not divide
+        // by zero and must stay flat.
+        assert_eq!(normalise(vec![(0., 0.)]), vec![(0., 0.)]);
+        assert!(normalise(Vec::new()).is_empty());
+    }
+
+    /// The whole waveform path, from the file on disk to the columns that get
+    /// painted: what no screenshot can assert about the shape.
+    #[test]
+    fn the_fixtures_waveform_reaches_the_lane_as_a_shape() {
+        let asset = |name: &str| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets")
+                .join(name)
+        };
+        let peaks = normalise(
+            engine::waveform::peaks(asset("test_av.mp4"), WAVE_BPS)
+                .expect("open the fixture")
+                .expect("test_av.mp4 has audio"),
+        );
+        // 5 s of source at the rate the lane asks for.
+        assert!(peaks.len().abs_diff(5 * WAVE_BPS as usize) <= WAVE_BPS as usize);
+        let cols = envelope(&peaks, 0., 5., 600., 30.);
+        let height = |&(_, top, bottom): &(f32, f32, f32)| bottom - top;
+        let tallest = cols.iter().map(height).fold(0., f32::max);
+        let flattest = cols.iter().map(height).fold(f32::MAX, f32::min);
+        // The fixture's 1 Hz pulse: a full-scale peak and a near-silent dip in
+        // every second, so the drawn envelope is a shape and not a bar.
+        assert!(tallest > 25., "loudest column only {tallest} px of 30");
+        assert!(
+            flattest < 8.,
+            "quietest column {flattest} px -- no dips drawn"
+        );
+        // A video-only source draws no waveform at all rather than a flat fake.
+        assert!(
+            engine::waveform::peaks(asset("test_baseline.mp4"), WAVE_BPS)
+                .expect("open the fixture")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_mark_on_a_clip_is_legible_on_it() {
+        for (i, tint) in SOURCE_TINTS.iter().enumerate() {
+            // WCAG 1.4.3: the clip's name is body text on its tint.
+            assert!(
+                contrast(INK, *tint) >= 4.5,
+                "source {i}: label contrast {:.2}",
+                contrast(INK, *tint)
+            );
+            // WCAG 1.4.11: the waveform is a non-text graphic on it.
+            assert!(
+                contrast(INK_DIM, *tint) >= 3.,
+                "source {i}: waveform contrast {:.2}",
+                contrast(INK_DIM, *tint)
+            );
+        }
+        // A selected clip's bed is the same two marks on a different colour.
+        assert!(contrast(INK, SELECTED) >= 4.5);
+        assert!(contrast(INK_DIM, SELECTED) >= 3.);
+        // The bed a gap shows through has to read as a hole in the lane, and
+        // the accent playhead has to be findable on it.
+        assert!(contrast(LETTERBOX, SURFACE) >= 1.5);
+        assert!(contrast(ACCENT, LETTERBOX) >= 3.);
+        // The sanity check on the ratio itself: black on white is 21:1.
+        assert!((contrast(0xffffff, 0x000000) - 21.).abs() < 0.01);
+    }
+
     #[test]
     fn source_tints_differ_per_source_and_cycle() {
         // The file the session opened with is the unchanged lane colour.
@@ -2312,6 +2849,7 @@ fn main() {
                     done: false,
                     ruler: Rc::default(),
                     selected: None,
+                    waves: HashMap::new(),
                     clipboard: None,
                     scrubbing: false,
                     last_scrub: Instant::now(),

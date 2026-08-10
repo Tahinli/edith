@@ -44,7 +44,9 @@ pub enum ActionId {
     Copy,
     Paste,
     Cut,
+    Regroup,
     Delete,
+    Lift,
     Undo,
     ToggleMute,
     VolumeUp,
@@ -55,14 +57,16 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 12] = [
+    pub const ALL: [ActionId; 14] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
         ActionId::Copy,
         ActionId::Paste,
         ActionId::Cut,
+        ActionId::Regroup,
         ActionId::Delete,
+        ActionId::Lift,
         ActionId::Undo,
         ActionId::ToggleMute,
         ActionId::VolumeUp,
@@ -79,7 +83,9 @@ impl ActionId {
             ActionId::Copy => "Copy",
             ActionId::Paste => "Paste",
             ActionId::Cut => "Cut",
+            ActionId::Regroup => "Regroup",
             ActionId::Delete => "Delete",
+            ActionId::Lift => "Lift (leave a gap)",
             ActionId::Undo => "Undo",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
@@ -98,7 +104,9 @@ impl ActionId {
             ActionId::Copy => "copy",
             ActionId::Paste => "paste",
             ActionId::Cut => "cut",
+            ActionId::Regroup => "regroup",
             ActionId::Delete => "delete",
+            ActionId::Lift => "lift",
             ActionId::Undo => "undo",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
@@ -207,8 +215,12 @@ impl Keymap {
                 b(ActionId::Copy, "c", true),
                 b(ActionId::Paste, "v", true),
                 b(ActionId::Cut, "c", false),
+                // The two lane keys, on the letters they are named after: both
+                // were free, and neither is next to a key that edits.
+                b(ActionId::Regroup, "g", false),
                 b(ActionId::Delete, "x", false),
                 b(ActionId::Delete, "delete", false),
+                b(ActionId::Lift, "l", false),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
                 b(ActionId::ToggleMute, "m", false),
@@ -443,15 +455,17 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 14);
+        assert_eq!(k.entries().len(), 16);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
         assert_eq!(k.lookup("c", true), Some(ActionId::Copy));
         assert_eq!(k.lookup("v", true), Some(ActionId::Paste));
         assert_eq!(k.lookup("c", false), Some(ActionId::Cut));
+        assert_eq!(k.lookup("g", false), Some(ActionId::Regroup));
         assert_eq!(k.lookup("x", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
+        assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
@@ -588,7 +602,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 12);
+        assert_eq!(ActionId::ALL.len(), 14);
     }
 
     #[test]
