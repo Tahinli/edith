@@ -24,7 +24,7 @@ use crate::audio::AudioSession;
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
-use crate::project::Project;
+use crate::project::{Lane, Project};
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -169,18 +169,31 @@ fn run(
     let mut encoder = Enc::open(meta, settings)?;
     let mut muxer = None;
     let mut done = 0u32;
-    for clip in project.clips() {
+    let black = Black::new(meta);
+    // Spans, not clips: a gap in the video lane is part of the timeline and
+    // gets encoded too, as black frames. The picture count is therefore
+    // `timeline_frames` however the lane is arranged.
+    for span in project.spans_from(Lane::Video, 0) {
         // Every clip reopens its own source file at its own in point; the
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
-        let source = sources
-            .get(clip.source)
-            .ok_or_else(|| format!("clip names source {} of {}", clip.source, sources.len()))?;
-        let mut pictures = ClipDecoder::open(source, clip.in_frame)?;
-        for _ in 0..clip.len() {
+        let mut pictures = match span.from {
+            Some((source, in_frame)) => {
+                let path = sources
+                    .get(source)
+                    .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
+                Some(ClipDecoder::open(path, in_frame)?)
+            }
+            None => None,
+        };
+        for _ in 0..span.len {
             cancelled(shared)?;
-            let Some((y, u, v, width, height)) = pictures.next()? else {
+            let picture = match &mut pictures {
+                Some(pictures) => pictures.next()?,
+                None => Some(black.picture()),
+            };
+            let Some((y, u, v, width, height)) = picture else {
                 break; // source ran out early; the clip list outlives the file
             };
             if let Some(au) = encoder.encode(y, u, v, width, height)? {
@@ -204,13 +217,40 @@ fn run(
     };
     if let Some((_, packets)) = audio {
         for packet in packets {
-            muxer.write_audio_packet(&packet.bytes)?;
+            muxer.write_audio_packet(&packet.bytes, packet.samples)?;
         }
     }
     cancelled(shared)?;
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
+}
+
+/// The I420 planes of one black picture, allocated once for a whole export: a
+/// gap in the video lane is encoded, not skipped, or every frame after it would
+/// arrive early. Limited-range black is `Y=16, U=V=128`, the same convention
+/// [`crate::convert`] decodes with.
+struct Black {
+    y: Vec<u8>,
+    uv: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Black {
+    fn new(meta: &VideoMeta) -> Self {
+        let (w, h) = (meta.width as usize, meta.height as usize);
+        Self {
+            y: vec![16; w * h],
+            uv: vec![128; w.div_ceil(2) * h.div_ceil(2)],
+            width: meta.width,
+            height: meta.height,
+        }
+    }
+
+    fn picture(&self) -> (&[u8], &[u8], &[u8], u32, u32) {
+        (&self.y, &self.uv, &self.uv, self.width, self.height)
+    }
 }
 
 /// `Err` once a cancel has been asked for. Called at every point where the work
