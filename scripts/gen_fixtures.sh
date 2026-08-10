@@ -48,6 +48,13 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a ac3 -b:a 192k assets/test_ac3.mp4
+# The shape a BluRay remux has: 48 kHz 5.1 AC-3, which the decoder downmixes to
+# stereo for the timeline. The mono fixture above is the other end of the same
+# path — no downmix at all — and both have to work.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -ac 6 -c:a ac3 -b:a 448k assets/test_ac3_51.mp4
 # Multi-language fixture: the shape real media has — one video and two AAC
 # streams that *agree* on rate and layout (44.1k stereo) and differ only in
 # language and content, 440/880 Hz undefined and 220/330 Hz French. One
