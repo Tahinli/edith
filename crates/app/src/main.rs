@@ -1548,6 +1548,11 @@ impl Player {
         match session.cut_regions(&regions, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Every hole closed moves the clips after it up a place, so the
+                // selection now names a different clip than the one that is
+                // highlighted -- dropped here as after every other edit that
+                // moves indexes (a delete, a paste, an undo).
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -1582,6 +1587,10 @@ impl Player {
         match session.speed_regions(&regions, rate, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Splitting each silence out and closing the room it no longer
+                // needs moves indexes exactly as the cut does: the selection
+                // goes with them.
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -2332,26 +2341,107 @@ impl Player {
             .as_mut()
             .map(|session| session.remove_source(path, stream));
         let text = match removed {
-            Some(Ok(())) => {
+            Some(Ok(idx)) => {
                 // The picked row may be the one that just went, and the engine
                 // reseeks, so this owes the flag reset like every other edit.
                 if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
                     self.selected_asset = None;
                 }
+                // A copied clip names its source by *index*, and every index
+                // past the one that went has just moved down: without this the
+                // next paste puts some other file on the timeline.
+                self.clipboard = clipboard_after_remove(self.clipboard, idx);
                 self.reset_after_reseek();
-                // The undo stack goes with it (`Project::remove_source`): said
-                // here, because a `z` that does nothing afterwards would
-                // otherwise read as a bug.
-                format!(
-                    "REMOVED {} — there is nothing left to undo",
-                    file_name(path)
-                )
+                // The last row leaves a session naming no file: nothing to
+                // play, nothing to save and nothing to show, which is the empty
+                // window the editor launches as. The next import scaffolds a
+                // fresh timeline from whatever file it is, at that file's own
+                // rate -- which is why the session goes rather than lingering
+                // on with the gone file's parameters.
+                match self
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.sources().is_empty())
+                {
+                    true => {
+                        self.close_session();
+                        format!(
+                            "REMOVED {} — the library is empty; import a file to start again",
+                            file_name(path)
+                        )
+                    }
+                    // The undo stack goes with it (`Project::remove_source`):
+                    // said here, because a `z` that does nothing afterwards
+                    // would otherwise read as a bug.
+                    false => format!(
+                        "REMOVED {} — there is nothing left to undo",
+                        file_name(path)
+                    ),
+                }
             }
             Some(Err(e)) => format!("NOT REMOVED — {e}"),
             None => "NO TIMELINE — open a file first".to_string(),
         };
         self.notice = Some(text.into());
         cx.notify();
+    }
+
+    /// Back to the window the editor launches as: no timeline, no library, no
+    /// picture -- and the hint that says to open a file. What removing the last
+    /// library row leaves, since a session whose library is empty has nothing
+    /// left to be ([`Player::remove_source`]).
+    ///
+    /// Everything a *loaded project* resets goes here for its reasons (an index
+    /// into a timeline that is gone names nothing), plus the three per-file
+    /// caches: they are keyed by path, and the next file to arrive fills them
+    /// again.
+    fn close_session(&mut self) {
+        self.session = None;
+        // The picture goes with it, or the empty window would keep showing the
+        // last frame of a timeline that no longer exists.
+        //
+        // ponytail: its atlas tile is not released -- `window.drop_image` wants
+        // a `&mut Window` this door has no other reason to take. One tile per
+        // emptied library, against one per displayed frame in `pump`; the
+        // upgrade path is threading the window through `act_on_row`.
+        self.image = None;
+        self.clipboard = None;
+        self.selected = None;
+        self.selected_asset = None;
+        self.context_menu = None;
+        self.library_menu = None;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.close_silence();
+        self.waves.clear();
+        self.streams.clear();
+        self.sizes.clear();
+        // Scanned off a source that is not in the library any more.
+        self.silence_levels = None;
+        // Every gesture in flight, dropped for `reset_after_reseek`'s reason
+        // (it drops the trim below): a drag holds a bar, a clip or a band of a
+        // timeline that has just stopped existing.
+        self.scrubbing = false;
+        self.volume_dragging = false;
+        self.eq_dragging = false;
+        self.speed_dragging = false;
+        self.color_dragging = false;
+        self.displayed = 0;
+        self.dropped = 0;
+        self.started = None;
+        // The empty window's own: no name in the titlebar, nowhere chosen to
+        // export or save to yet, and a rate that only keeps the timecode
+        // reading in frames until a file brings its own (`main`).
+        self.name = NO_FILE.into();
+        self.export_path = PathBuf::new();
+        self.project_path = PathBuf::new();
+        self.fps = 30.;
+        // No decoder to wait for a frame from: the hint is what shows.
+        self.reset_after_reseek();
+        self.pending_seek = false;
+        self.eos = false;
+        self.done = false;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -2387,11 +2477,22 @@ impl Player {
         cx.notify();
     }
 
-    /// The rate and layout the whole timeline's audio is, taken from source 0's
-    /// own stream: what a library row has to match to be placeable. `None`
-    /// until that file has been probed, and then nothing is greyed for it.
+    /// The rate and layout the whole timeline's audio is, taken from the stream
+    /// of the first source that could have one: what a library row has to match
+    /// to be placeable. `None` until that file has been probed, and then nothing
+    /// is greyed for it.
+    ///
+    /// The first source that is *not a still*, which is the rule the engine
+    /// holds every import to (`playback::audio_source_of`) -- a picture at the
+    /// head of the list (a removal moves indexes) has no stream to describe
+    /// anything with.
     fn timeline_audio(&self) -> Option<(u32, u16)> {
-        let first = self.session.as_ref()?.sources().first()?;
+        let first = self
+            .session
+            .as_ref()?
+            .sources()
+            .iter()
+            .find(|s| !engine::is_image(&s.path))?;
         let info = self
             .streams
             .get(&first.path)?
@@ -6301,6 +6402,28 @@ fn can_add(picked: Option<&(PathBuf, usize)>, timeline: bool, exporting: bool) -
     picked.is_some() && timeline && !exporting
 }
 
+/// What is left on the clipboard after the library row at `removed` was taken
+/// out. A copied clip names its file by *index* into the source list
+/// (`engine::Clip::source`) and a removal renumbers that list
+/// (`engine::Project::remove_source`), so a clipboard kept as it was would paste
+/// **a different file** -- the next one along -- over the range it was copied
+/// from.
+///
+/// The clip's own file gone means there is nothing to paste: `None`, and the
+/// next paste says the clipboard is empty rather than putting some other take
+/// down. Every index past it moves down by one, exactly as the lanes' clips do.
+fn clipboard_after_remove(clip: Option<Clip>, removed: usize) -> Option<Clip> {
+    let mut clip = clip?;
+    match clip.source.cmp(&removed) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            clip.source -= 1;
+            Some(clip)
+        }
+        std::cmp::Ordering::Less => Some(clip),
+    }
+}
+
 /// One library row: a file and one of its audio streams. Plain data, planned
 /// before anything is drawn -- which rows exist at all is the branchy part.
 #[derive(Debug, PartialEq)]
@@ -7715,12 +7838,12 @@ mod tests {
         MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H,
         SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
         Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label,
-        can_add, cancels_export, color_snap, envelope, eq_spectrum, eq_x, eq_y, export_path,
-        export_settings, format_key, format_line, format_refusal, frac_along, frac_down, frame_at,
-        histogram, is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at, normalise,
-        nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        silence_rate, source_tint, span_partner, speed_at, timecode, unseen_paths, unseen_sources,
-        whole_take, width_frac, window_title,
+        can_add, cancels_export, clipboard_after_remove, color_snap, envelope, eq_spectrum, eq_x,
+        eq_y, export_path, export_settings, format_key, format_line, format_refusal, frac_along,
+        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
+        menu_at, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
+        scrub_due, show_label, silence_rate, source_tint, span_partner, speed_at, timecode,
+        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{
         LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
@@ -8400,15 +8523,69 @@ mod tests {
             .expect("nothing plays av2 any more");
         assert_eq!(rows(&session), 1, "the row went with it");
         assert_eq!(session.sources().len(), 1);
-        // The one file left cannot go: a project that names none is not one
-        // that reopens.
+        // The one file left is held to the same rule and no other: its own take
+        // is still on the lanes, so it stays...
+        let first = session.sources()[0].path.clone();
         let refusal = session
-            .remove_source(&session.sources()[0].path.clone(), 0)
-            .expect_err("the last file stays")
+            .remove_source(&first, 0)
+            .expect_err("its take is still on the timeline")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
+        assert!(refusal.contains("still plays"), "{refusal}");
+        // ...and once nothing plays it, the *last* row goes too. What is left
+        // is the empty library `Player::close_session` turns back into the
+        // window the editor launches as -- the user-reported bug was that this
+        // very removal was refused, leaving a row that could never be taken
+        // out.
+        assert!(session.delete_clip(Lane::V1, 0));
+        session
+            .remove_source(&first, 0)
+            .expect("the only row goes like any other");
+        assert_eq!(rows(&session), 0, "an empty library");
+        assert!(session.sources().is_empty());
+        // And it is still a session: silent, empty, and asked for its length
+        // rather than panicking on a source list that is not there.
+        assert_eq!(session.timeline_duration(), 0.0);
+        assert!(
+            session.save_project(&asset("nothing.edith")).is_err(),
+            "a project naming no file could never be opened again, so it is not written"
+        );
         // A row this timeline never had is refused, not panicked on.
         assert!(session.remove_source(&second, 0).is_err());
+    }
+
+    /// The clipboard after a library removal. A copied clip names its file by
+    /// index and a removal renumbers the list, so this is the difference
+    /// between pasting the take that was copied and pasting **another file**
+    /// over the same range ([`clipboard_after_remove`], called by
+    /// [`Player::remove_source`]).
+    #[test]
+    fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
+        let clip = |source: usize| Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: 30,
+            source,
+            link: None,
+            eq: None,
+            color: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        // Copied from source 2, source 0 removed: the same file is source 1 now.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(2)), 0).map(|c| c.source),
+            Some(1),
+            "the clipboard follows its file down the list"
+        );
+        // Copied from a source *before* the one that went: untouched.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(0)), 2).map(|c| c.source),
+            Some(0)
+        );
+        // Copied from the row that was just removed: there is nothing left to
+        // paste, and pasting the next file along would be a lie.
+        assert!(clipboard_after_remove(Some(clip(1)), 1).is_none());
+        assert!(clipboard_after_remove(None, 0).is_none());
     }
 
     /// The trim-a-clip path through the doors the edge drag uses:
