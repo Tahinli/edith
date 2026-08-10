@@ -9,6 +9,16 @@
 //! everything: the caller gets an [`ExportHandle`] and polls it from its render
 //! loop.
 //!
+//! A **speeded** clip splits along the same line, and for the same reason. The
+//! picture is re-encoded, so the frame walk honours a rate: it takes the source
+//! frame each timeline frame shows ([`crate::project::Speed::source_at`], the
+//! very frame preview holds there) and encodes a held one again rather than
+//! decoding it twice. The sound is *copied*, and a packet carries no rate -- so
+//! a speeded clip on the one audio lane an mp4 copies is refused by name
+//! ([`copy_audio`]) rather than written out at 1.00x under a re-timed picture.
+//! AV1 carries no audio at all and never meets that refusal; WAV and FLAC are
+//! decoded and resampled, so they honour a rate like the picture does.
+//!
 //! Nothing partial survives a failure: the worker writes to `<out>.part` and
 //! renames it onto `out` only once the file is closed and complete, so the
 //! output either does not exist or is finished — there is no window where a
@@ -295,6 +305,32 @@ fn copy_audio(
     // where it sits on the timeline, because "some clip" is not a thing a user
     // can go and fix.
     let lane = project.audio_lanes()[0];
+    // ...and the same list decides whether any clip this would copy plays at a
+    // rate other than the one it was recorded at. A copy hands the mp4 the very
+    // AAC packets the source holds and there is no rate inside a packet to
+    // change: the picture would come out re-timed (the walk in [`run`] honours
+    // it) over sound at 1.00x, which is the drift a person finds only after the
+    // file has gone somewhere. Refused by name, exactly as the equalizer below
+    // is -- and only *here*, on the lane being copied: AV1 carries no audio at
+    // all and never reaches this, so it honours a speed like WAV and FLAC do.
+    //
+    // ponytail: the ceiling is the packet copy itself, not the rate. Upgrade
+    // path is the same one the equalizer below wants -- an AAC encoder (or a
+    // decode-and-re-encode of this lane) -- at which point the resample the WAV
+    // path already runs feeds it and this refusal goes.
+    if let Some((at, speed)) = project
+        .lane(lane)
+        .iter()
+        .find(|c| !c.speed.is_normal())
+        .map(|c| (c.start, c.speed))
+    {
+        return Err(format!(
+            "the clip at {} plays at {speed} and an mp4 export copies AAC packets, which carry \
+             no rate: export WAV or FLAC, which are decoded and resampled, or set it back to 1.00x",
+            timecode(at, meta.frame_rate)
+        )
+        .into());
+    }
     if let Some((at, _)) = project
         .lane(lane)
         .iter()
@@ -317,42 +353,6 @@ fn copy_audio(
     AudioSession::copy_multi_streams(&project.audio_sources(), segments)
 }
 
-/// The picture formats' answer to a speeded clip: **refused, by name**.
-///
-/// A clip at another rate is a clip whose pictures have to be picked out of its
-/// source at that rate and whose sound has to be resampled. The sound alone
-/// settles it here: this path *copies* AAC packets ([`copy_audio`]) and a
-/// resample is not a copy -- exporting it anyway would write the picture at one
-/// speed and the sound at another, which is the one failure a user would not
-/// notice until the file was somewhere else. So the whole export is refused
-/// rather than half-honoured, and the refusal says which clip and what to do:
-/// WAV and FLAC are decoded and mixed, and they honour it.
-///
-/// AV1 carries no sound at all and could honour the picture on its own, and is
-/// refused with the rest: a video export that silently dropped the rate on one
-/// format and kept it on another would be worse than one rule.
-///
-/// ponytail: the ceiling is the packet copy and the frame walk in [`run`], which
-/// steps its decoder once per output picture. Upgrade path is a `skip(n)` on
-/// [`ClipDecoder`] for a rate above real time, a held picture below it, and an
-/// AAC encoder (or a decode-and-re-encode) for the sound -- at which point this
-/// check becomes the `Format::Av1` arm alone.
-fn speeds_refused(project: &Project, meta: &VideoMeta) -> crate::Result<()> {
-    for lane in project.lanes() {
-        if let Some(clip) = project.lane(lane).iter().find(|c| !c.speed.is_normal()) {
-            return Err(format!(
-                "the {} clip at {} plays at {} and a picture export cannot re-time it: \
-                 export WAV or FLAC, which are resampled, or set that clip back to 1.00x",
-                lane.label(),
-                timecode(clip.start, meta.frame_rate),
-                clip.speed
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
 fn run(
     project: &Project,
     meta: &VideoMeta,
@@ -361,7 +361,6 @@ fn run(
     settings: &ExportSettings,
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
-    speeds_refused(project, meta)?;
     let sources = project.sources();
     // Audio first: a track has to be declared when the muxer is created, which
     // happens as soon as the first coded picture arrives. None of it for AV1 --
@@ -418,10 +417,37 @@ fn run(
             meta.height,
             project.composite_fit_at(span.start),
         );
-        for _ in 0..span.len {
+        // Timeline frames, taken a *source* frame at a time: at a rate other
+        // than real time the two are not the same count, and the span says which
+        // source frame each timeline frame shows ([`Speed::source_at`]) -- the
+        // very frame playback is holding there, because the two conversions are
+        // one floor/ceil pair (`speed_maps_both_ways`). A speed-up decodes the
+        // frames it skips and drops them, because the pictures after them
+        // reference those; a slow-down encodes the picture it is holding again
+        // rather than decoding it twice. At real time `repeats` is 1 and `want`
+        // advances by one, which is the loop this always ran.
+        let mut done_here = 0u32;
+        // Source frames already taken out of this span's decoder.
+        let mut taken = 0u32;
+        while done_here < span.len {
             cancelled(shared)?;
+            let want = span.speed.source_at(done_here);
+            let repeats = span.speed.repeats(done_here, span.len);
             let picture = match &mut pictures {
-                Some(pictures) => pictures.next()?,
+                Some(pictures) => {
+                    let mut ran_out = false;
+                    while taken < want && !ran_out {
+                        ran_out = pictures.next()?.is_none();
+                        taken += 1;
+                    }
+                    match ran_out {
+                        true => None,
+                        false => {
+                            taken += 1;
+                            pictures.next()?
+                        }
+                    }
+                }
                 None => Some(black.picture()),
             };
             let Some((y, u, v, width, height)) = picture else {
@@ -448,21 +474,27 @@ fn run(
             // Grade first, place second: the grade is the clip's own pixels
             // and the bars around them are not the clip (see `scale::Composer`).
             let (y, u, v, width, height) = canvas.place(y, u, v, width, height);
-            if let Some((au, key)) = encoder.encode(y, u, v, width, height)? {
-                write_video(
-                    &mut muxer,
-                    out,
-                    meta,
-                    settings,
-                    audio_params.as_ref(),
-                    au,
-                    key,
-                )?;
+            // Once per timeline frame this source frame covers: one at real time
+            // and faster, more when the clip is slowed -- the picture is already
+            // graded and placed, so a held frame costs an encode and no decode.
+            for _ in 0..repeats {
+                if let Some((au, key)) = encoder.encode(y, u, v, width, height)? {
+                    write_video(
+                        &mut muxer,
+                        out,
+                        meta,
+                        settings,
+                        audio_params.as_ref(),
+                        au,
+                        key,
+                    )?;
+                }
+                done += 1;
+                shared
+                    .progress
+                    .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
             }
-            done += 1;
-            shared
-                .progress
-                .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
+            done_here += repeats;
         }
     }
     while let Some((au, key)) = encoder.drain()? {

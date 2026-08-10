@@ -654,19 +654,17 @@ impl PlaybackSession {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
                     // A gap's worker indexes from zero, a decoder's from its in
-                    // point: `base` is whichever this span started at. An empty
-                    // timeline has no span, and its one black frame is frame 0.
-                    let (start, base, speed) = self.span.map_or((0, 0, Speed::NORMAL), |s| {
-                        (s.start, s.from.map_or(0, |(_, i)| i), s.speed)
-                    });
-                    // ...and a *speeded* clip's decoder counts source frames
-                    // faster than the timeline does, so the offset comes back
-                    // through the clip's own rate. At 2x two decoded frames land
-                    // on one timeline frame and the display drops the earlier of
-                    // them; at half speed each lands two apart and is held until
-                    // it is due. Real time divides by one and is the arithmetic
-                    // this always did.
-                    frame.index = start + speed.timeline_at(frame.index.saturating_sub(base));
+                    // point, and the span itself knows which: [`Span::timeline_at`]
+                    // is the *stamp*, and it is the ceil half of the pair whose
+                    // floor half an export encodes with -- so the frame the pump
+                    // is holding at any timeline frame is the very frame the
+                    // export writes there, at every rate
+                    // (`speed_maps_both_ways`). An empty timeline has no span,
+                    // and its one black frame is frame 0. Real time is the
+                    // arithmetic this always did, frame for frame.
+                    frame.index = self
+                        .span
+                        .map_or(frame.index, |s| s.timeline_at(frame.index));
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,

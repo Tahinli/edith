@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, Speed};
-use engine::{AudioSession, DecodeSession, ExportHandle, Project};
+use engine::{AudioSession, Clip, DecodeSession, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
 const FPS: f64 = 30.0;
@@ -301,32 +301,127 @@ fn a_wav_export_of_a_2x_timeline_matches_the_preview() {
     std::fs::remove_file(&out).ok();
 }
 
-/// A picture export cannot re-time a clip, so it says so and writes nothing --
-/// which is the one thing it may not do silently. Both picture formats, because
-/// a rule that held for one of them would be the surprise.
+/// The half that refuses: an mp4 *copies* AAC packets and a packet carries no
+/// rate, so a speeded clip **on the lane being copied** is refused by name --
+/// never written out at 1.00x under a re-timed picture. Only that lane: the
+/// picture honours a rate (below), and AV1 has no audio to copy at all.
 #[test]
-fn a_picture_export_refuses_a_speeded_clip_by_name() {
-    for format in [Format::Mp4, Format::Av1] {
-        let (mut project, meta) = sync_project();
-        project
-            .set_speed(Lane::V1, 0, Speed::from_permille(2000))
-            .expect("room enough");
-        let out = out_path("refuse", "mp4");
-        let handle = engine::export::start(
-            project,
-            meta.clone(),
-            &out,
-            &ExportSettings {
-                format,
-                ..Default::default()
-            },
-        );
-        let text = wait(&handle, Duration::from_secs(120))
-            .expect_err("a speeded timeline is not exportable as a picture")
-            .to_string();
-        assert!(text.contains("2.00x"), "{format:?}: {text}");
-        assert!(text.contains("V1"), "{format:?}: {text}");
-        assert!(text.contains("WAV"), "{format:?}: {text}");
-        assert!(!out.exists(), "{format:?}: no file was written");
-    }
+fn an_mp4_export_refuses_a_speeded_sound_clip_by_name() {
+    let (mut project, meta) = sync_project();
+    project
+        .set_speed(Lane::A1, 0, Speed::from_permille(2000))
+        .expect("room enough");
+    let out = out_path("refuse", "mp4");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let text = wait(&handle, Duration::from_secs(120))
+        .expect_err("an mp4 export cannot carry a rate in a copied packet")
+        .to_string();
+    assert!(text.contains("2.00x"), "{text}");
+    assert!(text.contains("00:00"), "{text}");
+    assert!(text.contains("WAV or FLAC"), "{text}");
+    assert!(!out.exists(), "a refused export writes no file");
+}
+
+/// The half that honours, and the shape that catches a walk that only works at
+/// one rate: **2x then 1x on the same lane**. Each span picks its own source
+/// frames, so the mark inside the fast clip lands at half its source offset and
+/// the mark inside the slow one lands where it always did -- one coded picture
+/// per timeline frame throughout.
+///
+/// The sound stays at 1.00x, which is what leaves the packet copy something it
+/// can carry (the refusal above is the other half of the same rule). Software
+/// encode, so this needs no plugin.
+#[test]
+fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
+    unsafe { std::env::set_var("VE_SW", "1") };
+    let (mut project, meta) = sync_project();
+    // Only the picture: detach it from its sound first, or the rate would land
+    // on the copied lane and be refused.
+    assert!(
+        project.ungroup(Lane::V1, 0),
+        "take the picture off the take"
+    );
+    project
+        .set_speed(Lane::V1, 0, Speed::from_permille(2000))
+        .expect("room enough");
+    assert_eq!(project.speed_of(Lane::A1, 0), Speed::NORMAL, "sound is 1x");
+    let fast = project.lane(Lane::V1)[0].frames();
+    assert_eq!(fast, 45, "90 source frames at 2x is 45 on the timeline");
+    // ...and the same take again behind it, at real time.
+    let whole = project.lane(Lane::V1)[0];
+    assert!(
+        project.place(
+            Lane::V1,
+            fast,
+            Clip {
+                speed: Speed::NORMAL,
+                ..whole
+            }
+        ),
+        "a second, unspeeded clip of the same source"
+    );
+    let total = project.timeline_frames();
+    assert_eq!(total, fast + 90, "45 fast frames then 90 slow ones");
+
+    let out = out_path("honoured", "mp4");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    wait(&handle, Duration::from_secs(300)).expect("an mp4 export of a speeded picture");
+    let (_, frames) = DecodeSession::open(&out).expect("reopen the export");
+    let frames: Vec<_> = frames.into_iter().collect();
+    assert_eq!(
+        frames.len() as u32,
+        total,
+        "one coded picture per timeline frame"
+    );
+    let bright: Vec<u32> = frames
+        .iter()
+        .filter(|frame| {
+            frame.bgra.iter().map(|&b| u64::from(b)).sum::<u64>() / frame.bgra.len() as u64 > 128
+        })
+        .map(|frame| frame.index)
+        .collect();
+    // The fixture flashes for four source frames, 30..=33. At 2x the walk takes
+    // every second one, so the flash is two timeline frames wide and starts at
+    // 15; in the clip behind it, at real time, it is its full four frames and
+    // starts at 45 + 30. Exactly that -- a walk that decoded per timeline frame
+    // instead of per source frame would smear the mark or lose it.
+    assert_eq!(
+        bright,
+        vec![15, 16, 75, 76, 77, 78],
+        "the flash halved at 2x, then whole at 1.00x"
+    );
+    std::fs::remove_file(&out).ok();
+}
+
+/// AV1 carries no audio at all, so nothing about a rate reaches a packet copy
+/// there: it honours a speeded picture with no detaching and no refusal.
+#[test]
+fn an_av1_export_honours_a_speeded_take_whole() {
+    let (mut project, meta) = sync_project();
+    project
+        .set_speed(Lane::V1, 0, Speed::from_permille(2000))
+        .expect("room enough");
+    let total = project.timeline_frames();
+    let out = out_path("av1", "mkv");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Av1,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(600)).expect("an AV1 export of a speeded take");
+    assert!(
+        out.exists(),
+        "AV1 never refuses a rate: it has no audio lane"
+    );
+    assert!(
+        std::fs::metadata(&out).expect("the export").len() > 0,
+        "and it wrote something"
+    );
+    // The timeline halved with the take, so the file is the shorter one.
+    assert_eq!(total, 45, "the whole take at 2x");
+    std::fs::remove_file(&out).ok();
 }
