@@ -299,10 +299,16 @@ impl Project {
     /// [`Project::undo`] is `false` until the first edit of the new session.
     /// This is the one door untrusted parts come in through, so every invariant
     /// every other constructor keeps is checked here, by name and in release:
-    /// every lane empty, an empty clip, a clip naming a source (or an equalizer,
+    /// no lanes at all, an empty clip, a clip naming a source (or an equalizer,
     /// or a colour) that is not there, a clip whose end overflows, a lane that is
     /// unsorted or self-overlapping, and the grouping rules of [`Clip::link`]
     /// below.
+    ///
+    /// A project whose lanes are all *empty* is not among them: an emptied
+    /// timeline is a project like any other -- it plays black and silent, it
+    /// saves, and it loads back. What a project cannot be is laneless, because
+    /// [`Project::lanes`] is what a front-end lays out and what every `Lane`
+    /// handle indexes into.
     pub fn from_parts(
         sources: Vec<Source>,
         lanes: Vec<(LaneKind, Vec<Clip>)>,
@@ -315,8 +321,8 @@ impl Project {
         if let Some(bad) = color.iter().position(|p| !color_finite(p)) {
             return Err(format!("color {bad} holds a value that is not a finite number").into());
         }
-        if lanes.iter().all(|(_, clips)| clips.is_empty()) {
-            return Err("every lane is empty: that is not a project".into());
+        if lanes.is_empty() {
+            return Err("no lanes at all: that is not a project".into());
         }
         let lanes: Vec<LaneData> = lanes
             .into_iter()
@@ -421,9 +427,8 @@ impl Project {
     /// that could not be taken back would be the one edit with no way out.
     /// Nothing plays differently until something is placed on it.
     ///
-    /// The new lane being empty is fine even though [`Project::from_parts`]
-    /// refuses an all-empty project: the lanes that were there still hold the
-    /// timeline, and "no lane holds anything" is what that door refuses.
+    /// An empty lane is a lane like any other -- so is a whole project of them
+    /// ([`Project::from_parts`]); nothing plays until something is placed.
     pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
         self.snapshot();
         self.lanes.push(LaneData {
@@ -525,6 +530,11 @@ impl Project {
     /// [`set_color`](Project::set_color) leaves settings nothing plays behind,
     /// and this is the one moment they can go -- the indexes that survive it are
     /// only the ones a clip names.
+    ///
+    /// One exception, and it is the emptied timeline's: a project no clip plays
+    /// from still keeps source 0. It is the file a session is scaffolded from --
+    /// its frame rate is the timeline's and is written nowhere else -- so a save
+    /// that pruned it would write a project that cannot be loaded back at all.
     pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
@@ -565,6 +575,9 @@ impl Project {
                     }
                 });
             }
+        }
+        if sources.is_empty() {
+            sources.extend(self.sources.first().cloned());
         }
         (
             sources,
@@ -1069,13 +1082,12 @@ impl Project {
     }
 
     /// Lift the clip at `idx` out of `lane`, leaving a gap: black frames or
-    /// silence, and nothing else moves. Refused for an out-of-range index (which
-    /// a lane that is not there always is) and for the lift that would leave
-    /// *every* lane empty -- an empty timeline is the front-end's state, not a
-    /// project's (see the never-empty invariant).
+    /// silence, and nothing else moves. Refused only for an out-of-range index
+    /// (which a lane that is not there always is) -- lifting the last placement
+    /// there is leaves an *empty* timeline, which is a state the project holds
+    /// like any other and an undo brings back.
     pub fn lift(&mut self, lane: Lane, idx: usize) -> bool {
-        let placed: usize = self.lanes.iter().map(|l| l.clips.len()).sum();
-        if idx >= self.lane(lane).len() || placed == 1 {
+        if idx >= self.lane(lane).len() {
             return false;
         }
         self.snapshot();
@@ -1085,23 +1097,17 @@ impl Project {
 
     /// Cut the timeline frames `[at, at + len)` out of *every* lane and close
     /// the hole: everything after slides back by `len`. The rippling delete --
-    /// [`lift`](Project::lift) is the one that leaves a gap. Refused for an
-    /// empty range and when it would leave every lane empty.
+    /// [`lift`](Project::lift) is the one that leaves a gap. Refused only for an
+    /// empty range; a delete that leaves nothing behind empties the timeline,
+    /// which is a state like any other and one undo away.
     pub fn ripple_delete(&mut self, at: u32, len: u32) -> bool {
         if len == 0 {
             return false;
         }
-        let survivors: usize = self
-            .lanes
-            .iter()
-            .map(|l| {
-                l.clips
-                    .iter()
-                    .filter(|c| c.start < at || c.end() > at + len)
-                    .count()
-            })
-            .sum();
-        if survivors == 0 {
+        // Nothing reaches past `at`: there is nothing to cut and nothing to
+        // slide back, and a delete that changes nothing must not cost an undo
+        // step (see [`snapshot`](Project::snapshot)).
+        if !self.lanes.iter().flat_map(|l| &l.clips).any(|c| c.end() > at) {
             return false;
         }
         self.snapshot();
@@ -1892,7 +1898,11 @@ mod tests {
 
         assert!(!p.delete(2), "index past the end");
         assert!(p.delete(1));
-        assert!(!p.delete(0), "the last remaining clip stays");
+        assert!(p.delete(0), "and the last remaining clip goes too");
+        assert_eq!(p.clips().len(), 0);
+        assert_eq!(p.timeline_frames(), 0, "the timeline is emptiable");
+        assert!(!p.delete(0), "there is nothing left to delete");
+        assert!(p.undo(), "one gesture, one undo");
         assert_eq!(p.clips().len(), 1);
     }
 
@@ -1943,13 +1953,28 @@ mod tests {
         }
     }
 
+    /// The timeline is emptiable: the last placement comes off like any other,
+    /// the project holds "nothing on any lane" as a state, and one undo per
+    /// gesture brings it back.
     #[test]
-    fn the_last_clip_of_the_last_lane_cannot_be_lifted() {
+    fn the_last_clip_of_the_last_lane_lifts_and_undoes() {
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0), "a silent timeline is fine");
-        assert!(!p.lift(Lane::V1, 0), "an empty one is not");
+        assert!(p.lift(Lane::V1, 0), "and an empty one is a timeline too");
+        assert_eq!(p.timeline_frames(), 0);
+        assert_eq!(p.composite_span_at(0), None, "nothing to show");
+        assert!(p.audio_segments_from(0, FPS).len() == 1, "one all-gap list");
         assert!(!p.lift(Lane::A1, 0), "index past the end");
-        assert_eq!(p.timeline_frames(), 9);
+        assert!(p.undo(), "and the last lift comes back");
+        assert_eq!(p.lane_spans(Lane::V1), vec![(0, 9)]);
+        // A saved-and-loaded empty timeline is a project like any other, and it
+        // still names the file its frame rate came from.
+        assert!(p.lift(Lane::V1, 0));
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        assert_eq!(sources.len(), 1, "source 0 survives an emptied timeline");
+        let back = Project::from_parts(sources, lanes, eq, color).expect("an empty project loads");
+        assert_eq!(back.timeline_frames(), 0);
+        assert_eq!(back.lanes().len(), 2, "and it kept its lanes");
     }
 
     /// What a keyboard selection walks: one answer per lane, gaps included --
@@ -2021,7 +2046,16 @@ mod tests {
         assert_eq!(shape(&p)[1], shape(&p)[0]);
         assert_eq!(p.timeline_frames(), 5);
         assert!(!p.ripple_delete(0, 0), "an empty range is not a delete");
-        assert!(!p.ripple_delete(0, 100), "and one that empties every lane");
+        assert!(p.undo());
+        assert_eq!(shape(&p), shape(&three()));
+        // One that takes everything is a delete like any other: the timeline
+        // empties, and the undo it cost brings it back whole.
+        assert!(p.ripple_delete(0, 100), "the timeline is emptiable");
+        assert_eq!(p.timeline_frames(), 0);
+        assert!(
+            !p.ripple_delete(0, 100),
+            "and a delete with nothing left to take is not an undo step"
+        );
         assert!(p.undo());
         assert_eq!(shape(&p), shape(&three()));
     }
@@ -2472,7 +2506,8 @@ mod tests {
         assert!(p.split(4), "...and is editable from there");
         assert!(p.undo());
 
-        // A lane may be empty; every lane may not, and neither may no lane.
+        // A lane may be empty, and so may every lane -- an emptied timeline is a
+        // project. No lane at all is not one: there would be nothing to place on.
         assert!(
             Project::from_parts(
                 sources.clone(),
@@ -2489,7 +2524,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             )
-            .is_err()
+            .is_ok()
         );
         assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
