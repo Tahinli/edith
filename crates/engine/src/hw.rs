@@ -9,11 +9,11 @@
 //! plugin built before the encode entry points existed must still decode, so a
 //! missing `vh_enc_*` may only cost us [`HwEncoder`], never [`HwSession`].
 //!
-//! The codec is *not* part of this ABI and adding VP9 did not change it: the
-//! plugin demuxes the file it is given and picks its decoder from the container,
-//! so a plugin older than VP9 support simply returns null for a VP9 path -- the
-//! same "no" it gives for an unsupported profile, and the caller's honest
-//! [`crate::demux::VP9_NEEDS_PLUGIN`] refusal covers both.
+//! The codec is *not* part of this ABI and adding VP9 and HEVC did not change
+//! it: the plugin demuxes the file it is given and picks its decoder from the
+//! container, so a plugin older than that support simply returns null for such a
+//! path -- the same "no" it gives for an unsupported profile, and the caller's
+//! honest [`crate::demux::Codec::needs_plugin`] refusal covers both.
 
 use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};

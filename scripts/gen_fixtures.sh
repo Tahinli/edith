@@ -74,6 +74,17 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libvpx-vp9 -b:v 2M -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_vp9.mp4
+# HEVC fixture: the same A/V shape again, so the tests measure the codec and
+# nothing else. `-tag:v hev1` is not a preference: mp4 0.14 only recognises a
+# hev1 sample entry, so an hvc1-tagged file would read back as no video track at
+# all. 8-bit Main profile, because the plugin's NV12 read-back cannot carry
+# Main 10.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx265 -tag:v hev1 -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_hevc.mp4
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
