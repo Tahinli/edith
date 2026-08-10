@@ -79,7 +79,7 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_2() {
         "v1 clips queue up, the second starting where the first ended"
     );
     assert_eq!(
-        loaded.lane_spans_by_source(engine::project::Lane::Audio),
+        loaded.lane_spans_by_source(engine::project::Lane::A1),
         loaded.clip_spans_by_source(),
         "both lanes, fully grouped: a v1 timeline had no holes"
     );
