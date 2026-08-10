@@ -208,6 +208,25 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
     // ...and back in, which is the half a five-second title card actually uses.
     assert!(session.trim_clip(Lane::V1, 0, Edge::End, clip.start + 60));
     assert_eq!(session.lane_clips(Lane::V1)[0].len(), 60);
+
+    // The *head* is the same story from the other side: a still has no first
+    // frame to walk an in-point back to, so its left edge stretches out to the
+    // same cap. Pulled in first, since a clip at frame 0 has nowhere to go.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 20));
+    let clip = session.lane_clips(Lane::V1)[0];
+    assert_eq!((clip.start, clip.len()), (20, 40));
+    assert_eq!(
+        session.trim_room(Lane::V1, 0, Edge::Start),
+        Some((0, clip.end() - 1)),
+        "out to frame 0: the cap is further off than the timeline reaches"
+    );
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 0), "dragged out");
+    let clip = session.lane_clips(Lane::V1)[0];
+    assert_eq!(
+        (clip.start, clip.in_frame, clip.len()),
+        (0, 0, 60),
+        "longer by what the head took, and still read from the first frame"
+    );
 }
 
 /// The *clipboard* door, which is the second way a clip picks its lanes and
