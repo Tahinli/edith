@@ -179,8 +179,12 @@ impl Session {
     /// or before it and the pictures in between are dropped unread.
     fn open_at(path: &Path, target_sample: u32) -> Option<Self> {
         let mut session = Self::open(path)?;
-        let sync = session.demuxer.seek_to_sync_at_or_before(target_sample);
-        session.skip = target_sample.saturating_sub(sync);
+        // The ABI still speaks 1-based sample ids, the demuxer speaks 0-based
+        // display frames -- and answers with a signed one, since a sync sample
+        // inside what the edit list trims sits before frame 0.
+        let target_frame = target_sample.saturating_sub(1);
+        let first = session.demuxer.seek_to_sync_at_or_before(target_frame);
+        session.skip = (i64::from(target_frame) - first).max(0) as u32;
         Some(session)
     }
 

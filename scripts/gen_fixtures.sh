@@ -25,6 +25,12 @@ ffmpeg -y -f lavfi -i testsrc=size=1280x720:rate=30:duration=4 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av2.mp4
+# Unsupported-audio fixture: an AC-3 track, which we cannot decode at all. The
+# file plays as picture with silence, and the point is that it says so.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a ac3 -b:a 192k assets/test_ac3.mp4
 # Mismatch fixture: different resolution and no audio track at all, so import
 # has something concrete to refuse.
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \

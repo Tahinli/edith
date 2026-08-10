@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track};
+use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known::CODEC_ID_AAC,
@@ -214,6 +214,25 @@ impl AudioSession {
                 })
             })?;
         Ok(Some((meta, rx)))
+    }
+
+    /// Why [`open`](Self::open) came back silent for a file that *has* sound:
+    /// `Some(reason)` when there is an audio track and it is not the AAC-LC
+    /// this decodes (an AC-3 remux, say). `None` when the file is simply silent
+    /// -- nothing to tell the user there. Header only, and only worth calling
+    /// once the open has already returned no audio.
+    pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
+        let file = File::open(path.as_ref())?;
+        let size = file.metadata()?.len();
+        let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+        Ok(reader
+            .tracks()
+            .values()
+            .find(|t| matches!(t.track_type(), Ok(TrackType::Audio)))
+            .map(|t| match t.media_type() {
+                Ok(media) => format!("the {media} audio track cannot be decoded (AAC-LC only)"),
+                Err(_) => "the audio track is in a codec we cannot decode (AAC-LC only)".to_string(),
+            }))
     }
 
     /// The audio parameters of `path`, for checking an import against the
@@ -559,8 +578,9 @@ fn audio_specific_config(track: &Mp4Track) -> crate::Result<Box<[u8]>> {
 }
 
 /// The stts entries as the `(sample_count, sample_delta)` pairs [`packet_at`]
-/// walks; the box's own entry type is `pub(crate)` in mp4 0.14.
-fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> + '_ {
+/// walks; the box's own entry type is `pub(crate)` in mp4 0.14. Shared with
+/// `demux`, which walks a video trak's table with the same two helpers.
+pub(crate) fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> + '_ {
     track
         .trak
         .mdia
@@ -579,6 +599,18 @@ fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> + '_ {
 /// Muxers that write a zero edit list despite a primed stream would leak the
 /// priming; upgrade path is preferring the codec delay when it disagrees.
 fn priming_samples(track: &Mp4Track, sample_rate: u32) -> u64 {
+    edit_media_time(track)
+        .and_then(|t| scale(t, sample_rate, track.timescale()))
+        .unwrap_or(DEFAULT_PRIMING)
+}
+
+/// `media_time` of the edit list's first real entry, in the track's own
+/// timescale: where the presentation starts inside the media. `None` when there
+/// is no edit list, or only empty entries -- those shift the timeline rather
+/// than trim the media, and neither track honours that shift (see
+/// [`priming_samples`]'s ponytail). Shared with `demux`, which owes the video
+/// track the same trim.
+pub(crate) fn edit_media_time(track: &Mp4Track) -> Option<u64> {
     track
         .trak
         .edts
@@ -590,8 +622,6 @@ fn priming_samples(track: &Mp4Track, sample_rate: u32) -> u64 {
                 .map(|e| e.media_time)
                 .find(|&t| t != EMPTY_EDIT && t != u64::MAX)
         })
-        .and_then(|t| scale(t, sample_rate, track.timescale()))
-        .unwrap_or(DEFAULT_PRIMING)
 }
 
 /// `value` from the track timescale into samples-per-channel. `None` on a zero
@@ -619,7 +649,7 @@ fn unscale(samples: u64, sample_rate: u32, timescale: u32) -> u64 {
 /// packets of an entry boundary gets less pre-roll. AAC packets are uniformly
 /// 1024 frames (one entry per track), so this cannot fire here; upgrade path is
 /// carrying the previous entry's delta through the walk.
-fn packet_at(
+pub(crate) fn packet_at(
     entries: impl IntoIterator<Item = (u32, u32)>,
     target_ts: u64,
     pre_roll: u32,
