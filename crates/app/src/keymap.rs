@@ -41,6 +41,12 @@ const MAGIC: &str = "edith-keys 1";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActionId {
     Play,
+    StepBack,
+    StepForward,
+    JumpBack,
+    JumpForward,
+    GoStart,
+    GoEnd,
     Export,
     Save,
     Copy,
@@ -68,8 +74,14 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 23] = [
+    pub const ALL: [ActionId; 29] = [
         ActionId::Play,
+        ActionId::StepBack,
+        ActionId::StepForward,
+        ActionId::JumpBack,
+        ActionId::JumpForward,
+        ActionId::GoStart,
+        ActionId::GoEnd,
         ActionId::Export,
         ActionId::Save,
         ActionId::Copy,
@@ -98,6 +110,12 @@ impl ActionId {
     pub fn label(self) -> &'static str {
         match self {
             ActionId::Play => "Play / Pause",
+            ActionId::StepBack => "One frame back",
+            ActionId::StepForward => "One frame forward",
+            ActionId::JumpBack => "One second back",
+            ActionId::JumpForward => "One second forward",
+            ActionId::GoStart => "Go to the start",
+            ActionId::GoEnd => "Go to the last frame",
             ActionId::Export => "Export",
             ActionId::Save => "Save",
             ActionId::Copy => "Copy",
@@ -128,6 +146,12 @@ impl ActionId {
     fn name(self) -> &'static str {
         match self {
             ActionId::Play => "play",
+            ActionId::StepBack => "step-back",
+            ActionId::StepForward => "step-forward",
+            ActionId::JumpBack => "jump-back",
+            ActionId::JumpForward => "jump-forward",
+            ActionId::GoStart => "go-start",
+            ActionId::GoEnd => "go-end",
             ActionId::Export => "export",
             ActionId::Save => "save",
             ActionId::Copy => "copy",
@@ -162,7 +186,13 @@ impl ActionId {
     /// forget.
     pub fn category(self) -> Category {
         match self {
-            ActionId::Play => Category::Playback,
+            ActionId::Play
+            | ActionId::StepBack
+            | ActionId::StepForward
+            | ActionId::JumpBack
+            | ActionId::JumpForward
+            | ActionId::GoStart
+            | ActionId::GoEnd => Category::Playback,
             ActionId::Copy
             | ActionId::Paste
             | ActionId::Select
@@ -403,6 +433,18 @@ impl Keymap {
         Keymap {
             bindings: vec![
                 b(ActionId::Play, "space", false),
+                // Seeking without a pointer, on the keys every player already
+                // seeks with (gpui names them "left"/"right"/"home"/"end",
+                // platform.rs:872-877). The colour card reads the same arrows
+                // for its sliders, but a card answers the stroke and returns
+                // before the keymap is consulted at all -- so these move the
+                // playhead only while no card is open.
+                b(ActionId::StepBack, "left", false),
+                b(ActionId::StepForward, "right", false),
+                b(ActionId::JumpBack, "left", true),
+                b(ActionId::JumpForward, "right", true),
+                b(ActionId::GoStart, "home", false),
+                b(ActionId::GoEnd, "end", false),
                 b(ActionId::Export, "e", false),
                 b(ActionId::Save, "s", true),
                 b(ActionId::Copy, "c", true),
@@ -711,8 +753,16 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 25);
+        assert_eq!(k.entries().len(), 31);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
+        // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
+        // ends of the timeline.
+        assert_eq!(k.lookup("left", false), Some(ActionId::StepBack));
+        assert_eq!(k.lookup("right", false), Some(ActionId::StepForward));
+        assert_eq!(k.lookup("left", true), Some(ActionId::JumpBack));
+        assert_eq!(k.lookup("right", true), Some(ActionId::JumpForward));
+        assert_eq!(k.lookup("home", false), Some(ActionId::GoStart));
+        assert_eq!(k.lookup("end", false), Some(ActionId::GoEnd));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
         assert_eq!(k.lookup("c", true), Some(ActionId::Copy));
@@ -927,7 +977,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 23);
+        assert_eq!(ActionId::ALL.len(), 29);
     }
 
     #[test]
