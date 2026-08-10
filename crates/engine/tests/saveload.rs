@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use engine::PlaybackSession;
-use engine::project::Source;
+use engine::project::{Lane, Source};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -51,7 +51,7 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     // can join this timeline; it lands as a second source of the same file.
     assert!(
         session
-            .place_stream_at(end, &media, 1, frames)
+            .place_stream_at(end, &media, 1, frames, None)
             .expect("stream 1 matches the timeline")
     );
     assert_eq!(
@@ -85,13 +85,13 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     session.set_gain(0.0);
     let frames = session.clip_at(0).expect("one clip").out_frame;
     let err = session
-        .place_stream_at(0.0, &other, 1, frames)
+        .place_stream_at(0.0, &other, 1, frames, None)
         .expect_err("22.05 kHz mono cannot join a 44.1 kHz stereo timeline")
         .to_string();
     assert!(err.contains("22050"), "unhelpful refusal: {err}");
     assert!(
         session
-            .place_stream_at(0.0, &media, 1, frames)
+            .place_stream_at(0.0, &media, 1, frames, None)
             .expect_err("a file that is not a source")
             .to_string()
             .contains("not on this timeline")
@@ -109,7 +109,10 @@ fn edited(dir: &Path) -> PlaybackSession {
         .expect("import the second file");
     assert!(session.cut_at(2.0), "cut inside the first file");
     assert!(session.cut_at(6.5), "cut inside the second file");
-    assert!(session.delete_clip(1), "drop the second half of the first");
+    assert!(
+        session.delete_clip(Lane::V1, 1),
+        "drop the second half of the first"
+    );
     session.seek(3.0);
     assert_eq!(session.timeline_duration(), 6.0);
     session
