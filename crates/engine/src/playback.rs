@@ -629,8 +629,7 @@ impl PlaybackSession {
     /// keypress rather than a `z`. Upgrade path is snapshotting it beside the
     /// lanes, which every existing snapshot site would then have to carry.
     pub fn set_resolution(&mut self, width: u32, height: u32) -> bool {
-        const MAX: u32 = 7680;
-        if width == 0 || height == 0 || width > MAX || height > MAX {
+        if !crate::is_resolution(width, height) {
             return false;
         }
         if (width, height) == (self.meta.width, self.meta.height) {

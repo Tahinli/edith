@@ -245,3 +245,48 @@ fn a_song_survives_a_save_and_a_reload() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// ...and the door the editor itself had onto that same broken project: a copy
+/// of the song pasted from the clipboard used to land on `V1` as well as `A1`,
+/// where it decodes to nothing -- and the save it wrote was refused on the way
+/// back in. The paste is the plain UI path, so this is data loss with no
+/// hand-editing anywhere in it.
+#[test]
+fn a_pasted_song_never_lands_on_the_video_lane() {
+    let dir = std::env::temp_dir().join(format!("ve_audio_paste_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let copy = |name: &str| {
+        let to = dir.join(name);
+        std::fs::copy(asset(name), &to).expect("copy the fixture");
+        to
+    };
+
+    let mut session = open(copy("test_av.mp4"));
+    session.import(&copy("test_tone.flac")).expect("import");
+    let song = session.lane_clips(Lane::A1)[1];
+    let video_before = session.lane_clips(Lane::V1).to_vec();
+    assert!(session.paste_at(0.0, song), "paste the copied song");
+
+    // The video lane got room and nothing else: the same clips, pushed along.
+    let video_after = session.lane_clips(Lane::V1).to_vec();
+    assert_eq!(video_after.len(), video_before.len(), "no clip on V1");
+    for (after, before) in video_after.iter().zip(&video_before) {
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.start, before.start + song.len());
+    }
+    // The audio lane is the one that gained it, at the playhead.
+    assert_eq!(session.lane_clips(Lane::A1).len(), 3);
+    assert_eq!(session.lane_clips(Lane::A1)[0].source, song.source);
+
+    // And the save that follows reopens -- which is what the video-lane clip
+    // used to cost ("file contains a box with a larger size than it").
+    let project = dir.join("pasted.edith");
+    session.save_project(&project).expect("save");
+    drop(session);
+    let reloaded = PlaybackSession::open_project(&project).expect("the save reopens");
+    reloaded.set_gain(0.0);
+    assert_eq!(reloaded.lane_clips(Lane::A1).len(), 3);
+    assert_eq!(reloaded.lane_clips(Lane::V1).len(), video_after.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
