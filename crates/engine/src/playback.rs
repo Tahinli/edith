@@ -26,6 +26,7 @@ use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{Clip, Lane, LaneKind, Project, Source, Span};
+use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -84,7 +85,17 @@ impl Audio {
 
 /// A file opened for playback. Starts paused at t=0; call [`PlaybackSession::play`].
 pub struct PlaybackSession {
+    /// The *timeline's* parameters, not any one file's: its frame rate and codec
+    /// come from source 0 and are what every other source is held to, while
+    /// `width`/`height` are the **project resolution** -- source 0's picture to
+    /// begin with, and whatever [`PlaybackSession::set_resolution`] or a saved
+    /// `resolution` line makes it after that. Every clip is composed onto it, so
+    /// a file of another size is a placed picture rather than a refusal.
     meta: VideoMeta,
+    /// Source 0's own picture, kept from the open: the project resolution
+    /// starts here, and a caller offering sizes to pick from needs the media's
+    /// own among them or a project moved off it could never come back.
+    native: (u32, u32),
     frames: Receiver<Frame>,
     /// The current decode worker.
     worker: Worker,
@@ -143,8 +154,16 @@ impl PlaybackSession {
         // Ungraded: a file just opened has one clip per lane and nothing has
         // graded it yet. Every later span is opened by `start_span`, which asks
         // the project.
-        let (meta, stream) =
-            DecodeSession::open_worker(&path, 0, u32::MAX, ColorParams::default())?;
+        // Passthrough: a freshly opened file *is* the project resolution, so
+        // there is nothing to place it on. Every later span goes through
+        // `start_span`, which builds the canvas from the project.
+        let (meta, stream) = DecodeSession::open_worker(
+            &path,
+            0,
+            u32::MAX,
+            ColorParams::default(),
+            Composer::passthrough(),
+        )?;
         // A file is opened on its first audio stream, like `Project::single`
         // names it: nothing has picked one yet.
         let (audio, audio_disabled) = open_audio(&path, 0);
@@ -158,6 +177,7 @@ impl PlaybackSession {
         let span = project.composite_span_at(0).expect("never empty");
         Ok(Self {
             meta,
+            native: (meta.width, meta.height),
             frames: stream.frames,
             worker: stream.worker,
             retired: Vec::new(),
@@ -203,9 +223,22 @@ impl PlaybackSession {
         // Ungraded, and superseded before a frame of it is shown: the `seek` at
         // the end of this function reopens the playhead's span through
         // `start_span`, which is where a saved grade reaches the picture.
-        let (meta, stream) =
-            DecodeSession::open_worker(&first.path, 0, u32::MAX, ColorParams::default())
-                .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        let (mut meta, stream) = DecodeSession::open_worker(
+            &first.path,
+            0,
+            u32::MAX,
+            ColorParams::default(),
+            Composer::passthrough(),
+        )
+        .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+        // The project's own resolution, which is source 0's picture unless the
+        // file says otherwise -- every dialect before v7 had no way to say it,
+        // and that default is exactly what those projects meant.
+        let native = (meta.width, meta.height);
+        if let Some((width, height)) = doc.resolution {
+            meta.width = width;
+            meta.height = height;
+        }
         let first_audio = AudioSession::probe(&first.path, first.audio_stream)?;
 
         let mut counts = vec![meta.frame_count];
@@ -266,6 +299,7 @@ impl PlaybackSession {
         let (audio, audio_disabled) = open_audio(&first.path, first.audio_stream);
         let mut session = Self {
             meta,
+            native,
             frames: stream.frames,
             worker: stream.worker,
             retired: Vec::new(),
@@ -313,7 +347,15 @@ impl PlaybackSession {
         let (sources, lanes, eq, color) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
-        crate::edith::save(path, &sources, &lanes, &eq, &color, playhead)
+        crate::edith::save(
+            path,
+            &sources,
+            &lanes,
+            &eq,
+            &color,
+            (self.meta.width, self.meta.height),
+            playhead,
+        )
     }
 
     /// The next decoded frame, its `index` rewritten from a source frame to a
@@ -404,6 +446,14 @@ impl PlaybackSession {
                     .composite_color_at(span.start)
                     .copied()
                     .unwrap_or_default(),
+                // ...and the canvas it is placed on: the project's resolution
+                // and this clip's own fit policy, constant across the span for
+                // the reason the grade is.
+                Composer::new(
+                    self.meta.width,
+                    self.meta.height,
+                    self.project.composite_fit_at(span.start),
+                ),
             )
             .map(|(_, stream)| stream)
             .inspect_err(|e| eprintln!("timeline frame {}: video open failed: {e}", span.start)),
@@ -555,6 +605,56 @@ impl PlaybackSession {
         self.edit(|p| p.set_color(lane, idx, params))
     }
 
+    /// The project's resolution: what every clip is composed onto, what the
+    /// window is sized to and what an export writes -- *not* any one file's.
+    /// It starts as source 0's picture, which is what a project meant before it
+    /// could have a resolution of its own.
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.meta.width, self.meta.height)
+    }
+
+    /// Source 0's own picture size -- what the project resolution started as,
+    /// and the one size a caller offering a list of them must not leave out.
+    pub fn native_resolution(&self) -> (u32, u32) {
+        self.native
+    }
+
+    /// Sets it. Reseeks like an edit, so the frame on screen is recomposed at
+    /// the new size at once, paused or playing. `false` for a size that is not a
+    /// picture -- zero either way, or past 8K, which is where the per-frame
+    /// buffers stop being a sane thing to allocate from a keystroke.
+    ///
+    /// ponytail: not an undo step. The project resolution is not in the lane
+    /// snapshots [`Project::undo`] restores, so cycling it back is one more
+    /// keypress rather than a `z`. Upgrade path is snapshotting it beside the
+    /// lanes, which every existing snapshot site would then have to carry.
+    pub fn set_resolution(&mut self, width: u32, height: u32) -> bool {
+        const MAX: u32 = 7680;
+        if width == 0 || height == 0 || width > MAX || height > MAX {
+            return false;
+        }
+        if (width, height) == (self.meta.width, self.meta.height) {
+            return false;
+        }
+        self.meta.width = width;
+        self.meta.height = height;
+        let now = self.now();
+        self.seek(now);
+        true
+    }
+
+    /// How the clip at `idx` of `lane` meets a project canvas of another shape.
+    pub fn fit_of(&self, lane: Lane, idx: usize) -> FitPolicy {
+        self.project.fit_of(lane, idx)
+    }
+
+    /// Sets that clip's fit policy. One undo step and a reseek, exactly like a
+    /// grade: the picture on screen is recomposed through the new policy without
+    /// the caller nudging the playhead. `false` for an index that is not there.
+    pub fn set_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy) -> bool {
+        self.edit(|p| p.set_fit(lane, idx, fit))
+    }
+
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
     /// numbers and nothing else, so a copy stays valid after the clip it came
     /// from is deleted. `None` past the end.
@@ -619,6 +719,7 @@ impl PlaybackSession {
             link: None,
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         // Which lane a source may land on is decided here and only here, so a
         // front-end never has to make the same call twice: a file with no
@@ -683,11 +784,11 @@ impl PlaybackSession {
     /// Appends the whole of `path` to the end of the timeline. One undo step,
     /// and the file becomes a source only if it is not one already.
     ///
-    /// Refused unless it matches the timeline exactly -- same dimensions, same
-    /// frame rate, same audio parameters or both silent -- because one timeline
-    /// this slice means one set of encoder/device parameters; the `Err` names
-    /// the property that disagrees, for a caller to show. Nothing is changed by
-    /// a refusal.
+    /// Refused unless it can join the timeline -- same codec, same frame rate,
+    /// same audio parameters or both silent; the `Err` names the property that
+    /// disagrees, for a caller to show. Nothing is changed by a refusal. A
+    /// *resolution* of its own is not a refusal: the clip is placed on the
+    /// project canvas by its fit policy ([`PlaybackSession::set_fit`]).
     pub fn import(&mut self, path: &Path) -> crate::Result<()> {
         if crate::is_audio(path) {
             return self.import_audio(path);
@@ -745,6 +846,7 @@ impl PlaybackSession {
                 link: None,
                 eq: None,
                 color: None,
+                fit: FitPolicy::default(),
             },
         );
         // Same reason as a video import: the running audio worker's segment
@@ -989,9 +1091,16 @@ impl Drop for PlaybackSession {
 }
 
 /// Whether `path`, already demuxed to `meta`, may join a timeline whose
-/// parameters are `timeline` and whose audio probes as `first`: same
-/// dimensions, same frame rate, same audio parameters or both silent -- one
-/// timeline this slice means one set of encoder/device parameters.
+/// parameters are `timeline` and whose audio probes as `first`: same codec,
+/// same frame rate, same audio parameters or both silent.
+///
+/// *Not* the same size any more. A project has its own resolution
+/// ([`PlaybackSession::set_resolution`]) and every clip is placed on it by its
+/// own fit policy, so a 640x360 file joining a 1920x1080 timeline is a
+/// letterboxed clip rather than a refusal. The frame rate stays refused on
+/// purpose: mixing rates means resampling the *timeline*, which is a different
+/// problem from resampling a picture, and a refusal is the honest answer until
+/// it is solved.
 ///
 /// The `Err` names the property that disagrees, and those strings are what a
 /// front-end shows verbatim; [`PlaybackSession::import`] and
@@ -1012,13 +1121,6 @@ fn matches_timeline(
             "{} does not match the timeline's {}",
             meta.codec.name(),
             timeline.codec.name()
-        )
-        .into());
-    }
-    if (meta.width, meta.height) != (timeline.width, timeline.height) {
-        return Err(format!(
-            "{}x{} does not match the timeline's {}x{}",
-            meta.width, meta.height, timeline.width, timeline.height
         )
         .into());
     }

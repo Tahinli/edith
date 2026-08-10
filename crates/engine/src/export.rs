@@ -32,6 +32,7 @@ use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Mp4Muxer, VideoParams};
 use crate::project::Project;
+use crate::scale::Composer;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -293,6 +294,16 @@ fn run(
         // and its allocation survives the whole span.
         let grade = project.composite_color_at(span.start).copied();
         let mut graded = (Vec::new(), Vec::new(), Vec::new());
+        // ...and the canvas it is placed on, which is where a source of another
+        // resolution becomes a picture at the project's. The same `Composer`
+        // playback composes with, given the same policy, so an export is what
+        // was watched down to the letterbox; a clip already the project's size
+        // passes through it untouched.
+        let mut canvas = Composer::new(
+            meta.width,
+            meta.height,
+            project.composite_fit_at(span.start),
+        );
         for _ in 0..span.len {
             cancelled(shared)?;
             let picture = match &mut pictures {
@@ -320,6 +331,9 @@ fn run(
                 }
                 None => (y, u, v),
             };
+            // Grade first, place second: the grade is the clip's own pixels
+            // and the bars around them are not the clip (see `scale::Composer`).
+            let (y, u, v, width, height) = canvas.place(y, u, v, width, height);
             if let Some(au) = encoder.encode(y, u, v, width, height)? {
                 write_video(&mut muxer, out, meta, audio_params.as_ref(), au)?;
             }

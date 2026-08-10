@@ -24,6 +24,7 @@ use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
 use engine::project::Lane;
 use engine::project::Source;
+use engine::scale::FitPolicy;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
@@ -175,6 +176,86 @@ fn exports_an_edited_timeline_in_hardware() {
     round_trip("hw", Duration::from_secs(60));
 }
 
+/// An export is written at the **project's** resolution, whatever sizes the
+/// media on the timeline are -- and with the same geometry that was watched.
+///
+/// 1280x720 and 640x360 clips on a 960x720 (4:3) project: every frame comes out
+/// 960x720, and both clips are letterboxed with 90 rows of bar at each edge,
+/// which is exactly what `scale::fit_rect` places and what playback shows
+/// (`playback.rs: a_fitted_clip_is_letterboxed_and_a_filled_one_is_not`).
+#[test]
+fn exports_at_the_project_resolution_with_the_watched_geometry() {
+    pin_software();
+    let clip = |source: usize, start: u32| engine::Clip {
+        start,
+        in_frame: 0,
+        out_frame: 10,
+        source,
+        link: Some(source as u32),
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+    };
+    let clips = vec![clip(0, 0), clip(1, 10)];
+    let project = Project::from_parts(
+        vec![
+            Source::new(asset("test_baseline.mp4"), 0),
+            Source::new(asset("test_mismatch.mp4"), 0),
+        ],
+        vec![
+            (engine::project::LaneKind::Video, clips.clone()),
+            (engine::project::LaneKind::Audio, clips),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a two-source project");
+    // The project's own resolution, which is neither source's: this is the
+    // value `PlaybackSession` keeps in its meta and hands the exporter.
+    let meta = engine::VideoMeta {
+        width: 960,
+        height: 720,
+        frame_rate: FPS,
+        frame_count: 20,
+        codec: engine::Codec::H264,
+    };
+    let out = out_path("mixed");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    wait(&handle, Duration::from_secs(120)).expect("export");
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen export");
+    assert_eq!(
+        (written.width, written.height),
+        (960, 720),
+        "an export is the project's size, not any source's"
+    );
+    assert_eq!(written.frame_count, 20);
+
+    let frames = decode_all(&out);
+    assert_eq!(frames.len(), 20);
+    // Lossy: a bar is black plus whatever the encoder left, so the bars are
+    // asserted as *flat and dark* rather than as byte 0, and the picture rows
+    // as neither.
+    let mean = |frame: &[u8], y: usize| {
+        frame[y * 960 * 4..][..960 * 4]
+            .chunks_exact(4)
+            .flat_map(|px| [px[0], px[1], px[2]])
+            .map(f64::from)
+            .sum::<f64>()
+            / (960.0 * 3.0)
+    };
+    for (at, what) in [(5usize, "the 1280x720 clip"), (15, "the 640x360 clip")] {
+        let frame = &frames[at];
+        assert!(mean(frame, 2) < 8.0, "{what}: top bar is not black");
+        assert!(mean(frame, 717) < 8.0, "{what}: bottom bar is not black");
+        assert!(
+            mean(frame, 360) > 20.0,
+            "{what}: the picture area is black, so nothing was composed"
+        );
+    }
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// The trap this slice exists to close: a timeline playing a file's *second*
 /// audio stream must export that stream's packets. Playing one stream and
 /// exporting another is a file that sounds nothing like what was edited, and
@@ -193,6 +274,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
         link: Some(0),
         eq: None,
         color: None,
+        fit: FitPolicy::default(),
     };
     // Stream 1 is the 22.05 kHz mono French track; stream 0 is 44.1 kHz
     // stereo. A project may only hold streams that agree, so this timeline is

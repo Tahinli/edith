@@ -1,17 +1,24 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 6
+//! edith 7
 //! playhead 90
+//! resolution 1920 1080
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
 //! eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk
 //! color 0.1:1.2:0.9:-0.3
-//! video 1 0 0 120 0 0 0 0
-//! audio 1 0 0 120 0 0 0 -
-//! video 2 120 0 120 1 - - -
+//! video 1 0 0 120 0 0 0 0 fit
+//! audio 1 0 0 120 0 0 0 - fit
+//! video 2 120 0 120 1 - - - fill
 //! audio 2
 //! ```
+//!
+//! The `resolution` line is the **project's** picture size, which is a
+//! different thing from any source's: media of other sizes are placed on it.
+//! It belongs once, beside the playhead, and a file without one (every dialect
+//! before v7) means "source 0's own picture", which is what such a project
+//! always was.
 //!
 //! A source line is `source <audio stream> <path>`: which of the file's audio
 //! tracks that source plays, in the file order
@@ -32,20 +39,25 @@
 //! -- the first colour line is color 0 -- printed and refused by the same rules.
 //!
 //! A lane line is `<kind> <lane> <start> <in> <out> <source> <link> <eq>
-//! <color>`: which lane the clip is on -- its kind and its 1-based number among
-//! the lanes of that kind, the [`crate::project::Lane::label`] a header column
-//! shows -- then where the clip sits on the timeline, the half-open source range
-//! it plays, the file it plays from, its group id, the eq line it plays through
-//! and the colour line it is graded by (`-` for none of them). Timeline
-//! placement is explicit, so a *gap* is simply a stretch no line covers -- there
-//! is nothing to write for one, and nothing that can disagree about its length.
+//! <color> <fit>`: which lane the clip is on -- its kind and its 1-based number
+//! among the lanes of that kind, the [`crate::project::Lane::label`] a header
+//! column shows -- then where the clip sits on the timeline, the half-open
+//! source range it plays, the file it plays from, its group id, the eq line it
+//! plays through, the colour line it is graded by (`-` for none of those three)
+//! and how it meets a project canvas of another shape, spelled `fit`, `fill`,
+//! `stretch` or `center` ([`crate::scale::FitPolicy`]). Timeline placement is
+//! explicit, so a *gap* is simply a stretch no line covers -- there is nothing
+//! to write for one, and nothing that can disagree about its length.
 //!
 //! A lane is declared by the clips on it, in the order the lanes are displayed
 //! in; a lane holding *nothing* has a bare `<kind> <lane>` line instead, which
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 5** was this without the colour lines and without the clip's colour
+//! **Version 6** was this without the `resolution` line and without the clip's
+//! fit field -- such a project is the size of its first source and letterboxes
+//! nothing, because nothing on it could differ in size. **Version 5** was that
+//! without the colour lines and without the clip's colour
 //! field. **Version 4** was that without the eq lines and without the clip's eq
 //! field. **Version 3** was that without the lane number, and held one video
 //! lane and one audio lane, no more. **Version 2** wrote `source <path>` as
@@ -54,7 +66,7 @@
 //! <in> <out> <source>`. All five still load -- a v1 file's clips are laid out
 //! cumulatively and copied onto both lanes as one group each, which is exactly
 //! what a v1 timeline meant, and an older file simply equalizes and grades
-//! nothing -- and saving any of them writes v6. An older reader refuses a newer
+//! nothing -- and saving any of them writes v7. An older reader refuses a newer
 //! file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -84,10 +96,12 @@ use std::path::{Path, PathBuf};
 use crate::color::ColorParams;
 use crate::eq::{Band, BandKind, EqParams};
 use crate::project::{Clip, Lane, LaneKind, Source};
+use crate::scale::FitPolicy;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 6";
+const MAGIC: &[u8] = b"edith 7";
+const MAGIC_V6: &[u8] = b"edith 6";
 const MAGIC_V5: &[u8] = b"edith 5";
 const MAGIC_V4: &[u8] = b"edith 4";
 const MAGIC_V3: &[u8] = b"edith 3";
@@ -111,6 +125,9 @@ pub struct Document {
     /// The colour table [`Clip::color`] indexes into, in file order. Empty for
     /// every dialect before v6.
     pub color: Vec<ColorParams>,
+    /// The project's own picture size. `None` for every dialect before v7 and
+    /// for a v7 file that leaves it out, which both mean "source 0's picture".
+    pub resolution: Option<(u32, u32)>,
     pub playhead: u32,
 }
 
@@ -122,6 +139,7 @@ pub fn save(
     lanes: &[(LaneKind, Vec<Clip>)],
     eq: &[EqParams],
     color: &[ColorParams],
+    resolution: (u32, u32),
     playhead: u32,
 ) -> crate::Result<()> {
     let dir = project_dir(path);
@@ -134,7 +152,7 @@ pub fn save(
     // the second one puts the name itself there.
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
-            f.write_all(&emit(&dir, sources, lanes, eq, color, playhead))?;
+            f.write_all(&emit(&dir, sources, lanes, eq, color, resolution, playhead))?;
             f.sync_all()
         })
         .and_then(|()| std::fs::rename(&part, path))
@@ -170,12 +188,14 @@ fn emit(
     lanes: &[(LaneKind, Vec<Clip>)],
     eq: &[EqParams],
     color: &[ColorParams],
+    resolution: (u32, u32),
     playhead: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.push(b'\n');
     out.extend_from_slice(format!("playhead {playhead}\n").as_bytes());
+    out.extend_from_slice(format!("resolution {} {}\n", resolution.0, resolution.1).as_bytes());
     for s in sources {
         out.extend_from_slice(format!("source {} ", s.audio_stream).as_bytes());
         escape(s.path.strip_prefix(dir).unwrap_or(&s.path), &mut out);
@@ -236,8 +256,12 @@ fn emit(
             let color = c.color.map_or("-".to_string(), |e| e.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {ord} {} {} {} {} {link} {eq} {color}\n",
-                    c.start, c.in_frame, c.out_frame, c.source
+                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {}\n",
+                    c.start,
+                    c.in_frame,
+                    c.out_frame,
+                    c.source,
+                    fit_name(c.fit)
                 )
                 .as_bytes(),
             );
@@ -256,8 +280,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries colour grades...
-    let v6 = first == MAGIC;
+    // The one that carries a project resolution and per-clip fit policies...
+    let v7 = first == MAGIC;
+    // ...the ones that carry colour grades...
+    let v6 = v7 || first == MAGIC_V6;
     // ...the ones that carry equalizer settings...
     let v5 = v6 || first == MAGIC_V5;
     // ...and the ones that number their lanes. Every older one held two.
@@ -282,6 +308,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // Nothing before v5 equalizes anything, and nothing before v6 grades.
         eq: Vec::new(),
         color: Vec::new(),
+        // Nothing before v7 has a resolution of its own: source 0's picture is
+        // what those projects were, and `None` is how the loader is told so.
+        resolution: None,
         playhead: 0,
     };
     let mut playhead_seen = false;
@@ -303,6 +332,19 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 }
                 doc.playhead = number(rest, n)?;
                 playhead_seen = true;
+            }
+            b"resolution" if v7 => {
+                if doc.resolution.is_some() || !doc.sources.is_empty() {
+                    return Err(
+                        format!("line {n}: resolution belongs once, before the sources").into(),
+                    );
+                }
+                let f = fields(rest, 2, "resolution", n)?;
+                let (width, height) = (number(f[0], n)?, number(f[1], n)?);
+                if width == 0 || height == 0 {
+                    return Err(format!("line {n}: {width}x{height} is not a picture").into());
+                }
+                doc.resolution = Some((width, height));
             }
             b"source" => {
                 if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
@@ -384,6 +426,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         link: Some(doc.lanes[0].1.len() as u32),
                         eq: None,
                         color: None,
+                        fit: FitPolicy::default(),
                     },
                     &doc,
                     n,
@@ -413,9 +456,9 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if numbered && rest.is_empty() {
                     continue;
                 }
-                // v6 grew the colour field and v5 the eq one; every older
-                // dialect ends at the link.
-                let want = 5 + usize::from(v5) + usize::from(v6);
+                // v7 grew the fit field, v6 the colour one and v5 the eq one;
+                // every older dialect ends at the link.
+                let want = 5 + usize::from(v5) + usize::from(v6) + usize::from(v7);
                 let f = fields(rest, want, "clip", n)?;
                 let clip = check(
                     Clip {
@@ -429,6 +472,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         },
                         eq: table_index(f.get(5).copied(), doc.eq.len(), "eq", n)?,
                         color: table_index(f.get(6).copied(), doc.color.len(), "color", n)?,
+                        fit: fit_policy(f.get(7).copied(), n)?,
                     },
                     &doc,
                     n,
@@ -542,6 +586,37 @@ fn check(clip: Clip, doc: &Document, line: usize) -> crate::Result<Clip> {
         .into());
     }
     Ok(clip)
+}
+
+/// How a fit policy is spelled in the file. One word each, so a clip line stays
+/// readable, and the same word the parser takes back.
+fn fit_name(fit: FitPolicy) -> &'static str {
+    match fit {
+        FitPolicy::Fit => "fit",
+        FitPolicy::Fill => "fill",
+        FitPolicy::Stretch => "stretch",
+        FitPolicy::Center => "center",
+    }
+}
+
+/// A clip's `<fit>` field. A dialect that has no such field at all means the
+/// default -- those projects held one resolution, so no clip of theirs was ever
+/// placed on anything.
+fn fit_policy(field: Option<&[u8]>, line: usize) -> crate::Result<FitPolicy> {
+    let Some(field) = field else {
+        return Ok(FitPolicy::default());
+    };
+    match field {
+        b"fit" => Ok(FitPolicy::Fit),
+        b"fill" => Ok(FitPolicy::Fill),
+        b"stretch" => Ok(FitPolicy::Stretch),
+        b"center" => Ok(FitPolicy::Center),
+        other => Err(format!(
+            "line {line}: {:?} is not a fit policy",
+            String::from_utf8_lossy(other)
+        )
+        .into()),
+    }
 }
 
 /// A clip's `<eq>` or `<color>` field: `-` (or a dialect that has no such field
@@ -667,6 +742,7 @@ mod tests {
             link,
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         }
     }
 
@@ -678,7 +754,7 @@ mod tests {
         lanes: &[(LaneKind, Vec<Clip>)],
         playhead: u32,
     ) -> Vec<u8> {
-        emit(dir, sources, lanes, &[], &[], playhead)
+        emit(dir, sources, lanes, &[], &[], (1280, 720), playhead)
     }
 
     /// Two sources, one under the project's own directory and one not, a clip
@@ -716,8 +792,10 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n",
+            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+             source 2 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
+             audio 1 0 0 30 0 0 - - fit\n",
             "the file under the project directory is written relative to it, \
              each with the audio stream it plays"
         );
@@ -751,8 +829,9 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 6\nplayhead 7\nsource 0 a.mp4\n\
-             video 1 0 0 30 0 4 - -\naudio 1\nvideo 2 40 0 10 0 - - -\naudio 2 0 0 30 0 4 - -\n",
+            "edith 7\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 4 - - fit\naudio 1\n\
+             video 2 40 0 10 0 - - - fit\naudio 2 0 0 30 0 4 - - fit\n",
             "an empty lane is a line of its own; everything else is its clips"
         );
         let back = parse(&bytes, &dir).expect("parse");
@@ -858,15 +937,15 @@ mod tests {
                 },
             ],
         );
-        let bytes = emit(&dir, &sources, &lanes, &eq, &[], 0);
+        let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 6\nplayhead 0\nsource 0 a.mp4\n\
+            "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
-             video 1 0 0 30 0 0 0 -\nvideo 1 30 10 20 0 - 1 -\n\
-             audio 1 0 0 30 0 0 0 -\naudio 1 30 0 10 0 - 2 -\n",
+             video 1 0 0 30 0 0 0 - fit\nvideo 1 30 10 20 0 - 1 - fit\n\
+             audio 1 0 0 30 0 0 0 - fit\naudio 1 30 0 10 0 - 2 - fit\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -893,7 +972,15 @@ mod tests {
         }
         assert_eq!(back.eq.len(), 3, "the empty cascade is an entry of its own");
         assert_eq!(
-            emit(&dir, &back.sources, &back.lanes, &back.eq, &back.color, 0),
+            emit(
+                &dir,
+                &back.sources,
+                &back.lanes,
+                &back.eq,
+                &back.color,
+                (1280, 720),
+                0
+            ),
             bytes
         );
     }
@@ -928,33 +1015,37 @@ mod tests {
             vec![
                 Clip {
                     color: Some(0),
+                    fit: FitPolicy::default(),
                     ..clip(0, 0, 30, 0, Some(0))
                 },
                 Clip {
                     color: Some(1),
+                    fit: FitPolicy::default(),
                     ..clip(30, 10, 20, 0, None)
                 },
             ],
             vec![
                 Clip {
                     color: Some(0),
+                    fit: FitPolicy::default(),
                     ..clip(0, 0, 30, 0, Some(0))
                 },
                 Clip {
                     color: Some(2),
+                    fit: FitPolicy::default(),
                     ..clip(30, 0, 10, 0, None)
                 },
             ],
         );
-        let bytes = emit(&dir, &sources, &lanes, &[], &color, 0);
+        let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 6\nplayhead 0\nsource 0 a.mp4\n\
+            "edith 7\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
-             video 1 0 0 30 0 0 - 0\nvideo 1 30 10 20 0 - - 1\n\
-             audio 1 0 0 30 0 0 - 0\naudio 1 30 0 10 0 - - 2\n",
+             video 1 0 0 30 0 0 - 0 fit\nvideo 1 30 10 20 0 - - 1 fit\n\
+             audio 1 0 0 30 0 0 - 0 fit\naudio 1 30 0 10 0 - - 2 fit\n",
             "the table comes before the clips, and a clip names a line of it"
         );
 
@@ -979,7 +1070,15 @@ mod tests {
         }
         assert_eq!(back.color.len(), 3);
         assert_eq!(
-            emit(&dir, &back.sources, &back.lanes, &back.eq, &back.color, 0),
+            emit(
+                &dir,
+                &back.sources,
+                &back.lanes,
+                &back.eq,
+                &back.color,
+                (1280, 720),
+                0
+            ),
             bytes
         );
     }
@@ -1003,10 +1102,12 @@ mod tests {
                 &old.lanes,
                 &old.eq,
                 &old.color,
+                (1280, 720),
                 old.playhead
             )),
-            "edith 6\nplayhead 3\nsource 0 a.mp4\neq 80.0:-3.0:0.707:ls\n\
-             video 1 0 0 30 0 0 0 -\naudio 1 0 0 30 0 0 - -\n"
+            "edith 7\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+             eq 80.0:-3.0:0.707:ls\n\
+             video 1 0 0 30 0 0 0 - fit\naudio 1 0 0 30 0 0 - - fit\n"
         );
     }
 
@@ -1015,6 +1116,8 @@ mod tests {
     fn a_malformed_colour_names_its_line() {
         let dir = PathBuf::from("/proj");
         let head = "edith 6\nsource 0 a.mp4\n";
+        // v6, deliberately: the colour grammar is the same one v7 inherits, and
+        // a v6 clip line is one field shorter.
         for (file, want) in [
             (
                 format!("{head}color 0.0:1.0:1.0\nvideo 1 0 0 5 0 - - 0\n"),
@@ -1138,8 +1241,10 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 2 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n"
+            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+             source 2 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
+             audio 1 0 0 30 0 0 - - fit\n"
         );
         // An empty lane's line is still the whole of that lane, eq or no eq.
         let empty = parse(
@@ -1189,8 +1294,10 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 6\nplayhead 12\nsource 0 a.mp4\nsource 0 /elsewhere/b.mp4\n\
-             video 1 0 0 30 0 0 - -\nvideo 1 30 10 20 1 1 - -\naudio 1 0 0 30 0 0 - -\n",
+            "edith 7\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+             source 0 /elsewhere/b.mp4\n\
+             video 1 0 0 30 0 0 - - fit\nvideo 1 30 10 20 1 1 - - fit\n\
+             audio 1 0 0 30 0 0 - - fit\n",
             "a re-saved v2 project differs only by its version, the lane \
              numbers, the streams it always meant and an equalizer it has none of"
         );
@@ -1216,9 +1323,10 @@ mod tests {
             "one take per clip, on both lanes"
         );
         assert_eq!(back.playhead, 5);
-        // Saved again it is v5, and that round-trips to the same document.
+        // Saved again it is the current version, which round-trips to the
+        // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 6\n"));
+        assert!(v5.starts_with(b"edith 7\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1313,13 +1421,15 @@ mod tests {
             &two(one.to_vec(), one.to_vec()),
             &[],
             &[],
+            (1280, 720),
             0,
         )
         .expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 6\nplayhead 0\nsource 1 a.mp4\nvideo 1 0 0 30 0 - - -\naudio 1 0 0 30 0 - - -\n"
+            "edith 7\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+             video 1 0 0 30 0 - - - fit\naudio 1 0 0 30 0 - - - fit\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
         // way the project was opened -- the same file, through the link, still
@@ -1350,9 +1460,9 @@ mod tests {
         );
         assert_eq!(
             bytes.iter().filter(|&&b| b == b'\n').count(),
-            5,
+            6,
             "the escaped newline must not become a line break: magic, playhead, \
-             source, the clip, and the empty audio lane's own line"
+             resolution, source, the clip, and the empty audio lane's own line"
         );
         let back = parse(&bytes, &dir).expect("parse");
         // The spaces in it are the reason the stream field leads rather than
@@ -1363,10 +1473,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 7\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 8\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 7");
+        assert_eq!(err, "line 1: unsupported version 8");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use engine::export::{ExportSettings, Format};
 use engine::project::LaneKind;
 use engine::project::Source;
+use engine::scale::FitPolicy;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
@@ -66,6 +67,7 @@ fn mixed_project() -> Project {
         link: None,
         eq: None,
         color: None,
+        fit: FitPolicy::default(),
     };
     Project::from_parts(
         vec![
@@ -86,6 +88,7 @@ fn mixed_project() -> Project {
                     link: None,
                     eq: None,
                     color: None,
+                    fit: FitPolicy::default(),
                 }],
             ),
             (LaneKind::Audio, vec![clip(0, 0), clip(60, 1)]),

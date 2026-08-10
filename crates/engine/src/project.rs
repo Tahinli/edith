@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
 use crate::eq::EqParams;
+use crate::scale::FitPolicy;
 
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
@@ -95,6 +96,13 @@ pub struct Clip {
     /// plays ungraded. An index for [`Clip::eq`]'s reason, and with the same
     /// promises: `Copy`, append-only within a session, never dangling.
     pub color: Option<u16>,
+    /// How this clip's picture meets a project canvas of another shape
+    /// ([`crate::scale::FitPolicy`]). Inline rather than a table index like the
+    /// two above: it is one byte with no parameters, so there is nothing for a
+    /// table to share, and a clip that is the project's own size never consults
+    /// it at all. [`FitPolicy::Fit`] is the default -- the whole picture, bars
+    /// where the aspect does not agree.
+    pub fit: FitPolicy,
 }
 
 impl Clip {
@@ -270,6 +278,7 @@ impl Project {
             link: Some(0),
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         Self {
             // A file is opened on its first audio stream: nothing has picked
@@ -491,6 +500,7 @@ impl Project {
             link: Some(self.new_link()),
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         for data in &mut self.lanes {
             data.clips.push(clip);
@@ -647,6 +657,27 @@ impl Project {
         };
         self.snapshot();
         self.lane_mut(lane).expect("checked above")[idx].color = slot;
+        true
+    }
+
+    /// How the clip at `idx` of `lane` meets a project canvas of another shape.
+    /// [`FitPolicy::Fit`] for an index that is not there, which is the default
+    /// every clip starts at anyway.
+    pub fn fit_of(&self, lane: Lane, idx: usize) -> FitPolicy {
+        self.lane(lane)
+            .get(idx)
+            .map_or(FitPolicy::default(), |c| c.fit)
+    }
+
+    /// Sets it. One undo step like every other edit, and `false` (with no
+    /// history) for an index that is not there. Unlike an eq or a grade there is
+    /// no "off": every clip has a policy, and `Fit` is what "off" would mean.
+    pub fn set_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].fit = fit;
         true
     }
 
@@ -818,6 +849,14 @@ impl Project {
     pub fn composite_color_at(&self, timeline_frame: u32) -> Option<&ColorParams> {
         let (lane, idx) = self.composite_clip_at(timeline_frame)?;
         self.color_of(lane, idx)
+    }
+
+    /// How the composite meets the project canvas at `timeline_frame`, so the
+    /// picture playback composes and the one an export encodes are placed from
+    /// one answer. `Fit` over a gap, where black is already the canvas.
+    pub fn composite_fit_at(&self, timeline_frame: u32) -> FitPolicy {
+        self.composite_clip_at(timeline_frame)
+            .map_or(FitPolicy::default(), |(lane, idx)| self.fit_of(lane, idx))
     }
 
     /// [`spans_from`](Project::spans_from) over the composite: every stretch the
@@ -1427,6 +1466,7 @@ mod tests {
             link: None,
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         }
     }
 
@@ -1621,6 +1661,23 @@ mod tests {
         assert_eq!(p.span_at(Lane::V1, 9), None);
     }
 
+    /// The fit policy is one byte *in* the clip rather than an index into a
+    /// table like the eq and the grade: there is nothing for a table to share.
+    /// It costs the clip nothing at all -- the fields before it (a `usize`
+    /// source and two `Option<u16>`s) already left the struct padded to 40
+    /// bytes, and the byte landed in that padding. This is the assert that says
+    /// so: a clip that grew a word grew every undo snapshot and every clipboard
+    /// copy with it.
+    #[test]
+    fn a_fit_policy_costs_the_clip_no_word() {
+        assert_eq!(
+            std::mem::size_of::<Clip>(),
+            40,
+            "Clip changed size: {} bytes",
+            std::mem::size_of::<Clip>()
+        );
+    }
+
     /// The clip a copy would hand back: source `[100, 102)`, unrelated to
     /// anything in `three()` so it is recognisable wherever it lands.
     const PASTED: Clip = Clip {
@@ -1631,6 +1688,7 @@ mod tests {
         link: None,
         eq: None,
         color: None,
+        fit: FitPolicy::Fit,
     };
 
     #[test]
@@ -2392,6 +2450,7 @@ mod tests {
         let graded = |i: u16| {
             vec![Clip {
                 color: Some(i),
+                fit: FitPolicy::default(),
                 ..video[0]
             }]
         };
@@ -2452,6 +2511,7 @@ mod tests {
             link: Some(link),
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
 
         // The door: named errors, one per cause.
@@ -2799,6 +2859,7 @@ mod tests {
             link: Some(link),
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         let lanes = vec![
             LaneData {
@@ -2832,6 +2893,7 @@ mod tests {
             link: Some(link),
             eq: None,
             color: None,
+            fit: FitPolicy::default(),
         };
         // V1, A1, V2, A2 -- one take over [0, 4) on all four.
         let kinds = [
