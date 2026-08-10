@@ -1186,7 +1186,7 @@ impl PlaybackSession {
     /// [`import`](Self::import) refuses a file with. One output device and one
     /// copied AAC track mean one set of audio parameters for the whole
     /// timeline, so a 22 kHz mono track cannot join a 44.1 kHz stereo one --
-    /// there is no resampler here, and no AAC encoder to write the join with.
+    /// there is no resampler here to make one rate of two.
     /// A front-end greys such a row out; this is the backstop that keeps a
     /// stale one from making the whole timeline silent.
     ///
