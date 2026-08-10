@@ -46,6 +46,20 @@ pub fn is_audio(path: &std::path::Path) -> bool {
     })
 }
 
+/// The largest picture this engine composes onto, either way: 8K, which is where
+/// a per-frame buffer stops being a sane thing to allocate.
+pub const MAX_RESOLUTION: u32 = 7680;
+
+/// Whether a project resolution is a picture at all: not zero either way, and
+/// not past [`MAX_RESOLUTION`]. Both doors ask -- the keystroke
+/// ([`PlaybackSession::set_resolution`](playback::PlaybackSession::set_resolution))
+/// and the file ([`edith::load`]) -- so a hand-written `resolution` line cannot
+/// reach an allocation a keypress could not, which is how `4294967295` used to
+/// panic the open with a capacity overflow.
+pub fn is_resolution(width: u32, height: u32) -> bool {
+    (1..=MAX_RESOLUTION).contains(&width) && (1..=MAX_RESOLUTION).contains(&height)
+}
+
 /// Boxed error; the engine has few failure modes and every one of them is fatal
 /// to the session, so a message is all a caller can act on.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
