@@ -23,6 +23,7 @@ use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::decode::{DecodeSession, Frame, Worker};
 use crate::demux::{Demuxer, VideoMeta};
+use crate::eq::EqParams;
 use crate::project::{Clip, Lane, LaneKind, Project, Source, Span};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -472,6 +473,27 @@ impl PlaybackSession {
             .regroup(secs_to_frame(timeline_secs, self.meta.frame_rate))
     }
 
+    /// What the clip at `idx` of `lane` is equalized with, or `None` for one
+    /// that plays flat -- what a card shows before it lets anyone drag a band.
+    pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {
+        self.project.eq_of(lane, idx)
+    }
+
+    /// Gives that clip an equalizer, or takes it off with `None`. One undo step,
+    /// like every other edit -- and, like every other edit, it *reseeks*: the
+    /// audio workers are rebuilt from the new curves right where the playhead
+    /// is, so a band changed during playback is heard from the next chunk on
+    /// rather than at the next play. `false` for a bad index or a non-finite
+    /// band, and nothing changes.
+    ///
+    /// ponytail: the reseek is what makes it live, so the cost of a change is a
+    /// decoder restart -- inaudible at a drag's end, but too much to call once
+    /// per pointer sample (a caller commits one change per gesture). Upgrade
+    /// path is an `Arc` swap the running worker polls per chunk.
+    pub fn set_eq(&mut self, lane: Lane, idx: usize, params: Option<EqParams>) -> bool {
+        self.edit(|p| p.set_eq(lane, idx, params))
+    }
+
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
     /// silence on the audio one, and nothing else moves. Reseeks, because what
     /// the playhead sits on has changed. `false` for a bad index and for the
@@ -783,10 +805,17 @@ impl PlaybackSession {
             // hears is every lane at once, and a lane's own gaps are silence in
             // it rather than a hole in the count the master clock keeps.
             let segs = self.project.audio_segments_from(target, fps);
+            // The equalizers beside them, one per segment: the worker filters a
+            // segment's own samples before the mix, so a clip's curve reaches
+            // that clip and stops. Rebuilt on every seek, which is what makes an
+            // EQ edit audible at once -- `edit` reseeks, so the drag that
+            // changed a band restarts the workers with the new curve already in
+            // them, and no live channel has to reach into a running one.
+            let eqs = self.project.audio_eqs_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
-            audio_running = match AudioSession::open_mixed_streams(&sources, &segs) {
+            audio_running = match AudioSession::open_mixed_streams_eq(&sources, &segs, &eqs) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };

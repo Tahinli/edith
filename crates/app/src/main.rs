@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::audio::StreamInfo;
+use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source};
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
@@ -215,13 +216,27 @@ struct ContextMenu {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 5] = [
+const MENU_ITEMS: [ActionId; 6] = [
     ActionId::Cut,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
+    ActionId::Equalizer,
     ActionId::ToggleMute,
 ];
+
+/// How far a band may be pushed either way, in dB. The engine clamps nothing
+/// here -- it will filter whatever it is given -- so this is a UI decision:
+/// past about this a peaking band stops sounding like tone and starts sounding
+/// like a fault.
+const EQ_GAIN_LIMIT: f32 = 12.;
+
+/// One dB per keystroke, which is roughly the smallest step anyone hears on a
+/// single band.
+const EQ_STEP: f32 = 1.;
+
+/// The gain bar's height inside a band row.
+const EQ_BAR_H: f32 = 6.;
 
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
@@ -317,6 +332,26 @@ struct Player {
     /// Which file the card will write. Kept across closes like the quality, and
     /// what [`Player::export_path`](Player) is named after.
     format: Format,
+    /// The equalizer card is up on this clip -- the lane and index it was
+    /// opened on. Held rather than re-read from `selected` every paint because
+    /// the card is modal: while it is up nothing else can move an index, and
+    /// the one edit it makes (`set_eq`) moves none.
+    eq_open: Option<(Lane, usize)>,
+    /// The curve the card is showing, which is the clip's own or the flat
+    /// five-band default. Edited live and written at the clip once per gesture
+    /// ([`Player::commit_eq`]): the project's equalizer table is append-only, so
+    /// a write per pointer sample would be a table entry -- and an undo step --
+    /// per pixel.
+    eq_params: EqParams,
+    /// Which band the keyboard moves, and which one a drag is holding.
+    eq_band: usize,
+    /// A band's bar is being dragged. Tracked on the root like `scrubbing`, for
+    /// the same reason: the pointer leaves the 6 px bar immediately.
+    eq_dragging: bool,
+    /// A band bar's own box, recorded at prepaint. One probe for five rows:
+    /// they are laid out identically and only the *x* of a click is read
+    /// ([`frac_along`]), so whichever row painted last answers for all of them.
+    eq_bar: Rc<Cell<Bounds<Pixels>>>,
     /// The action whose row is waiting for a stroke. The next key that is
     /// neither escape nor a lone modifier becomes the whole of what reaches it.
     rebinding: Option<ActionId>,
@@ -431,6 +466,7 @@ impl Player {
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
+            ActionId::Equalizer => self.open_eq(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -441,7 +477,103 @@ impl Player {
     /// out of reach, so a right-click there opens no menu -- the same rule the
     /// key handler and the drop target already follow.
     fn modal(&self) -> bool {
-        self.keys_open || self.export_open || self.exporting().is_some()
+        self.keys_open || self.export_open || self.eq_open.is_some() || self.exporting().is_some()
+    }
+
+    /// Opens the equalizer on the selected clip. Audio only, and it says so
+    /// rather than opening a card of bands that would reach nothing: a video
+    /// clip carries no sound of its own here (the sound is the audio lane's),
+    /// and the model would take the setting without anything ever playing it.
+    fn open_eq(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let refusal = match (self.selected, &self.session) {
+            (_, None) => Some("NO TIMELINE — open a file first"),
+            (None, _) => Some("NOTHING SELECTED — click an audio clip, then ask again"),
+            (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
+                "NOT AN AUDIO CLIP — the equalizer works on the sound, so pick a clip in an audio lane",
+            ),
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            self.notice = Some(refusal.into());
+            cx.notify();
+            return;
+        }
+        let (lane, idx) = self.selected.expect("checked above");
+        let session = self.session.as_ref().expect("checked above");
+        // What the clip already plays through, or the flat default -- so the
+        // card opens on the curve that is in force and a reopen shows the last
+        // drag rather than a fresh set of zeroes.
+        self.eq_params = session
+            .eq_of(lane, idx)
+            .cloned()
+            .unwrap_or_else(EqParams::default_layout);
+        self.eq_band = 0;
+        self.eq_dragging = false;
+        self.eq_open = Some((lane, idx));
+        // One card at a time, the rule the other two already follow.
+        self.keys_open = false;
+        self.export_open = false;
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Writes what the card is showing at its clip: one undo step, one entry in
+    /// the append-only equalizer table, so this is called once per *gesture* --
+    /// the end of a drag, a keystroke -- and never per pointer sample.
+    ///
+    /// A curve that moves nothing is stored as *no* equalizer at all, which is
+    /// what keeps a clip nobody has touched on the identity path through
+    /// playback and export (`engine::eq::EqParams::is_identity`).
+    fn commit_eq(&mut self, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.eq_open else {
+            return;
+        };
+        let params = (!self.eq_params.is_identity()).then(|| self.eq_params.clone());
+        if let Some(session) = &mut self.session {
+            session.set_eq(lane, idx, params);
+        }
+        // `set_eq` reseeks inside the engine -- that is what makes the change
+        // audible at once -- and a reseek is what these flags are about.
+        self.reset_after_reseek();
+        cx.notify();
+    }
+
+    /// Moves one band and says whether anything changed. Live only: the write
+    /// is [`commit_eq`](Player::commit_eq)'s.
+    fn set_band(&mut self, band: usize, gain_db: f32) -> bool {
+        let gain_db = gain_db.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
+        match self.eq_params.bands.get_mut(band) {
+            Some(b) if b.gain_db != gain_db => {
+                b.gain_db = gain_db;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The keyboard's version of a drag: one step on the picked band, committed
+    /// straight away -- a keystroke has no release to wait for.
+    fn nudge_band(&mut self, by: f32, cx: &mut Context<Self>) {
+        let gain = self
+            .eq_params
+            .bands
+            .get(self.eq_band)
+            .map_or(0., |b| b.gain_db);
+        if self.set_band(self.eq_band, gain + by) {
+            self.commit_eq(cx);
+        }
+    }
+
+    /// Where the pointer sits along a band's bar, as a gain: the middle is flat
+    /// and the two ends are the limit either way.
+    fn drag_band(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let gain = (frac_along(x, self.eq_bar.get()) * 2. - 1.) * EQ_GAIN_LIMIT;
+        if self.set_band(self.eq_band, gain) {
+            cx.notify();
+        }
     }
 
     /// Jumps the timeline.
@@ -1231,6 +1363,38 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // And the equalizer card, the same way again. Its own strokes
+                // are the card's input, exactly as the export card's digits
+                // are: a band reachable only by dragging is a band a keyboard
+                // cannot move at all, and every one of them is listed in the
+                // keys menu (keymap.rs `FIXED`) rather than being a secret.
+                if this.eq_open.is_some() {
+                    if key == ESCAPE {
+                        // Nothing to undo: every change is already at the clip,
+                        // and undo is undo's own key.
+                        this.eq_open = None;
+                        this.eq_dragging = false;
+                    } else if key == "up" {
+                        this.nudge_band(EQ_STEP, cx);
+                    } else if key == "down" {
+                        this.nudge_band(-EQ_STEP, cx);
+                    } else if key == "r" {
+                        for band in &mut this.eq_params.bands {
+                            band.gain_db = 0.;
+                        }
+                        this.commit_eq(cx);
+                    } else if let Ok(digit) = key.parse::<usize>() {
+                        // 1-based, as the rows are numbered on screen; a digit
+                        // past the last band picks nothing rather than panics.
+                        if let Some(band) = digit.checked_sub(1)
+                            && band < this.eq_params.bands.len()
+                        {
+                            this.eq_band = band;
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
@@ -1256,7 +1420,7 @@ impl Render for Player {
                 // sibling it can stop. The export card is over the timeline for
                 // the same reason: importing under it would change the very
                 // edit list the card is about to write out.
-                if this.keys_open || this.export_open {
+                if this.keys_open || this.export_open || this.eq_open.is_some() {
                     return;
                 }
                 for path in paths.paths() {
@@ -1272,6 +1436,20 @@ impl Render for Player {
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                // A band's bar is 6 px tall and the pointer leaves it at once,
+                // so the equalizer drag is tracked here for the ruler's reason.
+                if this.eq_dragging {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_band(event.position.x, cx);
+                    } else {
+                        // Released outside the window: the up below never came,
+                        // so this is where the gesture ends -- and it still owes
+                        // the one write the whole drag is worth.
+                        this.eq_dragging = false;
+                        this.commit_eq(cx);
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -1287,6 +1465,13 @@ impl Render for Player {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    if std::mem::take(&mut this.eq_dragging) {
+                        // The release lands exactly, then the gesture is written
+                        // once -- the append-only table's whole reason.
+                        this.drag_band(event.position.x, cx);
+                        this.commit_eq(cx);
+                        return;
+                    }
                     if std::mem::take(&mut this.scrubbing) {
                         this.scrub_to(event.position.x, true, cx);
                     }
@@ -1359,6 +1544,7 @@ impl Render for Player {
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
             .children(self.export_card(cx))
+            .children(self.eq_card(cx))
     }
 }
 
@@ -2167,6 +2353,158 @@ impl Player {
         )
     }
 
+    /// The equalizer of one audio clip: a row per band, each a bar that reads
+    /// flat in the middle and is dragged either way, and a row that flattens
+    /// them all. The same scrim, width and rows as the other two cards, and the
+    /// same plain divs -- nothing here takes focus, so the root keeps the
+    /// keyboard and the card's own strokes (`1`–`5`, up, down, `r`) reach it.
+    ///
+    /// Every change is written at the clip as it is made
+    /// ([`Player::commit_eq`]), so what the card shows is always what is
+    /// playing: there is no OK button to forget, and closing it changes
+    /// nothing. What takes a curve back off is undo, like every other edit.
+    fn eq_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (lane, idx) = self.eq_open?;
+        let rows: Vec<_> = self
+            .eq_params
+            .bands
+            .iter()
+            .enumerate()
+            .map(|(i, band)| {
+                let (left, width) = eq_fill(band.gain_db);
+                div()
+                    .id(("eq-band", i))
+                    .flex()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .when(i == self.eq_band, |d| d.bg(rgb(SELECTED)))
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    // The press picks the band *and* is already the first
+                    // sample of the drag, so a plain click sets a value.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.eq_band = i;
+                            this.eq_dragging = true;
+                            this.drag_band(event.position.x, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            // Wide enough for "12 kHz high shelf", so the bars
+                            // below each other all start at the same pixel.
+                            .w(px(112.))
+                            .text_size(px(11.))
+                            .child(format!("{} {}", i + 1, band_label(band))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(EQ_BAR_H))
+                            .rounded(px(3.))
+                            .bg(rgb(SURFACE))
+                            .child(bounds_probe(self.eq_bar.clone()))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(relative(left))
+                                    .w(relative(width))
+                                    .h_full()
+                                    .rounded(px(3.))
+                                    .bg(rgb(ACCENT)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            // Fixed, so a sign or a second digit appearing does
+                            // not shift the bar beside it mid-drag.
+                            .w(px(56.))
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("{:+.1} dB", band.gain_db)),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(KEYS_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        // Which clip, because the card is modal and the lane it
+                        // was opened from is behind a scrim by the time it is up.
+                        .child(div().flex_none().px(px(6.)).child(format!(
+                            "Equalizer — {} clip {}",
+                            lane.label(),
+                            idx + 1
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(self.notice.clone().unwrap_or_else(|| {
+                                    "drag a band, or 1–5 then up/down — esc closes".into()
+                                })),
+                        )
+                        // Five rows fit a 360 px window, but the layout is data
+                        // (a file may carry any number of bands), so the list
+                        // scrolls like the other two cards' do.
+                        .child(
+                            div()
+                                .id("eq-rows")
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .max_h(px(EXPORT_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .id("eq-reset")
+                                .mt(px(4.))
+                                .flex()
+                                .h(px(CONTROL_H))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(rgb(SELECTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    for band in &mut this.eq_params.bands {
+                                        band.gain_db = 0.;
+                                    }
+                                    this.commit_eq(cx);
+                                }))
+                                .child("Flatten"),
+                        ),
+                ),
+        )
+    }
+
     /// The menu a right-click on a clip opens: what that clip can be given,
     /// each item beside the stroke that does the very same thing, and a
     /// turn-over side that says what the clip *is*. An item that would do
@@ -2242,7 +2580,7 @@ impl Player {
             }
         } else {
             for action in MENU_ITEMS {
-                let enabled = applicable(&clip, action, playhead);
+                let enabled = applicable(&clip, menu.lane, action, playhead);
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
@@ -2750,11 +3088,44 @@ fn frame_at(secs: f64, fps: f64) -> u32 {
     (secs * fps + 1e-6).floor().max(0.) as u32
 }
 
+/// A band's bar as `(left, width)` in fractions of the track: the fill grows
+/// out of the *middle*, which is flat, towards whichever end the gain went --
+/// a bar that filled from the left would read a -12 dB cut as an empty control
+/// and 0 dB as a half-off one. The inverse of [`Player::drag_band`]'s reading
+/// of a click, and clamped like it, so a curve loaded from a file with a gain
+/// past the card's limit paints at the end of the bar rather than outside it.
+fn eq_fill(gain_db: f32) -> (f32, f32) {
+    let at = (gain_db / EQ_GAIN_LIMIT).clamp(-1., 1.) / 2. + 0.5;
+    match at >= 0.5 {
+        true => (0.5, at - 0.5),
+        false => (at, 0.5 - at),
+    }
+}
+
+/// What a band row calls itself: the corner or centre frequency, and for a
+/// shelf the fact that it tilts everything past it -- which is the difference
+/// between "12 kHz" moving the last octave and moving one band inside it.
+fn band_label(band: &Band) -> String {
+    let freq = match band.freq_hz >= 1000. {
+        true => format!("{:.0} kHz", band.freq_hz / 1000.),
+        false => format!("{:.0} Hz", band.freq_hz),
+    };
+    match band.kind {
+        BandKind::LowShelf => format!("{freq} low shelf"),
+        BandKind::HighShelf => format!("{freq} high shelf"),
+        BandKind::Peak => freq,
+    }
+}
+
 /// Whether the clip menu offers `action` on the clip it was opened on. Two of
 /// the items act on the *playhead* rather than on the clip, so a menu opened
-/// away from it dims them instead of looking broken when they are clicked.
-fn applicable(clip: &Clip, action: ActionId, playhead: u32) -> bool {
+/// away from it dims them instead of looking broken when they are clicked, and
+/// one acts on sound, which only an audio lane's clip has.
+fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool {
     match action {
+        // The equalizer filters samples, and a video clip has none of its own
+        // here: the sound is the audio lane's, clip for clip.
+        ActionId::Equalizer => lane.kind == LaneKind::Audio,
         // Splits this clip only from inside it: at either edge there is nothing
         // to split off (project.rs `splittable`).
         ActionId::Cut => clip.start < playhead && playhead < clip.end(),
@@ -3427,15 +3798,15 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, CONTROL_H, Clip, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_W, HIT_MIN,
-        INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LETTERBOX,
-        LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H,
-        RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W, Source, StreamInfo, Volume,
-        WAVE_BPS, WAVE_COL, Wave, applicable, can_add, cancels_export, envelope, export_path,
-        export_settings, format_line, frac_along, frame_at, is_bare_modifier, is_project, keymap,
-        lane_clips, marked, menu_at, normalise, project_path, push_digit, retarget, scrub_due,
-        show_label, source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources,
-        width_frac, window_title,
+        ACCENT, CONTROL_H, Clip, EQ_BAR_H, EQ_GAIN_LIMIT, EXPORT_ROWS_H, FORMATS, Format,
+        HEADER_GAP, HEADER_W, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
+        LABEL_MIN_W, LANE_H, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W,
+        NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SOURCE_TINTS, SURFACE, SWATCH_W,
+        Source, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
+        cancels_export, envelope, eq_fill, export_path, export_settings, format_line, frac_along,
+        frame_at, is_bare_modifier, is_project, keymap, lane_clips, marked, menu_at, normalise,
+        project_path, push_digit, retarget, scrub_due, show_label, source_frames, source_tint,
+        start_frac, timecode, unseen_paths, unseen_sources, width_frac, window_title,
     };
     use super::{file_name, library_rows};
     use engine::PlaybackSession;
@@ -3655,20 +4026,27 @@ mod tests {
         };
         assert_eq!(clip.end(), 90);
         // Cut splits from inside only: neither edge has anything to split off.
-        assert!(applicable(&clip, ActionId::Cut, 31));
-        assert!(applicable(&clip, ActionId::Cut, 89));
-        assert!(!applicable(&clip, ActionId::Cut, 30));
-        assert!(!applicable(&clip, ActionId::Cut, 90));
-        assert!(!applicable(&clip, ActionId::Cut, 200));
+        let a1 = Lane::A1;
+        let v1 = Lane::V1;
+        assert!(applicable(&clip, v1, ActionId::Cut, 31));
+        assert!(applicable(&clip, v1, ActionId::Cut, 89));
+        assert!(!applicable(&clip, v1, ActionId::Cut, 30));
+        assert!(!applicable(&clip, v1, ActionId::Cut, 90));
+        assert!(!applicable(&clip, v1, ActionId::Cut, 200));
         // Regroup is the other way round: only where this clip meets another.
-        assert!(applicable(&clip, ActionId::Regroup, 30));
-        assert!(applicable(&clip, ActionId::Regroup, 90));
-        assert!(!applicable(&clip, ActionId::Regroup, 60));
+        assert!(applicable(&clip, v1, ActionId::Regroup, 30));
+        assert!(applicable(&clip, v1, ActionId::Regroup, 90));
+        assert!(!applicable(&clip, v1, ActionId::Regroup, 60));
+        // The equalizer is the one item the *lane* decides: it filters samples,
+        // and a video clip has none of its own. Never the playhead's business.
+        assert!(applicable(&clip, a1, ActionId::Equalizer, 0));
+        assert!(applicable(&clip, a1, ActionId::Equalizer, 60));
+        assert!(!applicable(&clip, v1, ActionId::Equalizer, 60));
         // The rest act on the clip that was clicked, so they always mean
         // something -- the engine words its own refusals.
         for action in [ActionId::Delete, ActionId::Lift, ActionId::ToggleMute] {
-            assert!(applicable(&clip, action, 0));
-            assert!(applicable(&clip, action, 60));
+            assert!(applicable(&clip, v1, action, 0));
+            assert!(applicable(&clip, a1, action, 60));
         }
         // The playhead frame is the engine's own rule, boundary included.
         assert_eq!(frame_at(1.0, 30.), 30);
@@ -4088,6 +4466,77 @@ mod tests {
         // The rows are clickable, so WCAG 2.5.8 binds them like every other
         // target in this window.
         assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+
+    /// The equalizer card: what its bars paint, and that it fits the window the
+    /// other two cards are sized for. The bar is the one bit of geometry in the
+    /// card, and it is signed -- a fill that grew from the left would read a cut
+    /// as an empty control -- so it is checked against the reading of a click,
+    /// which is the same mapping backwards ([`Player::drag_band`]).
+    #[test]
+    fn the_equalizer_bar_grows_out_of_flat_and_the_card_fits_the_smallest_window() {
+        use engine::eq::{Band, BandKind, EqParams};
+        // Flat is the middle and paints nothing: a band nobody has touched must
+        // not look like one that has been turned down.
+        assert_eq!(eq_fill(0.), (0.5, 0.));
+        // Full boost fills the right half, full cut the left one.
+        assert_eq!(eq_fill(EQ_GAIN_LIMIT), (0.5, 0.5));
+        assert_eq!(eq_fill(-EQ_GAIN_LIMIT), (0., 0.5));
+        assert_eq!(eq_fill(EQ_GAIN_LIMIT / 2.), (0.5, 0.25));
+        assert_eq!(eq_fill(-EQ_GAIN_LIMIT / 2.), (0.25, 0.25));
+        // A file may carry a gain past what this card offers (the format writes
+        // any finite value): it paints at the end, never off the track.
+        assert_eq!(eq_fill(400.), (0.5, 0.5));
+        assert_eq!(eq_fill(-400.), (0., 0.5));
+
+        // A click reads back as the gain that paints where it landed, which is
+        // what makes a drag land where the pointer is.
+        for gain in [-12., -6., 0., 6., 12.] {
+            let (left, width) = eq_fill(gain);
+            let at = if gain >= 0. { left + width } else { left };
+            let read = (at * 2. - 1.) * EQ_GAIN_LIMIT;
+            assert!((read - gain).abs() < 1e-4, "{gain} read back as {read}");
+        }
+
+        // Every default band says what it is, and a shelf says so: "12 kHz"
+        // alone would not tell anyone it tilts the whole top octave.
+        let labels: Vec<String> = EqParams::default_layout()
+            .bands
+            .iter()
+            .map(band_label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "80 Hz low shelf",
+                "250 Hz",
+                "1 kHz",
+                "4 kHz",
+                "12 kHz high shelf"
+            ]
+        );
+        assert_eq!(
+            band_label(&Band {
+                freq_hz: 2600.,
+                gain_db: 0.,
+                q: 1.,
+                kind: BandKind::Peak
+            }),
+            "3 kHz",
+            "rounded, because a band label is not a measurement"
+        );
+
+        // The same shape as the other two cards, so it fits where they do.
+        let (title, status, gaps, padding) = (17., 28., 3. * 2., 24.);
+        assert!(
+            title + status + EXPORT_ROWS_H + gaps + padding + CONTROL_H <= 360.,
+            "card too tall"
+        );
+        assert!(KEYS_W <= 640., "card too wide");
+        // The rows are dragged, so WCAG 2.5.8 binds them like every other
+        // target in this window -- the 6 px bar is inside a full-height row.
+        assert!(KEYS_ROW_H >= HIT_MIN);
+        assert!(EQ_BAR_H < KEYS_ROW_H);
     }
 
     /// Mute and level are one control with two states, and the whole point is
@@ -4597,6 +5046,13 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     export_open: false,
+                    eq_open: None,
+                    // Replaced by the clip's own curve the moment the card
+                    // opens; nothing reads it before that.
+                    eq_params: EqParams::default(),
+                    eq_band: 0,
+                    eq_dragging: false,
+                    eq_bar: Rc::default(),
                     // What an export is until someone says otherwise: the
                     // bitrate the picture asks for.
                     quality: Quality::Auto,
