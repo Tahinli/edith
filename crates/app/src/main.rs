@@ -549,8 +549,27 @@ impl Player {
     /// moves along rather than being painted over. Reseeks like every other
     /// edit, and drops the timeline's selection with it: the insert has just
     /// moved the indices it pointed at.
-    fn insert_source(&mut self, source: usize, cx: &mut Context<Self>) {
+    fn insert_source(&mut self, source: usize, onto: Option<Lane>, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
+            return;
+        }
+        // A file with no picture belongs on the audio lane and nowhere else:
+        // dropped on the video lane it is refused by name, and asked for by the
+        // Add button (which names no lane) it goes to the audio one.
+        let songs: bool = self
+            .session
+            .as_ref()
+            .and_then(|session| session.sources().get(source))
+            .is_some_and(|path| engine::is_audio(path));
+        if songs && onto == Some(Lane::Video) {
+            let name = self
+                .session
+                .as_ref()
+                .map_or_else(String::new, |session| file_name(&session.sources()[source]));
+            self.notice = Some(
+                format!("NOT ON THE VIDEO LANE — {name} has no picture; drop it on A1").into(),
+            );
+            cx.notify();
             return;
         }
         let clip = self.session.as_ref().and_then(|session| {
@@ -567,6 +586,12 @@ impl Player {
             })
         });
         let added = match (&mut self.session, clip) {
+            // One lane, no ripple: there is nothing on the video lane to move
+            // along with it, and a song laid over the picture is what dropping
+            // it at the playhead means.
+            (Some(session), Some(clip)) if songs => {
+                session.place_at(Lane::Audio, session.now(), clip)
+            }
             (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
             _ => false,
         };
@@ -1218,6 +1243,13 @@ impl Player {
                     .map_or(0, |session| source_frames(lane_clips(session), i));
                 let name: SharedString = file_name(path).into();
                 let tip: SharedString = match meta {
+                    // A file with no picture has no size and no frame rate to
+                    // report, and only one lane it can go on: saying so is the
+                    // difference between a hint and a lie.
+                    _ if engine::is_audio(path) => format!(
+                        "{} — audio only · drag onto the audio lane, or Add at playhead",
+                        path.display()
+                    ),
                     Some(meta) => format!(
                         "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
                         path.display(),
@@ -1347,7 +1379,9 @@ impl Player {
                 can_add(self.selected_asset, self.session.is_some(), exporting),
                 cx.listener(|this, _: &ClickEvent, _, cx| {
                     if let Some(source) = this.selected_asset {
-                        this.insert_source(source, cx);
+                        // No lane: the button means "wherever this belongs",
+                        // which for a file with no picture is the audio lane.
+                        this.insert_source(source, None, cx);
                     }
                 }),
             ))
@@ -1944,9 +1978,9 @@ impl Player {
                     // Add button makes, through the same call -- at the
                     // playhead, not at the pointer: clips here are placed end
                     // to end, so where along the bed it landed says nothing.
-                    .on_drop(
-                        cx.listener(|this, drag: &AssetDrag, _, cx| this.insert_source(drag.0, cx)),
-                    )
+                    .on_drop(cx.listener(move |this, drag: &AssetDrag, _, cx| {
+                        this.insert_source(drag.0, Some(lane), cx)
+                    }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         let (start, len) = (

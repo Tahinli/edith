@@ -10,3 +10,22 @@ mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
+# The umbrella crate for the standalone audio files: one dependency instead of
+# seven, and its `default::get_probe`/`get_codecs` are the registries this would
+# otherwise hand-build. Explicit feature list rather than the default one -- no
+# mkv, no ape, no adpcm: what is listed here is exactly what `is_audio` admits.
+# There is no opus/ac3/dts feature at any symphonia version, which is why those
+# are refused rather than promised.
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac",
+    "alac",
+    "flac",
+    "id3v1",
+    "id3v2",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
