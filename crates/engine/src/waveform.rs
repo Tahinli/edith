@@ -165,7 +165,9 @@ mod tests {
         // that is what this refuses.
         assert_ne!(zero, one, "both streams drew the same envelope");
         assert_ne!(zero[0], one[0], "...and they differ from the first bucket");
-        // A stream that does not decode is refused, not drawn as silence.
-        assert!(peaks(&multi, 2, BPS).is_err(), "AC-3 has no envelope");
+        // Stream 2 is AC-3, and it decodes now: it draws its own envelope like
+        // any other stream rather than being refused.
+        let two = peaks(&multi, 2, BPS).expect("AC-3 opens").expect("stream 2");
+        assert!(!two.is_empty(), "the AC-3 stream drew nothing");
     }
 }

@@ -117,24 +117,59 @@ fn video_only_file_has_no_audio() {
     );
 }
 
-/// Sound we cannot decode must not be silence we say nothing about: the AC-3
-/// fixture opens as picture-only and the session carries the reason a
-/// front-end shows (`Player::open_media`).
+/// Both ends of the AC-3 path decode: the 44.1 kHz **mono** fixture stays the
+/// mono source it is, and the 48 kHz **5.1** one — the shape a BluRay remux has
+/// — arrives as stereo, downmixed by the decoder itself (A/52 §7.8). Both play
+/// their two seconds, at a level that is neither silence nor clipping, and
+/// neither owes the session an excuse.
 #[test]
-fn an_undecodable_audio_track_is_named() {
-    let path = asset("test_ac3.mp4");
+fn an_ac3_track_decodes_and_51_comes_down_to_stereo() {
+    for (name, rate, channels) in [("test_ac3.mp4", 44100, 1), ("test_ac3_51.mp4", 48000, 2)] {
+        let path = asset(name);
+        let (meta, rx) = AudioSession::open(&path)
+            .expect("open")
+            .expect("AC-3 decodes now");
+        assert_eq!((meta.sample_rate, meta.channels), (rate, channels), "{name}");
+        let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+        let secs = (samples.len() / channels as usize) as f64 / f64::from(rate);
+        assert!(
+            (1.9..2.1).contains(&secs),
+            "{name} is two seconds, decoded {secs:.3}s"
+        );
+        // The 440 Hz sine survives at a sane level. The vetting caveat was an
+        // LFE passthrough running hot, which the built-in downmix is what
+        // avoids; this is that level check, and it is also what catches a
+        // downmix that comes out silent.
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(
+            (0.005..0.75).contains(&rms),
+            "{name}: RMS {rms:.6} is not a sine at a sane level"
+        );
+        assert!(
+            samples.iter().all(|s| s.abs() <= 1.0),
+            "{name}: the decode must not leave the device's range"
+        );
+        let session = engine::PlaybackSession::open(&path).expect("open for playback");
+        assert_eq!(
+            session.audio_disabled_reason(),
+            None,
+            "{name}: a track that decodes owes no excuse"
+        );
+    }
+}
+
+/// An AC-3 source cannot be packet-copied into an mp4 -- there is no AAC
+/// encoder here -- and that refusal is named, never a silent silent export.
+#[test]
+fn an_ac3_source_refuses_an_mp4_audio_copy() {
+    let Err(err) = AudioSession::copy_segments(asset("test_ac3.mp4"), &[(0.0, 1.0)]) else {
+        panic!("AC-3 cannot become an mp4a track");
+    };
+    let err = err.to_string();
     assert!(
-        AudioSession::open(&path).expect("open").is_none(),
-        "AC-3 is not decodable here"
-    );
-    let reason = AudioSession::unsupported(&path)
-        .expect("probe")
-        .expect("the file has an audio track, so it owes a reason");
-    assert!(reason.contains("decode"), "unhelpful reason: {reason}");
-    let session = engine::PlaybackSession::open(&path).expect("open for playback");
-    assert_eq!(
-        session.audio_disabled_reason(),
-        Some(reason.as_str()),
-        "the session must carry it to the front-end"
+        err.contains("needs AAC audio") && err.contains("AC-3"),
+        "unhelpful refusal: {err}"
     );
 }

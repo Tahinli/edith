@@ -35,3 +35,5 @@ symphonia = { version = "0.6", default-features = false, features = [
     "vorbis",
     "wav",
 ] }
+oxideav-ac3 = "=0.0.10"
+oxideav-core = "0.1.34"
