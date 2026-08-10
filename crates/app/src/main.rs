@@ -400,6 +400,10 @@ struct Player {
     /// until it is answered -- any key retires it, so does a click on it -- so a
     /// failure is read in full instead of blinking past.
     notice: Option<SharedString>,
+    /// What the last finished export wrote, so the notice can be the way to it.
+    /// Only the [`EXPORT_DONE`] line reads it -- any later notice has replaced
+    /// that text -- so a click never opens a file the bar is not naming.
+    exported: Option<PathBuf>,
     /// What the compositor was last told this window is called. Setting a title
     /// is a protocol round trip and a repaint is sixty a second, so the title is
     /// pushed only when it is not this any more.
@@ -1533,7 +1537,12 @@ impl Player {
             return;
         }
         let text = match result {
-            Ok(()) => format!("EXPORT DONE → {}", file_name(&self.export_path)),
+            Ok(()) => {
+                // Written and still where it was written: the bar carries it
+                // until some other notice takes the bar.
+                self.exported = Some(self.export_path.clone());
+                format!("{EXPORT_DONE}{}", file_name(&self.export_path))
+            }
             Err(e) => format!("EXPORT FAILED: {e}"),
         };
         eprintln!("{text}");
@@ -2388,11 +2397,31 @@ impl Player {
     /// retires it (the key handler) and so does a click on it. Its own surface
     /// because the message is the point -- a failure cut to the timecode's slot
     /// is a failure nobody read.
+    ///
+    /// The export's own line is more than a message: it names a file that is
+    /// now on disk, so the same click that retires it shows that file in the
+    /// desktop's file manager.
     fn notice_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let notice = self.notice.clone()?;
+        // The path travels with the text it was written for: a later notice
+        // holds the bar and the click is a plain dismissal again.
+        let exported = self
+            .exported
+            .clone()
+            .filter(|_| notice.starts_with(EXPORT_DONE));
+        let hint = match exported {
+            Some(_) => "click — open file location",
+            None => "click or press any key to dismiss",
+        };
         Some(
             div()
                 .id("notice")
+                .when(exported.is_some(), |d| {
+                    d.tooltip(|_, cx| {
+                        cx.new(|_| Tip("Open file location — shows the export in the file manager".into()))
+                            .into()
+                    })
+                })
                 .flex_none()
                 .flex()
                 .items_start()
@@ -2402,7 +2431,14 @@ impl Player {
                 .bg(rgb(SURFACE))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(HOVER)))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    // Another process starting: off the UI thread, and it
+                    // outlives the notice it was asked from.
+                    if let Some(path) = exported.clone() {
+                        cx.background_executor()
+                            .spawn(async move { show_in_file_manager(&path) })
+                            .detach();
+                    }
                     this.notice = None;
                     cx.notify();
                 }))
@@ -2412,7 +2448,7 @@ impl Player {
                         .flex_none()
                         .text_size(px(11.))
                         .text_color(rgb(INK_DIM))
-                        .child("click or press any key to dismiss"),
+                        .child(hint),
                 ),
         )
     }
@@ -3477,6 +3513,61 @@ fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
 }
 
+/// How a finished export announces itself. Written by `poll_export` and read
+/// by the notice bar, which is what makes that one line clickable.
+const EXPORT_DONE: &str = "EXPORT DONE → ";
+
+/// The path as a URI the bus will take: percent-encoded, because an export
+/// lands wherever its source lives and those directories have spaces in them.
+/// Bytes, not chars -- a path is not required to be UTF-8.
+fn file_uri(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                uri.push(b as char)
+            }
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
+}
+
+/// Shows a file in the desktop's file manager, selected: the freedesktop
+/// interface every major one answers, asked for over the session bus. With no
+/// file manager on the bus the folder itself is the next best thing, and with
+/// neither there is nothing to say -- the notice the click retired was the
+/// answer, and a machine without a desktop opener is not one a second notice
+/// would help. Blocks on two child processes, so it is never called on the UI
+/// thread.
+fn show_in_file_manager(path: &std::path::Path) {
+    // The URI must be absolute; an export path is only as absolute as the
+    // source it was built from.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shown = std::process::Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.freedesktop.FileManager1",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1",
+            "ShowItems",
+            "ass",
+            "1",
+            &file_uri(&path),
+            "",
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if shown {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).status();
+    }
+}
+
 /// Runs the first chooser that is installed. `Some(None)` is a cancelled
 /// dialog; `None` is a machine with no chooser at all, and what still works
 /// without one differs per dialog, so the caller words that refusal.
@@ -4511,7 +4602,22 @@ mod tests {
         show_label, source_frames, source_tint, start_frac, timecode, unseen_paths, unseen_sources,
         whole_take, width_frac, window_title,
     };
-    use super::{file_name, library_rows};
+    use super::{file_name, file_uri, library_rows};
+
+    /// What the file manager is handed: the parts a path keeps as they are, and
+    /// the ones the bus would otherwise read as something else.
+    #[test]
+    fn file_uri_encodes_what_a_path_carries() {
+        assert_eq!(file_uri(std::path::Path::new("/a/b.mp4")), "file:///a/b.mp4");
+        assert_eq!(
+            file_uri(std::path::Path::new("/home/x/out dir/my export.mp4")),
+            "file:///home/x/out%20dir/my%20export.mp4"
+        );
+        assert_eq!(
+            file_uri(std::path::Path::new("/tmp/ünlü#1?.mp4")),
+            "file:///tmp/%C3%BCnl%C3%BC%231%3F.mp4"
+        );
+    }
     use engine::PlaybackSession;
     use engine::scale::FitPolicy;
     use gpui::{Bounds, Pixels, point, px, size};
@@ -5860,6 +5966,7 @@ fn main() {
                     format: Format::default(),
                     rebinding: None,
                     notice: notice.clone().map(SharedString::from),
+                    exported: None,
                     // Nothing pushed yet, and never a real title: the first
                     // render is what names the window.
                     titled: String::new(),
