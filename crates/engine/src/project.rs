@@ -919,12 +919,19 @@ impl Project {
         true
     }
 
-    /// Insert `clip` into *every* lane at `timeline_frame` as one new group,
-    /// pushing everything from there on later by its length -- the grouped,
-    /// rippling paste a clipboard does. Mid-clip the clip it lands in is split
-    /// around it; at or past the end of the timeline it is appended, because a
-    /// paste means "put it here", not "put it here and leave black in front".
+    /// Insert `clip` into the first lane of each kind at `timeline_frame` as one
+    /// new group, pushing everything from there on later by its length in
+    /// *every* lane -- the grouped, rippling paste a clipboard does. Mid-clip
+    /// the clip it lands in is split around it; at or past the end of the
+    /// timeline it is appended, because a paste means "put it here", not "put it
+    /// here and leave black in front".
     /// Use [`place`](Project::place) to paste into one lane, or to make a gap.
+    ///
+    /// `V1` and `A1` and no other lane, because a take is one picture and one
+    /// sound: copying it onto every lane there is would play the same audio
+    /// twice over (and leave an mp4 export with two tracks to copy). The room is
+    /// still opened everywhere, or the lanes it was not inserted into would slide
+    /// out of step with the ones it was.
     ///
     /// Exactly one history snapshot, so one [`Project::undo`] takes it back.
     /// Changes the timeline->source mapping: the caller must reseek. Refused
@@ -941,10 +948,16 @@ impl Project {
             link: Some(self.new_link()),
             ..clip
         };
-        for data in &mut self.lanes {
+        let takes: Vec<usize> = [LaneKind::Video, LaneKind::Audio]
+            .into_iter()
+            .filter_map(|kind| self.index(Lane::new(kind, 0)))
+            .collect();
+        for (i, data) in self.lanes.iter_mut().enumerate() {
             open_room(&mut data.clips, at, clip.len());
-            let idx = data.clips.partition_point(|c| c.start < at);
-            data.clips.insert(idx, clip);
+            if takes.contains(&i) {
+                let idx = data.clips.partition_point(|c| c.start < at);
+                data.clips.insert(idx, clip);
+            }
             debug_assert!(sorted_disjoint(&data.clips));
         }
         true
@@ -1001,7 +1014,15 @@ impl Project {
     /// -- the whole-group delete a single-lane front-end means. `false` for a
     /// bad index. Changes the mapping: the caller must reseek.
     pub fn delete(&mut self, idx: usize) -> bool {
-        let Some(clip) = self.clips().get(idx).copied() else {
+        self.delete_in(Lane::V1, idx)
+    }
+
+    /// [`delete`](Project::delete) for the lane the clip was picked on: the
+    /// clip's own span is cut out of *every* lane, so a take deletes whole from
+    /// whichever half of it was clicked. `false` for a bad index, and for a lane
+    /// that is not there.
+    pub fn delete_in(&mut self, lane: Lane, idx: usize) -> bool {
+        let Some(clip) = self.lane(lane).get(idx).copied() else {
             return false;
         };
         self.ripple_delete(clip.start, clip.len())
