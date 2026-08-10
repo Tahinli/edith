@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use engine::export::ExportSettings;
 use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, FocusHandle, KeyDownEvent,
@@ -120,6 +121,16 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
+    /// The export options card is up: what the export action opens now, so
+    /// nothing is written until the card's own button says so. One card at a
+    /// time -- opening either closes the other, since both are the whole window
+    /// and two stacked scrims say nothing about which one is listening.
+    export_open: bool,
+    /// Which quality row the card has picked, and the megabits typed against
+    /// the custom one. Kept across closes, so a second export offers what the
+    /// first one chose.
+    quality: Quality,
+    custom_mbps: u32,
     /// The action whose row is waiting for a stroke. The next key that is
     /// neither escape nor a lone modifier becomes the whole of what reaches it.
     rebinding: Option<ActionId>,
@@ -483,24 +494,82 @@ impl Player {
         self.export.as_ref().filter(|_| !self.cancelling)
     }
 
-    /// Writes the edit list out beside the source. Playback stops first: the
-    /// exporter opens its own decoder -- and, on the hardware path, an encoder --
-    /// so a running player would only compete with it for the GPU. A cancelled
-    /// export still winding down holds this off for the frame it takes to
-    /// notice, which is what keeps its `remove_file` off the new output.
+    /// What the export action does now: opens the card, which is where the
+    /// quality, the destination and the decision to write at all are. Nothing
+    /// is encoded until the button in it is pressed.
+    fn open_export(&mut self, cx: &mut Context<Self>) {
+        if self.export.is_some() {
+            return;
+        }
+        // Nothing to write out, and a refusal rather than a card about it: the
+        // window is empty and the export path is not even chosen yet.
+        if self.session.is_none() {
+            self.notice = Some("NOTHING TO EXPORT — open a file first".into());
+            cx.notify();
+            return;
+        }
+        self.export_open = true;
+        // One card at a time, and a waiting row must not outlive the card it
+        // was waiting in.
+        self.keys_open = false;
+        self.rebinding = None;
+        cx.notify();
+    }
+
+    /// The card's Destination row: the desktop's save dialog, on a background
+    /// thread like the import chooser -- the user may sit in it and the window
+    /// behind must not freeze. No chooser at all leaves the default path, which
+    /// is what the refusal says.
+    fn pick_destination(&mut self, cx: &mut Context<Self>) {
+        let default = self.export_path.clone();
+        let picked = cx
+            .background_executor()
+            .spawn(async move { pick_save(&default) });
+        cx.spawn(async move |this, cx| {
+            let picked = picked.await;
+            this.update(cx, |this, cx| {
+                // The dialog outlives the card: an export started meanwhile
+                // took the old path and its notice must name what it wrote.
+                if this.export.is_some() {
+                    return;
+                }
+                match picked {
+                    Ok(Some(path)) => this.export_path = path,
+                    // Cancelled: the default stands, as it did before.
+                    Ok(None) => {}
+                    Err(text) => {
+                        eprintln!("{text}");
+                        this.notice = Some(text.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Writes the edit list out, at the settings the card was left at. Playback
+    /// stops first: the exporter opens its own decoder -- and, on the hardware
+    /// path, an encoder -- so a running player would only compete with it for
+    /// the GPU. A cancelled export still winding down holds this off for the
+    /// frame it takes to notice, which is what keeps its `remove_file` off the
+    /// new output.
     fn start_export(&mut self, cx: &mut Context<Self>) {
         if self.export.is_some() {
             return;
         }
-        // Nothing to write out, and a refusal rather than a silent button: the
-        // window is empty and the export path is not even chosen yet.
+        let settings = export_settings(self.quality, self.custom_mbps);
         let Some(session) = &mut self.session else {
             self.notice = Some("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
             return;
         };
         session.pause();
-        self.export = Some(session.export_to(&self.export_path));
+        self.export = Some(session.export_to_with(&self.export_path, &settings));
+        // The card has been answered; the progress line takes the panel from
+        // here, and it is the running export's escape that matters now.
+        self.export_open = false;
         cx.notify();
     }
 
@@ -632,9 +701,28 @@ impl Render for Player {
                     }
                     return;
                 }
+                // The export card owns it the same way, and for the same
+                // reason. Escape closes it -- nothing has been written yet, so
+                // there is nothing here to cancel -- and a digit is the custom
+                // bitrate being typed: the card has no text field (nothing in
+                // it takes focus, ledger:182) so this listener is its input,
+                // exactly as it is a waiting row's.
+                if this.export_open {
+                    if key == ESCAPE {
+                        this.export_open = false;
+                    } else if let Ok(digit) = key.parse::<u32>() {
+                        this.custom_mbps = push_digit(this.custom_mbps, digit);
+                        this.quality = Quality::Custom;
+                    } else if key == "backspace" {
+                        this.custom_mbps /= 10;
+                        this.quality = Quality::Custom;
+                    }
+                    cx.notify();
+                    return;
+                }
                 match action {
                     Some(ActionId::Play) => this.toggle_or_restart(cx),
-                    Some(ActionId::Export) => this.start_export(cx),
+                    Some(ActionId::Export) => this.open_export(cx),
                     Some(ActionId::Save) => this.save_project(cx),
                     Some(ActionId::Copy) => this.copy_selected(),
                     Some(ActionId::Paste) => this.paste(cx),
@@ -653,8 +741,10 @@ impl Render for Player {
                 // The overlay owns the pointer as well as the keyboard, and a
                 // drop is a click the scrim cannot swallow: gpui delivers it to
                 // the root's hitbox, which is under the scrim but is not a
-                // sibling it can stop.
-                if this.keys_open {
+                // sibling it can stop. The export card is over the timeline for
+                // the same reason: importing under it would change the very
+                // edit list the card is about to write out.
+                if this.keys_open || this.export_open {
                     return;
                 }
                 for path in paths.paths() {
@@ -738,8 +828,10 @@ impl Render for Player {
             // the picture nothing the rest of the time.
             .children(self.notice_bar(cx))
             .child(self.panel(position, duration, playing, cx))
-            // Last, so it is over everything -- it takes no room in the column.
+            // Last, so they are over everything -- they take no room in the
+            // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
+            .children(self.export_card(cx))
     }
 }
 
@@ -853,11 +945,11 @@ impl Player {
                         None,
                         "Export",
                         format!(
-                            "{} — writes the timeline out beside the source",
+                            "{} — quality and destination, then writes the timeline out",
                             key(ActionId::Export)
                         ),
                         live && self.export.is_none(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.start_export(cx)),
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_export(cx)),
                     ))
                     .child(control(
                         "save",
@@ -879,6 +971,8 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.keys_open = !this.keys_open;
                             this.rebinding = None;
+                            // One card at a time, both ways round.
+                            this.export_open = false;
                             cx.notify();
                         }),
                     )),
@@ -1090,6 +1184,133 @@ impl Player {
         )
     }
 
+    /// What an export is going to be, before there is one: the destination, the
+    /// quality rows, and the two things that are not a choice at all. The same
+    /// scrim, width and row shape as the keybindings overlay -- two cards of
+    /// different builds over one window read as two different programs -- and
+    /// the same plain divs, so the root keeps the keyboard and a typed digit
+    /// reaches the custom row.
+    fn export_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.export_open {
+            return None;
+        }
+        let row = |id: (&'static str, usize)| {
+            div()
+                .id(id)
+                .flex()
+                // The floor, not the height: the destination's path wraps on a
+                // long name and must not paint over the row under it.
+                .min_h(px(KEYS_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+        };
+        let rows: Vec<_> = Quality::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(i, quality)| {
+                row(("quality", i))
+                    .when(self.quality == quality, |d| d.bg(rgb(SELECTED)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.quality = quality;
+                        cx.notify();
+                    }))
+                    .child(quality.label())
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(INK_DIM))
+                            .child(quality.detail(self.custom_mbps)),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(KEYS_W))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(div().flex_none().px(px(6.)).child("Export"))
+                        // The status line, where a refusal from the save dialog
+                        // lands: the notice bar it would otherwise take is under
+                        // the scrim.
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(self.notice.clone().unwrap_or_else(|| {
+                                    "pick a quality, then Export — esc closes".into()
+                                })),
+                        )
+                        .child(
+                            row(("destination", 0))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.pick_destination(cx)
+                                }))
+                                .child("Destination")
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(INK_DIM))
+                                        .child(file_name(&self.export_path)),
+                                ),
+                        )
+                        .children(rows)
+                        // Not offered, so said: these are what this program can
+                        // write, and a menu of one is a lie about the other
+                        // entries. `moov` last is the muxer's own shape -- the
+                        // file is playable only once it is finished.
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child("H.264 · MP4 · moov at end"),
+                        )
+                        .child(
+                            div()
+                                .id("export-confirm")
+                                .mt(px(4.))
+                                .flex()
+                                .h(px(CONTROL_H))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(rgb(SELECTED))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.start_export(cx)
+                                    }),
+                                )
+                                .child("Export"),
+                        ),
+                ),
+        )
+    }
+
     /// The edit list made visible: one box per clip, sized by its share of the
     /// timeline. A cut adds a box without moving anything, a delete closes the
     /// gap. A box has no room for a label at four clips, so the tooltip is where
@@ -1147,28 +1368,59 @@ fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
 }
 
-/// The desktop's own file choosers, best first. Asked for by name because gpui
-/// 0.2 has no file dialog of its own and none of these is worth a dependency.
-const PICKERS: [(&str, &[&str]); 2] = [
-    ("zenity", &["--file-selection", "--title=edith — import"]),
-    ("kdialog", &["--getopenfilename"]),
-];
-
-/// Runs the first chooser that is installed. `Ok(None)` is a cancelled dialog;
-/// the error is for a machine with no chooser at all, which still has the drop
-/// target -- the import path that never depended on another program.
-fn pick_file() -> Result<Option<PathBuf>, &'static str> {
-    for (bin, args) in PICKERS {
+/// Runs the first chooser that is installed. `Some(None)` is a cancelled
+/// dialog; `None` is a machine with no chooser at all, and what still works
+/// without one differs per dialog, so the caller words that refusal.
+///
+/// The desktop's own choosers, asked for by name because gpui 0.2 has no file
+/// dialog of its own and none of these is worth a dependency.
+fn run_picker(pickers: [(&str, Vec<String>); 2]) -> Option<Option<PathBuf>> {
+    for (bin, args) in pickers {
         // Not installed: try the next one. Anything else (a cancel, a refusal)
         // is that chooser's answer and is taken as final.
         let Ok(out) = std::process::Command::new(bin).args(args).output() else {
             continue;
         };
         let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+        return Some((!path.is_empty()).then(|| PathBuf::from(path)));
     }
-    Err(
+    None
+}
+
+fn pick_file() -> Result<Option<PathBuf>, &'static str> {
+    run_picker([
+        (
+            "zenity",
+            vec!["--file-selection".into(), "--title=edith — import".into()],
+        ),
+        ("kdialog", vec!["--getopenfilename".into()]),
+    ])
+    .ok_or(
         "NO FILE CHOOSER — install zenity or kdialog, or drag the file onto this window to import it",
+    )
+}
+
+/// The save-side dialog, opened on where the export would land anyway: with no
+/// chooser installed that default is still what gets written, so this refusal
+/// costs the export nothing and says so.
+fn pick_save(default: &std::path::Path) -> Result<Option<PathBuf>, &'static str> {
+    let default = default.to_string_lossy().into_owned();
+    run_picker([
+        (
+            "zenity",
+            vec![
+                "--file-selection".into(),
+                // No `--confirm-overwrite`: zenity 4.2 lists it as deprecated
+                // and does the confirming itself.
+                "--save".into(),
+                "--title=edith — export to".into(),
+                format!("--filename={default}"),
+            ],
+        ),
+        ("kdialog", vec!["--getsavefilename".into(), default]),
+    ])
+    .ok_or(
+        "NO FILE CHOOSER — install zenity or kdialog to choose where; exporting beside the source",
     )
 }
 
@@ -1211,6 +1463,81 @@ fn file_name(path: &std::path::Path) -> String {
 /// bright enough to leave the family.
 fn source_tint(source: usize) -> u32 {
     SOURCE_TINTS[source % SOURCE_TINTS.len()]
+}
+
+/// What the export card offers, top to bottom. Bitrate is the only thing the
+/// encoder actually takes: the codec and the container are what this program
+/// can write and nothing else, so the card states them rather than offering
+/// them.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Quality {
+    Auto,
+    Low,
+    Medium,
+    High,
+    Custom,
+}
+
+impl Quality {
+    const ALL: [Quality; 5] = [
+        Quality::Auto,
+        Quality::Low,
+        Quality::Medium,
+        Quality::High,
+        Quality::Custom,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Quality::Auto => "Auto",
+            Quality::Low => "Low",
+            Quality::Medium => "Medium",
+            Quality::High => "High",
+            Quality::Custom => "Custom",
+        }
+    }
+
+    /// The figure the row stands for, said in the units the row is chosen by.
+    fn detail(self, custom_mbps: u32) -> String {
+        match self {
+            Quality::Auto => "from the picture size and frame rate".to_string(),
+            Quality::Custom => format!("{custom_mbps} Mbps — type a number, 1–20"),
+            other => format!(
+                "{} Mbps",
+                export_settings(other, 0).bitrate.unwrap_or_default() / 1_000_000
+            ),
+        }
+    }
+}
+
+/// The card's rows as the engine takes them. `Auto` leaves the bitrate to the
+/// exporter, which derives it from the picture; the fixed rows are figures that
+/// hold from 720p to 1080p, and a typed one is passed exactly as typed -- the
+/// engine clamps every explicit bitrate to 1..20 Mbps (export.rs:290), so this
+/// must not clamp it a second time and disagree about where the edge is.
+fn export_settings(quality: Quality, custom_mbps: u32) -> ExportSettings {
+    ExportSettings {
+        bitrate: match quality {
+            Quality::Auto => None,
+            Quality::Low => Some(2_000_000),
+            Quality::Medium => Some(6_000_000),
+            Quality::High => Some(12_000_000),
+            Quality::Custom => Some(u64::from(custom_mbps) * 1_000_000),
+        },
+        // No row of its own: the software pin is for a driver that encodes
+        // badly, which is a thing about the machine and not about the output --
+        // `VE_SW_ENC` already says it, and to the whole run rather than once.
+        force_sw: false,
+    }
+}
+
+/// A digit typed against the custom row, appended to what is already there.
+/// Refused rather than truncated past two digits: the engine's ceiling is
+/// 20 Mbps, so a third digit can only be a mistake, and a silently dropped one
+/// would leave the card showing a number nobody typed.
+fn push_digit(mbps: u32, digit: u32) -> u32 {
+    let next = mbps * 10 + digit;
+    if next <= 99 { next } else { mbps }
 }
 
 /// Whether a stroke gets out of a running export. Escape does, whatever
@@ -1435,9 +1762,9 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_W, LANE_H, RULER_HIT_H, SOURCE_TINTS, SURFACE,
-        cancels_export, export_path, frac_along, is_bare_modifier, is_project, keymap,
-        project_path, scrub_due, source_tint, timecode, width_frac,
+        CONTROL_H, HIT_MIN, KEYS_ROW_H, KEYS_W, LANE_H, Quality, RULER_HIT_H, SOURCE_TINTS,
+        SURFACE, cancels_export, export_path, export_settings, frac_along, is_bare_modifier,
+        is_project, keymap, project_path, push_digit, scrub_due, source_tint, timecode, width_frac,
     };
     use gpui::{Bounds, Pixels, point, px, size};
     use std::time::Duration;
@@ -1600,6 +1927,65 @@ mod tests {
     }
 
     #[test]
+    fn a_quality_row_is_the_bitrate_it_promises() {
+        // Auto is the one row that says nothing: the exporter derives it, and
+        // a number typed against the custom row must not leak into it.
+        assert_eq!(export_settings(Quality::Auto, 7).bitrate, None);
+        assert_eq!(export_settings(Quality::Low, 0).bitrate, Some(2_000_000));
+        assert_eq!(export_settings(Quality::Medium, 0).bitrate, Some(6_000_000));
+        assert_eq!(export_settings(Quality::High, 0).bitrate, Some(12_000_000));
+        // Megabits as typed, and as the row says it back.
+        assert_eq!(export_settings(Quality::Custom, 7).bitrate, Some(7_000_000));
+        assert_eq!(Quality::Low.detail(0), "2 Mbps");
+        // Every fixed row sits inside the engine's clamp (export.rs:290), so no
+        // row can promise a bitrate the exporter silently changes.
+        for quality in Quality::ALL {
+            let settings = export_settings(quality, 7);
+            if let Some(bitrate) = settings.bitrate {
+                assert!(
+                    (1_000_000..=20_000_000).contains(&bitrate),
+                    "{quality:?} outside the engine clamp"
+                );
+            }
+            // The software pin is the environment's to set, never a row's.
+            assert!(!settings.force_sw);
+        }
+    }
+
+    #[test]
+    fn a_typed_bitrate_stops_at_two_digits() {
+        assert_eq!(push_digit(0, 8), 8);
+        assert_eq!(push_digit(1, 2), 12);
+        // A third digit is refused whole: the ceiling is 20 Mbps, so it can
+        // only be a mistake, and dropping it silently would leave the card
+        // showing a number nobody typed.
+        assert_eq!(push_digit(12, 3), 12);
+        assert_eq!(push_digit(99, 9), 99);
+        // Never past what the clamp can take back to a real bitrate.
+        assert!(u64::from(push_digit(99, 9)) * 1_000_000 < u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn the_export_card_fits_the_smallest_window() {
+        // Same 640x360 floor the keybindings card is measured against: a
+        // destination row, one row per quality, the fixed-format line and the
+        // confirm button, under a title and a status line.
+        let rows = Quality::ALL.len() as f32 + 1.;
+        let title = 17.;
+        let status = 28.;
+        let fixed = 17.;
+        let gaps = (rows + 3.) * 2.;
+        let padding = 24.;
+        assert!(
+            title + status + rows * KEYS_ROW_H + fixed + CONTROL_H + 4. + gaps + padding <= 360.,
+            "card too tall"
+        );
+        // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's.
+        assert!(KEYS_ROW_H >= HIT_MIN);
+        assert!(CONTROL_H >= HIT_MIN);
+    }
+
+    #[test]
     fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
         // Every hit target in the panel, including the scrub strip -- whose bar
         // is 6 px to look at and whose click area must not be.
@@ -1740,6 +2126,11 @@ fn main() {
                     project_path: project.clone(),
                     keymap: keymap.clone(),
                     keys_open: false,
+                    export_open: false,
+                    // What an export is until someone says otherwise: the
+                    // bitrate the picture asks for.
+                    quality: Quality::Auto,
+                    custom_mbps: 0,
                     rebinding: None,
                     notice: notice.clone().map(SharedString::from),
                     displayed: 0,
