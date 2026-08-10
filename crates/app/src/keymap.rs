@@ -51,13 +51,14 @@ pub enum ActionId {
     ToggleMute,
     VolumeUp,
     VolumeDown,
+    Equalizer,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 14] = [
+    pub const ALL: [ActionId; 15] = [
         ActionId::Play,
         ActionId::Export,
         ActionId::Save,
@@ -71,6 +72,7 @@ impl ActionId {
         ActionId::ToggleMute,
         ActionId::VolumeUp,
         ActionId::VolumeDown,
+        ActionId::Equalizer,
         ActionId::CancelExport,
     ];
 
@@ -90,6 +92,7 @@ impl ActionId {
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
+            ActionId::Equalizer => "Equalizer",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -111,6 +114,7 @@ impl ActionId {
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
+            ActionId::Equalizer => "equalizer",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -127,7 +131,10 @@ impl ActionId {
             ActionId::Play => Category::Playback,
             ActionId::Copy | ActionId::Paste | ActionId::Delete | ActionId::Lift => Category::Clips,
             ActionId::Cut | ActionId::Regroup | ActionId::Undo => Category::Editing,
-            ActionId::ToggleMute | ActionId::VolumeUp | ActionId::VolumeDown => Category::Audio,
+            ActionId::ToggleMute
+            | ActionId::VolumeUp
+            | ActionId::VolumeDown
+            | ActionId::Equalizer => Category::Audio,
             ActionId::Save | ActionId::Export | ActionId::CancelExport => Category::File,
         }
     }
@@ -179,7 +186,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 5] = [
+pub const FIXED: [Fixed; 9] = [
     Fixed {
         chord: "esc",
         label: "Close this card or clip menu, or cancel a capture",
@@ -204,6 +211,29 @@ pub const FIXED: [Fixed; 5] = [
         chord: "backspace",
         label: "Erase a bitrate digit",
         category: Category::File,
+    },
+    // The equalizer card's own input, for the same reason the export card has
+    // its own: a band nothing but a drag can reach is a band half the users of
+    // this editor cannot move at all. Card-local, so none of them is bindable.
+    Fixed {
+        chord: "1–5",
+        label: "Pick an equalizer band",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "up",
+        label: "Raise the picked band 1 dB",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "down",
+        label: "Lower the picked band 1 dB",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "r",
+        label: "Flatten every band",
+        category: Category::Audio,
     },
 ];
 
@@ -316,6 +346,9 @@ impl Keymap {
                 // player has, without asking for shift to make the "+".
                 b(ActionId::VolumeUp, "=", false),
                 b(ActionId::VolumeDown, "-", false),
+                // The one free letter that says the word: "e" is already the
+                // export and an equalizer is the q in nobody else's way.
+                b(ActionId::Equalizer, "q", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -542,7 +575,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 16);
+        assert_eq!(k.entries().len(), 17);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
@@ -556,6 +589,7 @@ mod tests {
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
+        assert_eq!(k.lookup("q", false), Some(ActionId::Equalizer));
         // The volume pair is the unshifted one, so neither needs a modifier
         // and neither is the "+" gpui reports for shift+=.
         assert_eq!(k.lookup("=", false), Some(ActionId::VolumeUp));
@@ -565,7 +599,7 @@ mod tests {
         // The modifier is half the chord: ctrl+e is not e.
         assert_eq!(k.lookup("e", true), None);
         assert_eq!(k.lookup("space", true), None);
-        assert_eq!(k.lookup("q", false), None);
+        assert_eq!(k.lookup("j", false), None);
         // Nothing is bound twice, or lookup's first match would be a coin toss.
         for (i, a) in k.entries().iter().enumerate() {
             assert!(
@@ -689,7 +723,7 @@ mod tests {
         );
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 14);
+        assert_eq!(ActionId::ALL.len(), 15);
     }
 
     #[test]
