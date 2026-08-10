@@ -2,11 +2,14 @@
 //! interleaved f32 over a bounded channel, same shape as `decode`. Uses its own
 //! reader so the video demuxer stays single-owner.
 //!
-//! Two readers, one output. An mp4 goes through `mp4`+`symphonia-codec-aac` as
+//! Three readers, one output. An mp4 goes through `mp4`+`symphonia-codec-aac` as
 //! it always has -- that path also yields the raw access units the export
 //! copies, which is the only reason it is kept separate -- and a standalone
 //! audio file (`crate::is_audio`: mp3, wav, flac, ogg, ALAC, ADTS) goes through
-//! symphonia's own format probe. Everything downstream of [`Track`] sees the
+//! symphonia's own format probe. An mp4's **AC-3** track is the third: the same
+//! sample tables, decoded by `oxideav-ac3` and downmixed to stereo by the
+//! decoder itself, which is what lets a 5.1 BluRay remux play on a stereo
+//! timeline. Everything downstream of [`Track`] sees the
 //! same samples either way; only the packet copy asks which reader it came from,
 //! because there is nothing to copy out of an mp3 that an mp4 can hold.
 //!
@@ -27,6 +30,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
 use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
+use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet as Ac3Packet};
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
     AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known::CODEC_ID_AAC,
@@ -58,6 +62,14 @@ const PRE_ROLL: u32 = 2;
 
 /// Frames per channel one AAC-LC packet carries. Fixed by the codec.
 const SAMPLES_PER_PACKET: u32 = 1024;
+
+/// Frames per channel one AC-3 syncframe carries. Fixed by the codec (6 blocks
+/// of 256), the way 1024 is fixed for AAC-LC.
+const AC3_SAMPLES_PER_FRAME: u32 = 1536;
+
+/// Syncframes decoded and thrown away ahead of an AC-3 seek target: one, for the
+/// 256-sample overlap-add the target frame is reconstructed with.
+const AC3_PRE_ROLL: u32 = 1;
 
 /// Frames per channel a seek into a standalone audio file lands ahead of the
 /// window, decoded and thrown away: enough to refill an mp3's bit reservoir
@@ -493,14 +505,35 @@ impl AudioSession {
             .map(|(index, id)| {
                 let track = &reader.tracks()[&id];
                 let aac = matches!(track.media_type(), Ok(MediaType::AAC));
+                // An AC-3 track describes itself through its own reader: mp4
+                // 0.14 parses no sample entry for it, so `channel_config` and
+                // `sample_freq_index` have nothing to say. What is listed is
+                // the *decoded* shape -- stereo, because that is what the §7.8
+                // downmix hands the timeline (see [`Ac3Track`]).
+                let ac3 = (!aac)
+                    .then(|| Ac3Track::open(path, index).ok().flatten())
+                    .flatten();
                 let lang = track.language();
                 StreamInfo {
                     index,
-                    codec: if aac { "aac" } else { "unknown" }.into(),
-                    channels: track.channel_config().map_or(0, channel_count),
-                    sample_rate: track.sample_freq_index().map_or(0, |f| f.freq()),
+                    codec: match (aac, &ac3) {
+                        (true, _) => "aac",
+                        (_, Some(_)) => "ac-3",
+                        _ => "unknown",
+                    }
+                    .into(),
+                    channels: ac3
+                        .as_ref()
+                        .map_or_else(|| track.channel_config().map_or(0, channel_count), |t| {
+                            t.channels
+                        }),
+                    sample_rate: ac3.as_ref().map_or_else(
+                        || track.sample_freq_index().map_or(0, |f| f.freq()),
+                        |t| t.sample_rate,
+                    ),
                     lang: (!lang.is_empty() && lang != "und").then(|| lang.to_string()),
-                    decodable: aac
+                    decodable: ac3.as_ref().is_some_and(|t| matches!(t.channels, 1 | 2))
+                        || aac
                         && matches!(track.audio_profile(), Ok(AudioObjectType::AacLowComplexity))
                         && matches!(
                             track.channel_config(),
@@ -732,15 +765,24 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
     match Track::open(path, stream)? {
         None => Ok(None),
         Some(Track::Aac(track)) => Ok(Some(track)),
-        Some(Track::Sym(track)) => Err(format!(
-            "export needs AAC audio today; {} is {}",
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy(),
-            track.codec
-        )
-        .into()),
+        Some(Track::Sym(track)) => Err(uncopyable(path, track.codec)),
+        // Decoded, never copied: an AC-3 syncframe is not something an `mp4a`
+        // sample table can hold, and there is no AAC encoder here to turn it
+        // into one. A WAV/FLAC export of the same timeline decodes fine.
+        Some(Track::Ac3(_)) => Err(uncopyable(path, "AC-3")),
     }
+}
+
+/// The one wording for "this source's audio cannot be copied into an mp4",
+/// shared by every format that cannot be: a front-end shows it verbatim.
+fn uncopyable(path: &Path, codec: &str) -> crate::Error {
+    format!(
+        "export needs AAC audio today; {} is {codec}",
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy(),
+    )
+    .into()
 }
 
 /// One source's audio, however it is stored: the mp4 AAC track the export can
@@ -748,6 +790,7 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
 /// the worker speak to this, never to either reader directly.
 enum Track {
     Aac(AacTrack),
+    Ac3(Ac3Track),
     Sym(SymTrack),
 }
 
@@ -773,6 +816,15 @@ impl Track {
             return Ok(None);
         }
         let audio_file = crate::is_audio(path);
+        // Ahead of the AAC reader, because that one answers "not AAC" for a
+        // *named* stream with an `Err` and an AC-3 track is not an error any
+        // more. `Ok(None)` here means "not an AC-3 track", so every other file
+        // falls through to exactly the reader it always used.
+        if !audio_file
+            && let Some(track) = Ac3Track::open(path, stream)?
+        {
+            return Ok(Some(Self::Ac3(track)));
+        }
         match AacTrack::open(path, stream) {
             Ok(Some(track)) => return Ok(Some(Self::Aac(track))),
             Ok(None) if !audio_file => return Ok(None),
@@ -788,6 +840,7 @@ impl Track {
     fn sample_rate(&self) -> u32 {
         match self {
             Self::Aac(t) => t.sample_rate,
+            Self::Ac3(t) => t.sample_rate,
             Self::Sym(t) => t.sample_rate,
         }
     }
@@ -797,6 +850,12 @@ impl Track {
     fn channels(&self) -> crate::Result<u16> {
         match self {
             Self::Aac(t) => t.channels(),
+            // Already downmixed: `channels` is what comes *out* of the decoder,
+            // which is 2 for everything from mono to 5.1 (see [`Ac3Track`]).
+            Self::Ac3(t) => match t.channels {
+                1 | 2 => Ok(t.channels),
+                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
+            },
             Self::Sym(t) => match t.channels {
                 1 | 2 => Ok(t.channels),
                 n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
@@ -808,6 +867,7 @@ impl Track {
     fn total_samples(&self) -> Option<u64> {
         match self {
             Self::Aac(t) => t.total_samples,
+            Self::Ac3(t) => t.total_samples,
             Self::Sym(t) => t.total_samples,
         }
     }
@@ -816,6 +876,7 @@ impl Track {
     fn priming(&self) -> u64 {
         match self {
             Self::Aac(t) => t.priming,
+            Self::Ac3(t) => t.priming,
             Self::Sym(t) => t.priming,
         }
     }
@@ -825,6 +886,7 @@ impl Track {
     fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
         match self {
             Self::Aac(t) => t.segment(source, start_secs, end_secs),
+            Self::Ac3(t) => t.segment(source, start_secs, end_secs),
             Self::Sym(t) => {
                 let media_target = t.media(start_secs);
                 Segment {
@@ -844,6 +906,9 @@ impl Track {
         match self {
             Self::Aac(t) => {
                 AacDecoder::try_new(&t.params, &AudioDecoderOptions::default())?;
+            }
+            Self::Ac3(t) => {
+                ac3_decoder(t.requested)?;
             }
             Self::Sym(t) => {
                 t.decoder()?;
@@ -942,6 +1007,159 @@ impl SymTrack {
     fn samples_at(&self, ts: symphonia_core::units::Timestamp) -> u64 {
         let secs = self.time_base.calc_time_saturating(ts).as_secs_f64();
         (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+    }
+}
+
+/// One source's AC-3 track: the same mp4 sample tables the AAC track is read
+/// from, decoded through `oxideav-ac3` and **downmixed to stereo by the decoder
+/// itself** (ATSC A/52 §7.8, `channels: Some(2)`), because one output device and
+/// one timeline layout is all there is. A 5.1 BluRay track therefore arrives
+/// here as an ordinary stereo source, and its rows in the picker say so.
+///
+/// `channels` is what the decoder actually emitted for the first frame rather
+/// than an assumed 2: everything from mono to 5.1 downmixes to stereo, but a 2.1
+/// stream is a passthrough the library leaves at 3, and that is refused by name
+/// in [`Track::channels`] instead of being mislabelled.
+struct Ac3Track {
+    reader: Mp4Reader<BufReader<File>>,
+    track_id: u32,
+    sample_count: u32,
+    sample_rate: u32,
+    channels: u16,
+    timescale: u32,
+    priming: u64,
+    total_samples: Option<u64>,
+    stts: Vec<(u32, u32)>,
+    /// What the decoder is asked to hand out, from this track's own layout:
+    /// `Some(2)` for anything with more than one front channel, `None` — the
+    /// library's passthrough — for a mono track. See [`ac3_decoder`].
+    requested: Option<u16>,
+}
+
+impl Ac3Track {
+    /// The `stream`-th audio track of `path` when it is AC-3, `Ok(None)` when it
+    /// is anything else (including out of range) — the caller then goes on to
+    /// the AAC reader, which owns those verdicts and their wording.
+    ///
+    /// mp4 0.14 parses `mp4a` sample entries and drops every other kind without
+    /// keeping the fourcc, so what the track *is* comes out of the `stsd` by
+    /// hand ([`crate::demux::sample_entry`]); the rate and the channel count
+    /// come out of the first syncframe, which is where AC-3 states them.
+    fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+        let ids = audio_track_ids(&reader);
+        let Some(&track_id) = ids.get(stream) else {
+            return Ok(None);
+        };
+        if !matches!(crate::demux::sample_entry(path, track_id), Ok((kind, _)) if &kind == b"ac-3")
+        {
+            return Ok(None);
+        }
+        let track = &reader.tracks()[&track_id];
+        let timescale = track.timescale();
+        let duration = track.trak.mdia.mdhd.duration;
+        let edit = edit_media_time(track);
+        let stts: Vec<(u32, u32)> = stts_pairs(track).collect();
+        let sample_count = reader.sample_count(track_id)?;
+
+        let first = reader
+            .read_sample(track_id, 1)?
+            .ok_or("the AC-3 track has no samples")?;
+        let sample_rate = oxideav_ac3::syncinfo::parse(&first.bytes)
+            .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?
+            .sample_rate;
+        let nfchans = oxideav_ac3::bsi::parse(first.bytes.get(5..).unwrap_or_default())
+            .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?
+            .nfchans;
+        let requested = (nfchans > 1).then_some(2);
+        let mut decoder = ac3_decoder(requested)?;
+        let channels = decode_ac3(&mut decoder, &first.bytes)?
+            .map(|pcm| (pcm.len() / AC3_SAMPLES_PER_FRAME as usize) as u16)
+            .filter(|&c| c > 0)
+            .ok_or("the first AC-3 syncframe decoded to nothing")?;
+
+        // No encoder delay in AC-3; a remux that writes an edit list is still
+        // honoured, exactly as the AAC track honours it.
+        let priming = edit
+            .and_then(|t| scale(t, sample_rate, timescale))
+            .unwrap_or(0);
+        Ok(Some(Self {
+            track_id,
+            sample_count,
+            sample_rate,
+            channels,
+            timescale,
+            priming,
+            total_samples: scale(duration, sample_rate, timescale)
+                .map(|d| d.saturating_sub(priming)),
+            stts,
+            requested,
+            reader,
+        }))
+    }
+
+    /// `secs` on this source's audible timeline into media samples.
+    fn media(&self, secs: f64) -> u64 {
+        ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
+    }
+
+    /// One `[start, end)` window, resolved to syncframes and media samples —
+    /// [`AacTrack::segment`] with AC-3's own frame length and pre-roll.
+    fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
+        let media_target = self.media(start_secs);
+        let target_ts = unscale(media_target, self.sample_rate, self.timescale);
+        let (start_id, start_ts) = packet_at(self.stts.iter().copied(), target_ts, AC3_PRE_ROLL);
+        Segment {
+            source: Some(source),
+            start_id,
+            start_pos: scale(start_ts, self.sample_rate, self.timescale).unwrap_or(0),
+            media_target,
+            media_end: self.media(end_secs).max(media_target),
+        }
+    }
+}
+
+/// A fresh AC-3 decoder handing out `channels`: `Some(2)` is the library's own
+/// A/52 §7.8 stereo downmix, which is the whole reason the timeline can carry a
+/// 5.1 track at all. Fresh per segment for the same reason every other decoder
+/// here is: a seek leaves overlap-add state belonging to the frames we skipped.
+///
+/// ponytail: `Some(2)` on a **mono** (`acmod` 1/0) source decodes to digital
+/// silence in oxideav-ac3 0.0.10 — measured, 5.1 and stereo are correct — so a
+/// mono track asks for no downmix at all and stays the mono source it is. The
+/// upgrade path is `Some(2)` unconditionally once the library duplicates the
+/// centre channel; the caller ([`Ac3Track::open`]) is the only thing to change.
+fn ac3_decoder(channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
+    let mut registry = CodecRegistry::new();
+    oxideav_ac3::register_codecs(&mut registry);
+    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    params.channels = channels;
+    registry
+        .first_decoder(&params)
+        .map_err(|e| format!("no AC-3 decoder: {e:?}").into())
+}
+
+/// One syncframe in, one buffer of interleaved f32 out. `Ok(None)` when the
+/// decoder wants more input before it can hand a frame back, which is not an
+/// error. The library speaks S16 little-endian; `/32768` is the whole
+/// conversion, and it lands in the `[-1, 1)` every other reader here emits.
+fn decode_ac3(decoder: &mut Box<dyn Decoder>, bytes: &[u8]) -> crate::Result<Option<Vec<f32>>> {
+    let packet = Ac3Packet::new(0, oxideav_core::TimeBase::new(1, 48_000), bytes.to_vec());
+    decoder
+        .send_packet(&packet)
+        .map_err(|e| format!("AC-3 decode failed: {e:?}"))?;
+    match decoder.receive_frame() {
+        Ok(Frame::Audio(audio)) => Ok(Some(
+            audio.data[0]
+                .chunks_exact(2)
+                .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+                .collect(),
+        )),
+        Ok(other) => Err(format!("AC-3 decoder handed back {other:?}").into()),
+        Err(oxideav_core::Error::NeedMore) => Ok(None),
+        Err(e) => Err(format!("AC-3 decode failed: {e:?}").into()),
     }
 }
 
@@ -1416,6 +1634,12 @@ fn run(mut w: Worker) {
                 }
                 continue;
             }
+            Track::Ac3(track) => {
+                if !run_ac3(track, seg, eq.as_mut(), channels, &mut timeline, &w.tx) {
+                    return; // consumer went away
+                }
+                continue;
+            }
             Track::Aac(track) => track,
         };
         let mut decoder = match AacDecoder::try_new(&track.params, &AudioDecoderOptions::default())
@@ -1521,6 +1745,65 @@ fn emit(
     };
     *timeline += (chunk.samples.len() / channels) as u64;
     tx.send(chunk).is_ok()
+}
+
+/// One segment of an AC-3 track: the AAC loop with AC-3's decoder. Sample ids
+/// come out of the same mp4 tables, the window rules are [`emit`]'s as always,
+/// and what reaches the mixer is already the stereo downmix. `false` means the
+/// consumer went away.
+fn run_ac3(
+    track: &mut Ac3Track,
+    seg: &Segment,
+    mut eq: Option<&mut EqState>,
+    channels: usize,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    let mut decoder = match ac3_decoder(track.requested) {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let mut pos = seg.start_pos;
+    for id in seg.start_id..=track.sample_count {
+        let mut interleaved;
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let sample = match track.reader.read_sample(track.track_id, id) {
+            Ok(Some(sample)) => sample,
+            Ok(None) => return true,
+            Err(e) => {
+                eprintln!("audio demux error at sample {id}: {e}");
+                return true;
+            }
+        };
+        match decode_ac3(&mut decoder, &sample.bytes) {
+            Ok(Some(pcm)) => interleaved = pcm,
+            Ok(None) => continue, // the decoder wants another frame first
+            Err(e) => {
+                eprintln!("audio decode error at sample {id}: {e}");
+                return true;
+            }
+        }
+        let next = pos + (interleaved.len() / channels) as u64;
+        if !emit(
+            &mut interleaved,
+            channels,
+            seg,
+            eq.as_deref_mut(),
+            pos,
+            next,
+            timeline,
+            tx,
+        ) {
+            return false;
+        }
+        pos = next;
+    }
+    true
 }
 
 /// One segment of a standalone audio file: seek the reader to just before the

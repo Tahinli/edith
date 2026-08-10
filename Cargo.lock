@@ -1634,6 +1634,8 @@ dependencies = [
  "hound",
  "libloading",
  "mp4",
+ "oxideav-ac3",
+ "oxideav-core",
  "rusty_h264",
  "symphonia",
  "symphonia-codec-aac",
@@ -3922,6 +3924,26 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "oxideav-ac3"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c60744c9688507efb6849b1bff197fb17e742b56f8a7f914129464bc86197ad"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
+name = "oxideav-core"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a68d9a74d6d0a7373589eca0c0bb8ab380c46fd1d7fc807e696d716cdad078c"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

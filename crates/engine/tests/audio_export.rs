@@ -305,3 +305,57 @@ fn a_silent_timeline_refuses_an_audio_export() {
         "nothing written"
     );
 }
+
+/// An AC-3 source leaves through this door and no other: the mp4 export cannot
+/// copy a syncframe into an `mp4a` track (no AAC encoder here), but a WAV of the
+/// same timeline decodes, downmixes and reopens through the engine's own reader.
+#[test]
+fn a_51_ac3_source_round_trips_through_a_wav() {
+    let source = asset("test_ac3_51.mp4");
+    let project = Project::from_parts(
+        vec![Source::new(source.clone(), 0)],
+        vec![(
+            LaneKind::Audio,
+            vec![Clip {
+                start: 0,
+                in_frame: 0,
+                out_frame: 30,
+                source: 0,
+                link: None,
+                eq: None,
+                color: None,
+                fit: FitPolicy::default(),
+            }],
+        )],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a one-source AC-3 project");
+    let video = engine::demux::Demuxer::open(&source).expect("open the fixture").0;
+
+    let out = out_path("ac3", "wav");
+    let handle = engine::export::start(
+        project,
+        video,
+        &out,
+        &ExportSettings {
+            format: Format::Wav,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(60)).expect("wav export of an AC-3 source");
+
+    let (meta, samples) = decode(&out);
+    assert_eq!(
+        (meta.sample_rate, meta.channels),
+        (48_000, 2),
+        "the §7.8 downmix is what reaches the file"
+    );
+    let secs = (samples.len() / 2) as f64 / 48_000.;
+    assert!((0.9..1.1).contains(&secs), "one second of clip, got {secs:.3}s");
+    let energy = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+    assert!(energy > 0.005, "the exported AC-3 is silence: RMS {energy:.6}");
+    std::fs::remove_file(&out).unwrap();
+}
