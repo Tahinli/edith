@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use mp4::{MediaType, Mp4Reader, Mp4Track};
+use mp4::{MediaType, Mp4Reader, Mp4Track, TrackType};
 
 use crate::audio::{edit_media_time, packet_at, stts_pairs};
 
@@ -144,7 +144,19 @@ impl Mp4Demuxer {
                 Ok(MediaType::H264) => Some((t, Codec::H264)),
                 Ok(MediaType::H265) => Some((t, Codec::Hevc)),
                 Ok(MediaType::VP9) => Some((t, Codec::Vp9)),
-                _ => None,
+                // `mp4 0.14`'s `stsd` parser knows only a `hev1` sample entry
+                // (`stsd.rs:107`), so an `hvc1`-tagged HEVC track -- what Apple
+                // and ffmpeg's mov muxer write in practice -- reports no media
+                // type at all, and the file used to read back as having no
+                // video. Its sample tables (`stts`/`stsz`/`stsc`/`stss`) are
+                // parsed regardless of the entry the crate dropped, so only the
+                // fourcc has to be read here by hand. hvc1 differs from hev1 in
+                // that the parameter sets may not repeat in-band, which costs
+                // nothing: they are re-injected out of `hvcC` ahead of every
+                // sync sample either way.
+                _ => (matches!(t.track_type(), Ok(TrackType::Video))
+                    && sample_entry(path, t.track_id()).is_ok_and(|(kind, _)| &kind == b"hvc1"))
+                .then_some((t, Codec::Hevc)),
             })
             .ok_or("no H.264, HEVC or VP9 video track in file")?;
         let (track, codec) = track;
@@ -852,26 +864,36 @@ fn append_annex_b(mut src: &[u8], n: usize, out: &mut Vec<u8>) -> crate::Result<
 /// everything after it (`hev1.rs:193`), so the VPS/SPS/PPS an HEVC decoder
 /// cannot start without are unreachable through the crate.
 fn hvcc_record(path: &Path, track_id: u32) -> crate::Result<Vec<u8>> {
+    let (_, entry) = sample_entry(path, track_id)?;
+    // A VisualSampleEntry header is a fixed 78 bytes before the child boxes,
+    // and `hvcC` sits there for `hev1` and `hvc1` alike.
+    let hvcc = child(entry.get(78..).unwrap_or_default(), b"hvcC")
+        .ok_or("no hvcC box in the HEVC sample entry")?;
+    Ok(hvcc.to_vec())
+}
+
+/// The four-character code of `track_id`'s first `stsd` sample entry and that
+/// entry's payload. Read by hand for the same reason the record above is: the
+/// crate keeps no fourcc for a sample entry it does not recognise, so this is
+/// the only thing that can tell an `hvc1` track from a track in a codec nothing
+/// here reads.
+fn sample_entry(path: &Path, track_id: u32) -> crate::Result<([u8; 4], Vec<u8>)> {
     let moov = read_top_level(path, b"moov")?.ok_or("no moov box in file")?;
     let trak = boxes(&moov)
         .filter(|(kind, _)| *kind == b"trak")
         .find(|(_, payload)| child(payload, b"tkhd").and_then(tkhd_track_id) == Some(track_id))
-        .ok_or("the HEVC track has no trak box")?
+        .ok_or("that track has no trak box")?
         .1;
     let stsd = child(trak, b"mdia")
         .and_then(|b| child(b, b"minf"))
         .and_then(|b| child(b, b"stbl"))
         .and_then(|b| child(b, b"stsd"))
-        .ok_or("the HEVC track has no stsd box")?;
-    // stsd is a FullBox (4) plus entry_count (4); then sample entries, whose
-    // VisualSampleEntry header is a fixed 78 bytes before the child boxes.
-    let entry = boxes(stsd.get(8..).unwrap_or_default())
+        .ok_or("that track has no stsd box")?;
+    // stsd is a FullBox (4) plus entry_count (4), then the sample entries.
+    let (kind, payload) = boxes(stsd.get(8..).unwrap_or_default())
         .next()
-        .ok_or("empty stsd box")?
-        .1;
-    let hvcc = child(entry.get(78..).unwrap_or_default(), b"hvcC")
-        .ok_or("no hvcC box in the HEVC sample entry")?;
-    Ok(hvcc.to_vec())
+        .ok_or("empty stsd box")?;
+    Ok((*kind, payload.to_vec()))
 }
 
 /// HEVCDecoderConfigurationRecord (ISO 14496-15 §8.3.3.1) -> the NAL length
