@@ -552,6 +552,54 @@ fn synthetic(index: u32, width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<
     )
 }
 
+/// A timeline whose *first* second of sound was lifted. A reader drops the
+/// first packet of an AAC track as encoder priming, so a track that opens on a
+/// hole has to carry one extra packet of silence for it to drop -- without it
+/// the drop comes out of the hole and every sound after the hole plays 23 ms
+/// early, which is a lip sync error for the whole export.
+#[test]
+fn a_leading_audio_gap_keeps_the_sound_after_it_in_place() {
+    pin_software();
+    let source = asset("test_av.mp4");
+    let mut session = PlaybackSession::open(&source).expect("open source");
+    assert!(session.cut_at(1.0), "cut at 1 s");
+    assert!(session.lift_clip(Lane::Audio, 0), "lift the first second");
+    session.pause();
+    let out = out_path("leading_gap");
+    let handle = session.export_to(&out);
+    wait(&handle, Duration::from_secs(180)).expect("export");
+
+    let (_, chunks) = engine::AudioSession::open(&out)
+        .expect("reopen export audio")
+        .expect("export has an audio track");
+    let mut pcm: Vec<f32> = Vec::new();
+    while let Ok(chunk) = chunks.recv_timeout(Duration::from_secs(10)) {
+        pcm.resize(chunk.start_sample as usize * 2, 0.0);
+        pcm.extend_from_slice(&chunk.samples);
+    }
+    // Where the sound starts, measured in whole packets so the MDCT leak either
+    // side of the splice cannot be mistaken for the onset: the first block
+    // carrying a quarter of the export's own peak.
+    let block = 1024 * 2;
+    let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    let loud = peak(&pcm) / 4.0;
+    let onset = pcm
+        .chunks(block)
+        .position(|b| peak(b) > loud)
+        .expect("the export has no sound at all") as f64
+        * 1024.0;
+    println!("leading gap: sound starts at sample {onset} of an expected 44100");
+    assert!(
+        (onset - 44_100.0).abs() <= 1024.0,
+        "the sound after the gap is at {onset}, not at the 1 s hole's end"
+    );
+    // ...and the hole really is a hole, not the first second played quietly.
+    let quiet = peak(&pcm[..(0.9 * 44_100.0) as usize * 2]);
+    assert!(quiet < 1e-3, "the lifted second is not silent: {quiet}");
+
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// A timeline with a hole in each lane, exported. The video gap is encoded as
 /// black rather than skipped -- the file is as long as the timeline, frame for
 /// frame -- and the audio gap is copied as real silent packets, so the audio
