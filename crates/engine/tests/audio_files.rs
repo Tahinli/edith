@@ -240,7 +240,7 @@ fn a_song_survives_a_save_and_a_reload() {
     .expect("write");
     let e = refusal(PlaybackSession::open_project(&broken));
     assert!(
-        e.ends_with("has no picture: it can only play on the audio lane"),
+        e.ends_with("has no picture: it can only play on an audio lane"),
         "{e}"
     );
     let _ = std::fs::remove_dir_all(&dir);
