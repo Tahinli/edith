@@ -40,6 +40,23 @@ rusty_aac = "0.5"
 # symphonia's below -- an mp3 has always been importable here, and until this it
 # was the one format the editor could read and never write.
 rusty_mp3 = "0.6"
+# The Vorbis encoder, same family and the same reason as the three above: pure
+# Rust, Apache-2.0, no C and no FFI. It is the *first* permissively-licensed
+# pure-Rust Vorbis encoder -- `vorbis_rs` and `vorbis-encoder` are both bindings
+# to Xiph's C library, which this project's no-install rule forbids, and
+# `oxideav-vorbis` (whose own manifest calls itself an "orphan-rebuild scaffold")
+# ships encoder-side *bitstream writers* with no analysis stage at all: no psy
+# model, no floor fit, no residue quantiser, nothing that turns PCM into a
+# packet. This one does the whole pipeline. Its quirks are measured and worked
+# around in [`crate::export::write_ogg`] -- read that before touching this line.
+rusty_vorbis = "0.1.1"
+# The Ogg container, and the only new *name* here that is not a new crate tree:
+# its one dependency is `oxideav-core`, which the AC-3 decoder above already
+# pulls in. MIT. Vorbis-aware where it counts -- `xiph_lace` builds the
+# three-header blob and the muxer pages those ahead of the audio, which is the
+# encapsulation order a Vorbis decoder needs and the part that is easy to get
+# wrong by hand.
+oxideav-ogg = "0.1.8"
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of

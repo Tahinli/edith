@@ -9792,7 +9792,12 @@ const FORMATS: [(&[Format], &str, &str, &str); 8] = [
     (&[Format::Wav], "w", "WAV", "16-bit PCM — audio only"),
     (&[Format::Flac], "f", "FLAC", "lossless — audio only"),
     (&[Format::Mp3], "p", "MP3", "MPEG-1 Layer III — audio only"),
-    (&[], "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
+    (
+        &[Format::Ogg],
+        "o",
+        "OGG",
+        "Vorbis (rusty_vorbis) — quality-coded, stereo",
+    ),
     (&[], "", "VP9", "AV1 above replaces it"),
 ];
 
@@ -9856,6 +9861,14 @@ fn bitrate_refusal(format: Format) -> Option<&'static str> {
     match format {
         Format::Wav | Format::Flac => Some("lossless audio — no bitrate to pick"),
         Format::Mp3 => Some("sound only — its rate is the Sound row"),
+        // The guard is the question and not a list of names: an audio format
+        // added without a line of its own above would otherwise show live
+        // quality rows over a file that has no picture to spend a bitrate on.
+        // OGG is exactly that format -- and it wants this sentence rather than
+        // one of its own, because its *Sound* row already says the Vorbis half
+        // ("quality-coded — Vorbis holds no rate to pick") and two rows saying
+        // the same thing is one of them wasted.
+        _ if !format.has_video() => Some("sound only — no picture to spend a bitrate on"),
         _ => None,
     }
 }
@@ -10145,6 +10158,7 @@ fn format_line(format: Format) -> &'static str {
         Format::Wav => "16-bit PCM · WAV",
         Format::Flac => "FLAC · lossless",
         Format::Mp3 => "MP3 · lossy",
+        Format::Ogg => "Vorbis · OGG",
     }
 }
 
@@ -10406,7 +10420,7 @@ fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     match picture {
         true => None,
         false => Some(format!(
-            "no picture — {} would be black; export WAV, FLAC or MP3",
+            "no picture — {} would be black; export WAV, FLAC, MP3 or OGG",
             format.name()
         )),
     }
@@ -11785,15 +11799,15 @@ mod tests {
         // and are never refused.
         assert_eq!(
             format_refusal(&session, Format::Mp4).as_deref(),
-            Some("no picture — an mp4 would be black; export WAV, FLAC or MP3")
+            Some("no picture — an mp4 would be black; export WAV, FLAC, MP3 or OGG")
         );
         assert_eq!(
             format_refusal(&session, Format::Av1).as_deref(),
-            Some("no picture — an AV1 Matroska would be black; export WAV, FLAC or MP3")
+            Some("no picture — an AV1 Matroska would be black; export WAV, FLAC, MP3 or OGG")
         );
         assert_eq!(
             format_refusal(&session, Format::Av1Mp4).as_deref(),
-            Some("no picture — an AV1 mp4 would be black; export WAV, FLAC or MP3")
+            Some("no picture — an AV1 mp4 would be black; export WAV, FLAC, MP3 or OGG")
         );
         assert_eq!(format_refusal(&session, Format::Wav), None);
         assert_eq!(format_refusal(&session, Format::Flac), None);
@@ -14715,7 +14729,7 @@ mod tests {
     #[test]
     fn every_codec_row_is_offered_or_says_why_not() {
         // One row per codec, and the boxes it can go in are the container row's
-        // business: six rows that pick, two that say why they cannot. A codec
+        // business: seven rows that pick, one that says why it cannot. A codec
         // twice over (AV1 · MKV beside AV1 · MP4) was two rows asking the same
         // question, and five picture rows above the fold is what the card was
         // called unfriendly for.
@@ -14733,6 +14747,7 @@ mod tests {
                 &[Format::Wav][..],
                 &[Format::Flac][..],
                 &[Format::Mp3][..],
+                &[Format::Ogg][..],
             ]
         );
         // Every format the engine writes is on exactly one row: one the card
@@ -14746,6 +14761,7 @@ mod tests {
             Format::Wav,
             Format::Flac,
             Format::Mp3,
+            Format::Ogg,
         ] {
             assert_eq!(
                 FORMATS
@@ -14838,18 +14854,28 @@ mod tests {
             None,
             "a stroke no row carries"
         );
-        // The codec this program reads and cannot write is a row of its own,
-        // refused by name rather than absent: VP9, because AV1 is the row that
-        // replaced it. Its reason travels with it, in the row or in the footer
-        // line that collects them -- either way it is on screen without a click.
-        for (label, word) in [("VP9", "replaces it"), ("OGG", "no pure-Rust")] {
-            let (row, _, _, detail) = FORMATS
-                .into_iter()
-                .find(|(_, _, name, _)| *name == label)
-                .unwrap_or_else(|| panic!("{label} has no row"));
-            assert!(row.is_empty(), "{label} is not offered");
-            assert!(detail.contains(word), "{label}: {detail}");
-        }
+        assert_eq!(format_key("o", Format::Mp4), Some(Format::Ogg));
+        // The one codec left that this program reads and cannot write is a row
+        // of its own, refused by name rather than absent: VP9, because AV1 is
+        // the row that replaced it. Its reason travels with it, in the row or in
+        // the footer line that collects them -- either way it is on screen
+        // without a click. OGG was the other one until `rusty_vorbis` gave this
+        // project an encoder, and the row that says so is the row above.
+        let (row, _, _, detail) = FORMATS
+            .into_iter()
+            .find(|(_, _, name, _)| *name == "VP9")
+            .expect("VP9 has a row");
+        assert!(row.is_empty(), "VP9 is not offered");
+        assert!(detail.contains("replaces it"), "VP9: {detail}");
+        let (row, _, _, detail) = FORMATS
+            .into_iter()
+            .find(|(_, _, name, _)| *name == "OGG")
+            .expect("OGG has a row");
+        assert_eq!(row, [Format::Ogg], "OGG is a row that picks now");
+        assert!(
+            detail.contains("rusty_vorbis"),
+            "the row names the encoder like every other live one: {detail}"
+        );
         // Both AV1 boxes say they carry sound: the file used to be picture only,
         // and a line that still said so would be the lie a user plays the file
         // to find out about. HEVC says intra-only before anyone waits on one --

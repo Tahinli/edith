@@ -1193,8 +1193,17 @@ struct SymTrack {
     source_channels: u16,
     /// Frames per channel of audible audio, `None` when the header does not say.
     total_samples: Option<u64>,
-    /// Encoder delay: the same role [`AacTrack::priming`] plays, taken from the
-    /// container where it declares one (mp3's Xing/LAME tag, ALAC's edit list).
+    /// Encoder delay, and **always zero here**: symphonia 0.6 drops the leading
+    /// frames itself, so a reader that skipped `Track::delay` on top would skip
+    /// them twice. Kept as a field because [`Track::priming`] asks every track
+    /// for one and the AAC and AC-3 readers beside it do owe a real number.
+    ///
+    /// This used to carry `delay` and cost the double skip on the two formats
+    /// that declare one: a `.mp3` lost its first 1105 samples (25 ms) and read
+    /// 25 ms short, an `.ogg` its first 128. Measured 2026-08-11 against
+    /// `test_tone.flac` -- lossless, and the only one of the three whose
+    /// container declares no delay at all -- which the mp3 and the ogg of the
+    /// same tone align with sample for sample once this is not subtracted.
     priming: u64,
     time_base: TimeBase,
     params: AudioCodecParameters,
@@ -1227,7 +1236,8 @@ impl SymTrack {
         let Some(track) = reader.default_track(SymKind::Audio) else {
             return Ok(None);
         };
-        let (track_id, num_frames, delay) = (track.id, track.num_frames, track.delay);
+        // `track.delay` is deliberately not read: see the `priming` field.
+        let (track_id, num_frames) = (track.id, track.num_frames);
         let time_base = track
             .time_base
             .ok_or_else(|| format!("{} declares no time base", path.display()))?;
@@ -1257,7 +1267,7 @@ impl SymTrack {
             channels: if channels == 6 { 2 } else { channels },
             source_channels: channels,
             total_samples: num_frames,
-            priming: u64::from(delay.unwrap_or(0)),
+            priming: 0,
             time_base,
             params,
             codec,

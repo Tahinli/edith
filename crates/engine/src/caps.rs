@@ -35,7 +35,7 @@ const SW_CODECS: [(&str, &str, bool, bool); 10] = [
     ("FLAC", "symphonia / flacenc", true, true),
     ("PCM", "symphonia / hound", true, true),
     ("AC-3", "oxideav-ac3", true, false),
-    ("Vorbis", "symphonia", true, false),
+    ("Vorbis", "symphonia / rusty_vorbis", true, true),
     ("ALAC", "symphonia", true, false),
 ];
 
