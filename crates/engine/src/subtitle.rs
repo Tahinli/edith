@@ -157,6 +157,11 @@ pub fn of_matroska(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
 /// makes an embedded track and the standalone file it was muxed from come back
 /// as the same cues.
 fn cues_of(track: &crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
+    // A track compressed or encrypted with something the demuxer cannot undo is
+    // refused in those words, like a bitmap one: the row stays, and it says why.
+    if let Some(why) = &track.unsupported {
+        return Err(why.clone());
+    }
     let cues = match track.codec.as_str() {
         "S_TEXT/UTF8" | "S_TEXT/ASCII" => track
             .cues
