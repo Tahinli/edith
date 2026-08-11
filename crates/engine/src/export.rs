@@ -82,11 +82,13 @@ pub enum Format {
     #[default]
     Mp4,
     /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
-    /// this project can write: this engine's Matroska writer has no audio track
-    /// at all, and an AAC track written into one would be one *this engine's own
-    /// reader* leaves silent
-    /// (`audio::AudioSession::open` refuses Matroska audio). The sound of an AV1
-    /// export is a WAV or FLAC beside it, which a front-end says up front.
+    /// this project can *write*: this engine's Matroska writer has no audio
+    /// track at all, and the copy path walks an mp4 sample table, which a
+    /// Matroska file has none of. (*Reading* one's AAC is a different question,
+    /// and since this engine gained a Matroska demuxer the answer is yes --
+    /// `audio::Track::open` does it through symphonia's mkv reader.) The sound
+    /// of an AV1 export is a WAV or FLAC beside it, which a front-end says up
+    /// front.
     Av1,
     /// The audio lane alone, 16-bit PCM.
     Wav,
@@ -345,6 +347,19 @@ fn copy_audio(
         )
         .into());
     }
+    // A frame *rate* of its own is not one of those, and that is deliberate:
+    // do not "fix" this into a re-encode. A clip counts the **timeline's**
+    // frames whatever its file was shot at ([`Rate`]), so the window this copy
+    // trims a source's sound to is `start..end` in whole timeline frames --
+    // exactly the seconds the picture covers -- and the file is read at the
+    // pitch it was recorded at, which is what playing at the rate it was shot at
+    // means. There is no per-clip stretch to express, so the packets are already
+    // the right sound in the right place; re-encoding a conformed lane would buy
+    // nothing and cost a generation of loss on every mixed-rate export
+    // (`tests/mixed_fps.rs`, `an_export_of_two_rates_runs_at_the_speed_it_was_shot`
+    // measures the copied sound against the picture). A *speed* is different
+    // because it resamples, which is why it is refused above.
+    //
     // ...and last, whether any clip on it carries an equalizer. An EQ is sample
     // math and a copy never decodes, so copying such a lane would write the clip
     // *flat*, silently -- the failure a missing audio track is. This lane is
@@ -660,7 +675,10 @@ fn source_rate(path: &Path, timeline_fps: f64) -> Rate {
         return Rate::REAL_TIME;
     }
     match Demuxer::open(path) {
-        Ok((meta, _)) => Rate::new(meta.frame_rate, timeline_fps),
+        // ...and one whose rate cannot be named against the timeline's, which
+        // `matches_timeline` refuses at import, so nothing on a timeline is on
+        // this arm either.
+        Ok((meta, _)) => Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
         Err(_) => Rate::REAL_TIME,
     }
 }

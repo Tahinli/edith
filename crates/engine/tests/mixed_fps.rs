@@ -17,7 +17,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::{Edge, Lane, Speed};
+use engine::project::{Edge, Lane, Rate, Speed};
 use engine::{DecodeSession, Frame, PlaybackSession};
 
 /// The timeline's rate, which `test_av.mp4` (30 fps, 5 s) defines.
@@ -133,6 +133,62 @@ fn a_file_at_another_rate_is_placed_for_the_seconds_it_lasts() {
         "{} s",
         session.timeline_duration()
     );
+    // ...and the sound that came down with each take is the same length as its
+    // picture: a placed take is one linked group, so a rate that stretched only
+    // the picture would slide the two apart on the very first drag.
+    let (video, audio) = (session.lane_clips(Lane::V1), session.lane_clips(Lane::A1));
+    assert_eq!(video.len(), 3, "the 30 fps take and the two others");
+    assert_eq!(audio.len(), video.len(), "one audio clip per take");
+    for (v, a) in video.iter().zip(audio) {
+        assert_eq!((v.start, v.len()), (a.start, a.len()), "{v:?} vs {a:?}");
+    }
+}
+
+/// The NTSC ratio, which the 23.976 fps fixture is shot at: 24000/1001 over 30
+/// is exactly 800/1001, and it stays exact however far the timeline runs. A rate
+/// rounded to a float -- or to milli-fps -- would leave a fraction of a frame
+/// per clip to pile up into a visible drift over an hour, which is why the
+/// mapping is built out of the muxer's own timescales and not a division.
+#[test]
+fn a_23_976_rate_is_exact_and_never_drifts() {
+    let ntsc = Rate::from_fps(24_000.0 / 1001.0, FPS).expect("23.976 over 30");
+    assert!(
+        (ntsc.as_f64() - 800.0 / 1001.0).abs() < 1e-15,
+        "{}",
+        ntsc.as_f64()
+    );
+    // Independent integer arithmetic, out to an hour of source and past it: 800
+    // source frames per 1001 timeline ones, and a file's length is that ceiled
+    // (the last picture must still be reachable by a trim).
+    for source in [1u64, 2, 24, 1000, 86_486, 500_000, 1_000_000] {
+        assert_eq!(
+            u64::from(ntsc.timeline_at(source as u32)),
+            (source * 1001).div_ceil(800),
+            "{source} source frames"
+        );
+    }
+    // ...and the two directions stay each other's inverse at every one of them:
+    // the frame an export writes at timeline frame `d` is the frame playback is
+    // holding there, which is what `timeline_at`'s ceil buys.
+    for d in [0u32, 1, 2, 3, 1000, 100_000, 1_000_000] {
+        let source = ntsc.source_at(d);
+        assert!(ntsc.timeline_at(source) <= d, "frame {d} is not yet due");
+        assert!(
+            ntsc.timeline_at(source + 1) > d,
+            "the next frame is due too early at {d}"
+        );
+    }
+    // A timeline's own rate conforms by nothing at all, exactly -- whichever of
+    // the two rates it is written at.
+    assert!(Rate::from_fps(FPS, FPS).expect("30 over 30").is_real_time());
+    assert!(
+        Rate::from_fps(24_000.0 / 1001.0, 24_000.0 / 1001.0)
+            .expect("ntsc over ntsc")
+            .is_real_time()
+    );
+    // A rate no timescale can name is refused rather than read 1:1 in silence:
+    // the one thing `matches_timeline` still turns a file away for.
+    assert!(Rate::from_fps(0.0, FPS).is_err(), "not a rate at all");
 }
 
 /// The picture on screen at a timeline frame is the picture the *file* holds
@@ -162,6 +218,55 @@ fn playback_shows_the_frame_the_file_holds_there() {
     session.seek(f64::from(start + 59) / FPS);
     let last = next_frame(&mut session, "the last frame of the clip");
     assert!(last.bgra == source_frame(&pal, 49), "source frame 49 last");
+    // ...and the frame in front of it is the 30 fps take, frame for frame: a
+    // rate belongs to the source that has one, so the clip beside it is read
+    // exactly as it was before any of this existed.
+    let av = asset("test_av.mp4");
+    session.seek(f64::from(start - 1) / FPS);
+    let before = next_frame(&mut session, "the last frame of the 30 fps take");
+    assert_eq!(before.index, start - 1);
+    assert!(
+        before.bgra == source_frame(&av, start - 1),
+        "the 30 fps clip is still frame for frame"
+    );
+}
+
+/// A trim of a clip at another rate is dragged in *timeline* frames and commits
+/// the source range those frames are worth -- so the box is exactly the room it
+/// was dragged to, and the picture at its new edge is the file's own frame
+/// there.
+#[test]
+fn a_clip_at_another_rate_trims_to_the_room_it_was_dragged_to() {
+    let pal = asset("test_25fps.mp4");
+    let mut session = open(asset("test_av.mp4"));
+    import_and_place(&mut session, &pal);
+    session.pause();
+    let start = 150u32;
+    // Drag its tail back to 30 timeline frames of room: one second, which at 25
+    // fps is the file's first 25 pictures.
+    assert!(
+        session.trim_clip(Lane::V1, 1, Edge::End, start + 30),
+        "trim the tail of the 25 fps clip"
+    );
+    let clip = session.lane_clips(Lane::V1)[1];
+    assert_eq!((clip.start, clip.len()), (start, 30), "{clip:?}");
+    session.seek(f64::from(start + 29) / FPS);
+    let last = next_frame(&mut session, "the trimmed tail");
+    assert!(
+        last.bgra == source_frame(&pal, 24),
+        "one second of a 25 fps file ends on its frame 24"
+    );
+    // ...and its head, dragged forward into source it keeps: 6 timeline frames
+    // in is 5 source frames in, and the tail did not move.
+    assert!(session.trim_clip(Lane::V1, 1, Edge::Start, start + 6));
+    let clip = session.lane_clips(Lane::V1)[1];
+    assert_eq!((clip.start, clip.len()), (start + 6, 24), "{clip:?}");
+    session.seek(f64::from(start + 6) / FPS);
+    let head = next_frame(&mut session, "the trimmed head");
+    assert!(
+        head.bgra == source_frame(&pal, 5),
+        "6 frames of a 30 fps timeline is 5 frames of a 25 fps file"
+    );
 }
 
 /// A speed and a frame rate compose: a 2x 25 fps clip on a 30 fps timeline is
@@ -275,6 +380,40 @@ fn an_export_of_two_rates_runs_at_the_speed_it_was_shot() {
     assert_eq!(
         held, 5,
         "30 timeline frames of a 25 fps clip hold 5 pictures over"
+    );
+
+    // ...and *which* picture each of those frames is: the very one playback
+    // holds there, which is the whole reason the two conversions are one
+    // floor/ceil pair. Nearer its own source frame than either neighbour rather
+    // than equal to it -- the export is re-encoded, so no pixel survives whole.
+    for offset in [0u32, 1, 6, 12, 24, 29] {
+        let want = (u64::from(offset) * 25_000 / 30_000) as u32;
+        let mine = difference(&written[(15 + offset) as usize], &source_frame(&pal, want));
+        for other in [want.saturating_sub(1), want + 1] {
+            if other == want {
+                continue;
+            }
+            assert!(
+                mine < difference(&written[(15 + offset) as usize], &source_frame(&pal, other)),
+                "exported frame {offset} of the 25 fps clip is nearer source \
+                 frame {other} than its own {want}"
+            );
+        }
+    }
+
+    // The sound came out as long as the picture, from a *packet copy*: a clip
+    // counts timeline frames whatever its file was shot at, so the window this
+    // export trimmed the 25 fps file's AAC to is whole timeline frames and the
+    // copy is in sync. This is the assertion behind the note in
+    // `export::copy_audio` that says not to turn a conformed lane into a
+    // re-encode.
+    let secs = engine::AudioSession::duration_secs(&out)
+        .expect("probe the export")
+        .expect("the export has sound");
+    let want = f64::from(total) / FPS;
+    assert!(
+        (secs - want).abs() < 0.05,
+        "sound is {secs} s under {want} s of picture"
     );
     std::fs::remove_file(&out).ok();
 }

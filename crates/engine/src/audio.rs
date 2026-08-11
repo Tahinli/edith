@@ -6,7 +6,9 @@
 //! it always has -- that path also yields the raw access units the export
 //! copies, which is the only reason it is kept separate -- and a standalone
 //! audio file (`crate::is_audio`: mp3, wav, flac, ogg, ALAC, ADTS) goes through
-//! symphonia's own format probe. An mp4's **AC-3** track is the third: the same
+//! symphonia's own format probe, as does the AAC track of a **Matroska** file:
+//! same reader, `mkv` instead of `isomp4`, and a 5.1 film soundtrack folded to
+//! stereo on the way out ([`SymDecoder`]). An mp4's **AC-3** track is the third: the same
 //! sample tables, decoded by `oxideav-ac3` and downmixed to stereo by the
 //! decoder itself, which is what lets a 5.1 BluRay remux play on a stereo
 //! timeline. Everything downstream of [`Track`] sees the
@@ -268,14 +270,23 @@ impl AudioSession {
         eqs: &[Option<EqParams>],
         speeds: &[Option<crate::project::Stretch>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        let Some((path, stream)) = sources.first() else {
+        // The first source that could have a track, which is not always index 0:
+        // a still image has none, and one at the front of the list (a save
+        // renumbers, a library removal moves indexes) would be opened as a
+        // broken audio file and take the whole timeline's sound down with it.
+        // The same rule `PlaybackSession` probes by (`audio_source_of`).
+        let Some((at, (path, stream))) = sources
+            .iter()
+            .enumerate()
+            .find(|(_, (path, _))| !crate::is_image(path))
+        else {
             return Ok(None);
         };
         let Some(first) = Track::open(path, *stream)? else {
             return Ok(None);
         };
-        // The timeline's meta is the first source's: policy makes every other
-        // source match it, and the checks below hold them to that.
+        // The timeline's meta is that source's: policy makes every other source
+        // match it, and the checks below hold them to that.
         let meta = AudioMeta {
             sample_rate: first.sample_rate(),
             channels: first.channels()?,
@@ -286,7 +297,7 @@ impl AudioSession {
         first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
-        tracks[0] = Some(first);
+        tracks[at] = Some(first);
         for &(source, ..) in segs {
             let Some(source) = source else {
                 continue; // a gap opens no file
@@ -459,8 +470,9 @@ impl AudioSession {
         let mut meta = None;
         let mut rxs = Vec::with_capacity(lanes.len());
         for (i, segs) in lanes.iter().enumerate() {
-            // Every lane probes the same source 0, so the metas agree by
-            // construction; `None` from any of them is a silent timeline.
+            // Every lane takes its meta from the same source, so the metas
+            // agree by construction; `None` from any of them is a silent
+            // timeline.
             let flat = Vec::new();
             let plain = Vec::new();
             let Some((lane_meta, rx)) = Self::open_multi_streams_speed(
@@ -490,14 +502,15 @@ impl AudioSession {
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
-        // Matroska: the demuxer reads its picture and nothing else yet, so a
-        // file that has sound is told so by name rather than playing silent
-        // with no reason given. A Matroska file with no audio track at all
-        // returns `None` here like any other silent file.
+        // Matroska: AAC is read out of one ([`Track::open`]) and everything
+        // else -- Opus, AC-3, DTS, none of which symphonia decodes at any
+        // version -- is named rather than left playing silent with no reason
+        // given. A Matroska file with no audio track at all returns `None` here
+        // like any other silent file.
         if crate::demux::is_matroska(path.as_ref()) {
             return Ok(
                 crate::demux::matroska_audio_codec(path.as_ref())?.map(|codec| {
-                    format!("{codec} audio in a Matroska file is not wired to the decoder yet")
+                    format!("the {codec} track of this Matroska file cannot be decoded (AAC only)")
                 }),
             );
         }
@@ -546,11 +559,22 @@ impl AudioSession {
     /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
-        // A Matroska file's audio tracks are not readable here yet ([`Track`]),
-        // and a stream nothing can open is not one to offer: an mkv lists as
-        // the silent source it currently is.
+        // A Matroska file has exactly one readable audio stream here -- the
+        // reader's default track ([`SymTrack::open`]) -- so it lists like a
+        // standalone audio file rather than like an mp4, and one with no
+        // readable track at all lists as the silent source it is.
         if crate::demux::is_matroska(path) {
-            return Ok(Vec::new());
+            let Ok(track) = SymTrack::open(path) else {
+                return Ok(Vec::new());
+            };
+            return Ok(vec![StreamInfo {
+                index: 0,
+                codec: track.codec.into(),
+                channels: track.channels,
+                sample_rate: track.sample_rate,
+                lang: None,
+                decodable: matches!(track.channels, 1 | 2) && track.decoder().is_ok(),
+            }]);
         }
         if crate::is_audio(path) {
             let track = SymTrack::open(path)?;
@@ -835,6 +859,24 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
     match Track::open(path, stream)? {
         None => Ok(None),
         Some(Track::Aac(track)) => Ok(Some(track)),
+        // A Matroska source gets its own words: its packets *are* AAC, so
+        // "export needs AAC audio today" would read as a contradiction. What
+        // they are not is packets of an mp4 sample table, which is what the
+        // copy walks -- and refusing beats writing a film with no sound in it.
+        //
+        // ponytail: the ceiling is the copy path being written against the mp4
+        // reader, not anything about the bytes. Upgrade path is the same one
+        // every other refusal here names -- an AAC encoder, or a `copy_segments`
+        // that walks a Matroska track -- and either would let this through.
+        Some(Track::Sym(_)) if crate::demux::is_matroska(path) => Err(format!(
+            "{}'s sound is AAC inside a Matroska file, which an mp4 export cannot copy: \
+             it copies packets out of an mp4's own sample table. Export WAV or FLAC for \
+             the sound, or AV1 for the picture alone",
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy(),
+        )
+        .into()),
         Some(Track::Sym(track)) => Err(uncopyable(path, track.codec)),
         // Decoded, never copied: an AC-3 syncframe is not something an `mp4a`
         // sample table can hold, and there is no AAC encoder here to turn it
@@ -879,11 +921,20 @@ impl Track {
     /// has exactly one, so any `stream` above 0 there is a promise the file
     /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
-        // A Matroska file's sound is not wired to either reader yet: its picture
-        // is what this slice delivers, and the source counts as a silent one --
-        // which `AudioSession::unsupported` puts into words for the user.
+        // A Matroska file goes straight to symphonia, whose `mkv` reader is the
+        // one thing here that reads its packets -- neither mp4 reader can open
+        // the file at all. Sound this cannot decode (Opus, AC-3, DTS: symphonia
+        // has no such decoder at any version) leaves the source the silent one
+        // it always was, which `AudioSession::unsupported` puts into words,
+        // rather than failing the import of a file whose picture is fine.
         if crate::demux::is_matroska(path) {
-            return Ok(None);
+            if stream > 0 {
+                return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
+            }
+            return Ok(SymTrack::open(path)
+                .ok()
+                .filter(|t| t.decoder().is_ok())
+                .map(Self::Sym));
         }
         let audio_file = crate::is_audio(path);
         // Ahead of the AAC reader, because that one answers "not AAC" for a
@@ -996,7 +1047,12 @@ struct SymTrack {
     reader: Box<dyn FormatReader>,
     track_id: u32,
     sample_rate: u32,
+    /// What reaches the timeline: the file's own layout, or 2 for a 5.1 track,
+    /// which is folded down by [`SymDecoder`] exactly as the AC-3 reader's
+    /// decoder folds its own.
     channels: u16,
+    /// What the decoder emits, which is what the fold reads.
+    source_channels: u16,
     /// Frames per channel of audible audio, `None` when the header does not say.
     total_samples: Option<u64>,
     /// Encoder delay: the same role [`AacTrack::priming`] plays, taken from the
@@ -1051,7 +1107,11 @@ impl SymTrack {
             reader,
             track_id,
             sample_rate,
-            channels,
+            // 5.1 arrives as a stereo source, whatever it was stored as; every
+            // other layout is passed through and refused above stereo by
+            // [`Track::channels`], where it always was.
+            channels: if channels == 6 { 2 } else { channels },
+            source_channels: channels,
             total_samples: num_frames,
             priming: u64::from(delay.unwrap_or(0)),
             time_base,
@@ -1062,9 +1122,28 @@ impl SymTrack {
 
     /// A fresh decoder: seeking mid-stream leaves state that belongs to the
     /// packets we skipped, exactly as on the AAC path.
-    fn decoder(&self) -> crate::Result<Box<dyn AudioDecoder>> {
-        Ok(symphonia::default::get_codecs()
-            .make_audio_decoder(&self.params, &AudioDecoderOptions::default())?)
+    ///
+    /// Which decoder is not the caller's business, and it is not always
+    /// symphonia's: its AAC decoder refuses anything wider than stereo outright
+    /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 track
+    /// of a film in an mkv, so that one goes to `rusty_aac` instead.
+    fn decoder(&self) -> crate::Result<SymDecoder> {
+        let fold = self.source_channels != self.channels;
+        if self.params.codec == CODEC_ID_AAC && self.source_channels > 2 {
+            let asc = self
+                .params
+                .extra_data
+                .as_deref()
+                .ok_or("a multichannel AAC track with no AudioSpecificConfig")?;
+            let decoder = rusty_aac::AacDecoder::with_config_bytes(asc)
+                .map_err(|e| format!("multichannel AAC decoder init failed: {e}"))?;
+            return Ok(SymDecoder::Aac(Box::new(decoder), fold));
+        }
+        Ok(SymDecoder::Sym(
+            symphonia::default::get_codecs()
+                .make_audio_decoder(&self.params, &AudioDecoderOptions::default())?,
+            fold,
+        ))
     }
 
     /// `secs` on this source's audible timeline into media samples (priming
@@ -1078,6 +1157,65 @@ impl SymTrack {
         let secs = self.time_base.calc_time_saturating(ts).as_secs_f64();
         (secs.max(0.0) * f64::from(self.sample_rate)) as u64
     }
+}
+
+/// One packet in, interleaved f32 out — whichever library did the decoding, and
+/// already folded to the layout [`SymTrack::channels`] promised. The flag is
+/// that fold: `true` for a 5.1 track, and there is nothing else it can be.
+enum SymDecoder {
+    Sym(Box<dyn AudioDecoder>, bool),
+    /// Boxed because the decoder carries its own IMDCT tables and this enum is
+    /// moved into the worker.
+    Aac(Box<rusty_aac::AacDecoder>, bool),
+}
+
+impl SymDecoder {
+    fn decode(&mut self, packet: &Packet, out: &mut Vec<f32>) -> crate::Result<()> {
+        match self {
+            Self::Sym(decoder, fold) => {
+                decoder.decode(packet)?.copy_to_vec_interleaved::<f32>(out);
+                fold_5_1(out, *fold);
+            }
+            Self::Aac(decoder, fold) => {
+                let pcm = decoder
+                    .decode(&packet.data, None)
+                    .map_err(|e| format!("AAC decode failed: {e}"))?;
+                *out = pcm.samples;
+                fold_5_1(out, *fold);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 5.1 down to stereo, in place. ITU-R BS.775: the centre and the surround of
+/// each side join that side at -3 dB, and the LFE is dropped -- it carries no
+/// programme a stereo pair could put anywhere. Both outputs are divided by the
+/// sum of their own coefficients, so a source at full scale cannot come out
+/// clipped; that is what every player does by default.
+///
+/// The layout is FL, FR, FC, LFE, BL, BR, which is what symphonia's decoders
+/// and `rusty_aac` both hand back (the latter reorders AAC's own C, L, R, Ls,
+/// Rs, LFE element order into it: `decode.rs:779`).
+///
+/// ponytail: that normalisation costs 7.7 dB against what ffmpeg's `-ac 2` hands
+/// out, which does not normalise and can overload -- so a film plays quieter
+/// here than in a player beside it. It is the loudness the AC-3 5.1 path already
+/// has (measured within 1.3 dB), so the two agree; the upgrade path is a
+/// limiter on the output, at which point the coefficients can go back to 1.0.
+fn fold_5_1(samples: &mut Vec<f32>, fold: bool) {
+    if !fold {
+        return;
+    }
+    const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const NORM: f32 = 1.0 / (1.0 + 2.0 * CENTRE);
+    for frame in 0..samples.len() / 6 {
+        let [fl, fr, fc, _lfe, bl, br] = <[f32; 6]>::try_from(&samples[frame * 6..frame * 6 + 6])
+            .expect("six samples of a 5.1 frame");
+        samples[2 * frame] = (fl + CENTRE * (fc + bl)) * NORM;
+        samples[2 * frame + 1] = (fr + CENTRE * (fc + br)) * NORM;
+    }
+    samples.truncate(samples.len() / 6 * 2);
 }
 
 /// One source's AC-3 track: the same mp4 sample tables the AAC track is read
@@ -2086,14 +2224,10 @@ fn run_sym(
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
-        let buf = match decoder.decode(&packet) {
-            Ok(buf) => buf,
-            Err(e) => {
-                eprintln!("audio decode error at sample {pos}: {e}");
-                return true;
-            }
-        };
-        buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
+        if let Err(e) = decoder.decode(&packet, &mut interleaved) {
+            eprintln!("audio decode error at sample {pos}: {e}");
+            return true;
+        }
         let next = pos + (interleaved.len() / channels) as u64;
         // Reborrowed per packet: the filter memory has to carry across the
         // packet boundary, so this is one `EqState` for the whole segment.
@@ -2115,7 +2249,43 @@ fn run_sym(
 
 #[cfg(test)]
 mod tests {
-    use super::{PRE_ROLL, SAMPLES_PER_PACKET, packet_at, packet_run};
+    use super::{PRE_ROLL, SAMPLES_PER_PACKET, fold_5_1, packet_at, packet_run};
+
+    /// The 5.1 fold: each side keeps its own front channel, takes the centre
+    /// and its own surround at -3 dB, drops the LFE, and comes out unable to
+    /// clip a full-scale source. The channel order is FL, FR, FC, LFE, BL, BR.
+    #[test]
+    fn five_one_folds_to_stereo_without_clipping() {
+        // One frame per channel at full scale, one channel at a time.
+        for (channel, (left, right)) in [
+            (0, (1.0, 0.0)),                                     // FL
+            (1, (0.0, 1.0)),                                     // FR
+            (2, (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2)), // FC
+            (3, (0.0, 0.0)),                                     // LFE, dropped
+            (4, (std::f32::consts::FRAC_1_SQRT_2, 0.0)),         // BL
+            (5, (0.0, std::f32::consts::FRAC_1_SQRT_2)),         // BR
+        ] {
+            let mut frame = vec![0.0f32; 6];
+            frame[channel] = 1.0;
+            fold_5_1(&mut frame, true);
+            let norm = 1.0 / (1.0 + 2.0 * std::f32::consts::FRAC_1_SQRT_2);
+            assert_eq!(frame.len(), 2, "one 5.1 frame is one stereo frame");
+            assert!((frame[0] - left * norm).abs() < 1e-6, "ch{channel}: {frame:?}");
+            assert!((frame[1] - right * norm).abs() < 1e-6, "ch{channel}: {frame:?}");
+        }
+        // Every channel at once is what a normalised fold exists for.
+        let mut loud = vec![1.0f32; 12];
+        fold_5_1(&mut loud, true);
+        assert_eq!(loud.len(), 4);
+        assert!(
+            loud.iter().all(|s| (*s - 1.0).abs() < 1e-6),
+            "full scale in, full scale out, never past it: {loud:?}"
+        );
+        // A track that is not 5.1 is handed over untouched.
+        let mut stereo = vec![0.5f32, -0.5];
+        fold_5_1(&mut stereo, false);
+        assert_eq!(stereo, [0.5, -0.5]);
+    }
 
     /// A real AAC track: one stts entry, N packets of 1024.
     fn aac(count: u32) -> impl IntoIterator<Item = (u32, u32)> {
