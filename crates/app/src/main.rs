@@ -12973,8 +12973,7 @@ mod tests {
 
         // Saved and loaded back with the lanes in the order a hand-written
         // project may hold them: the sound last, behind the layer.
-        let dir = std::env::temp_dir().join(format!("ve_group_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let dir = engine::scratch::Scratch::dir("ve_group");
         let file = dir.join("lanes.edith");
         session.save_project(&file).expect("save the project");
         let text = std::fs::read_to_string(&file).expect("read it back");

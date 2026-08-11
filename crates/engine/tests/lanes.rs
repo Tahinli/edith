@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Clip, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
+use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
@@ -41,12 +42,10 @@ fn pin_software() {
     });
 }
 
-/// Per-run unique, like the export suite's: two suites at once must not write
-/// each other's files.
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_lanes_{name}_{}.{ext}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    path
+/// Its own directory, gone with the value: two suites at once must not write
+/// each other's files, and nothing may outlive the test that wrote it.
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("ve_lanes_{name}"), ext)
 }
 
 /// A hand-written v4 project: `V1` the whole of `test_av`, `V2` the middle
@@ -57,7 +56,7 @@ fn out_path(name: &str, ext: &str) -> PathBuf {
 /// per test: two tests sharing one name run in parallel over one file, and the
 /// first to finish deletes it out from under the second -- which then fails on
 /// a file that is simply not there any more.
-fn three_lane_file(name: &str) -> PathBuf {
+fn three_lane_file(name: &str) -> Scratch {
     let path = out_path(name, "edith");
     // `source <audio stream> <path>`: the number is which audio track of the
     // file plays, not the source index -- both of these are on their first.

@@ -1283,6 +1283,8 @@ fn nal_type(nal: &[u8]) -> u8 {
 mod tests {
     use std::io::BufReader;
 
+    use crate::scratch::Scratch;
+
     use super::*;
 
     const SPS: &[u8] = &[0x67, 0x42, 0x00, 0x1E, 0xAB];
@@ -1372,7 +1374,7 @@ mod tests {
 
     #[test]
     fn create_rejects_unusable_config() {
-        let out = std::env::temp_dir().join("ve_mux_never_written.mp4");
+        let out = Scratch::file("ve_mux_never_written", "mp4");
         let ok = VideoParams {
             width: 64,
             height: 64,
@@ -1420,7 +1422,7 @@ mod tests {
             au(&[&[0x41, 0x04, 0x05]]),
             au(&[&[0x41, 0x06]]),
         ];
-        let out = std::env::temp_dir().join(format!("ve_mux_{}.mp4", std::process::id()));
+        let out = Scratch::file("ve_mux", "mp4");
 
         let mut muxer = Mp4Muxer::create(
             &out,
@@ -1565,7 +1567,7 @@ mod tests {
         let packets = tone_packets(48_000, 2);
         let heard: usize = packets.iter().map(|p| p.samples as usize).sum();
 
-        let out = std::env::temp_dir().join(format!("ve_mkv_sound_{}.mkv", std::process::id()));
+        let out = Scratch::file("ve_mkv_sound", "mkv");
         let mut muxer = MkvMuxer::create(
             &out,
             &Av1Params {
@@ -1637,7 +1639,7 @@ mod tests {
         let inter = obu(6, &[0xBB; 5]);
         let packets = tone_packets(48_000, 2);
 
-        let out = std::env::temp_dir().join(format!("ve_mp4_av1_{}.mp4", std::process::id()));
+        let out = Scratch::file("ve_mp4_av1", "mp4");
         let mut muxer = Mp4Muxer::create_av1(
             &out,
             &Av1Params {
@@ -1698,7 +1700,7 @@ mod tests {
         key.extend_from_slice(&obu(6, &[0xAA; 8]));
         let inter = obu(6, &[0xBB; 5]);
 
-        let out = std::env::temp_dir().join(format!("ve_mkv_{}.mkv", std::process::id()));
+        let out = Scratch::file("ve_mkv", "mkv");
         let config = av1_sequence_header(&key).expect("the keyframe carries one");
         assert_eq!(config, &sequence[..], "the sequence header OBU, whole");
         let mut muxer = MkvMuxer::create(
@@ -1769,7 +1771,7 @@ mod tests {
     #[test]
     fn an_ntsc_rate_survives_the_round_trip() {
         const NTSC: f64 = 24_000.0 / 1001.0;
-        let out = std::env::temp_dir().join(format!("ve_mux_ntsc_{}.mp4", std::process::id()));
+        let out = Scratch::file("ve_mux_ntsc", "mp4");
         let mut muxer = Mp4Muxer::create(
             &out,
             &VideoParams {

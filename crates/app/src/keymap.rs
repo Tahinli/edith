@@ -961,6 +961,8 @@ fn parse(text: &str) -> Result<(Keymap, Vec<String>), String> {
 
 #[cfg(test)]
 mod tests {
+    use engine::scratch::Scratch;
+
     use super::{ActionId, Chord, Keymap, config_path_in, emit, parse};
 
     fn chord(key: &str, ctrl: bool) -> Chord {
@@ -1124,7 +1126,7 @@ mod tests {
 
         // The notice names the line and the file, and the defaults do *not*
         // take over -- that was the data loss.
-        let dir = std::env::temp_dir().join(format!("edith-keymap-drop-{}", std::process::id()));
+        let dir = Scratch::dir("edith-keymap-drop");
         let path = dir.join("edith").join("keybindings");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
@@ -1230,7 +1232,7 @@ mod tests {
     #[test]
     fn a_saved_keymap_comes_back_off_the_disk() {
         // Its own directory, never the real config one: this test writes.
-        let dir = std::env::temp_dir().join(format!("edith-keymap-{}", std::process::id()));
+        let dir = Scratch::dir("edith-keymap");
         let path = dir.join("edith").join("keybindings");
         let mut written = Keymap::defaults();
         written

@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use engine::audio::{AudioSession, StreamInfo};
+use engine::scratch::Scratch;
 
 /// Three audio streams: 0 is AAC 44.1k stereo (440/880 Hz, und), 1 is AAC
 /// 22.05k mono (220 Hz, fra), 2 is AC-3, which we cannot decode.
@@ -197,7 +198,7 @@ fn flag_default_on_a_later_track_is_still_stream_0() {
         "the fixture stopped carrying an explicit FlagDefault=0"
     );
     bytes[at + 2] = 1;
-    let patched = std::env::temp_dir().join(format!("ve_flagdefault_{}.mkv", std::process::id()));
+    let patched = Scratch::file("ve_flagdefault", "mkv");
     std::fs::write(&patched, &bytes).expect("write the patched file");
 
     // The flagged track leads: it is what `AudioSession::open` played before
@@ -215,7 +216,7 @@ fn flag_default_on_a_later_track_is_still_stream_0() {
     // track's tone, sample for sample what the wrapper hands out.
     let (wrapped, rx) = AudioSession::open(&patched).expect("opens").expect("audio");
     let played: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
-    let sources = [(patched.clone(), 0)];
+    let sources = [(patched.to_path_buf(), 0)];
     let (meta, stream_0) = {
         let (meta, rx) = AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])
             .expect("opens")
