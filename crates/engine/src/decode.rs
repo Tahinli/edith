@@ -10,11 +10,12 @@ use std::thread;
 use rusty_h264::Decoder;
 
 use crate::color::ColorParams;
-use crate::colorspace::ColorDescription;
+use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
 use crate::scale::Composer;
+use crate::tonemap::{self, ToneMapper};
 
 /// One decoded picture, ready to hand to a renderer.
 pub struct Frame {
@@ -496,11 +497,25 @@ struct Render {
     /// used to assume of every file.
     desc: ColorDescription,
     canvas: Composer,
-    /// The graded copy of the source planes, refilled per frame and kept across
-    /// the worker's whole range. Empty unless the clip is both graded *and*
-    /// placed, which is the only case that needs it.
+    /// This stream's HDR-to-SDR map, built once here because building it is
+    /// float work over 9 537 grid nodes and the transfer is a property of the
+    /// stream. `None` for an SDR stream, which is what keeps that path exactly
+    /// the one it was.
+    tone: Option<ToneMapper>,
+    /// The working copy of the source planes, refilled per frame and kept
+    /// across the worker's whole range. Empty unless the clip needs one: it is
+    /// tone-mapped in place, graded in place, or both.
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
+
+/// What [`Render::frame`] converts a tone-mapped picture in: the tone map's
+/// output contract ([`crate::tonemap`]), and no longer the HDR space the file
+/// declared.
+const TONE_MAPPED: ColorDescription = ColorDescription {
+    matrix: Matrix::Bt709,
+    transfer: Transfer::Sdr,
+    full_range: false,
+};
 
 impl Render {
     fn new(color: ColorParams, desc: ColorDescription, canvas: Composer) -> Self {
@@ -508,6 +523,16 @@ impl Render {
             color,
             desc,
             canvas,
+            // ponytail: the ceiling is that the map reads limited-range codes
+            // (`tonemap`'s input contract), so a full-range PQ file -- which
+            // no encoder writes and no camera produces -- is mapped as if it
+            // were limited and comes out slightly crushed. The upgrade is a
+            // range argument to `ToneMapper::new`.
+            tone: match desc.transfer {
+                Transfer::Sdr => None,
+                Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq)),
+                Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg)),
+            },
             graded: (Vec::new(), Vec::new(), Vec::new()),
         }
     }
@@ -521,13 +546,47 @@ impl Render {
         width: u32,
         height: u32,
     ) -> Frame {
-        if self.canvas.is_passthrough(width, height) {
+        let passthrough = self.canvas.is_passthrough(width, height);
+        // Everything that has to happen to the samples before the canvas sees
+        // them, on one copy: the tone map (HDR streams only) and, unless the
+        // conversion below can fuse it, the grade. An SDR stream that is either
+        // ungraded or passing through takes neither and never allocates.
+        //
+        // The grade lands *after* the map on purpose: it is a look on the
+        // picture a viewer is shown, so its brightness and saturation mean what
+        // they say in the SDR the tone map just produced, not in the 10-stop
+        // HDR the file was in.
+        let (y, u, v, desc) = if self.tone.is_some() || (!passthrough && !self.color.is_identity())
+        {
+            let (gy, gu, gv) = &mut self.graded;
+            gy.clear();
+            gy.extend_from_slice(y);
+            gu.clear();
+            gu.extend_from_slice(u);
+            gv.clear();
+            gv.extend_from_slice(v);
+            if let Some(tone) = &self.tone {
+                tone.map(gy, gu, gv, width as usize, height as usize);
+            }
+            if !passthrough && !self.color.is_identity() {
+                crate::color::apply_yuv(&self.color, gy, gu, gv);
+            }
+            let desc = if self.tone.is_some() {
+                TONE_MAPPED
+            } else {
+                self.desc
+            };
+            (&gy[..], &gu[..], &gv[..], desc)
+        } else {
+            (y, u, v, self.desc)
+        };
+        if passthrough {
             return Frame {
                 index,
                 width,
                 height,
                 bgra: i420_to_bgra_with(
-                    &self.desc,
+                    &desc,
                     &self.color,
                     y,
                     u,
@@ -537,19 +596,6 @@ impl Render {
                 ),
             };
         }
-        let (gy, gu, gv) = &mut self.graded;
-        let (y, u, v) = if self.color.is_identity() {
-            (y, u, v)
-        } else {
-            gy.clear();
-            gy.extend_from_slice(y);
-            gu.clear();
-            gu.extend_from_slice(u);
-            gv.clear();
-            gv.extend_from_slice(v);
-            crate::color::apply_yuv(&self.color, gy, gu, gv);
-            (&gy[..], &gu[..], &gv[..])
-        };
         let (y, u, v, width, height) = self.canvas.place(y, u, v, width, height);
         Frame {
             index,
@@ -557,7 +603,7 @@ impl Render {
             height,
             // Ungraded on purpose: the grade is already in the pixels above and
             // the canvas around them must stay the black it was filled with.
-            bgra: i420_to_bgra(&self.desc, y, u, v, width as usize, height as usize),
+            bgra: i420_to_bgra(&desc, y, u, v, width as usize, height as usize),
         }
     }
 }

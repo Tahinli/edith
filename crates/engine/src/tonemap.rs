@@ -32,12 +32,12 @@
 //!    BT.1886 -- the SDR display's own curve, so peak stays peak and black stays
 //!    black -- and back to limited-range BT.709 Y'C'bC'r.
 //!
-//! Method A is conservative on mid-tones by construction: with the standard
+//! Method A is conservative on mid-tones by construction: told the standard
 //! 1000 cd/m^2 mastering peak it puts 203-nit HDR diffuse white near SDR code
-//! 166 (about 40 cd/m^2), not at SDR white. [`MASTER_NITS`] is the exposure
-//! knob -- a lower assumed peak lifts everything -- and is a constant here
-//! because this module is handed pixels, never the stream metadata that would
-//! carry the real one.
+//! 166 (about 40 cd/m^2), not at SDR white -- a picture a viewer reads as dark.
+//! [`MASTER_NITS`] is the exposure knob that answers it: a lower assumed peak
+//! lifts everything, and it is a constant here because this module is handed
+//! pixels, never the stream metadata that would carry the real one.
 //!
 //! # Why a 3D LUT
 //!
@@ -50,11 +50,11 @@
 //!
 //! The axes are deliberately uneven. A node every 8th code on luma and every
 //! 16th on chroma was measured against a uniform 33^3 and a uniform 17^3 on
-//! this machine: 17^3 puts the assumed peak (1000 cd/m^2, code 181) 5 codes
-//! shy of SDR white, because the curve's knee falls inside a 16-code luma
-//! cell, while a full 33^3 costs 30.7 ms a 4K frame against this one's 19.3 --
-//! four times the table, out of cache and out of budget. Fine where the eye
-//! is, coarse where the format already is.
+//! this machine, back when the assumed peak was 1000 cd/m^2: 17^3 put that
+//! peak's own code 5 codes shy of SDR white, because the curve's knee falls
+//! inside a 16-code luma cell, while a full 33^3 costs 30.7 ms a 4K frame
+//! against this one's 19.3 -- four times the table, out of cache and out of
+//! budget. Fine where the eye is, coarse where the format already is.
 //!
 //! Nodes are `u8`, the output's own precision, and the interpolation rounds
 //! once at the end in `u32` fixed point. On a node the grid *is* the pipeline;
@@ -71,10 +71,13 @@
 //! pixels is mapped in the same visit, sharing the block's bilinear chroma
 //! weights, which is what keeps a 4K frame inside a frame's time budget.
 
-/// The mastering peak Method A is told to assume, cd/m^2. 1000 is what HDR10
-/// grades are mastered to in practice and what BT.2446's own worked example
-/// uses. See the module note: this is the exposure knob.
-const MASTER_NITS: f32 = 1000.0;
+/// The mastering peak Method A is told to assume, cd/m^2. Not the 1000 an HDR10
+/// grade is mastered to and not BT.2446's own worked example: the goal here is
+/// what a *viewer* sees on an SDR screen next to mpv, and told 1000 the method
+/// lands 203-nit diffuse white on code 166, which reads as broadcast-dark.
+/// Told 400 it lands near 205 -- display-referred, the brightness a player
+/// shows -- which is what this constant buys. See the module note.
+const MASTER_NITS: f32 = 400.0;
 /// The SDR display peak Method A targets, cd/m^2.
 const SDR_NITS: f32 = 100.0;
 /// Method A's working gamma. Not a display curve here -- it is the domain the
@@ -103,7 +106,8 @@ pub enum Transfer {
     /// SMPTE ST 2084 / BT.2100 PQ, absolute: a code *is* a luminance.
     Pq,
     /// BT.2100 HLG, relative: a code is scene light, and the OOTF (system gamma
-    /// 1.2 at a 1000 cd/m^2 display) turns it into display light.
+    /// 1.2 at a 1000 cd/m^2 display, less at a dimmer one) turns it into
+    /// display light.
     Hlg,
 }
 
@@ -299,10 +303,12 @@ fn map_code(transfer: Transfer, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
     // Clamping instead walks a too-bright pixel toward white, which is what a
     // highlight past the display's reach should do.
     //
-    // ponytail: the ceiling is that MASTER_NITS is a guess. Content mastered
-    // brighter than 1000 cd/m^2 loses its top stops to white here. The upgrade
-    // is the stream's own MaxCLL/mastering-display metadata reaching this
-    // module as a `new` argument -- nothing else in the pipeline changes.
+    // ponytail: the ceiling is that MASTER_NITS is an exposure choice, not a
+    // measurement. Everything the content masters above it -- which at 400 is
+    // most of an HDR10 grade's highlight range -- walks to white here. The
+    // upgrade is the stream's own MaxCLL/mastering-display metadata reaching
+    // this module as a `new` argument, with 400 as the fallback: nothing else
+    // in the pipeline changes.
     let lin = display_light(transfer, [r, g, b]);
     let gam = lin.map(|c| (c / MASTER_NITS).clamp(0.0, 1.0).powf(1.0 / GAMMA));
 
@@ -351,11 +357,14 @@ fn display_light(transfer: Transfer, rgb: [f32; 3]) -> [f32; 3] {
         Transfer::Pq => rgb.map(pq_eotf),
         Transfer::Hlg => {
             // BT.2100: inverse OETF to scene light, then the OOTF, whose system
-            // gamma is 1.2 at a 1000 cd/m^2 display -- which is the peak this
-            // module assumes anyway, so no log term is needed for it.
+            // gamma is 1.2 at a 1000 cd/m^2 display and follows the display
+            // peak from there by the standard's own log term -- so the peak
+            // [`MASTER_NITS`] names is the peak the OOTF is built for, rather
+            // than a number the constant silently invalidates.
             let scene = rgb.map(hlg_scene);
             let ys = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
-            let gain = MASTER_NITS * ys.max(0.0).powf(0.2);
+            let gamma = 1.2 + 0.42 * (MASTER_NITS / 1000.0).log10();
+            let gain = MASTER_NITS * ys.max(0.0).powf(gamma - 1.0);
             scene.map(|c| gain * c)
         }
     }
@@ -435,16 +444,26 @@ mod tests {
         (y[0], u[0], v[0])
     }
 
-    /// The three anchors, in cd/m^2, against codes worked out by hand from the
-    /// stages in the module note. Black is pinned by the curve (0 in, 0 out);
-    /// 1000 nits is the assumed peak and must reach SDR white; 203 nits is
-    /// BT.2408 diffuse white, which Method A deliberately does *not* put at SDR
-    /// white -- 166 is what the published maths gives, and the day that number
-    /// moves, the transcription moved with it.
+    /// The anchors, in cd/m^2, against the codes the stages in the module note
+    /// give for [`MASTER_NITS`]. Black is pinned by the curve (0 in, 0 out);
+    /// [`MASTER_NITS`] itself is the assumed peak and must reach SDR white;
+    /// 203 nits is BT.2408 diffuse white, and 205 is where a 400 cd/m^2 peak
+    /// puts it -- a picture as bright as a player shows, which is the whole
+    /// reason that constant is not 1000 (where the same maths gives 166). The
+    /// day one of these moves, the transcription moved with it.
+    ///
+    /// 1000 nits is the ceiling the `map_code` ponytail names, asserted rather
+    /// than described: everything above the assumed peak is white.
     #[test]
     fn pq_anchors_land_where_method_a_puts_them() {
         let mapper = ToneMapper::new(Transfer::Pq);
-        for (nits, expected) in [(0.0, 16u8), (26.0, 89), (203.0, 166), (1000.0, 235)] {
+        for (nits, expected) in [
+            (0.0, 16u8),
+            (26.0, 108),
+            (203.0, 205),
+            (MASTER_NITS, 235),
+            (1000.0, 235),
+        ] {
             let code = byte(pq_code(nits));
             let (y, _, _) = mapped(&mapper, code, 128, 128);
             assert!(
@@ -571,13 +590,16 @@ mod tests {
     }
 
     /// HLG's own anchors. Its signal is relative, so what is worth pinning is
-    /// where the OOTF puts it: black at black, peak signal at the assumed
-    /// 1000 cd/m^2 display peak (hence SDR white, the PQ side's 1000-nit
-    /// anchor), and BT.2408 HLG diffuse white -- signal 0.75, which the inverse
-    /// OETF and the system-gamma-1.2 OOTF land on 203 cd/m^2, the same light as
-    /// the PQ side's diffuse white and so the same output code. One pipeline,
-    /// two front doors: if the HLG stage drifts, that agreement is the first
-    /// thing to break.
+    /// where the OOTF puts it: black at black and peak signal at the assumed
+    /// display peak, hence SDR white -- to the grid's rounding, since code 235
+    /// sits between two luma nodes and the one below it is a hair under peak.
+    ///
+    /// BT.2408 HLG diffuse white is signal 0.75, and it does *not* land on the
+    /// PQ side's 203-nit code: relative is the point of HLG, so 0.75 is 19% of
+    /// whatever peak the display has -- 76 cd/m^2 of [`MASTER_NITS`]'s 400,
+    /// against PQ's absolute 203 -- and it comes out darker, at 170. That is
+    /// the standard's own behaviour and the number to watch: if the OOTF's
+    /// system gamma stops following the assumed peak, this is what moves.
     #[test]
     fn hlg_anchors_are_sane() {
         let mapper = ToneMapper::new(Transfer::Hlg);
@@ -587,7 +609,7 @@ mod tests {
         let (white, _, _) = mapped(&mapper, code(1.0), 128, 128);
         assert!(black.abs_diff(16) <= 3, "HLG black -> {black}");
         assert!(white.abs_diff(235) <= 3, "HLG peak -> {white}");
-        assert!(diffuse.abs_diff(166) <= 3, "HLG diffuse white -> {diffuse}");
+        assert!(diffuse.abs_diff(170) <= 3, "HLG diffuse white -> {diffuse}");
     }
 
     /// A short plane is left alone rather than half mapped, and a frame with no
