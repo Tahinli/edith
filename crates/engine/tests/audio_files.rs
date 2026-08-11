@@ -273,7 +273,7 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
     assert_eq!(
         e.to_string(),
         "the timeline has no picture: an mp4 would be black. \
-         Export WAV or FLAC, which are the sound itself"
+         Export WAV, FLAC or MP3, which are the sound itself"
     );
     assert!(!mp4.exists(), "the refusal wrote a file anyway");
 
@@ -415,16 +415,19 @@ fn wait(handle: &engine::ExportHandle) -> engine::Result<()> {
     }
 }
 
-/// The export copies AAC packets and has no encoder, so a timeline carrying an
-/// mp3 cannot become an mp4 -- named, with its format, rather than exported
-/// silent or exported wrong.
+/// The *copy* path names what it cannot copy, by file and by format. That is a
+/// fallback's reason rather than a user's refusal now -- `export::copy_audio`
+/// takes this `Err` as "not copyable" and decodes and re-encodes the timeline
+/// instead (`tests/audio_export.rs` exports exactly this shape as an mp4 with
+/// sound in it) -- but the words are what a caller with no encoder shows, so
+/// they are still asserted here.
 #[test]
 fn an_export_refuses_audio_it_cannot_copy() {
     let sources = vec![asset("test_av.mp4"), asset("test_tone.mp3")];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     assert_eq!(
         refusal(AudioSession::copy_multi_segments(&sources, &segs)),
-        "export needs AAC audio today; test_tone.mp3 is mp3"
+        "a packet copy needs AAC in an mp4; test_tone.mp3 is mp3"
     );
     // A timeline of nothing but mp4 still exports, which is the invariant this
     // refusal must not have cost.
