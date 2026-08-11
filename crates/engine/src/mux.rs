@@ -482,6 +482,11 @@ const CODEC_DELAY: u32 = 0x56AA;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
+const TRACK_NAME: u32 = 0x536E;
+const TRACK_LANGUAGE: u32 = 0x22B59C;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+const BLOCK_DURATION: u32 = 0x9B;
 
 /// One millisecond, the tick every Matroska muxer writes and this one's block
 /// timestamps are in. The *rate* is not derived from these -- `DefaultDuration`
@@ -532,6 +537,34 @@ pub struct HevcParams<'a> {
     pub hvcc: &'a [u8],
 }
 
+/// The soft subtitle track a Matroska file carries beside the picture: text,
+/// timed, still text in the file -- a player draws it and a user can turn it
+/// off, which is what "soft" means and what burning it into the pixels is not.
+///
+/// The cues are the *exported timeline's* (`export::timeline_cues` puts them
+/// there), because the file's clock is the timeline's; nothing here shifts
+/// anything.
+pub struct SubParams {
+    /// What the track is called in the file. A three-letter code goes in as
+    /// `Language`, which is what a player's subtitle menu reads; anything else
+    /// is a `Name`, which is what it shows when there is no language to show.
+    ///
+    /// ponytail: one string for both because a [`crate::subtitle::SubtitleTrack`]
+    /// carries one label and not a (language, name) pair. The upgrade path is to
+    /// keep the two apart from the demuxer down -- `MkvSubtitle` already has
+    /// them -- and it belongs to whoever needs a per-language export list.
+    pub label: String,
+    /// In start order, which is the order they are written in.
+    pub cues: Vec<crate::subtitle::Cue>,
+}
+
+/// The cues waiting to be interleaved into the clusters, [`MkvAudio`]'s twin.
+struct MkvSubs {
+    cues: Vec<crate::subtitle::Cue>,
+    /// Cues already written.
+    next: usize,
+}
+
 /// Writes one AV1 video track as Matroska (`.mkv`), and the timeline's AAC
 /// beside it where there is any: an `A_AAC` track whose `CodecPrivate` is the
 /// two-byte `AudioSpecificConfig` an mp4's `esds` carries, which is what
@@ -562,6 +595,9 @@ pub struct MkvMuxer {
     /// The AAC track, if the timeline has sound, and how far it has been
     /// written.
     audio: Option<MkvAudio>,
+    /// The subtitle track, if one travels with the file, and how far it has
+    /// been written.
+    subs: Option<MkvSubs>,
 }
 
 /// The sound waiting to be interleaved into the clusters.
@@ -588,6 +624,7 @@ impl MkvMuxer {
         path: &Path,
         video: &Av1Params,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+        subs: Option<SubParams>,
     ) -> crate::Result<Self> {
         if video.config.is_empty() {
             return Err("no AV1 sequence header for the track's CodecPrivate".into());
@@ -602,6 +639,7 @@ impl MkvMuxer {
             b"V_AV1",
             &av1c,
             audio,
+            subs,
         )
     }
 
@@ -616,6 +654,7 @@ impl MkvMuxer {
         path: &Path,
         video: &HevcParams,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+        subs: Option<SubParams>,
     ) -> crate::Result<Self> {
         if video.hvcc.is_empty() {
             return Err("no hvcC record for the track's CodecPrivate".into());
@@ -628,9 +667,11 @@ impl MkvMuxer {
             b"V_MPEGH/ISO/HEVC",
             video.hvcc,
             audio,
+            subs,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open(
         path: &Path,
         width: u32,
@@ -639,6 +680,7 @@ impl MkvMuxer {
         codec_id: &[u8],
         codec_private: &[u8],
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+        subs: Option<SubParams>,
     ) -> crate::Result<Self> {
         if !frame_rate.is_finite() || frame_rate <= 0.0 {
             return Err(format!("bad frame rate {frame_rate}").into());
@@ -697,6 +739,12 @@ impl MkvMuxer {
         if let Some((audio, _)) = &audio {
             elem(&mut tracks, TRACK_ENTRY, &aac_track_entry(audio)?);
         }
+        // Declared even where the audio track is not: the numbers are fixed
+        // (1 picture, 2 sound, 3 text) rather than counted, so a file with
+        // subtitles and no sound still says track 3 in its blocks.
+        if let Some(subs) = &subs {
+            elem(&mut tracks, TRACK_ENTRY, &subtitle_track_entry(&subs.label));
+        }
         elem(&mut head, TRACKS, &tracks);
 
         let mut file = File::create(path)?;
@@ -714,6 +762,10 @@ impl MkvMuxer {
                 next: 0,
                 samples: 0,
                 sample_rate: params.sample_rate.max(1),
+            }),
+            subs: subs.map(|subs| MkvSubs {
+                cues: subs.cues,
+                next: 0,
             }),
         })
     }
@@ -742,8 +794,10 @@ impl MkvMuxer {
             uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
         }
         // The sound this picture plays under goes in first, into the cluster the
-        // picture opened: a player reads the two together.
+        // picture opened: a player reads the two together. The cue over it with
+        // them, for the same reason.
         self.drain_audio(ts)?;
+        self.drain_subs(ts)?;
         self.block(1, ts, key, obus);
         self.frames += 1;
         Ok(())
@@ -784,6 +838,41 @@ impl MkvMuxer {
         }
     }
 
+    /// Every cue that has come up by `until`, into the current cluster --
+    /// [`drain_audio`](MkvMuxer::drain_audio)'s twin, and `i64::MAX` at
+    /// [`finish`](MkvMuxer::finish) writes what is left: a cue may still be on
+    /// screen over the last picture, and one written nowhere is one a player
+    /// never shows.
+    fn drain_subs(&mut self, until: i64) -> crate::Result<()> {
+        loop {
+            let Some(subs) = &mut self.subs else {
+                return Ok(());
+            };
+            let Some(cue) = subs.cues.get_mut(subs.next) else {
+                return Ok(());
+            };
+            // Milliseconds, the tick this file is written in: a cue is read for
+            // a second or more and no eye finds the half a tick it rounds by.
+            let ts = (cue.start_us + 500) / 1_000;
+            if ts > until {
+                return Ok(());
+            }
+            // A cue that says it ends before it starts stays up for one tick
+            // rather than for a duration a reader would take as unsigned.
+            let ms = ((cue.end_us - cue.start_us + 500) / 1_000).max(1) as u64;
+            let text = std::mem::take(&mut cue.text);
+            subs.next += 1;
+            // A cluster of its own where the text has run past what a 16-bit
+            // relative timestamp reaches, exactly as the sound's drain does.
+            if self.cluster.is_empty() || ts - self.cluster_ts >= CLUSTER_MS {
+                self.flush()?;
+                self.cluster_ts = ts;
+                uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+            }
+            self.block_group(SUB_TRACK, ts, ms, text.as_bytes());
+        }
+    }
+
     /// One `SimpleBlock` of `track`, timed against the open cluster. Every AAC
     /// packet is a keyframe; a picture is one when the encoder said so.
     fn block(&mut self, track: u8, ts: i64, key: bool, payload: &[u8]) {
@@ -793,6 +882,24 @@ impl MkvMuxer {
         block.push(if key { 0x80 } else { 0 });
         block.extend_from_slice(payload);
         elem(&mut self.cluster, SIMPLE_BLOCK, &block);
+    }
+
+    /// One `BlockGroup`: a `Block` and the `BlockDuration` beside it. That pair
+    /// is how a cue says when it goes away -- a `SimpleBlock` has nowhere to put
+    /// a duration, and a subtitle without one stays up until whatever a player
+    /// decides, which is what a subtitle must never do.
+    fn block_group(&mut self, track: u8, ts: i64, duration_ms: u64, payload: &[u8]) {
+        let mut block = Vec::with_capacity(payload.len() + 4);
+        block.push(0x80 | track); // the track number as a one-byte EBML integer
+        block.extend_from_slice(&((ts - self.cluster_ts) as i16).to_be_bytes());
+        // No flags a text block can carry: not lacing, and "keyframe" is a
+        // `SimpleBlock` field that a plain `Block` does not have at all.
+        block.push(0);
+        block.extend_from_slice(payload);
+        let mut group = Vec::new();
+        elem(&mut group, BLOCK, &block);
+        uint(&mut group, BLOCK_DURATION, duration_ms);
+        elem(&mut self.cluster, BLOCK_GROUP, &group);
     }
 
     fn flush(&mut self) -> crate::Result<()> {
@@ -814,6 +921,7 @@ impl MkvMuxer {
         // Whatever sound outlasts the last picture, before the last cluster is
         // closed: a track cut short here is a file that goes silent at the end.
         self.drain_audio(i64::MAX)?;
+        self.drain_subs(i64::MAX)?;
         self.flush()?;
         if self.frames == 0 {
             return Err("no frames were written to the Matroska file".into());
@@ -876,6 +984,36 @@ fn aac_track_entry(audio: &AudioParams) -> crate::Result<Vec<u8>> {
     uint(&mut audio_elem, CHANNELS, u64::from(audio.chan_conf));
     elem(&mut entry, AUDIO, &audio_elem);
     Ok(entry)
+}
+
+/// Which track a subtitle block names. Fixed, like the picture's 1 and the
+/// sound's 2: a file with no audio track still writes its text on 3, so nothing
+/// has to count tracks to read a block.
+const SUB_TRACK: u8 = 3;
+
+/// The `TrackEntry` of the subtitle track: type 0x11 (subtitles) and
+/// `S_TEXT/UTF8`, whose blocks are the cue's own UTF-8 text and whose timing is
+/// the block's -- the codec every player draws and the one this project's own
+/// reader parses back (`subtitle::cues_of`).
+///
+/// The label is a `Language` where it is one (`eng`, `tur`: three letters is
+/// what ISO-639-2 is) and a `Name` otherwise, which is exactly what
+/// [`crate::subtitle::of_matroska`] reads back out, so a track exported and
+/// re-imported keeps the name it had.
+fn subtitle_track_entry(label: &str) -> Vec<u8> {
+    let mut entry = Vec::new();
+    uint(&mut entry, TRACK_NUMBER, u64::from(SUB_TRACK));
+    uint(&mut entry, TRACK_UID, u64::from(SUB_TRACK));
+    uint(&mut entry, TRACK_TYPE, 0x11);
+    uint(&mut entry, FLAG_LACING, 0);
+    elem(&mut entry, CODEC_ID, b"S_TEXT/UTF8");
+    let code = label.len() == 3 && label.bytes().all(|b| b.is_ascii_lowercase());
+    match (code, label.is_empty()) {
+        (true, _) => elem(&mut entry, TRACK_LANGUAGE, label.as_bytes()),
+        (false, false) => elem(&mut entry, TRACK_NAME, label.as_bytes()),
+        (false, true) => {}
+    }
+    entry
 }
 
 /// The sequence header OBU of a coded temporal unit, for the track's
@@ -1444,6 +1582,7 @@ mod tests {
                 },
                 packets,
             )),
+            None,
         )
         .unwrap();
         // Half a second of picture under a second of sound: the tail of the
@@ -1571,6 +1710,7 @@ mod tests {
                 config,
             },
             None,
+            None,
         )
         .unwrap();
         muxer.write_frame(&key, true).unwrap();
@@ -1613,6 +1753,7 @@ mod tests {
                     frame_rate: 30.0,
                     config: &[],
                 },
+                None,
                 None,
             )
             .is_err()

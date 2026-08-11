@@ -4139,8 +4139,13 @@ impl Player {
         if self.export.is_some() {
             return;
         }
-        let settings =
+        let mut settings =
             export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
+        // The track the library has picked is the one that travels -- the same
+        // row the overlay draws, so the file carries what was watched. Set here
+        // rather than inside `export_settings`, which the card also calls for
+        // the *estimate* and which nothing else needs a subtitle for.
+        settings.subtitles = Some(self.sub_track);
         let Some(session) = &mut self.session else {
             self.notice = Some("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
@@ -6394,6 +6399,27 @@ impl Player {
             }));
         }
         list.push(r.into_any_element());
+        // What happens to the picked subtitle track, in one line: it is written
+        // into the file, or the reason it is not. Nothing to pick here -- which
+        // track is the library's row and the container is the format row above
+        // -- so the row says and does not answer, like the machine lines below.
+        list.push(
+            entry(
+                ("subtitles", 0),
+                "",
+                "Subtitles".into(),
+                self.session
+                    .as_ref()
+                    .map_or_else(
+                        || "none".into(),
+                        |s| s.planned_subtitles(self.format, Some(self.sub_track)),
+                    )
+                    .into(),
+                false,
+                false,
+            )
+            .into_any_element(),
+        );
         let destination = entry(
             ("destination", 0),
             "d",
@@ -10126,6 +10152,10 @@ fn export_settings(
         // badly, which is a thing about the machine and not about the output --
         // `VE_SW_ENC` already says it, and to the whole run rather than once.
         force_sw: false,
+        // The picked track is put on by `start_export`, which is the only
+        // caller that writes a file; the rest of them are asking about the
+        // bitrate and the format.
+        subtitles: None,
     }
 }
 
