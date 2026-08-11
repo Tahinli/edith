@@ -814,14 +814,26 @@ fn import_refuses_what_does_not_match() {
         .import(&asset("test_mismatch.mp4"))
         .expect("a silent 640x360 file joins a timeline with sound");
 
-    // Same codec, same audio, 25 fps: the one property left, named with both
-    // rates. Mixing rates would mean retiming the timeline itself, and there is
-    // no resampler for that, so the refusal is the honest answer.
-    let err = session
+    // A frame rate of its own is no longer a refusal either: 25 fps joins a
+    // 30 fps timeline and is read at `Rate` against it -- see
+    // `tests/mixed_fps.rs` for what it then plays like.
+    session
         .import(&asset("test_25fps.mp4"))
-        .expect_err("25 fps must not join a 30 fps timeline")
+        .expect("25 fps may join a 30 fps timeline");
+    session
+        .remove_source(&asset("test_25fps.mp4"), 0)
+        .expect("...and the row it made comes back off");
+
+    // What is still refused, and all that is: one output device means one rate
+    // and one layout, and there is no resampler to make two into one.
+    let err = session
+        .import(&asset("test_ac3.mp4"))
+        .expect_err("a mono track cannot join a stereo timeline")
         .to_string();
-    assert_eq!(err, "25.000 fps does not match the timeline's 30.000 fps");
+    assert_eq!(
+        err,
+        "audio 44100 Hz 1 ch does not match the timeline's 44100 Hz 2 ch"
+    );
 
     assert!(
         session.import(&asset("no_such_file.mp4")).is_err(),

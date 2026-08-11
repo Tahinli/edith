@@ -11,17 +11,19 @@ use std::time::{Duration, Instant};
 
 use engine::audio::StreamInfo;
 use engine::color::ColorParams;
+use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
+use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
-use engine::{Clip, ExportHandle, Frame, PlaybackSession};
+use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba,
-    size,
+    Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -74,6 +76,11 @@ const LABEL_MIN_W: f32 = 36.;
 /// allocates one bucket per window, so a rate taken from anything the user can
 /// influence is an allocation bomb -- and 40 is already finer than the pixels a
 /// clip is ever given.
+///
+/// ponytail: "finer than the pixels" stops being true once the timeline is
+/// zoomed -- past ~25 ms per bucket the envelope reads as steps rather than as
+/// a shape. Ceiling: [`View::max_zoom`]'s 8 frames across the bed. The upgrade
+/// is a second, finer pass over the visible span only, cached like `waves` is.
 const WAVE_BPS: u32 = 40;
 /// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
 /// and a path with a point per pixel is a path per repaint.
@@ -95,6 +102,9 @@ const ROW_H: f32 = 32.;
 /// wear in the lanes, which is the whole of the panel<->timeline association.
 const SWATCH_W: f32 = 4.;
 const CONTROL_H: f32 = 28.;
+/// The volume slider beside its button: a hundred steps across it, so a pixel
+/// is finer than a step and the drag reads as continuous.
+const VOLUME_W: f32 = 110.;
 const RULER_HIT_H: f32 = HIT_MIN;
 /// Wide enough for `HH:MM:SS:FF / HH:MM:SS:FF`, and fixed so changing digits
 /// cannot push the layout around.
@@ -107,16 +117,39 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 /// keeps the card inside the smallest window no matter how many actions the
 /// editor grows -- ten rows fit here, and the eleventh is a scroll away.
 const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
-/// The same for the export card, which carries a fixed-format line and a button
-/// under its list and so has less room: destination, nine formats and five
-/// qualities are fifteen rows, eight of them on screen.
+/// The same for the export card, which carries two summary lines and a button
+/// under its list and so has less room: a section header, six codecs, the
+/// container, five qualities and the destination are more rows than a 360 px
+/// window holds. Eight on screen, which is the whole format section and its
+/// header -- what a user picks first is never behind a scroll.
 const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
+/// The export card is wider than the keybindings one: its rows carry a key, a
+/// name *and* what the choice means, and the two summary lines under them state
+/// the whole file. At `KEYS_W` every one of those wrapped to two lines, which is
+/// the card the user called unfriendly. Still inside the 640 px floor with the
+/// scrim showing either side of it.
+const EXPORT_W: f32 = 420.;
+/// The column the key of a row is printed in, wide enough for `0–9`: every row
+/// in the export card says what picks it, so the card is drivable by keyboard
+/// without a legend to memorise.
+const EXPORT_KEY_W: f32 = 26.;
+/// Everything in the export card that is *not* the row list: the title, the
+/// status line, the head and tail of the summary, the button, the gaps between
+/// them and the padding around the lot. What the list may be is the window
+/// minus this -- and never less than [`EXPORT_ROWS_H`], which is the number
+/// that makes the card fit the 360 px floor.
+const EXPORT_FIXED_H: f32 = 17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
 /// binds like every other list here.
 const MENU_W: f32 = 260.;
 const MENU_ROW_H: f32 = HIT_MIN;
 const MENU_PAD: f32 = 6.;
+/// How much of the item list is on screen at once, capped and scrolling like the
+/// keybindings and export lists: every action the pointer can reach is an item
+/// here, and a menu taller than the 640x360 floor would hang its last items off
+/// the bottom edge, where nobody can click them.
+const MENU_ROWS_H: f32 = 12. * MENU_ROW_H;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -127,6 +160,18 @@ const ESCAPE: &str = "escape";
 /// What the header says with no timeline open, and what the window title reads
 /// as a program name rather than as a file name.
 const NO_FILE: &str = "no file open";
+
+/// What a press of play says when there is nothing to play: no timeline at all
+/// and an emptied one are the same answer to the user, so they are one line.
+const NOTHING_TO_PLAY: &str = "NOTHING TO PLAY — put a clip on the timeline first";
+
+/// Whether a press of play would have anything to play. No timeline at all and
+/// one every clip has been taken off are the same state to a transport, and the
+/// button and the key both have to give the same answer to it -- so there is
+/// one of them, and it is free of the window so it can be checked without one.
+fn nothing_to_play(session: Option<&PlaybackSession>) -> bool {
+    session.is_none_or(PlaybackSession::is_empty)
+}
 
 /// What the monitoring output is set to. Two things, not one: the level the
 /// user picked, and whether it is being held silent -- so unmuting comes back
@@ -146,27 +191,43 @@ struct Volume {
 }
 
 impl Volume {
-    /// 5% a press: twenty of them across the range.
-    const MAX_STEPS: u8 = 20;
+    /// One step is one percent: fine enough that a drag along the slider reads
+    /// as continuous, and still a count rather than a float.
+    const MAX_STEPS: u8 = 100;
+
+    /// 5% a press: twenty presses across the range, which is what the keys have
+    /// always moved. The slider is what the finer grid is for.
+    const KEY_STEP: u8 = 5;
 
     /// What the device is set to: mute wins, and the level is what it returns
     /// to. `0.0..=1.0`, which is the range the plugin's ABI accepts.
     fn gain(self) -> f32 {
-        if self.muted {
-            0.
-        } else {
-            f32::from(self.steps) / f32::from(Self::MAX_STEPS)
-        }
+        if self.muted { 0. } else { self.along() }
     }
 
     /// One press up or down, clamped at both ends -- saturating, so the count
     /// cannot wrap past silence into full volume.
     fn step(&mut self, up: bool) {
         self.steps = if up {
-            self.steps.saturating_add(1).min(Self::MAX_STEPS)
+            self.steps.saturating_add(Self::KEY_STEP).min(Self::MAX_STEPS)
         } else {
-            self.steps.saturating_sub(1)
+            self.steps.saturating_sub(Self::KEY_STEP)
         };
+    }
+
+    /// Where the hand let go along the slider, 0..1 from silence to full. The
+    /// grid is the same one the keys land on, so a drag to the top and a key
+    /// held up reach the very same number -- and a drag never touches mute:
+    /// asking for a level while muted is not asking for sound.
+    fn set_along(&mut self, frac: f32) {
+        self.steps = (frac.clamp(0., 1.) * f32::from(Self::MAX_STEPS)).round() as u8;
+    }
+
+    /// How full the slider is drawn, 0..1. The level and not the gain: a muted
+    /// slider still shows what unmuting comes back to, exactly as the label
+    /// does.
+    fn along(self) -> f32 {
+        f32::from(self.steps) / f32::from(Self::MAX_STEPS)
     }
 
     /// What the button reads. The level shows while muted too: it is what the
@@ -209,8 +270,9 @@ struct AssetDrag(PathBuf, usize);
 
 /// A clip already on the timeline being dragged: the lane it is on and its index
 /// there, which is how every other edit names a clip. Unlike an [`AssetDrag`]
-/// nothing is inserted -- the same clip changes lane and keeps its frames -- so
-/// where along the bed it is let go says nothing here either.
+/// nothing is inserted -- the same clip changes lane and keeps the frames it
+/// plays -- but where along the bed it is let go is exactly where it lands, less
+/// the offset the hand grabbed it at ([`Player::grab`]).
 #[derive(Clone, Copy)]
 struct ClipDrag {
     lane: Lane,
@@ -241,6 +303,12 @@ struct Trim {
 /// Wide enough to hit, narrow enough that the middle of even a small box is
 /// still the body.
 const EDGE_W: f32 = 6.;
+
+/// How close to an edge a dragged clip has to be let go for it to land *on* it:
+/// the snap every timeline has, in pixels rather than frames so that it feels
+/// the same at every zoom. Narrower than [`EDGE_W`] -- a hand aiming between two
+/// takes must still be able to leave a gap of a few frames there.
+const SNAP_PX: f64 = 5.;
 
 /// An open clip menu: which clip it was opened on, where it hangs, and whether
 /// it has been turned over to show what that clip *is* instead of what can be
@@ -311,8 +379,13 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 11] = [
+const MENU_ITEMS: [ActionId; 14] = [
     ActionId::Cut,
+    // The clipboard pair, which had no door but a chord: copy takes the clip the
+    // menu names, and paste is the timeline's rather than this clip's -- the
+    // same kind of global item the mute below already is.
+    ActionId::Copy,
+    ActionId::Paste,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
@@ -320,6 +393,10 @@ const MENU_ITEMS: [ActionId; 11] = [
     ActionId::Group,
     ActionId::Equalizer,
     ActionId::Speed,
+    // The scan is a clip card like the two above it -- opened on whichever half
+    // was clicked -- and a card only a stroke could open is one a pointer never
+    // finds.
+    ActionId::Silence,
     ActionId::Color,
     ActionId::Fit,
     ActionId::ToggleMute,
@@ -358,9 +435,10 @@ fn speed_at(permille: i32) -> Speed {
 }
 
 /// The silence card's rows, in the order it lists them: how wide the apply
-/// reaches, the four settings a scan is told, and the rate the speed-up plays
-/// at. What `silence_field` indexes and what [`Player::nudge_silence`] moves.
-const SILENCE_ROWS: usize = 6;
+/// reaches, the threshold and the unit it is read in, the three durations a
+/// scan is told, and the rate the speed-up plays at. What `silence_field`
+/// indexes and what [`Player::nudge_silence`] moves.
+const SILENCE_ROWS: usize = 7;
 
 /// How wide a jumpcut reaches. A ripple used to be the whole timeline's
 /// business and nothing else; it is a *choice* now, because a podcast track's
@@ -408,10 +486,23 @@ const SILENCE_DB_STEP: f32 = 1.;
 const SILENCE_SECS_STEP: f64 = 0.05;
 
 /// How far each of them may be pushed. UI decisions, all of them: the engine
-/// takes any finite number, but a threshold at 0 dBFS calls a whole take silent
-/// and a forgiveness of ten seconds finds nothing in a talking head.
-const SILENCE_DB_RANGE: (f32, f32) = (-80., -10.);
+/// takes any finite number, but a forgiveness of ten seconds finds nothing in a
+/// talking head. The threshold reaches full scale, which calls a whole take
+/// silent -- that is a thing someone may want to ask for (the preview on the
+/// lane says what it would cost before anything is cut), so the top is 0 rather
+/// than a number this card picked for them.
+const SILENCE_DB_RANGE: (f32, f32) = (-80., 0.);
 const SILENCE_SECS_RANGE: (f64, f64) = (0., 5.);
+
+/// One press of a nudge key on the mix card, in dB: the step every fader and
+/// the limiter's ceiling moves by. A whole decibel, the smallest move anyone
+/// hears as a move -- and it lands on round numbers, so a track set by ear
+/// still reads as a number a person would say.
+const MIX_DB_STEP: f32 = 1.;
+
+/// The mix card's rows below the faders: the limiter's ceiling and its switch.
+/// One fader per audio track comes first, however many there are.
+const MIX_MASTER_ROWS: usize = 2;
 
 /// The speed-up rate is bounded *below* by real time: a "speed-up" that slows
 /// the silence down would make the timeline longer, which is the one thing
@@ -450,6 +541,36 @@ const EQ_TICKS: [(f32, &str); 5] = [
     (10000., "10k"),
     (20000., "20k"),
 ];
+
+/// The gains the graph rules a line across, besides the 0 dB one it already
+/// had: half way to each limit, so a boost can be read as "about six" without
+/// counting pixels. The limits themselves are the box's own edges and are
+/// named at the corners instead.
+const EQ_DB_GRID: [f32; 2] = [6., -6.];
+
+/// The grid's ink: above the card's background and below everything drawn on
+/// it, so the lines are a ruling rather than a thing to look at.
+const EQ_GRID: u32 = 0x3a3a3a;
+
+/// How many played samples one spectrum frame is transformed from. A power of
+/// two ([`fft`] is radix-2) and the whole of the engine's tap: 1024 at 48 kHz
+/// is a 47 Hz bin, fine enough that the bass end is a shape and short enough
+/// (21 ms) that the analyser moves with the music.
+const EQ_FFT: usize = 1024;
+
+/// The level range the analyser is drawn across, floor to ceiling in dBFS: the
+/// bottom of the box is silence and the top is a bin at -12 dBFS, which is
+/// about where a mixed track's loudest band sits. A look, not a measurement --
+/// the numbers on the axis are the curve's dB, never the analyser's.
+const EQ_SPECTRUM_DB: (f32, f32) = (-96., -12.);
+
+/// The analyser's fill, behind the curve: a dim blue-grey with enough alpha to
+/// read as a haze the accent line sits on top of.
+const EQ_SPECTRUM_INK: u32 = 0x7f95ad66;
+
+/// The area under the response curve, same accent as the line at a tenth of
+/// its weight: it is what makes a boost read as a hill rather than as a wire.
+const EQ_FILL_INK: u32 = 0x4a9eff26;
 
 /// The colour card's four controls, in the order it lists them: what each is
 /// called and the range it moves in. The order is `ColorParams`' own, which is
@@ -515,6 +636,10 @@ struct Player {
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
+    /// How much of the timeline the ruler and the lanes are showing. Held here
+    /// and nowhere else: every frame-to-pixel answer in the panel comes out of
+    /// it, so the boxes, the playhead and the pointer cannot disagree.
+    view: View,
     /// Which clip the edit keys act on: the lane it is in and its index there.
     /// The *clicked* half, not the group -- a group is what gets marked on
     /// screen, but Lift has to know which half it was aimed at. Indices move
@@ -549,6 +674,19 @@ struct Player {
     /// `None` is a file with no picture to report (every source that is not an
     /// image, and one whose header would not read).
     sizes: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Which decoder each source will run on, probed once at import and kept:
+    /// the codec (`None` for a still) and the seat the engine picked for it.
+    /// What a library row says *before* anything plays; the running answer is
+    /// the session's own (`PlaybackSession::decode_backend`), which follows a
+    /// fallback this cannot. Filled like `sizes`: presence means "asked", and
+    /// `None` is a source with no decoder to name -- a song, or one the probe
+    /// refused -- which must stay in the map or every repaint would ask again.
+    decoders: HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
+    /// Which encoder an export of the picked settings would open, and what it
+    /// was asked about: the probe opens a real VA-API encoder (~100 ms), so it
+    /// runs off the render thread and only while the export card is up. The
+    /// inner `None` is "asked, not answered yet".
+    export_seat: Option<(ExportSettings, (u32, u32), Option<&'static str>)>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -559,6 +697,13 @@ struct Player {
     /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
     /// [`Trim`].
     trim: Option<Trim>,
+    /// How far into the clip the last press on a box landed, in timeline
+    /// frames: what a drag lets go of is the *point that was grabbed*, so the
+    /// head lands that much in front of the pointer and the clip does not jump
+    /// under the hand. Recorded at the press because gpui hands the drop only
+    /// the value being dragged, and stale between drags, which costs nothing --
+    /// no drag starts without a press on the box it moves.
+    grab: u32,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -584,6 +729,11 @@ struct Player {
     /// also why it is not written to the project file and cannot reach an
     /// export. [`Player::apply_volume`] is what pushes it at a session.
     volume: Volume,
+    /// Where the volume slider was last painted, and whether a hand is on it --
+    /// the speed bar's pair, for the speed bar's reason: the pointer moves
+    /// arrive at the root, so the bar's own geometry has to be readable there.
+    volume_bar: Rc<Cell<Bounds<Pixels>>>,
+    volume_dragging: bool,
     /// The keybindings overlay is up. While it is, it owns the keyboard and the
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
@@ -593,6 +743,15 @@ struct Player {
     /// time -- opening either closes the other, since both are the whole window
     /// and two stacked scrims say nothing about which one is listening.
     export_open: bool,
+    /// How the card lays its rows out, and where the formats this program
+    /// cannot write are said. Two shapes of the same card, kept behind `g` and
+    /// `r` so the choice between them can be made by looking at both rather
+    /// than by argument: sections with headers against one flat list, and a
+    /// collapsed "cannot write" footer against a dimmed row each. The defaults
+    /// are grouped and collapsed -- the five dead rows used to eat the fold.
+    /// Not persisted: this is a look, not a setting.
+    export_grouped: bool,
+    export_refusals_inline: bool,
     /// Which quality row the card has picked, and the megabits typed against
     /// the custom one. Kept across closes, so a second export offers what the
     /// first one chose.
@@ -622,6 +781,11 @@ struct Player {
     /// window position only, so this is what a press and a drag are read
     /// against ([`frac_along`], [`frac_down`]).
     eq_graph: Rc<Cell<Bounds<Pixels>>>,
+    /// Whether the analyser is drawn behind the curve. On by default -- what
+    /// the curve is being *shaped against* is the point of drawing it -- and
+    /// off with one press for anyone who would rather read the curve alone.
+    /// Card state, not the project's: it changes nothing that plays.
+    eq_spectrum: bool,
     /// The colour card is up on this clip -- the lane it is on and its index
     /// there. `None` when it is closed, which is the only place that state
     /// lives: the grade itself is the project's.
@@ -637,6 +801,14 @@ struct Player {
     /// The bar is being dragged. On the root like the colour card's, for the
     /// same reason: the pointer leaves a 4 px bar on the first move.
     speed_dragging: bool,
+    /// The mix card is up: every audio track's own volume and the master
+    /// limiter, which are project settings and not any clip's -- so unlike the
+    /// four clip cards there is no handle to hold, only whether it is open.
+    mix_open: bool,
+    /// Which of its rows the arrow keys move -- a fader, the limiter's ceiling
+    /// or its switch. The card's own focus, since nothing in it takes gpui's
+    /// (ledger:182).
+    mix_field: usize,
     /// The silence card is up on this clip -- the lane it is on and its index
     /// there, exactly as the speed card's handle is.
     silence_open: Option<(Lane, usize)>,
@@ -652,6 +824,14 @@ struct Player {
     /// Which of the card's [`SILENCE_ROWS`] the arrow keys move. The card's own
     /// focus, since nothing in it takes gpui's (ledger:182).
     silence_field: usize,
+    /// Whether the threshold is *labelled* dBFS or dB. Display only, and the
+    /// number is the same either way: the setting is a level below full scale,
+    /// so 0 is the loudest sample a file can hold and -40 is forty decibels
+    /// under it -- "dBFS" names that reference out loud, "dB" leaves it unsaid.
+    /// No conversion is hiding behind the row (there is no reference here worth
+    /// inventing, and a made-up SPL would be a lie about what was measured);
+    /// what it changes is which of the two spellings a person reads.
+    silence_dbfs: bool,
     /// What the last scan found, in timeline frames: what the lane draws marks
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
@@ -819,15 +999,27 @@ impl Player {
             ActionId::Color => self.open_color(cx),
             ActionId::Fit => self.cycle_fit(cx),
             ActionId::Resolution => self.cycle_resolution(cx),
+            // The playhead is what a key zoom is aimed at: it is the one place
+            // on the timeline the user is certainly looking at, and keeping it
+            // still is what every editor does.
+            ActionId::ZoomIn => self.zoom(ZOOM_STEP, None, cx),
+            ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
+            ActionId::ZoomFit => self.zoom_fit(cx),
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
+            // The last track of that kind: the one the add key put there, so the
+            // two strokes undo each other press for press. Any other track goes
+            // through the × in its own header.
+            ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
+            ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
             ActionId::Equalizer => self.open_eq(cx),
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
+            ActionId::Mix => self.open_mix(None, cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -934,6 +1126,26 @@ impl Player {
             self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(next)).into());
             self.reset_after_reseek();
         }
+        cx.notify();
+    }
+
+    /// Magnifies the timeline about a point that stays put: `anchor` is where
+    /// along the bed to hold still (a ctrl+wheel holds the pointer), and with
+    /// none it is the playhead -- so the frame being worked on is still the
+    /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
+    /// stops at the whole timeline, in at a handful of frames.
+    fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
+        let duration = self.drawn_duration();
+        let at = self.playhead(duration);
+        let anchor = anchor.unwrap_or_else(|| self.view.frac_at(at, duration).clamp(0., 1.));
+        self.view = self.view.zoomed(factor, anchor, duration, self.fps);
+        cx.notify();
+    }
+
+    /// All the way back out: the whole timeline across the bed, which is what
+    /// the panel shows before anyone has zoomed at all.
+    fn zoom_fit(&mut self, cx: &mut Context<Self>) {
+        self.view = View::default();
         cx.notify();
     }
 
@@ -1216,6 +1428,82 @@ impl Player {
         cx.notify();
     }
 
+    /// Opens the mix card. `lane` is the row it lands on -- the track whose
+    /// header was clicked -- and `None` starts at the top, which is what the
+    /// stroke means.
+    ///
+    /// Nothing here is a clip's, so nothing is refused for want of a selection:
+    /// a timeline with no audio track at all still has a limiter to set, and a
+    /// fader on an empty track is the level the next take lands at.
+    fn open_mix(&mut self, lane: Option<Lane>, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        self.mix_open = true;
+        self.mix_field = lane
+            .and_then(|lane| self.mix_lanes().iter().position(|&l| l == lane))
+            .unwrap_or(0);
+        // One card at a time, the rule the other five follow.
+        self.keys_open = false;
+        self.export_open = false;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.close_silence();
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// The audio tracks the card shows a fader for, top to bottom: *every* one
+    /// of them, empty ones included -- what the timeline lays out, not what the
+    /// mixer happens to open (`Project::audio_lanes` leaves an empty track out,
+    /// and a fader that disappeared when a track was cleared would be a setting
+    /// nobody could reach).
+    fn mix_lanes(&self) -> Vec<Lane> {
+        self.session.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == LaneKind::Audio)
+                .collect()
+        })
+    }
+
+    /// Moves the row the card has picked: a fader by [`MIX_DB_STEP`], the
+    /// ceiling by the same, and the switch either way (a ring of two, like the
+    /// silence card's unit row).
+    ///
+    /// Every one of them goes through the session, so it reseeks: what the ear
+    /// hears while the arrow is held is the mix that is being set.
+    fn nudge_mix(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let lanes = self.mix_lanes();
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        match lanes.get(self.mix_field) {
+            Some(&lane) => {
+                let at = session.lane_gain_db(lane) + steps as f32 * MIX_DB_STEP;
+                session.set_lane_gain_db(lane, at);
+            }
+            None => {
+                let limiter = session.limiter();
+                let at = match self.mix_field - lanes.len() {
+                    0 => Limiter {
+                        on: limiter.on,
+                        ..limiter
+                    }
+                    .with_ceiling(limiter.ceiling_db + steps as f32 * MIX_DB_STEP),
+                    _ => Limiter {
+                        on: !limiter.on,
+                        ..limiter
+                    },
+                };
+                session.set_limiter(at);
+            }
+        }
+        cx.notify();
+    }
+
     /// Closes it and drops the preview with it: marks left on the lane after
     /// the card is gone would name frames the next edit has already moved.
     fn close_silence(&mut self) {
@@ -1314,9 +1602,12 @@ impl Player {
                     + steps as f32 * SILENCE_DB_STEP)
                     .clamp(SILENCE_DB_RANGE.0, SILENCE_DB_RANGE.1)
             }
-            2 => self.silence.min_silence = secs(self.silence.min_silence),
-            3 => self.silence.padding = secs(self.silence.padding),
-            4 => self.silence.min_keep = secs(self.silence.min_keep),
+            // Two spellings of the same level, so either arrow flips it -- a
+            // ring of two, like the scope row's.
+            2 => self.silence_dbfs = !self.silence_dbfs,
+            3 => self.silence.min_silence = secs(self.silence.min_silence),
+            4 => self.silence.padding = secs(self.silence.padding),
+            5 => self.silence.min_keep = secs(self.silence.min_keep),
             _ => {
                 self.silence_factor =
                     silence_rate(i32::from(self.silence_factor.permille()) + steps * SPEED_STEP)
@@ -1408,6 +1699,11 @@ impl Player {
         match session.cut_regions(&regions, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Every hole closed moves the clips after it up a place, so the
+                // selection now names a different clip than the one that is
+                // highlighted -- dropped here as after every other edit that
+                // moves indexes (a delete, a paste, an undo).
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -1442,6 +1738,10 @@ impl Player {
         match session.speed_regions(&regions, rate, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Splitting each silence out and closing the room it no longer
+                // needs moves indexes exactly as the cut does: the selection
+                // goes with them.
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -1466,7 +1766,32 @@ impl Player {
             || self.color_open.is_some()
             || self.speed_open.is_some()
             || self.silence_open.is_some()
+            || self.mix_open
             || self.exporting().is_some()
+    }
+
+    /// Which of [`Repeat`]'s three the window is in, for the hold gate at the
+    /// top of the key handler. Not [`Player::modal`]: that asks whether an
+    /// overlay is up at all, and here the cards with sliders in them are
+    /// exactly the ones that answer differently from the keys menu and the
+    /// export card.
+    fn repeat_scope(&self) -> Repeat {
+        if self.rebinding.is_some()
+            || self.keys_open
+            || self.export_open
+            || self.exporting().is_some()
+        {
+            Repeat::Nothing
+        } else if self.eq_open.is_some()
+            || self.color_open.is_some()
+            || self.speed_open.is_some()
+            || self.silence_open.is_some()
+            || self.mix_open
+        {
+            Repeat::Card
+        } else {
+            Repeat::Keymap
+        }
     }
 
     /// Opens the equalizer on the selected clip. Audio only, and it says so
@@ -1825,6 +2150,28 @@ impl Player {
             })
             .detach();
         }
+        // Which decoder each file will run on, for the row that says so before
+        // a frame of it plays. Off the render thread like the streams above: a
+        // stream the plugin takes costs one VA-API init (~90 ms) to answer.
+        for path in unseen_paths(session.sources(), &self.decoders) {
+            self.decoders.insert(path.clone(), None);
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                // A song and a source no decoder here takes are both `None`:
+                // the row says nothing about them rather than guessing, and
+                // import refused the second at the door anyway.
+                async move { engine::decode::probe(&path).ok() }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.decoders.insert(path, probed);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         for key in unseen_sources(session.sources(), &self.waves) {
             self.waves.insert(key.clone(), Wave::Loading);
             let decoded = cx.background_executor().spawn({
@@ -1857,6 +2204,59 @@ impl Player {
         }
     }
 
+    /// Probes the encoder an export would open, once per (settings,
+    /// resolution) and only while the export card is up -- it opens the very
+    /// VA-API encoder the export would, which is what makes the card's line a
+    /// measurement instead of a promise, and also what makes it too slow for
+    /// the render thread. Written before the spawn, like the probes above, so
+    /// the repaints during it start no second one.
+    fn cache_export_seat(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        if !self.export_open {
+            return;
+        }
+        // A format with no picture has no seat to probe -- and the *last*
+        // format's is not its answer: cleared rather than left standing, or
+        // picking MP3 after AV1 would read "SW encode (rav1e) · MP3 · SW
+        // (rusty_mp3)", which names an encoder that will not run.
+        if !settings.format.has_video() {
+            self.export_seat = None;
+            return;
+        }
+        let meta = *session.meta();
+        let key = (settings, (meta.width, meta.height));
+        if self
+            .export_seat
+            .is_some_and(|(asked, size, _)| (asked, size) == key)
+        {
+            return;
+        }
+        self.export_seat = Some((key.0, key.1, None));
+        let probed = cx
+            .background_executor()
+            .spawn(async move { engine::export::planned_video(&meta, &settings) });
+        cx.spawn(async move |this, cx| {
+            let probed = probed.await;
+            this.update(cx, |this, cx| {
+                // Only if the card is still asking the same question: a format
+                // changed while the plugin opened has a probe of its own.
+                if let Some(seat) = this
+                    .export_seat
+                    .as_mut()
+                    .filter(|(asked, size, _)| (*asked, *size) == key)
+                {
+                    seat.2 = probed;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The group id of the clicked clip, which is what marks the other half.
     fn selected_link(&self) -> Option<u32> {
         let (lane, idx) = self.selected?;
@@ -1878,19 +2278,29 @@ impl Player {
         cx.notify();
     }
 
-    /// A clip dragged off one lane and let go over another: it changes track and
-    /// keeps the frames it covers, as one undo step. Dropped back on its own
-    /// lane it is not an edit at all, so nothing is said about it. The engine
-    /// reseeks, so all this owes is the flag reset -- and the selection, whose
-    /// index was that lane's own and now names a different clip there.
-    fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, cx: &mut Context<Self>) {
-        if self.exporting().is_some() || from == to {
+    /// A clip let go at window `x` over lane `to`: it lands with its head where
+    /// the hand is carrying it ([`Player::drop_frame`]), on the track it was
+    /// dropped on, taking its whole take with it -- one undo step for the
+    /// gesture. Dropped back where it was picked up it is not an edit at all, so
+    /// nothing is said about it. The engine reseeks, so all this owes is the
+    /// flag reset -- and the selection, whose index was that lane's own and now
+    /// names a different clip there.
+    fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
             return;
         }
+        let (Some(start), Some(was)) = (
+            self.drop_frame(from, idx, to, x),
+            self.session
+                .as_ref()
+                .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.start)),
+        ) else {
+            return;
+        };
         let moved = self
             .session
             .as_mut()
-            .is_some_and(|session| session.move_clip_to_lane(from, idx, to));
+            .is_some_and(|session| session.move_clip_to(from, idx, to, start));
         let (kind, lanes) = match from.kind {
             LaneKind::Video => ("picture", "video"),
             LaneKind::Audio => ("sound", "audio"),
@@ -1900,9 +2310,10 @@ impl Player {
                 self.selected = None;
                 self.reset_after_reseek();
             }
-            // The two ways a drag is refused, told apart by the one thing the
-            // front-end already knows: a lane's kind. Everything else that
-            // could refuse (a clip that is not there) cannot be dragged.
+            // The three ways a drag is refused, told apart by what the
+            // front-end already knows: a lane's kind, and where the clip was.
+            // Everything else that could refuse (a clip that is not there)
+            // cannot be dragged.
             false if from.kind != to.kind => {
                 self.notice = Some(
                     format!(
@@ -1912,6 +2323,9 @@ impl Player {
                     .into(),
                 )
             }
+            // Picked up and put back down where it was: a click, and a click
+            // says nothing.
+            false if from == to && start == was => {}
             false => {
                 self.notice = Some(
                     format!(
@@ -1923,6 +2337,55 @@ impl Player {
             }
         }
         cx.notify();
+    }
+
+    /// Where a clip let go at window `x` over lane `to` wants its head: the
+    /// frame under the pointer, less however far into the box the hand grabbed
+    /// it (so the clip does not jump under the pointer), pulled onto a
+    /// neighbouring edge when it lands within [`SNAP_PX`] of one. `None` when
+    /// there is no such clip to move. The engine has the last word on where it
+    /// may actually go -- this is the ask, not the answer.
+    ///
+    /// ponytail: the bed ends where the timeline does, so a clip cannot be
+    /// dragged *past* the last frame -- the pointer has no pixel out there to
+    /// name and [`View::time_at`] clamps to the duration. Room to the right is
+    /// made by pulling a tail out first ([`Player::drawn_duration`] already
+    /// lengthens the bed for exactly that gesture). The upgrade is to draw the
+    /// bed past the end while a clip drag is in flight, the way a trim already
+    /// does: `drawn_duration` would take the dragged clip's length the same way
+    /// it takes a trim's reach.
+    fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
+        let session = self.session.as_ref()?;
+        let clip = session.lane_clips(from).get(idx).copied()?;
+        let raw = self.frame_under(x).saturating_sub(self.grab);
+        // The edges worth landing on: both ends of every clip already on the
+        // lane it is being let go over, the playhead, and the head of the
+        // timeline. Never the group's own boxes -- a clip does not snap to
+        // where it already is.
+        let mut marks: Vec<u32> = session
+            .lane_clips(to)
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| {
+                (to, i) != (from, idx) && !(clip.link.is_some() && c.link == clip.link)
+            })
+            .flat_map(|(_, c)| [c.start, c.end()])
+            .collect();
+        marks.push(frame_at(session.now(), self.fps));
+        marks.push(0);
+        Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the zoom the bed is drawn at: a snap is
+    /// a distance on screen, so zoomed right in it is worth less than a frame
+    /// (no snap at all, which is what a hand placing single frames wants) and
+    /// zoomed out to the whole timeline it is worth many.
+    fn snap_frames(&self) -> u32 {
+        let bed = f64::from(f32::from(self.ruler.get().size.width));
+        if bed <= 0. {
+            return 0;
+        }
+        (SNAP_PX / bed * self.view.span(self.drawn_duration()) * self.fps) as u32
     }
 
     /// Opens the clip menu on the box under the pointer, from the right button
@@ -1979,16 +2442,28 @@ impl Player {
     /// against the same duration the boxes are drawn to, so the edge tracks the
     /// pointer exactly.
     fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let (duration, fps) = (self.drawn_duration(), self.fps);
-        let frac = frac_along(x, self.ruler.get());
+        let at = self.frame_under(x);
         let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
             return;
         };
         let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
             return;
         };
-        trim.to = frame_at(f64::from(frac) * duration, fps).clamp(lo, hi);
+        trim.to = at.clamp(lo, hi);
         cx.notify();
+    }
+
+    /// The timeline frame a pointer at window x is on: along the same bed the
+    /// ruler is measured on, through the same [`View`] every box is drawn
+    /// through, so a zoomed-in panel answers with the frame under the pointer
+    /// and not with the one that would have been there unzoomed. The one
+    /// question a trim, a grab and a drop all ask.
+    fn frame_under(&self, x: Pixels) -> u32 {
+        let duration = self.drawn_duration();
+        frame_at(
+            self.view.time_at(frac_along(x, self.ruler.get()), duration),
+            self.fps,
+        )
     }
 
     /// The release: the whole drag reaches the engine as one edit, so it is one
@@ -2018,6 +2493,25 @@ impl Player {
             return clip;
         };
         match trim.edge {
+            // A still grows forward from source frame 0 instead, exactly as
+            // `Project::trim` writes it: with the in-point clamped at 0 the box
+            // below would slide left rather than stretch, and the release would
+            // then commit a wider clip than the drag drew.
+            Edge::Start
+                if self.session.as_ref().is_some_and(|session| {
+                    session
+                        .sources()
+                        .get(clip.source)
+                        .is_some_and(|s| engine::is_image(&s.path))
+                }) =>
+            {
+                Clip {
+                    in_frame: 0,
+                    out_frame: clip.end().saturating_sub(trim.to).max(1),
+                    start: trim.to,
+                    ..clip
+                }
+            }
             // The in-point follows the head, exactly as `Project::trim` moves
             // it: what stays on screen plays what it always played.
             Edge::Start => Clip {
@@ -2054,18 +2548,35 @@ impl Player {
         }
     }
 
+    /// Where the playhead is, as the panel draws it. The clock keeps running
+    /// after the last frame (wall time takes over at audio EOF) while the
+    /// picture is frozen, so what the UI shows is the clamped one, pinned to
+    /// the out-point once playback is done.
+    fn playhead(&self, duration: f64) -> f64 {
+        if self.done {
+            duration
+        } else {
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::now)
+                .clamp(0., duration)
+        }
+    }
+
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
-    /// "add this source" does. The whole source goes in at the playhead as one
-    /// grouped take -- the same insert a paste makes, so everything after it
-    /// moves along rather than being painted over. Reseeks like every other
-    /// edit, and drops the timeline's selection with it: the insert has just
-    /// moved the indices it pointed at.
+    /// "add this source" does. The whole source goes in as one grouped take at
+    /// `at` -- the frame the pointer let it go on, or the playhead for the
+    /// button, which names no place. It is the same insert a paste makes, so
+    /// everything after it moves along rather than being painted over. Reseeks
+    /// like every other edit, and drops the timeline's selection with it: the
+    /// insert has just moved the indices it pointed at.
     fn insert_source(
         &mut self,
         path: &Path,
         stream: usize,
         onto: Option<Lane>,
+        at: Option<u32>,
         cx: &mut Context<Self>,
     ) {
         if self.exporting().is_some() {
@@ -2100,8 +2611,16 @@ impl Player {
         // in: a row that has never been on a lane is placeable at its full
         // length, which is the whole point of an import that only fills the
         // library.
+        let fps = self.fps;
         let placed = match &mut self.session {
-            Some(session) => session.place_stream_at(session.now(), path, stream, onto),
+            // Seconds, because that is what the engine's own door takes: the
+            // frame the pointer named goes back through the same rate every box
+            // on the bed is drawn at, so it lands on the frame it was let go on
+            // rather than a neighbouring one.
+            Some(session) => {
+                let at = at.map_or_else(|| session.now(), |frame| f64::from(frame) / fps);
+                session.place_stream_at(at, path, stream, onto)
+            }
             None => Ok(false),
         };
         match placed {
@@ -2133,26 +2652,107 @@ impl Player {
             .as_mut()
             .map(|session| session.remove_source(path, stream));
         let text = match removed {
-            Some(Ok(())) => {
+            Some(Ok(idx)) => {
                 // The picked row may be the one that just went, and the engine
                 // reseeks, so this owes the flag reset like every other edit.
                 if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
                     self.selected_asset = None;
                 }
+                // A copied clip names its source by *index*, and every index
+                // past the one that went has just moved down: without this the
+                // next paste puts some other file on the timeline.
+                self.clipboard = clipboard_after_remove(self.clipboard, idx);
                 self.reset_after_reseek();
-                // The undo stack goes with it (`Project::remove_source`): said
-                // here, because a `z` that does nothing afterwards would
-                // otherwise read as a bug.
-                format!(
-                    "REMOVED {} — there is nothing left to undo",
-                    file_name(path)
-                )
+                // The last row leaves a session naming no file: nothing to
+                // play, nothing to save and nothing to show, which is the empty
+                // window the editor launches as. The next import scaffolds a
+                // fresh timeline from whatever file it is, at that file's own
+                // rate -- which is why the session goes rather than lingering
+                // on with the gone file's parameters.
+                match self
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.sources().is_empty())
+                {
+                    true => {
+                        self.close_session();
+                        format!(
+                            "REMOVED {} — the library is empty; import a file to start again",
+                            file_name(path)
+                        )
+                    }
+                    // The undo stack goes with it (`Project::remove_source`):
+                    // said here, because a `z` that does nothing afterwards
+                    // would otherwise read as a bug.
+                    false => format!(
+                        "REMOVED {} — there is nothing left to undo",
+                        file_name(path)
+                    ),
+                }
             }
             Some(Err(e)) => format!("NOT REMOVED — {e}"),
             None => "NO TIMELINE — open a file first".to_string(),
         };
         self.notice = Some(text.into());
         cx.notify();
+    }
+
+    /// Back to the window the editor launches as: no timeline, no library, no
+    /// picture -- and the hint that says to open a file. What removing the last
+    /// library row leaves, since a session whose library is empty has nothing
+    /// left to be ([`Player::remove_source`]).
+    ///
+    /// Everything a *loaded project* resets goes here for its reasons (an index
+    /// into a timeline that is gone names nothing), plus the three per-file
+    /// caches: they are keyed by path, and the next file to arrive fills them
+    /// again.
+    fn close_session(&mut self) {
+        self.session = None;
+        // The picture goes with it, or the empty window would keep showing the
+        // last frame of a timeline that no longer exists.
+        //
+        // ponytail: its atlas tile is not released -- `window.drop_image` wants
+        // a `&mut Window` this door has no other reason to take. One tile per
+        // emptied library, against one per displayed frame in `pump`; the
+        // upgrade path is threading the window through `act_on_row`.
+        self.image = None;
+        self.clipboard = None;
+        self.selected = None;
+        self.selected_asset = None;
+        self.context_menu = None;
+        self.library_menu = None;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.close_silence();
+        self.waves.clear();
+        self.streams.clear();
+        self.sizes.clear();
+        // Scanned off a source that is not in the library any more.
+        self.silence_levels = None;
+        // Every gesture in flight, dropped for `reset_after_reseek`'s reason
+        // (it drops the trim below): a drag holds a bar, a clip or a band of a
+        // timeline that has just stopped existing.
+        self.scrubbing = false;
+        self.volume_dragging = false;
+        self.eq_dragging = false;
+        self.speed_dragging = false;
+        self.color_dragging = false;
+        self.displayed = 0;
+        self.dropped = 0;
+        self.started = None;
+        // The empty window's own: no name in the titlebar, nowhere chosen to
+        // export or save to yet, and a rate that only keeps the timecode
+        // reading in frames until a file brings its own (`main`).
+        self.name = NO_FILE.into();
+        self.export_path = PathBuf::new();
+        self.project_path = PathBuf::new();
+        self.fps = 30.;
+        // No decoder to wait for a frame from: the hint is what shows.
+        self.reset_after_reseek();
+        self.pending_seek = false;
+        self.eos = false;
+        self.done = false;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -2170,7 +2770,7 @@ impl Player {
             }
             RowItem::Add => {
                 self.library_menu = None;
-                self.insert_source(&menu.path, menu.stream, None, cx);
+                self.insert_source(&menu.path, menu.stream, None, None, cx);
             }
             RowItem::Remove => {
                 self.library_menu = None;
@@ -2188,11 +2788,22 @@ impl Player {
         cx.notify();
     }
 
-    /// The rate and layout the whole timeline's audio is, taken from source 0's
-    /// own stream: what a library row has to match to be placeable. `None`
-    /// until that file has been probed, and then nothing is greyed for it.
+    /// The rate and layout the whole timeline's audio is, taken from the stream
+    /// of the first source that could have one: what a library row has to match
+    /// to be placeable. `None` until that file has been probed, and then nothing
+    /// is greyed for it.
+    ///
+    /// The first source that is *not a still*, which is the rule the engine
+    /// holds every import to (`playback::audio_source_of`) -- a picture at the
+    /// head of the list (a removal moves indexes) has no stream to describe
+    /// anything with.
     fn timeline_audio(&self) -> Option<(u32, u16)> {
-        let first = self.session.as_ref()?.sources().first()?;
+        let first = self
+            .session
+            .as_ref()?
+            .sources()
+            .iter()
+            .find(|s| !engine::is_image(&s.path))?;
         let info = self
             .streams
             .get(&first.path)?
@@ -2397,6 +3008,64 @@ impl Player {
         cx.notify();
     }
 
+    /// The × in a track's header: the add taken back, one undo step, and the
+    /// engine's own words when it refuses -- those name the clips still on the
+    /// track, so the notice says what to delete first. A removal never deletes a
+    /// clip.
+    ///
+    /// Everything holding a `(lane, idx)` is dropped, because the tracks below
+    /// the one that went have just moved up an `ord`
+    /// ([`engine::Project::remove_lane`]): a selection or an open card kept
+    /// across it would be pointing at the *next* track's clip.
+    fn remove_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let removed = self
+            .session
+            .as_mut()
+            .map(|session| session.remove_lane(lane));
+        let text = match removed {
+            Some(Ok(())) => {
+                self.selected = None;
+                self.context_menu = None;
+                self.eq_open = None;
+                self.color_open = None;
+                self.speed_open = None;
+                self.close_silence();
+                format!(
+                    "{} REMOVED — {} brings it back",
+                    lane.label(),
+                    self.keymap.display(ActionId::Undo)
+                )
+            }
+            Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
+            None => "NO TRACK REMOVED — open a file first".to_string(),
+        };
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// What the remove keys act on: the last track of that kind, which is the
+    /// one the matching add key appended. Nothing at all before a file is open,
+    /// where the timeline drawn is a placeholder pair.
+    fn remove_last_lane(&mut self, kind: LaneKind, cx: &mut Context<Self>) {
+        let last = self.session.as_ref().and_then(|session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == kind)
+                .next_back()
+        });
+        match last {
+            Some(lane) => self.remove_lane(lane, cx),
+            None => {
+                self.notice = Some("NO TRACK REMOVED — open a file first".into());
+                cx.notify();
+            }
+        }
+    }
+
     fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
             self.reset_after_reseek();
@@ -2452,7 +3121,9 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
-        let t = f64::from(frac_along(x, self.ruler.get())) * session.timeline_duration();
+        let t = self
+            .view
+            .time_at(frac_along(x, self.ruler.get()), session.timeline_duration());
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
@@ -2483,8 +3154,31 @@ impl Player {
         cx.notify();
     }
 
+    /// Where the pointer sits along the slider, as a level. The press and every
+    /// sample after it come here, so the sound follows the hand rather than the
+    /// release -- there is nothing to undo about a monitoring level, which is
+    /// why this writes live and keeps no gesture state beyond the flag.
+    fn drag_volume(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let along = frac_along(x, self.volume_bar.get());
+        self.set_volume(|volume| volume.set_along(along), cx);
+    }
+
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
+            return;
+        }
+        // Nothing to play is a message, not a transport state. An empty
+        // timeline is `done` from its one black frame onward, so the restart
+        // below would start a clock against a zero-length timeline -- and it is
+        // `done` again by the next repaint, so no later press could ever stop
+        // it: the button would read "Pause" and never pause. A delete can empty
+        // the timeline mid-play, and that press must still stop it.
+        if nothing_to_play(self.session.as_ref()) {
+            match self.session.as_mut().filter(|s| s.is_playing()) {
+                Some(session) => session.pause(),
+                None => self.notice = Some(NOTHING_TO_PLAY.into()),
+            }
+            cx.notify();
             return;
         }
         if self.done {
@@ -2543,6 +3237,38 @@ impl Player {
         }
         self.format = format;
         self.export_path = retarget(&self.export_path, format);
+    }
+
+    /// The container row: the same codec in the other box, which retargets the
+    /// destination exactly as picking a codec does -- and does nothing at all
+    /// for a codec with only one box, so the stroke cannot invent a choice the
+    /// card is not offering.
+    fn cycle_container(&mut self) {
+        self.set_format(next_container(self.format));
+    }
+
+    /// The quality rows by keyboard, wrapping. Refused by name where the format
+    /// has no bitrate to pick: a key that silently does nothing is the card
+    /// looking broken.
+    fn cycle_quality(&mut self) {
+        if let Some(why) = bitrate_refusal(self.format) {
+            self.notice = Some(why.into());
+            return;
+        }
+        let at = Quality::ALL
+            .iter()
+            .position(|&q| q == self.quality)
+            .unwrap_or(0);
+        self.quality = Quality::ALL[(at + 1) % Quality::ALL.len()];
+    }
+
+    /// The custom bitrate by pointer: the typed digits were the only control in
+    /// this card a mouse could not reach. Clamped to the range the row states
+    /// (the engine's own 1..20 Mbps), and picking the row is part of the step --
+    /// a stepper that moves a number nobody is using would move nothing.
+    fn nudge_mbps(&mut self, step: i32) {
+        self.custom_mbps = (self.custom_mbps as i32 + step).clamp(1, 20) as u32;
+        self.quality = Quality::Custom;
     }
 
     /// The card's Destination row: the desktop's save dialog, on a background
@@ -2672,6 +3398,7 @@ impl Render for Player {
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
         self.cache_media(cx);
+        self.cache_export_seat(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
         let title = window_title(&self.name);
@@ -2699,24 +3426,29 @@ impl Render for Player {
         // timecode, the ruler and the clamp below all have to follow it -- and
         // so does the room a tail being dragged needs to grow into.
         let duration = self.drawn_duration();
-        // The clock keeps running after the last frame (wall time takes over at
-        // audio EOF) while the picture is frozen, so the timeline the UI shows is
-        // the clamped one, pinned to the out-point once playback is done.
-        let position = if self.done {
-            duration
-        } else {
-            self.session
-                .as_ref()
-                .map_or(0., PlaybackSession::now)
-                .clamp(0., duration)
-        };
+        let position = self.playhead(duration);
+        // Re-settled every frame against the duration this one is drawing: an
+        // edit that shortens the timeline moves the far end of the view, and a
+        // playhead that has run off the bed pulls the view after it -- which is
+        // what makes a zoomed-in timeline scroll while it plays.
+        self.view = self.view.following(position, duration, self.fps);
 
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                // `is_held` filters auto-repeat, which would otherwise toggle
-                // playback -- or cut the timeline -- many times a second.
-                if event.is_held {
+                let key = event.keystroke.key.as_str();
+                let ctrl = event.keystroke.modifiers.control;
+                // `is_held` is the auto-repeat, and a value is the one thing
+                // worth running on it: a held arrow on a card moves the slider
+                // it picked, and a held volume key runs the volume. Everything
+                // else is filtered exactly as it always was -- a repeat that
+                // toggled playback, or cut the timeline, many times a second is
+                // what this guard is for, and a row waiting for a stroke takes
+                // none of it either (it would bind the key, then fire what it
+                // just bound). See [`repeats`].
+                if event.is_held
+                    && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl))
+                {
                     return;
                 }
                 // Any key retires the last message, whatever it was -- and owes
@@ -2726,7 +3458,6 @@ impl Render for Player {
                 if this.notice.take().is_some() {
                     cx.notify();
                 }
-                let key = event.keystroke.key.as_str();
                 // A row is waiting for a stroke, and while it is, that stroke is
                 // data: it means the binding and nothing else, which is why this
                 // answers before the export guard and before the keymap is
@@ -2735,7 +3466,7 @@ impl Render for Player {
                     if key == ESCAPE {
                         this.rebinding = None;
                     } else if !is_bare_modifier(key) {
-                        this.capture(action, key, event.keystroke.modifiers.control);
+                        this.capture(action, key, ctrl);
                     }
                     cx.notify();
                     return;
@@ -2744,7 +3475,7 @@ impl Render for Player {
                 // control modifier set (the control code is mapped back), which
                 // is why the keymap is keyed on the pair and never on the key
                 // alone.
-                let action = this.keymap.lookup(key, event.keystroke.modifiers.control);
+                let action = this.keymap.lookup(key, ctrl);
                 // An export is reading the edit list every other action here
                 // would change, so cancelling is the only one that means
                 // anything until it is over.
@@ -2778,16 +3509,35 @@ impl Render for Player {
                         // The card's own button, by keyboard: the one thing in
                         // it that writes a file must not be pointer-only either.
                         this.start_export(cx);
-                    } else if let Some(format) = format_key(key) {
-                        // The format rows by their initial, so the card can be
+                    } else if let Some(format) = format_key(key, this.format) {
+                        // The codec rows by their own letter, so the card can be
                         // driven without a mouse -- the same card-local input
                         // the typed bitrate is, and for the same reason: a
                         // choice reachable only by pointer is not reachable by
                         // everyone. Not a keymap binding: it means nothing
                         // outside this card, exactly like the digits.
                         this.set_format(format);
+                    } else if key == "c" {
+                        this.cycle_container();
+                    } else if key == "q" {
+                        this.cycle_quality();
+                    } else if key == "d" {
+                        // The save dialog, which was the one row here a
+                        // keyboard could not open.
+                        this.pick_destination(cx);
+                    } else if key == "g" {
+                        this.export_grouped = !this.export_grouped;
+                    } else if key == "r" {
+                        this.export_refusals_inline = !this.export_refusals_inline;
                     } else if let Ok(digit) = key.parse::<u32>() {
-                        this.custom_mbps = push_digit(this.custom_mbps, digit);
+                        let next = push_digit(this.custom_mbps, digit);
+                        // A refused third digit says so: it used to be dropped
+                        // in silence, which left the card showing a number the
+                        // user had already typed past.
+                        if next == this.custom_mbps && this.custom_mbps > 0 {
+                            this.notice = Some("1–20 Mbps — a third digit is refused".into());
+                        }
+                        this.custom_mbps = next;
                         this.quality = Quality::Custom;
                     } else if key == "backspace" {
                         this.custom_mbps /= 10;
@@ -2816,6 +3566,11 @@ impl Render for Player {
                             band.gain_db = 0.;
                         }
                         this.commit_eq(cx);
+                    } else if key == "s" {
+                        // The analyser off and on. Nothing is committed: it is
+                        // what the card *shows*, so it survives no further than
+                        // this window.
+                        this.eq_spectrum = !this.eq_spectrum;
                     } else if let Ok(digit) = key.parse::<usize>() {
                         // 1-based, as the rows are numbered on screen; a digit
                         // past the last band picks nothing rather than panics.
@@ -2895,6 +3650,25 @@ impl Render for Player {
                         this.cut_silences(cx);
                     } else if key == "f" {
                         this.speed_silences(cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                // The mix card, the same way again: ↑↓ pick a row -- a track's
+                // fader, the limiter's ceiling or its switch -- and ←→ move it,
+                // held or pressed. Card-local like the four above it.
+                if this.mix_open {
+                    let rows = this.mix_lanes().len() + MIX_MASTER_ROWS;
+                    if key == ESCAPE {
+                        this.mix_open = false;
+                    } else if key == "down" {
+                        this.mix_field = (this.mix_field + 1) % rows;
+                    } else if key == "up" {
+                        this.mix_field = (this.mix_field + rows - 1) % rows;
+                    } else if key == "right" {
+                        this.nudge_mix(1, cx);
+                    } else if key == "left" {
+                        this.nudge_mix(-1, cx);
                     }
                     cx.notify();
                     return;
@@ -2991,6 +3765,16 @@ impl Render for Player {
                     }
                     return;
                 }
+                // The volume slider, the same live writes: what the hand is on
+                // is what the speakers are doing, and there is nothing to undo.
+                if this.volume_dragging {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_volume(event.position.x, cx);
+                    } else {
+                        this.volume_dragging = false;
+                    }
+                    return;
+                }
                 if !this.scrubbing {
                     return;
                 }
@@ -3029,6 +3813,10 @@ impl Render for Player {
                     }
                     if std::mem::take(&mut this.speed_dragging) {
                         this.drag_speed(event.position.x, false, cx);
+                        return;
+                    }
+                    if std::mem::take(&mut this.volume_dragging) {
+                        this.drag_volume(event.position.x, cx);
                         return;
                     }
                     if std::mem::take(&mut this.scrubbing) {
@@ -3106,11 +3894,12 @@ impl Render for Player {
             // Last, so they are over everything -- they take no room in the
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
-            .children(self.export_card(cx))
+            .children(self.export_card(window.viewport_size(), cx))
             .children(self.eq_card(cx))
             .children(self.color_card(cx))
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
+            .children(self.mix_card(cx))
     }
 }
 
@@ -3139,11 +3928,17 @@ impl Player {
         // Its own length, not one derived from what is on the lanes: a row
         // imported and never placed is a row with a length, and it is the
         // length a drag would put down.
-        let rows: Vec<_> = library_rows(sources, &self.streams, self.timeline_audio(), |path| {
-            self.session
-                .as_ref()
-                .map_or(0, |session| session.file_frames(path))
-        })
+        let rows: Vec<_> = library_rows(
+            sources,
+            &self.streams,
+            &self.decoders,
+            self.timeline_audio(),
+            |path| {
+                self.session
+                    .as_ref()
+                    .map_or(0, |session| session.file_frames(path))
+            },
+        )
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
@@ -3174,12 +3969,18 @@ impl Player {
                         None => String::new(),
                     }
                 ),
+                // The file's *own* frame rate, not the timeline's: a clip shot
+                // at another rate plays at the speed it was shot at, and the
+                // row that says where it came from has to say which rate that
+                // was.
                 (None, Some(meta)) => format!(
-                    "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
+                    "{} — {}x{} @ {:.2} fps · drag it where you want it, or Add at playhead",
                     row.path.display(),
                     meta.width,
                     meta.height,
-                    meta.frame_rate
+                    self.session
+                        .as_ref()
+                        .map_or(meta.frame_rate, |session| session.file_fps(&row.path))
                 ),
                 (None, None) => row.path.display().to_string(),
             };
@@ -3357,7 +4158,7 @@ impl Player {
                 "Add at playhead",
                 match self.selected_asset {
                     Some(_) => "inserts the picked file at the playhead".to_string(),
-                    None => "click a file above first — or drag one onto a lane".to_string(),
+                    None => "click a file above first — or drag one where you want it".to_string(),
                 },
                 can_add(
                     self.selected_asset.as_ref(),
@@ -3368,10 +4169,34 @@ impl Player {
                     if let Some((path, stream)) = this.selected_asset.clone() {
                         // No lane: the button means "wherever this belongs",
                         // which for a file with no picture is the audio lane.
-                        this.insert_source(&path, stream, None, cx);
+                        this.insert_source(&path, stream, None, None, cx);
                     }
                 }),
             ))
+    }
+
+    /// What is decoding the picture right now, for the transport line: the
+    /// backend is the running worker's own (it is written where a hardware
+    /// session falls back to software, so this follows reality), and the codec
+    /// comes from the clip under the playhead. Empty when nothing is playing --
+    /// the question is about what is happening, not about what would.
+    fn live_decode(&self, position: f64, playing: bool) -> String {
+        let Some(session) = self.session.as_ref().filter(|_| playing) else {
+            return String::new();
+        };
+        let backend = session.decode_backend();
+        let codec = session
+            .video_clip_at(position)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| clip.source))
+            .and_then(|source| session.sources().get(source))
+            .and_then(|source| self.decoders.get(&source.path).copied().flatten())
+            .and_then(|(codec, _)| codec);
+        match backend {
+            // Neither is a decode, and saying "SW" of them would be a lie.
+            Backend::Gap => "gap · nothing to decode".to_string(),
+            Backend::Still => "still · one decode, held".to_string(),
+            _ => format!("{} decode", decode_label(codec, backend)),
+        }
     }
 
     /// Transport, edit and file buttons, timecode, playhead, clips lane.
@@ -3382,11 +4207,11 @@ impl Player {
         playing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let filled = if duration > 0. {
-            (position / duration) as f32
-        } else {
-            0.
-        };
+        // Where the playhead is *on the bed*, which at the fit is where along
+        // the timeline it is and zoomed in is where along the visible slice.
+        // Clamped because it is drawn as a width as well as an offset, and the
+        // view follows the playhead anyway, so it is never off the bed.
+        let filled = self.view.frac_at(position, duration).clamp(0., 1.);
         // An export owns the hint slot and the ruler while it runs: the
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
@@ -3394,6 +4219,10 @@ impl Player {
         // Everything but Import and Keys needs a timeline to act on: with none
         // open they are dimmed rather than silently doing nothing.
         let live = self.session.is_some() && !exporting;
+        // The project's own picture size, for the button that cycles it: read
+        // per render like everything else here, so a cycle shows on the button
+        // that made it.
+        let resolution = self.session.as_ref().map(PlaybackSession::resolution);
         let key = |action| self.keymap.display(action);
         // The lanes the project has, or the pair a fresh one starts with so the
         // panel reads the same before a file is open as after.
@@ -3411,8 +4240,16 @@ impl Player {
             let progress = export.progress();
             (
                 format!(
-                    "EXPORTING {}% — {} cancels",
+                    "EXPORTING {}% · {} · {} — {} cancels",
                     (progress * 100.) as u32,
+                    // The row that was picked; the engine's line below names the
+                    // seats alone, since the library is what identifies a codec.
+                    format_label(self.format),
+                    // What the worker actually opened, so a fallback to the
+                    // software encoder shows here rather than being invisible.
+                    export
+                        .encoders()
+                        .unwrap_or_else(|| "opening the encoder".to_string()),
                     key(ActionId::CancelExport)
                 ),
                 progress,
@@ -3422,12 +4259,19 @@ impl Player {
             // tooltips. Keys first: at a 640 px window the tail is what a
             // truncation eats, and the two hints at the end are also on the
             // ruler's and Import's tooltips.
+            // While it plays, what is decoding it goes first: it is the
+            // answer that changes as the playhead crosses a cut, and the tail
+            // of this line is what a narrow window truncates.
             (
-                format!(
-                    "{} copy · {} paste · {} undo · click the bar to seek · drop a file to import",
-                    key(ActionId::Copy),
-                    key(ActionId::Paste),
-                    key(ActionId::Undo)
+                join_detail(
+                    &self.live_decode(position, playing),
+                    &format!(
+                        "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
+                         import",
+                        key(ActionId::Copy),
+                        key(ActionId::Paste),
+                        key(ActionId::Undo)
+                    ),
                 ),
                 filled,
             )
@@ -3443,18 +4287,35 @@ impl Player {
             .bg(rgb(CHROME))
             // Transport | edit | file: three groups, so the eye can skip two of
             // them. Every button says what it does; the tooltip adds its key.
+            //
+            // The row scrolls rather than losing its tail: at the 640 px floor
+            // this window is sized for it is wider than the panel, and a button
+            // off the right edge is a button a pointer cannot press. A plain
+            // wheel moves it -- gpui puts a vertical delta on the x axis when
+            // that is the only one scrolling (div.rs:2424).
             .child(
                 div()
+                    .id("controls")
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .overflow_x_scroll()
                     .child(control(
                         "transport",
                         Some(transport_glyph(playing).into_any_element()),
                         if playing { "Pause" } else { "Play" },
-                        key(ActionId::Play),
-                        live,
+                        if nothing_to_play(self.session.as_ref()) && !playing {
+                            format!("{} — put a clip on a lane first", key(ActionId::Play))
+                        } else {
+                            key(ActionId::Play)
+                        },
+                        // An empty timeline has nothing to play, so the button
+                        // says so by being dim rather than by starting a clock
+                        // against nothing (the key press answers with the
+                        // notice). Still live while it *is* playing: a delete
+                        // can empty the timeline mid-play and that has to stop.
+                        live && (playing || !nothing_to_play(self.session.as_ref())),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
                     .child(separator())
@@ -3480,6 +4341,17 @@ impl Player {
                         },
                         live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    // The way back from every one of them. It was a stroke and
+                    // nothing else, which made the whole edit group a one-way
+                    // door for anyone working with a pointer.
+                    .child(control(
+                        "undo",
+                        None,
+                        "Undo",
+                        format!("{} — takes the last edit back", key(ActionId::Undo)),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
                     ))
                     // With the edit group, beside the buttons that change the
                     // edit list: a track is a row of it, and adding one is an
@@ -3529,20 +4401,115 @@ impl Player {
                             this.set_volume(|volume| volume.muted = !volume.muted, cx)
                         }),
                     ))
+                    // The level itself, to drag. The button beside it stays the
+                    // mute -- one gesture each -- and the label above is what
+                    // this writes, live, so the number follows the hand.
+                    .child(volume_slider(
+                        self.volume,
+                        self.volume_bar.clone(),
+                        live,
+                        cx,
+                    ))
                     .child(separator())
+                    // The size every clip is composed onto, which is also the
+                    // size the export comes out at: the one project setting a
+                    // stroke used to be the only way to. Cycles exactly as the
+                    // key does, and says where it is now rather than opening a
+                    // list to close again.
+                    .child(control(
+                        "resolution",
+                        None,
+                        resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                        match resolution {
+                            Some((w, h)) => format!(
+                                "{} — the project is {w}x{h}; cycles source → 2160p → 1080p → 720p → 480p",
+                                key(ActionId::Resolution)
+                            ),
+                            None => format!("{} — open a file first", key(ActionId::Resolution)),
+                        },
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_resolution(cx)),
+                    ))
+                    // How much of the timeline the panel below is showing --
+                    // beside the resolution, since neither of them edits
+                    // anything: they are both what is being looked at. The
+                    // middle one reads as the state (1.0x is the whole
+                    // timeline) and is the way back to it.
+                    .child(control(
+                        "zoom-out",
+                        None,
+                        "−",
+                        format!(
+                            "{} — show more of the timeline; stops at the whole of it",
+                            key(ActionId::ZoomOut)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.zoom(1. / ZOOM_STEP, None, cx)
+                        }),
+                    ))
+                    .child(control(
+                        "zoom-fit",
+                        None,
+                        format!("{:.1}x", self.view.zoom),
+                        format!(
+                            "{} — fit the whole timeline; showing {} to {}",
+                            key(ActionId::ZoomFit),
+                            timecode(self.view.start, self.fps),
+                            timecode(
+                                (self.view.start + self.view.span(duration)).min(duration),
+                                self.fps
+                            )
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_fit(cx)),
+                    ))
+                    .child(control(
+                        "zoom-in",
+                        None,
+                        "+",
+                        format!(
+                            "{} — magnify around the playhead; ctrl+wheel on the bar zooms at the pointer",
+                            key(ActionId::ZoomIn)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
+                    ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
                     // which one is the real one.
+                    //
+                    // While one runs, this button is the way out of it: the
+                    // progress line promised esc and nothing else, which left a
+                    // pointer no way to stop an export it had started.
                     .child(control(
                         "export",
                         None,
-                        "Export",
-                        format!(
-                            "{} — quality and destination, then writes the timeline out",
-                            key(ActionId::Export)
-                        ),
-                        live && self.export.is_none(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_export(cx)),
+                        if exporting { "Cancel" } else { "Export" },
+                        if exporting {
+                            format!(
+                                "{} — stops the export; the part-written file goes",
+                                key(ActionId::CancelExport)
+                            )
+                        } else {
+                            format!(
+                                "{} — quality and destination, then writes the timeline out",
+                                key(ActionId::Export)
+                            )
+                        },
+                        if exporting {
+                            true
+                        } else {
+                            live && self.export.is_none()
+                        },
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if this.exporting().is_some() {
+                                this.cancel_export();
+                                cx.notify();
+                            } else {
+                                this.open_export(cx);
+                            }
+                        }),
                     ))
                     .child(control(
                         "save",
@@ -3620,7 +4587,32 @@ impl Player {
                             .hover(|s| s.bg(rgb(HOVER_DIM)))
                             // The strip carries no text, so the tooltip is the only
                             // place it can say what it is.
-                            .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tip("Seek — click or drag; ctrl+wheel zooms".into()))
+                                    .into()
+                            })
+                            // Ctrl+wheel is what every timeline zooms with, and
+                            // the point held still is the one under the pointer
+                            // rather than the playhead. Only with ctrl: a bare
+                            // wheel here is the window's to scroll, and the
+                            // controls row above scrolls on exactly that.
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    if !event.modifiers.control {
+                                        return;
+                                    }
+                                    let dy = match event.delta {
+                                        ScrollDelta::Lines(d) => d.y,
+                                        ScrollDelta::Pixels(d) => f32::from(d.y),
+                                    };
+                                    if dy == 0. {
+                                        return;
+                                    }
+                                    let anchor = frac_along(event.position.x, this.ruler.get());
+                                    let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
+                                    this.zoom(factor, Some(anchor), cx);
+                                },
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -3885,16 +4877,33 @@ impl Player {
         )
     }
 
-    /// What an export is going to be, before there is one: the destination, the
-    /// quality rows, and the two things that are not a choice at all. The same
-    /// scrim, width and row shape as the keybindings overlay -- two cards of
-    /// different builds over one window read as two different programs -- and
-    /// the same plain divs, so the root keeps the keyboard and a typed digit
-    /// reaches the custom row.
-    fn export_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// What an export is going to be, before there is one: the codec, the box
+    /// it goes into, the bitrate, where it lands -- and, above the button, the
+    /// two lines that state the file all of that adds up to. The same scrim and
+    /// row shape as the keybindings overlay (two cards of different builds over
+    /// one window read as two different programs) and the same plain divs, so
+    /// the root keeps the keyboard and a typed digit reaches the custom row.
+    ///
+    /// Every row carries the key that picks it, so the card is drivable end to
+    /// end without a pointer *and* without a legend to memorise -- and every
+    /// row is clickable, the bitrate's steppers included, so it is drivable end
+    /// to end without a keyboard as well.
+    ///
+    /// Two shapes of it, behind `g` and `r`: sections against one flat list,
+    /// and the codecs with no encoder collapsed into a footer against a dimmed
+    /// row each. Grouped and collapsed is what opens.
+    fn export_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.export_open {
             return None;
         }
+        // The cap is what keeps the card inside the smallest window; a taller
+        // one gets a taller list rather than a scroll past empty space, and the
+        // card is still only as tall as the rows it has.
+        let rows_h = (f32::from(viewport.height) - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
         let row = |id: (&'static str, usize)| {
             div()
                 .id(id)
@@ -3911,70 +4920,261 @@ impl Player {
         // A row that cannot be picked is dimmed and takes no click, exactly as
         // an inapplicable item in the clip menu is: it still says its piece.
         let live = |d: Stateful<Div>, enabled: bool| {
-            d.when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
-                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
-        };
-        // The formats first: the quality rows below are *video* bitrate, so
-        // which file is being written decides whether they mean anything.
-        // An mp4 this timeline cannot be written as reads exactly like the
-        // formats there is no encoder for: dimmed, unclickable, and carrying its
-        // own reason instead of the detail line.
-        let formats: Vec<_> = FORMATS
-            .into_iter()
-            .enumerate()
-            .map(|(i, (format, label, detail))| {
-                // Per row, because the two picture formats are refused by
-                // different things: an audio-only timeline greys both, a second
-                // audio lane only the mp4.
-                let refused = format
-                    .zip(self.session.as_ref())
-                    .and_then(|(f, s)| format_refusal(s, f));
-                let blocked = refused.is_some();
-                let detail: SharedString = match &refused {
-                    Some(why) => why.clone().into(),
-                    None => detail.into(),
-                };
-                let picked = format == Some(self.format) && !blocked;
-                let format = format.filter(|_| !blocked);
-                live(row(("format", i)), format.is_some())
-                    .when(picked, |d| d.bg(rgb(SELECTED)))
-                    .when_some(format, |d, format| {
-                        d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.set_format(format);
-                            cx.notify();
-                        }))
-                    })
-                    .child(label)
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(detail),
-                    )
+            d.when(!enabled, |d| {
+                d.cursor_not_allowed().text_color(rgb(INK_DIM))
             })
-            .collect();
-        let video = self.format.has_video();
-        let rows: Vec<_> = Quality::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(i, quality)| {
-                live(row(("quality", i)), video)
-                    .when(video && self.quality == quality, |d| d.bg(rgb(SELECTED)))
-                    .when(video, |d| {
-                        d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+        };
+        // A row as this card writes them: the mark saying which one is picked,
+        // the key that picks it, its name, and what the choice means. The mark
+        // is a glyph and not only a colour -- a background alone is gone the
+        // moment a hover lands on the row, and invisible to anyone who cannot
+        // tell the two greys apart (WCAG 1.4.1).
+        let entry = |id: (&'static str, usize),
+                     key: &str,
+                     label: SharedString,
+                     detail: SharedString,
+                     picked: bool,
+                     enabled: bool| {
+            // The small print of a picked row sits on the highlight, where the
+            // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
+            // 1.4.3, and the fit test pins both numbers).
+            let ink = match picked {
+                true => INK,
+                false => INK_DIM,
+            };
+            live(row(id), enabled)
+                .when(picked, |d| d.bg(rgb(SELECTED)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().w(px(10.)).child(match picked {
+                            true => "✓",
+                            false => " ",
+                        }))
+                        .child(
+                            div()
+                                .w(px(EXPORT_KEY_W))
+                                .text_size(px(11.))
+                                .text_color(rgb(ink))
+                                .child(SharedString::from(key.to_string())),
+                        )
+                        .child(label),
+                )
+                // Wraps rather than runs off the row: a refusal is the longest
+                // thing in this column and the half of it past the edge is the
+                // half that says what to do instead.
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .flex_shrink()
+                        .text_size(px(11.))
+                        .text_color(rgb(ink))
+                        .child(detail),
+                )
+        };
+        let header = |text: &'static str| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .pt(px(4.))
+                .text_size(px(10.))
+                .text_color(rgb(INK_DIM))
+                .child(text)
+                .into_any_element()
+        };
+        let mut list: Vec<AnyElement> = Vec::new();
+        if self.export_grouped {
+            list.push(header("FORMAT"));
+        }
+        // The codecs first: which one is being written decides whether every
+        // row under it means anything. One a *this* timeline cannot be written
+        // as (an audio-only edit, for a picture codec) reads exactly like one
+        // there is no encoder for -- dimmed, unclickable, and carrying its own
+        // reason where its detail was, with nothing to click to find that out.
+        let mut refusals: Vec<String> = Vec::new();
+        for (i, (boxes, key, label, detail)) in FORMATS.into_iter().enumerate() {
+            let format = same_box(boxes, self.format);
+            let refused = format
+                .zip(self.session.as_ref())
+                .and_then(|(f, s)| format_refusal(s, f));
+            // A codec with no encoder here at all is the other kind of refusal,
+            // and the one the footer collects: it can never become pickable, so
+            // a row each is dead rows above the fold.
+            if format.is_none() {
+                refusals.push(format!("{label} — {detail}"));
+                if !self.export_refusals_inline {
+                    continue;
+                }
+            }
+            let detail: SharedString = match &refused {
+                Some(why) => why.clone().into(),
+                None => detail.into(),
+            };
+            let format = format.filter(|_| refused.is_none());
+            let mut r = entry(
+                ("format", i),
+                key,
+                label.into(),
+                detail,
+                boxes.contains(&self.format),
+                format.is_some(),
+            );
+            if let Some(format) = format {
+                r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_format(format);
+                    cx.notify();
+                }));
+            }
+            list.push(r.into_any_element());
+        }
+        if self.export_grouped {
+            list.push(header("DETAILS"));
+        }
+        // The container, and only where the picked codec has more than one box:
+        // a row offering a single choice reads as a choice.
+        let boxes = containers(self.format);
+        if boxes.len() > 1 {
+            let next = next_container(self.format);
+            list.push(
+                entry(
+                    ("container", 0),
+                    "c",
+                    "Container".into(),
+                    format!(
+                        "{} — c for {}",
+                        self.format.ext().to_uppercase(),
+                        next.ext().to_uppercase()
+                    )
+                    .into(),
+                    false,
+                    true,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.cycle_container();
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
+        match bitrate_refusal(self.format) {
+            // One dimmed row carrying the reason, rather than five rows of a
+            // figure that will not be written: the quality rows are the
+            // *picture's* bitrate, and this file has no picture in it.
+            Some(why) => list.push(
+                entry(
+                    ("quality", 0),
+                    "q",
+                    "Quality".into(),
+                    why.into(),
+                    false,
+                    false,
+                )
+                .into_any_element(),
+            ),
+            None => {
+                for (i, quality) in Quality::ALL.into_iter().enumerate() {
+                    let mut r = entry(
+                        ("quality", i),
+                        match quality {
+                            // The one row a key does not step to but types
+                            // into, which is what its key column says.
+                            Quality::Custom => "0–9",
+                            _ => "q",
+                        },
+                        quality.label().into(),
+                        quality.detail(self.custom_mbps).into(),
+                        self.quality == quality,
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
                             this.quality = quality;
                             cx.notify();
-                        }))
-                    })
-                    .child(quality.label())
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(quality.detail(self.custom_mbps)),
-                    )
-            })
-            .collect();
+                        },
+                    ));
+                    if quality == Quality::Custom {
+                        r = r.child(self.mbps_steppers(cx));
+                    }
+                    list.push(r.into_any_element());
+                }
+            }
+        }
+        let destination = entry(
+            ("destination", 0),
+            "d",
+            "Destination".into(),
+            file_name(&self.export_path).into(),
+            false,
+            true,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
+        .into_any_element();
+        match self.export_grouped {
+            true => list.push(destination),
+            // Flat: the same rows with no headers over them, and the
+            // destination back at the top where the card used to open with it.
+            false => list.insert(0, destination),
+        }
+        if !self.export_refusals_inline && !refusals.is_empty() {
+            // Last, and one line: the reason travels with the name (a footer
+            // that only listed them would be the "why not?" the rows exist to
+            // answer), but nothing here can ever be picked, so it sits under
+            // every row that can rather than above them.
+            list.push(
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_DIM))
+                    .child(format!("cannot write: {}", refusals.join(" · ")))
+                    .into_any_element(),
+            );
+        }
+        // What the rows add up to, which is the one thing that has to be right:
+        // codec, box, size, rate, sound, where it goes and about how big. Two
+        // lines, outside the scrolling list, so it is on screen whatever the
+        // list is scrolled to and whatever is picked.
+        let picture = self
+            .session
+            .as_ref()
+            .map(|s| (s.resolution(), s.meta().frame_rate));
+        let audio = self
+            .session
+            .as_ref()
+            .map_or("", |s| s.planned_audio(self.format));
+        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        let mb = estimated_mb(
+            settings.bitrate.filter(|_| self.format.has_video()),
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::timeline_duration),
+        );
+        let head = summary_head(self.format, picture, audio);
+        let tail = summary_tail(
+            &self.export_path,
+            mb,
+            self.export_seat.and_then(|(.., seat)| seat),
+            self.format.has_video(),
+        );
+        // The button says the refusal *before* it is pressed: the picked codec
+        // can go invalid one edit after it was picked (a cleared video lane),
+        // and a button that looks ready until it is pressed is the lie the
+        // dimmed rows above it are there to avoid.
+        let blocked = self
+            .session
+            .as_ref()
+            .and_then(|s| format_refusal(s, self.format));
+        let action: SharedString = match &blocked {
+            Some(why) => {
+                format!("Cannot export — {}", why.split(" — ").next().unwrap_or(why)).into()
+            }
+            None => "Export".into(),
+        };
         Some(
             div()
                 .absolute()
@@ -3988,7 +5188,7 @@ impl Player {
                 })
                 .child(
                     div()
-                        .w(px(KEYS_W))
+                        .w(px(EXPORT_W))
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -3998,7 +5198,9 @@ impl Player {
                         .child(div().flex_none().px(px(6.)).child("Export"))
                         // The status line, where a refusal from the save dialog
                         // lands: the notice bar it would otherwise take is under
-                        // the scrim.
+                        // the scrim. The keys are on the rows, so this says how
+                        // the card as a whole is answered rather than listing
+                        // them a second time.
                         .child(
                             div()
                                 .flex_none()
@@ -4006,51 +5208,33 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "pick a format (m/a/w/f), then Export — esc closes".into()
+                                    "the keys are on the rows · enter exports · esc closes · \
+                                     g/r change the layout"
+                                        .into()
                                 })),
                         )
                         // Capped and scrolling like the keybindings list: the
-                        // destination, nine formats and five qualities are more
-                        // rows than a 360 px window has room for, and it is the
-                        // list that scrolls, never the card that grows.
+                        // rows are more than a 360 px window has room for, and
+                        // it is the list that scrolls, never the card that
+                        // grows -- the summary and the button below stay put.
                         .child(
                             div()
                                 .id("export-rows")
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
-                                .max_h(px(EXPORT_ROWS_H))
+                                .max_h(px(rows_h))
                                 .overflow_y_scroll()
-                                .child(
-                                    live(row(("destination", 0)), true)
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.pick_destination(cx)
-                                        }))
-                                        .child("Destination")
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(rgb(INK_DIM))
-                                                .child(file_name(&self.export_path)),
-                                        ),
-                                )
-                                .children(formats)
-                                .children(rows),
+                                .children(list),
                         )
-                        // What the picked row really writes. `moov` last is the
-                        // muxer's own shape -- an mp4 is playable only once it
-                        // is finished. The project's resolution is on the same
-                        // line because it *is* what the file comes out at,
-                        // whatever size the media on the timeline are: this is
-                        // the one place the number is shown, and ctrl+r is what
-                        // changes it.
+                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(head))
                         .child(
                             div()
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(export_line(self.format, self.session.as_ref())),
+                                .child(tail),
                         )
                         .child(
                             div()
@@ -4061,7 +5245,10 @@ impl Player {
                                 .items_center()
                                 .justify_center()
                                 .rounded(px(3.))
-                                .bg(rgb(SELECTED))
+                                .bg(rgb(match blocked.is_some() {
+                                    true => CHROME,
+                                    false => SELECTED,
+                                }))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(HOVER)))
                                 .on_click(
@@ -4069,10 +5256,40 @@ impl Player {
                                         this.start_export(cx)
                                     }),
                                 )
-                                .child("Export"),
+                                .child(action),
                         ),
                 ),
         )
+    }
+
+    /// The custom bitrate's two pointer buttons. The typed digits were the last
+    /// control in this card a mouse could not reach at all -- and a number that
+    /// can only be typed is a number a hand on the pointer has to leave the
+    /// card to change. `HIT_MIN` square, like every other target here.
+    fn mbps_steppers(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let step = |id: &'static str, label: &'static str, by: i32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .w(px(HIT_MIN))
+                .h(px(HIT_MIN))
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .bg(rgb(CHROME))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.nudge_mbps(by);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        div()
+            .flex()
+            .gap(px(4.))
+            .child(step("mbps-down", "−", -1, cx))
+            .child(step("mbps-up", "+", 1, cx))
     }
 
     /// The equalizer of one audio clip: its frequency response drawn as a
@@ -4096,6 +5313,18 @@ impl Player {
         // clip and a 48 kHz one are not the same shape.
         let sample_rate = self.timeline_audio().map_or(48_000, |(rate, _)| rate);
         let picked = self.eq_params.bands.get(self.eq_band);
+        // What is playing, drawn behind the curve -- and only while something
+        // *is* playing: the tap freezes with the device, and a still spectrum
+        // under a paused timeline would look like sound that is not there.
+        let spectrum = self
+            .eq_spectrum
+            .then_some(self.session.as_ref())
+            .flatten()
+            .filter(|session| session.is_playing())
+            .and_then(PlaybackSession::audio_tap)
+            .map(|(samples, rate)| eq_spectrum(&samples, rate))
+            .filter(|levels| !levels.is_empty())
+            .map(eq_spectrum_curve);
         let handles: Vec<_> = self
             .eq_params
             .bands
@@ -4141,6 +5370,44 @@ impl Player {
                 }),
             )
             .child(bounds_probe(self.eq_graph.clone()))
+            // The analyser first, so everything else is drawn on top of it.
+            .children(spectrum)
+            // The decades, so a hump can be read as "around 200 Hz" without
+            // dropping the eye to the labels along the bottom. The two ends
+            // are the box's own edges and rule nothing.
+            .children(
+                EQ_TICKS
+                    .iter()
+                    .filter(|(freq, _)| *freq > EQ_FREQ_LOW && *freq < EQ_FREQ_HIGH)
+                    .map(|(freq, _)| {
+                        div()
+                            .absolute()
+                            .left(relative(eq_x(*freq)))
+                            .w(px(1.))
+                            .h_full()
+                            .bg(rgb(EQ_GRID))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            // Half way to each limit, each carrying its own number: the curve
+            // is a curve of decibels, and until now only one of them was drawn.
+            .children(EQ_DB_GRID.map(|db| {
+                div()
+                    .absolute()
+                    .top(relative(eq_y(db)))
+                    .w_full()
+                    .h(px(1.))
+                    .bg(rgb(EQ_GRID))
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(px(-11.))
+                            .text_size(px(9.))
+                            .text_color(rgb(INK_DIM))
+                            .child(format!("{db:+.0}")),
+                    )
+            }))
             // 0 dB: the line a boost is a boost *from*.
             .child(
                 div()
@@ -4175,6 +5442,9 @@ impl Player {
                     .text_color(rgb(INK_DIM))
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
+        // The bottom of the axis is not named: -12 dB would land in the same
+        // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
+        // already say what the box is worth per pixel.
         Some(
             div()
                 .absolute()
@@ -4209,7 +5479,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag the curve, or 1–5 then up/down — esc closes".into()
+                                    "drag the curve, or 1–5 then up/down — s hides the spectrum, esc closes".into()
                                 })),
                         )
                         .child(graph)
@@ -4218,34 +5488,72 @@ impl Player {
                         // one pulling the other way is not readable off it.
                         .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
                             match picked {
+                                // Q as well as the two the curve shows: it is
+                                // how wide the hump under the handle is, and
+                                // nothing else on the card says so.
                                 Some(band) => format!(
-                                    "{} {} {:+.1} dB",
+                                    "{} {} {:+.1} dB — Q {:.2}",
                                     self.eq_band + 1,
                                     band_label(band),
-                                    band.gain_db
+                                    band.gain_db,
+                                    band.q
                                 ),
                                 None => "no bands".into(),
                             },
                         ))
                         .child(
                             div()
-                                .id("eq-reset")
                                 .mt(px(4.))
                                 .flex()
-                                .h(px(CONTROL_H))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(rgb(SELECTED))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    for band in &mut this.eq_params.bands {
-                                        band.gain_db = 0.;
-                                    }
-                                    this.commit_eq(cx);
-                                }))
-                                .child("Flatten"),
+                                .gap(px(4.))
+                                .child(
+                                    div()
+                                        .id("eq-reset")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(SELECTED))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            for band in &mut this.eq_params.bands {
+                                                band.gain_db = 0.;
+                                            }
+                                            this.commit_eq(cx);
+                                        }))
+                                        .child("Flatten"),
+                                )
+                                // The analyser's switch, next to the one other
+                                // button the card has: `s` does the same, and a
+                                // toggle only a keystroke can reach is one most
+                                // people never find.
+                                .child(
+                                    div()
+                                        .id("eq-spectrum")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(match self.eq_spectrum {
+                                            true => SELECTED,
+                                            false => HOVER_DIM,
+                                        }))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.eq_spectrum = !this.eq_spectrum;
+                                            cx.notify();
+                                        }))
+                                        .child(match self.eq_spectrum {
+                                            true => "Spectrum on",
+                                            false => "Spectrum off",
+                                        }),
+                                ),
                         ),
                 ),
         )
@@ -4537,6 +5845,174 @@ impl Player {
         )
     }
 
+    /// The mix card: one fader per audio track and the master limiter under
+    /// them -- the two settings that belong to the *sound of the whole
+    /// timeline* rather than to any clip on it.
+    ///
+    /// A track's fader moves everything on that track by the same amount,
+    /// every frequency of it: it is not the equalizer (one take, one band) and
+    /// it is not the volume in the panel, which is what this machine monitors
+    /// at and is written to no file. The limiter is over the sum of them all,
+    /// which is where a mix can pass full scale and where a clamp used to
+    /// square it off.
+    ///
+    /// The silence card's shape, down to the steppers: a row is a label, a
+    /// value and the two presses that move it, and the arrows pick a row and
+    /// move it too. The rows scroll rather than the card growing past the
+    /// window -- a timeline may hold more tracks than a 360 px window has room
+    /// for faders.
+    fn mix_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.mix_open {
+            return None;
+        }
+        let session = self.session.as_ref();
+        let lanes = self.mix_lanes();
+        let limiter = session.map_or_else(Limiter::default, PlaybackSession::limiter);
+        let mut rows: Vec<(String, String)> = lanes
+            .iter()
+            .map(|&lane| {
+                let db = session.map_or(0., |s| s.lane_gain_db(lane));
+                (format!("{} plays at", lane.label()), format!("{db:+.0} dB"))
+            })
+            .collect();
+        // The ceiling in dBFS and the faders in dB, the silence card's rule:
+        // a ceiling is a level below full scale, a fader is a change.
+        rows.push((
+            "Limiter ceiling".into(),
+            format!("{:+.0} dBFS", limiter.ceiling_db),
+        ));
+        rows.push((
+            "Limiter".into(),
+            match limiter.on {
+                true => "on".into(),
+                false => "off".into(),
+            },
+        ));
+        let rows: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, (label, value))| {
+                div()
+                    .id(("mix-row", n))
+                    .flex()
+                    .flex_none()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .justify_between()
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .bg(rgb(match n == self.mix_field {
+                        true => SELECTED,
+                        false => CHROME,
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.mix_field = n;
+                        cx.notify();
+                    }))
+                    .child(div().text_color(rgb(INK_DIM)).child(label))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(value)
+                            .children([-1, 1].map(|steps: i32| {
+                                div()
+                                    .id(("mix-step", n * 2 + usize::from(steps > 0)))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h(px(KEYS_ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(CHROME))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        // Picked as well as moved, the silence
+                                        // card's rule: the row a press lands on
+                                        // is the row the arrows carry on from.
+                                        this.mix_field = n;
+                                        this.nudge_mix(steps, cx);
+                                    }))
+                                    .child(match steps > 0 {
+                                        true => "+",
+                                        false => "−",
+                                    })
+                            })),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(COLOR_W))
+                        .max_h(px(360. - 24.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .child("Mix — track volumes and the master limiter"),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; esc closes",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("mix-rows")
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                // What the choice *is*: the limiter's own line,
+                                // because "on" alone says nothing about what it
+                                // does to a mix that never reaches the ceiling.
+                                .child(match limiter.on {
+                                    true => format!(
+                                        "the mix is held under {:+.0} dBFS — quieter passages are untouched",
+                                        limiter.ceiling_db
+                                    ),
+                                    false => "the limiter is out of circuit — a hot mix clips at full scale".to_string(),
+                                }),
+                        ),
+                ),
+        )
+    }
+
     /// The silence card: what the scan is looking for, what it found, and the
     /// two things that can be done about it.
     ///
@@ -4548,9 +6024,19 @@ impl Player {
     fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let cfg = self.silence;
+        // The unit is a label, never a conversion: the threshold is a level
+        // below full scale whichever of the two the row says (`silence_dbfs`).
+        let unit = match self.silence_dbfs {
+            true => "dBFS",
+            false => "dB",
+        };
         let rows = [
             ("Apply to", self.silence_scope.label(&self.silence_lanes())),
-            ("Silence is under", format!("{:.0} dBFS", cfg.threshold_db)),
+            (
+                "Silence is under",
+                format!("{:.0} {unit}", cfg.threshold_db),
+            ),
+            ("Level read in", format!("{unit} (0 = full scale)")),
             (
                 "Forgive quiet shorter than",
                 format!("{:.2} s", cfg.min_silence),
@@ -4591,7 +6077,45 @@ impl Player {
                         cx.notify();
                     }))
                     .child(div().text_color(rgb(INK_DIM)).child(label))
-                    .child(value)
+                    // The value and the two steps that move it. Every other
+                    // card has something to drag or press; this one had the
+                    // arrow keys and nothing else, so a row was a setting a
+                    // pointer could pick but never change. One press each, the
+                    // same call the arrows make -- the hold-to-run is the
+                    // keyboard's own and is not a thing a button has.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(value)
+                            .children([-1, 1].map(|steps: i32| {
+                                div()
+                                    .id(("silence-step", n * 2 + usize::from(steps > 0)))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h(px(KEYS_ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(CHROME))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        // Picked as well as moved: the row a
+                                        // press lands on is the row the arrows
+                                        // carry on from.
+                                        this.silence_field = n;
+                                        this.nudge_silence(steps);
+                                        cx.notify();
+                                    }))
+                                    .child(match steps > 0 {
+                                        true => "+",
+                                        false => "−",
+                                    })
+                            })),
+                    )
             })
             .collect();
         // The two buttons the ask names, side by side: a mode toggle would hide
@@ -4649,7 +6173,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "↑↓ picks a setting, ←→ moves it — the marks on the lane are what would go; esc closes",
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
                                 ),
                         )
                         .children(rows)
@@ -4930,7 +6454,7 @@ impl Player {
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
-                let label = if action == ActionId::ToggleMute {
+                let label = if matches!(action, ActionId::ToggleMute | ActionId::Paste) {
                     format!("{} (global)", action.label())
                 } else {
                     action.label().to_string()
@@ -4977,7 +6501,10 @@ impl Player {
         let (x, y) = menu_at(
             menu.at,
             viewport,
-            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+            // The cap once the list is longer than it: past that the list
+            // scrolls and the card stops growing, exactly as the keybindings and
+            // export lists do.
+            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
         );
         let full: SharedString = source.path.display().to_string().into();
         Some(
@@ -5032,7 +6559,18 @@ impl Player {
                         .when(menu.details, |d| {
                             d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
                         })
-                        .children(rows),
+                        // The list scrolls where the card would otherwise grow
+                        // past the window's floor -- an item hanging off the
+                        // bottom edge is an item nobody can click.
+                        .child(
+                            div()
+                                .id("menu-rows")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(MENU_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -5059,6 +6597,9 @@ impl Player {
         // one probe answers for both. Zero before the first paint, which only
         // costs the labels one frame.
         let bed_w = f32::from(self.ruler.get().size.width);
+        // The slice being shown, copied out once: every box in the row is
+        // placed through it, so all of them move together when it does.
+        let view = self.view;
         let clips = self
             .session
             .as_ref()
@@ -5077,14 +6618,33 @@ impl Player {
         });
         let name = lane.label();
         let row_id: SharedString = format!("{name}-clip").into();
+        let remove_id: SharedString = format!("{name}-remove").into();
+        let remove_tip: SharedString = format!(
+            "Remove {name} — it must be empty first, and {} brings it back",
+            self.keymap.display(ActionId::Undo)
+        )
+        .into();
         let sources = self
             .session
             .as_ref()
             .map_or(&[][..], PlaybackSession::sources);
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
+        // What this track plays at, on the header it belongs to: shown only
+        // when it is not unity, because a column 40 px wide has room for a
+        // number or for a name, and the name is what a header is for. The
+        // press opens the mix card on this very track.
+        let gain_db = self
+            .session
+            .as_ref()
+            .map_or(0., |session| session.lane_gain_db(lane));
+        let gain_tip: SharedString = format!(
+            "{name} plays at {gain_db:+.0} dB — opens the mix ({}); the whole track, every frequency, unlike the equalizer",
+            self.keymap.display(ActionId::Mix)
+        )
+        .into();
         let tip: SharedString = format!(
-            "Select (or {} under the playhead, {}/{} along the lane) — drag an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
+            "Select (or {} under the playhead, {}/{} along the lane) — drag it to move it, an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Select),
             self.keymap.display(ActionId::SelectPrev),
             self.keymap.display(ActionId::SelectNext),
@@ -5106,13 +6666,65 @@ impl Player {
                     .w(px(HEADER_W))
                     .h_full()
                     .flex()
+                    .flex_col()
                     .items_center()
                     .justify_center()
                     .rounded(px(3.))
                     .bg(rgb(SURFACE))
                     .text_size(px(11.))
                     .text_color(rgb(INK_DIM))
-                    .child(name),
+                    .child(match audio {
+                        // A button, not a label: the one setting a track has of
+                        // its own used to be reachable from nowhere.
+                        true => div()
+                            .id(("mix-lane", lane.ord))
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(gain_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.open_mix(Some(lane), cx)
+                            }))
+                            .child(match gain_db == 0. {
+                                true => name.clone(),
+                                false => format!("{name} {gain_db:+.0}"),
+                            })
+                            .into_any_element(),
+                        false => div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .child(name.clone())
+                            .into_any_element(),
+                    })
+                    // The one thing a header does: take this track away again.
+                    // A `HIT_MIN` target rather than a glyph-sized one, and it
+                    // stays put on a track holding clips instead of hiding --
+                    // the refusal names them, and a control that vanishes
+                    // teaches nothing.
+                    .child(
+                        div()
+                            .id(remove_id)
+                            .flex_none()
+                            .w_full()
+                            .h(px(HIT_MIN))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.remove_lane(lane, cx)
+                            }))
+                            .child("×"),
+                    ),
             )
             .child(
                 // Clips are placed at their own start rather than queued edge
@@ -5127,18 +6739,23 @@ impl Player {
                     .bg(rgb(LETTERBOX))
                     .overflow_hidden()
                     // A library row let go over a lane is the same insert the
-                    // Add button makes, through the same call -- at the
-                    // playhead, not at the pointer: clips here are placed end
-                    // to end, so where along the bed it landed says nothing.
-                    .on_drop(cx.listener(move |this, drag: &AssetDrag, _, cx| {
-                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), cx)
+                    // Add button makes, through the same call -- but where the
+                    // pointer let it go, not at the playhead: a hand that
+                    // carried a file to a place on the bed named that place.
+                    // gpui hands a drop no event, so the pointer is read off
+                    // the window, which took it from the release that fired
+                    // this (gpui window.rs:3602).
+                    .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+                        let at = this.frame_under(window.mouse_position().x);
+                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
-                    // A clip let go over another lane changes track and keeps
-                    // the frames it covers -- the pointer's position along the
-                    // bed says nothing here either, for the reason above.
-                    .on_drop(cx.listener(move |this, drag: &ClipDrag, _, cx| {
-                        this.move_clip(drag.lane, drag.idx, lane, cx)
+                    // ...and a clip let go over a lane lands the same way: on
+                    // the track it was dropped on, at the frame it was carried
+                    // to -- its own included, which is the drag that moves a
+                    // take along its track.
+                    .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+                        this.move_clip(drag.lane, drag.idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
@@ -5166,7 +6783,7 @@ impl Player {
                                 .and_then(|s| sources.iter().position(|o| o.path == s.path))
                                 .unwrap_or(clip.source),
                         );
-                        let width = width_frac(len, duration);
+                        let width = view.width_frac(len, duration);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
@@ -5183,6 +6800,10 @@ impl Player {
                         // says what is moving.
                         let ghost: SharedString =
                             label.clone().unwrap_or_else(|| lane.label()).into();
+                        // Its head in frames, for the press below: the `start`
+                        // above is the same moment in seconds, which is what
+                        // the box is *drawn* from.
+                        let head = clip.start;
                         div()
                             // Named per lane: two rows numbering their clips
                             // from zero would hand gpui the same id twice.
@@ -5190,7 +6811,11 @@ impl Player {
                             .absolute()
                             .top_0()
                             .h_full()
-                            .left(relative(start_frac(start, duration)))
+                            // Negative once the clip's head has been scrolled
+                            // off the left edge: the bed clips what hangs out
+                            // of it, so a half-visible clip is drawn as the
+                            // half of itself that is on screen.
+                            .left(relative(view.frac_at(start, duration)))
                             .w(relative(width))
                             .overflow_hidden()
                             .rounded(px(3.))
@@ -5206,16 +6831,23 @@ impl Player {
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT)))
                             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
-                            // Dragged onto another lane it *moves* there; the
-                            // click that starts the drag still selects, so
-                            // picking a clip up and putting it back down where
-                            // it was is exactly a click.
+                            // Dragged, it *moves*: to the frame it was let go on
+                            // and to the lane it was let go over. The click that
+                            // starts the drag still selects, so picking a clip
+                            // up and putting it back down where it was is
+                            // exactly a click.
                             .on_drag(ClipDrag { lane, idx: i }, move |_, _, _, cx| {
                                 cx.new(|_| Tip(ghost.clone()))
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    // Where in the box the hand took hold of it,
+                                    // for the drag this press may become: the
+                                    // clip has to move with the pointer rather
+                                    // than jump its head under it.
+                                    this.grab =
+                                        this.frame_under(event.position.x).saturating_sub(head);
                                     this.select((lane, i), cx);
                                 }),
                             )
@@ -5339,8 +6971,12 @@ impl Player {
                                     .absolute()
                                     .top_0()
                                     .h_full()
-                                    .left(relative(start_frac(f64::from(at) / self.fps, duration)))
-                                    .w(relative(width_frac(f64::from(len) / self.fps, duration)))
+                                    .left(relative(
+                                        view.frac_at(f64::from(at) / self.fps, duration),
+                                    ))
+                                    .w(relative(
+                                        view.width_frac(f64::from(len) / self.fps, duration),
+                                    ))
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
@@ -5650,6 +7286,28 @@ fn can_add(picked: Option<&(PathBuf, usize)>, timeline: bool, exporting: bool) -
     picked.is_some() && timeline && !exporting
 }
 
+/// What is left on the clipboard after the library row at `removed` was taken
+/// out. A copied clip names its file by *index* into the source list
+/// (`engine::Clip::source`) and a removal renumbers that list
+/// (`engine::Project::remove_source`), so a clipboard kept as it was would paste
+/// **a different file** -- the next one along -- over the range it was copied
+/// from.
+///
+/// The clip's own file gone means there is nothing to paste: `None`, and the
+/// next paste says the clipboard is empty rather than putting some other take
+/// down. Every index past it moves down by one, exactly as the lanes' clips do.
+fn clipboard_after_remove(clip: Option<Clip>, removed: usize) -> Option<Clip> {
+    let mut clip = clip?;
+    match clip.source.cmp(&removed) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            clip.source -= 1;
+            Some(clip)
+        }
+        std::cmp::Ordering::Less => Some(clip),
+    }
+}
+
 /// One library row: a file and one of its audio streams. Plain data, planned
 /// before anything is drawn -- which rows exist at all is the branchy part.
 #[derive(Debug, PartialEq)]
@@ -5683,6 +7341,7 @@ struct Row {
 fn library_rows(
     sources: &[Source],
     streams: &HashMap<PathBuf, Vec<StreamInfo>>,
+    decoders: &HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
     timeline_audio: Option<(u32, u16)>,
     frames: impl Fn(&Path) -> u32,
 ) -> Vec<Row> {
@@ -5698,12 +7357,22 @@ fn library_rows(
             path: source.path.clone(),
             stream: source.audio_stream,
             name: row_name(&source.path, source.audio_stream, of_file.len() > 1),
-            // Only where there is a choice to describe: a file with one audio
-            // track is the row it has always been, name and length, and the
-            // length is what would be squeezed out at the panel's least width.
-            detail: info
-                .filter(|_| of_file.len() > 1)
-                .map_or_else(String::new, stream_detail),
+            // The decoder first: it is the same for every row of a file and
+            // it is what a person opening the panel is asking about. The
+            // stream half only where there is a choice to describe -- a file
+            // with one audio track is the row it has always been, name and
+            // length, and the length is what would be squeezed out at the
+            // panel's least width.
+            detail: join_detail(
+                &decoders
+                    .get(&source.path)
+                    .copied()
+                    .flatten()
+                    .map_or_else(String::new, |(codec, backend)| decode_label(codec, backend)),
+                &info
+                    .filter(|_| of_file.len() > 1)
+                    .map_or_else(String::new, stream_detail),
+            ),
             // A stream already on the timeline is playing: whatever a probe
             // would say about it now, it is usable by demonstration.
             unusable: None,
@@ -5740,9 +7409,20 @@ fn library_rows(
 /// why it cannot be used, with the separator only where both halves exist (a
 /// single-stream file says nothing about its stream).
 fn join_detail(detail: &str, tail: &str) -> String {
-    match detail.is_empty() {
-        true => tail.to_string(),
-        false => format!("{detail} · {tail}"),
+    match (detail.is_empty(), tail.is_empty()) {
+        (true, _) => tail.to_string(),
+        (false, true) => detail.to_string(),
+        (false, false) => format!("{detail} · {tail}"),
+    }
+}
+
+/// How a source's decoder reads: the codec and which seat has it, or the seat
+/// alone for a still, which has no coded stream to name. The one place either
+/// answer is spelled, so a row, a transport line and a card cannot disagree.
+fn decode_label(codec: Option<Codec>, backend: Backend) -> String {
+    match codec {
+        Some(codec) => format!("{} · {}", codec.name(), backend.label()),
+        None => backend.label().to_string(),
     }
 }
 
@@ -5881,48 +7561,115 @@ impl Quality {
     }
 }
 
-/// The export card's format rows: what this program can write, and what it
-/// cannot with the reason it cannot. A format with no entry at all would read
-/// as an oversight, and a menu of three as a claim that nothing else exists --
-/// so the refusals are rows too, dimmed and unclickable.
+/// The export card's format rows: the key that picks one, its name, and what it
+/// writes -- or, where this program cannot write it, the reason it cannot. A
+/// format with no entry at all would read as an oversight, and a menu of three
+/// as a claim that nothing else exists -- so the refusals are rows too, dimmed
+/// and unclickable.
 ///
-/// `None` is exactly that kind of row. The MP3 reason is a *licence* and not a
-/// capability: `shine-rs` encodes mp3 in pure Rust under LGPL-2.0, which is a
-/// decision about this project rather than about the code, and the row says so
-/// instead of pretending the encoder does not exist. HEVC and VP9 are the two
-/// this program *reads* and cannot write -- the plugin decodes both and there is
-/// no encoder for either here -- so they are rows for the same reason: a codec
-/// that opens but never comes back out is exactly the gap a user would other-
-/// wise go looking for.
-const FORMATS: [(Option<Format>, &str, &str); 9] = [
-    (Some(Format::Mp4), "MP4", "H.264 picture + copied AAC"),
+/// `None` is exactly that kind of row, and there are two left. MP3 stopped
+/// being one when `rusty_mp3` gave this project an Apache-2.0 encoder (the LGPL
+/// `shine-rs` was the licence question, and it is not the only encoder any
+/// more), and HEVC stopped being one when OxideAV's pure-Rust H.265 gave it an
+/// encoder — an *intra-only* one, which the rows say rather than let a user
+/// find out from the size of the file. VP9 is the one this program still only
+/// *reads*: the plugin decodes it and there is no encoder for it here, so it is
+/// a row for the reason the refusals are rows at all — a codec that opens but
+/// never comes back out is exactly the gap a user would otherwise go looking
+/// for. AAC is not a row at all: it is what both containers' sound *is*, never a
+/// file of its own.
+///
+/// A codec is one row, and the boxes it can be written into are the row's
+/// containers: the same AV1 picture and the same AAC track go into a Matroska
+/// file or into an mp4, and which one a user needs is about what has to play
+/// the file, not about the encode. So the container is asked *once*, in a row
+/// of its own, and only where there is more than one to ask about -- five
+/// picture rows to read past were four of them saying the same codec twice.
+const FORMATS: [(&[Format], &str, &str, &str); 8] = [
     (
-        Some(Format::Av1),
+        &[Format::Mp4],
+        "m",
+        "H.264",
+        "plays everywhere · AAC sound · MP4 only",
+    ),
+    (
+        &[Format::Av1, Format::Av1Mp4],
+        "a",
         "AV1",
-        "AV1 picture in .mkv — no sound: export WAV or FLAC for that",
+        "smallest file for the picture · AAC sound",
     ),
-    (Some(Format::Wav), "WAV", "16-bit PCM — audio only"),
-    (Some(Format::Flac), "FLAC", "lossless — audio only"),
-    (None, "MP3", "encoder is LGPL — licence decision pending"),
-    (None, "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (None, "AAC", "no pure-Rust AAC encoder"),
     (
-        None,
+        &[Format::Hevc, Format::HevcMp4],
+        "h",
         "HEVC",
-        "no encoder in this stack, and patent-encumbered",
+        "intra-only, every frame a cut point — large files",
     ),
-    (None, "VP9", "superseded by AV1, which is the row above"),
+    (&[Format::Wav], "w", "WAV", "16-bit PCM — audio only"),
+    (&[Format::Flac], "f", "FLAC", "lossless — audio only"),
+    (
+        &[Format::Mp3],
+        "p",
+        "MP3",
+        "MPEG-1 Layer III, 256 kbps — audio only",
+    ),
+    (&[], "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
+    (&[], "", "VP9", "AV1 above replaces it"),
 ];
 
-/// The format a key picks while the export card is up: the row's own initial,
-/// which is unambiguous across the three that can be picked. `None` for
-/// everything else, digits included -- those are the bitrate's.
-fn format_key(key: &str) -> Option<Format> {
+/// The codec row a key picks, landed in the container already chosen: pressing
+/// `a` after an mp4 gives AV1 *in mp4*, because a box decided once is not a
+/// question again. A letter of the row's own name, spelled out in the table
+/// rather than taken from the initial (`MP4` and `MP3` share one). Never a
+/// digit -- those are the bitrate's. `None` for every other stroke, the rows
+/// that cannot be picked included.
+fn format_key(key: &str, current: Format) -> Option<Format> {
     FORMATS
         .into_iter()
-        .filter_map(|(format, label, _)| format.zip(label.get(..1)))
-        .find(|(_, initial)| initial.eq_ignore_ascii_case(key))
-        .map(|(format, _)| format)
+        .filter(|(_, stroke, ..)| !stroke.is_empty() && stroke.eq_ignore_ascii_case(key))
+        .find_map(|(row, ..)| same_box(row, current))
+}
+
+/// The boxes one codec may be written into, in the order its container row
+/// cycles them. Empty for a codec this program cannot write at all.
+fn containers(format: Format) -> &'static [Format] {
+    FORMATS
+        .into_iter()
+        .map(|(row, ..)| row)
+        .find(|row| row.contains(&format))
+        .unwrap_or(&[])
+}
+
+/// This row's format under the container `current` is already in, or the row's
+/// first when it has no such box: an AV1 picked from a WAV lands in Matroska,
+/// and picked from an mp4 stays in the mp4.
+fn same_box(row: &[Format], current: Format) -> Option<Format> {
+    row.iter()
+        .copied()
+        .find(|f| f.ext() == current.ext())
+        .or_else(|| row.first().copied())
+}
+
+/// The next box for the same codec, wrapping -- what the container row's key
+/// does. The format itself for a codec with only one, so the stroke cannot
+/// change what it is not offering.
+fn next_container(format: Format) -> Format {
+    let row = containers(format);
+    let at = row.iter().position(|&f| f == format).unwrap_or(0);
+    row.get((at + 1) % row.len().max(1))
+        .copied()
+        .unwrap_or(format)
+}
+
+/// Why the quality rows say nothing about this format, or `None` where they
+/// decide the picture. Only a picture encoder is given a bitrate here: the two
+/// lossless audio formats have none to give and MP3 is written at one fixed
+/// figure, so a live row over either would be a control that changes nothing.
+fn bitrate_refusal(format: Format) -> Option<&'static str> {
+    match format {
+        Format::Wav | Format::Flac => Some("lossless audio — no bitrate to pick"),
+        Format::Mp3 => Some("MP3 is written at a fixed 256 kbps"),
+        _ => None,
+    }
 }
 
 /// What one of the colour card's own strokes does. Its keys are card-local --
@@ -6057,36 +7804,85 @@ fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
     sizes[at.map_or(0, |at| (at + 1) % sizes.len())]
 }
 
-/// [`format_line`] plus the project's resolution, which is what a video export
-/// is written at however many sizes the media on the timeline are. Only for the
-/// formats that carry a picture -- a WAV has no resolution to state.
-fn export_line(format: Format, session: Option<&PlaybackSession>) -> String {
-    let line = format_line(format);
-    match session.filter(|_| format.has_video()) {
-        Some(session) => {
-            let (w, h) = session.resolution();
-            format!("{line} · project {w}x{h}")
+/// The first of the two lines the card keeps above its button: what will be
+/// *inside* the file. [`format_line`]'s codec and box, then the project's own
+/// picture size and rate -- which is what a video export is written at however
+/// many sizes and rates the media on the timeline are -- and last what the
+/// sound will be, or that there is none. Every field here is one `ffprobe`
+/// reads back off the finished file, so the line is checkable rather than a
+/// promise.
+fn summary_head(format: Format, picture: Option<((u32, u32), f64)>, audio: &str) -> String {
+    let line = match picture.filter(|_| format.has_video()) {
+        Some(((w, h), fps)) => {
+            format!("{} · {w}x{h} · {} fps", format_line(format), fps_label(fps))
         }
-        None => line.to_string(),
+        None => format_line(format).to_string(),
+    };
+    join_detail(&line, audio)
+}
+
+/// The second: where it lands, roughly how big, and what will encode the
+/// picture -- the seat as the probe found it (`…` until it lands, never a
+/// guess), which is what the running export then names on its progress line.
+fn summary_tail(path: &Path, mb: Option<u64>, seat: Option<&'static str>, video: bool) -> String {
+    let size = mb.map_or_else(String::new, |mb| format!("≈ {mb} MB"));
+    let seat = match (video, seat) {
+        (true, Some(seat)) => seat,
+        (true, None) => "encoder …",
+        (false, _) => "",
+    };
+    join_detail(&join_detail(&file_name(path), &size), seat)
+}
+
+/// A frame rate as a person writes it: `30`, not `30.000`, and `23.976` for the
+/// rate that is a ratio.
+fn fps_label(fps: f64) -> String {
+    match (fps - fps.round()).abs() < 0.001 {
+        true => format!("{fps:.0}"),
+        false => format!("{fps:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
     }
 }
 
+/// About how big a *chosen* bitrate makes the file: the picture's megabits over
+/// the timeline's length. `None` for `Auto`, whose figure is the encoder's to
+/// decide, and for a format with no bitrate at all -- a number nobody picked is
+/// not an estimate. The sound and the container's own overhead are not in it,
+/// which is why the card says "≈".
+fn estimated_mb(bitrate: Option<u64>, duration: f64) -> Option<u64> {
+    let bitrate = bitrate.filter(|&b| b > 0 && duration > 0.)?;
+    Some((bitrate as f64 * duration / 8e6).round() as u64)
+}
+
+/// What is in the file and what box it is in, which is the head of the summary.
+/// Terse on purpose: the fields after it (size, rate, sound) are what the line
+/// is *for*, and a head that spent its width on prose used to push the whole
+/// summary onto a second line -- what each codec means is on its row.
 fn format_line(format: Format) -> &'static str {
     match format {
-        Format::Mp4 => "H.264 · MP4 · moov at end",
-        Format::Av1 => "AV1 · Matroska · picture only, no audio track",
-        Format::Wav => "16-bit PCM · WAV · timeline audio only",
-        Format::Flac => "FLAC · lossless · timeline audio only",
+        Format::Mp4 => "H.264 · MP4",
+        Format::Av1 => "AV1 · MKV",
+        Format::Av1Mp4 => "AV1 · MP4",
+        Format::Hevc => "HEVC intra · MKV",
+        Format::HevcMp4 => "HEVC intra · MP4",
+        // The three whose codec *is* their box: naming it twice would be the
+        // only field on this line that says nothing.
+        Format::Wav => "16-bit PCM · WAV",
+        Format::Flac => "FLAC · lossless",
+        Format::Mp3 => "MP3 · 256 kbps",
     }
 }
 
-/// The row a format is picked by, which is what a refusal calls it: `MP4`, not
-/// the `mkv` an AV1 file is named with.
+/// The row a format is picked by, which is what a refusal calls it: the codec,
+/// since the container is a row of its own now -- `AV1`, not the `mkv` such a
+/// file is named with.
 fn format_label(format: Format) -> &'static str {
     FORMATS
         .iter()
-        .find(|(row, ..)| *row == Some(format))
-        .map_or("EXPORT", |(_, label, _)| *label)
+        .find(|(row, ..)| row.contains(&format))
+        .map_or("EXPORT", |(_, _, label, _)| *label)
 }
 
 /// The destination under a format: `take.export.mp4` becomes `take.export.wav`.
@@ -6142,6 +7938,50 @@ fn cancels_export(key: &str, action: Option<ActionId>) -> bool {
     key == ESCAPE || action == Some(ActionId::CancelExport)
 }
 
+/// Where a held key would land, which is the whole of what auto-repeat has to
+/// know. [`Player::repeat_scope`] answers it from the same state the handler
+/// walks below itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Repeat {
+    /// A card with values in it owns the keyboard: equalizer, colour, speed or
+    /// silence. Its arrows are sliders.
+    Card,
+    /// Nobody does, so the keymap answers -- and only one pair of its actions
+    /// is a value being moved rather than a thing being done once.
+    Keymap,
+    /// A stroke is being captured, an export is running, or an overlay with no
+    /// value in it is up. Nothing there is worth a repeat.
+    Nothing,
+}
+
+/// Whether a *held* stroke means it again. One press is always one action; a
+/// hold is only ever a value running, so this is what tells the two apart.
+///
+/// The cards' arrows, because that is what every one of them moves a slider
+/// with -- and only the arrows, so the equalizer's `r` cannot flatten five
+/// bands forty times a second and the silence card's `enter` cannot cut forty
+/// places again on the next tick. Outside a card the volume pair and nothing
+/// else: play, cut, delete, save, export and every other binding is a one-shot,
+/// exactly as it was when the handler filtered every held key alike.
+fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> bool {
+    match scope {
+        Repeat::Card => matches!(key, "up" | "down" | "left" | "right"),
+        Repeat::Keymap => matches!(
+            action,
+            Some(
+                ActionId::VolumeUp
+                    | ActionId::VolumeDown
+                    // A zoom is a value being moved as much as a level is:
+                    // held, it runs from the whole timeline down to a handful
+                    // of frames and stops there. The fit is one press.
+                    | ActionId::ZoomIn
+                    | ActionId::ZoomOut
+            )
+        ),
+        Repeat::Nothing => false,
+    }
+}
+
 /// The keys that are only ever half a chord. gpui delivers a lone modifier
 /// press as a keystroke of its own, and taking one as a binding would leave an
 /// action that fires the moment the user reaches for any chord that uses it --
@@ -6162,11 +8002,12 @@ fn is_bare_modifier(key: &str) -> bool {
 /// refuses it too (`export::start`); this is what greys the row before a
 /// destination has been picked.
 ///
-/// The second reason is the mp4 path's alone: it *copies* one AAC track and
-/// there is no encoder here to mix several with, so a timeline whose sound is
-/// spread over more than one audio lane is refused by the engine
-/// (`export::run`). An AV1 export carries no sound at all -- said on its row as
-/// its detail, not as a refusal -- so no count of audio lanes stops it.
+/// It is the *only* reason left. A second audio lane, a speeded clip, a source
+/// no mp4 sample table holds: each of those used to grey the MP4 row, because
+/// the mp4 path could only *copy* an AAC track. It re-encodes where a copy
+/// cannot say what the timeline says (`export::copy_audio`), so none of them is
+/// a refusal any more -- and every video format carries the sound, so there is
+/// nothing here that is one format's alone.
 fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
     if !format.has_video() {
         return None;
@@ -6175,43 +8016,13 @@ fn format_refusal(session: &PlaybackSession, format: Format) -> Option<String> {
         .lanes()
         .into_iter()
         .any(|lane| lane.kind == LaneKind::Video && !session.lane_clips(lane).is_empty());
-    if !picture {
-        return Some(format!(
-            "no picture — {} would be black; export WAV or FLAC",
+    match picture {
+        true => None,
+        false => Some(format!(
+            "no picture — {} would be black; export WAV, FLAC or MP3",
             format.name()
-        ));
+        )),
     }
-    if format != Format::Mp4 {
-        return None;
-    }
-    let audio: Vec<Lane> = session
-        .lanes()
-        .into_iter()
-        .filter(|&lane| lane.kind == LaneKind::Audio && !session.lane_clips(lane).is_empty())
-        .collect();
-    if audio.len() > 1 {
-        return Some(format!("{} audio lanes — an mp4 copies one", audio.len()));
-    }
-    // ...and the third reason, the same path's: a copied AAC packet carries no
-    // rate, so a speeded clip on the lane being copied would come back at 1.00x
-    // under a picture the export *does* re-time. The engine refuses it by name
-    // (`export::copy_audio`); this greys the row before anyone picks a
-    // destination. The picture's own rate is no reason at all -- the export walk
-    // honours that -- so only this one lane is asked.
-    audio
-        .first()
-        .and_then(|&lane| {
-            session
-                .lane_clips(lane)
-                .iter()
-                .find(|c| !c.speed.is_normal())
-        })
-        .map(|c| {
-            format!(
-                "sound at {} — an mp4 copies packets, which carry no rate",
-                c.speed
-            )
-        })
 }
 
 /// How tall a column of `lanes` rows is, gaps included -- the panel's own gap
@@ -6235,14 +8046,127 @@ fn width_frac(len: f64, total: f64) -> f32 {
     if total > 0. { (len / total) as f32 } else { 1. }
 }
 
-/// Where along the lane a clip starts, 0..1. Unlike [`width_frac`] a timeline
-/// with no length pins this to the left edge -- a full-width offset would push
-/// the box out of the lane it belongs to.
-fn start_frac(start: f64, total: f64) -> f32 {
-    if total > 0. {
-        (start / total).clamp(0., 1.) as f32
-    } else {
-        0.
+/// One press of a zoom key, or one notch of ctrl+wheel.
+const ZOOM_STEP: f32 = 1.25;
+
+/// How few frames the bed may be narrowed down to. Past this there is nothing
+/// left to aim at -- a single frame across a whole window is a wall of colour,
+/// not an edit surface.
+const ZOOM_MIN_FRAMES: f64 = 8.;
+
+/// Which slice of the timeline the ruler and the lanes are showing: `zoom` is
+/// how many times the whole of it the bed is now worth, and `start` the moment
+/// at the bed's left edge. The one place frames become pixels -- every box, the
+/// playhead, a seek and a trim all go through it, so none of them can drift
+/// away from the others when the view moves.
+///
+/// [`View::default`] is the whole timeline across the bed, which is what the
+/// panel drew before there was a zoom at all: at zoom 1 `start` is pinned to 0
+/// and every fraction here is the one [`width_frac`] and `start_frac` gave.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    zoom: f32,
+    start: f64,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View {
+            zoom: 1.,
+            start: 0.,
+        }
+    }
+}
+
+impl View {
+    /// How much of the timeline is on the bed, in seconds.
+    fn span(self, duration: f64) -> f64 {
+        duration / f64::from(self.zoom)
+    }
+
+    /// The tightest this timeline may be zoomed: [`ZOOM_MIN_FRAMES`] across the
+    /// bed. Never under 1 -- a timeline shorter than that is already at its
+    /// floor, and a zoom that cannot fit the whole of it is not a zoom.
+    fn max_zoom(duration: f64, fps: f64) -> f32 {
+        let frames = duration * fps;
+        if frames > ZOOM_MIN_FRAMES {
+            (frames / ZOOM_MIN_FRAMES) as f32
+        } else {
+            1.
+        }
+    }
+
+    /// Where a moment sits along the bed, 0 at its left edge and 1 at its
+    /// right. Outside that range for a moment scrolled off the view, which is
+    /// exactly the negative offset a half-visible clip is drawn at.
+    fn frac_at(self, at: f64, duration: f64) -> f32 {
+        let span = self.span(duration);
+        if span > 0. {
+            ((at - self.start) / span) as f32
+        } else {
+            0.
+        }
+    }
+
+    /// How wide a stretch of `len` seconds is on the bed. More than the whole
+    /// bed once zoomed in, which is the point of zooming in.
+    fn width_frac(self, len: f64, duration: f64) -> f32 {
+        width_frac(len, self.span(duration))
+    }
+
+    /// The moment a pointer at `frac` along the bed is pointing at: the inverse
+    /// of [`View::frac_at`], and what every seek and every trim reads.
+    fn time_at(self, frac: f32, duration: f64) -> f64 {
+        (self.start + f64::from(frac) * self.span(duration)).clamp(0., duration)
+    }
+
+    /// Zoomed by `factor` about `anchor` (0..1 along the bed): whatever moment
+    /// was under that point stays under it, so a zoom magnifies what was being
+    /// looked at rather than throwing it off the edge.
+    fn zoomed(self, factor: f32, anchor: f32, duration: f64, fps: f64) -> Self {
+        let at = self.start + f64::from(anchor) * self.span(duration);
+        // Clamped *before* the offset is worked out, not after: a press that
+        // runs into either stop must still leave the anchor where it is, and a
+        // start measured against a zoom the stop then took away would slide it.
+        let zoom = (self.zoom * factor).clamp(1., Self::max_zoom(duration, fps));
+        let start = at - f64::from(anchor) * View { zoom, start: 0. }.span(duration);
+        View { zoom, start }.settled(duration, fps)
+    }
+
+    /// Clamped to the timeline it draws: never wider than the whole of it (the
+    /// zoom-out floor is the fit), never tighter than [`View::max_zoom`], and
+    /// never scrolled past either end.
+    fn settled(self, duration: f64, fps: f64) -> Self {
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.clamp(1., Self::max_zoom(duration, fps))
+        } else {
+            1.
+        };
+        let span = View { zoom, start: 0. }.span(duration);
+        let start = if self.start.is_finite() {
+            self.start.clamp(0., (duration - span).max(0.))
+        } else {
+            0.
+        };
+        View { zoom, start }
+    }
+
+    /// The view a playhead at `at` needs: the same one while it is on the bed,
+    /// and one centred on it once it has run off -- which is how a zoomed-in
+    /// timeline scrolls, during playback and after a seek alike. At the fit
+    /// this can never fire, so an unzoomed panel is untouched by it.
+    fn following(self, at: f64, duration: f64, fps: f64) -> Self {
+        let view = self.settled(duration, fps);
+        let span = view.span(duration);
+        if at < view.start || at > view.start + span {
+            View {
+                start: at - span / 2.,
+                ..view
+            }
+            .settled(duration, fps)
+        } else {
+            view
+        }
     }
 }
 
@@ -6440,6 +8364,59 @@ fn control(
         })
 }
 
+/// The monitoring level as something to drag: 4 px of bar to look at and the
+/// whole control's height to hit (WCAG 2.5.8), the split the speed bar and the
+/// colour sliders both make. Only the level -- mute is the button beside it, so
+/// a muted slider still shows what unmuting comes back to, drawn dim.
+///
+/// Dimmed and inert without a timeline, like every other control that would
+/// have nothing to act on.
+fn volume_slider(
+    volume: Volume,
+    bar: Rc<Cell<Bounds<Pixels>>>,
+    enabled: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
+    div()
+        .id("volume-bar")
+        .relative()
+        .flex_none()
+        .w(px(VOLUME_W))
+        .h(px(CONTROL_H))
+        .flex()
+        .items_center()
+        .tooltip(|_, cx| {
+            cx.new(|_| Tip("Volume — drag to set the level; the button mutes".into()))
+                .into()
+        })
+        .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.volume_dragging = true;
+                        this.drag_volume(event.position.x, cx);
+                    }),
+                )
+                .child(bounds_probe(bar))
+        })
+        .child(
+            div()
+                .w_full()
+                .h(px(4.))
+                .rounded(px(2.))
+                .bg(rgb(SURFACE))
+                .child(
+                    div()
+                        .h_full()
+                        .w(relative(volume.along()))
+                        .rounded(px(2.))
+                        .bg(rgb(if volume.muted { INK_DIM } else { ACCENT })),
+                ),
+        )
+}
+
 /// The line between two groups of buttons.
 fn separator() -> impl IntoElement {
     div()
@@ -6521,6 +8498,28 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
 }
 
+/// The frame a dropped clip's head lands on: `raw`, unless one of `marks` is
+/// within `tol` frames of where its head -- or its tail, `len` frames along --
+/// would come to rest, in which case that edge wins. The snap every timeline
+/// has: clips meet exactly instead of a frame apart, and the hand does not have
+/// to aim. The nearest mark wins, and a head landing on one beats a tail at the
+/// same distance -- what was dragged is the head.
+fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
+    let mut best: Option<(u32, u32)> = None;
+    for &mark in marks {
+        // Head on the mark, then tail on it -- a clip dragged up against the
+        // take in front of it snaps by whichever end reaches first.
+        for start in [Some(mark), mark.checked_sub(len)] {
+            let Some(start) = start else { continue };
+            let d = start.abs_diff(raw);
+            if d <= tol && best.is_none_or(|(near, _)| d < near) {
+                best = Some((d, start));
+            }
+        }
+    }
+    best.map_or(raw, |(_, start)| start)
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -6599,6 +8598,131 @@ fn hist_curves(bins: [[u32; HIST_BINS]; 3]) -> impl IntoElement {
     .size_full()
 }
 
+/// In-place radix-2 FFT of `re`/`im`, whose length must be a power of two.
+///
+/// Hand-written, and deliberately: a 1024-point transform once a frame is a
+/// few tens of microseconds of plain arithmetic, and a dependency for it would
+/// be a build cost this editor pays on every compile for one card's backdrop.
+fn fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    // Decimation in time: the input is first put in bit-reversed order, after
+    // which the butterflies run over neighbours.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut span = 2;
+    while span <= n {
+        let step = std::f32::consts::TAU / span as f32;
+        for start in (0..n).step_by(span) {
+            for k in 0..span / 2 {
+                // e^{-i2πk/span}: the negative sign is the forward transform.
+                let (sin, cos) = (-step * k as f32).sin_cos();
+                let (a, b) = (start + k, start + k + span / 2);
+                let (tr, ti) = (cos * re[b] - sin * im[b], cos * im[b] + sin * re[b]);
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        span <<= 1;
+    }
+}
+
+/// The played signal as one height per curve point, 0 (silence) to 1 (the top
+/// of the box) -- the analyser the response curve is drawn on top of.
+///
+/// The newest [`EQ_FFT`] samples of the engine's tap, Hann-windowed so a tone
+/// that does not land on a bin centre is one hump rather than a smear across
+/// the axis. Each column takes the *loudest* bin between it and its
+/// neighbours: the axis is logarithmic, so one column near 20 Hz is a fraction
+/// of a bin while one near 20 kHz is hundreds, and averaging those would sink
+/// every peak up there into the noise beside it.
+///
+/// Empty -- nothing to draw -- for a tap too short to transform, which is what
+/// a session has just after a seek.
+///
+/// ponytail: one transform length for the whole axis, so the bass end is a bin
+/// (47 Hz at 48 kHz) wide however many columns are drawn across it -- a 60 Hz
+/// hum and an 80 Hz one are the same hump down there. Upgrade path is the
+/// analyser every mastering EQ uses: two or three transforms of different
+/// lengths, each drawn over the octaves it resolves.
+fn eq_spectrum(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.len() < EQ_FFT {
+        return Vec::new();
+    }
+    let tail = &samples[samples.len() - EQ_FFT..];
+    let mut re: Vec<f32> = tail
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let w = 0.5 * (1. - (std::f32::consts::TAU * i as f32 / EQ_FFT as f32).cos());
+            s * w
+        })
+        .collect();
+    let mut im = vec![0.; EQ_FFT];
+    fft(&mut re, &mut im);
+    // Magnitude per bin, scaled so a full-scale sine reads 0 dBFS: half the
+    // energy is in the mirrored half of the transform, and the Hann window
+    // takes another factor of two off.
+    let mags: Vec<f32> = (0..EQ_FFT / 2)
+        .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt() * 4. / EQ_FFT as f32)
+        .collect();
+    let bin_hz = sample_rate as f32 / EQ_FFT as f32;
+    let (floor, ceiling) = EQ_SPECTRUM_DB;
+    let at = |along: f32| EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+    (0..=EQ_CURVE_STEPS)
+        .map(|step| {
+            let along = step as f32 / EQ_CURVE_STEPS as f32;
+            let half = 0.5 / EQ_CURVE_STEPS as f32;
+            // Bin 0 is DC and means nothing here, so the low end starts at 1.
+            let low = (at(along - half) / bin_hz).round().max(1.) as usize;
+            let high = (at(along + half) / bin_hz).round().max(1.) as usize;
+            let peak = (low..=high)
+                .filter_map(|k| mags.get(k))
+                .fold(0f32, |a, &b| a.max(b));
+            let db = 20. * peak.max(1e-9).log10();
+            ((db - floor) / (ceiling - floor)).clamp(0., 1.)
+        })
+        .collect()
+}
+
+/// The analyser drawn as one filled shape from the floor of the box.
+fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let last = levels.len().saturating_sub(1).max(1) as f32;
+            let mut path = PathBuilder::fill();
+            path.move_to(point(o.x, o.y + s.height));
+            for (i, level) in levels.iter().enumerate() {
+                path.line_to(point(
+                    o.x + s.width * (i as f32 / last),
+                    o.y + s.height * (1. - level),
+                ));
+            }
+            path.line_to(point(o.x + s.width, o.y + s.height));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(EQ_SPECTRUM_INK));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
 /// The cascade's frequency response, drawn as one line across the graph.
 ///
 /// Every point comes from `EqParams::response_db`, which reads the very
@@ -6613,14 +8737,31 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             let (o, s) = (bounds.origin, bounds.size);
+            let points: Vec<_> = (0..=EQ_CURVE_STEPS)
+                .map(|step| {
+                    let along = step as f32 / EQ_CURVE_STEPS as f32;
+                    let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
+                    point(
+                        o.x + s.width * along,
+                        o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
+                    )
+                })
+                .collect();
+            // The area between the curve and 0 dB, closed along that line: a
+            // boost and a cut wind opposite ways around it, which is exactly
+            // what makes both of them fill and the flat parts stay empty.
+            let mut area = PathBuilder::fill();
+            area.move_to(point(o.x, o.y + s.height / 2.));
+            for at in &points {
+                area.line_to(*at);
+            }
+            area.line_to(point(o.x + s.width, o.y + s.height / 2.));
+            area.close();
+            if let Ok(area) = area.build() {
+                window.paint_path(area, rgba(EQ_FILL_INK));
+            }
             let mut path = PathBuilder::stroke(px(2.));
-            for step in 0..=EQ_CURVE_STEPS {
-                let along = step as f32 / EQ_CURVE_STEPS as f32;
-                let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
-                let at = point(
-                    o.x + s.width * along,
-                    o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
-                );
+            for (step, at) in points.into_iter().enumerate() {
                 match step {
                     0 => path.move_to(at),
                     _ => path.line_to(at),
@@ -6704,21 +8845,27 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_FREQ_HIGH,
-        EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_TICKS, EXPORT_ROWS_H, FORMATS,
-        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
-        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
-        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_W, NO_FILE, PANEL_H,
-        Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Volume, WAVE_BPS, WAVE_COL, Wave,
-        applicable, band_label, can_add, cancels_export, color_snap, envelope, eq_x, eq_y,
-        export_path, export_settings, format_key, format_line, format_refusal, frac_along,
-        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
-        menu_at, normalise, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
+        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
+        EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, FORMATS, Format, HEADER_GAP,
+        HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
+        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
+        LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
+        PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
+        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS,
+        WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
+        clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
+        estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
+        fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
+        keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
+        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
+        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
         unseen_sources, whole_take, width_frac, window_title,
     };
-    use super::{LaneKind, file_name, file_uri, library_rows, unscannable};
+    use super::{
+        LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
+        repeats, unscannable,
+    };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
     /// the ones the bus would otherwise read as something else.
@@ -6791,9 +8938,13 @@ mod tests {
         );
         // The rows the panel draws: one per source, each its file's own length
         // -- source 1 has no clip anywhere and is still 4 s at 30 fps.
-        let rows = library_rows(session.sources(), &HashMap::new(), None, |path| {
-            session.file_frames(path)
-        });
+        let rows = library_rows(
+            session.sources(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            |path| session.file_frames(path),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].frames, 150, "5 s at 30 fps");
         assert_eq!(rows[1].frames, 120, "4 s at 30 fps, never placed");
@@ -6832,7 +8983,9 @@ mod tests {
             .find(|s| s.index == session.sources()[0].audio_stream)
             .map(|s| (s.sample_rate, s.channels));
         let frames = session.file_frames(&path);
-        let rows = library_rows(session.sources(), &streams, rate, |_| frames);
+        let rows = library_rows(session.sources(), &streams, &HashMap::new(), rate, |_| {
+            frames
+        });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "test_tone.mp3");
         assert_eq!(rows[0].unusable, None, "the row is placeable");
@@ -6854,14 +9007,19 @@ mod tests {
         // and are never refused.
         assert_eq!(
             format_refusal(&session, Format::Mp4).as_deref(),
-            Some("no picture — an mp4 would be black; export WAV or FLAC")
+            Some("no picture — an mp4 would be black; export WAV, FLAC or MP3")
         );
         assert_eq!(
             format_refusal(&session, Format::Av1).as_deref(),
-            Some("no picture — an AV1 export would be black; export WAV or FLAC")
+            Some("no picture — an AV1 Matroska would be black; export WAV, FLAC or MP3")
+        );
+        assert_eq!(
+            format_refusal(&session, Format::Av1Mp4).as_deref(),
+            Some("no picture — an AV1 mp4 would be black; export WAV, FLAC or MP3")
         );
         assert_eq!(format_refusal(&session, Format::Wav), None);
         assert_eq!(format_refusal(&session, Format::Flac), None);
+        assert_eq!(format_refusal(&session, Format::Mp3), None);
     }
 
     fn info(
@@ -6899,7 +9057,13 @@ mod tests {
                 info(3, 0, 0, None, false),
             ],
         );
-        let rows = library_rows(&sources, &streams, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(
+            &sources,
+            &streams,
+            &HashMap::new(),
+            Some((44_100, 2)),
+            |_| 90,
+        );
         assert_eq!(
             rows.iter().map(|r| r.stream).collect::<Vec<_>>(),
             [0, 1, 2, 3],
@@ -6937,7 +9101,7 @@ mod tests {
             PathBuf::from("/m/plain.mp4"),
             vec![info(0, 44_100, 2, None, true)],
         );
-        let rows = library_rows(&plain, &one, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(&plain, &one, &HashMap::new(), Some((44_100, 2)), |_| 90);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "plain.mp4");
         assert_eq!(
@@ -6948,7 +9112,7 @@ mod tests {
         let mut silent = HashMap::new();
         silent.insert(PathBuf::from("/m/plain.mp4"), Vec::new());
         for probe in [silent, HashMap::new()] {
-            let rows = library_rows(&plain, &probe, None, |_| 90);
+            let rows = library_rows(&plain, &probe, &HashMap::new(), None, |_| 90);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].name, "plain.mp4");
             assert_eq!(rows[0].detail, "");
@@ -6966,7 +9130,13 @@ mod tests {
             PathBuf::from("/m/other.mp4"),
             vec![info(0, 44_100, 2, None, true)],
         );
-        let rows = library_rows(&placed, &streams, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(
+            &placed,
+            &streams,
+            &HashMap::new(),
+            Some((44_100, 2)),
+            |_| 90,
+        );
         assert_eq!(
             rows.iter()
                 .map(|r| (file_name(&r.path), r.stream))
@@ -7066,6 +9236,98 @@ mod tests {
         for action in MENU_ITEMS {
             assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
+        // ...and the whole card still fits the 640x360 floor, however many items
+        // it grows to: the list is what scrolls past the cap, never the card.
+        let items = MENU_ITEMS.len() + 1; // Properties
+        assert!(MENU_PAD * 2. + MENU_ROWS_H <= 360., "menu too tall");
+        assert!(
+            MENU_ROWS_H / MENU_ROW_H >= 12.,
+            "too few items visible to scan"
+        );
+        assert_eq!(
+            menu_at(point(px(0.), px(0.)), size(px(640.), px(360.)), {
+                MENU_PAD * 2. + (items as f32 * MENU_ROW_H).min(MENU_ROWS_H)
+            }),
+            (0., 0.)
+        );
+    }
+
+    /// The other half of the keys menu's guarantee, and the audit this batch was
+    /// asked for kept as a test: no action may be a stroke and nothing else.
+    /// Either the clip menu offers it, or a control in the panel does -- named
+    /// here by the id [`control`] is handed, read out of this file's own source
+    /// like `no_stroke_is_missing_from_the_keys_menu` reads the key handler.
+    #[test]
+    fn every_action_is_reachable_without_the_keyboard() {
+        use keymap::ActionId;
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let element = |id: &str| source.contains(&format!("\"{id}\""));
+        for action in ActionId::ALL {
+            let by_pointer = MENU_ITEMS.contains(&action)
+                || match action {
+                    ActionId::Play => element("transport"),
+                    // One slot, two states: it starts an export and stops the
+                    // one it started.
+                    ActionId::Export | ActionId::CancelExport => element("export"),
+                    ActionId::Save => element("save"),
+                    ActionId::Undo => element("undo"),
+                    ActionId::Resolution => element("resolution"),
+                    // Three buttons beside it, and the ctrl+wheel on the bar.
+                    ActionId::ZoomIn => element("zoom-in"),
+                    ActionId::ZoomOut => element("zoom-out"),
+                    ActionId::ZoomFit => element("zoom-fit"),
+                    ActionId::AddVideoLane => element("add-video-lane"),
+                    ActionId::AddAudioLane => element("add-audio-lane"),
+                    // The × in a lane's own header, which takes any track and
+                    // not only the last one.
+                    ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
+                        source.contains("this.remove_lane(lane, cx)")
+                    }
+                    ActionId::ToggleMute => element("volume"),
+                    // The fader on every audio track's own header, which is
+                    // also what opens the card the limiter is on.
+                    ActionId::Mix => element("mix-lane"),
+                    ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
+                    // The ruler seeks anywhere the pointer points; the frame and
+                    // the second are the keyboard's finer grain of that move.
+                    ActionId::StepBack
+                    | ActionId::StepForward
+                    | ActionId::JumpBack
+                    | ActionId::JumpForward
+                    | ActionId::GoStart
+                    | ActionId::GoEnd => element("ruler"),
+                    // A press on a clip is the selection, group and all.
+                    ActionId::Select | ActionId::SelectNext | ActionId::SelectPrev => {
+                        source.contains("this.select((lane, i), cx)")
+                    }
+                    _ => false,
+                };
+            assert!(by_pointer, "{action:?} is reachable by keyboard only");
+        }
+        // The card-local strokes have the same rule, and each of them is a thing
+        // on its card: the graph and its two buttons, the colour bars and their
+        // reset, the speed bar and its presets, and the silence card's rows --
+        // whose steppers are the pointer's only way to a threshold.
+        for id in [
+            "eq-graph",
+            "eq-reset",
+            "eq-spectrum",
+            "color-bar",
+            "color-reset",
+            "speed-bar",
+            "speed-preset",
+            "silence-row",
+            "silence-step",
+            "mix-row",
+            "mix-step",
+            "silence-apply",
+            "export-confirm",
+        ] {
+            assert!(element(id), "{id} is not on any card");
         }
     }
 
@@ -7185,11 +9447,12 @@ mod tests {
         // Silent like the engine suite: this opens the real device.
         session.set_gain(0.0);
         assert_eq!(session.sources().len(), 1);
-        // 640x360 would join now (the project canvas places it); this file is
-        // also silent, and a silent file cannot join a timeline with sound.
+        // 640x360 joins now (the project canvas places it), and so does a file
+        // with no sound (it plays silence over its span). What is left is one
+        // output device: a mono track cannot join a stereo timeline.
         let refusal = session
-            .import(&asset("test_mismatch.mp4"))
-            .expect_err("a silent file must not join a timeline with audio")
+            .import(&asset("test_ac3.mp4"))
+            .expect_err("a mono track must not join a stereo timeline")
             .to_string();
         assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
         assert_eq!(session.sources().len(), 1, "a refusal added a row");
@@ -7282,7 +9545,7 @@ mod tests {
         );
         let streams = HashMap::new();
         let rows = |session: &PlaybackSession| {
-            library_rows(session.sources(), &streams, None, |_| 0).len()
+            library_rows(session.sources(), &streams, &HashMap::new(), None, |_| 0).len()
         };
         assert_eq!(rows(&session), 2, "a row per source");
 
@@ -7306,15 +9569,69 @@ mod tests {
             .expect("nothing plays av2 any more");
         assert_eq!(rows(&session), 1, "the row went with it");
         assert_eq!(session.sources().len(), 1);
-        // The one file left cannot go: a project that names none is not one
-        // that reopens.
+        // The one file left is held to the same rule and no other: its own take
+        // is still on the lanes, so it stays...
+        let first = session.sources()[0].path.clone();
         let refusal = session
-            .remove_source(&session.sources()[0].path.clone(), 0)
-            .expect_err("the last file stays")
+            .remove_source(&first, 0)
+            .expect_err("its take is still on the timeline")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
+        assert!(refusal.contains("still plays"), "{refusal}");
+        // ...and once nothing plays it, the *last* row goes too. What is left
+        // is the empty library `Player::close_session` turns back into the
+        // window the editor launches as -- the user-reported bug was that this
+        // very removal was refused, leaving a row that could never be taken
+        // out.
+        assert!(session.delete_clip(Lane::V1, 0));
+        session
+            .remove_source(&first, 0)
+            .expect("the only row goes like any other");
+        assert_eq!(rows(&session), 0, "an empty library");
+        assert!(session.sources().is_empty());
+        // And it is still a session: silent, empty, and asked for its length
+        // rather than panicking on a source list that is not there.
+        assert_eq!(session.timeline_duration(), 0.0);
+        assert!(
+            session.save_project(&asset("nothing.edith")).is_err(),
+            "a project naming no file could never be opened again, so it is not written"
+        );
         // A row this timeline never had is refused, not panicked on.
         assert!(session.remove_source(&second, 0).is_err());
+    }
+
+    /// The clipboard after a library removal. A copied clip names its file by
+    /// index and a removal renumbers the list, so this is the difference
+    /// between pasting the take that was copied and pasting **another file**
+    /// over the same range ([`clipboard_after_remove`], called by
+    /// [`Player::remove_source`]).
+    #[test]
+    fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
+        let clip = |source: usize| Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: 30,
+            source,
+            link: None,
+            eq: None,
+            color: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        // Copied from source 2, source 0 removed: the same file is source 1 now.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(2)), 0).map(|c| c.source),
+            Some(1),
+            "the clipboard follows its file down the list"
+        );
+        // Copied from a source *before* the one that went: untouched.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(0)), 2).map(|c| c.source),
+            Some(0)
+        );
+        // Copied from the row that was just removed: there is nothing left to
+        // paste, and pasting the next file along would be a lie.
+        assert!(clipboard_after_remove(Some(clip(1)), 1).is_none());
+        assert!(clipboard_after_remove(None, 0).is_none());
     }
 
     /// The trim-a-clip path through the doors the edge drag uses:
@@ -7392,7 +9709,7 @@ mod tests {
         let v2 = session.add_lane(LaneKind::Video);
         assert_eq!(session.video_clip_at(0.0), Some((Lane::V1, 0)));
 
-        assert!(session.move_clip_to_lane(Lane::V1, 0, v2), "V1 -> V2");
+        assert!(session.move_clip_to(Lane::V1, 0, v2, 0), "V1 -> V2");
         assert!(session.lane_clips(Lane::V1).is_empty(), "it left V1");
         assert_eq!(session.lane_clips(v2).len(), 1, "and landed on V2");
         assert_eq!(
@@ -7405,11 +9722,11 @@ mod tests {
         // Dropped on a lane of the other kind it is refused and nothing moves --
         // the notice the front-end shows for it says which kind of lane to use.
         // (The other refusal, landing on another clip, is the engine's own test
-        // `move_to_lane_keeps_the_frames_and_refuses_the_rest`.)
-        assert!(!session.move_clip_to_lane(v2, 0, Lane::A1), "picture on A1");
+        // `move_clip_keeps_the_frames_and_refuses_the_rest`.)
+        assert!(!session.move_clip_to(v2, 0, Lane::A1, 0), "picture on A1");
         assert_eq!(session.lane_clips(v2).len(), 1, "and it stayed on V2");
         assert!(
-            session.move_clip_to_lane(v2, 0, Lane::V1),
+            session.move_clip_to(v2, 0, Lane::V1, 0),
             "dragged back down"
         );
 
@@ -7460,28 +9777,24 @@ mod tests {
         assert!(session.lane_clips(v2).is_empty());
         assert_eq!(session.lane_clips(Lane::V1).len(), 1, "V1 stayed put");
 
-        // A second audio lane carrying sound is what an mp4 export cannot
-        // write, so the card greys that row before a destination is picked.
+        // A second audio lane used to be what an mp4 export could not write --
+        // it copied one AAC track and a mix is not a copy. It mixes now
+        // (`export::copy_audio`), so no row is greyed by a count of lanes.
         assert_eq!(format_refusal(&session, Format::Mp4), None);
         let a2 = session.add_lane(LaneKind::Audio);
         assert_eq!(a2.label(), "A2");
-        assert_eq!(
-            format_refusal(&session, Format::Mp4),
-            None,
-            "an empty lane carries nothing"
-        );
         assert!(
             session
                 .place_stream_at(0.0, &path, 0, Some(a2))
                 .expect("its own file is on this timeline")
         );
-        assert_eq!(
-            format_refusal(&session, Format::Mp4).as_deref(),
-            Some("2 audio lanes — an mp4 copies one")
-        );
-        // ...and the one thing that does not stop an AV1 export, which carries
-        // no sound to have too much of.
-        assert_eq!(format_refusal(&session, Format::Av1), None);
+        for format in [Format::Mp4, Format::Av1, Format::Av1Mp4] {
+            assert_eq!(
+                format_refusal(&session, format),
+                None,
+                "two audio lanes are a mix, not a refusal"
+            );
+        }
 
         // Undo, one edit at a time and backwards: the drop on A2, the lane A2
         // itself, the lift, the drop on V2, and last the lane V2 -- an added
@@ -7607,6 +9920,70 @@ mod tests {
         // Never painted reads as flat: an unpainted graph must not slam a band
         // to +12 dB on the first press.
         assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
+    }
+
+    /// What a drop reads: the frame under the pointer, through the same view
+    /// the boxes are drawn through. Zoomed in, the same pixel is a different
+    /// frame -- which is the whole reason `Player::frame_under` goes through
+    /// [`View`] rather than through the duration alone.
+    #[test]
+    fn a_drop_reads_the_frame_under_the_pointer_at_every_zoom() {
+        // A 200 px bed inset by the panel's padding, 10 seconds at 30 fps.
+        let bed: Bounds<Pixels> = Bounds {
+            origin: point(px(12.), px(400.)),
+            size: size(px(200.), px(6.)),
+        };
+        let (duration, fps) = (10., 30.);
+        // The frame a pointer at window `x` names, exactly as `frame_under`
+        // composes it.
+        let under =
+            |view: View, x: f32| frame_at(view.time_at(frac_along(px(x), bed), duration), fps);
+
+        // The whole timeline across the bed: halfway along is frame 150.
+        let fit = View::default();
+        assert_eq!(under(fit, 12.), 0);
+        assert_eq!(under(fit, 112.), 150);
+        assert_eq!(under(fit, 212.), 300);
+
+        // Four times in, starting at second 5: the same middle pixel is now the
+        // frame in the middle of seconds 5..7.5, and the left edge is not 0.
+        let zoomed = View {
+            zoom: 4.,
+            start: 5.,
+        };
+        assert_eq!(under(zoomed, 12.), 150);
+        assert_eq!(under(zoomed, 112.), 187);
+        assert_eq!(under(zoomed, 212.), 225);
+        // ...and a drop past either end of the bed lands on the timeline, never
+        // outside it: `time_at` clamps.
+        assert_eq!(under(zoomed, 0.), 150);
+        assert_eq!(under(fit, 9999.), 300);
+    }
+
+    /// The snap: a clip let go a few frames off a neighbour's edge lands *on*
+    /// it, by whichever of its own ends is nearer, and a clip let go in open bed
+    /// stays exactly where the hand left it.
+    #[test]
+    fn a_dropped_clip_snaps_to_the_edges_worth_landing_on() {
+        // A neighbour covering [100, 160) and the playhead at 300.
+        let marks = [100, 160, 300, 0];
+        // Head a frame short of the neighbour's tail: laid end to end with it.
+        assert_eq!(snapped(158, 40, 4, &marks), 160);
+        // Tail a frame into its head: pulled back so the two meet exactly.
+        assert_eq!(snapped(62, 40, 4, &marks), 60);
+        // The playhead is an edge like any other.
+        assert_eq!(snapped(298, 40, 4, &marks), 300);
+        // Outside the tolerance nothing moves -- a gap the hand meant to leave
+        // is a gap.
+        assert_eq!(snapped(150, 40, 4, &marks), 150);
+        // No tolerance at all (zoomed right in, where a few pixels are worth
+        // less than a frame) is no snap: single frames are placed by hand.
+        assert_eq!(snapped(158, 40, 0, &marks), 158);
+        // The nearer edge wins when two are in reach.
+        assert_eq!(snapped(101, 40, 8, &marks), 100);
+        // ...and a mark closer to the head than `len` cannot pull the clip to a
+        // negative start.
+        assert_eq!(snapped(2, 40, 4, &marks), 0);
     }
 
     #[test]
@@ -7740,6 +10117,169 @@ mod tests {
         }
         for fixed in &keymap::FIXED {
             assert!(keymap::Category::ALL.contains(&fixed.category));
+        }
+    }
+
+    /// The mapping the whole panel is drawn and clicked through: a moment goes
+    /// to a fraction of the bed and comes back the same moment, at every zoom.
+    /// The fit is the invariant that matters most -- it must be the arithmetic
+    /// the panel did before there was a zoom at all.
+    #[test]
+    fn a_moment_and_the_place_it_is_drawn_are_the_same_at_every_zoom() {
+        let duration = 20.;
+        // The fit: what `start_frac`/`width_frac` used to answer, exactly.
+        let fit = View::default();
+        for t in [0., 5., 12.5, 20.] {
+            assert_eq!(
+                fit.frac_at(t, duration),
+                (t / duration) as f32,
+                "fit at {t}"
+            );
+        }
+        assert_eq!(fit.width_frac(5., duration), width_frac(5., duration));
+        for view in [
+            fit,
+            View {
+                zoom: 2.,
+                start: 4.,
+            },
+            View {
+                zoom: 8.,
+                start: 12.5,
+            },
+            View {
+                zoom: 37.5,
+                start: 19.,
+            },
+        ] {
+            let view = view.settled(duration, 30.);
+            for frac in [0., 0.25, 0.5, 1.] {
+                let at = view.time_at(frac, duration);
+                assert!(
+                    (f64::from(view.frac_at(at, duration)) - f64::from(frac)).abs() < 1e-6,
+                    "{view:?} round trip at {frac}"
+                );
+            }
+            // A stretch is as wide as the share of the visible slice it takes.
+            assert!(
+                (f64::from(view.width_frac(view.span(duration), duration)) - 1.).abs() < 1e-6,
+                "{view:?} spans the bed"
+            );
+        }
+    }
+
+    /// The rule that makes a zoom usable: whatever was under the anchor is
+    /// still under it afterwards -- the playhead for a key, the pointer for a
+    /// ctrl+wheel.
+    #[test]
+    fn a_zoom_leaves_the_anchor_where_it_was_on_screen() {
+        let (duration, fps) = (20., 30.);
+        let mut view = View::default();
+        for anchor in [0.5f32, 0.25, 0.9] {
+            // Well past the zoom-in stop: the anchor holds at the clamp too,
+            // which is where it used to slide (the clamp came after the offset).
+            for _ in 0..30 {
+                let at = view.time_at(anchor, duration);
+                let zoomed = view.zoomed(ZOOM_STEP, anchor, duration, fps);
+                // Only where the anchor is not pinned by an edge of the
+                // timeline: a view already against an end cannot slide further.
+                let pinned = zoomed.start <= 0. || zoomed.start + zoomed.span(duration) >= duration;
+                if !pinned {
+                    assert!(
+                        (f64::from(zoomed.frac_at(at, duration)) - f64::from(anchor)).abs() < 1e-6,
+                        "{at} moved: {view:?} -> {zoomed:?}"
+                    );
+                }
+                assert!(zoomed.zoom >= view.zoom, "and it did zoom in");
+                view = zoomed;
+            }
+        }
+    }
+
+    /// Both stops: out is the whole timeline (which is where the panel starts,
+    /// so nothing regressed for anyone who never zooms), in is a handful of
+    /// frames -- and neither can scroll off an end.
+    #[test]
+    fn zoom_stops_at_the_whole_timeline_and_at_a_handful_of_frames() {
+        let (duration, fps) = (20., 30.);
+        let mut view = View::default();
+        for _ in 0..200 {
+            view = view.zoomed(1. / ZOOM_STEP, 0.5, duration, fps);
+        }
+        assert_eq!(view, View::default(), "zoomed out is the fit");
+        for _ in 0..200 {
+            view = view.zoomed(ZOOM_STEP, 0.5, duration, fps);
+        }
+        assert_eq!(
+            (view.span(duration) * fps).round(),
+            ZOOM_MIN_FRAMES,
+            "tightest is a handful of frames"
+        );
+        // Against the far end, the slice still ends at the last frame.
+        let end = View {
+            zoom: view.zoom,
+            start: 1e6,
+        }
+        .settled(duration, fps);
+        assert!((end.start + end.span(duration) - duration).abs() < 1e-9);
+        assert!(
+            View {
+                zoom: view.zoom,
+                start: -5.
+            }
+            .settled(duration, fps)
+            .start
+                == 0.
+        );
+        // A timeline too short to zoom into, and one with no length at all,
+        // both stay at the fit rather than dividing by nothing.
+        assert_eq!(View::max_zoom(0.1, fps), 1.);
+        assert_eq!(View::default().settled(0., fps), View::default());
+        assert_eq!(View::default().frac_at(3., 0.), 0.);
+        assert_eq!(View::default().time_at(0.5, 0.), 0.);
+    }
+
+    /// What makes a zoomed timeline follow the playing head: off the bed at
+    /// either end pulls the view onto it, and on the bed it never moves -- a
+    /// view that jumped every frame would be unreadable.
+    #[test]
+    fn the_view_follows_a_playhead_that_runs_off_the_bed() {
+        let (duration, fps) = (20., 30.);
+        let view = View {
+            zoom: 4.,
+            start: 5.,
+        }
+        .settled(duration, fps);
+        assert_eq!(view.span(duration), 5.);
+        // Inside: untouched, whichever part of the slice it is in.
+        for at in [5., 7.5, 10.] {
+            assert_eq!(
+                view.following(at, duration, fps),
+                view,
+                "{at} is on the bed"
+            );
+        }
+        // Past the right edge, as playback does it: the head comes back on the
+        // bed, and the zoom is not changed by the scroll.
+        let moved = view.following(12., duration, fps);
+        assert_eq!(moved.zoom, view.zoom);
+        assert!(moved.start > view.start, "scrolled forward");
+        assert!(
+            moved.frac_at(12., duration) > 0. && moved.frac_at(12., duration) < 1.,
+            "and the playhead is on screen"
+        );
+        // A seek back behind the slice does the same the other way.
+        let back = view.following(1., duration, fps);
+        assert!(back.start < view.start);
+        assert!(back.frac_at(1., duration) >= 0.);
+        // At the fit there is nothing to follow: the whole timeline is on the
+        // bed already, so no playhead can move it.
+        for at in [0., 10., 20.] {
+            assert_eq!(
+                View::default().following(at, duration, fps),
+                View::default(),
+                "the fit never scrolls"
+            );
         }
     }
 
@@ -7916,6 +10456,86 @@ mod tests {
             "a dot that size would want its own hitbox"
         );
         assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+
+    /// The analyser drawn behind the curve: a tone has to land on its own
+    /// frequency, or the backdrop is a decoration rather than a reading of what
+    /// is playing -- and someone shaping a band against it would be aiming at
+    /// the wrong octave.
+    #[test]
+    fn the_spectrum_puts_a_tone_under_its_own_frequency() {
+        use std::f32::consts::TAU;
+        let rate = 48_000u32;
+        let sine = |hz: f32, amp: f32| -> Vec<f32> {
+            (0..EQ_FFT)
+                .map(|i| amp * (TAU * hz * i as f32 / rate as f32).sin())
+                .collect()
+        };
+
+        // Silence is the floor of the box everywhere, not a band of noise.
+        let quiet = eq_spectrum(&vec![0.; EQ_FFT], rate);
+        assert_eq!(quiet.len(), EQ_CURVE_STEPS + 1);
+        assert!(quiet.iter().all(|&l| l == 0.), "silence drew something");
+
+        // A tone peaks over its own frequency, and the columns two octaves
+        // either side of it are near the floor. "Over" to within a bin down low
+        // and a column up high, which is all a 1024-point transform on a log
+        // axis can promise: at 200 Hz a whole column is a fraction of a bin
+        // wide, so the peak sits on the bin the tone fell in.
+        let column = |freq: f32| (eq_x(freq) * EQ_CURVE_STEPS as f32).round() as usize;
+        let freq_at = |col: usize| {
+            let along = col as f32 / EQ_CURVE_STEPS as f32;
+            EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along)
+        };
+        for hz in [200., 1000., 5000.] {
+            let levels = eq_spectrum(&sine(hz, 0.05), rate);
+            let (at, top) =
+                levels
+                    .iter()
+                    .enumerate()
+                    .fold((0, 0f32), |best, (i, &l)| match l > best.1 {
+                        true => (i, l),
+                        false => best,
+                    });
+            let slack = 1.5 * rate as f32 / EQ_FFT as f32 + 0.04 * hz;
+            assert!(
+                (freq_at(at) - hz).abs() <= slack,
+                "{hz} Hz peaked at {:.0} Hz (column {at})",
+                freq_at(at)
+            );
+            // -26 dBFS, which is where a 0.05 tone sits on the axis.
+            let want =
+                (20. * 0.05f32.log10() - EQ_SPECTRUM_DB.0) / (EQ_SPECTRUM_DB.1 - EQ_SPECTRUM_DB.0);
+            assert!(
+                (top - want).abs() < 0.05,
+                "a -26 dBFS tone drew {top} of the box, not {want}"
+            );
+            // Two octaves off is far enough down the box that the hump reads as
+            // one hump: 0.4 of the axis is a little over 30 dB.
+            for off in [hz / 4., hz * 4.] {
+                let away = levels[column(off).min(EQ_CURVE_STEPS)];
+                assert!(
+                    top - away > 0.4,
+                    "{hz} Hz drew {top} but still {away} at {off} Hz"
+                );
+            }
+        }
+
+        // Level reads as level: 40 dB quieter sits lower by the fraction of the
+        // axis those 40 dB are.
+        let loud = eq_spectrum(&sine(1000., 0.05), rate);
+        let soft = eq_spectrum(&sine(1000., 0.0005), rate);
+        let at = column(1000.);
+        let drop = loud[at] - soft[at];
+        let (floor, ceiling) = EQ_SPECTRUM_DB;
+        assert!(
+            (drop - 40. / (ceiling - floor)).abs() < 0.05,
+            "40 dB quieter moved the analyser {drop} of the box"
+        );
+
+        // A tap the engine has not filled yet (right after a seek) draws
+        // nothing at all rather than a transform of half a window.
+        assert!(eq_spectrum(&[0.; 16], rate).is_empty());
     }
 
     /// The speed bar is the same round trip -- pixels -> rate -> fill -- with
@@ -8226,11 +10846,56 @@ mod tests {
         );
     }
 
+    /// The hold gate: a value runs, everything else still means one press one
+    /// action -- which is the whole invariant the blanket `is_held` filter used
+    /// to carry on its own.
+    #[test]
+    fn a_held_key_moves_a_value_and_nothing_else() {
+        use keymap::ActionId;
+        // A card's four arrows, whichever card it is.
+        for key in ["up", "down", "left", "right"] {
+            assert!(repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // The card's own one-shots: flatten every band, cut forty places, play
+        // them fast, close. None of them on a hold.
+        for key in ["r", "enter", "f", "1", "escape"] {
+            assert!(!repeats(Repeat::Card, key, None), "{key} on a card");
+        }
+        // Outside a card the keymap answers, and only the volume pair is a
+        // value being moved.
+        assert!(repeats(Repeat::Keymap, "up", Some(ActionId::VolumeUp)));
+        assert!(repeats(Repeat::Keymap, "down", Some(ActionId::VolumeDown)));
+        // ...and the zoom pair, which runs the view the way they run the level.
+        assert!(repeats(Repeat::Keymap, "=", Some(ActionId::ZoomIn)));
+        assert!(!repeats(Repeat::Keymap, "0", Some(ActionId::ZoomFit)));
+        for action in ActionId::ALL {
+            let held = repeats(Repeat::Keymap, "k", Some(action));
+            assert_eq!(
+                held,
+                matches!(
+                    action,
+                    ActionId::VolumeUp
+                        | ActionId::VolumeDown
+                        | ActionId::ZoomIn
+                        | ActionId::ZoomOut
+                ),
+                "{action:?} on a hold"
+            );
+        }
+        // An arrow with nothing bound to it moves nothing on the timeline.
+        assert!(!repeats(Repeat::Keymap, "left", None));
+        // And a stroke being captured, an export, or the overlays: nothing at
+        // all, or the hold would bind a key and then fire what it just bound.
+        for key in ["up", "left", "escape", "5"] {
+            assert!(!repeats(Repeat::Nothing, key, Some(ActionId::VolumeUp)));
+        }
+    }
+
     #[test]
     fn the_silence_card_fits_the_smallest_window_and_never_slows_a_silence_down() {
         // The same 640x360 floor, and this card starts below the header: a
-        // title and a hint over its five rows, the count line and the two
-        // buttons.
+        // title and a hint over its [`SILENCE_ROWS`] rows, the count line and
+        // the two buttons.
         let (title, hint, count) = (17., 17., 17.);
         let gaps = 6. * 5.;
         let padding = 24.;
@@ -8247,8 +10912,11 @@ mod tests {
                 <= 360.,
             "card too tall"
         );
-        // Its rows and buttons are clicked, so WCAG 2.5.8 binds them.
+        // Its rows, its steppers and its buttons are clicked, so WCAG 2.5.8
+        // binds them: a stepper is `HIT_MIN` square inside a row of that height.
         assert!(KEYS_ROW_H >= HIT_MIN);
+        // ...and the pair of them fits beside the widest value the card prints.
+        assert!(2. * HIT_MIN + 4. < COLOR_W / 2., "steppers crowd the value");
         // A "speed-up" is never a slow-down: the rate stops above real time at
         // one end and at what a clip can hold at the other, whatever the keys
         // ask for. A silence played *slower* would make the timeline longer,
@@ -8262,80 +10930,265 @@ mod tests {
     #[test]
     fn the_export_card_fits_the_smallest_window() {
         // Same 640x360 floor the keybindings card is measured against: the
-        // capped row list, the fixed-format line and the confirm button, under
+        // capped row list, the two summary lines and the confirm button, under
         // a title and a status line.
         let title = 17.;
         let status = 28.;
-        let fixed = 17.;
-        let gaps = 4. * 2.;
+        // The head is one line of 11 px at this width -- every field of it,
+        // worst case, is 71 characters against the 76 that fit. The tail is
+        // budgeted for two: the destination's name is the user's and a long one
+        // wraps.
+        let summary = 15. + 30.;
+        // Six children in the column, so five gaps.
+        let gaps = 5. * 2.;
         let padding = 24.;
-        assert!(
-            title + status + EXPORT_ROWS_H + fixed + CONTROL_H + 4. + gaps + padding <= 360.,
-            "card too tall"
+        assert_eq!(
+            EXPORT_FIXED_H,
+            title + status + summary + CONTROL_H + 4. + gaps + padding
         );
+        assert!(EXPORT_FIXED_H + EXPORT_ROWS_H <= 360., "card too tall");
+        // The list grows with a window that has the room -- and never shrinks
+        // below the cap that made the floor fit, whatever arithmetic the window
+        // hands it.
+        let cap = |h: f32| (h - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
+        assert_eq!(cap(360.), EXPORT_ROWS_H);
+        assert_eq!(cap(0.), EXPORT_ROWS_H);
+        assert!(cap(720.) > EXPORT_ROWS_H);
+        assert!(EXPORT_FIXED_H + cap(720.) <= 720.);
+        // ...and inside the 640 px floor with the scrim showing either side.
+        assert!(EXPORT_W + 2. * 12. <= 640.);
         // The cap is only honest if enough of the list is on screen to read as
-        // one -- the destination and the first formats, not a slot.
-        assert!(EXPORT_ROWS_H / KEYS_ROW_H >= 6.);
-        // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's.
+        // one -- and the whole format section is: its header and every codec
+        // row, so nothing that is picked *first* is behind a scroll.
+        let codecs = FORMATS.iter().filter(|(row, ..)| !row.is_empty()).count();
+        assert!(EXPORT_ROWS_H / KEYS_ROW_H >= 1. + codecs as f32);
+        // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's --
+        // and the bitrate steppers are `HIT_MIN` squares sitting inside a row,
+        // which only fits while the row is at least as tall as one.
         assert!(KEYS_ROW_H >= HIT_MIN);
         assert!(CONTROL_H >= HIT_MIN);
+        // The dimmed text on the card -- every refusal, every detail, every key
+        // in its column -- is body text on `SURFACE` and WCAG 1.4.3 binds it.
+        // A dimmed row is drawn in this ink rather than at an opacity, which is
+        // what a refusal used to be readable through.
+        assert!(
+            contrast(INK_DIM, SURFACE) >= 4.5,
+            "refusal ink {:.2}",
+            contrast(INK_DIM, SURFACE)
+        );
+        // On the picked row that ink would only be 3.3:1 against the highlight,
+        // so the row it lands on lifts its key and detail to `INK`.
+        assert!(contrast(INK, SELECTED) >= 4.5);
+        assert!(
+            contrast(INK_DIM, SELECTED) < 4.5,
+            "the lift is still needed"
+        );
     }
 
     #[test]
-    fn every_format_row_is_offered_or_says_why_not() {
-        // The four this program can write are rows that pick. Three are named
-        // after their own extension, so a destination cannot disagree with its
-        // bytes; the fourth is named after its *codec*, because AV1 arrives and
-        // leaves in a Matroska file and "MKV" would name the box rather than
-        // what is in it.
-        let offered: Vec<Format> = FORMATS.iter().filter_map(|&(f, ..)| f).collect();
+    fn every_codec_row_is_offered_or_says_why_not() {
+        // One row per codec, and the boxes it can go in are the container row's
+        // business: six rows that pick, two that say why they cannot. A codec
+        // twice over (AV1 · MKV beside AV1 · MP4) was two rows asking the same
+        // question, and five picture rows above the fold is what the card was
+        // called unfriendly for.
+        let offered: Vec<&[Format]> = FORMATS
+            .iter()
+            .map(|&(row, ..)| row)
+            .filter(|row| !row.is_empty())
+            .collect();
         assert_eq!(
             offered,
-            vec![Format::Mp4, Format::Av1, Format::Wav, Format::Flac]
+            vec![
+                &[Format::Mp4][..],
+                &[Format::Av1, Format::Av1Mp4][..],
+                &[Format::Hevc, Format::HevcMp4][..],
+                &[Format::Wav][..],
+                &[Format::Flac][..],
+                &[Format::Mp3][..],
+            ]
         );
-        assert_eq!(Format::Av1.ext(), "mkv");
-        for (format, label, _) in FORMATS {
-            match format {
-                Some(Format::Av1) => assert_eq!(label, "AV1"),
-                Some(format) => assert_eq!(format.ext(), label.to_lowercase()),
-                // A refused format is a row with a reason, never a hidden one:
-                // an empty detail column would read as an oversight.
-                None => assert!(!label.is_empty()),
-            }
-        }
-        for (format, label, detail) in FORMATS {
-            assert!(!detail.is_empty(), "{label} says nothing");
-            // Only the two picture formats leave the bitrate rows live -- the
-            // card dims them off exactly this.
+        // Every format the engine writes is on exactly one row: one the card
+        // cannot reach is one nobody can pick.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+            Format::Wav,
+            Format::Flac,
+            Format::Mp3,
+        ] {
             assert_eq!(
-                format.is_some_and(Format::has_video),
-                matches!(format, Some(Format::Mp4 | Format::Av1))
+                FORMATS
+                    .iter()
+                    .filter(|(row, ..)| row.contains(&format))
+                    .count(),
+                1,
+                "{format:?}"
             );
         }
-        // The two codecs this program reads and cannot write are rows of their
-        // own, refused by name rather than absent -- HEVC for want of an encoder
-        // (and for its patents), VP9 because AV1 is the row that replaced it.
-        for (label, word) in [("HEVC", "no encoder"), ("VP9", "superseded")] {
-            let (format, _, detail) = FORMATS
+        // The boxes the container row offers, and what the extension of each is
+        // -- the destination follows the format, so these are what a file gets
+        // named with.
+        assert_eq!(containers(Format::Av1), [Format::Av1, Format::Av1Mp4]);
+        assert_eq!(containers(Format::HevcMp4), [Format::Hevc, Format::HevcMp4]);
+        assert_eq!(containers(Format::Mp3), [Format::Mp3]);
+        assert_eq!(Format::Av1.ext(), "mkv");
+        assert_eq!(Format::Av1Mp4.ext(), "mp4");
+        assert_eq!(Format::Hevc.ext(), "mkv");
+        assert_eq!(Format::HevcMp4.ext(), "mp4");
+        // The container key walks the row and wraps, and does nothing at all
+        // where there is only one box -- a stroke must not invent a choice the
+        // card is not offering.
+        assert_eq!(next_container(Format::Av1), Format::Av1Mp4);
+        assert_eq!(next_container(Format::Av1Mp4), Format::Av1);
+        assert_eq!(next_container(Format::Hevc), Format::HevcMp4);
+        assert_eq!(next_container(Format::Mp4), Format::Mp4);
+        assert_eq!(next_container(Format::Wav), Format::Wav);
+        for (row, stroke, label, detail) in FORMATS {
+            assert!(!label.is_empty(), "a row with no name");
+            // A refused row is a row with a reason, never a hidden one: an
+            // empty detail column would read as an oversight.
+            assert!(!detail.is_empty(), "{label} says nothing");
+            // Every row that can be picked has a key of its own, and no row
+            // that cannot has one: the card is drivable without a pointer.
+            assert_eq!(!row.is_empty(), !stroke.is_empty(), "{label}");
+            if let Some(&first) = row.first() {
+                assert_eq!(
+                    format_key(stroke, first),
+                    Some(first),
+                    "{label} keys to itself"
+                );
+                assert!(
+                    stroke.parse::<u32>().is_err(),
+                    "{label} takes a digit the bitrate needs"
+                );
+                // Every box on one row is the same codec, so the quality rows
+                // do not change meaning when the container does.
+                assert!(row.iter().all(|f| f.has_video() == first.has_video()));
+                assert!(
+                    row.iter()
+                        .all(|f| bitrate_refusal(*f) == bitrate_refusal(first))
+                );
+            }
+        }
+        // No two rows share a key, and none of them is a stroke the card already
+        // answers to itself -- an ambiguous key is a key that picks the wrong
+        // thing on a card that has no other input.
+        let keys: Vec<&str> = FORMATS
+            .iter()
+            .map(|&(_, stroke, ..)| stroke)
+            .filter(|stroke| !stroke.is_empty())
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            assert!(!keys[i + 1..].contains(key), "{key} picks two rows");
+            assert!(
+                !["c", "q", "d", "g", "r", "enter", "backspace", ESCAPE].contains(key),
+                "{key} is already the card's own"
+            );
+        }
+        assert_eq!(
+            format_key("a", Format::Mp4),
+            Some(Format::Av1Mp4),
+            "the box already chosen is kept"
+        );
+        assert_eq!(
+            format_key("a", Format::Wav),
+            Some(Format::Av1),
+            "and a codec with no such box takes its first"
+        );
+        assert_eq!(format_key("h", Format::Av1Mp4), Some(Format::HevcMp4));
+        assert_eq!(format_key("p", Format::Mp4), Some(Format::Mp3));
+        assert_eq!(
+            format_key("m", Format::Mp3),
+            Some(Format::Mp4),
+            "not MP3, which is p"
+        );
+        assert_eq!(
+            format_key("x", Format::Mp4),
+            None,
+            "a stroke no row carries"
+        );
+        // The codec this program reads and cannot write is a row of its own,
+        // refused by name rather than absent: VP9, because AV1 is the row that
+        // replaced it. Its reason travels with it, in the row or in the footer
+        // line that collects them -- either way it is on screen without a click.
+        for (label, word) in [("VP9", "replaces it"), ("OGG", "no pure-Rust")] {
+            let (row, _, _, detail) = FORMATS
                 .into_iter()
-                .find(|(_, row, _)| *row == label)
+                .find(|(_, _, name, _)| *name == label)
                 .unwrap_or_else(|| panic!("{label} has no row"));
-            assert!(format.is_none(), "{label} is not offered");
+            assert!(row.is_empty(), "{label} is not offered");
             assert!(detail.contains(word), "{label}: {detail}");
         }
-        // The AV1 row says on the row itself that it carries no sound, which is
-        // the one thing a user could otherwise only find out by playing the file.
-        let (_, _, av1) = FORMATS
-            .into_iter()
-            .find(|(f, ..)| *f == Some(Format::Av1))
-            .expect("an AV1 row");
-        assert!(av1.contains("no sound"), "{av1}");
-        assert!(format_line(Format::Av1).contains("picture only"));
-        assert_eq!(
-            format_key("a"),
-            Some(Format::Av1),
-            "its own initial picks it"
+        // Both AV1 boxes say they carry sound: the file used to be picture only,
+        // and a line that still said so would be the lie a user plays the file
+        // to find out about. HEVC says intra-only before anyone waits on one --
+        // a file several times the size, which the disk would otherwise say.
+        for format in [Format::Av1, Format::Av1Mp4] {
+            assert!(format_line(format).starts_with("AV1 · "));
+        }
+        for format in [Format::Hevc, Format::HevcMp4] {
+            assert!(format_line(format).starts_with("HEVC intra · "));
+        }
+        // The head names the box every format goes in, which is what the
+        // destination is then named after.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+        ] {
+            assert!(
+                format_line(format).contains(&format.ext().to_uppercase()),
+                "{format:?}: {}",
+                format_line(format)
+            );
+        }
+        // ...and it stays inside the one line the card budgets for it: the
+        // longest of them, with every field after it, against the 76 characters
+        // that fit at `EXPORT_W`.
+        let longest = summary_head(
+            Format::Hevc,
+            Some(((1920, 1080), 23.976)),
+            "AAC · SW encode (rusty_aac)",
         );
+        assert!(
+            longest.chars().count() <= 76,
+            "{longest} is {} long",
+            longest.chars().count()
+        );
+        assert!(
+            FORMATS
+                .into_iter()
+                .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
+        );
+        // Only a picture encoder is given a bitrate, and the quality rows dim
+        // with the reason for every format that is not one.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+        ] {
+            assert!(
+                format.has_video() && bitrate_refusal(format).is_none(),
+                "{format:?}"
+            );
+        }
+        for format in [Format::Wav, Format::Flac, Format::Mp3] {
+            assert!(!format.has_video());
+            assert!(
+                bitrate_refusal(format).is_some(),
+                "{format:?} dims silently"
+            );
+        }
+        assert!(bitrate_refusal(Format::Wav).unwrap().contains("lossless"));
+        assert!(bitrate_refusal(Format::Mp3).unwrap().contains("256 kbps"));
         // The destination follows the format and keeps the stem, mp4 included.
         assert_eq!(
             retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),
@@ -8345,7 +11198,59 @@ mod tests {
             retarget(std::path::Path::new("/a/take.export.wav"), Format::Mp4),
             std::path::Path::new("/a/take.export.mp4")
         );
-        assert!(format_line(Format::Flac).contains("audio only"));
+        assert!(format_line(Format::Flac).contains("lossless"));
+    }
+
+    /// The one line the card is answerable for: what it says is on screen before
+    /// the button is pressed, and every field of it is one `ffprobe` reads back
+    /// off the file that comes out.
+    #[test]
+    fn the_summary_states_the_file_before_it_is_written() {
+        let head = summary_head(Format::Mp4, Some(((1920, 1080), 30.)), "AAC copy");
+        for field in ["H.264", "MP4", "1920x1080", "30 fps", "AAC copy"] {
+            assert!(head.contains(field), "{field} missing from {head}");
+        }
+        // The rate as a person writes it, and the ratio one spelled out rather
+        // than rounded to a rate nothing is written at.
+        assert_eq!(fps_label(30.), "30");
+        assert_eq!(fps_label(24000. / 1001.), "23.976");
+        assert_eq!(fps_label(29.97002997), "29.97");
+        // A format with no picture states no size and no rate it does not write.
+        let audio = summary_head(Format::Wav, Some(((1920, 1080), 30.)), "PCM · SW (hound)");
+        assert!(
+            !audio.contains("1920x1080") && !audio.contains("fps"),
+            "{audio}"
+        );
+        assert!(audio.contains("PCM · SW (hound)"));
+        // ...and one with no sound on the timeline says that, rather than
+        // leaving the field out and reading as a file with sound in it.
+        assert!(
+            summary_head(Format::Mp4, Some(((640, 360), 25.)), "no sound to write")
+                .contains("no sound to write")
+        );
+        // The tail: where it lands, about how big, and what will encode it --
+        // never a guessed seat, and no seat at all for a format with no picture.
+        let tail = summary_tail(
+            Path::new("/a/take.export.mp4"),
+            Some(45),
+            Some("VA-API"),
+            true,
+        );
+        assert!(tail.starts_with("take.export.mp4"), "{tail}");
+        assert!(
+            tail.contains("≈ 45 MB") && tail.contains("VA-API"),
+            "{tail}"
+        );
+        assert!(summary_tail(Path::new("/a/x.mp4"), None, None, true).contains("encoder …"));
+        assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("encoder"));
+        assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("MB"));
+        // 6 Mbps over a minute is 45 MB. `Auto` has no figure to estimate from
+        // and an empty timeline no length: neither invents one.
+        assert_eq!(estimated_mb(Some(6_000_000), 60.), Some(45));
+        assert_eq!(estimated_mb(Some(2_000_000), 90.), Some(23));
+        assert_eq!(estimated_mb(None, 60.), None);
+        assert_eq!(estimated_mb(Some(6_000_000), 0.), None);
+        assert_eq!(estimated_mb(Some(0), 60.), None);
     }
 
     #[test]
@@ -8434,10 +11339,9 @@ mod tests {
         assert!(show_label(400.));
         assert!(!show_label(LABEL_MIN_W - 0.1));
         // A timeline with no length must not put a box outside its lane.
-        assert_eq!(start_frac(3., 0.), 0.);
-        assert_eq!(start_frac(1., 4.), 0.25);
-        // Past the end clamps rather than running off the bed.
-        assert_eq!(start_frac(8., 4.), 1.);
+        let fit = View::default();
+        assert_eq!(fit.frac_at(3., 0.), 0.);
+        assert_eq!(fit.frac_at(1., 4.), 0.25);
     }
 
     #[test]
@@ -8561,6 +11465,119 @@ mod tests {
         assert_eq!(source_tint(9), source_tint(1));
         assert_eq!(source_tint(usize::MAX), SOURCE_TINTS[usize::MAX % 4]);
     }
+
+    /// The bug: an empty timeline is end-of-stream from its one black frame
+    /// onward, so the pump had `done` set before anything was ever pressed --
+    /// and the transport's restart branch read that as "played out, start from
+    /// the top". It started a clock against a zero-length timeline, which was
+    /// `done` again by the next repaint, so every further press restarted it
+    /// too: the button read "Pause" and no press of it ever paused.
+    ///
+    /// What holds it now is one predicate, checked here against real sessions
+    /// on both sides -- the emptied one refuses, a timeline with clips on it
+    /// does not.
+    #[test]
+    fn an_empty_timeline_has_nothing_to_play() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        // Silent like the engine suite: this opens the real device.
+        session.set_gain(0.0);
+        // A timeline with clips on it plays, and always did: the guard must not
+        // touch that side.
+        assert!(!session.is_empty());
+        assert!(!nothing_to_play(Some(&session)));
+
+        // Every clip taken off, which is a state and not a failure.
+        while session.delete_clip(Lane::V1, 0) {}
+        while session.delete_clip(Lane::A1, 0) {}
+        assert!(session.is_empty(), "the timeline is empty");
+        assert_eq!(session.timeline_duration(), 0.0);
+
+        // What the pump does every render, and what set `done` before the fix:
+        // the black frame goes by and the session is at its end at once.
+        for _ in 0..40 {
+            while session.try_frame().is_some() {}
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            session.is_eos(),
+            "an empty timeline is done before it starts"
+        );
+
+        // So the press is refused rather than sent down the restart branch --
+        // and with no session at all it is the same refusal.
+        assert!(nothing_to_play(Some(&session)));
+        assert!(nothing_to_play(None));
+        assert!(!session.is_playing(), "and nothing was started");
+    }
+
+    /// The slider writes the same numbers the keys do, and mute is not one of
+    /// them: dragging while muted picks the level unmuting comes back to.
+    #[test]
+    fn the_slider_lands_on_the_grid_the_keys_move_on() {
+        let mut volume = Volume::default();
+        // Both ends exactly, and clamped past them.
+        volume.set_along(0.);
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Vol 0%");
+        volume.set_along(1.5);
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(volume.along(), 1.0);
+
+        // Halfway is 50%, and a key press from there is 5% -- the same step
+        // count as before, on a finer grid.
+        volume.set_along(0.5);
+        assert_eq!(volume.label(), "Vol 50%");
+        volume.step(true);
+        assert_eq!(volume.label(), "Vol 55%");
+        volume.step(false);
+        assert_eq!(volume.gain(), 0.5);
+
+        // A number no step lands on comes back as the nearest one, so the label
+        // and the fill are the same value the device was handed.
+        volume.set_along(0.333);
+        assert_eq!(volume.label(), "Vol 33%");
+        assert_eq!(volume.along(), 0.33);
+
+        // Muted, the drag moves the level and nothing comes out.
+        volume.muted = true;
+        volume.set_along(0.8);
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(volume.label(), "Muted 80%");
+        volume.muted = false;
+        assert_eq!(volume.gain(), 0.8);
+    }
+
+    /// The slider lands where it paints: the arithmetic `Player::drag_volume`
+    /// runs over the bar's own painted width, which is the one thing a test of
+    /// it can share without re-deriving it.
+    #[test]
+    fn the_volume_slider_lands_where_it_paints() {
+        let bar = Bounds {
+            origin: point(px(420.), px(508.)),
+            size: size(px(VOLUME_W), px(CONTROL_H)),
+        };
+        let at = |x: f32| {
+            let mut volume = Volume::default();
+            volume.set_along(frac_along(px(x), bar));
+            volume
+        };
+        assert_eq!(at(420.).gain(), 0.0, "the left end is silence");
+        assert_eq!(at(420. + VOLUME_W).gain(), 1.0, "the right end is full");
+        assert_eq!(at(-4000.).gain(), 0.0, "off the left clamps");
+        assert_eq!(at(9999.).gain(), 1.0, "off the right clamps");
+        // Every pixel along it: a level the keys could also reach, painted back
+        // where the hand pressed to within the half step the rounding costs.
+        for step in 0..=(VOLUME_W as u32) {
+            let along = step as f32 / VOLUME_W;
+            let volume = at(420. + along * VOLUME_W);
+            let painted = volume.along();
+            let slack = 0.5 / f32::from(Volume::MAX_STEPS) + 1e-4;
+            assert!(
+                (painted - along).abs() <= slack,
+                "pressed at {along}, paints at {painted}"
+            );
+        }
+    }
 }
 
 fn main() {
@@ -8681,6 +11698,8 @@ fn main() {
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
+                    volume_bar: Rc::default(),
+                    volume_dragging: false,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: meta.map_or(30., |meta| meta.frame_rate),
@@ -8690,6 +11709,9 @@ fn main() {
                     eos: false,
                     done: false,
                     ruler: Rc::default(),
+                    // The whole timeline across the bed, which is where a
+                    // project opens: zooming is something the user asks for.
+                    view: View::default(),
                     selected: None,
                     context_menu: None,
                     library_menu: None,
@@ -8697,9 +11719,12 @@ fn main() {
                     waves: HashMap::new(),
                     streams: HashMap::new(),
                     sizes: HashMap::new(),
+                    decoders: HashMap::new(),
+                    export_seat: None,
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
+                    grab: 0,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
@@ -8709,6 +11734,8 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     export_open: false,
+                    export_grouped: true,
+                    export_refusals_inline: false,
                     eq_open: None,
                     // Replaced by the clip's own curve the moment the card
                     // opens; nothing reads it before that.
@@ -8716,9 +11743,12 @@ fn main() {
                     eq_band: 0,
                     eq_dragging: false,
                     eq_graph: Rc::default(),
+                    eq_spectrum: true,
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
+                    mix_open: false,
+                    mix_field: 0,
                     silence_open: None,
                     // The conservative defaults the engine documents: a first
                     // scan that leaves a little too much is one nobody undoes.
@@ -8728,6 +11758,9 @@ fn main() {
                     // one a person can widen on purpose.
                     silence_scope: Scope::Take,
                     silence_field: 0,
+                    // The reference named, which is what the card said before
+                    // there was a choice about it.
+                    silence_dbfs: true,
                     silence_marks: Vec::new(),
                     silence_levels: None,
                     color_open: None,
