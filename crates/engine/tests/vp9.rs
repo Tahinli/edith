@@ -76,17 +76,33 @@ fn the_software_path_refuses_vp9_by_name() {
     assert!(h264, "software H.264 decode still opens");
 }
 
-/// A VP9 timeline is refused a source coded differently, in the same words a
-/// resolution mismatch is refused in: a front-end shows the string as it is.
+/// A timeline is *not* refused a source coded differently -- every clip opens
+/// its own decoder. What survives is the reason the codec gate existed: on a
+/// machine that cannot decode VP9 the file is refused at the door, by the
+/// decoder's own name, rather than becoming a clip of black frames.
 #[test]
-fn a_timeline_refuses_the_other_codec() {
+fn a_timeline_takes_the_other_codec_or_names_the_missing_decoder() {
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av.mp4");
+    // The no-plugin machine, forced.
+    // SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
     let refused = session
         .import(&asset("test_vp9.mp4"))
-        .expect_err("VP9 must not join an H.264 timeline")
+        .expect_err("no VP9 decoder means no VP9 clip")
         .to_string();
-    assert!(refused.contains("VP9"), "{refused}");
-    assert!(refused.contains("H.264"), "{refused}");
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(refused, Codec::Vp9.needs_plugin());
+    assert!(
+        !refused.contains("H.264"),
+        "the timeline's own codec is no longer a reason: {refused}"
+    );
+    assert_eq!(session.sources().len(), 1, "a refusal left no row");
+
+    // ...and where a decoder exists, it simply joins.
+    match session.import(&asset("test_vp9.mp4")) {
+        Ok(_) => assert_eq!(session.sources().len(), 2, "VP9 beside H.264"),
+        Err(e) => assert_eq!(e.to_string(), Codec::Vp9.needs_plugin()),
+    }
 }
 
 /// The end-to-end user path: opening the file yields pictures, all of them,

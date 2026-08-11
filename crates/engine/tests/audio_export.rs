@@ -281,6 +281,67 @@ fn a_cancelled_audio_export_leaves_no_file() {
     assert!(!part_path(&out).exists(), "no half-written .part either");
 }
 
+/// The samples a silent take contributes: a clip of a file with no audio track
+/// is silence for exactly its span, between two clips that are heard. This is
+/// what makes `PlaybackSession::import` letting such a file in honest -- the
+/// export reads the same play list playback does, so a hole here is a hole in
+/// the ear too.
+#[test]
+fn a_silent_clip_exports_as_silence_over_its_own_span() {
+    let clip = |start, source| Clip {
+        start,
+        in_frame: 0,
+        out_frame: 30,
+        source,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let project = Project::from_parts(
+        vec![
+            Source::new(asset("test_av.mp4"), 0),
+            // Video only, no audio track at all: the silent take.
+            Source::new(asset("test_mismatch.mp4"), 0),
+        ],
+        vec![
+            (LaneKind::Video, vec![clip(0, 0), clip(30, 1), clip(60, 0)]),
+            (LaneKind::Audio, vec![clip(0, 0), clip(30, 1), clip(60, 0)]),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a project whose middle take is silent");
+
+    let out = out_path("silent_clip", "wav");
+    let handle = engine::export::start(
+        project,
+        meta(),
+        &out,
+        &ExportSettings {
+            format: Format::Wav,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(60)).expect("wav export");
+    let (audio, samples) = decode(&out);
+    let channels = usize::from(audio.channels);
+    assert_eq!(
+        samples.len(),
+        (3.0 * f64::from(RATE)) as usize * channels,
+        "three seconds of timeline, silent take included"
+    );
+    let heard = rms(&samples, channels, 0.05, 0.95);
+    let quiet = rms(&samples, channels, 1.0, 2.0);
+    let again = rms(&samples, channels, 2.05, 2.95);
+    println!("rms: heard {heard:.4}  silent take {quiet:.6}  heard {again:.4}");
+    assert!(heard > 0.01, "the first take is audible");
+    assert!(again > 0.01, "the third take is audible");
+    assert_eq!(quiet, 0.0, "the silent take is exact silence, not a stall");
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// A silent timeline cannot become an audio file, and says so rather than
 /// writing zero samples that a user would take for a broken microphone.
 #[test]
