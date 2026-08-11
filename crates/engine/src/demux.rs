@@ -1320,9 +1320,10 @@ pub struct MkvSubtitle {
     /// `CodecPrivate`: the ASS script header (`[Script Info]` through the
     /// `[Events]` `Format:` line) for `S_TEXT/ASS`, empty for `S_TEXT/UTF8`.
     pub private: Vec<u8>,
-    /// Every cue block, in storage order -- but only for the `S_TEXT/*` codecs.
-    /// A bitmap track (PGS, VobSub) comes back declared and empty: its blocks
-    /// are megabytes of pictures, and nothing here can draw one.
+    /// Every cue block, in storage order, for the codecs [`crate::subtitle`]
+    /// reads: the `S_TEXT/*` ones and `S_HDMV/PGS`, whose blocks are display
+    /// sets of run-length pictures rather than lines. A codec neither of those
+    /// -- VobSub off a DVD -- comes back declared and empty.
     pub cues: Vec<MkvCue>,
 }
 
@@ -1340,6 +1341,10 @@ pub struct MkvCue {
     /// `Dialogue` fields (`ReadOrder` first, no timing) for `S_TEXT/ASS`.
     pub payload: Vec<u8>,
 }
+
+/// The Matroska codec id of Blu-ray bitmap subtitles: run-length pictures in
+/// display sets, read by [`crate::subtitle`] as [`MkvCue`]s like any other.
+pub const PGS: &str = "S_HDMV/PGS";
 
 /// The subtitle tracks of a Matroska file, in file order. An mp4's are not read
 /// (its `tx3g` is a different beast, and no file this project opens carries
@@ -1380,10 +1385,10 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
         }
         at = stop;
     }
-    // The text tracks only: see `MkvSubtitle::cues`.
+    // The tracks something reads: see `MkvSubtitle::cues`.
     let wanted: Vec<u64> = tracks
         .iter()
-        .filter(|t| t.codec.starts_with("S_TEXT"))
+        .filter(|t| t.codec.starts_with("S_TEXT") || t.codec == PGS)
         .map(|t| t.number)
         .collect();
     if !wanted.is_empty() {
@@ -1485,8 +1490,10 @@ fn mkv_subtitle_blocks(
             if block.flags & 0x06 != 0 {
                 return Err("laced subtitle blocks are not supported".into());
             }
-            // A megabyte of *text* in one cue is a corrupt file, not a subtitle,
-            // and a crafted length may not reach an allocation through here.
+            // A megabyte in one cue is a corrupt file, not a subtitle -- a line
+            // of dialogue is bytes and a PGS display set of run-length pictures
+            // is tens of kilobytes -- and a crafted length may not reach an
+            // allocation through here.
             if block.len > 1 << 20 {
                 return Err("a Matroska subtitle block larger than a megabyte".into());
             }

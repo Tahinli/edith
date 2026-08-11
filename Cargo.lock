@@ -1646,6 +1646,7 @@ dependencies = [
  "oxideav-core",
  "oxideav-h265",
  "oxideav-ogg",
+ "oxideav-sub-image",
  "oxideav-subtitle",
  "rav1e",
  "rusty_aac",
@@ -4035,6 +4036,15 @@ dependencies = [
  "oxideav-otf",
  "oxideav-png",
  "oxideav-ttf",
+]
+
+[[package]]
+name = "oxideav-sub-image"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb5030e2dce8efa58c20f3e9ce4e53064b7697dc2dcc2585a678d313718582d6"
+dependencies = [
+ "oxideav-core",
 ]
 
 [[package]]
