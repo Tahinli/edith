@@ -15,10 +15,18 @@ use crate::AudioSession;
 /// failure. Values are clamped to `[-1.0, 1.0]`, and a bucket's pair always
 /// straddles zero, so silence draws as a flat line.
 ///
-/// Decoding the whole file runs at ~1700x realtime, but it is still linear in
-/// source length: callers cache the result per source *and stream* — two
-/// streams of one file are two different envelopes, and a cache keyed on the
-/// path alone would draw the first one under both.
+/// Decoding the whole file runs at ~1700x realtime for an mp4's stereo AAC and
+/// ~50x for a film's 5.1 AAC in an mkv (six channels through `rusty_aac`), but
+/// it is linear in source length either way: callers cache the result per source
+/// *and stream* — two streams of one file are two different envelopes, and a
+/// cache keyed on the path alone would draw the first one under both. Memory is
+/// flat in it, though: chunks are consumed as they arrive and only the buckets
+/// are kept (2 hours at 10/s is 70k pairs).
+///
+/// ponytail: that 50x is 2.4 minutes of background decode for a two-hour film
+/// before its lane has a waveform. The upgrade path is decoding the source in
+/// segments on several threads — `open_multi_streams` already takes a window per
+/// call — and stitching the buckets, which the fold to one envelope makes safe.
 pub fn peaks(
     path: impl AsRef<Path>,
     stream: usize,
@@ -139,6 +147,33 @@ mod tests {
         let loudest = band.iter().map(level).fold(0.0, f32::max);
         assert!(loudest > 0.05, "peak level only {loudest}");
         assert!(dip < 0.2 * loudest, "dip {dip} against peak {loudest}");
+    }
+
+    /// The shape the ask came from: a film in an mkv with a 5.1 AAC track,
+    /// which no symphonia decoder takes (`aac: aac too complex`) and which
+    /// therefore reaches the lane through `rusty_aac` and the stereo fold. A
+    /// clip of one draws a waveform like any other -- an envelope that is not
+    /// flat -- rather than the empty band a silent file makes.
+    #[test]
+    fn a_five_one_aac_mkv_draws_an_envelope() {
+        let peaks = peaks(asset("test_hevc10.mkv"), 0, BPS)
+            .expect("the 5.1 AAC track decodes")
+            .expect("test_hevc10.mkv has an audio track");
+        let want = 2 * BPS as usize; // 2 s of tones
+        assert!(
+            peaks.len().abs_diff(want) <= 2,
+            "{} buckets, want {want} +/-2",
+            peaks.len()
+        );
+        // Six tones, one per channel, folded to stereo: every bucket carries
+        // signal, and a decode that came out silent (or clipped to a rail) is
+        // exactly what this refuses.
+        for (i, &(lo, hi)) in peaks.iter().enumerate() {
+            assert!(
+                (0.02..2.0).contains(&(hi - lo)),
+                "bucket {i} is ({lo}, {hi})"
+            );
+        }
     }
 
     #[test]
