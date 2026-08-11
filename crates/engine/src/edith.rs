@@ -1046,6 +1046,7 @@ mod tests {
             track,
             label: String::new(),
             cues: Vec::new(),
+            bitmap: false,
             refused: None,
         }
     }

@@ -2327,6 +2327,7 @@ mod tests {
             path: path.into(),
             track,
             label: "eng".into(),
+            bitmap: false,
             cues: vec![
                 Cue {
                     start_us: 500_000,
