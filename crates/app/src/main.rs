@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use engine::audio::StreamInfo;
 use engine::color::ColorParams;
+use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
-use engine::{Clip, ExportHandle, Frame, PlaybackSession};
+use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
@@ -637,6 +638,19 @@ struct Player {
     /// `None` is a file with no picture to report (every source that is not an
     /// image, and one whose header would not read).
     sizes: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Which decoder each source will run on, probed once at import and kept:
+    /// the codec (`None` for a still) and the seat the engine picked for it.
+    /// What a library row says *before* anything plays; the running answer is
+    /// the session's own (`PlaybackSession::decode_backend`), which follows a
+    /// fallback this cannot. Filled like `sizes`: presence means "asked", and
+    /// `None` is a source with no decoder to name -- a song, or one the probe
+    /// refused -- which must stay in the map or every repaint would ask again.
+    decoders: HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
+    /// Which encoder an export of the picked settings would open, and what it
+    /// was asked about: the probe opens a real VA-API encoder (~100 ms), so it
+    /// runs off the render thread and only while the export card is up. The
+    /// inner `None` is "asked, not answered yet".
+    export_seat: Option<(ExportSettings, (u32, u32), Option<&'static str>)>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -1997,6 +2011,28 @@ impl Player {
             })
             .detach();
         }
+        // Which decoder each file will run on, for the row that says so before
+        // a frame of it plays. Off the render thread like the streams above: a
+        // stream the plugin takes costs one VA-API init (~90 ms) to answer.
+        for path in unseen_paths(session.sources(), &self.decoders) {
+            self.decoders.insert(path.clone(), None);
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                // A song and a source no decoder here takes are both `None`:
+                // the row says nothing about them rather than guessing, and
+                // import refused the second at the door anyway.
+                async move { engine::decode::probe(&path).ok() }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.decoders.insert(path, probed);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         for key in unseen_sources(session.sources(), &self.waves) {
             self.waves.insert(key.clone(), Wave::Loading);
             let decoded = cx.background_executor().spawn({
@@ -2027,6 +2063,51 @@ impl Player {
             })
             .detach();
         }
+    }
+
+    /// Probes the encoder an export would open, once per (settings,
+    /// resolution) and only while the export card is up -- it opens the very
+    /// VA-API encoder the export would, which is what makes the card's line a
+    /// measurement instead of a promise, and also what makes it too slow for
+    /// the render thread. Written before the spawn, like the probes above, so
+    /// the repaints during it start no second one.
+    fn cache_export_seat(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        if !self.export_open || !settings.format.has_video() {
+            return;
+        }
+        let meta = *session.meta();
+        let key = (settings, (meta.width, meta.height));
+        if self
+            .export_seat
+            .is_some_and(|(asked, size, _)| (asked, size) == key)
+        {
+            return;
+        }
+        self.export_seat = Some((key.0, key.1, None));
+        let probed = cx
+            .background_executor()
+            .spawn(async move { engine::export::planned_video(&meta, &settings) });
+        cx.spawn(async move |this, cx| {
+            let probed = probed.await;
+            this.update(cx, |this, cx| {
+                // Only if the card is still asking the same question: a format
+                // changed while the plugin opened has a probe of its own.
+                if let Some(seat) = this
+                    .export_seat
+                    .as_mut()
+                    .filter(|(asked, size, _)| (*asked, *size) == key)
+                {
+                    seat.2 = probed;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The group id of the clicked clip, which is what marks the other half.
@@ -3055,6 +3136,7 @@ impl Render for Player {
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
         self.cache_media(cx);
+        self.cache_export_seat(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
         let title = window_title(&self.name);
@@ -3545,11 +3627,17 @@ impl Player {
         // Its own length, not one derived from what is on the lanes: a row
         // imported and never placed is a row with a length, and it is the
         // length a drag would put down.
-        let rows: Vec<_> = library_rows(sources, &self.streams, self.timeline_audio(), |path| {
-            self.session
-                .as_ref()
-                .map_or(0, |session| session.file_frames(path))
-        })
+        let rows: Vec<_> = library_rows(
+            sources,
+            &self.streams,
+            &self.decoders,
+            self.timeline_audio(),
+            |path| {
+                self.session
+                    .as_ref()
+                    .map_or(0, |session| session.file_frames(path))
+            },
+        )
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
@@ -3780,6 +3868,30 @@ impl Player {
             ))
     }
 
+    /// What is decoding the picture right now, for the transport line: the
+    /// backend is the running worker's own (it is written where a hardware
+    /// session falls back to software, so this follows reality), and the codec
+    /// comes from the clip under the playhead. Empty when nothing is playing --
+    /// the question is about what is happening, not about what would.
+    fn live_decode(&self, position: f64, playing: bool) -> String {
+        let Some(session) = self.session.as_ref().filter(|_| playing) else {
+            return String::new();
+        };
+        let backend = session.decode_backend();
+        let codec = session
+            .video_clip_at(position)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| clip.source))
+            .and_then(|source| session.sources().get(source))
+            .and_then(|source| self.decoders.get(&source.path).copied().flatten())
+            .and_then(|(codec, _)| codec);
+        match backend {
+            // Neither is a decode, and saying "SW" of them would be a lie.
+            Backend::Gap => "gap · nothing to decode".to_string(),
+            Backend::Still => "still · one decode, held".to_string(),
+            _ => format!("{} decode", decode_label(codec, backend)),
+        }
+    }
+
     /// Transport, edit and file buttons, timecode, playhead, clips lane.
     fn panel(
         &self,
@@ -3821,8 +3933,16 @@ impl Player {
             let progress = export.progress();
             (
                 format!(
-                    "EXPORTING {}% — {} cancels",
+                    "EXPORTING {}% · {} · {} — {} cancels",
                     (progress * 100.) as u32,
+                    // The row that was picked; the engine's line below names the
+                    // seats alone, since the library is what identifies a codec.
+                    format_label(self.format),
+                    // What the worker actually opened, so a fallback to the
+                    // software encoder shows here rather than being invisible.
+                    export
+                        .encoders()
+                        .unwrap_or_else(|| "opening the encoder".to_string()),
                     key(ActionId::CancelExport)
                 ),
                 progress,
@@ -3832,12 +3952,19 @@ impl Player {
             // tooltips. Keys first: at a 640 px window the tail is what a
             // truncation eats, and the two hints at the end are also on the
             // ruler's and Import's tooltips.
+            // While it plays, what is decoding it goes first: it is the
+            // answer that changes as the playhead crosses a cut, and the tail
+            // of this line is what a narrow window truncates.
             (
-                format!(
-                    "{} copy · {} paste · {} undo · click the bar to seek · drop a file to import",
-                    key(ActionId::Copy),
-                    key(ActionId::Paste),
-                    key(ActionId::Undo)
+                join_detail(
+                    &self.live_decode(position, playing),
+                    &format!(
+                        "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
+                         import",
+                        key(ActionId::Copy),
+                        key(ActionId::Paste),
+                        key(ActionId::Undo)
+                    ),
                 ),
                 filled,
             )
@@ -4608,7 +4735,11 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(export_line(self.format, self.session.as_ref())),
+                                .child(export_line(
+                                    self.format,
+                                    self.session.as_ref(),
+                                    self.export_seat.and_then(|(.., seat)| seat),
+                                )),
                         )
                         .child(
                             div()
@@ -6457,6 +6588,7 @@ struct Row {
 fn library_rows(
     sources: &[Source],
     streams: &HashMap<PathBuf, Vec<StreamInfo>>,
+    decoders: &HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
     timeline_audio: Option<(u32, u16)>,
     frames: impl Fn(&Path) -> u32,
 ) -> Vec<Row> {
@@ -6472,12 +6604,22 @@ fn library_rows(
             path: source.path.clone(),
             stream: source.audio_stream,
             name: row_name(&source.path, source.audio_stream, of_file.len() > 1),
-            // Only where there is a choice to describe: a file with one audio
-            // track is the row it has always been, name and length, and the
-            // length is what would be squeezed out at the panel's least width.
-            detail: info
-                .filter(|_| of_file.len() > 1)
-                .map_or_else(String::new, stream_detail),
+            // The decoder first: it is the same for every row of a file and
+            // it is what a person opening the panel is asking about. The
+            // stream half only where there is a choice to describe -- a file
+            // with one audio track is the row it has always been, name and
+            // length, and the length is what would be squeezed out at the
+            // panel's least width.
+            detail: join_detail(
+                &decoders
+                    .get(&source.path)
+                    .copied()
+                    .flatten()
+                    .map_or_else(String::new, |(codec, backend)| decode_label(codec, backend)),
+                &info
+                    .filter(|_| of_file.len() > 1)
+                    .map_or_else(String::new, stream_detail),
+            ),
             // A stream already on the timeline is playing: whatever a probe
             // would say about it now, it is usable by demonstration.
             unusable: None,
@@ -6514,9 +6656,20 @@ fn library_rows(
 /// why it cannot be used, with the separator only where both halves exist (a
 /// single-stream file says nothing about its stream).
 fn join_detail(detail: &str, tail: &str) -> String {
-    match detail.is_empty() {
-        true => tail.to_string(),
-        false => format!("{detail} · {tail}"),
+    match (detail.is_empty(), tail.is_empty()) {
+        (true, _) => tail.to_string(),
+        (false, true) => detail.to_string(),
+        (false, false) => format!("{detail} · {tail}"),
+    }
+}
+
+/// How a source's decoder reads: the codec and which seat has it, or the seat
+/// alone for a still, which has no coded stream to name. The one place either
+/// answer is spelled, so a row, a transport line and a card cannot disagree.
+fn decode_label(codec: Option<Codec>, backend: Backend) -> String {
+    match codec {
+        Some(codec) => format!("{} · {}", codec.name(), backend.label()),
+        None => backend.label().to_string(),
     }
 }
 
@@ -6834,14 +6987,32 @@ fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
 /// [`format_line`] plus the project's resolution, which is what a video export
 /// is written at however many sizes the media on the timeline are. Only for the
 /// formats that carry a picture -- a WAV has no resolution to state.
-fn export_line(format: Format, session: Option<&PlaybackSession>) -> String {
+fn export_line(
+    format: Format,
+    session: Option<&PlaybackSession>,
+    seat: Option<&'static str>,
+) -> String {
     let line = format_line(format);
+    // What it will really be encoded by, on the same line: the picture's seat
+    // as the probe found it (`…` until it lands, never a guess) and the sound's,
+    // which is decided without opening anything. Both are what a running export
+    // then names on its progress line, from the same two functions.
+    let encoders = match session {
+        Some(session) => join_detail(
+            seat.unwrap_or(match format.has_video() {
+                true => "encoder …",
+                false => "",
+            }),
+            session.planned_audio(format),
+        ),
+        None => String::new(),
+    };
     match session.filter(|_| format.has_video()) {
         Some(session) => {
             let (w, h) = session.resolution();
-            format!("{line} · project {w}x{h}")
+            format!("{line} · project {w}x{h} · {encoders}")
         }
-        None => line.to_string(),
+        None => join_detail(line, &encoders),
     }
 }
 
@@ -7921,9 +8092,13 @@ mod tests {
         );
         // The rows the panel draws: one per source, each its file's own length
         // -- source 1 has no clip anywhere and is still 4 s at 30 fps.
-        let rows = library_rows(session.sources(), &HashMap::new(), None, |path| {
-            session.file_frames(path)
-        });
+        let rows = library_rows(
+            session.sources(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            |path| session.file_frames(path),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].frames, 150, "5 s at 30 fps");
         assert_eq!(rows[1].frames, 120, "4 s at 30 fps, never placed");
@@ -7962,7 +8137,9 @@ mod tests {
             .find(|s| s.index == session.sources()[0].audio_stream)
             .map(|s| (s.sample_rate, s.channels));
         let frames = session.file_frames(&path);
-        let rows = library_rows(session.sources(), &streams, rate, |_| frames);
+        let rows = library_rows(session.sources(), &streams, &HashMap::new(), rate, |_| {
+            frames
+        });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "test_tone.mp3");
         assert_eq!(rows[0].unusable, None, "the row is placeable");
@@ -8029,7 +8206,13 @@ mod tests {
                 info(3, 0, 0, None, false),
             ],
         );
-        let rows = library_rows(&sources, &streams, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(
+            &sources,
+            &streams,
+            &HashMap::new(),
+            Some((44_100, 2)),
+            |_| 90,
+        );
         assert_eq!(
             rows.iter().map(|r| r.stream).collect::<Vec<_>>(),
             [0, 1, 2, 3],
@@ -8067,7 +8250,7 @@ mod tests {
             PathBuf::from("/m/plain.mp4"),
             vec![info(0, 44_100, 2, None, true)],
         );
-        let rows = library_rows(&plain, &one, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(&plain, &one, &HashMap::new(), Some((44_100, 2)), |_| 90);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "plain.mp4");
         assert_eq!(
@@ -8078,7 +8261,7 @@ mod tests {
         let mut silent = HashMap::new();
         silent.insert(PathBuf::from("/m/plain.mp4"), Vec::new());
         for probe in [silent, HashMap::new()] {
-            let rows = library_rows(&plain, &probe, None, |_| 90);
+            let rows = library_rows(&plain, &probe, &HashMap::new(), None, |_| 90);
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].name, "plain.mp4");
             assert_eq!(rows[0].detail, "");
@@ -8096,7 +8279,13 @@ mod tests {
             PathBuf::from("/m/other.mp4"),
             vec![info(0, 44_100, 2, None, true)],
         );
-        let rows = library_rows(&placed, &streams, Some((44_100, 2)), |_| 90);
+        let rows = library_rows(
+            &placed,
+            &streams,
+            &HashMap::new(),
+            Some((44_100, 2)),
+            |_| 90,
+        );
         assert_eq!(
             rows.iter()
                 .map(|r| (file_name(&r.path), r.stream))
@@ -8499,7 +8688,7 @@ mod tests {
         );
         let streams = HashMap::new();
         let rows = |session: &PlaybackSession| {
-            library_rows(session.sources(), &streams, None, |_| 0).len()
+            library_rows(session.sources(), &streams, &HashMap::new(), None, |_| 0).len()
         };
         assert_eq!(rows(&session), 2, "a row per source");
 
@@ -9820,7 +10009,9 @@ mod tests {
         // a title and a status line.
         let title = 17.;
         let status = 28.;
-        let fixed = 17.;
+        // Two lines of 11 px: the format line carries the encoders an export
+        // would open, which is what takes it past one at this width.
+        let fixed = 30.;
         let gaps = 4. * 2.;
         let padding = 24.;
         assert!(
@@ -10365,6 +10556,8 @@ fn main() {
                     waves: HashMap::new(),
                     streams: HashMap::new(),
                     sizes: HashMap::new(),
+                    decoders: HashMap::new(),
+                    export_seat: None,
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
