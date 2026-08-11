@@ -10706,11 +10706,12 @@ mod tests {
         // Silent like the engine suite: this opens the real device.
         session.set_gain(0.0);
         assert_eq!(session.sources().len(), 1);
-        // 640x360 would join now (the project canvas places it); this file is
-        // also silent, and a silent file cannot join a timeline with sound.
+        // 640x360 joins now (the project canvas places it), and so does a file
+        // with no sound (it plays silence over its span). What is left is one
+        // output device: a mono track cannot join a stereo timeline.
         let refusal = session
-            .import(&asset("test_mismatch.mp4"))
-            .expect_err("a silent file must not join a timeline with audio")
+            .import(&asset("test_ac3.mp4"))
+            .expect_err("a mono track must not join a stereo timeline")
             .to_string();
         assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
         assert_eq!(session.sources().len(), 1, "a refusal added a row");
