@@ -625,7 +625,13 @@ fn typed(key: &str) -> Option<char> {
 /// The project resolutions [`Player::cycle_resolution`] offers, largest first.
 /// A short list of the sizes people name; the media's own is cycled in beside
 /// them, which is what makes the trip round come back to where it started.
-const RESOLUTIONS: [(u32, u32); 4] = [(3840, 2160), (1920, 1080), (1280, 720), (854, 480)];
+const RESOLUTIONS: [(u32, u32); 5] = [
+    (3840, 2160),
+    (2560, 1440),
+    (1920, 1080),
+    (1280, 720),
+    (854, 480),
+];
 
 /// The project frame rates the list offers, slowest first: the rates footage is
 /// actually shot and delivered at, the NTSC ones written as the ratios they are
@@ -14854,6 +14860,7 @@ mod tests {
             ladder,
             [
                 (3840, 2160),
+                (2560, 1440),
                 (1920, 1080),
                 (1440, 1080),
                 (1280, 720),
@@ -14879,7 +14886,7 @@ mod tests {
         }
         // The media's own size says so: it is the one rung a person cannot read
         // off a number they chose.
-        let (.., native_detail, _) = &rows[2];
+        let (.., native_detail, _) = &rows[3];
         assert!(
             native_detail.contains("the media's own"),
             "{native_detail}"
