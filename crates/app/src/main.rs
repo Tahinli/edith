@@ -1022,9 +1022,12 @@ struct Player {
     /// what keeps a finished decoder from reading as [`Transport::Ended`] one
     /// tick early. See [`Player::transport`].
     held: Option<Frame>,
-    /// A seek is waiting for its frame. Keeps the repaint loop alive while
-    /// paused, which is the only way the new still ever reaches the screen.
-    pending_seek: bool,
+    /// A seek is waiting for its frame, and since when. Keeps the repaint loop
+    /// alive while paused, which is the only way the new still ever reaches the
+    /// screen; the instant is what a drag's samples are gated on
+    /// ([`Player::flush_drag`]) and what says so in words when one open stands
+    /// too long ([`seek_line`]).
+    seek_since: Option<Instant>,
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
@@ -1265,6 +1268,10 @@ struct Player {
     /// The bar is being dragged. On the root like the colour card's, for the
     /// same reason: the pointer leaves a 4 px bar on the first move.
     speed_dragging: bool,
+    /// The rate the hand is on, held back because the worker still owes a frame
+    /// ([`Player::flush_drag`]). What the bar draws while it stands, so the
+    /// handle stays under the hand even though the picture has not caught up.
+    pending_speed: Option<Speed>,
     /// The mix card is up: every audio track's own volume and the master
     /// limiter, which are project settings and not any clip's -- so unlike the
     /// four clip cards there is no handle to hold, only whether it is open.
@@ -1316,6 +1323,13 @@ struct Player {
     /// ([`frac_along`]). One per band, because the press picks the row it landed
     /// on and the drag then belongs to that row's range.
     color_bars: [Rc<Cell<Bounds<Pixels>>>; COLOR_BANDS.len()],
+    /// The grade the hand is on, held back because the worker still owes a
+    /// frame ([`Player::flush_drag`]): a live write into a busy worker only
+    /// cancels the open the picture is already waiting for, so a bar-wide sweep
+    /// would pay for forty of them and show one. What the sliders draw while it
+    /// stands, and never lost -- the frame that lands writes it, and so does the
+    /// release.
+    pending_color: Option<ColorParams>,
     /// The frame on screen counted into `HIST_BINS` bins per channel -- the
     /// *graded* frame, because the grade is applied in the decode worker and
     /// what arrives here is already through it. Refilled by every pumped frame,
@@ -1381,7 +1395,7 @@ impl Player {
 
         if let Some(frame) = newest {
             self.displayed += 1;
-            self.pending_seek = false;
+            self.seek_since = None;
             self.started.get_or_insert_with(|| {
                 eprintln!("first frame displayed (index {})", frame.index);
                 Instant::now()
@@ -1404,9 +1418,9 @@ impl Player {
 
         if self.transport() == Transport::Ended {
             // A seek whose worker never produced a frame (vanished file) would
-            // otherwise repaint at vsync forever. Held true for as long as the
+            // otherwise repaint at vsync forever. Held clear for as long as the
             // state does, not just on the crossing: nothing else is coming.
-            self.pending_seek = false;
+            self.seek_since = None;
             if was != Transport::Ended {
                 // Ended is a *stopped* transport, so the clock stops with it,
                 // on the out point the timecode and the playhead have been
@@ -1452,7 +1466,9 @@ impl Player {
     /// edits reseek inside the engine and still owe this.
     fn reset_after_reseek(&mut self) {
         self.held = None;
-        self.pending_seek = true;
+        // Restarted on every reseek, not only on the first: what it measures is
+        // the open now standing, which is what a person is waiting on.
+        self.seek_since = Some(Instant::now());
         // An edit moves the indices a drag in flight is holding -- a stroke
         // during one is exactly that -- and an edge committed against a moved
         // index would trim a clip nobody grabbed. Dropping it is the whole fix:
@@ -1912,6 +1928,9 @@ impl Player {
                 self.color_open = Some(clip);
                 self.color_band = 0;
                 self.color_dragging = false;
+                // A sample the last card held back belongs to the clip it was
+                // dragged on, and this may be another one.
+                self.pending_color = None;
                 // One card at a time, the rule both the others already follow.
                 self.keys_open = false;
                 self.export_open = false;
@@ -1923,8 +1942,13 @@ impl Player {
     }
 
     /// What the card's clip is graded by right now -- the identity for one
-    /// nobody has graded, which is what the sliders start at.
+    /// nobody has graded, which is what the sliders start at. A sample a drag is
+    /// still holding wins over the clip's own: it is what the hand has asked
+    /// for, so it is what the sliders show and what the next sample builds on.
     fn color_params(&self) -> ColorParams {
+        if let Some(params) = self.pending_color {
+            return params;
+        }
         self.color_open
             .zip(self.session.as_ref())
             .and_then(|((lane, idx), session)| session.color_of(lane, idx).copied())
@@ -1946,6 +1970,9 @@ impl Player {
     /// (`PlaybackSession::set_color_live`). Either way the engine reseeks, so
     /// the picture -- and the histogram counted off it -- is regraded at once.
     fn write_color(&mut self, params: ColorParams, live: bool, cx: &mut Context<Self>) {
+        // Any write supersedes a held sample, whichever way it arrived -- a key,
+        // a reset, or the flush that took this one out of the stash.
+        self.pending_color = None;
         let Some((lane, idx)) = self.color_open else {
             return;
         };
@@ -1986,9 +2013,11 @@ impl Player {
     /// Values land on the [`COLOR_STEP`] grid the keys use, which also bounds
     /// one drag to forty-odd entries in the project's colour table.
     ///
-    /// ponytail: one reseek per step crossed, up to ~40 for a bar-wide sweep. If
-    /// that ever stutters, the throttle is [`scrub_due`]'s, which the ruler drag
-    /// already uses for the same cost.
+    /// Samples crossed while the worker still owes a frame are held rather than
+    /// written ([`stash_or_write`]): a reopen costs half a second on a big film,
+    /// so a bar-wide sweep that wrote every step would queue forty opens, cancel
+    /// thirty-nine of them and freeze the window for the sum. What is written is
+    /// one grade per frame the worker actually delivers.
     fn drag_color(&mut self, x: Pixels, first: bool, cx: &mut Context<Self>) {
         let (_, low, high) = COLOR_BANDS[self.color_band];
         let along = frac_along(x, self.color_bars[self.color_band].get());
@@ -1999,7 +2028,13 @@ impl Player {
             return;
         }
         *at = value;
-        self.write_color(params, !first, cx);
+        let busy = self.seek_since.is_some();
+        match stash_or_write(&mut self.pending_color, params, first, busy) {
+            Some(params) => self.write_color(params, !first, cx),
+            // The sliders draw off the held sample, so the handle goes on
+            // following the hand while the picture catches up.
+            None => cx.notify(),
+        }
     }
 
     /// Opens the speed card on the clip whose rate is to change: the selected
@@ -2023,6 +2058,8 @@ impl Player {
             Some(clip) => {
                 self.speed_open = Some(clip);
                 self.speed_dragging = false;
+                // The colour card's rule: a held sample is the last clip's.
+                self.pending_speed = None;
                 // One card at a time, the rule the other four follow.
                 self.keys_open = false;
                 self.export_open = false;
@@ -2039,6 +2076,9 @@ impl Player {
     /// What the card's clip plays at right now -- real time for one nobody has
     /// touched, which is where the bar starts.
     fn card_speed(&self) -> Speed {
+        if let Some(speed) = self.pending_speed {
+            return speed;
+        }
         self.speed_open
             .zip(self.session.as_ref())
             .map_or(Speed::NORMAL, |((lane, idx), session)| {
@@ -2061,6 +2101,8 @@ impl Player {
     /// 2.00x is one undo press and lands back where the hand picked it up, and
     /// the whole linked group comes back with it.
     fn write_speed(&mut self, speed: Speed, live: bool, cx: &mut Context<Self>) {
+        // The colour card's rule: a write supersedes whatever a drag was holding.
+        self.pending_speed = None;
         let Some((lane, idx)) = self.speed_open else {
             return;
         };
@@ -2102,7 +2144,31 @@ impl Player {
         // step of it: 1.00x is the one value a hand must be able to hit, and
         // nothing about the bar's geometry guarantees a pixel lands on it.
         let stepped = (raw / SPEED_STEP as f32).round() as i32 * SPEED_STEP;
-        self.write_speed(speed_at(stepped), !first, cx);
+        // Held back while the worker is busy, the colour card's way and for a
+        // sharper reason: a live rate also restarts the sound, so a sweep that
+        // wrote every step would restart it forty times.
+        let busy = self.seek_since.is_some();
+        match stash_or_write(&mut self.pending_speed, speed_at(stepped), first, busy) {
+            Some(speed) => self.write_speed(speed, !first, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Writes what a slider drag held back, now that the worker has delivered.
+    /// The gate is the frame that landed and never a timer: a 100 ms tick
+    /// ([`SCRUB_GAP`]) says nothing about a reopen that costs half a second, and
+    /// a drag gated on one would still queue opens nobody sees.
+    ///
+    /// Called again by the release, where readiness is beside the point: the
+    /// value the hand let go on is owed whatever the worker is doing, and a
+    /// gesture may not end on a sample that was dropped.
+    fn flush_drag(&mut self, cx: &mut Context<Self>) {
+        if let Some(params) = self.pending_color.take() {
+            self.write_color(params, true, cx);
+        }
+        if let Some(speed) = self.pending_speed.take() {
+            self.write_speed(speed, true, cx);
+        }
     }
 
     /// Opens the silence card on the clip to be scanned: the selected one, or
@@ -3638,6 +3704,8 @@ impl Player {
         self.eq_dragging = false;
         self.speed_dragging = false;
         self.color_dragging = false;
+        self.pending_color = None;
+        self.pending_speed = None;
         self.displayed = 0;
         self.dropped = 0;
         self.started = None;
@@ -3652,7 +3720,7 @@ impl Player {
         // transport reads `Stopped` from the session being gone, so there is no
         // end-of-stream state left to clear here.
         self.reset_after_reseek();
-        self.pending_seek = false;
+        self.seek_since = None;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -4483,6 +4551,11 @@ impl Render for Player {
             session.tick();
         }
         self.pump(window);
+        // A cleared seek is a frame delivered, which is the one readiness signal
+        // there is: whatever a slider drag held back is written here.
+        if self.seek_since.is_none() {
+            self.flush_drag(cx);
+        }
         self.poll_export();
         self.poll_import(cx);
         // Every way a source can arrive -- argv, an import, a project load --
@@ -4512,7 +4585,7 @@ impl Render for Player {
         // only reach the screen on a repaint, and a still line is the very
         // thing it exists to disprove.
         if state.is_playing()
-            || self.pending_seek
+            || self.seek_since.is_some()
             || self.export.is_some()
             || self.importing.is_some()
         {
@@ -4961,7 +5034,11 @@ impl Render for Player {
                     if event.pressed_button == Some(MouseButton::Left) {
                         this.drag_color(event.position.x, false, cx);
                     } else {
+                        // The release happened outside the window, so this is
+                        // where the gesture ends -- and it may not end on a
+                        // sample the worker was too busy to take.
                         this.color_dragging = false;
+                        this.flush_drag(cx);
                     }
                     return;
                 }
@@ -4972,6 +5049,7 @@ impl Render for Player {
                         this.drag_speed(event.position.x, false, cx);
                     } else {
                         this.speed_dragging = false;
+                        this.flush_drag(cx);
                     }
                     return;
                 }
@@ -5017,12 +5095,16 @@ impl Render for Player {
                     if std::mem::take(&mut this.color_dragging) {
                         // The release lands exactly where the hand let go, and
                         // it is a live write like every other sample: the undo
-                        // step the gesture rolls back to was the press's.
+                        // step the gesture rolls back to was the press's. The
+                        // flush is what makes "exactly" true while the worker is
+                        // still busy -- the sample above would only be held.
                         this.drag_color(event.position.x, false, cx);
+                        this.flush_drag(cx);
                         return;
                     }
                     if std::mem::take(&mut this.speed_dragging) {
                         this.drag_speed(event.position.x, false, cx);
+                        this.flush_drag(cx);
                         return;
                     }
                     if std::mem::take(&mut this.volume_dragging) {
@@ -5106,6 +5188,9 @@ impl Render for Player {
             // over the notice's: a notice is about something that has already
             // happened, and this is about something still happening.
             .children(self.import_bar())
+            // The same slot and the same reason: work still going on, said out
+            // loud because a still picture is the only other evidence of it.
+            .children(self.seek_bar())
             .children(self.notice_bar(cx))
             .child(self.panel(position, duration, state, cx))
             // Over the panel it was opened on, and under the cards: it is only
@@ -6462,6 +6547,22 @@ impl Player {
                                 .bg(rgb(ACCENT)),
                         ),
                 ),
+        )
+    }
+
+    /// The line a long-standing seek shows, in the import bar's place and by the
+    /// import bar's rules: nothing dismisses it, and it leaves by itself the
+    /// moment the frame lands. No sweep under it -- an open reports nothing about
+    /// where it has got to, and the clock is the honest half of that bar anyway.
+    fn seek_bar(&self) -> Option<impl IntoElement> {
+        let line = seek_line(self.seek_since.map(|t| t.elapsed()))?;
+        Some(
+            div()
+                .flex_none()
+                .px(px(12.))
+                .py(px(6.))
+                .bg(rgb(SURFACE))
+                .child(line),
         )
     }
 
@@ -9532,12 +9633,57 @@ impl Player {
 }
 
 /// Rate limit for scrub seeks: a video worker reopen costs 72-87 ms on the
-/// hardware path (215 ms in software), so one seek per mouse move would only
-/// queue workers that are cancelled before they decode anything.
+/// hardware path for the small files it was measured on (215 ms in software), so
+/// one seek per mouse move would only queue workers that are cancelled before
+/// they decode anything.
+///
+/// It is a *floor*, not a bound: the reopen is a demux open
+/// ([`engine::decode::open_worker`]), and on a 25 GB film that is 550-750 ms --
+/// five to seven times this gap, which therefore gates nothing there. Where the
+/// cost had to be bounded rather than thinned -- the colour and speed drags --
+/// the gate is the frame the worker delivers ([`Player::flush_drag`]) and no
+/// timer at all. The ruler keeps this one: a scrub has no value to hold back,
+/// only a position that the next mouse move replaces anyway.
 const SCRUB_GAP: Duration = Duration::from_millis(100);
 
 fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
+}
+
+/// The gate a live drag sample goes through. With the worker still owing a
+/// frame (`busy`), writing now would only cancel the open the picture is already
+/// waiting for -- the sample is held in `stash` instead, and the frame that
+/// lands writes it ([`Player::flush_drag`]). Returns what to write, if anything.
+///
+/// The press (`first`) never waits: it is the undo step the whole gesture rolls
+/// back to, so it has to be taken against the state the hand picked up.
+fn stash_or_write<T: Copy>(stash: &mut Option<T>, value: T, first: bool, busy: bool) -> Option<T> {
+    match busy && !first {
+        true => {
+            *stash = Some(value);
+            None
+        }
+        false => Some(value),
+    }
+}
+
+/// How long an open may stand before the window says so in words. Well past an
+/// ordinary seek (a warm reopen is under a tenth of this) and well under what a
+/// cold read of a big film takes, which is the only case worth a line.
+const SEEK_STALL: Duration = Duration::from_secs(2);
+
+/// What a seek that has stood past [`SEEK_STALL`] says, and nothing at all
+/// before that: a line on every click of the ruler would be a flicker, and the
+/// picture holding still for a tenth of a second is not something to explain.
+/// The import bar's words, for the import bar's reason -- a window that cannot
+/// move and a window that has hung look identical, so this one says which.
+fn seek_line(standing: Option<Duration>) -> Option<String> {
+    let since = standing.filter(|d| *d >= SEEK_STALL)?;
+    Some(format!(
+        "still opening the picture — a cold read of a big file is seconds of it, and the window \
+         is not frozen · {} elapsed",
+        clock(since.as_secs_f32())
+    ))
 }
 
 /// How a finished export announces itself. Written by `poll_export` and read
@@ -12670,7 +12816,8 @@ mod tests {
         ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
-        IMPORT_STALL, Import, ImportStage, import_line, read_ahead,
+        IMPORT_STALL, Import, ImportStage, SEEK_STALL, import_line, read_ahead, seek_line,
+        stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
         trimmed_clip, unscannable,
         visible_slice,
@@ -15967,6 +16114,70 @@ mod tests {
         assert_eq!(import.since, held, "an unchanged stage must not reset it");
     }
 
+    /// One gesture over the real gate, with the plumbing around it spelled out:
+    /// a write reseeks (the worker owes a frame again), a landed frame clears
+    /// that and flushes what is held, and the release flushes whatever the
+    /// worker is doing. Forty snapped steps and four frames delivered must cost
+    /// five writes -- the press's and one per frame -- and not forty, which is
+    /// the 22-30 s freeze this exists to remove.
+    #[test]
+    fn a_bar_wide_sweep_writes_once_per_frame_delivered() {
+        let mut stash: Option<i32> = None;
+        let mut written = Vec::new();
+        let mut busy = false;
+        for step in 0..40 {
+            if let Some(value) = stash_or_write(&mut stash, step, step == 0, busy) {
+                // What `write_color` does: the write supersedes the stash and
+                // reseeks, so the worker owes a frame from here.
+                stash = None;
+                written.push(value);
+                busy = true;
+            }
+            // A frame lands every tenth sample: `pump` clears the seek and the
+            // render flushes what the drag held back.
+            if step % 10 == 9 {
+                busy = false;
+                if let Some(value) = stash.take() {
+                    written.push(value);
+                    busy = true;
+                }
+            }
+        }
+        // The release, whatever the worker is doing.
+        written.extend(stash.take());
+        assert_eq!(written, vec![0, 9, 19, 29, 39], "one write per frame landed");
+    }
+
+    /// The one value a gesture may never lose: where the hand let go. The
+    /// release samples into a busy worker -- so the sample is held -- and the
+    /// flush behind it is what writes it.
+    #[test]
+    fn a_release_lands_the_value_the_hand_let_go_on() {
+        let mut stash = None;
+        assert_eq!(stash_or_write(&mut stash, 7, false, true), None);
+        assert_eq!(stash_or_write(&mut stash, 11, false, true), None);
+        assert_eq!(stash.take(), Some(11), "the release writes the last sample");
+        // The press is never held: it is the undo step the gesture rolls back
+        // to, and one taken a frame late is a snapshot of the wrong grade.
+        assert_eq!(stash_or_write(&mut stash, 3, true, true), Some(3));
+        assert_eq!(stash, None);
+        // Nothing to hold when the worker is idle: the write goes straight out.
+        assert_eq!(stash_or_write(&mut stash, 5, false, false), Some(5));
+        assert_eq!(stash, None);
+    }
+
+    /// A seek says nothing until it has stood: an ordinary one is a flicker and
+    /// a cold read of a big file is the case worth words.
+    #[test]
+    fn a_seek_says_so_only_once_it_has_stood() {
+        assert_eq!(seek_line(None), None, "no seek, no line");
+        assert_eq!(seek_line(Some(Duration::from_millis(300))), None);
+        let line = seek_line(Some(SEEK_STALL + Duration::from_secs(7))).expect("past the stall");
+        assert!(line.contains("still opening the picture"), "{line}");
+        assert!(line.contains("not frozen"), "{line}");
+        assert!(line.contains("0:09 elapsed"), "{line}");
+    }
+
     /// The read-ahead is a *cache warmer* and nothing else: whatever it did or
     /// failed to do, the import that follows lands exactly the rows, lengths
     /// and refusals it landed before there was a worker at all.
@@ -17421,7 +17632,7 @@ fn main() {
                     // same repaint a seek's still owes: nothing plays by
                     // itself, so this is what carries the poster frame to the
                     // screen. An empty window has none to wait for.
-                    pending_seek: session.is_some(),
+                    seek_since: session.is_some().then(Instant::now),
                     session,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
@@ -17486,6 +17697,7 @@ fn main() {
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
+                    pending_speed: None,
                     mix_open: false,
                     mix_field: 0,
                     silence_open: None,
@@ -17506,6 +17718,7 @@ fn main() {
                     color_band: 0,
                     color_dragging: false,
                     color_bars: std::array::from_fn(|_| Rc::default()),
+                    pending_color: None,
                     // Empty until the first frame is pumped, which draws as a
                     // flat line rather than as a shape nothing measured.
                     histogram: [[0; HIST_BINS]; 3],
