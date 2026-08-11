@@ -713,6 +713,11 @@ struct Player {
     /// handle is held until the worker settles, because its last act is to
     /// delete the output file and a second export must not be what it deletes.
     cancelling: bool,
+    /// When the running export started, and how far it had come at each sample
+    /// since, as `(elapsed, progress)` marks. The elapsed clock and the
+    /// rolling-window estimate the progress line reads; see [`note_progress`].
+    export_started: Option<Instant>,
+    export_marks: Vec<(f32, f32)>,
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
@@ -3343,6 +3348,10 @@ impl Player {
         }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
+        // The clock starts with the worker, not with the first repaint that
+        // happens to notice it.
+        self.export_started = Some(Instant::now());
+        self.export_marks.clear();
         // The card has been answered; the progress line takes the panel from
         // here, and it is the running export's escape that matters now.
         self.export_open = false;
@@ -3361,10 +3370,23 @@ impl Player {
     /// Takes the export's verdict once it has one. The only place the app
     /// touches the handle's completion side.
     fn poll_export(&mut self) {
+        // Sampled here rather than while drawing: a repaint stays a repaint,
+        // and this runs once per repaint either way.
+        if let (Some(progress), Some(started)) = (
+            self.exporting().map(ExportHandle::progress),
+            self.export_started,
+        ) {
+            note_progress(
+                &mut self.export_marks,
+                started.elapsed().as_secs_f32(),
+                progress,
+            );
+        }
         let Some(result) = self.export.as_ref().and_then(ExportHandle::result) else {
             return;
         };
         self.export = None;
+        self.export_started = None;
         // A cancellation is reported as an error, and the one who asked for it
         // has had the editor back since the keystroke. Nothing to say.
         if std::mem::take(&mut self.cancelling) {
@@ -4238,10 +4260,25 @@ impl Player {
         }
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
+            let elapsed = self
+                .export_started
+                .map_or(0., |t| t.elapsed().as_secs_f32());
+            // Two numbers that must both be honest: the one that counts up is
+            // measured, the one that counts down is a guess and says so.
+            let left = eta_secs(&self.export_marks, elapsed, progress).map_or_else(
+                || "estimating…".to_owned(),
+                |s| format!("~{} left", clock(s)),
+            );
             (
                 format!(
-                    "EXPORTING {}% · {} · {} — {} cancels",
+                    // Clocks, then the way out, then what is encoding: at the
+                    // 640 px floor the tail is what truncation eats, and the
+                    // codec pair is the one part of this line the card already
+                    // said. The escape must not be what goes missing.
+                    "EXPORTING {}% · {} elapsed · {left} — {} cancels · {} · {}",
                     (progress * 100.) as u32,
+                    clock(elapsed),
+                    key(ActionId::CancelExport),
                     // The row that was picked; the engine's line below names the
                     // seats alone, since the library is what identifies a codec.
                     format_label(self.format),
@@ -4250,7 +4287,6 @@ impl Player {
                     export
                         .encoders()
                         .unwrap_or_else(|| "opening the encoder".to_string()),
-                    key(ActionId::CancelExport)
                 ),
                 progress,
             )
@@ -8842,6 +8878,57 @@ fn timecode(t: f64, fps: f64) -> String {
     )
 }
 
+/// Wall clock for a progress line: `M:SS`, minutes past the hour included
+/// rather than an hours field nobody reads on an export.
+fn clock(secs: f32) -> String {
+    let secs = secs.max(0.) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// How often a progress mark is worth keeping, how far back the rate is
+/// measured, and the least span that may answer at all. An export crosses
+/// hardware and software segments that run at different speeds, so the
+/// estimate is a window's average and never the instant's.
+const ETA_SAMPLE: f32 = 0.5;
+const ETA_WINDOW: f32 = 8.;
+const ETA_SPAN: f32 = 1.5;
+
+/// Records where the export has got to and forgets what has fallen out of the
+/// window. One mark per `ETA_SAMPLE`, a window's worth kept: a bounded list
+/// whichever way the encode goes.
+fn note_progress(marks: &mut Vec<(f32, f32)>, elapsed: f32, progress: f32) {
+    if marks.last().is_none_or(|&(t, _)| elapsed - t >= ETA_SAMPLE) {
+        marks.push((elapsed, progress));
+    }
+    while marks.len() > 2 && marks[0].0 < elapsed - ETA_WINDOW {
+        marks.remove(0);
+    }
+}
+
+/// Seconds left at the window's rate, or `None` while nothing measurable has
+/// happened yet -- which the line says as "estimating…" rather than as a
+/// number it would have to take back.
+fn eta_secs(marks: &[(f32, f32)], elapsed: f32, progress: f32) -> Option<f32> {
+    // A finished pass is not a guess: it is over.
+    if progress >= 1. {
+        return Some(0.);
+    }
+    if progress <= 0. || elapsed < ETA_SPAN {
+        return None;
+    }
+    // Two rates, averaged. The window's follows the encode across a
+    // hardware-to-software handover; the whole run's is what keeps a window
+    // that is all stall from throwing the number minutes out and back. Neither
+    // alone reads well: raw window rate spikes eightfold on either edge of a
+    // stall, and the run average alone never notices a segment change.
+    let overall = progress / elapsed;
+    let recent = marks
+        .first()
+        .filter(|&&(t, _)| elapsed - t >= ETA_SPAN)
+        .map_or(overall, |&(t, p)| (progress - p) / (elapsed - t));
+    Some(2. * (1. - progress) / (recent + overall))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8863,8 +8950,8 @@ mod tests {
         unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{
-        LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
-        repeats, unscannable,
+        ETA_SPAN, LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, clock, eta_secs, file_name,
+        file_uri, library_rows, note_progress, repeats, unscannable,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -10984,6 +11071,77 @@ mod tests {
         );
     }
 
+    /// The progress line's two clocks, driven the way a repaint drives them:
+    /// steady work, a stall where hardware hands over to software, then steady
+    /// work again. The estimate may not whipsaw, may not vanish once it has
+    /// been given, and must meet the elapsed clock at the end.
+    #[test]
+    fn the_export_estimate_rides_out_a_stall_and_converges() {
+        let (mut marks, mut elapsed, mut progress) = (Vec::new(), 0f32, 0f32);
+        // 2%/s, a 12 s stall at 40% -- longer than the window, so the window
+        // alone would have nothing left to measure -- and the same rate to the
+        // end: 62 s of wall clock for 50 s of work.
+        let rate = 0.02;
+        let (mut quiet, mut before_stall, mut after_stall, mut last) = (0f32, 0., 0., f32::MAX);
+        while progress < 1. {
+            let stalled = (20. ..32.).contains(&elapsed);
+            note_progress(&mut marks, elapsed, progress);
+            // What is really left, to hold every guess against.
+            let truth = (1. - progress) / rate + if stalled { 32. - elapsed } else { 0. };
+            match eta_secs(&marks, elapsed, progress) {
+                // "estimating…" is only allowed before there is a span to
+                // measure, and never again after the first number.
+                None => {
+                    assert!(elapsed < ETA_SPAN + 1., "estimate vanished at {elapsed}");
+                    quiet = elapsed;
+                }
+                Some(left) => {
+                    // No guess is ever wilder than four times the truth: that
+                    // is the eightfold spike a raw window rate throws on either
+                    // edge of the stall.
+                    assert!(left <= truth * 4., "at {elapsed}s: {left} vs {truth}");
+                    // While the rate holds, the answer is the true one and it
+                    // only ever counts down.
+                    if elapsed >= 5. && elapsed < 20. {
+                        assert!((left - truth).abs() <= truth * 0.15, "{elapsed}s: {left}");
+                        assert!(left < last, "estimate grew while the rate held");
+                    }
+                    // Eight seconds past the stall it has caught up again.
+                    if elapsed >= 40. {
+                        assert!((left - truth).abs() <= truth * 0.25, "{elapsed}s: {left}");
+                        assert!(left < last + 0.001, "estimate grew after the stall");
+                    }
+                    if (20. ..20.25).contains(&elapsed) {
+                        before_stall = left;
+                    }
+                    if (31.5..31.75).contains(&elapsed) {
+                        after_stall = left;
+                    }
+                    last = left;
+                }
+            }
+            // A window's worth of marks and no more, however long the encode.
+            assert!(marks.len() <= 20, "{} marks", marks.len());
+            elapsed += 0.25;
+            if !stalled {
+                progress = (progress + rate * 0.25).min(1.);
+            }
+        }
+        assert!(quiet > 0. && quiet < ETA_SPAN + 1.);
+        // The stall stretched the guess instead of erasing it, and by more than
+        // the stopped clock adds on its own.
+        assert!(
+            after_stall > before_stall + 12.,
+            "{before_stall} -> {after_stall}"
+        );
+        // Both clocks meet: a finished pass has nothing left.
+        assert_eq!(eta_secs(&marks, elapsed, 1.), Some(0.));
+        assert!((elapsed - 62.).abs() < 1., "{elapsed}");
+        assert_eq!(clock(83.4), "1:23");
+        assert_eq!(clock(114.), "1:54");
+        assert_eq!(clock(-1.), "0:00");
+    }
+
     #[test]
     fn every_codec_row_is_offered_or_says_why_not() {
         // One row per codec, and the boxes it can go in are the container row's
@@ -11728,6 +11886,8 @@ fn main() {
                     last_target: 0,
                     export: None,
                     cancelling: false,
+                    export_started: None,
+                    export_marks: Vec::new(),
                     export_path: out.clone(),
                     project_path: project.clone(),
                     keymap: keymap.clone(),
