@@ -64,13 +64,14 @@ use flacenc::error::Verify;
 use oxideav_core::Muxer as _;
 
 use crate::audio::{AudioMeta, AudioSession};
-use crate::colorspace::{ColorDescription, Matrix};
+use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams};
 use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
 use crate::subtitle::{Cue, SubtitleTrack};
+use crate::tonemap::{self, ToneMapper};
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -962,6 +963,20 @@ fn run(
         .iter()
         .map(|source| source_rate(&source.path, meta.frame_rate))
         .collect();
+    // ...and, for a source on an HDR curve, the tone map that brings its samples
+    // down to the SDR this file is written in ([`crate::tonemap`]). Once per
+    // source stream: the table costs a couple of milliseconds to build and a
+    // span reopens its file, so building it here rather than in the loop below
+    // is the difference between paying that once and paying it per cut. An SDR
+    // source -- the whole of an ordinary project -- builds no table at all.
+    let tone: Vec<Option<ToneMapper>> = rates
+        .iter()
+        .map(|(_, color)| match color.transfer {
+            Transfer::Sdr => None,
+            Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq)),
+            Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg)),
+        })
+        .collect();
     // ...and the one space they are all written in, the same rule a reader with
     // no tags to read would apply to this file's height.
     let out_color = ColorDescription::output(meta.height);
@@ -990,7 +1005,7 @@ fn run(
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
-        let (mut pictures, rate, in_frame, color) = match span.from {
+        let (mut pictures, rate, in_frame, color, mapper) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
@@ -999,11 +1014,18 @@ fn run(
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
                 let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
-                (Some(pictures), rate, in_frame, Some(color))
+                (
+                    Some(pictures),
+                    rate,
+                    in_frame,
+                    Some(color),
+                    tone[source].as_ref(),
+                )
             }
-            // A gap's black is 16/128/128, which is black in every matrix here:
-            // nothing to remap, which is what `None` says.
-            None => (None, Rate::REAL_TIME, 0, None),
+            // A gap's black is 16/128/128, which is black in every matrix here
+            // and on every curve: nothing to remap and nothing to tone-map,
+            // which is what `None` says.
+            None => (None, Rate::REAL_TIME, 0, None, None),
         };
         // Mixed spaces on one timeline: a clip coded against another matrix than
         // the one this file declares is rewritten into it, *after* the grade --
@@ -1013,13 +1035,9 @@ fn run(
         // the whole of an ordinary project -- take `None` and not a byte is
         // touched.
         //
-        // ponytail: an HDR source is composited with the matrix treatment alone
-        // and still looks washed out; the tonemap lands here, ahead of this, and
-        // is a sibling task's.
-        let remap = color
-            .map(|c| c.matrix)
-            .filter(|&m| m != out_color.matrix)
-            .map(|m| (m, out_color.matrix));
+        // ...and what the samples mean when that remap sees them is not always
+        // what the file said, which is [`remap_into`]'s whole question.
+        let remap = remap_into(color, mapper.is_some(), out_color.matrix);
         // What this span is graded by -- the same answer playback's decoder
         // carries, so the export is the picture that was watched. `None` for a
         // gap and for an ungraded clip, and that is the path where not a byte
@@ -1092,9 +1110,9 @@ fn run(
             // applied in place: it goes onto a copy, which the encoder then
             // reads instead.
             let params = grade.filter(|p| !p.is_identity());
-            let (y, u, v) = match (params, remap) {
-                (None, None) => (y, u, v),
-                (params, remap) => {
+            let (y, u, v) = match (params, remap, mapper) {
+                (None, None, None) => (y, u, v),
+                (params, remap, mapper) => {
                     let (gy, gu, gv) = &mut graded;
                     gy.clear();
                     gy.extend_from_slice(y);
@@ -1102,9 +1120,13 @@ fn run(
                     gu.extend_from_slice(u);
                     gv.clear();
                     gv.extend_from_slice(v);
-                    // Grade in the source's space, then remap the graded
-                    // result: the order playback's `Decoded::frame` renders in,
-                    // and the only order in which preview and export agree.
+                    // Tone-map first, so the grade is applied to the SDR picture
+                    // the canvas showed and not to HDR codes; then remap the
+                    // graded result. The order playback renders in, and the
+                    // only order in which preview and export agree.
+                    if let Some(mapper) = mapper {
+                        mapper.map(gy, gu, gv, width as usize, height as usize);
+                    }
                     if let Some(params) = params {
                         crate::color::apply_yuv(&params, gy, gu, gv);
                     }
@@ -1177,6 +1199,27 @@ fn run(
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
+}
+
+/// Which matrix pair a span's samples are rewritten by on the way into a file
+/// whose own matrix is `out` -- `None` when they are already coded against it,
+/// and for a gap, whose 16/128/128 black is black in every matrix here.
+///
+/// `toned` says the tone map ran on this span: it hands back BT.709 SDR whatever
+/// the source was coded as, so an HDR clip is never *also* given the matrix
+/// treatment its BT.2020 tag would ask for -- one conversion or the other, never
+/// both on one frame -- while a tone-mapped clip on a canvas below 720 lines
+/// still takes its 709 -> 601 step.
+fn remap_into(
+    color: Option<ColorDescription>,
+    toned: bool,
+    out: Matrix,
+) -> Option<(Matrix, Matrix)> {
+    let from = match toned {
+        true => Matrix::Bt709,
+        false => color?.matrix,
+    };
+    (from != out).then_some((from, out))
 }
 
 /// What rate `path` was shot at against a timeline at `timeline_fps`
@@ -2417,6 +2460,44 @@ impl SwDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one rule that keeps a picture from being converted twice: a frame the
+    /// tone map has already brought to BT.709 is never handed the 2020 matrix as
+    /// well, on either canvas -- and everything else about the remap is
+    /// unchanged by the tone map existing.
+    #[test]
+    fn a_tone_mapped_span_is_never_matrix_remapped_too() {
+        let hdr = ColorDescription {
+            matrix: Matrix::Bt2020Ncl,
+            transfer: Transfer::Pq,
+            full_range: false,
+        };
+        let sdr = ColorDescription::default(); // BT.601
+        for out in [Matrix::Bt709, Matrix::Bt601] {
+            let toned = remap_into(Some(hdr), true, out);
+            assert!(
+                toned.is_none_or(|(from, _)| from == Matrix::Bt709),
+                "tone-mapped onto a {out:?} canvas asked for {toned:?}"
+            );
+            // Untouched by any of this: the 2020 clip that was *not* tone-mapped
+            // (an unreachable state today, and still the matrix answer), the
+            // ordinary 601-on-709 reconcile, and a gap.
+            assert_eq!(
+                remap_into(Some(hdr), false, out),
+                (out != Matrix::Bt2020Ncl).then_some((Matrix::Bt2020Ncl, out))
+            );
+            assert_eq!(
+                remap_into(Some(sdr), false, out),
+                (out != Matrix::Bt601).then_some((Matrix::Bt601, out))
+            );
+            assert_eq!(remap_into(None, false, out), None);
+        }
+        assert_eq!(
+            remap_into(Some(hdr), true, Matrix::Bt601),
+            Some((Matrix::Bt709, Matrix::Bt601)),
+            "a tone-mapped clip below 720 lines still takes its 709 -> 601 step"
+        );
+    }
 
     /// A track of three cues, in whichever clock `track` says: `Some(n)` is a
     /// track of the media file, `None` a `.srt` beside it.
