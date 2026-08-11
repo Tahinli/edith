@@ -326,7 +326,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 16] = [
+pub const FIXED: [Fixed; 21] = [
     // Not a chord at all but a way of pressing one, and the only place the
     // editor can say so: holding a key that moves a *value* runs it, and
     // holding anything else still does what one press did.
@@ -346,9 +346,38 @@ pub const FIXED: [Fixed; 16] = [
         category: Category::File,
     },
     Fixed {
-        chord: "m / a / v / h / x / w / f / p",
-        label: "Pick the export format: MP4, AV1 in MKV, AV1 in MP4, HEVC in MKV, \
-                HEVC in MP4, WAV, FLAC or MP3",
+        chord: "m / a / h / w / f / p",
+        label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC or MP3",
+        category: Category::File,
+    },
+    // The rest of the export card's own rows, each on the letter its row is
+    // named after. They shadow the clip keys of the same letter while the card
+    // is up, exactly as its digits shadow nothing and its arrows would: a modal
+    // card owns the keyboard, and cutting a clip under it is not a thing that
+    // can happen anyway.
+    Fixed {
+        chord: "c",
+        label: "Switch the export container: Matroska or MP4",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "q",
+        label: "Step through the export quality rows",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "d",
+        label: "Choose where the export is written",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "g",
+        label: "Export card: sections or one flat list",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "r",
+        label: "Export card: the formats with no encoder as rows or as one line",
         category: Category::File,
     },
     Fixed {
