@@ -66,10 +66,6 @@ const PRE_ROLL: u32 = 2;
 /// Frames per channel one AAC-LC packet carries. Fixed by the codec.
 const SAMPLES_PER_PACKET: u32 = 1024;
 
-/// Frames per channel one AC-3 syncframe carries. Fixed by the codec (6 blocks
-/// of 256), the way 1024 is fixed for AAC-LC.
-const AC3_SAMPLES_PER_FRAME: u32 = 1536;
-
 /// Syncframes decoded and thrown away ahead of an AC-3 seek target: one, for the
 /// 256-sample overlap-add the target frame is reconstructed with.
 const AC3_PRE_ROLL: u32 = 1;
@@ -207,10 +203,14 @@ impl AudioSession {
     /// pause — the master clock counts what the device has been fed, so a hole
     /// that fed nothing would stall the whole timeline on it.
     ///
+    /// A segment naming a source that has **no track** is the same silence: a
+    /// clip of a silent file is a hole with a picture over it, and the timeline
+    /// let it in on exactly that footing ([`crate::PlaybackSession::import`]).
+    ///
     /// Only the sources some segment names are opened. `Ok(None)` when `sources`
-    /// is empty or its first entry has no AAC track; a later source that is
-    /// missing audio or disagrees on rate/layout is an `Err` — import refuses
-    /// those up front (one timeline, one output device), this is the backstop.
+    /// is empty or its first entry has no AAC track; a later source that
+    /// disagrees on rate/layout is an `Err` — import refuses those up front (one
+    /// timeline, one output device), this is the backstop.
     pub fn open_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -298,11 +298,18 @@ impl AudioSession {
         first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
+        // ...and which of them turned out to have no track at all, so a silent
+        // source is opened once like any other rather than once per segment
+        // naming it.
+        let mut silent: Vec<bool> = sources.iter().map(|_| false).collect();
         tracks[at] = Some(first);
         for &(source, ..) in segs {
             let Some(source) = source else {
                 continue; // a gap opens no file
             };
+            if silent.get(source) == Some(&true) {
+                continue;
+            }
             let slot = tracks
                 .get_mut(source)
                 .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))?;
@@ -310,8 +317,14 @@ impl AudioSession {
                 continue; // already opened, and the checks below already ran
             }
             let (path, stream) = &sources[source];
-            let track = Track::open(path, *stream)?
-                .ok_or_else(|| format!("source {source} has no audio track"))?;
+            // A source with no audio track at all is not a failure: its
+            // segments are silence, exactly as a gap's are, and the slot stays
+            // empty to say so. That is what a silent clip on an audio lane
+            // means -- a picture over a hole.
+            let Some(track) = Track::open(path, *stream)? else {
+                silent[source] = true;
+                continue;
+            };
             if (track.sample_rate(), track.channels()?) != (meta.sample_rate, meta.channels) {
                 return Err(format!(
                     "source {source} is {} Hz {} ch, the timeline is {} Hz {} ch",
@@ -328,14 +341,15 @@ impl AudioSession {
 
         let segments: Vec<Segment> = segs
             .iter()
-            .map(|&(source, start_secs, end_secs)| match source {
-                Some(source) => tracks[source]
-                    .as_ref()
-                    .expect("opened above")
-                    .segment(source, start_secs, end_secs),
-                None => Segment::silence(
-                    ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
-                ),
+            // A gap, and a source with no track to decode, are the same stretch
+            // of nothing: as many frames of silence as the window is long.
+            .map(|&(source, start_secs, end_secs)| {
+                match source.and_then(|source| Some((source, tracks[source].as_ref()?))) {
+                    Some((source, track)) => track.segment(source, start_secs, end_secs),
+                    None => Segment::silence(
+                        ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
+                    ),
+                }
             })
             .collect();
         // Chunk numbering is continuous across every join, counted from the first
@@ -541,17 +555,26 @@ impl AudioSession {
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
-        // Matroska: AAC is read out of one ([`Track::open`]) and everything
-        // else -- Opus, AC-3, DTS, none of which symphonia decodes at any
-        // version -- is named rather than left playing silent with no reason
-        // given. A Matroska file with no audio track at all returns `None` here
-        // like any other silent file.
+        // Matroska: what symphonia reads out of one ([`Track::open`]) plus the
+        // AC-3 and E-AC-3 whose blocks are handed to the Dolby decoder
+        // ([`MkvAc3Track`]); everything else -- Opus, DTS, which no decoder here
+        // has at any version -- is named rather than left playing silent with no
+        // reason given. A Matroska file with no audio track at all returns
+        // `None` here like any other silent file.
         if crate::demux::is_matroska(path.as_ref()) {
-            return Ok(
-                crate::demux::matroska_audio_codec(path.as_ref())?.map(|codec| {
-                    format!("the {codec} track of this Matroska file cannot be decoded (AAC only)")
-                }),
-            );
+            let Some(codec) = crate::demux::matroska_audio_codec(path.as_ref())? else {
+                return Ok(None);
+            };
+            // An AC-3 track that came up silent all the same is one that could
+            // not be read -- a laced block, an unreadable syncframe -- and the
+            // reader's own words are the ones worth showing.
+            return Ok(Some(match MkvAc3Track::open(path.as_ref()) {
+                Ok(Some(_)) => return Ok(None),
+                Ok(None) => format!(
+                    "the {codec} track of this Matroska file cannot be decoded (AAC and AC-3 only)"
+                ),
+                Err(e) => format!("the {codec} track of this Matroska file cannot be decoded: {e}"),
+            }));
         }
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
@@ -599,11 +622,29 @@ impl AudioSession {
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
         // A Matroska file has exactly one readable audio stream here -- the
-        // reader's default track ([`SymTrack::open`]) -- so it lists like a
+        // reader's default track ([`SymTrack::open`]), or the AC-3 / E-AC-3 one
+        // symphonia has no decoder for ([`MkvAc3Track`]) -- so it lists like a
         // standalone audio file rather than like an mp4, and one with no
         // readable track at all lists as the silent source it is.
         if crate::demux::is_matroska(path) {
-            let Ok(track) = SymTrack::open(path) else {
+            // The AC-3 row describes what the decoder *emits*, which is the
+            // stereo the §7.8 downmix hands the timeline, not the 5.1 the file
+            // carries -- exactly as the mp4 AC-3 rows do.
+            if let Ok(Some(track)) = MkvAc3Track::open(path) {
+                return Ok(vec![StreamInfo {
+                    index: 0,
+                    codec: if track.mkv.codec == "eac3" { "e-ac-3" } else { "ac-3" }.into(),
+                    channels: track.channels,
+                    sample_rate: track.sample_rate,
+                    lang: None,
+                    decodable: matches!(track.channels, 1 | 2),
+                }]);
+            }
+            // No audio track lists as the silent source it is; a track that
+            // will not open at all is an `Err` here, as it is in
+            // [`Track::open`] -- a listing that quietly came back empty for a
+            // broken file is how a lane ends up silent with nothing to go on.
+            let Some(track) = SymTrack::open(path)? else {
                 return Ok(Vec::new());
             };
             return Ok(vec![StreamInfo {
@@ -616,7 +657,7 @@ impl AudioSession {
             }]);
         }
         if crate::is_audio(path) {
-            let track = SymTrack::open(path)?;
+            let track = SymTrack::open_required(path)?;
             return Ok(vec![StreamInfo {
                 index: 0,
                 codec: track.codec.into(),
@@ -743,15 +784,18 @@ impl AudioSession {
     /// half a packet over the whole list however many files it spans, and the
     /// extra priming packet is still the very first segment's alone.
     ///
-    /// Every source must declare the same [`AacTrackParams`]: the copy becomes
-    /// one output track with one esds. Import refuses a mismatch up front; the
-    /// check here is the backstop, as is the missing-track `Err`.
+    /// Every source that *has* a track must declare the same
+    /// [`AacTrackParams`]: the copy becomes one output track with one esds.
+    /// Import refuses a mismatch up front; the check here is the backstop.
     ///
     /// A segment naming **no** source is a gap, and is copied as that many
     /// packets of [`silent_packet`] silence — the rounding debt carried through
     /// it like any other, so the hole occupies its exact duration and the audio
     /// after it stays in sync with the picture. A gap the track *opens* on gets
-    /// one silent packet more, which is the priming a reader drops.
+    /// one silent packet more, which is the priming a reader drops. A segment
+    /// naming a *silent* source is written the same way: a clip whose file has
+    /// no audio track is a hole with a picture over it, and the timeline it
+    /// joined already said so ([`crate::PlaybackSession::import`]).
     pub fn copy_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -770,24 +814,34 @@ impl AudioSession {
         sources: &[(PathBuf, usize)],
         segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
-        let Some(&(Some(first), ..)) = segs.iter().find(|s| s.0.is_some()) else {
+        // The output track is declared from the first source that has one --
+        // not simply the first one named, which may be a silent clip. Such a
+        // clip defines no rate and no layout; it is written as silence below
+        // and the track goes on being the audible sources' track.
+        let mut tracks: Vec<Option<Option<AacTrack>>> = sources.iter().map(|_| None).collect();
+        let mut first = None;
+        for &(source, ..) in segs {
+            let Some(source) = source else { continue };
+            if let Some(track) = source_at(&mut tracks, sources, source)? {
+                first = Some(track.track_params());
+                break;
+            }
+        }
+        let Some(params) = first else {
             return Ok(None); // no segments, or nothing but silence
         };
-        let (path, stream) = sources
-            .get(first)
-            .ok_or_else(|| format!("segment names source {first} of {}", sources.len()))?;
-        let Some(track) = copy_track(path, *stream)? else {
-            return Ok(None); // silent source, silent export
-        };
-        let params = track.track_params();
-        let mut tracks: Vec<Option<AacTrack>> = sources.iter().map(|_| None).collect();
-        tracks[first] = Some(track);
 
         let sample_rate = params.sample_rate;
         let mut err = 0i64;
         let mut packets: Vec<AacPacket> = Vec::new();
         for &(source, start_secs, end_secs) in segs {
-            let Some(source) = source else {
+            // A gap, and a clip whose source carries no track, are the same hole
+            // to write: silence for as long as the window is.
+            let named = match source {
+                Some(source) => source_at(&mut tracks, sources, source)?.map(|t| (source, t)),
+                None => None,
+            };
+            let Some((source, track)) = named else {
                 let ideal = ((end_secs - start_secs).max(0.0) * f64::from(sample_rate)) as i64;
                 let bytes = silent_packet(params.chan_conf)?;
                 // A reader drops the first packet of an AAC track as the
@@ -805,7 +859,6 @@ impl AudioSession {
                 }
                 continue;
             };
-            let track = source_at(&mut tracks, sources, source)?;
             if track.track_params() != params {
                 return Err(format!(
                     "source {source} audio is {:?}, the timeline's is {params:?}",
@@ -866,24 +919,25 @@ fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
     }
 }
 
-/// The source at `index`, on the stream it names, opened on first use. Sources
-/// a segment list never names are never touched: a project's list only grows.
+/// The source at `index`, on the stream it names, opened on first use -- and
+/// `None` for a source that has no track at all, which the caller writes as
+/// silence exactly as it writes a gap. The outer `Option` is "has it been
+/// opened", the inner one "was there anything in it", so a silent source is
+/// opened once like any other. Sources a segment list never names are never
+/// touched: a project's list only grows.
 fn source_at<'a>(
-    tracks: &'a mut [Option<AacTrack>],
+    tracks: &'a mut [Option<Option<AacTrack>>],
     sources: &[(PathBuf, usize)],
     index: usize,
-) -> crate::Result<&'a mut AacTrack> {
+) -> crate::Result<Option<&'a mut AacTrack>> {
     let slot = tracks
         .get_mut(index)
         .ok_or_else(|| format!("segment names source {index} of {}", sources.len()))?;
     if slot.is_none() {
         let (path, stream) = &sources[index];
-        *slot = Some(
-            copy_track(path, *stream)?
-                .ok_or_else(|| format!("source {index} has no audio track"))?,
-        );
+        *slot = Some(copy_track(path, *stream)?);
     }
-    Ok(slot.as_mut().expect("just opened"))
+    Ok(slot.as_mut().expect("just opened").as_mut())
 }
 
 /// A source's track for the *copy* path, which needs raw AAC access units.
@@ -924,7 +978,7 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         // Decoded, never copied: an AC-3 syncframe is not something an `mp4a`
         // sample table can hold. The export decodes it and encodes AAC, exactly
         // as it does for every other source no copy reaches.
-        Some(Track::Ac3(_)) => Err(uncopyable(path, "AC-3")),
+        Some(Track::Ac3(_) | Track::Mkv(_)) => Err(uncopyable(path, "AC-3")),
     }
 }
 
@@ -947,6 +1001,9 @@ fn uncopyable(path: &Path, codec: &str) -> crate::Error {
 enum Track {
     Aac(AacTrack),
     Ac3(Ac3Track),
+    /// The same AC-3 decoder, fed out of a Matroska file's blocks instead of an
+    /// mp4's sample table.
+    Mkv(MkvAc3Track),
     Sym(SymTrack),
 }
 
@@ -965,20 +1022,43 @@ impl Track {
     /// has exactly one, so any `stream` above 0 there is a promise the file
     /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
-        // A Matroska file goes straight to symphonia, whose `mkv` reader is the
-        // one thing here that reads its packets -- neither mp4 reader can open
-        // the file at all. Sound this cannot decode (Opus, AC-3, DTS: symphonia
-        // has no such decoder at any version) leaves the source the silent one
-        // it always was, which `AudioSession::unsupported` puts into words,
-        // rather than failing the import of a file whose picture is fine.
+        // A Matroska file goes to symphonia, whose `mkv` reader is the one thing
+        // here that reads its packets -- neither mp4 reader can open the file at
+        // all -- except for the two codecs symphonia has no decoder for at any
+        // version and this project does: AC-3 and E-AC-3 are handed to the Dolby
+        // decoder straight out of the blocks ([`MkvAc3Track`]). Sound neither
+        // one can decode (Opus, DTS) leaves the source the silent one it always
+        // was, which `AudioSession::unsupported` puts into words, rather than
+        // failing the import of a file whose picture is fine. A track that will
+        // not open at all is *not* in that group: see below.
         if crate::demux::is_matroska(path) {
             if stream > 0 {
                 return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
             }
-            return Ok(SymTrack::open(path)
-                .ok()
-                .filter(|t| t.decoder().is_ok())
-                .map(Self::Sym));
+            match MkvAc3Track::open(path) {
+                Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
+                Ok(None) => {}
+                // Named on the way past rather than returned: symphonia gets the
+                // same file next and may read the track perfectly well (a laced
+                // block is [`MkvAc3Track`]'s limitation, not the file's), and
+                // if it cannot either, *its* `Err` is the one that comes back.
+                Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
+            }
+            // Two things are silent here and no more: a file with no audio
+            // track at all, and a track whose codec nothing in this project
+            // decodes (Opus, DTS -- [`AudioSession::unsupported`] is what puts
+            // that into words). A track that will not *open* is an `Err`, the
+            // same answer the mp4 arm gives: turned into silence it would play
+            // and export as a hole with only an eprintln to say why, which is a
+            // bug wearing a feature's clothes.
+            let Some(track) = SymTrack::open(path)? else {
+                return Ok(None);
+            };
+            if let Err(e) = track.decoder() {
+                eprintln!("matroska audio: {}: {e}", path.display());
+                return Ok(None);
+            }
+            return Ok(Some(Self::Sym(track)));
         }
         let audio_file = crate::is_audio(path);
         // Ahead of the AAC reader, because that one answers "not AAC" for a
@@ -999,13 +1079,14 @@ impl Track {
         if stream > 0 {
             return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
         }
-        SymTrack::open(path).map(|track| Some(Self::Sym(track)))
+        SymTrack::open_required(path).map(|track| Some(Self::Sym(track)))
     }
 
     fn sample_rate(&self) -> u32 {
         match self {
             Self::Aac(t) => t.sample_rate,
             Self::Ac3(t) => t.sample_rate,
+            Self::Mkv(t) => t.sample_rate,
             Self::Sym(t) => t.sample_rate,
         }
     }
@@ -1021,6 +1102,11 @@ impl Track {
                 1 | 2 => Ok(t.channels),
                 n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
             },
+            // Downmixed by the very same decoder, out of a Matroska file.
+            Self::Mkv(t) => match t.channels {
+                1 | 2 => Ok(t.channels),
+                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
+            },
             Self::Sym(t) => match t.channels {
                 1 | 2 => Ok(t.channels),
                 n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
@@ -1033,6 +1119,7 @@ impl Track {
         match self {
             Self::Aac(t) => t.total_samples,
             Self::Ac3(t) => t.total_samples,
+            Self::Mkv(t) => t.total_samples,
             Self::Sym(t) => t.total_samples,
         }
     }
@@ -1042,6 +1129,9 @@ impl Track {
         match self {
             Self::Aac(t) => t.priming,
             Self::Ac3(t) => t.priming,
+            // Matroska writes no edit list and AC-3 has no encoder delay:
+            // block 0 is sample 0.
+            Self::Mkv(_) => 0,
             Self::Sym(t) => t.priming,
         }
     }
@@ -1052,6 +1142,7 @@ impl Track {
         match self {
             Self::Aac(t) => t.segment(source, start_secs, end_secs),
             Self::Ac3(t) => t.segment(source, start_secs, end_secs),
+            Self::Mkv(t) => t.segment(source, start_secs, end_secs),
             Self::Sym(t) => {
                 let media_target = t.media(start_secs);
                 Segment {
@@ -1073,7 +1164,10 @@ impl Track {
                 AacDecoder::try_new(&t.params, &AudioDecoderOptions::default())?;
             }
             Self::Ac3(t) => {
-                ac3_decoder(t.requested)?;
+                ac3_decoder("ac3", t.requested)?;
+            }
+            Self::Mkv(t) => {
+                ac3_decoder(t.mkv.codec, t.requested)?;
             }
             Self::Sym(t) => {
                 t.decoder()?;
@@ -1110,7 +1204,13 @@ struct SymTrack {
 }
 
 impl SymTrack {
-    fn open(path: &Path) -> crate::Result<Self> {
+    /// `Ok(None)` for a container that opened and holds no audio track at all --
+    /// a silent source, which is a thing a file is allowed to be. Everything
+    /// else that goes wrong here is an `Err`: a file that will not open, will
+    /// not parse, or carries a track it cannot describe is *broken*, and the
+    /// difference matters because silence is played and exported without a word
+    /// while an `Err` is shown ([`Track::open`]).
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
         let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
         // The extension is a hint, not a decision: the probe reads the magic and
         // is free to disagree, which is what makes a mislabelled file work.
@@ -1124,9 +1224,9 @@ impl SymTrack {
             FormatOptions::default(),
             MetadataOptions::default(),
         )?;
-        let track = reader
-            .default_track(SymKind::Audio)
-            .ok_or_else(|| format!("{} has no audio track", path.display()))?;
+        let Some(track) = reader.default_track(SymKind::Audio) else {
+            return Ok(None);
+        };
         let (track_id, num_frames, delay) = (track.id, track.num_frames, track.delay);
         let time_base = track
             .time_base
@@ -1147,7 +1247,7 @@ impl SymTrack {
         let codec = symphonia::default::get_codecs()
             .get_audio_decoder(params.codec)
             .map_or("an unsupported format", |d| d.codec.info.short_name);
-        Ok(Self {
+        Ok(Some(Self {
             reader,
             track_id,
             sample_rate,
@@ -1161,7 +1261,14 @@ impl SymTrack {
             time_base,
             params,
             codec,
-        })
+        }))
+    }
+
+    /// [`open`](Self::open) where having no audio track is itself the error:
+    /// what a standalone audio file is held to, since a song with no sound in
+    /// it is a broken file and not a silent source.
+    fn open_required(path: &Path) -> crate::Result<Self> {
+        Self::open(path)?.ok_or_else(|| format!("{} has no audio track", path.display()).into())
     }
 
     /// A fresh decoder: seeking mid-stream leaves state that belongs to the
@@ -1326,9 +1433,9 @@ impl Ac3Track {
             .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?
             .nfchans;
         let requested = (nfchans > 1).then_some(2);
-        let mut decoder = ac3_decoder(requested)?;
+        let mut decoder = ac3_decoder("ac3", requested)?;
         let channels = decode_ac3(&mut decoder, &first.bytes)?
-            .map(|pcm| (pcm.len() / AC3_SAMPLES_PER_FRAME as usize) as u16)
+            .map(|(pcm, samples)| (pcm.len() as u64 / samples.max(1)) as u16)
             .filter(|&c| c > 0)
             .ok_or("the first AC-3 syncframe decoded to nothing")?;
 
@@ -1373,6 +1480,101 @@ impl Ac3Track {
     }
 }
 
+/// One source's AC-3 or E-AC-3 track out of a **Matroska** file: the very same
+/// decoder and the very same §7.8 stereo downmix [`Ac3Track`] runs, fed out of
+/// the container's blocks instead of an mp4 sample table. A 5.1 E-AC-3 remux
+/// therefore arrives on the timeline as an ordinary stereo source, exactly as
+/// the mp4 path's does, and the mono passthrough quirk is the same one.
+///
+/// Matroska indexes no samples, so what an `stts` walk answers on the mp4 side
+/// is answered here by the blocks' own timestamps ([`crate::demux::MkvAudio`]):
+/// one block is one packet, one packet is one syncframe, and a seek lands on
+/// the block at or before the target with [`AC3_PRE_ROLL`] blocks of warm-up in
+/// front of it.
+struct MkvAc3Track {
+    mkv: crate::demux::MkvAudio,
+    sample_rate: u32,
+    /// What comes *out* of the decoder, measured on the first frame — 2 for
+    /// anything from stereo to 5.1, 1 for a mono track (see `requested`).
+    channels: u16,
+    total_samples: Option<u64>,
+    /// What the decoder is asked to hand out, from this track's own layout:
+    /// `Some(2)` for anything with more than one front channel, `None` for a
+    /// mono track. The reason is [`ac3_decoder`]'s `ponytail`, not this file's.
+    requested: Option<u16>,
+}
+
+impl MkvAc3Track {
+    /// `Ok(None)` when the file's first audio track is not AC-3 or E-AC-3 —
+    /// that mkv is the silent source it has always been. An `Err` is a track
+    /// that is one and could not be read, which
+    /// [`AudioSession::unsupported`] quotes back to the user.
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
+        let Some(mut mkv) = crate::demux::MkvAudio::open(path)? else {
+            return Ok(None);
+        };
+        let first = mkv
+            .frame(0)?
+            .ok_or("the AC-3 track of this Matroska file has no blocks")?;
+        // Rate and layout come out of the bit stream, which is where AC-3
+        // states them: Matroska's `Audio` element repeats them and muxers get
+        // that wrong often enough that the frame is the better source.
+        // `nfchans` excludes the LFE in both syntaxes, which is what the
+        // downmix decision wants.
+        let (sample_rate, nfchans) = if mkv.codec == "eac3" {
+            // Annex E's BSI starts right after the 16-bit syncword.
+            let bsi = oxideav_ac3::eac3::bsi::parse(first.get(2..).unwrap_or_default())
+                .map_err(|e| format!("not a readable E-AC-3 bit stream information: {e:?}"))?;
+            (bsi.sample_rate, bsi.nfchans)
+        } else {
+            let sync = oxideav_ac3::syncinfo::parse(&first)
+                .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?;
+            let bsi = oxideav_ac3::bsi::parse(first.get(5..).unwrap_or_default())
+                .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?;
+            (sync.sample_rate, bsi.nfchans)
+        };
+        let requested = (nfchans > 1).then_some(2);
+        let mut decoder = ac3_decoder(mkv.codec, requested)?;
+        let (pcm, samples) =
+            decode_ac3(&mut decoder, &first)?.ok_or("the first AC-3 syncframe decoded to nothing")?;
+        let channels = (pcm.len() as u64 / samples.max(1)) as u16;
+        if channels == 0 {
+            return Err("the first AC-3 syncframe decoded to nothing".into());
+        }
+        // The track runs to the last block's timestamp plus that block's own
+        // frame -- a container that indexes nothing states no duration either,
+        // and every frame of a syncframe stream is the same length.
+        let last = mkv.secs(mkv.blocks().saturating_sub(1));
+        Ok(Some(Self {
+            total_samples: Some((last * f64::from(sample_rate)) as u64 + samples),
+            sample_rate,
+            channels,
+            requested,
+            mkv,
+        }))
+    }
+
+    /// `secs` on this source's timeline into media samples. No priming: the
+    /// container carries no edit list and AC-3 no encoder delay.
+    fn media(&self, secs: f64) -> u64 {
+        (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+    }
+
+    /// One `[start, end)` window, resolved to blocks and media samples —
+    /// [`Ac3Track::segment`] against block timestamps instead of an `stts`.
+    fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
+        let media_target = self.media(start_secs);
+        let start_id = self.mkv.block_at(start_secs, AC3_PRE_ROLL as usize);
+        Segment {
+            source: Some(source),
+            start_id: start_id as u32,
+            start_pos: self.media(self.mkv.secs(start_id)),
+            media_target,
+            media_end: self.media(end_secs).max(media_target),
+        }
+    }
+}
+
 /// A fresh AC-3 decoder handing out `channels`: `Some(2)` is the library's own
 /// A/52 §7.8 stereo downmix, which is the whole reason the timeline can carry a
 /// 5.1 track at all. Fresh per segment for the same reason every other decoder
@@ -1383,32 +1585,47 @@ impl Ac3Track {
 /// mono track asks for no downmix at all and stays the mono source it is. The
 /// upgrade path is `Some(2)` unconditionally once the library duplicates the
 /// centre channel; the caller ([`Ac3Track::open`]) is the only thing to change.
-fn ac3_decoder(channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
+///
+/// `codec` is the track's own id — `ac3` or `eac3`, which the library registers
+/// separately (E-AC-3 claims up to 8 channels where AC-3 claims 6). The struct
+/// behind both dispatches per packet on `bsid` in any case, so what this picks
+/// is the capability set, not the syntax.
+fn ac3_decoder(codec: &str, channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
     let mut registry = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut registry);
-    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    let mut params = CodecParameters::audio(CodecId::new(codec));
     params.channels = channels;
     registry
         .first_decoder(&params)
         .map_err(|e| format!("no AC-3 decoder: {e:?}").into())
 }
 
-/// One syncframe in, one buffer of interleaved f32 out. `Ok(None)` when the
-/// decoder wants more input before it can hand a frame back, which is not an
-/// error. The library speaks S16 little-endian; `/32768` is the whole
-/// conversion, and it lands in the `[-1, 1)` every other reader here emits.
-fn decode_ac3(decoder: &mut Box<dyn Decoder>, bytes: &[u8]) -> crate::Result<Option<Vec<f32>>> {
+/// One syncframe in, one buffer of interleaved f32 out and the frames per
+/// channel it holds. `Ok(None)` when the decoder wants more input before it can
+/// hand a frame back, which is not an error. The library speaks S16
+/// little-endian; `/32768` is the whole conversion, and it lands in the
+/// `[-1, 1)` every other reader here emits.
+///
+/// The frame count comes back beside the samples because an E-AC-3 frame is not
+/// the fixed 1536 (6 blocks of 256) an AC-3 one is -- `numblkscod` may say 1, 2
+/// or 3 blocks instead of 6 -- and dividing by an assumed length would put the
+/// channel count and every media position after it out.
+fn decode_ac3(
+    decoder: &mut Box<dyn Decoder>,
+    bytes: &[u8],
+) -> crate::Result<Option<(Vec<f32>, u64)>> {
     let packet = Ac3Packet::new(0, oxideav_core::TimeBase::new(1, 48_000), bytes.to_vec());
     decoder
         .send_packet(&packet)
         .map_err(|e| format!("AC-3 decode failed: {e:?}"))?;
     match decoder.receive_frame() {
-        Ok(Frame::Audio(audio)) => Ok(Some(
+        Ok(Frame::Audio(audio)) => Ok(Some((
             audio.data[0]
                 .chunks_exact(2)
                 .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
                 .collect(),
-        )),
+            u64::from(audio.samples),
+        ))),
         Ok(other) => Err(format!("AC-3 decoder handed back {other:?}").into()),
         Err(oxideav_core::Error::NeedMore) => Ok(None),
         Err(e) => Err(format!("AC-3 decode failed: {e:?}").into()),
@@ -2026,6 +2243,21 @@ fn run(mut w: Worker) {
                 }
                 continue;
             }
+            Track::Mkv(track) => {
+                if !run_mkv_ac3(
+                    track,
+                    seg,
+                    eq.as_mut(),
+                    speed,
+                    channels,
+                    &mut timeline,
+                    &w.tx,
+                ) || !settle(speed, channels, &mut timeline, &w.tx)
+                {
+                    return; // consumer went away
+                }
+                continue;
+            }
             Track::Ac3(track) => {
                 if !run_ac3(
                     track,
@@ -2191,7 +2423,7 @@ fn run_ac3(
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
 ) -> bool {
-    let mut decoder = match ac3_decoder(track.requested) {
+    let mut decoder = match ac3_decoder("ac3", track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
             eprintln!("audio decoder init failed: {e}");
@@ -2200,7 +2432,6 @@ fn run_ac3(
     };
     let mut pos = seg.start_pos;
     for id in seg.start_id..=track.sample_count {
-        let mut interleaved;
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
@@ -2212,15 +2443,75 @@ fn run_ac3(
                 return true;
             }
         };
-        match decode_ac3(&mut decoder, &sample.bytes) {
-            Ok(Some(pcm)) => interleaved = pcm,
+        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &sample.bytes) {
+            Ok(Some(decoded)) => decoded,
             Ok(None) => continue, // the decoder wants another frame first
             Err(e) => {
                 eprintln!("audio decode error at sample {id}: {e}");
                 return true;
             }
+        };
+        let next = pos + samples;
+        if !emit(
+            &mut interleaved,
+            channels,
+            seg,
+            eq.as_deref_mut(),
+            speed.as_mut(),
+            pos,
+            next,
+            timeline,
+            tx,
+        ) {
+            return false;
         }
-        let next = pos + (interleaved.len() / channels) as u64;
+        pos = next;
+    }
+    true
+}
+
+/// One segment of a Matroska AC-3 / E-AC-3 track: [`run_ac3`] reading blocks
+/// instead of mp4 samples. The decoder, the window rules ([`emit`]) and the
+/// stereo downmix are the same ones; only where a packet comes from differs.
+/// `false` means the consumer went away.
+fn run_mkv_ac3(
+    track: &mut MkvAc3Track,
+    seg: &Segment,
+    mut eq: Option<&mut EqState>,
+    speed: &mut Option<Resample>,
+    channels: usize,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    let mut decoder = match ac3_decoder(track.mkv.codec, track.requested) {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let mut pos = seg.start_pos;
+    for id in seg.start_id as usize.. {
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let block = match track.mkv.frame(id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return true, // end of the track
+            Err(e) => {
+                eprintln!("audio demux error at block {id}: {e}");
+                return true;
+            }
+        };
+        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &block) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => continue, // the decoder wants another frame first
+            Err(e) => {
+                eprintln!("audio decode error at block {id}: {e}");
+                return true;
+            }
+        };
+        let next = pos + samples;
         if !emit(
             &mut interleaved,
             channels,

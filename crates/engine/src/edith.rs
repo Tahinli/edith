@@ -1,13 +1,15 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 9
+//! edith 10
 //! playhead 90
 //! resolution 1920 1080
 //! fps 30.0
 //! limiter -1.0 on
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
+//! subtitle - subs.srt
+//! subtitle 3 test_av.mp4
 //! eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk
 //! color 0.1:1.2:0.9:-0.3
 //! video 1 0 0 120 0 0 0 0 fit 1000
@@ -22,6 +24,15 @@
 //! the scaffolding source runs at", which is what such a project always was and
 //! is an answer only a project holding a video has
 //! ([`crate::PlaybackSession::open_project`]).
+//!
+//! A `subtitle` line is `subtitle <track> <path>`: which track of that file the
+//! cues are in -- a Matroska track number, or `-` when the path *is* a subtitle
+//! file ([`crate::subtitle`]) -- and then the path, last and escaped for the
+//! reason a source's is. Only the reference is written: the cues themselves are
+//! read back out of the file on the way in, exactly as a clip's pictures are, so
+//! a project file stays an edit list. A subtitle file that has gone missing
+//! since the save comes back listed and refused by name rather than dropped,
+//! which is what keeps a re-save from losing it.
 //!
 //! The `limiter` line is the master limiter over the whole mix
 //! ([`crate::limiter`]): its ceiling in dBFS and whether it is in circuit,
@@ -79,7 +90,9 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 8** was this without the `fps` and `limiter` lines and without
+//! **Version 9** was this without the `subtitle` lines: such a project shows no
+//! subtitles, which is all any project could do.
+//! **Version 8** was that without the `fps` and `limiter` lines and without
 //! the `gain` ones: such a project mixes every lane at unity, limits nothing,
 //! and comes back at the rate its scaffolding source runs at.
 //! **Version 7** was that without the clip's speed field -- every clip of such
@@ -97,8 +110,8 @@
 //! cumulatively and copied onto both lanes as one group each, which is exactly
 //! what a v1 timeline meant, and an older file simply equalizes and grades
 //! nothing, and an older one plays everything at real time, and an older one
-//! mixes flat -- and saving any of them writes v9. An older reader refuses a
-//! newer file by name.
+//! mixes flat, and an older one shows no subtitles -- and saving any of them
+//! writes v10. An older reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -129,10 +142,12 @@ use crate::eq::{Band, BandKind, EqParams};
 use crate::limiter::Limiter;
 use crate::project::{Clip, Lane, LaneKind, Source, Speed};
 use crate::scale::FitPolicy;
+use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 9";
+const MAGIC: &[u8] = b"edith 10";
+const MAGIC_V9: &[u8] = b"edith 9";
 const MAGIC_V8: &[u8] = b"edith 8";
 const MAGIC_V7: &[u8] = b"edith 7";
 const MAGIC_V6: &[u8] = b"edith 6";
@@ -169,6 +184,11 @@ pub struct Document {
     /// The master limiter. Off for every dialect before v9, and for a v9 file
     /// that leaves the line out.
     pub limiter: Limiter,
+    /// The subtitle tracks, as the file names them: the path the cues are in
+    /// and which track of it, which is what [`crate::subtitle::open`] takes.
+    /// Reading them is the loader's business, not this module's -- a `.edith`
+    /// holds no cues. Empty for every dialect before v10.
+    pub subtitles: Vec<(PathBuf, Option<u64>)>,
     /// The timeline's frame rate. `None` for every dialect before v9 and for a
     /// v9 file that leaves it out, which both mean "whatever the scaffolding
     /// source runs at" -- the inference a project of nothing but stills and
@@ -188,6 +208,7 @@ pub fn save(
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     gains: &[f32],
+    subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
     resolution: (u32, u32),
@@ -206,7 +227,8 @@ pub fn save(
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
             f.write_all(&emit(
-                &dir, sources, lanes, gains, eq, color, resolution, fps, limiter, playhead,
+                &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, limiter,
+                playhead,
             ))?;
             f.sync_all()
         })
@@ -243,6 +265,7 @@ fn emit(
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     gains: &[f32],
+    subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
     resolution: (u32, u32),
@@ -278,6 +301,16 @@ fn emit(
     for s in sources {
         out.extend_from_slice(format!("source {} ", s.audio_stream).as_bytes());
         escape(s.path.strip_prefix(dir).unwrap_or(&s.path), &mut out);
+        out.push(b'\n');
+    }
+    // The subtitle tracks, by reference: which track of which file, and never
+    // the cues (see the module docs). Beside the sources because that is what
+    // they are -- a file this project reads from -- although nothing indexes
+    // them and their order is only the order they were added in.
+    for t in subtitles {
+        let track = t.track.map_or("-".to_string(), |n| n.to_string());
+        out.extend_from_slice(format!("subtitle {track} ").as_bytes());
+        escape(t.path.strip_prefix(dir).unwrap_or(&t.path), &mut out);
         out.push(b'\n');
     }
     // Before the clips, for the reason the sources are: a clip names one by the
@@ -379,9 +412,11 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries the mix -- lane volumes, the master limiter and the
-    // rate the timeline was cut at...
-    let v9 = first == MAGIC;
+    // The one that carries subtitle tracks...
+    let v10 = first == MAGIC;
+    // ...the ones that carry the mix -- lane volumes, the master limiter and
+    // the rate the timeline was cut at...
+    let v9 = v10 || first == MAGIC_V9;
     // ...the ones that carry a per-clip speed...
     let v8 = v9 || first == MAGIC_V8;
     // ...the ones that carry a project resolution and per-clip fit policies...
@@ -418,6 +453,8 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // ...and nothing before v9 carries a mix or a rate: every lane at unity,
         // no limiter, and the rate inferred from the scaffold as it always was.
         gains: Vec::new(),
+        // Nothing before v10 shows a subtitle.
+        subtitles: Vec::new(),
         limiter: Limiter::default(),
         fps: None,
         playhead: 0,
@@ -527,6 +564,31 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     .ok_or_else(|| format!("line {n}: gain names a lane that is not there"))?;
                 doc.gains.resize(doc.lanes.len(), 0.0);
                 doc.gains[at] = float(f[2], n)?;
+            }
+            // Beside the source lines and read the same way: fields first, the
+            // path last, because a path runs to the end of the line.
+            b"subtitle" if v10 => {
+                let at = rest
+                    .iter()
+                    .position(|&b| b == b' ')
+                    .ok_or_else(|| format!("line {n}: subtitle without a path"))?;
+                let track = match &rest[..at] {
+                    b"-" => None,
+                    field => Some(u64::from(number(field, n)?)),
+                };
+                let path = unescape(&rest[at + 1..], n)?;
+                if path.as_os_str().is_empty() {
+                    return Err(format!("line {n}: subtitle without a path").into());
+                }
+                doc.subtitles.push((
+                    // Relative to the project file, as a source path is.
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        dir.join(path)
+                    },
+                    track,
+                ));
             }
             b"source" => {
                 if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
@@ -963,6 +1025,7 @@ mod tests {
             sources,
             lanes,
             &[],
+            &[],
             eq,
             color,
             resolution,
@@ -970,6 +1033,84 @@ mod tests {
             Limiter::default(),
             playhead,
         )
+    }
+
+    /// A subtitle track as a save hands one over: the cues are not written and
+    /// so are not here either.
+    fn subtitle(path: &str, track: Option<u64>) -> SubtitleTrack {
+        SubtitleTrack {
+            path: PathBuf::from(path),
+            track,
+            label: String::new(),
+            cues: Vec::new(),
+            refused: None,
+        }
+    }
+
+    /// The v10 line: which track of which file, written beside the sources and
+    /// read back as the pair a load opens. And what a v9 file is -- one with no
+    /// subtitles at all, which still opens and re-saves as v10.
+    #[test]
+    fn subtitles_round_trip_as_references_and_a_v9_file_has_none() {
+        let dir = PathBuf::from("/proj");
+        let (_, sources, lanes) = doc();
+        let tracks = [
+            subtitle("/proj/subs.srt", None),
+            subtitle("/proj/a.mp4", Some(3)),
+            subtitle("/elsewhere/od d name.ass", None),
+        ];
+        let bytes = super::emit(
+            &dir,
+            &sources,
+            &lanes,
+            &[],
+            &tracks,
+            &[],
+            &[],
+            (1280, 720),
+            None,
+            Limiter::default(),
+            0,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains(
+                "subtitle - subs.srt\n\
+                 subtitle 3 a.mp4\n\
+                 subtitle - /elsewhere/od d name.ass\n"
+            ),
+            "the path is relative where it can be, and runs to the end of its \
+             line, spaces and all: {text}"
+        );
+        let back = parse(&bytes, &dir).expect("v10 parses");
+        assert_eq!(
+            back.subtitles,
+            vec![
+                (PathBuf::from("/proj/subs.srt"), None),
+                (PathBuf::from("/proj/a.mp4"), Some(3)),
+                (PathBuf::from("/elsewhere/od d name.ass"), None),
+            ]
+        );
+
+        // A v9 file is a project with no subtitles, and re-saving it writes v10.
+        let v9 = b"edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+                   video 1 0 0 30 0 - - - fit 1000\n";
+        let old = parse(v9, &dir).expect("v9 still loads");
+        assert_eq!(old.subtitles, Vec::new());
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 10\n"));
+        // ...and the line itself is not a v9 line: a dialect may not be mixed.
+        let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mixed, "line 3: unknown keyword \"subtitle\"");
+        // A subtitle line with no path is refused, as a source with none is.
+        for line in ["subtitle -\n", "subtitle - \n", "subtitle x subs.srt\n"] {
+            let file = format!("edith 10\nsource 0 a.mp4\n{line}");
+            assert!(
+                parse(file.as_bytes(), &dir).is_err(),
+                "{line:?} is not a subtitle line"
+            );
+        }
     }
 
     fn clip(start: u32, in_frame: u32, out_frame: u32, source: usize, link: Option<u32>) -> Clip {
@@ -1032,7 +1173,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1069,7 +1210,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1177,7 +1318,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1281,7 +1422,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1346,7 +1487,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1384,7 +1525,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -1413,7 +1554,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -1450,6 +1591,7 @@ mod tests {
             &[0.0, 3.0, -6.5],
             &[],
             &[],
+            &[],
             (1280, 720),
             Some(23.976023976023978),
             limiter,
@@ -1457,7 +1599,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 10\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -1489,7 +1631,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -1653,7 +1795,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -1706,7 +1848,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1738,7 +1880,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 9\n"));
+        assert!(v5.starts_with(b"edith 10\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1834,6 +1976,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             (1280, 720),
             None,
             Limiter::default(),
@@ -1843,7 +1986,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 9\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 10\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -1888,10 +2031,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 10\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 11\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 10");
+        assert_eq!(err, "line 1: unsupported version 11");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
