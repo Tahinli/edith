@@ -87,7 +87,7 @@ impl Backend {
 pub struct BackendCell(Arc<AtomicU8>);
 
 impl BackendCell {
-    fn new(backend: Backend) -> Self {
+    pub(crate) fn new(backend: Backend) -> Self {
         Self(Arc::new(AtomicU8::new(backend.code())))
     }
 
