@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
@@ -23,6 +23,106 @@ pub struct Frame {
     pub height: u32,
     /// BGRA8, straight alpha, tightly packed.
     pub bgra: Vec<u8>,
+}
+
+/// Which decoder a source is really running on. Read-only introspection: it
+/// decides nothing, it *reports* what [`DecodeSession::open_worker`] chose --
+/// a hardware session that opened and then failed before its first picture
+/// falls back to software and this says so, because it is written where the
+/// fallback happens rather than where it was hoped for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// The worker has not reached its decoder yet: the plugin's VA-API init is
+    /// ~90 ms, and this is what a caller reads in that window.
+    #[default]
+    Opening,
+    /// The VA-API plugin (`libengine_hw.so`).
+    Hardware,
+    /// `rusty_h264`, in this process.
+    Software,
+    /// A still image: one `image` decode, no stream and no decoder to pick.
+    Still,
+    /// A gap: black frames, nothing decoded at all.
+    Gap,
+}
+
+impl Backend {
+    /// Short enough for a library row and a transport line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opening => "opening",
+            Self::Hardware => "HW",
+            Self::Software => "SW",
+            Self::Still => "still",
+            Self::Gap => "gap",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Opening => 0,
+            Self::Hardware => 1,
+            Self::Software => 2,
+            Self::Still => 3,
+            Self::Gap => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Hardware,
+            2 => Self::Software,
+            3 => Self::Still,
+            4 => Self::Gap,
+            _ => Self::Opening,
+        }
+    }
+}
+
+/// Where a worker publishes the decoder it opened, for whoever holds the other
+/// end of its channel. One atomic byte, written once at open (and once more if
+/// hardware hands the range back to software), read whenever a caller repaints
+/// -- never per frame on either side.
+#[derive(Clone, Default)]
+pub struct BackendCell(Arc<AtomicU8>);
+
+impl BackendCell {
+    fn new(backend: Backend) -> Self {
+        Self(Arc::new(AtomicU8::new(backend.code())))
+    }
+
+    fn set(&self, backend: Backend) {
+        self.0.store(backend.code(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> Backend {
+        Backend::from_code(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Which decoder `path` would open, decided exactly as [`DecodeSession::open_worker`]
+/// decides it: the same `VE_SW` pin and the same plugin probe against this very
+/// file. What lets a front-end name the decoder *before* anything plays.
+///
+/// The codec is `None` for a still image, which has no coded stream. A stream
+/// no decoder here can take is an `Err` naming the plugin, exactly as opening
+/// it would be -- the same refusal, one VA-API init earlier.
+///
+/// Costs that one init (~90 ms) for a stream the plugin takes: ask it once per
+/// file, off a render thread, and keep the answer.
+pub fn probe(path: &Path) -> crate::Result<(Option<Codec>, Backend)> {
+    if crate::is_image(path) {
+        return Ok((None, Backend::Still));
+    }
+    let path = path.to_path_buf();
+    let (meta, _demuxer) = Demuxer::open(&path)?;
+    if open_hw(&path, 0).is_some() {
+        return Ok((Some(meta.codec), Backend::Hardware));
+    }
+    if meta.codec != Codec::H264 {
+        return Err(meta.codec.needs_plugin().into());
+    }
+    Ok((Some(meta.codec), Backend::Software))
 }
 
 /// A running decode worker: the flag that stops it, and the handle to wait on.
@@ -85,6 +185,9 @@ impl Drop for Worker {
 pub(crate) struct FrameStream {
     pub(crate) frames: Receiver<Frame>,
     pub(crate) worker: Worker,
+    /// What this stream's pictures are being decoded by. Dropped last and read
+    /// by the caller, so it outlives nothing and blocks nothing.
+    pub(crate) backend: BackendCell,
 }
 
 pub struct DecodeSession;
@@ -152,6 +255,7 @@ impl DecodeSession {
                     cancel,
                     handle: None,
                 },
+                backend: BackendCell::new(Backend::Gap),
             };
         }
         let worker_cancel = Arc::clone(&cancel);
@@ -180,6 +284,7 @@ impl DecodeSession {
         FrameStream {
             frames: rx,
             worker: Worker { cancel, handle },
+            backend: BackendCell::new(Backend::Gap),
         }
     }
 
@@ -209,6 +314,7 @@ impl DecodeSession {
                     cancel,
                     handle: None,
                 },
+                backend: BackendCell::new(Backend::Still),
             });
         }
         // The one conversion, on this thread: it is a few milliseconds and the
@@ -245,6 +351,7 @@ impl DecodeSession {
         Ok(FrameStream {
             frames: rx,
             worker: Worker { cancel, handle },
+            backend: BackendCell::new(Backend::Still),
         })
     }
 
@@ -285,6 +392,9 @@ impl DecodeSession {
         // decoder run ahead of the display without limit.
         let (tx, rx) = sync_channel(2);
         let cancel = Arc::new(AtomicBool::new(false));
+        // Written by the worker below the moment it knows, so a caller reading
+        // it sees what opened rather than what was hoped for.
+        let backend = BackendCell::default();
         if end_frame <= start_frame {
             // Nothing to decode: dropping `tx` here closes the channel cleanly,
             // so the caller sees an immediate end of stream rather than an error.
@@ -296,10 +406,12 @@ impl DecodeSession {
                         cancel,
                         handle: None,
                     },
+                    backend,
                 },
             ));
         }
         let worker_cancel = Arc::clone(&cancel);
+        let worker_backend = backend.clone();
         let handle = thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
@@ -320,6 +432,7 @@ impl DecodeSession {
                         return;
                     }
                     eprintln!("decode backend: hardware (VA-API plugin)");
+                    worker_backend.set(Backend::Hardware);
                     if run_hw(hw, &tx, start_frame, end_frame, &mut render, &worker_cancel) {
                         return;
                     }
@@ -334,6 +447,7 @@ impl DecodeSession {
                     return;
                 }
                 eprintln!("decode backend: software (rusty_h264)");
+                worker_backend.set(Backend::Software);
                 run(
                     demuxer,
                     tx,
@@ -351,6 +465,7 @@ impl DecodeSession {
                     cancel,
                     handle: Some(handle),
                 },
+                backend,
             },
         ))
     }

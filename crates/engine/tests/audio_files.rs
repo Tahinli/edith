@@ -273,7 +273,7 @@ fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
     assert_eq!(
         e.to_string(),
         "the timeline has no picture: an mp4 would be black. \
-         Export WAV or FLAC, which are the sound itself"
+         Export WAV, FLAC or MP3, which are the sound itself"
     );
     assert!(!mp4.exists(), "the refusal wrote a file anyway");
 
@@ -386,20 +386,21 @@ fn a_video_joins_a_timeline_a_song_started() {
     import_and_place(&mut session, &asset("test_av.mp4"));
     assert_eq!(session.lane_clips(Lane::V1).len(), 1, "a picture at last");
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
-    // And a file at another rate is refused in the timeline's own words rather
-    // than silently retiming the song already on the lane -- the sample rate at
-    // one door, the *frame* rate at the other: the canvas a song scaffolds has
-    // a frame rate of its own (30 fps), and a 25 fps picture cannot join it.
+    // A sample rate the device cannot have two of is still refused in the
+    // timeline's own words...
     let e = refusal(session.import(&asset("test_tone_48k.wav")));
     assert_eq!(
         e,
         "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
     );
-    assert_eq!(
-        refusal(session.import(&asset("test_25fps.mp4"))),
-        "25.000 fps does not match the timeline's 30.000 fps"
-    );
     assert_eq!(session.sources().len(), 2, "a refusal left a library row");
+    // ...but a *frame* rate of its own is not a refusal: the canvas a song
+    // scaffolds runs at 30 fps and a 25 fps picture joins it at the length it
+    // lasts in seconds (50 frames of file, 60 of timeline).
+    session
+        .import(&asset("test_25fps.mp4"))
+        .expect("25 fps joins the 30 fps canvas a song scaffolded");
+    assert_eq!(session.file_frames(&asset("test_25fps.mp4")), 60);
 }
 
 /// Blocks until the export settles, whichever way it settled.
@@ -414,16 +415,19 @@ fn wait(handle: &engine::ExportHandle) -> engine::Result<()> {
     }
 }
 
-/// The export copies AAC packets and has no encoder, so a timeline carrying an
-/// mp3 cannot become an mp4 -- named, with its format, rather than exported
-/// silent or exported wrong.
+/// The *copy* path names what it cannot copy, by file and by format. That is a
+/// fallback's reason rather than a user's refusal now -- `export::copy_audio`
+/// takes this `Err` as "not copyable" and decodes and re-encodes the timeline
+/// instead (`tests/audio_export.rs` exports exactly this shape as an mp4 with
+/// sound in it) -- but the words are what a caller with no encoder shows, so
+/// they are still asserted here.
 #[test]
 fn an_export_refuses_audio_it_cannot_copy() {
     let sources = vec![asset("test_av.mp4"), asset("test_tone.mp3")];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     assert_eq!(
         refusal(AudioSession::copy_multi_segments(&sources, &segs)),
-        "export needs AAC audio today; test_tone.mp3 is mp3"
+        "a packet copy needs AAC in an mp4; test_tone.mp3 is mp3"
     );
     // A timeline of nothing but mp4 still exports, which is the invariant this
     // refusal must not have cost.
