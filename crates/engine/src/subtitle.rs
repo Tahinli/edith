@@ -26,6 +26,7 @@
 //! here reads, and a file carrying one opens with a row that says so instead of
 //! opening with an empty list.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -201,23 +202,55 @@ impl SubtitleTrack {
 /// because a project that opened yesterday has to open today -- a subtitle is
 /// not what a whole timeline should refuse over.
 pub fn open(path: &Path, track: Option<u64>) -> SubtitleTrack {
-    let Some(number) = track else {
-        return external(path);
-    };
-    let label = format!("track {number}");
-    let mut tracks = match of_matroska(path) {
-        Ok(tracks) => tracks,
-        Err(why) => return SubtitleTrack::refused(path, track, label, why.to_string()),
-    };
-    match tracks.iter().position(|t| t.track == Some(number)) {
-        Some(i) => tracks.swap_remove(i),
-        None => SubtitleTrack::refused(
-            path,
-            track,
-            label,
-            format!("no subtitle track {number} in {} any more", path.display()),
-        ),
-    }
+    let mut one = open_all(std::slice::from_ref(&(path.to_path_buf(), track)));
+    one.remove(0)
+}
+
+/// Every saved subtitle line of a project at once, back in the order they were
+/// saved in -- which is the order they are picked by, so it is the row order
+/// this hands back whatever it had to read.
+///
+/// The reason this exists beside [`open`]: a Matroska file is walked whole to
+/// reach *one* of its tracks, and a film whose project names thirty-five of them
+/// was thirty-five walks of a 25 GB file -- seven seconds with the window
+/// stopped, since a project opens on the UI thread. Each distinct file is walked
+/// once here and every row that named it is picked out of that one walk.
+pub fn open_all(rows: &[(PathBuf, Option<u64>)]) -> Vec<SubtitleTrack> {
+    // Keyed by path, so a second row naming the same file finds the walk rather
+    // than doing it again. The whole walk is kept until the last row is served:
+    // it is the tracks nobody asked for that are dropped at the end.
+    //
+    // ponytail: a track is *moved* out of its walk, so two rows naming the same
+    // file and the same track leave the second refused by name rather than
+    // holding the cues twice. No project edith saves has one -- a row is added
+    // by (file, track) and only once ([`crate::Project::add_subtitles`]) -- and
+    // a hand-written `.edith` with a doubled row still opens, with that row
+    // saying so. Clone the picked track instead if that ever has to hold.
+    let mut walked: HashMap<&Path, crate::Result<Vec<SubtitleTrack>>> = HashMap::new();
+    rows.iter()
+        .map(|(path, track)| {
+            let Some(number) = *track else {
+                return external(path);
+            };
+            let label = format!("track {number}");
+            let tracks = walked
+                .entry(path.as_path())
+                .or_insert_with(|| of_matroska(path));
+            let tracks = match tracks {
+                Ok(tracks) => tracks,
+                Err(why) => return SubtitleTrack::refused(path, *track, label, why.to_string()),
+            };
+            match tracks.iter().position(|t| t.track == Some(number)) {
+                Some(i) => tracks.swap_remove(i),
+                None => SubtitleTrack::refused(
+                    path,
+                    *track,
+                    label,
+                    format!("no subtitle track {number} in {} any more", path.display()),
+                ),
+            }
+        })
+        .collect()
 }
 
 /// A standalone subtitle file, parsed by its extension.
