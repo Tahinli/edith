@@ -15,6 +15,7 @@
 //! apart.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use crate::AudioSession;
 use crate::project::{Clip, Speed};
@@ -73,12 +74,50 @@ impl Default for Settings {
 /// settings above are all applied to the result and none of them needs a second
 /// decode.
 pub fn levels(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<Vec<f32>>> {
+    levels_with_progress(path, stream, &Progress::default())
+}
+
+/// What a running [`levels_with_progress`] says about itself while it runs, and
+/// the one word that stops it. Tenths of a second rather than a fraction: how
+/// far into the sound the decode has come is a fact the moment it starts, where
+/// a percentage needs a duration the header does not always carry.
+///
+/// Shared by an [`Arc`](std::sync::Arc) between the worker and whatever is
+/// drawing it, the way an export's progress is.
+#[derive(Default, Debug)]
+pub struct Progress {
+    /// Source time decoded so far, in tenths of a second. Only ever grows.
+    pub scanned: AtomicU64,
+    /// What the header claims the whole track is, in tenths of a second, or `0`
+    /// for a file that does not say -- the estimate is drawn as `~` and a `0`
+    /// is drawn as nothing rather than as a lie.
+    pub total: AtomicU64,
+    /// Set by whoever asked for the scan when nobody is waiting for it any
+    /// more. The loop below reads it once per chunk and gives up there; the
+    /// decoder behind it stops with the dropped receiver.
+    pub cancel: AtomicBool,
+}
+
+/// [`levels`] reporting where it has come to and stopping when it is told to.
+///
+/// A **cancelled scan returns what it had got to**, which is a prefix of the
+/// track and not an answer: the caller sets [`Progress::cancel`], so the caller
+/// is the one that must check it before believing the result.
+pub fn levels_with_progress(
+    path: impl AsRef<Path>,
+    stream: usize,
+    progress: &Progress,
+) -> crate::Result<Option<Vec<f32>>> {
     let sources = [(path.as_ref().to_path_buf(), stream)];
     let Some((meta, rx)) =
         AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])?
     else {
         return Ok(None);
     };
+    let rate = f64::from(meta.sample_rate).max(1.);
+    if let Some(total) = meta.total_samples {
+        progress.total.store((total as f64 / rate * 10.) as u64, Relaxed);
+    }
     // Fractional for `peaks`'s reason: 44100 / 50 is whole, 44100 / 30 is not,
     // and a rounded window drifts a bucket every few seconds over a long take.
     let per_window = f64::from(meta.sample_rate) / f64::from(WINDOWS_PER_SEC);
@@ -87,6 +126,14 @@ pub fn levels(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<Vec
     // mean square, kept in f64 because a loud minute is millions of terms.
     let mut sums: Vec<(f64, u64)> = Vec::new();
     for chunk in rx {
+        // Once per chunk, not per sample: a cancelled scan may run one block
+        // longer, and a progress line moves in blocks anyway.
+        if progress.cancel.load(Relaxed) {
+            break;
+        }
+        progress
+            .scanned
+            .store((chunk.start_sample as f64 / rate * 10.) as u64, Relaxed);
         for (frame, values) in chunk.samples.chunks(channels).enumerate() {
             let window = ((chunk.start_sample + frame as u64) as f64 / per_window) as usize;
             if window >= sums.len() {
@@ -287,6 +334,36 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// Reporting where a scan has got to changes nothing about what it finds,
+    /// and the word that stops one is heard: the numbers are the plain scan's
+    /// to the last window, the header's duration reaches the card, and a scan
+    /// cancelled before its first chunk comes back with a prefix instead of a
+    /// track -- which is why a cancelled scan is never cached.
+    #[test]
+    fn a_scan_that_reports_itself_finds_exactly_what_the_plain_one_does() {
+        use super::{Progress, levels_with_progress};
+        use std::sync::atomic::Ordering::Relaxed;
+        let progress = Progress::default();
+        let watched = levels_with_progress(asset("test_av.mp4"), 0, &progress)
+            .expect("open")
+            .expect("test_av.mp4 has an audio track");
+        let plain = levels(asset("test_av.mp4"), 0).expect("open").expect("audio");
+        assert_eq!(watched, plain, "a watched scan must find the same levels");
+        // Five seconds of fixture, in tenths, from the header and from the last
+        // chunk the loop saw.
+        assert_eq!(progress.total.load(Relaxed), 50);
+        assert!(progress.scanned.load(Relaxed) > 0);
+        assert!(progress.scanned.load(Relaxed) <= progress.total.load(Relaxed));
+        // Cancelled at the door: the loop gives up at its first chunk, the
+        // receiver is dropped and the decoder behind it stops with it.
+        let stopped = Progress::default();
+        stopped.cancel.store(true, Relaxed);
+        let partial = levels_with_progress(asset("test_av.mp4"), 0, &stopped)
+            .expect("open")
+            .expect("audio");
+        assert!(partial.len() < plain.len(), "{} windows", partial.len());
     }
 
     /// The three settings, each one visible on its own: a quiet run shorter
