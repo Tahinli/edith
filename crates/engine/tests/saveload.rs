@@ -209,7 +209,7 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 8\n"), "{text}");
+    assert!(text.starts_with("edith 9\n"), "{text}");
     assert!(
         text.contains("\nresolution 1280 720\n"),
         "a project with no resolution of its own is saved at source 0's: {text}"
@@ -297,7 +297,7 @@ fn a_version_4_project_holds_more_than_two_lanes() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
+        "edith 9\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          video 1 0 0 30 0 3 - - fit 1000\naudio 1\n\
          video 2 40 0 20 0 - - - fit 1000\naudio 2 0 0 30 0 3 - - fit 1000\n",
         "a four-lane project is written as it was read, three versions on"
@@ -327,7 +327,7 @@ fn a_version_5_project_carries_per_clip_equalizers() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
+        "edith 9\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
          eq 12000.0:6.25:0.5:hs\n\
          video 1 0 0 30 0 - 0 - fit 1000\nvideo 1 30 30 60 0 - 1 - fit 1000\n\
@@ -362,7 +362,7 @@ fn a_version_6_project_carries_per_clip_colours() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 test_av.mp4\n\
+        "edith 9\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls\n\
          color 0.1:1.2:0.9:-0.3\n\
          color -0.25:1.0:0.0:0.5\n\
@@ -412,7 +412,7 @@ fn a_version_7_project_carries_a_resolution_and_fit_policies() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 8\nplayhead 0\nresolution 960 720\nsource 0 test_av.mp4\n\
+        "edith 9\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
          video 1 0 0 30 0 - - - fill 1000\nvideo 1 30 30 60 0 - - - center 1000\n\
          audio 1 0 0 60 0 - - - fit 1000\n",
         "a v7 project is written back as the v8 it now is: the same clips, each \
@@ -670,7 +670,7 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 
     for (text, want) in [
         (
-            "edith 9\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
+            "edith 10\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
             "line 1",
         ),
         // An eq index the table does not hold, and a band shape there is none.
@@ -754,4 +754,75 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
             dir.join("test_av2.mp4").display()
         )
     );
+}
+
+/// The mix a project was left at comes back with it: a track's fader, the
+/// master limiter and the rate the timeline was cut at. A fader that vanished
+/// on a reload would be a setting nobody could keep.
+#[test]
+fn the_mix_survives_a_save_and_an_open() {
+    use engine::project::{Lane, LaneKind};
+    let dir = scratch("mix");
+    let source = copy_in(&dir, "test_av.mp4");
+    let mut saved = PlaybackSession::open(&source).expect("open the fixture");
+    let a2 = saved.add_lane(LaneKind::Audio);
+    assert!(saved.set_lane_gain_db(Lane::A1, -6.0));
+    assert!(saved.set_lane_gain_db(a2, 3.0));
+    let limiter = engine::limiter::Limiter {
+        ceiling_db: -2.0,
+        on: true,
+    };
+    assert!(saved.set_limiter(limiter));
+    let path = dir.join("mix.edith");
+    saved.save_project(&path).expect("save");
+
+    let mut loaded = PlaybackSession::open_project(&path).expect("open the project");
+    assert_eq!(loaded.lane_gain_db(Lane::A1), -6.0, "A1's fader");
+    assert_eq!(loaded.lane_gain_db(a2), 3.0, "A2's own, not A1's");
+    assert_eq!(loaded.limiter(), limiter);
+    assert!(!loaded.undo(), "a loaded mix is not an undo step");
+    // ...and saving it again is the same bytes: the format holds all of it.
+    let again = dir.join("again.edith");
+    loaded
+        .save_project(&again)
+        .expect("save the loaded project");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        std::fs::read(&again).unwrap(),
+        "save -> load -> save is not a fixed point"
+    );
+}
+
+/// The other half of the v9 bump, and the debt it pays: a timeline holding
+/// nothing but a song has no file to take a frame rate from, so it used to come
+/// back at the canvas rate whatever it was cut at. The written `fps` is now
+/// preferred over that inference -- and a project whose scaffold *does* have a
+/// picture still takes the rate from the file, which is what every clip on it
+/// was conformed to.
+#[test]
+fn a_song_only_project_comes_back_at_the_rate_it_names() {
+    let dir = scratch("song_fps");
+    copy_in(&dir, "test_tone.mp3");
+    let path = dir.join("song.edith");
+    std::fs::write(
+        &path,
+        "edith 9\nplayhead 0\nresolution 1920 1080\nfps 24.0\nsource 0 test_tone.mp3\n\
+         video 1\naudio 1 0 0 24 0 - - - fit 1000\n",
+    )
+    .expect("write a v9 song project");
+    let loaded = PlaybackSession::open_project(&path).expect("a song-only project opens");
+    assert_eq!(loaded.meta().frame_rate, 24.0, "the rate the file names");
+    assert_eq!(loaded.timeline_duration(), 1.0, "one second at 24 fps");
+
+    // The same file without the line -- which is every dialect before v9 --
+    // still comes back at the canvas rate, so an old project is unchanged.
+    let old = dir.join("song8.edith");
+    std::fs::write(
+        &old,
+        "edith 8\nplayhead 0\nresolution 1920 1080\nsource 0 test_tone.mp3\n\
+         video 1\naudio 1 0 0 24 0 - - - fit 1000\n",
+    )
+    .expect("write a v8 song project");
+    let loaded = PlaybackSession::open_project(&old).expect("a v8 song project opens");
+    assert_eq!(loaded.meta().frame_rate, 30.0, "the canvas rate, as before");
 }
