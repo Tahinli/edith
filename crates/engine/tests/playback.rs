@@ -284,15 +284,27 @@ fn seek_keeps_the_audio_clock() {
         "clock at {}",
         session.now()
     );
+    // From here on the *sound* is what the clock counts, and the sound restarts
+    // at once -- the video decoder's reopen (up to a VA-API init) happens
+    // underneath a stream that is already playing, so the window `next_index`
+    // spends waiting for the first picture is time the timeline really moved
+    // through. Measured against the wall rather than assumed free: counting it
+    // is the fix for the offset an edit-while-playing used to leave behind
+    // (`invalidation.rs`), where the clock re-anchored onto an empty ring and
+    // the picture stayed that far behind the sound for good.
+    let from = Instant::now();
     let first = next_index(&mut session, "seek(3.0)");
     assert_eq!(first, (3.0 * meta.frame_rate) as u32);
     let mut after_seek = None;
     run_for(&mut session, &mut after_seek, Duration::from_millis(600));
     let advanced = session.now();
-    eprintln!("seek(3.0) -> {advanced:.3}s, frames {first}..={after_seek:?}");
+    let real = from.elapsed().as_secs_f64();
+    eprintln!(
+        "seek(3.0) -> {advanced:.3}s after {real:.3}s of real time, frames {first}..={after_seek:?}"
+    );
     assert!(
-        (3.3..3.9).contains(&advanced),
-        "clock did not run at real speed after the seek: {advanced:.3}s"
+        (3.0 + real - 0.35..3.0 + real + 0.35).contains(&advanced),
+        "clock did not run at real speed after the seek: {advanced:.3}s after {real:.3}s"
     );
 
     // Everything from the target on, and nothing before it: ~2 s of frames.
