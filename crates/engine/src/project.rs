@@ -221,9 +221,120 @@ impl std::fmt::Display for Speed {
     }
 }
 
+/// What a file's own frame rate is against the timeline's, as an exact
+/// rational: how many frames of the *file* one frame of the timeline is worth.
+///
+/// Every frame number in this module counts **timeline** frames -- a clip's
+/// `in_frame` and `out_frame` included -- so a 23.976 fps file placed on a 30 fps
+/// timeline is as many frames long as the seconds it lasts, and every edit
+/// (trim, split, speed, paste) is the same arithmetic it always was. This is the
+/// one conversion, and it happens at the decoder's door: [`PlaybackSession`]
+/// opens a worker with it and [`crate::export`] pulls pictures through it. The
+/// file's own numbering exists nowhere else.
+///
+/// The same floor/ceil pair as [`Speed`], for the same reason: the frame an
+/// export encodes at a timeline frame has to be the frame playback is holding
+/// there. Composed *after* a speed rather than folded into it, so a 2x 24 fps
+/// clip on a 30 fps timeline is exactly both (`rate_composes_with_speed`).
+///
+/// Rational and not an `f64`, exactly: 24000/1001 over 30 is `800/1001` and
+/// stays `800/1001` however far the timeline runs, where a rate rounded to
+/// (say) milli-fps would leave a fraction of a frame per clip to pile up into a
+/// visible drift over an hour (`a_23_976_rate_is_exact_and_never_drifts`).
+///
+/// [`PlaybackSession`]: crate::PlaybackSession
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rate {
+    /// Frames of the file...
+    source: u32,
+    /// ...per this many frames of the timeline it plays on. Never zero.
+    timeline: u32,
+}
+
+impl Rate {
+    /// A file shot at the timeline's own rate: every conversion below is the
+    /// identity, which is the path a single-rate project is on.
+    pub const REAL_TIME: Self = Self {
+        source: 1,
+        timeline: 1,
+    };
+
+    /// The rate of a file at `source_fps` on a timeline at `timeline_fps`,
+    /// exactly.
+    ///
+    /// Both rates come out of a container as a division, so neither is ever the
+    /// number it means (`23.976023976...`); [`crate::mux::frame_timing`] is what
+    /// already knows how to name one exactly -- it is the same pair the muxer
+    /// counts an export's frames in -- and this is that pair divided by that
+    /// pair, reduced. A rate no timescale can name is an `Err` in that
+    /// function's own words rather than a silent 1:1 -- `matches_timeline` is
+    /// where a file carrying one is refused by name, beside the codec.
+    ///
+    /// Exactly [`REAL_TIME`](Self::REAL_TIME) when the two agree, which is every
+    /// timeline that had ever opened in this editor before mixed rates.
+    pub fn from_fps(source_fps: f64, timeline_fps: f64) -> crate::Result<Self> {
+        let (src_scale, src_ticks) = crate::mux::frame_timing(source_fps)?;
+        let (tl_scale, tl_ticks) = crate::mux::frame_timing(timeline_fps)?;
+        // fps is scale/ticks, so the ratio is (src_scale/src_ticks) / (tl_scale/tl_ticks).
+        let num = u64::from(src_scale) * u64::from(tl_ticks);
+        let den = u64::from(src_ticks) * u64::from(tl_scale);
+        let g = gcd(num, den);
+        let (mut num, mut den) = (num / g, den / g);
+        // A ratio no pair of real frame rates produces, but the fields are `u32`
+        // so that every multiplication below fits a `u64` at any frame count.
+        while num > u64::from(u32::MAX) || den > u64::from(u32::MAX) {
+            (num, den) = (num.div_ceil(2), den.div_ceil(2));
+        }
+        Ok(Self {
+            source: num.max(1) as u32,
+            timeline: den.max(1) as u32,
+        })
+    }
+
+    pub fn is_real_time(self) -> bool {
+        self.source == self.timeline
+    }
+
+    /// As a multiplier of the timeline's rate: what a *file's* own frame rate
+    /// is, given the timeline's, for a library row that names it.
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.source) / f64::from(self.timeline)
+    }
+
+    /// Which frame of the file the `frame`th timeline-rate frame of it is:
+    /// floored, [`Speed::source_at`]'s half of the pair.
+    pub fn source_at(self, frame: u32) -> u32 {
+        (u64::from(frame) * u64::from(self.source) / u64::from(self.timeline))
+            .min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Its inverse, ceiled ([`Speed::timeline_at`]'s half): the first
+    /// timeline-rate frame that shows source frame `source_frame` -- which is
+    /// the stamp playback puts on a decoded picture, and, applied to a file's
+    /// frame *count*, how long that file is in timeline frames.
+    pub fn timeline_at(self, source_frame: u32) -> u32 {
+        (u64::from(source_frame) * u64::from(self.timeline))
+            .div_ceil(u64::from(self.source))
+            .min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Greatest common divisor, for reducing a [`Rate`] to the numbers that fit its
+/// fields. `a` for `gcd(a, 0)`, and never zero: something divides by it.
+fn gcd(a: u64, b: u64) -> u64 {
+    match b {
+        0 => a.max(1),
+        b => gcd(b, a % b),
+    }
+}
+
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
 /// Never empty.
+///
+/// Counted at the **timeline's** frame rate, not the file's: a source shot at
+/// another rate is converted at the decoder's door ([`Rate`]), so every edit
+/// here is frames of one clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Clip {
     /// Timeline frame the clip's first frame is shown at. Meaningless on a
@@ -4555,6 +4666,87 @@ mod tests {
         assert_eq!(Speed::from_permille(1000), Speed::NORMAL);
         assert_eq!(Speed::NORMAL.to_string(), "1.00x");
         assert_eq!(Speed::from_permille(2500).to_string(), "2.50x");
+    }
+
+    /// [`Rate`] is [`Speed`]'s pair again, over the *file's* rate: the frame an
+    /// export encodes at a timeline frame is the one playback is holding there,
+    /// a file is as long in timeline frames as the seconds it lasts, and the two
+    /// compose so a speeded clip at another rate is exactly both.
+    #[test]
+    fn rate_composes_with_speed() {
+        // 23.976 into 30 (the ratio that does not terminate), 30 into 23.976,
+        // 60 into 30, 25 into 30 -- and the timeline's own rate, which must be
+        // the identity map or a single-rate project would move.
+        for (source_fps, timeline_fps) in [
+            (24000. / 1001., 30.),
+            (30., 24000. / 1001.),
+            (60., 30.),
+            (25., 30.),
+            (30., 30.),
+        ] {
+            let rate = Rate::from_fps(source_fps, timeline_fps).expect("a nameable rate");
+            for n in 0..2000u32 {
+                let source = rate.source_at(n);
+                // The stamp is the *first* timeline-rate frame that shows it, so
+                // the picture on screen at `n` is the picture encoded at `n`.
+                let held = (0..=source + 4)
+                    .filter(|&s| rate.timeline_at(s) <= n)
+                    .next_back();
+                assert_eq!(held, Some(source), "{source_fps} on {timeline_fps} at {n}");
+            }
+            // A file of `count` frames is `timeline_at(count)` frames long here,
+            // and its last one still reads a frame the file has.
+            for count in 1..500u32 {
+                let frames = rate.timeline_at(count);
+                assert!(frames >= 1, "a file is never zero frames long");
+                assert!(
+                    rate.source_at(frames - 1) < count,
+                    "{source_fps} on {timeline_fps}: {count} frames reads past the file"
+                );
+            }
+            // No drift: the mapping is one exact division of the *rate itself*,
+            // not an accumulation and not a rounded rate, so an hour in is as
+            // true as the first second. (Held to the real ratio of the two rates
+            // the caller asked for -- `as_f64` would be true of a wrong rate.)
+            for n in [1u32, 100, 10_000, 500_000, 3_000_000] {
+                let want = f64::from(n) * source_fps / timeline_fps;
+                assert!(
+                    (f64::from(rate.source_at(n)) - want).abs() < 1.,
+                    "{source_fps} on {timeline_fps}: frame {n} drifted"
+                );
+            }
+        }
+        // The timeline's own rate is the identity, whichever way it is written.
+        assert!(Rate::from_fps(30., 30.).expect("30 over 30").is_real_time());
+        assert!(
+            Rate::from_fps(30.0004, 30.)
+                .expect("30.0004 over 30")
+                .is_real_time(),
+            "a rate is named by the muxer's timescales, and 30.0004 is 30030/1001"
+        );
+        // ...and a rate no timescale can name is an `Err`, not a silent 1:1: the
+        // one thing `matches_timeline` refuses a file for now that the rate gate
+        // is gone.
+        assert!(Rate::from_fps(0., 30.).is_err(), "not a rate at all");
+        assert!(Rate::from_fps(30., f64::NAN).is_err());
+        for n in 0..1000 {
+            assert_eq!(Rate::REAL_TIME.source_at(n), n);
+            assert_eq!(Rate::REAL_TIME.timeline_at(n), n);
+        }
+        // ...and the composition, in the order the decoder's door applies it:
+        // the speed picks the clip's (timeline-rate) frame, the rate picks the
+        // file's. A 2x clip of a 23.976 fps file on a 30 fps timeline reads two
+        // timeline frames per frame shown, each of them exactly 800/1001 of a
+        // file frame.
+        let rate = Rate::from_fps(24000. / 1001., 30.).expect("23.976 over 30");
+        let speed = Speed::from_permille(2000);
+        for d in 0..100u32 {
+            assert_eq!(
+                rate.source_at(speed.source_at(d)),
+                (u64::from(d) * 2 * 800 / 1001) as u32,
+                "2x of a 23.976 fps file at timeline frame {d}"
+            );
+        }
     }
 
     /// The mapping a speed changes, and the one it does not: a 2x clip reads two
