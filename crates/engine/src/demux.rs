@@ -7,7 +7,10 @@
 //! (`.mkv`/`.webm`) walked here as EBML. AV1 is why the second one exists --
 //! `mp4 0.14` has no `av01` sample entry at all, and AV1 ships in Matroska in
 //! practice -- and HEVC rides the same walk, because that is the other codec a
-//! `.mkv` off a disc arrives in.
+//! `.mkv` off a disc arrives in. An AV1 *mp4* is read here too, its sample entry
+//! picked out of the `stsd` by hand for the same reason `mux` writes it by hand:
+//! this project exports one, and a file this cannot reopen is a file it had no
+//! business writing.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -131,9 +134,9 @@ pub struct Mp4Demuxer {
     /// (`audio::priming_samples`), and frame indices count from there.
     first_sample: u32,
     codec: Codec,
-    /// Annex-B parameter sets (SPS+PPS for H.264, VPS+SPS+PPS for HEVC),
-    /// re-injected ahead of every sync sample. Empty for VP9, which carries no
-    /// out-of-band parameter sets.
+    /// Annex-B parameter sets (SPS+PPS for H.264, VPS+SPS+PPS for HEVC), or
+    /// the sequence header OBU for AV1, re-injected ahead of every sync sample.
+    /// Empty for VP9, which carries no out-of-band parameter sets.
     parameter_sets: Vec<u8>,
     /// Bytes of the NAL length prefix each sample is written with, off `avcC`
     /// or `hvcC`. Unused by VP9.
@@ -160,20 +163,26 @@ impl Mp4Demuxer {
                 Ok(MediaType::H265) => Some((t, Codec::Hevc)),
                 Ok(MediaType::VP9) => Some((t, Codec::Vp9)),
                 // `mp4 0.14`'s `stsd` parser knows only a `hev1` sample entry
-                // (`stsd.rs:107`), so an `hvc1`-tagged HEVC track -- what Apple
-                // and ffmpeg's mov muxer write in practice -- reports no media
-                // type at all, and the file used to read back as having no
-                // video. Its sample tables (`stts`/`stsz`/`stsc`/`stss`) are
-                // parsed regardless of the entry the crate dropped, so only the
-                // fourcc has to be read here by hand. hvc1 differs from hev1 in
-                // that the parameter sets may not repeat in-band, which costs
-                // nothing: they are re-injected out of `hvcC` ahead of every
-                // sync sample either way.
-                _ => (matches!(t.track_type(), Ok(TrackType::Video))
-                    && sample_entry(path, t.track_id()).is_ok_and(|(kind, _)| &kind == b"hvc1"))
-                .then_some((t, Codec::Hevc)),
+                // (`stsd.rs:107`) and no `av01` at all, so an `hvc1`-tagged HEVC
+                // track -- what Apple and ffmpeg's mov muxer write in practice
+                // -- and every AV1 track report no media type, and such a file
+                // used to read back as having no video. Its sample tables
+                // (`stts`/`stsz`/`stsc`/`stss`) are parsed regardless of the
+                // entry the crate dropped, so only the fourcc has to be read
+                // here by hand. hvc1 differs from hev1 in that the parameter
+                // sets may not repeat in-band, which costs nothing: they are
+                // re-injected out of `hvcC` ahead of every sync sample either
+                // way, exactly as an AV1 sequence header is out of `av1C`.
+                _ => matches!(t.track_type(), Ok(TrackType::Video))
+                    .then(|| sample_entry(path, t.track_id()).ok())
+                    .flatten()
+                    .and_then(|(kind, _)| match &kind {
+                        b"hvc1" => Some((t, Codec::Hevc)),
+                        b"av01" => Some((t, Codec::Av1)),
+                        _ => None,
+                    }),
             })
-            .ok_or("no H.264, HEVC or VP9 video track in file")?;
+            .ok_or("no H.264, HEVC, VP9 or AV1 video track in file")?;
         let (track, codec) = track;
 
         let track_id = track.track_id();
@@ -216,10 +225,19 @@ impl Mp4Demuxer {
                 parameter_sets = sets;
                 bit_depth = depth;
             }
-            // No parameter sets: a VP9 sample is self-contained, and AV1 never
-            // reaches this arm at all -- `mp4 0.14` knows no `av01` sample
-            // entry, so AV1 only ever arrives through [`MkvDemuxer`].
-            Codec::Vp9 | Codec::Av1 => {}
+            // The sequence header OBU out of `av1C`, re-injected ahead of every
+            // sync sample exactly as [`MkvDemuxer`] does it off `CodecPrivate` --
+            // the same record in the same bytes, which is what makes an AV1 mp4
+            // written here and an AV1 Matroska written here one stream in two
+            // containers.
+            Codec::Av1 => {
+                let (_, entry) = sample_entry(path, track_id)?;
+                let av1c = child(entry.get(78..).unwrap_or_default(), b"av1C")
+                    .ok_or("no av1C box in the AV1 sample entry")?;
+                parameter_sets = parse_av1c(av1c)?;
+            }
+            // No parameter sets: a VP9 sample is self-contained.
+            Codec::Vp9 => {}
         }
         let sync_samples = track
             .trak
@@ -272,6 +290,16 @@ impl Mp4Demuxer {
         // no length prefixes to strip, no parameter sets to re-inject.
         if self.codec == Codec::Vp9 {
             return Ok(Some(sample.bytes.to_vec()));
+        }
+        // An AV1 one is a whole temporal unit, likewise unframed -- with the
+        // sequence header in front of it where a decoder may start.
+        if self.codec == Codec::Av1 {
+            let mut au = Vec::with_capacity(self.parameter_sets.len() + sample.bytes.len());
+            if sample.is_sync {
+                au.extend_from_slice(&self.parameter_sets);
+            }
+            au.extend_from_slice(&sample.bytes);
+            return Ok(Some(au));
         }
 
         let mut au = Vec::with_capacity(self.parameter_sets.len() + sample.bytes.len() + 16);
@@ -1075,7 +1103,7 @@ fn read_top_level(path: &Path, want: &[u8; 4]) -> crate::Result<Option<Vec<u8>>>
 /// The ISO-BMFF boxes in `buf`, as (type, payload). Stops at the first
 /// malformed header rather than erroring: every caller is looking for one box
 /// and reports its own absence.
-fn boxes(mut buf: &[u8]) -> impl Iterator<Item = (&[u8; 4], &[u8])> {
+pub(crate) fn boxes(mut buf: &[u8]) -> impl Iterator<Item = (&[u8; 4], &[u8])> {
     std::iter::from_fn(move || {
         let header: &[u8; 8] = buf.get(..8)?.try_into().ok()?;
         let (size, header_len) = match u32::from_be_bytes(header[..4].try_into().unwrap()) as usize

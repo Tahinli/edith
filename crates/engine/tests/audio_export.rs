@@ -55,8 +55,8 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// One second of `test_av`, one second of hole, one second of `test_tone.mp3`.
 ///
 /// Three things at once: a cut, a gap (which must arrive as silence), and a
-/// source the mp4 export flatly refuses — there is no AAC encoder here, so an
-/// mp3 on the timeline can *only* leave through this door.
+/// source no mp4 sample table holds — an mp3, which the mp4 path decodes and
+/// re-encodes today and once refused outright.
 fn mixed_project() -> Project {
     let clip = |start, source| Clip {
         start,
@@ -252,6 +252,116 @@ fn exports_the_timeline_as_a_flac() {
     std::fs::remove_file(&out).unwrap();
 }
 
+/// The third audio row, and the one that used to be a licence note: `rusty_mp3`
+/// encodes it, and the file is read straight back through symphonia's mp3
+/// decoder -- the very door an mp3 *import* comes in through, so an export can
+/// be dropped back onto the timeline it came from.
+///
+/// The shape is checked loosely where MP3 cannot be exact: the encoder pads its
+/// tail to a whole 1152-frame frame and the decoder hands back the padding, so
+/// the length is asserted to within a frame instead of to the sample. What is
+/// exact is the edit -- audible, silent, audible -- and the fixtures' 1 Hz
+/// pulse inside the first second.
+#[test]
+fn exports_the_timeline_as_an_mp3() {
+    let out = out_path("mp3", "mp3");
+    let handle = engine::export::start(
+        mixed_project(),
+        meta(),
+        &out,
+        &ExportSettings {
+            format: Format::Mp3,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(120)).expect("mp3 export");
+    assert_eq!(handle.progress(), 1.0, "finished at full progress");
+    assert!(!part_path(&out).exists(), "the .part was renamed away");
+
+    let (meta, samples) = decode(&out);
+    assert_eq!((meta.sample_rate, meta.channels), (RATE, 2));
+    let channels = usize::from(meta.channels);
+    let frames = samples.len() / channels;
+    let timeline = (3.0 * f64::from(RATE)) as usize;
+    assert!(
+        frames >= timeline && frames <= timeline + 2 * 1152,
+        "{frames} frames for a three-second timeline ({timeline})"
+    );
+    let av = rms(&samples, channels, 0.05, 0.95);
+    let gap = rms(&samples, channels, 1.1, 1.9);
+    let tone = rms(&samples, channels, 2.05, 2.95);
+    println!("mp3 rms: av {av:.4}  gap {gap:.6}  mp3 second {tone:.4}");
+    assert!(av > 0.01, "the first second is audible");
+    assert!(tone > 0.01, "the mp3 second is audible");
+    assert!(gap < av / 20.0, "the hole is silence: {gap:.6}");
+    let peak = rms(&samples, channels, 0.2, 0.3);
+    let dip = rms(&samples, channels, 0.7, 0.8);
+    assert!(
+        peak > dip * 4.0,
+        "the 1 Hz pulse survived: peak {peak:.4} vs dip {dip:.4}"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The failure a user hit, as a test: a still picture and a song, exported as an
+/// **mp4**. There is no AAC track anywhere in that timeline to copy -- an mp3
+/// holds no such packets and a png holds nothing at all -- so this used to be
+/// refused by name and the only way out was a WAV beside a picture nobody had.
+/// The song is decoded and encoded as AAC instead (`export::copy_audio` falls
+/// through to `encode_audio`), and the file comes back with picture *and* sound.
+#[test]
+fn a_still_and_a_song_export_as_an_mp4_with_sound() {
+    let song = asset("test_tone.mp3");
+    let still = asset("test_still.png");
+    let clip = |source, frames| Clip {
+        start: 0,
+        in_frame: 0,
+        out_frame: frames,
+        source,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    // Two seconds of each at the project's own 30 fps: a still has no length of
+    // its own and the song is longer than what is placed.
+    let project = Project::from_parts(
+        vec![Source::new(still, 0), Source::new(song, 0)],
+        vec![
+            (LaneKind::Video, vec![clip(0, 60)]),
+            (LaneKind::Audio, vec![clip(1, 60)]),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a still under a song");
+    // The project's own picture size and rate: the still decides the one and
+    // the scaffold the other, exactly as opening a png in the editor does.
+    let meta = engine::VideoMeta {
+        width: 640,
+        height: 360,
+        frame_rate: 30.0,
+        frame_count: 60,
+        codec: engine::Codec::H264,
+    };
+    let out = out_path("still_song", "mp4");
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    wait(&handle, Duration::from_secs(300)).expect("an mp4 of a still under a song");
+
+    // Picture: two seconds of it, through the demuxer an import uses.
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen the export");
+    assert_eq!((written.width, written.height), (640, 360));
+    assert_eq!(written.frame_count, 60, "two seconds at 30 fps");
+    // ...and sound, which is the half that used to be missing.
+    let (audio, samples) = decode(&out);
+    let channels = usize::from(audio.channels);
+    let heard = rms(&samples, channels, 0.2, 1.8);
+    println!("still+song: {} Hz, rms {heard:.4}", audio.sample_rate);
+    assert!(heard > 0.01, "the song is in the file (rms {heard:.4})");
+    std::fs::remove_file(&out).unwrap();
+}
+
 /// Cancel leaves nothing behind -- not the output, not the `.part`. The
 /// timeline is long enough (a minute of audio) that the escape lands mid-decode
 /// rather than after the file is already closed.
@@ -307,9 +417,9 @@ fn a_silent_timeline_refuses_an_audio_export() {
     );
 }
 
-/// An AC-3 source leaves through this door and no other: the mp4 export cannot
-/// copy a syncframe into an `mp4a` track (no AAC encoder here), but a WAV of the
-/// same timeline decodes, downmixes and reopens through the engine's own reader.
+/// An AC-3 source through the audio-only door: the mp4 export cannot
+/// copy a syncframe into an `mp4a` track, but a WAV of the same timeline
+/// decodes, downmixes and reopens through the engine's own reader.
 #[test]
 fn a_51_ac3_source_round_trips_through_a_wav() {
     let source = asset("test_ac3_51.mp4");

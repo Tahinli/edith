@@ -160,8 +160,10 @@ fn an_ac3_track_decodes_and_51_comes_down_to_stereo() {
     }
 }
 
-/// An AC-3 source cannot be packet-copied into an mp4 -- there is no AAC
-/// encoder here -- and that refusal is named, never a silent silent export.
+/// An AC-3 syncframe is not something an `mp4a` sample table holds, so the
+/// *copy* path names it and hands the export on to the re-encode (which decodes
+/// this very source: the downmix above is what it encodes). Named either way --
+/// never a silent export.
 #[test]
 fn an_ac3_source_refuses_an_mp4_audio_copy() {
     let Err(err) = AudioSession::copy_segments(asset("test_ac3.mp4"), &[(0.0, 1.0)]) else {
@@ -169,7 +171,7 @@ fn an_ac3_source_refuses_an_mp4_audio_copy() {
     };
     let err = err.to_string();
     assert!(
-        err.contains("needs AAC audio") && err.contains("AC-3"),
+        err.contains("needs AAC in an mp4") && err.contains("AC-3"),
         "unhelpful refusal: {err}"
     );
 }
