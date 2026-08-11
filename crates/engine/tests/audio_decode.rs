@@ -272,3 +272,40 @@ fn an_ac3_source_refuses_an_mp4_audio_copy() {
         "unhelpful refusal: {err}"
     );
 }
+
+/// The two things a Matroska file with no *readable* sound can be, told apart:
+/// a file with no audio track is the silent source it says it is, and a file
+/// whose audio will not open at all is an error. They used to be the same
+/// answer -- silence -- so a broken track played and exported as a hole with
+/// nothing but an `eprintln` to say why.
+#[test]
+fn a_matroska_with_no_track_is_silent_and_a_broken_one_is_an_error() {
+    // No audio track at all: a picture and two subtitle tracks. Silent, and the
+    // stream picker offers nothing rather than refusing the file.
+    let subs = asset("test_subs.mkv");
+    assert!(
+        AudioSession::probe(&subs, 0)
+            .expect("no audio is not an error")
+            .is_none(),
+        "an mkv with no audio track is a silent source"
+    );
+    assert!(AudioSession::probe_streams(&subs).expect("list").is_empty());
+    assert!(
+        AudioSession::open(&subs).expect("open").is_none(),
+        "no sound"
+    );
+
+    // ...and a file that will not parse at all, under the same extension: an
+    // `Err` a front-end can show, not a silent import.
+    let broken = std::env::temp_dir().join(format!("ve_broken_{}.mkv", std::process::id()));
+    std::fs::write(&broken, b"\x1a\x45\xdf\xa3not a matroska file at all").expect("write");
+    let err = AudioSession::probe(&broken, 0)
+        .expect_err("a broken file must not pass for a silent one")
+        .to_string();
+    assert!(!err.is_empty(), "the refusal says something");
+    assert!(
+        AudioSession::probe_streams(&broken).is_err(),
+        "and so does the listing"
+    );
+    std::fs::remove_file(&broken).unwrap();
+}
