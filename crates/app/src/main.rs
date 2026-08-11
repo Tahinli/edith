@@ -116,10 +116,28 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 /// keeps the card inside the smallest window no matter how many actions the
 /// editor grows -- ten rows fit here, and the eleventh is a scroll away.
 const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
-/// The same for the export card, which carries a fixed-format line and a button
-/// under its list and so has less room: destination, ten formats and five
-/// qualities are fifteen rows, eight of them on screen.
+/// The same for the export card, which carries two summary lines and a button
+/// under its list and so has less room: a section header, six codecs, the
+/// container, five qualities and the destination are more rows than a 360 px
+/// window holds. Eight on screen, which is the whole format section and its
+/// header -- what a user picks first is never behind a scroll.
 const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
+/// The export card is wider than the keybindings one: its rows carry a key, a
+/// name *and* what the choice means, and the two summary lines under them state
+/// the whole file. At `KEYS_W` every one of those wrapped to two lines, which is
+/// the card the user called unfriendly. Still inside the 640 px floor with the
+/// scrim showing either side of it.
+const EXPORT_W: f32 = 420.;
+/// The column the key of a row is printed in, wide enough for `0–9`: every row
+/// in the export card says what picks it, so the card is drivable by keyboard
+/// without a legend to memorise.
+const EXPORT_KEY_W: f32 = 26.;
+/// Everything in the export card that is *not* the row list: the title, the
+/// status line, the head and tail of the summary, the button, the gaps between
+/// them and the padding around the lot. What the list may be is the window
+/// minus this -- and never less than [`EXPORT_ROWS_H`], which is the number
+/// that makes the card fit the 360 px floor.
+const EXPORT_FIXED_H: f32 = 17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.;
 /// The menu a right-click on a clip opens: wide enough for the longest label
 /// beside the stroke that does the same thing, with the click targets `HIT_MIN`
 /// binds like every other list here.
@@ -714,6 +732,15 @@ struct Player {
     /// time -- opening either closes the other, since both are the whole window
     /// and two stacked scrims say nothing about which one is listening.
     export_open: bool,
+    /// How the card lays its rows out, and where the formats this program
+    /// cannot write are said. Two shapes of the same card, kept behind `g` and
+    /// `r` so the choice between them can be made by looking at both rather
+    /// than by argument: sections with headers against one flat list, and a
+    /// collapsed "cannot write" footer against a dimmed row each. The defaults
+    /// are grouped and collapsed -- the five dead rows used to eat the fold.
+    /// Not persisted: this is a look, not a setting.
+    export_grouped: bool,
+    export_refusals_inline: bool,
     /// Which quality row the card has picked, and the megabits typed against
     /// the custom one. Kept across closes, so a second export offers what the
     /// first one chose.
@@ -3114,6 +3141,38 @@ impl Player {
         self.export_path = retarget(&self.export_path, format);
     }
 
+    /// The container row: the same codec in the other box, which retargets the
+    /// destination exactly as picking a codec does -- and does nothing at all
+    /// for a codec with only one box, so the stroke cannot invent a choice the
+    /// card is not offering.
+    fn cycle_container(&mut self) {
+        self.set_format(next_container(self.format));
+    }
+
+    /// The quality rows by keyboard, wrapping. Refused by name where the format
+    /// has no bitrate to pick: a key that silently does nothing is the card
+    /// looking broken.
+    fn cycle_quality(&mut self) {
+        if let Some(why) = bitrate_refusal(self.format) {
+            self.notice = Some(why.into());
+            return;
+        }
+        let at = Quality::ALL
+            .iter()
+            .position(|&q| q == self.quality)
+            .unwrap_or(0);
+        self.quality = Quality::ALL[(at + 1) % Quality::ALL.len()];
+    }
+
+    /// The custom bitrate by pointer: the typed digits were the only control in
+    /// this card a mouse could not reach. Clamped to the range the row states
+    /// (the engine's own 1..20 Mbps), and picking the row is part of the step --
+    /// a stepper that moves a number nobody is using would move nothing.
+    fn nudge_mbps(&mut self, step: i32) {
+        self.custom_mbps = (self.custom_mbps as i32 + step).clamp(1, 20) as u32;
+        self.quality = Quality::Custom;
+    }
+
     /// The card's Destination row: the desktop's save dialog, on a background
     /// thread like the import chooser -- the user may sit in it and the window
     /// behind must not freeze. No chooser at all leaves the default path, which
@@ -3352,16 +3411,35 @@ impl Render for Player {
                         // The card's own button, by keyboard: the one thing in
                         // it that writes a file must not be pointer-only either.
                         this.start_export(cx);
-                    } else if let Some(format) = format_key(key) {
-                        // The format rows by their initial, so the card can be
+                    } else if let Some(format) = format_key(key, this.format) {
+                        // The codec rows by their own letter, so the card can be
                         // driven without a mouse -- the same card-local input
                         // the typed bitrate is, and for the same reason: a
                         // choice reachable only by pointer is not reachable by
                         // everyone. Not a keymap binding: it means nothing
                         // outside this card, exactly like the digits.
                         this.set_format(format);
+                    } else if key == "c" {
+                        this.cycle_container();
+                    } else if key == "q" {
+                        this.cycle_quality();
+                    } else if key == "d" {
+                        // The save dialog, which was the one row here a
+                        // keyboard could not open.
+                        this.pick_destination(cx);
+                    } else if key == "g" {
+                        this.export_grouped = !this.export_grouped;
+                    } else if key == "r" {
+                        this.export_refusals_inline = !this.export_refusals_inline;
                     } else if let Ok(digit) = key.parse::<u32>() {
-                        this.custom_mbps = push_digit(this.custom_mbps, digit);
+                        let next = push_digit(this.custom_mbps, digit);
+                        // A refused third digit says so: it used to be dropped
+                        // in silence, which left the card showing a number the
+                        // user had already typed past.
+                        if next == this.custom_mbps && this.custom_mbps > 0 {
+                            this.notice = Some("1–20 Mbps — a third digit is refused".into());
+                        }
+                        this.custom_mbps = next;
                         this.quality = Quality::Custom;
                     } else if key == "backspace" {
                         this.custom_mbps /= 10;
@@ -3699,7 +3777,7 @@ impl Render for Player {
             // Last, so they are over everything -- they take no room in the
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
-            .children(self.export_card(cx))
+            .children(self.export_card(window.viewport_size(), cx))
             .children(self.eq_card(cx))
             .children(self.color_card(cx))
             .children(self.speed_card(cx))
@@ -4681,16 +4759,33 @@ impl Player {
         )
     }
 
-    /// What an export is going to be, before there is one: the destination, the
-    /// quality rows, and the two things that are not a choice at all. The same
-    /// scrim, width and row shape as the keybindings overlay -- two cards of
-    /// different builds over one window read as two different programs -- and
-    /// the same plain divs, so the root keeps the keyboard and a typed digit
-    /// reaches the custom row.
-    fn export_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    /// What an export is going to be, before there is one: the codec, the box
+    /// it goes into, the bitrate, where it lands -- and, above the button, the
+    /// two lines that state the file all of that adds up to. The same scrim and
+    /// row shape as the keybindings overlay (two cards of different builds over
+    /// one window read as two different programs) and the same plain divs, so
+    /// the root keeps the keyboard and a typed digit reaches the custom row.
+    ///
+    /// Every row carries the key that picks it, so the card is drivable end to
+    /// end without a pointer *and* without a legend to memorise -- and every
+    /// row is clickable, the bitrate's steppers included, so it is drivable end
+    /// to end without a keyboard as well.
+    ///
+    /// Two shapes of it, behind `g` and `r`: sections against one flat list,
+    /// and the codecs with no encoder collapsed into a footer against a dimmed
+    /// row each. Grouped and collapsed is what opens.
+    fn export_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         if !self.export_open {
             return None;
         }
+        // The cap is what keeps the card inside the smallest window; a taller
+        // one gets a taller list rather than a scroll past empty space, and the
+        // card is still only as tall as the rows it has.
+        let rows_h = (f32::from(viewport.height) - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
         let row = |id: (&'static str, usize)| {
             div()
                 .id(id)
@@ -4707,70 +4802,261 @@ impl Player {
         // A row that cannot be picked is dimmed and takes no click, exactly as
         // an inapplicable item in the clip menu is: it still says its piece.
         let live = |d: Stateful<Div>, enabled: bool| {
-            d.when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
-                .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
-        };
-        // The formats first: the quality rows below are *video* bitrate, so
-        // which file is being written decides whether they mean anything.
-        // An mp4 this timeline cannot be written as reads exactly like the
-        // formats there is no encoder for: dimmed, unclickable, and carrying its
-        // own reason instead of the detail line.
-        let formats: Vec<_> = FORMATS
-            .into_iter()
-            .enumerate()
-            .map(|(i, (format, _, label, detail))| {
-                // Per row, because the two picture formats are refused by
-                // different things: an audio-only timeline greys both, a second
-                // audio lane only the mp4.
-                let refused = format
-                    .zip(self.session.as_ref())
-                    .and_then(|(f, s)| format_refusal(s, f));
-                let blocked = refused.is_some();
-                let detail: SharedString = match &refused {
-                    Some(why) => why.clone().into(),
-                    None => detail.into(),
-                };
-                let picked = format == Some(self.format) && !blocked;
-                let format = format.filter(|_| !blocked);
-                live(row(("format", i)), format.is_some())
-                    .when(picked, |d| d.bg(rgb(SELECTED)))
-                    .when_some(format, |d, format| {
-                        d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.set_format(format);
-                            cx.notify();
-                        }))
-                    })
-                    .child(label)
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(detail),
-                    )
+            d.when(!enabled, |d| {
+                d.cursor_not_allowed().text_color(rgb(INK_DIM))
             })
-            .collect();
-        let video = self.format.has_video();
-        let rows: Vec<_> = Quality::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(i, quality)| {
-                live(row(("quality", i)), video)
-                    .when(video && self.quality == quality, |d| d.bg(rgb(SELECTED)))
-                    .when(video, |d| {
-                        d.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))))
+        };
+        // A row as this card writes them: the mark saying which one is picked,
+        // the key that picks it, its name, and what the choice means. The mark
+        // is a glyph and not only a colour -- a background alone is gone the
+        // moment a hover lands on the row, and invisible to anyone who cannot
+        // tell the two greys apart (WCAG 1.4.1).
+        let entry = |id: (&'static str, usize),
+                     key: &str,
+                     label: SharedString,
+                     detail: SharedString,
+                     picked: bool,
+                     enabled: bool| {
+            // The small print of a picked row sits on the highlight, where the
+            // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
+            // 1.4.3, and the fit test pins both numbers).
+            let ink = match picked {
+                true => INK,
+                false => INK_DIM,
+            };
+            live(row(id), enabled)
+                .when(picked, |d| d.bg(rgb(SELECTED)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().w(px(10.)).child(match picked {
+                            true => "✓",
+                            false => " ",
+                        }))
+                        .child(
+                            div()
+                                .w(px(EXPORT_KEY_W))
+                                .text_size(px(11.))
+                                .text_color(rgb(ink))
+                                .child(SharedString::from(key.to_string())),
+                        )
+                        .child(label),
+                )
+                // Wraps rather than runs off the row: a refusal is the longest
+                // thing in this column and the half of it past the edge is the
+                // half that says what to do instead.
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .flex_shrink()
+                        .text_size(px(11.))
+                        .text_color(rgb(ink))
+                        .child(detail),
+                )
+        };
+        let header = |text: &'static str| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .pt(px(4.))
+                .text_size(px(10.))
+                .text_color(rgb(INK_DIM))
+                .child(text)
+                .into_any_element()
+        };
+        let mut list: Vec<AnyElement> = Vec::new();
+        if self.export_grouped {
+            list.push(header("FORMAT"));
+        }
+        // The codecs first: which one is being written decides whether every
+        // row under it means anything. One a *this* timeline cannot be written
+        // as (an audio-only edit, for a picture codec) reads exactly like one
+        // there is no encoder for -- dimmed, unclickable, and carrying its own
+        // reason where its detail was, with nothing to click to find that out.
+        let mut refusals: Vec<String> = Vec::new();
+        for (i, (boxes, key, label, detail)) in FORMATS.into_iter().enumerate() {
+            let format = same_box(boxes, self.format);
+            let refused = format
+                .zip(self.session.as_ref())
+                .and_then(|(f, s)| format_refusal(s, f));
+            // A codec with no encoder here at all is the other kind of refusal,
+            // and the one the footer collects: it can never become pickable, so
+            // a row each is dead rows above the fold.
+            if format.is_none() {
+                refusals.push(format!("{label} — {detail}"));
+                if !self.export_refusals_inline {
+                    continue;
+                }
+            }
+            let detail: SharedString = match &refused {
+                Some(why) => why.clone().into(),
+                None => detail.into(),
+            };
+            let format = format.filter(|_| refused.is_none());
+            let mut r = entry(
+                ("format", i),
+                key,
+                label.into(),
+                detail,
+                boxes.contains(&self.format),
+                format.is_some(),
+            );
+            if let Some(format) = format {
+                r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_format(format);
+                    cx.notify();
+                }));
+            }
+            list.push(r.into_any_element());
+        }
+        if self.export_grouped {
+            list.push(header("DETAILS"));
+        }
+        // The container, and only where the picked codec has more than one box:
+        // a row offering a single choice reads as a choice.
+        let boxes = containers(self.format);
+        if boxes.len() > 1 {
+            let next = next_container(self.format);
+            list.push(
+                entry(
+                    ("container", 0),
+                    "c",
+                    "Container".into(),
+                    format!(
+                        "{} — c for {}",
+                        self.format.ext().to_uppercase(),
+                        next.ext().to_uppercase()
+                    )
+                    .into(),
+                    false,
+                    true,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.cycle_container();
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
+        match bitrate_refusal(self.format) {
+            // One dimmed row carrying the reason, rather than five rows of a
+            // figure that will not be written: the quality rows are the
+            // *picture's* bitrate, and this file has no picture in it.
+            Some(why) => list.push(
+                entry(
+                    ("quality", 0),
+                    "q",
+                    "Quality".into(),
+                    why.into(),
+                    false,
+                    false,
+                )
+                .into_any_element(),
+            ),
+            None => {
+                for (i, quality) in Quality::ALL.into_iter().enumerate() {
+                    let mut r = entry(
+                        ("quality", i),
+                        match quality {
+                            // The one row a key does not step to but types
+                            // into, which is what its key column says.
+                            Quality::Custom => "0–9",
+                            _ => "q",
+                        },
+                        quality.label().into(),
+                        quality.detail(self.custom_mbps).into(),
+                        self.quality == quality,
+                        true,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
                             this.quality = quality;
                             cx.notify();
-                        }))
-                    })
-                    .child(quality.label())
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(quality.detail(self.custom_mbps)),
-                    )
-            })
-            .collect();
+                        },
+                    ));
+                    if quality == Quality::Custom {
+                        r = r.child(self.mbps_steppers(cx));
+                    }
+                    list.push(r.into_any_element());
+                }
+            }
+        }
+        let destination = entry(
+            ("destination", 0),
+            "d",
+            "Destination".into(),
+            file_name(&self.export_path).into(),
+            false,
+            true,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
+        .into_any_element();
+        match self.export_grouped {
+            true => list.push(destination),
+            // Flat: the same rows with no headers over them, and the
+            // destination back at the top where the card used to open with it.
+            false => list.insert(0, destination),
+        }
+        if !self.export_refusals_inline && !refusals.is_empty() {
+            // Last, and one line: the reason travels with the name (a footer
+            // that only listed them would be the "why not?" the rows exist to
+            // answer), but nothing here can ever be picked, so it sits under
+            // every row that can rather than above them.
+            list.push(
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_DIM))
+                    .child(format!("cannot write: {}", refusals.join(" · ")))
+                    .into_any_element(),
+            );
+        }
+        // What the rows add up to, which is the one thing that has to be right:
+        // codec, box, size, rate, sound, where it goes and about how big. Two
+        // lines, outside the scrolling list, so it is on screen whatever the
+        // list is scrolled to and whatever is picked.
+        let picture = self
+            .session
+            .as_ref()
+            .map(|s| (s.resolution(), s.meta().frame_rate));
+        let audio = self
+            .session
+            .as_ref()
+            .map_or("", |s| s.planned_audio(self.format));
+        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        let mb = estimated_mb(
+            settings.bitrate.filter(|_| self.format.has_video()),
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::timeline_duration),
+        );
+        let head = summary_head(self.format, picture, audio);
+        let tail = summary_tail(
+            &self.export_path,
+            mb,
+            self.export_seat.and_then(|(.., seat)| seat),
+            self.format.has_video(),
+        );
+        // The button says the refusal *before* it is pressed: the picked codec
+        // can go invalid one edit after it was picked (a cleared video lane),
+        // and a button that looks ready until it is pressed is the lie the
+        // dimmed rows above it are there to avoid.
+        let blocked = self
+            .session
+            .as_ref()
+            .and_then(|s| format_refusal(s, self.format));
+        let action: SharedString = match &blocked {
+            Some(why) => {
+                format!("Cannot export — {}", why.split(" — ").next().unwrap_or(why)).into()
+            }
+            None => "Export".into(),
+        };
         Some(
             div()
                 .absolute()
@@ -4784,7 +5070,7 @@ impl Player {
                 })
                 .child(
                     div()
-                        .w(px(KEYS_W))
+                        .w(px(EXPORT_W))
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -4794,7 +5080,9 @@ impl Player {
                         .child(div().flex_none().px(px(6.)).child("Export"))
                         // The status line, where a refusal from the save dialog
                         // lands: the notice bar it would otherwise take is under
-                        // the scrim.
+                        // the scrim. The keys are on the rows, so this says how
+                        // the card as a whole is answered rather than listing
+                        // them a second time.
                         .child(
                             div()
                                 .flex_none()
@@ -4802,56 +5090,33 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "pick a format (m/a/v/h/x/w/f/p), then Export — esc closes"
+                                    "the keys are on the rows · enter exports · esc closes · \
+                                     g/r change the layout"
                                         .into()
                                 })),
                         )
                         // Capped and scrolling like the keybindings list: the
-                        // destination, ten formats and five qualities are more
-                        // rows than a 360 px window has room for, and it is the
-                        // list that scrolls, never the card that grows.
+                        // rows are more than a 360 px window has room for, and
+                        // it is the list that scrolls, never the card that
+                        // grows -- the summary and the button below stay put.
                         .child(
                             div()
                                 .id("export-rows")
                                 .flex()
                                 .flex_col()
                                 .gap(px(2.))
-                                .max_h(px(EXPORT_ROWS_H))
+                                .max_h(px(rows_h))
                                 .overflow_y_scroll()
-                                .child(
-                                    live(row(("destination", 0)), true)
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.pick_destination(cx)
-                                        }))
-                                        .child("Destination")
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(rgb(INK_DIM))
-                                                .child(file_name(&self.export_path)),
-                                        ),
-                                )
-                                .children(formats)
-                                .children(rows),
+                                .children(list),
                         )
-                        // What the picked row really writes. `moov` last is the
-                        // muxer's own shape -- an mp4 is playable only once it
-                        // is finished. The project's resolution is on the same
-                        // line because it *is* what the file comes out at,
-                        // whatever size the media on the timeline are: this is
-                        // the one place the number is shown, and ctrl+r is what
-                        // changes it.
+                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(head))
                         .child(
                             div()
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(export_line(
-                                    self.format,
-                                    self.session.as_ref(),
-                                    self.export_seat.and_then(|(.., seat)| seat),
-                                )),
+                                .child(tail),
                         )
                         .child(
                             div()
@@ -4862,7 +5127,10 @@ impl Player {
                                 .items_center()
                                 .justify_center()
                                 .rounded(px(3.))
-                                .bg(rgb(SELECTED))
+                                .bg(rgb(match blocked.is_some() {
+                                    true => CHROME,
+                                    false => SELECTED,
+                                }))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(HOVER)))
                                 .on_click(
@@ -4870,10 +5138,40 @@ impl Player {
                                         this.start_export(cx)
                                     }),
                                 )
-                                .child("Export"),
+                                .child(action),
                         ),
                 ),
         )
+    }
+
+    /// The custom bitrate's two pointer buttons. The typed digits were the last
+    /// control in this card a mouse could not reach at all -- and a number that
+    /// can only be typed is a number a hand on the pointer has to leave the
+    /// card to change. `HIT_MIN` square, like every other target here.
+    fn mbps_steppers(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let step = |id: &'static str, label: &'static str, by: i32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .w(px(HIT_MIN))
+                .h(px(HIT_MIN))
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .bg(rgb(CHROME))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.nudge_mbps(by);
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        div()
+            .flex()
+            .gap(px(4.))
+            .child(step("mbps-down", "−", -1, cx))
+            .child(step("mbps-up", "+", 1, cx))
     }
 
     /// The equalizer of one audio clip: its frequency response drawn as a
@@ -6954,58 +7252,97 @@ impl Quality {
 /// for. AAC is not a row at all: it is what both containers' sound *is*, never a
 /// file of its own.
 ///
-/// AV1 is two rows because a codec and a container are two choices: the same
-/// picture and the same AAC track go into a Matroska file or into an mp4, and
-/// which one a user needs is about what has to play the file, not about the
-/// encode. HEVC is two rows for the same reason.
-const FORMATS: [(Option<Format>, &str, &str, &str); 10] = [
-    (Some(Format::Mp4), "m", "MP4", "H.264 picture + AAC sound"),
+/// A codec is one row, and the boxes it can be written into are the row's
+/// containers: the same AV1 picture and the same AAC track go into a Matroska
+/// file or into an mp4, and which one a user needs is about what has to play
+/// the file, not about the encode. So the container is asked *once*, in a row
+/// of its own, and only where there is more than one to ask about -- five
+/// picture rows to read past were four of them saying the same codec twice.
+const FORMATS: [(&[Format], &str, &str, &str); 8] = [
     (
-        Some(Format::Av1),
+        &[Format::Mp4],
+        "m",
+        "H.264",
+        "plays everywhere · AAC sound · MP4 only",
+    ),
+    (
+        &[Format::Av1, Format::Av1Mp4],
         "a",
-        "AV1 · MKV",
-        "AV1 picture + AAC sound in .mkv",
+        "AV1",
+        "smallest file for the picture · AAC sound",
     ),
     (
-        Some(Format::Av1Mp4),
-        "v",
-        "AV1 · MP4",
-        "the same AV1 picture and sound in .mp4",
-    ),
-    (
-        Some(Format::Hevc),
+        &[Format::Hevc, Format::HevcMp4],
         "h",
-        "HEVC · MKV",
-        "intra-only HEVC + AAC in .mkv — large files",
+        "HEVC",
+        "intra-only, every frame a cut point — large files",
     ),
+    (&[Format::Wav], "w", "WAV", "16-bit PCM — audio only"),
+    (&[Format::Flac], "f", "FLAC", "lossless — audio only"),
     (
-        Some(Format::HevcMp4),
-        "x",
-        "HEVC · MP4",
-        "the same intra-only HEVC and sound in .mp4",
-    ),
-    (Some(Format::Wav), "w", "WAV", "16-bit PCM — audio only"),
-    (Some(Format::Flac), "f", "FLAC", "lossless — audio only"),
-    (
-        Some(Format::Mp3),
+        &[Format::Mp3],
         "p",
         "MP3",
         "MPEG-1 Layer III, 256 kbps — audio only",
     ),
-    (None, "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (None, "", "VP9", "superseded by AV1, which is the row above"),
+    (&[], "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
+    (&[], "", "VP9", "AV1 above replaces it"),
 ];
 
-/// The format a key picks while the export card is up. A letter of the row's
-/// own name, spelled out in the table rather than taken from the initial: `MP4`
-/// and `MP3` share one, and so do the two AV1 containers, so an initial cannot
-/// tell six rows apart. Never a digit -- those are the bitrate's. `None` for
-/// everything else, the rows that cannot be picked included.
-fn format_key(key: &str) -> Option<Format> {
+/// The codec row a key picks, landed in the container already chosen: pressing
+/// `a` after an mp4 gives AV1 *in mp4*, because a box decided once is not a
+/// question again. A letter of the row's own name, spelled out in the table
+/// rather than taken from the initial (`MP4` and `MP3` share one). Never a
+/// digit -- those are the bitrate's. `None` for every other stroke, the rows
+/// that cannot be picked included.
+fn format_key(key: &str, current: Format) -> Option<Format> {
     FORMATS
         .into_iter()
         .filter(|(_, stroke, ..)| !stroke.is_empty() && stroke.eq_ignore_ascii_case(key))
-        .find_map(|(format, ..)| format)
+        .find_map(|(row, ..)| same_box(row, current))
+}
+
+/// The boxes one codec may be written into, in the order its container row
+/// cycles them. Empty for a codec this program cannot write at all.
+fn containers(format: Format) -> &'static [Format] {
+    FORMATS
+        .into_iter()
+        .map(|(row, ..)| row)
+        .find(|row| row.contains(&format))
+        .unwrap_or(&[])
+}
+
+/// This row's format under the container `current` is already in, or the row's
+/// first when it has no such box: an AV1 picked from a WAV lands in Matroska,
+/// and picked from an mp4 stays in the mp4.
+fn same_box(row: &[Format], current: Format) -> Option<Format> {
+    row.iter()
+        .copied()
+        .find(|f| f.ext() == current.ext())
+        .or_else(|| row.first().copied())
+}
+
+/// The next box for the same codec, wrapping -- what the container row's key
+/// does. The format itself for a codec with only one, so the stroke cannot
+/// change what it is not offering.
+fn next_container(format: Format) -> Format {
+    let row = containers(format);
+    let at = row.iter().position(|&f| f == format).unwrap_or(0);
+    row.get((at + 1) % row.len().max(1))
+        .copied()
+        .unwrap_or(format)
+}
+
+/// Why the quality rows say nothing about this format, or `None` where they
+/// decide the picture. Only a picture encoder is given a bitrate here: the two
+/// lossless audio formats have none to give and MP3 is written at one fixed
+/// figure, so a live row over either would be a control that changes nothing.
+fn bitrate_refusal(format: Format) -> Option<&'static str> {
+    match format {
+        Format::Wav | Format::Flac => Some("lossless audio — no bitrate to pick"),
+        Format::Mp3 => Some("MP3 is written at a fixed 256 kbps"),
+        _ => None,
+    }
 }
 
 /// What one of the colour card's own strokes does. Its keys are card-local --
@@ -7140,57 +7477,84 @@ fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
     sizes[at.map_or(0, |at| (at + 1) % sizes.len())]
 }
 
-/// [`format_line`] plus the project's resolution, which is what a video export
-/// is written at however many sizes the media on the timeline are. Only for the
-/// formats that carry a picture -- a WAV has no resolution to state.
-fn export_line(
-    format: Format,
-    session: Option<&PlaybackSession>,
-    seat: Option<&'static str>,
-) -> String {
-    let line = format_line(format);
-    // What it will really be encoded by, on the same line: the picture's seat
-    // as the probe found it (`…` until it lands, never a guess) and the sound's,
-    // which is decided without opening anything. Both are what a running export
-    // then names on its progress line, from the same two functions.
-    let encoders = match session {
-        Some(session) => join_detail(
-            seat.unwrap_or(match format.has_video() {
-                true => "encoder …",
-                false => "",
-            }),
-            session.planned_audio(format),
-        ),
-        None => String::new(),
-    };
-    match session.filter(|_| format.has_video()) {
-        Some(session) => {
-            let (w, h) = session.resolution();
-            format!("{line} · project {w}x{h} · {encoders}")
+/// The first of the two lines the card keeps above its button: what will be
+/// *inside* the file. [`format_line`]'s codec and box, then the project's own
+/// picture size and rate -- which is what a video export is written at however
+/// many sizes and rates the media on the timeline are -- and last what the
+/// sound will be, or that there is none. Every field here is one `ffprobe`
+/// reads back off the finished file, so the line is checkable rather than a
+/// promise.
+fn summary_head(format: Format, picture: Option<((u32, u32), f64)>, audio: &str) -> String {
+    let line = match picture.filter(|_| format.has_video()) {
+        Some(((w, h), fps)) => {
+            format!("{} · {w}x{h} · {} fps", format_line(format), fps_label(fps))
         }
-        None => join_detail(line, &encoders),
+        None => format_line(format).to_string(),
+    };
+    join_detail(&line, audio)
+}
+
+/// The second: where it lands, roughly how big, and what will encode the
+/// picture -- the seat as the probe found it (`…` until it lands, never a
+/// guess), which is what the running export then names on its progress line.
+fn summary_tail(path: &Path, mb: Option<u64>, seat: Option<&'static str>, video: bool) -> String {
+    let size = mb.map_or_else(String::new, |mb| format!("≈ {mb} MB"));
+    let seat = match (video, seat) {
+        (true, Some(seat)) => seat,
+        (true, None) => "encoder …",
+        (false, _) => "",
+    };
+    join_detail(&join_detail(&file_name(path), &size), seat)
+}
+
+/// A frame rate as a person writes it: `30`, not `30.000`, and `23.976` for the
+/// rate that is a ratio.
+fn fps_label(fps: f64) -> String {
+    match (fps - fps.round()).abs() < 0.001 {
+        true => format!("{fps:.0}"),
+        false => format!("{fps:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
     }
 }
 
+/// About how big a *chosen* bitrate makes the file: the picture's megabits over
+/// the timeline's length. `None` for `Auto`, whose figure is the encoder's to
+/// decide, and for a format with no bitrate at all -- a number nobody picked is
+/// not an estimate. The sound and the container's own overhead are not in it,
+/// which is why the card says "≈".
+fn estimated_mb(bitrate: Option<u64>, duration: f64) -> Option<u64> {
+    let bitrate = bitrate.filter(|&b| b > 0 && duration > 0.)?;
+    Some((bitrate as f64 * duration / 8e6).round() as u64)
+}
+
+/// What is in the file and what box it is in, which is the head of the summary.
+/// Terse on purpose: the fields after it (size, rate, sound) are what the line
+/// is *for*, and a head that spent its width on prose used to push the whole
+/// summary onto a second line -- what each codec means is on its row.
 fn format_line(format: Format) -> &'static str {
     match format {
-        Format::Mp4 => "H.264 · MP4 · moov at end",
-        Format::Av1 => "AV1 · Matroska · picture and sound",
-        Format::Av1Mp4 => "AV1 · MP4 · picture and sound",
-        Format::Hevc => "HEVC intra · Matroska · picture and sound",
-        Format::HevcMp4 => "HEVC intra · MP4 · picture and sound",
-        Format::Wav => "16-bit PCM · WAV · timeline audio only",
-        Format::Flac => "FLAC · lossless · timeline audio only",
-        Format::Mp3 => "MP3 · 256 kbps · timeline audio only",
+        Format::Mp4 => "H.264 · MP4",
+        Format::Av1 => "AV1 · MKV",
+        Format::Av1Mp4 => "AV1 · MP4",
+        Format::Hevc => "HEVC intra · MKV",
+        Format::HevcMp4 => "HEVC intra · MP4",
+        // The three whose codec *is* their box: naming it twice would be the
+        // only field on this line that says nothing.
+        Format::Wav => "16-bit PCM · WAV",
+        Format::Flac => "FLAC · lossless",
+        Format::Mp3 => "MP3 · 256 kbps",
     }
 }
 
-/// The row a format is picked by, which is what a refusal calls it: `MP4`, not
-/// the `mkv` an AV1 file is named with.
+/// The row a format is picked by, which is what a refusal calls it: the codec,
+/// since the container is a row of its own now -- `AV1`, not the `mkv` such a
+/// file is named with.
 fn format_label(format: Format) -> &'static str {
     FORMATS
         .iter()
-        .find(|(row, ..)| *row == Some(format))
+        .find(|(row, ..)| row.contains(&format))
         .map_or("EXPORT", |(_, _, label, _)| *label)
 }
 
@@ -8156,18 +8520,20 @@ mod tests {
     use super::{
         ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
         EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
-        EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS,
-        HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
-        LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
-        MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H,
-        SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
-        Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label,
-        can_add, cancels_export, clipboard_after_remove, color_snap, envelope, eq_spectrum, eq_x,
-        eq_y, export_path, export_settings, format_key, format_line, format_refusal, frac_along,
-        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
-        menu_at, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
-        scrub_due, show_label, silence_rate, snapped, source_tint, span_partner, speed_at,
-        timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
+        EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, FORMATS, Format, HEADER_GAP,
+        HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
+        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
+        LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
+        PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
+        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS,
+        WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
+        clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
+        estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
+        fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
+        keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
+        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
+        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
+        unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{
         LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
@@ -10231,128 +10597,265 @@ mod tests {
     #[test]
     fn the_export_card_fits_the_smallest_window() {
         // Same 640x360 floor the keybindings card is measured against: the
-        // capped row list, the fixed-format line and the confirm button, under
+        // capped row list, the two summary lines and the confirm button, under
         // a title and a status line.
         let title = 17.;
         let status = 28.;
-        // Two lines of 11 px: the format line carries the encoders an export
-        // would open, which is what takes it past one at this width.
-        let fixed = 30.;
-        let gaps = 4. * 2.;
+        // The head is one line of 11 px at this width -- every field of it,
+        // worst case, is 71 characters against the 76 that fit. The tail is
+        // budgeted for two: the destination's name is the user's and a long one
+        // wraps.
+        let summary = 15. + 30.;
+        // Six children in the column, so five gaps.
+        let gaps = 5. * 2.;
         let padding = 24.;
-        assert!(
-            title + status + EXPORT_ROWS_H + fixed + CONTROL_H + 4. + gaps + padding <= 360.,
-            "card too tall"
+        assert_eq!(
+            EXPORT_FIXED_H,
+            title + status + summary + CONTROL_H + 4. + gaps + padding
         );
+        assert!(EXPORT_FIXED_H + EXPORT_ROWS_H <= 360., "card too tall");
+        // The list grows with a window that has the room -- and never shrinks
+        // below the cap that made the floor fit, whatever arithmetic the window
+        // hands it.
+        let cap = |h: f32| (h - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
+        assert_eq!(cap(360.), EXPORT_ROWS_H);
+        assert_eq!(cap(0.), EXPORT_ROWS_H);
+        assert!(cap(720.) > EXPORT_ROWS_H);
+        assert!(EXPORT_FIXED_H + cap(720.) <= 720.);
+        // ...and inside the 640 px floor with the scrim showing either side.
+        assert!(EXPORT_W + 2. * 12. <= 640.);
         // The cap is only honest if enough of the list is on screen to read as
-        // one -- the destination and the first formats, not a slot.
-        assert!(EXPORT_ROWS_H / KEYS_ROW_H >= 6.);
-        // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's.
+        // one -- and the whole format section is: its header and every codec
+        // row, so nothing that is picked *first* is behind a scroll.
+        let codecs = FORMATS.iter().filter(|(row, ..)| !row.is_empty()).count();
+        assert!(EXPORT_ROWS_H / KEYS_ROW_H >= 1. + codecs as f32);
+        // Clickable rows, so WCAG 2.5.8 binds them as it binds the panel's --
+        // and the bitrate steppers are `HIT_MIN` squares sitting inside a row,
+        // which only fits while the row is at least as tall as one.
         assert!(KEYS_ROW_H >= HIT_MIN);
         assert!(CONTROL_H >= HIT_MIN);
+        // The dimmed text on the card -- every refusal, every detail, every key
+        // in its column -- is body text on `SURFACE` and WCAG 1.4.3 binds it.
+        // A dimmed row is drawn in this ink rather than at an opacity, which is
+        // what a refusal used to be readable through.
+        assert!(
+            contrast(INK_DIM, SURFACE) >= 4.5,
+            "refusal ink {:.2}",
+            contrast(INK_DIM, SURFACE)
+        );
+        // On the picked row that ink would only be 3.3:1 against the highlight,
+        // so the row it lands on lifts its key and detail to `INK`.
+        assert!(contrast(INK, SELECTED) >= 4.5);
+        assert!(
+            contrast(INK_DIM, SELECTED) < 4.5,
+            "the lift is still needed"
+        );
     }
 
     #[test]
-    fn every_format_row_is_offered_or_says_why_not() {
-        // The six this program can write are rows that pick. Four are named
-        // after their own extension, so a destination cannot disagree with its
-        // bytes; the AV1 pair is named after codec *and* container, because the
-        // same picture goes into either box and the row is the choice between
-        // them.
-        let offered: Vec<Format> = FORMATS.iter().filter_map(|&(f, ..)| f).collect();
+    fn every_codec_row_is_offered_or_says_why_not() {
+        // One row per codec, and the boxes it can go in are the container row's
+        // business: six rows that pick, two that say why they cannot. A codec
+        // twice over (AV1 · MKV beside AV1 · MP4) was two rows asking the same
+        // question, and five picture rows above the fold is what the card was
+        // called unfriendly for.
+        let offered: Vec<&[Format]> = FORMATS
+            .iter()
+            .map(|&(row, ..)| row)
+            .filter(|row| !row.is_empty())
+            .collect();
         assert_eq!(
             offered,
             vec![
-                Format::Mp4,
-                Format::Av1,
-                Format::Av1Mp4,
-                Format::Hevc,
-                Format::HevcMp4,
-                Format::Wav,
-                Format::Flac,
-                Format::Mp3
+                &[Format::Mp4][..],
+                &[Format::Av1, Format::Av1Mp4][..],
+                &[Format::Hevc, Format::HevcMp4][..],
+                &[Format::Wav][..],
+                &[Format::Flac][..],
+                &[Format::Mp3][..],
             ]
         );
+        // Every format the engine writes is on exactly one row: one the card
+        // cannot reach is one nobody can pick.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+            Format::Wav,
+            Format::Flac,
+            Format::Mp3,
+        ] {
+            assert_eq!(
+                FORMATS
+                    .iter()
+                    .filter(|(row, ..)| row.contains(&format))
+                    .count(),
+                1,
+                "{format:?}"
+            );
+        }
+        // The boxes the container row offers, and what the extension of each is
+        // -- the destination follows the format, so these are what a file gets
+        // named with.
+        assert_eq!(containers(Format::Av1), [Format::Av1, Format::Av1Mp4]);
+        assert_eq!(containers(Format::HevcMp4), [Format::Hevc, Format::HevcMp4]);
+        assert_eq!(containers(Format::Mp3), [Format::Mp3]);
         assert_eq!(Format::Av1.ext(), "mkv");
         assert_eq!(Format::Av1Mp4.ext(), "mp4");
         assert_eq!(Format::Hevc.ext(), "mkv");
         assert_eq!(Format::HevcMp4.ext(), "mp4");
-        for (format, _, label, _) in FORMATS {
-            match format {
-                Some(Format::Av1) => assert_eq!(label, "AV1 · MKV"),
-                Some(Format::Av1Mp4) => assert_eq!(label, "AV1 · MP4"),
-                Some(Format::Hevc) => assert_eq!(label, "HEVC · MKV"),
-                Some(Format::HevcMp4) => assert_eq!(label, "HEVC · MP4"),
-                Some(format) => assert_eq!(format.ext(), label.to_lowercase()),
-                // A refused format is a row with a reason, never a hidden one:
-                // an empty detail column would read as an oversight.
-                None => assert!(!label.is_empty()),
-            }
-        }
-        for (format, stroke, label, detail) in FORMATS {
+        // The container key walks the row and wraps, and does nothing at all
+        // where there is only one box -- a stroke must not invent a choice the
+        // card is not offering.
+        assert_eq!(next_container(Format::Av1), Format::Av1Mp4);
+        assert_eq!(next_container(Format::Av1Mp4), Format::Av1);
+        assert_eq!(next_container(Format::Hevc), Format::HevcMp4);
+        assert_eq!(next_container(Format::Mp4), Format::Mp4);
+        assert_eq!(next_container(Format::Wav), Format::Wav);
+        for (row, stroke, label, detail) in FORMATS {
+            assert!(!label.is_empty(), "a row with no name");
+            // A refused row is a row with a reason, never a hidden one: an
+            // empty detail column would read as an oversight.
             assert!(!detail.is_empty(), "{label} says nothing");
-            // Only the picture formats leave the bitrate rows live -- the card
-            // dims them off exactly this.
-            assert_eq!(
-                format.is_some_and(Format::has_video),
-                matches!(
-                    format,
-                    Some(
-                        Format::Mp4 | Format::Av1 | Format::Av1Mp4 | Format::Hevc | Format::HevcMp4
-                    )
-                )
-            );
-            // Every row that can be picked has a key of its own, and no two
-            // share one: the card is drivable without a pointer.
-            assert_eq!(format.is_some(), !stroke.is_empty(), "{label}");
-            if !stroke.is_empty() {
-                assert_eq!(format_key(stroke), format, "{label} keys to itself");
+            // Every row that can be picked has a key of its own, and no row
+            // that cannot has one: the card is drivable without a pointer.
+            assert_eq!(!row.is_empty(), !stroke.is_empty(), "{label}");
+            if let Some(&first) = row.first() {
+                assert_eq!(
+                    format_key(stroke, first),
+                    Some(first),
+                    "{label} keys to itself"
+                );
                 assert!(
                     stroke.parse::<u32>().is_err(),
                     "{label} takes a digit the bitrate needs"
                 );
+                // Every box on one row is the same codec, so the quality rows
+                // do not change meaning when the container does.
+                assert!(row.iter().all(|f| f.has_video() == first.has_video()));
+                assert!(
+                    row.iter()
+                        .all(|f| bitrate_refusal(*f) == bitrate_refusal(first))
+                );
             }
         }
+        // No two rows share a key, and none of them is a stroke the card already
+        // answers to itself -- an ambiguous key is a key that picks the wrong
+        // thing on a card that has no other input.
+        let keys: Vec<&str> = FORMATS
+            .iter()
+            .map(|&(_, stroke, ..)| stroke)
+            .filter(|stroke| !stroke.is_empty())
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            assert!(!keys[i + 1..].contains(key), "{key} picks two rows");
+            assert!(
+                !["c", "q", "d", "g", "r", "enter", "backspace", ESCAPE].contains(key),
+                "{key} is already the card's own"
+            );
+        }
+        assert_eq!(
+            format_key("a", Format::Mp4),
+            Some(Format::Av1Mp4),
+            "the box already chosen is kept"
+        );
+        assert_eq!(
+            format_key("a", Format::Wav),
+            Some(Format::Av1),
+            "and a codec with no such box takes its first"
+        );
+        assert_eq!(format_key("h", Format::Av1Mp4), Some(Format::HevcMp4));
+        assert_eq!(format_key("p", Format::Mp4), Some(Format::Mp3));
+        assert_eq!(
+            format_key("m", Format::Mp3),
+            Some(Format::Mp4),
+            "not MP3, which is p"
+        );
+        assert_eq!(
+            format_key("x", Format::Mp4),
+            None,
+            "a stroke no row carries"
+        );
         // The codec this program reads and cannot write is a row of its own,
         // refused by name rather than absent: VP9, because AV1 is the row that
-        // replaced it. HEVC used to be one beside it and is now two rows that
-        // pick -- an intra-only encoder is still an encoder.
-        for (label, word) in [("VP9", "superseded")] {
-            let (format, _, _, detail) = FORMATS
+        // replaced it. Its reason travels with it, in the row or in the footer
+        // line that collects them -- either way it is on screen without a click.
+        for (label, word) in [("VP9", "replaces it"), ("OGG", "no pure-Rust")] {
+            let (row, _, _, detail) = FORMATS
                 .into_iter()
-                .find(|(_, _, row, _)| *row == label)
+                .find(|(_, _, name, _)| *name == label)
                 .unwrap_or_else(|| panic!("{label} has no row"));
-            assert!(format.is_none(), "{label} is not offered");
+            assert!(row.is_empty(), "{label} is not offered");
             assert!(detail.contains(word), "{label}: {detail}");
         }
-        // Both AV1 rows say they carry sound: the file used to be picture only,
-        // and a row that still said so would be the lie a user plays the file
-        // to find out about.
+        // Both AV1 boxes say they carry sound: the file used to be picture only,
+        // and a line that still said so would be the lie a user plays the file
+        // to find out about. HEVC says intra-only before anyone waits on one --
+        // a file several times the size, which the disk would otherwise say.
         for format in [Format::Av1, Format::Av1Mp4] {
-            let (_, _, _, detail) = FORMATS
-                .into_iter()
-                .find(|(f, ..)| *f == Some(format))
-                .expect("an AV1 row");
-            assert!(detail.contains("sound"), "{detail}");
-            assert!(format_line(format).contains("picture and sound"));
+            assert!(format_line(format).starts_with("AV1 · "));
         }
-        // ...and both HEVC rows say what they are before a user waits on one:
-        // intra-only, which is a file several times the size of the AV1 above
-        // it. A row that hid that would be found out by the disk.
         for format in [Format::Hevc, Format::HevcMp4] {
-            let (_, _, _, detail) = FORMATS
-                .into_iter()
-                .find(|(f, ..)| *f == Some(format))
-                .expect("an HEVC row");
-            assert!(detail.contains("intra-only"), "{detail}");
-            assert!(format_line(format).contains("picture and sound"));
+            assert!(format_line(format).starts_with("HEVC intra · "));
         }
-        assert_eq!(format_key("a"), Some(Format::Av1), "the Matroska one");
-        assert_eq!(format_key("v"), Some(Format::Av1Mp4), "and the mp4 one");
-        assert_eq!(format_key("h"), Some(Format::Hevc), "HEVC's Matroska");
-        assert_eq!(format_key("x"), Some(Format::HevcMp4), "and its mp4");
-        assert_eq!(format_key("p"), Some(Format::Mp3));
-        assert_eq!(format_key("m"), Some(Format::Mp4), "not MP3, which is p");
+        // The head names the box every format goes in, which is what the
+        // destination is then named after.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+        ] {
+            assert!(
+                format_line(format).contains(&format.ext().to_uppercase()),
+                "{format:?}: {}",
+                format_line(format)
+            );
+        }
+        // ...and it stays inside the one line the card budgets for it: the
+        // longest of them, with every field after it, against the 76 characters
+        // that fit at `EXPORT_W`.
+        let longest = summary_head(
+            Format::Hevc,
+            Some(((1920, 1080), 23.976)),
+            "AAC · SW encode (rusty_aac)",
+        );
+        assert!(
+            longest.chars().count() <= 76,
+            "{longest} is {} long",
+            longest.chars().count()
+        );
+        assert!(
+            FORMATS
+                .into_iter()
+                .any(|(row, _, _, detail)| row.contains(&Format::Hevc) && detail.contains("intra"))
+        );
+        // Only a picture encoder is given a bitrate, and the quality rows dim
+        // with the reason for every format that is not one.
+        for format in [
+            Format::Mp4,
+            Format::Av1,
+            Format::Av1Mp4,
+            Format::Hevc,
+            Format::HevcMp4,
+        ] {
+            assert!(
+                format.has_video() && bitrate_refusal(format).is_none(),
+                "{format:?}"
+            );
+        }
+        for format in [Format::Wav, Format::Flac, Format::Mp3] {
+            assert!(!format.has_video());
+            assert!(
+                bitrate_refusal(format).is_some(),
+                "{format:?} dims silently"
+            );
+        }
+        assert!(bitrate_refusal(Format::Wav).unwrap().contains("lossless"));
+        assert!(bitrate_refusal(Format::Mp3).unwrap().contains("256 kbps"));
         // The destination follows the format and keeps the stem, mp4 included.
         assert_eq!(
             retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),
@@ -10362,7 +10865,59 @@ mod tests {
             retarget(std::path::Path::new("/a/take.export.wav"), Format::Mp4),
             std::path::Path::new("/a/take.export.mp4")
         );
-        assert!(format_line(Format::Flac).contains("audio only"));
+        assert!(format_line(Format::Flac).contains("lossless"));
+    }
+
+    /// The one line the card is answerable for: what it says is on screen before
+    /// the button is pressed, and every field of it is one `ffprobe` reads back
+    /// off the file that comes out.
+    #[test]
+    fn the_summary_states_the_file_before_it_is_written() {
+        let head = summary_head(Format::Mp4, Some(((1920, 1080), 30.)), "AAC copy");
+        for field in ["H.264", "MP4", "1920x1080", "30 fps", "AAC copy"] {
+            assert!(head.contains(field), "{field} missing from {head}");
+        }
+        // The rate as a person writes it, and the ratio one spelled out rather
+        // than rounded to a rate nothing is written at.
+        assert_eq!(fps_label(30.), "30");
+        assert_eq!(fps_label(24000. / 1001.), "23.976");
+        assert_eq!(fps_label(29.97002997), "29.97");
+        // A format with no picture states no size and no rate it does not write.
+        let audio = summary_head(Format::Wav, Some(((1920, 1080), 30.)), "PCM · SW (hound)");
+        assert!(
+            !audio.contains("1920x1080") && !audio.contains("fps"),
+            "{audio}"
+        );
+        assert!(audio.contains("PCM · SW (hound)"));
+        // ...and one with no sound on the timeline says that, rather than
+        // leaving the field out and reading as a file with sound in it.
+        assert!(
+            summary_head(Format::Mp4, Some(((640, 360), 25.)), "no sound to write")
+                .contains("no sound to write")
+        );
+        // The tail: where it lands, about how big, and what will encode it --
+        // never a guessed seat, and no seat at all for a format with no picture.
+        let tail = summary_tail(
+            Path::new("/a/take.export.mp4"),
+            Some(45),
+            Some("VA-API"),
+            true,
+        );
+        assert!(tail.starts_with("take.export.mp4"), "{tail}");
+        assert!(
+            tail.contains("≈ 45 MB") && tail.contains("VA-API"),
+            "{tail}"
+        );
+        assert!(summary_tail(Path::new("/a/x.mp4"), None, None, true).contains("encoder …"));
+        assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("encoder"));
+        assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("MB"));
+        // 6 Mbps over a minute is 45 MB. `Auto` has no figure to estimate from
+        // and an empty timeline no length: neither invents one.
+        assert_eq!(estimated_mb(Some(6_000_000), 60.), Some(45));
+        assert_eq!(estimated_mb(Some(2_000_000), 90.), Some(23));
+        assert_eq!(estimated_mb(None, 60.), None);
+        assert_eq!(estimated_mb(Some(6_000_000), 0.), None);
+        assert_eq!(estimated_mb(Some(0), 60.), None);
     }
 
     #[test]
@@ -10846,6 +11401,8 @@ fn main() {
                     keymap: keymap.clone(),
                     keys_open: false,
                     export_open: false,
+                    export_grouped: true,
+                    export_refusals_inline: false,
                     eq_open: None,
                     // Replaced by the clip's own curve the moment the card
                     // opens; nothing reads it before that.
