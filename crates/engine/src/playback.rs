@@ -1720,7 +1720,12 @@ impl PlaybackSession {
     /// delete this moves every following frame, so the session reseeks; past
     /// the end of the timeline the clip is appended. One undo step.
     pub fn paste_at(&mut self, timeline_secs: f64, clip: Clip) -> bool {
-        let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+        // The clipboard's own rule, and only the clipboard's: a paste past the
+        // end is an append, never a clip with black in front of it. The frame
+        // itself is honoured in [`Project::paste`], because a *drop* names a
+        // place on the bed and means it.
+        let at = secs_to_frame(timeline_secs, self.meta.frame_rate)
+            .min(self.project.timeline_frames());
         self.edit(Dirty::Both, |p| p.paste(at, clip))
     }
 
@@ -1823,7 +1828,14 @@ impl PlaybackSession {
         };
         Ok(match onto {
             Some(lane) => self.place_at(lane, timeline_secs, clip),
-            None => self.paste_at(timeline_secs, clip),
+            // The grouped take, at the frame it was let go on -- past the last
+            // clip included, where the bed is black and the ghost was drawn.
+            // Not [`Self::paste_at`]: that door clamps to the end for the
+            // clipboard, and a drop that named a place is not a paste.
+            None => {
+                let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+                self.edit(Dirty::Both, |p| p.paste(at, clip))
+            }
         })
     }
 
