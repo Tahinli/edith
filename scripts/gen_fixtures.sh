@@ -113,6 +113,32 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# HEVC in Matroska: the shape a film off a disc arrives in. Same A/V shape as
+# test_hevc.mp4 so the tests measure the container and nothing else, `-g 30` for
+# the same reason test_av1.mkv has it (a second keyframe to seek to), and the
+# AAC track is read out of the mkv now rather than named as unsupported.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx265 -x265-params log-level=error -g 30 -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_hevc.mkv
+# ...and the same file in the shape the ask came from: HEVC **Main 10** with a
+# 5.1 AAC track, which is a 4K BluRay remux in miniature. The picture decodes
+# through a P010 surface pool and the sound is folded to stereo, so both halves
+# of that file have a fixture. One tone per channel -- 440 FL, 880 FR, 220 FC,
+# 60 LFE, 1320 BL, 1760 BR as written, whatever the encoder's own element order
+# does with them -- so a test can say which channel reached which output.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=220:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=60:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=1320:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=1760:duration=2:sample_rate=48000" \
+    -filter_complex "[1:a][2:a][3:a][4:a][5:a][6:a]join=inputs=6:channel_layout=5.1[a]" \
+    -map 0:v -map "[a]" -c:v libx265 -x265-params log-level=error -g 30 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 384k assets/test_hevc10.mkv
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.
@@ -135,15 +161,23 @@ enable='between(t,1,1.1)'[v];\
 ffmpeg -y -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 \
     -an -c:v libx264 -profile:v baseline -pix_fmt yuv420p assets/test_mismatch.mp4
 # Frame-rate fixture: test_av.mp4 in every respect a timeline is held to -- same
-# codec, same profile, same 44.1k stereo AAC -- except that it runs at 25 fps.
-# The only thing left for an import to refuse is the rate, which is what makes
-# the refusal's wording testable.
+# codec, same profile, same 44.1k stereo AAC -- except that it runs at 25 fps,
+# so a timeline of 30 fps clips has one at another rate to read through `Rate`.
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=25:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -f lavfi -i "sine=frequency=880:duration=2" \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_25fps.mp4
+# ...and the same again at 23.976 fps (24000/1001), the rate whose ratio to a
+# 30 fps timeline does not terminate: what the frame mapping's rounding is
+# actually tested against.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=24000/1001:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_23976fps.mp4
 # Standalone audio fixtures: the same 440/880 Hz tone with the 1 Hz pulse the
 # A/V fixture carries, at test_av.mp4's own 44.1k stereo -- so an imported song
 # can share a timeline with the video clips and the peaks tests can reuse the
