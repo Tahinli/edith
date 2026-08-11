@@ -360,10 +360,22 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
     std::fs::create_dir_all(&dir).expect("a place to save");
     let file = dir.join("cut.edith");
     let (sources, lanes, eq, color) = p.without_orphan_sources();
-    engine::edith::save(&file, &sources, &lanes, &eq, &color, (1920, 1080), 0).expect("save");
+    engine::edith::save(
+        &file,
+        &sources,
+        &lanes,
+        &p.lane_gains(),
+        &eq,
+        &color,
+        (1920, 1080),
+        None,
+        p.limiter(),
+        0,
+    )
+    .expect("save");
     let text = std::fs::read_to_string(&file).expect("read it back");
     assert!(
-        text.starts_with("edith 8"),
+        text.starts_with("edith 9"),
         "{:?}",
         &text[..16.min(text.len())]
     );

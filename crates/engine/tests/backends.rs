@@ -204,6 +204,70 @@ fn audio_only_job_names_its_encoder(format: Format) {
     assert_eq!(opened, planned, "{}", format.ext());
 }
 
+/// A mixed timeline cannot be copied, and the card must say so *before* the
+/// export: a fader and a limiter both live where the lanes are summed, and a
+/// copied AAC packet was never summed at all -- so an mp4 of such a timeline is
+/// decoded and re-encoded, and the line names the encoder that will do it.
+///
+/// The truthfulness rule of this whole file, applied to the one edit that used
+/// to be invisible to it.
+#[test]
+fn a_mixed_timeline_says_it_re_encodes_and_then_does() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    assert_eq!(
+        session.planned_audio(Format::Mp4),
+        "AAC copy",
+        "a timeline nobody has mixed is still a copy"
+    );
+    // A fader off unity...
+    assert!(session.set_lane_gain_db(engine::project::Lane::A1, -3.0));
+    let planned = session.planned_audio(Format::Mp4);
+    assert!(planned.contains("encode"), "a faded lane: {planned}");
+    // ...and back at unity it is a copy again: the answer follows the edit, it
+    // is not a latch.
+    assert!(session.set_lane_gain_db(engine::project::Lane::A1, 0.0));
+    assert_eq!(session.planned_audio(Format::Mp4), "AAC copy");
+    // ...and the limiter alone does it too.
+    assert!(session.set_limiter(engine::limiter::Limiter {
+        ceiling_db: -1.0,
+        on: true,
+    }));
+    assert_eq!(session.planned_audio(Format::Mp4), planned);
+
+    // ...and the job opens exactly that, which is the pin the whole file is
+    // about: the encoders line published by the running export.
+    let out = out_path("mixed", "mp4");
+    let handle = session.export_to_with(
+        &out,
+        &ExportSettings {
+            format: Format::Mp4,
+            ..ExportSettings::default()
+        },
+    );
+    let started = Instant::now();
+    let opened = loop {
+        if let Some(line) = handle.encoders() {
+            break line;
+        }
+        assert!(
+            !handle.is_finished(),
+            "the export settled before it opened an encoder: {:?}",
+            handle.result().map(|r| r.err())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "no encoder was published"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    handle.cancel();
+    wind_down(&handle);
+    assert!(
+        opened.ends_with(&planned),
+        "{opened} does not end in {planned}"
+    );
+}
+
 /// Waits for a cancelled job to settle, so its `.part` is gone before the test
 /// ends -- and so no worker outlives the process holding a VA-API session.
 fn wind_down(handle: &ExportHandle) {
