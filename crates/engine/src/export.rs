@@ -570,7 +570,10 @@ fn export_subtitles(
         return None;
     }
     let track = project.subtitles().get(settings.subtitles?)?;
-    if track.refused.is_some() {
+    // A picture is not a line: the muxer writes an `S_TEXT/UTF8` track and a
+    // PGS cue has no words to put in one. `planned_subtitles` says so before
+    // the button is pressed rather than the file coming out short.
+    if track.refused.is_some() || track.is_bitmap() {
         return None;
     }
     let cues = timeline_cues(project, track, meta.frame_rate);
@@ -633,6 +636,7 @@ pub fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<
                     start_us,
                     end_us,
                     text: cue.text.clone(),
+                    image: cue.image.clone(),
                 })
             })
             .collect();
@@ -660,6 +664,7 @@ pub fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<
                 start_us: onto(a),
                 end_us: onto(b).min(end),
                 text: cue.text.clone(),
+                image: cue.image.clone(),
             });
         }
     }
@@ -678,6 +683,12 @@ pub fn planned_subtitles(project: &Project, format: Format, pick: Option<usize>)
     };
     if let Some(why) = &track.refused {
         return format!("{} — {why}", track.label);
+    }
+    // Drawn over the picture, written into no file: the exported track is text
+    // and these cues are bitmaps. Said whatever the format, because it is the
+    // track and not the container that cannot be carried.
+    if track.is_bitmap() {
+        return format!("{} — pictures; drawn, not written", track.label);
     }
     match format {
         _ if track.cues.is_empty() => "none".into(),
@@ -2321,16 +2332,19 @@ mod tests {
                     start_us: 500_000,
                     end_us: 1_500_000,
                     text: "first".into(),
+                    image: None,
                 },
                 Cue {
                     start_us: 2_000_000,
                     end_us: 3_250_000,
                     text: "second".into(),
+                    image: None,
                 },
                 Cue {
                     start_us: 4_000_000,
                     end_us: 4_750_000,
                     text: "third".into(),
+                    image: None,
                 },
             ],
             refused: None,
@@ -2359,13 +2373,15 @@ mod tests {
                 Cue {
                     start_us: 500_000,
                     end_us: 1_500_000,
-                    text: "first".into()
+                    text: "first".into(),
+                    image: None,
                 },
                 // Clipped to the three seconds the export writes...
                 Cue {
                     start_us: 2_000_000,
                     end_us: 3_000_000,
-                    text: "second".into()
+                    text: "second".into(),
+                    image: None,
                 },
                 // ...and the one wholly past the end is not written at all.
             ]
@@ -2393,13 +2409,15 @@ mod tests {
                 Cue {
                     start_us: 500_000,
                     end_us: 1_250_000,
-                    text: "second".into()
+                    text: "second".into(),
+                    image: None,
                 },
                 // ...and the third simply moves back the two seconds that went.
                 Cue {
                     start_us: 2_000_000,
                     end_us: 2_750_000,
-                    text: "third".into()
+                    text: "third".into(),
+                    image: None,
                 },
             ]
         );
