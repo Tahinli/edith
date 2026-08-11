@@ -673,8 +673,19 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
+        // The subtitle files are read here rather than in the parser: a
+        // `.edith` names them and holds no cues. One that has gone missing, or
+        // whose track is a codec of pictures, comes back listed and refused by
+        // name ([`crate::subtitle::open`]) -- a project does not stop opening
+        // over a subtitle, and a re-save does not lose the row.
+        let subtitles = doc
+            .subtitles
+            .iter()
+            .map(|(path, track)| crate::subtitle::open(path, *track))
+            .collect();
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
-            .with_mix(&doc.gains, doc.limiter);
+            .with_mix(&doc.gains, doc.limiter)
+            .with_subtitles(subtitles);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -762,6 +773,47 @@ impl PlaybackSession {
         self.project.sources()
     }
 
+    /// The subtitle tracks on this timeline, in the order they were added: what
+    /// a front-end lists and what [`save_project`](Self::save_project) writes.
+    /// A track that could not be read is *in* this list, saying why
+    /// ([`crate::subtitle::SubtitleTrack::refused`]) -- listed and skipped, not
+    /// dropped.
+    pub fn subtitles(&self) -> &[crate::subtitle::SubtitleTrack] {
+        self.project.subtitles()
+    }
+
+    /// Adds subtitles from `path`: every subtitle track of a Matroska file, or
+    /// the one track a standalone `.srt`/`.vtt`/`.ass` is. Hands back how many
+    /// were added -- 0 for a file whose tracks are all on the timeline already,
+    /// since importing the same file twice is the same subtitles.
+    ///
+    /// An error only when the file cannot be read *at all*; a track this cannot
+    /// parse is added refused by name, for the reason
+    /// [`crate::subtitle::open`] gives. Nothing else about the timeline moves:
+    /// subtitles are not clips and land on no lane.
+    pub fn import_subtitles(&mut self, path: &Path) -> crate::Result<usize> {
+        let tracks = match path.extension().is_some_and(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            e == "mkv" || e == "webm"
+        }) {
+            true => crate::subtitle::of_matroska(path)?,
+            false => vec![crate::subtitle::open(path, None)],
+        };
+        // A standalone file that could not be parsed is a refusal here rather
+        // than a row nobody asked for: the import is the moment to say so, and
+        // the load is the moment to keep it.
+        if let [one] = &tracks[..]
+            && one.track.is_none()
+            && let Some(why) = &one.refused
+        {
+            return Err(why.clone().into());
+        }
+        Ok(tracks
+            .into_iter()
+            .filter(|t| self.project.add_subtitles(t))
+            .count())
+    }
+
     /// Writes the timeline to `path` as a `.edith`, atomically (see
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
@@ -787,6 +839,9 @@ impl PlaybackSession {
             // project's, not this machine's (the monitoring volume is not
             // written and never will be).
             &self.project.lane_gains(),
+            // The subtitle tracks with them, by reference: which file the cues
+            // are in, never the cues (see [`crate::edith`]).
+            self.project.subtitles(),
             &eq,
             &color,
             (self.meta.width, self.meta.height),
@@ -1611,8 +1666,9 @@ impl PlaybackSession {
     /// nothing playable, so there is nothing for [`undo`](Self::undo) to take
     /// back, and nothing reseeks.
     ///
-    /// Refused unless it can join the timeline -- same codec, same audio
-    /// parameters or both silent; the `Err` names the property that disagrees,
+    /// Refused unless it can join the timeline -- a decoder this machine can
+    /// open, and audio parameters that agree or none at all; the `Err` names
+    /// the property that disagrees,
     /// for a caller to show. Nothing is changed by a refusal. A *resolution* of
     /// its own is not a refusal: the clip is placed on the project canvas by its
     /// fit policy ([`PlaybackSession::set_fit`]) -- and neither is a *frame
@@ -1737,6 +1793,25 @@ impl PlaybackSession {
         } else {
             self.play()
         }
+    }
+
+    /// Stops the transport where the timeline stops: the clock is paused and put
+    /// on the out point.
+    ///
+    /// Playing past the last frame is wall time counting on past the end of the
+    /// media -- there is no picture left to pace it -- so a session left at EOF
+    /// reports a `now()` that walks off the end of the timeline in real time,
+    /// and a caller that reads the playhead (a cut, a paste, an insert) then
+    /// acts at a position no clip is at. How far off depends only on how long
+    /// the window was left open, so no clamp in a caller is worth writing.
+    ///
+    /// End of stream is deliberately left set: the picture is still the last
+    /// frame and this is still the end. That is what makes it safe to call on
+    /// the crossing into it -- the state the transport shows does not change,
+    /// only the running clock stops.
+    pub fn halt_at_end(&mut self) {
+        self.pause();
+        self.clock.seek_to(self.timeline_duration());
     }
 
     /// Sets the monitoring gain, 0.0 (silent) to 1.0. Mute is a gain of 0.0:
@@ -1951,8 +2026,9 @@ impl Drop for PlaybackSession {
 }
 
 /// Whether `path`, already demuxed to `meta`, may join a timeline whose
-/// parameters are `timeline` and whose audio probes as `first`: same codec,
-/// same audio parameters or both silent, and a frame rate that can be named
+/// parameters are `timeline` and whose audio probes as `first`: a decoder this
+/// machine can open, audio parameters that agree (or no audio at all), and a
+/// frame rate that can be named
 /// against the timeline's. The [`Rate`] it will be read at comes back with the
 /// answer, so the number the check was decided on is the number it plays by.
 ///
@@ -1961,7 +2037,9 @@ impl Drop for PlaybackSession {
 /// own fit policy, so a 640x360 file joining a 1920x1080 timeline is a
 /// letterboxed clip rather than a refusal, and so is a frame rate of its own:
 /// the timeline keeps its own rate and the file is read at [`Rate`] against it
-/// ([`PlaybackSession::import`] notes how long it is *here*).
+/// ([`PlaybackSession::import`] notes how long it is *here*). Nor the same
+/// codec: every clip opens its own decoder, so a mixed-codec timeline is a
+/// decoder each rather than a refusal.
 ///
 /// The `Err` names the property that disagrees, and those strings are what a
 /// front-end shows verbatim; [`PlaybackSession::import`] and
@@ -1973,18 +2051,22 @@ fn matches_timeline(
     timeline: &VideoMeta,
     first: &Option<crate::AudioProbe>,
 ) -> crate::Result<Rate> {
-    // Codec first: one timeline is one kind of source. Mixing them would decode
-    // (every clip opens its own decoder) but on a machine without the VA-API
-    // plugin the VP9 half would be black frames with the refusal only on
-    // stderr, which is exactly what a front-end cannot show.
-    if meta.codec != timeline.codec {
-        return Err(format!(
-            "{} does not match the timeline's {}",
-            meta.codec.name(),
-            timeline.codec.name()
-        )
-        .into());
-    }
+    // The codec is *not* held to the timeline's -- every clip opens its own
+    // decoder, so an H.264 take and an HEVC one play on one timeline. What the
+    // codec gate was really protecting against stays, in the one place that can
+    // actually answer it: on a machine without the VA-API plugin an HEVC or VP9
+    // clip would be black frames with the refusal on stderr alone, so the file
+    // is asked for a decoder *here*, at the door, where the `Err` is still
+    // something a front-end can show. A zero-length range probes and starts no
+    // worker, and H.264 costs nothing at all -- [`DecodeSession::open_worker`]
+    // only enters VA-API off that path.
+    DecodeSession::open_worker(
+        &source.path,
+        0,
+        0,
+        ColorParams::default(),
+        Composer::passthrough(),
+    )?;
     // The frame rate is *not* a refusal any more: a file shot at another rate is
     // placed for the seconds it lasts and read through [`Rate`] at the
     // decoder's door, so it plays at the speed it was shot at on a timeline
@@ -2002,8 +2084,9 @@ fn matches_timeline(
 }
 
 /// Whether a candidate's audio may join a timeline whose first source probes as
-/// `first`: same rate, same layout, or both silent. One output device and one
-/// exported track is all there is, and no resampler.
+/// `first`: same rate, same layout -- or no audio of its own at all, which is
+/// silence over the clip's span and agrees with everything. One output device
+/// and one exported track is all there is, and no resampler.
 ///
 /// The audio half of [`matches_timeline`], which a stream placed on its own
 /// ([`PlaybackSession::place_stream_at`]) has to pass while the picture it
@@ -2021,9 +2104,9 @@ fn matches_timeline(
 /// `Ok(None)` for a timeline whose first such source is silent, and for one of
 /// nothing but stills. That is a silent timeline, and a file with sound is
 /// still refused by [`audio_matches`] in the words it always used ("the file
-/// has audio, the timeline is silent") -- the same answer a silent *video* as
-/// source 0 has always given. This function widens which source is asked, not
-/// what the answer means.
+/// has audio, the timeline is silent") -- the device was opened on source 0's
+/// track and there is none to open. This function widens which source is asked,
+/// not what the answer means.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
     match audio_source_of(sources) {
         Some(first) => AudioSession::probe(&first.path, first.audio_stream),
@@ -2052,12 +2135,19 @@ fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::R
     if probe == *first {
         return Ok(());
     }
-    Err(match (probe, first) {
-        (None, _) => "the file is silent, the timeline has audio".to_string(),
-        (_, None) => "the file has audio, the timeline is silent".to_string(),
-        (Some(a), Some(b)) => format!(
+    // ...and a *silent* file joins whatever the timeline is: it contributes
+    // silence over its span, which is the very thing both audio paths already
+    // synthesise for a gap ([`AudioSession::open_multi_streams_speed`] plays
+    // it, `AudioSession::copy_multi_streams` writes it). There is no rate and
+    // no layout to disagree about, so there is nothing left to refuse.
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    Err(match first {
+        None => "the file has audio, the timeline is silent".to_string(),
+        Some(b) => format!(
             "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
-            a.sample_rate, a.channels, b.sample_rate, b.channels
+            probe.sample_rate, probe.channels, b.sample_rate, b.channels
         ),
     }
     .into())
