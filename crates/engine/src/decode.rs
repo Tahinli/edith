@@ -335,6 +335,9 @@ impl DecodeSession {
             ColorDescription::default(),
             canvas,
             tonemap::Preset::default(),
+            // ...and no declared peak either, for the same reason: there is no
+            // tone map on this path to hand one to.
+            None,
         )
         .frame(
             start_frame,
@@ -414,6 +417,12 @@ impl DecodeSession {
         // Read off the file once, here, and carried into the worker: it is a
         // property of the stream, so it cannot change while one range decodes.
         let source_color = meta.color;
+        // ...and with it what the film says its own brightest picture is
+        // ([`Demuxer::light`]): the tone map's assumed peak on the reference
+        // rendition, so a 1759 cd/m^2 grade is converted at 1759 rather than at
+        // the 1000 a file that declared nothing is assumed at. Read here
+        // because the demuxer is moved into the worker below.
+        let declared_peak = demuxer.light().peak();
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
         // decoder run ahead of the display without limit.
         let (tx, rx) = sync_channel(2);
@@ -448,7 +457,7 @@ impl DecodeSession {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut render = Render::new(color, source_color, canvas, tone);
+                let mut render = Render::new(color, source_color, canvas, tone, declared_peak);
                 // The plugin has to be opened on the thread that uses it: its
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
@@ -536,11 +545,15 @@ const TONE_MAPPED: ColorDescription = ColorDescription {
 };
 
 impl Render {
+    /// `peak` is what the file declared about its own brightness
+    /// ([`Demuxer::light`]), which only an HDR stream has and only the
+    /// reference rendition reads (see [`tonemap::Preset`]).
     fn new(
         color: ColorParams,
         desc: ColorDescription,
         canvas: Composer,
         preset: tonemap::Preset,
+        peak: Option<f32>,
     ) -> Self {
         Self {
             color,
@@ -553,8 +566,8 @@ impl Render {
             // range argument to `ToneMapper::new`.
             tone: match desc.transfer {
                 Transfer::Sdr => None,
-                Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset)),
-                Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset)),
+                Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset, peak)),
+                Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset, peak)),
             },
             graded: (Vec::new(), Vec::new(), Vec::new()),
         }

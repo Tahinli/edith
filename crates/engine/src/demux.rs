@@ -95,9 +95,11 @@ impl Demuxer {
     /// read at open out of the container and -- for an HEVC stream whose
     /// container said nothing -- out of the first access unit's SEI.
     ///
-    /// Not part of [`VideoMeta`] for the reason [`Self::bit_depth`] is not:
-    /// nothing above reads it yet. [`crate::tonemap`] is where it goes, and that
-    /// is a change of its own.
+    /// Read by the two sites that build a tone map -- the decode funnel
+    /// (`decode::DecodeSession::open_worker`) and the export table -- as the
+    /// assumed peak of [`crate::tonemap::Preset::Reference`]. Still not part of
+    /// [`VideoMeta`]: both of them have the demuxer itself in hand, so the
+    /// number travels no further than the open that read it.
     pub fn light(&self) -> ContentLight {
         match self {
             Self::Mp4(d) => d.light,

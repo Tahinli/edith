@@ -442,7 +442,9 @@ fn an_hdr_clip_is_tone_mapped_before_it_is_graded() {
         let got = raw_yuv(&out).expect("ffmpeg read the export");
 
         let (width, height) = (1280usize, 720usize);
-        let mapper = ToneMapper::new(tonemap::Transfer::Pq, preset);
+        // No declared peak: the fixture's tags say PQ and nothing about how
+        // bright it is, so both sides are on the rendition's own number.
+        let mapper = ToneMapper::new(tonemap::Transfer::Pq, preset, None);
         // The same bytes twice, through the two orders. Whichever preset is in
         // force, both sides move with it -- what is asserted is which of them
         // the export sits on, not where either lands.
@@ -495,6 +497,19 @@ fn a_real_hdr_film_exports_as_a_picture() {
     }
     let mut session = PlaybackSession::open(film).expect("open the film");
     assert_eq!(session.meta().color.transfer, Transfer::Pq, "an HDR10 film");
+    // What this film declares about itself, and therefore what the reference
+    // rendition converts it at: 1759 cd/m^2 of MaxCLL, which its Matroska never
+    // says and its HEVC SEI does. Both the funnel and the export table below
+    // build their tables off this same number.
+    let (_, demuxer) = Demuxer::open(film).expect("reopen the film");
+    let peak = demuxer.light().peak();
+    assert_eq!(peak, Some(1759.0), "the film's declared peak");
+    let mapper = ToneMapper::new(tonemap::Transfer::Pq, session.tone(), peak);
+    assert_eq!(
+        mapper.peak(),
+        1759.0,
+        "the reference rendition converts this film at its own peak"
+    );
     // A five-second window out of the middle: cut both ends, drop them, and the
     // delete closes the gap ahead of what is left, so the export is those five
     // seconds and no leading black.
@@ -585,4 +600,33 @@ fn a_graded_clip_exports_the_picture_the_preview_showed() {
         drop(reopened);
         std::fs::remove_file(&out).unwrap();
     }
+}
+
+/// Preview and export agree on the film's own peak, not merely on the preset:
+/// `test_hdr_bright.mkv` declares 4000 cd/m^2, and the two sides read it in
+/// different places -- the decode funnel off the demuxer it already opened, the
+/// export table off `source_rate`'s. One of them left on the 1000 an undeclared
+/// file is assumed at would be a preview the export does not match, which is
+/// exactly the failure this file exists to refuse.
+///
+/// Measured as everywhere else here: this engine's own decode of its own export
+/// against the canvas the preview showed.
+#[test]
+fn a_declared_peak_exports_the_picture_the_preview_showed() {
+    let mut session = two_frames(&asset("test_hdr_bright.mkv"));
+    assert_eq!(session.meta().color.transfer, Transfer::Pq, "an HDR fixture");
+    let preview = frame0_bgra(&mut session);
+    let out = out_path("declared_peak", "mp4");
+    export(&session, &out, Format::Mp4);
+
+    let mut reopened = PlaybackSession::open(&*out).expect("reopen the export");
+    let exported = frame0_bgra(&mut reopened);
+    let diff = mean_abs_diff(&preview, &exported);
+    eprintln!("declared peak 4000: preview vs export {diff:.2} mean codes");
+    assert!(
+        diff <= 2.0,
+        "the export is {diff:.2} codes from what the preview showed"
+    );
+    drop(reopened);
+    std::fs::remove_file(&out).unwrap();
 }
