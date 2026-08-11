@@ -1720,7 +1720,7 @@ impl Player {
     /// pixels along the bed to hold still (a ctrl+wheel holds the pointer), and
     /// with none it is the playhead -- so the frame being worked on is still the
     /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
-    /// stops at [`ZOOM_MAX_SECONDS`] on the bed, in at a handful of frames.
+    /// stops at the whole timeline on the bed, in at a handful of frames.
     fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
         let view = self.view();
         let at = self.playhead(view.duration);
@@ -5995,7 +5995,7 @@ impl Player {
                         None,
                         "−",
                         format!(
-                            "{} — show more of the timeline; stops at four hours on the bed",
+                            "{} — show more of the timeline; stops with all of it on the bed",
                             key(ActionId::ZoomOut)
                         ),
                         live,
@@ -11173,10 +11173,15 @@ const ZOOM_STEP: f32 = 1.25;
 /// not an edit surface.
 const ZOOM_MIN_FRAMES: f64 = 8.;
 
-/// How much timeline the bed may be widened out to hold. The far stop, and the
-/// counterpart of [`ZOOM_MIN_FRAMES`]: both are measured against the bed, never
-/// against what is on the timeline, so neither moves when a clip is added.
-const ZOOM_MAX_SECONDS: f64 = 4. * 3600.;
+/// How thin a second of timeline may be drawn on a bed that is already showing
+/// all of it: the far stop for a *short* project, which has no length of its own
+/// worth widening to, so a five second import can still be zoomed out of.
+const PPS_MIN: f64 = 1.;
+
+/// How much bed the far stop leaves past the last frame, as a multiple of the
+/// timeline's own length -- so a timeline zoomed all the way out ends a sliver
+/// short of the window's edge rather than glued to it.
+const ZOOM_OUT_MARGIN: f64 = 1.05;
 
 /// How wide a second of timeline is drawn before anyone zooms: a five second
 /// import is 200 px of a bed several times that, so a short clip reads as
@@ -11189,6 +11194,10 @@ const PPS_DEFAULT: f64 = 40.;
 fn span_label(span: f64) -> String {
     match span {
         s if !s.is_finite() || s <= 0. => "—".to_string(),
+        // Hours once a timeline is long enough to be measured in them: the far
+        // stop follows the content now, so "315m" is a span a user can be sat
+        // at, and no one reads a pill in minutes past sixty.
+        s if s >= 3600. => format!("{:.1}h", s / 3600.),
         s if s >= 600. => format!("{:.0}m", s / 60.),
         s if s >= 60. => format!("{:.1}m", s / 60.),
         s if s >= 10. => format!("{s:.0}s"),
@@ -11288,22 +11297,36 @@ impl View {
     }
 
     /// The two stops, in pixels per second: [`ZOOM_MIN_FRAMES`] across the bed
-    /// is as tight as it goes, [`ZOOM_MAX_SECONDS`] across it as wide. `None`
-    /// on a bed that was never painted -- there is nothing to measure them
-    /// against yet, and a stop guessed off a zero width would throw away a zoom
-    /// the user asked for.
+    /// is as tight as it goes, and as wide as it goes is the whole timeline on
+    /// the bed with [`ZOOM_OUT_MARGIN`] to spare -- the far stop is *relative*,
+    /// so the end of a five hour timeline is reachable for the same reason the
+    /// end of a five minute one is. A fixed far stop could not say that: a
+    /// timeline longer than it had an end no zoom could reach, which is the bug
+    /// this is. Short of [`PPS_MIN`] the timeline's own length is not worth
+    /// widening to and the pixel takes over, so a short import can still be
+    /// zoomed out of and the resting scale is nobody's content.
+    ///
+    /// `None` on a bed that was never painted -- there is nothing to measure
+    /// them against yet, and a stop guessed off a zero width would throw away a
+    /// zoom the user asked for.
     fn stops(self) -> Option<(f64, f64)> {
         (self.bed > 0.).then(|| {
             let bed = f64::from(self.bed);
-            let min = bed / ZOOM_MAX_SECONDS;
+            let whole = match self.duration > 0. {
+                true => bed / (self.duration * ZOOM_OUT_MARGIN),
+                false => PPS_MIN,
+            };
+            let min = whole.min(PPS_MIN);
             (min, (bed * self.fps / ZOOM_MIN_FRAMES).max(min))
         })
     }
 
     /// Clamped to the bed it draws on: between the two stops, and never
     /// scrolled past either end of the timeline. Unlike the fractional view
-    /// this replaced, the *floor* is not the content -- a five second timeline
-    /// zooms out as far as an hour long one does.
+    /// this replaced, the *resting* scale is not the content -- a five second
+    /// timeline zooms out as far as an hour long one does, and both are drawn
+    /// at [`PPS_DEFAULT`] until someone zooms. Only the far stop knows the
+    /// length, and only once the length is worth more than [`PPS_MIN`].
     fn settled(self) -> Scale {
         let pps = match self.scale.pps.is_finite() && self.scale.pps > 0. {
             true => self.scale.pps,
@@ -12360,9 +12383,9 @@ mod tests {
         whole_take, window_title,
     };
     use super::{
-        Choice, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, Preset, RESOLUTIONS, Repeat,
+        Choice, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
         Scale, View,
-        ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
+        ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
@@ -14048,10 +14071,10 @@ mod tests {
         }
     }
 
-    /// Both stops, and the point of the whole mapping: neither is the content's
-    /// own length any more. Out is [`ZOOM_MAX_SECONDS`] across the bed, in is
-    /// [`ZOOM_MIN_FRAMES`] across it -- so a short import can be zoomed out of
-    /// and a long one zoomed into, and neither can scroll off an end.
+    /// Both stops. In is [`ZOOM_MIN_FRAMES`] across the bed; out, on a timeline
+    /// far too short to be worth widening to, is a pixel to the second -- so a
+    /// short import can be zoomed out of, a long one zoomed into, and neither
+    /// can scroll off an end.
     #[test]
     fn zoom_stops_at_a_bedful_of_time_and_at_a_handful_of_frames() {
         let (duration, fps) = (20., 30.);
@@ -14060,8 +14083,8 @@ mod tests {
             scale = test_view(scale, duration).zoomed(1. / ZOOM_STEP, 100.);
         }
         assert!(
-            (test_view(scale, duration).span() - ZOOM_MAX_SECONDS).abs() < 1e-6,
-            "widest is a bedful of hours, not the 20 s that happen to be on it"
+            (test_view(scale, duration).span() - f64::from(TEST_BED) / PPS_MIN).abs() < 1e-6,
+            "widest is a pixel to the second, not the 20 s that happen to be on it"
         );
         for _ in 0..200 {
             scale = test_view(scale, duration).zoomed(ZOOM_STEP, 100.);
@@ -14113,6 +14136,68 @@ mod tests {
         };
         assert_eq!(unpainted.settled().pps, 4e6);
         assert_eq!(unpainted.following(19.), unpainted.scale);
+    }
+
+    /// The bug a fixed far stop was: two two-and-a-half hour clips are five
+    /// hours of timeline, longer than any stop measured in hours, so the end of
+    /// the second one could not be brought on screen by any zoom. The stop is
+    /// the timeline's own length now, so it can.
+    #[test]
+    fn zooming_out_reaches_the_end_of_a_timeline_however_long_it_is() {
+        let bed = 900.;
+        let view = |scale: Scale, duration: f64| View {
+            scale,
+            bed,
+            duration,
+            fps: 30.,
+        };
+        // As far out as the keys go, from the scale a fresh project is drawn at.
+        let out = |duration: f64| {
+            let mut scale = Scale::default();
+            for _ in 0..400 {
+                scale = view(scale, duration).zoomed(1. / ZOOM_STEP, 0.);
+            }
+            scale
+        };
+        let five_hours = 2. * 2.5 * 3600.;
+        let wide = out(five_hours);
+        // The whole five hours is on the bed, the last frame drawn inside the
+        // window rather than against its edge.
+        assert_eq!(wide.start, 0.);
+        let end = wide.px_at(five_hours);
+        assert!(end < bed, "the end of the timeline is off the bed at {end} px");
+        assert!(end > bed * 0.9, "and not shrunk into a corner: {end} px");
+        assert!(
+            (view(wide, five_hours).span() - five_hours * ZOOM_OUT_MARGIN).abs() < 1e-6,
+            "the far stop is the timeline plus its margin"
+        );
+        // Zooming back in still reaches the frame stop on a timeline that long:
+        // the far stop moving does not drag the near one with it.
+        let mut scale = wide;
+        for _ in 0..400 {
+            scale = view(scale, five_hours).zoomed(ZOOM_STEP, 0.);
+        }
+        assert_eq!(
+            (view(scale, five_hours).span() * 30.).round(),
+            ZOOM_MIN_FRAMES
+        );
+        // And a ten second project is not zoomed out to four hours of empty
+        // bed: short of a pixel to the second its own length is not worth
+        // widening to, and that is 900 s of bed, not 14400.
+        assert!((view(out(10.), 10.).span() - f64::from(bed) / PPS_MIN).abs() < 1e-6);
+        // Whatever the length, the resting scale is nobody's content: the width
+        // invariant, which a far stop measured off the content would break.
+        assert_eq!(view(Scale::default(), 10.).settled(), Scale::default());
+        assert_eq!(view(Scale::default(), five_hours).settled(), Scale::default());
+        // Shrinking the timeline pulls a fully zoomed out view in with it --
+        // what was showing all of the timeline still shows all of it.
+        let shrunk = view(wide, 1800.).settled();
+        assert!((view(shrunk, 1800.).span() - 1800. * ZOOM_OUT_MARGIN).abs() < 1e-6);
+        assert!(shrunk.px_at(1800.) < bed);
+        // Growing it does not: a scale the user zoomed to is still legal, and
+        // the stop it stopped at is one press further out.
+        assert_eq!(view(wide, 2. * five_hours).settled().pps, wide.pps);
+        assert!(view(wide, 2. * five_hours).zoomed(1. / ZOOM_STEP, 0.).pps < wide.pps);
     }
 
     /// What makes a zoomed timeline follow the playing head: off the bed at
@@ -14206,7 +14291,9 @@ mod tests {
         assert_eq!(span_label(4.5), "4.5s");
         assert_eq!(span_label(22.5), "22s");
         assert_eq!(span_label(90.), "1.5m");
-        assert_eq!(span_label(3600.), "60m");
+        assert_eq!(span_label(3600.), "1.0h");
+        // The span a five hour timeline is zoomed all the way out to.
+        assert_eq!(span_label(5. * 3600. * 1.05), "5.2h");
         // Before the first paint there is no bed and so no answer to give.
         assert_eq!(span_label(0.), "—");
         assert_eq!(span_label(f64::NAN), "—");
