@@ -73,7 +73,6 @@ pub(crate) trait VaStreamInfo {
     /// Returns the VA profile of the stream.
     fn va_profile(&self) -> anyhow::Result<i32>;
     /// Returns the RT format of the stream.
-    #[allow(dead_code)]
     fn rt_format(&self) -> anyhow::Result<u32>;
     /// Returns the minimum number of surfaces required to decode the stream.
     fn min_num_surfaces(&self) -> usize;
@@ -255,13 +254,18 @@ impl<V: VideoFrame> VaapiBackend<V> {
         self.stream_info.min_num_frames = stream_params.min_num_surfaces();
 
         // TODO: Handle context re-use
-        // TODO: We should obtain RT_FORMAT from stream_info
+        // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): the RT format comes
+        // from the stream rather than being assumed 8-bit 4:2:0, which is what
+        // an HEVC Main 10 stream needs -- its surfaces are P010 and a
+        // YUV420-only config rejects them. This is upstream's own TODO, and
+        // `VaStreamInfo::rt_format` is upstream's own answer to it.
+        let rt_format = stream_params.rt_format().unwrap_or(libva::VA_RT_FORMAT_YUV420);
         let config = self
             .display
             .create_config(
                 vec![libva::VAConfigAttrib {
                     type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
-                    value: libva::VA_RT_FORMAT_YUV420,
+                    value: rt_format,
                 }],
                 stream_params.va_profile().map_err(|_| anyhow!("Could not get VAProfile!"))?,
                 libva::VAEntrypoint::VAEntrypointVLD,

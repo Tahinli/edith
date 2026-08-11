@@ -35,7 +35,8 @@ use cros_codecs::encoder::{
 };
 use cros_codecs::image_processing::nv12_to_i420;
 use cros_codecs::libva::{
-    Display, Image, Surface, VA_FOURCC_NV12, VAEntrypoint, VAImageFormat, VAProfile,
+    Display, Image, Surface, VA_FOURCC_NV12, VA_FOURCC_P010, VAEntrypoint, VAImageFormat,
+    VAProfile,
 };
 use cros_codecs::video_frame::VideoFrame;
 use cros_codecs::video_frame::frame_pool::{FramePool, PooledVideoFrame};
@@ -58,11 +59,16 @@ type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 /// still loads and still decodes H.264 (it simply refuses the newer codecs'
 /// files at `Demuxer`).
 ///
-/// ponytail: 8-bit 4:2:0 only -- VP9 profile 0, HEVC Main, AV1 Main. VP9
-/// profile 2, HEVC Main 10 and AV1 Professional decode 10-bit, which the NV12
-/// pool and the `vaGetImage` read-back here cannot carry (`Demuxer` refuses
-/// both HEVC Main 10 and 10-bit AV1 by name); the upgrade path is a P010 pool
-/// selected from the stream info.
+/// 4:2:0 only, 8- or 10-bit: HEVC Main and Main 10, VP9 profile 0, AV1 Main.
+/// A 10-bit stream decodes into a P010 pool and is read back down to the 8-bit
+/// I420 every frame here is ([`Session::emit`]).
+///
+/// ponytail: 10-bit is *carried* 8-bit, because [`VhFrame`] is a byte-per-sample
+/// interface all the way to the renderer. That costs the low two bits of a Main
+/// 10 source; the upgrade path is a 16-bit `VhFrame`, which is a change to every
+/// stage between here and the texture upload, not to this file.
+/// VP9 profile 2 and 10-bit AV1 are still refused by `Demuxer`: neither codec
+/// states its depth where this reads it.
 enum Decoder {
     H264(Dec<H264>),
     Hevc(Dec<H265>),
@@ -97,8 +103,12 @@ const STALL_LIMIT: u32 = 10_000;
 
 struct Session {
     decoder: Decoder,
-    /// NV12 descriptor for `vaGetImage`, queried once at open.
+    /// NV12 (or, for a 10-bit stream, P010) descriptor for `vaGetImage`,
+    /// queried once at open.
     nv12_format: VAImageFormat,
+    /// Whether the surfaces are P010 rather than NV12, which is the one thing
+    /// the read-back has to do differently.
+    ten_bit: bool,
     pool: FramePool<GenericDmaVideoFrame>,
     demuxer: Demuxer,
     meta: VhMeta,
@@ -122,23 +132,35 @@ struct Session {
 /// NV12 layout inside it ourselves. VA-API imports it as one DRM-PRIME object
 /// with two planes at known offsets, which is exactly what the descriptor in
 /// `GenericDmaVideoFrame` emits.
+///
+/// `ten_bit` asks for the same thing in P010: the very same two-plane 4:2:0
+/// shape with 16-bit samples, so the buffer is simply twice as wide.
 fn alloc_nv12(
     gbm: &gbm::Device<std::fs::File>,
     coded: Resolution,
+    ten_bit: bool,
 ) -> Result<GenericDmaVideoFrame, String> {
     let rows = coded.height + coded.height.div_ceil(2);
+    let width = coded.width * if ten_bit { 2 } else { 1 };
     let bo = gbm
-        .create_buffer_object::<()>(coded.width, rows, GbmFormat::R8, BufferObjectFlags::LINEAR)
-        .map_err(|e| format!("gbm R8 {}x{rows} allocation failed: {e}", coded.width))?;
+        .create_buffer_object::<()>(width, rows, GbmFormat::R8, BufferObjectFlags::LINEAR)
+        .map_err(|e| format!("gbm R8 {width}x{rows} allocation failed: {e}"))?;
     let pitch = bo.stride().map_err(|e| e.to_string())? as usize;
     let fd = bo.fd().map_err(|e| e.to_string())?;
-    GenericDmaVideoFrame::new(vec![std::fs::File::from(fd)], nv12_layout(coded, pitch))
+    GenericDmaVideoFrame::new(
+        vec![std::fs::File::from(fd)],
+        nv12_layout(coded, pitch, ten_bit),
+    )
 }
 
-/// Two NV12 planes packed one after the other in a single buffer object.
-fn nv12_layout(coded: Resolution, pitch: usize) -> FrameLayout {
+/// Two NV12 (or P010) planes packed one after the other in a single buffer
+/// object.
+fn nv12_layout(coded: Resolution, pitch: usize, ten_bit: bool) -> FrameLayout {
     FrameLayout {
-        format: (Fourcc::from(b"NV12"), 0 /* DRM_FORMAT_MOD_LINEAR */),
+        format: (
+            Fourcc::from(if ten_bit { b"P010" } else { b"NV12" }),
+            0, /* DRM_FORMAT_MOD_LINEAR */
+        ),
         size: coded,
         planes: vec![
             PlaneLayout {
@@ -186,11 +208,21 @@ impl Session {
     fn open(path: &Path) -> Option<Self> {
         let (meta, demuxer) = Demuxer::open(path).ok()?;
         let (display, gbm) = open_devices()?;
+        // A 10-bit stream decodes into P010 surfaces and is read back through a
+        // P010 image; a driver that has no such image format is one this cannot
+        // read 10-bit off at all, which is a null session and a software
+        // fallback like any other refusal here.
+        let ten_bit = demuxer.bit_depth() > 8;
+        let want = if ten_bit {
+            VA_FOURCC_P010
+        } else {
+            VA_FOURCC_NV12
+        };
         let nv12_format = display
             .query_image_formats()
             .ok()?
             .into_iter()
-            .find(|f| f.fourcc == VA_FOURCC_NV12)?;
+            .find(|f| f.fourcc == want)?;
         let decoder = match meta.codec {
             Codec::H264 => {
                 Decoder::H264(Dec::<H264>::new_vaapi(display, BlockingMode::Blocking).ok()?)
@@ -206,11 +238,12 @@ impl Session {
             }
         };
         let pool = FramePool::new(move |info: &StreamInfo| {
-            alloc_nv12(&gbm, info.coded_resolution).expect("output frame allocation failed")
+            alloc_nv12(&gbm, info.coded_resolution, ten_bit).expect("output frame allocation failed")
         });
         Some(Self {
             decoder,
             nv12_format,
+            ten_bit,
             pool,
             demuxer,
             meta: VhMeta {
@@ -350,6 +383,20 @@ impl Session {
 
         let (dst_y, rest) = self.out.split_at_mut(self.luma);
         let (dst_u, dst_v) = rest.split_at_mut(self.chroma);
+        if self.ten_bit {
+            p010_to_i420(
+                &data[va.offsets[Y_PLANE] as usize..],
+                va.pitches[Y_PLANE] as usize,
+                dst_y,
+                &data[va.offsets[UV_PLANE] as usize..],
+                va.pitches[UV_PLANE] as usize,
+                dst_u,
+                dst_v,
+                w,
+                h,
+            );
+            return;
+        }
         nv12_to_i420(
             &data[va.offsets[Y_PLANE] as usize..],
             va.pitches[Y_PLANE] as usize,
@@ -380,6 +427,43 @@ impl Session {
         out.v_stride = cw;
         out.width = self.meta.width;
         out.height = self.meta.height;
+    }
+}
+
+/// One P010 picture down to packed 8-bit I420: [`nv12_to_i420`] for a surface
+/// whose samples are 16-bit little-endian with the value in the **high** bits,
+/// which is what P010 means. The high byte of each pair is therefore the 10-bit
+/// sample shifted down by two, i.e. the 8-bit one -- no rounding, because a
+/// second read of the low byte costs more than the half-bit it would buy.
+fn p010_to_i420(
+    src_y: &[u8],
+    src_y_pitch: usize,
+    dst_y: &mut [u8],
+    src_uv: &[u8],
+    src_uv_pitch: usize,
+    dst_u: &mut [u8],
+    dst_v: &mut [u8],
+    width: usize,
+    height: usize,
+) {
+    for row in 0..height {
+        let src = &src_y[row * src_y_pitch..];
+        let dst = &mut dst_y[row * width..row * width + width];
+        for (x, out) in dst.iter_mut().enumerate() {
+            *out = src[2 * x + 1];
+        }
+    }
+    let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+    for row in 0..ch {
+        let src = &src_uv[row * src_uv_pitch..];
+        let (u, v) = (
+            &mut dst_u[row * cw..row * cw + cw],
+            &mut dst_v[row * cw..row * cw + cw],
+        );
+        for x in 0..cw {
+            u[x] = src[4 * x + 1];
+            v[x] = src[4 * x + 3];
+        }
     }
 }
 
@@ -657,8 +741,8 @@ impl EncSession {
         };
         // Allocated at the aligned size, so the buffer's pitch is never smaller
         // than a padded row.
-        let frame = alloc_nv12(&gbm, coded).ok()?;
-        let layout = nv12_layout(coded, frame.get_plane_pitch()[0]);
+        let frame = alloc_nv12(&gbm, coded, false).ok()?;
+        let layout = nv12_layout(coded, frame.get_plane_pitch()[0], false);
         Some(Self {
             encoder,
             h264: !av1,
