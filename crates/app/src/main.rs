@@ -636,10 +636,10 @@ struct Player {
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
-    /// How much of the timeline the ruler and the lanes are showing. Held here
+    /// How wide a second of timeline is drawn, and from which moment. Held here
     /// and nowhere else: every frame-to-pixel answer in the panel comes out of
     /// it, so the boxes, the playhead and the pointer cannot disagree.
-    view: View,
+    scale: Scale,
     /// Which clip the edit keys act on: the lane it is in and its index there.
     /// The *clicked* half, not the group -- a group is what gets marked on
     /// screen, but Lift has to know which half it was aimed at. Indices move
@@ -1129,23 +1129,37 @@ impl Player {
         cx.notify();
     }
 
-    /// Magnifies the timeline about a point that stays put: `anchor` is where
-    /// along the bed to hold still (a ctrl+wheel holds the pointer), and with
-    /// none it is the playhead -- so the frame being worked on is still the
+    /// The scale against the bed it is drawn on and the timeline it is drawn
+    /// from: every clamp, zoom and scroll is worked out through this, and the
+    /// bed is measured off the ruler's probe rather than remembered, so a
+    /// resized window is a resized view on the very next answer.
+    fn view(&self) -> View {
+        View {
+            scale: self.scale,
+            bed: f32::from(self.ruler.get().size.width),
+            duration: self.drawn_duration(),
+            fps: self.fps,
+        }
+    }
+
+    /// Magnifies the timeline about a point that stays put: `anchor` is how many
+    /// pixels along the bed to hold still (a ctrl+wheel holds the pointer), and
+    /// with none it is the playhead -- so the frame being worked on is still the
     /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
-    /// stops at the whole timeline, in at a handful of frames.
+    /// stops at [`ZOOM_MAX_SECONDS`] on the bed, in at a handful of frames.
     fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
-        let duration = self.drawn_duration();
-        let at = self.playhead(duration);
-        let anchor = anchor.unwrap_or_else(|| self.view.frac_at(at, duration).clamp(0., 1.));
-        self.view = self.view.zoomed(factor, anchor, duration, self.fps);
+        let view = self.view();
+        let at = self.playhead(view.duration);
+        let anchor = anchor.unwrap_or_else(|| self.scale.px_at(at).clamp(0., view.bed));
+        self.scale = view.zoomed(factor, anchor);
         cx.notify();
     }
 
-    /// All the way back out: the whole timeline across the bed, which is what
-    /// the panel shows before anyone has zoomed at all.
+    /// All the way back out: the whole timeline across the bed, and the one
+    /// thing that reads the timeline's own length to decide how wide a second
+    /// is drawn.
     fn zoom_fit(&mut self, cx: &mut Context<Self>) {
-        self.view = View::default();
+        self.scale = self.view().fit();
         cx.notify();
     }
 
@@ -2346,14 +2360,12 @@ impl Player {
     /// there is no such clip to move. The engine has the last word on where it
     /// may actually go -- this is the ask, not the answer.
     ///
-    /// ponytail: the bed ends where the timeline does, so a clip cannot be
-    /// dragged *past* the last frame -- the pointer has no pixel out there to
-    /// name and [`View::time_at`] clamps to the duration. Room to the right is
-    /// made by pulling a tail out first ([`Player::drawn_duration`] already
-    /// lengthens the bed for exactly that gesture). The upgrade is to draw the
-    /// bed past the end while a clip drag is in flight, the way a trim already
-    /// does: `drawn_duration` would take the dragged clip's length the same way
-    /// it takes a trim's reach.
+    /// ponytail: the bed now runs past the last frame whenever the timeline is
+    /// shorter than the view ([`Scale::time_at`] clamps at the head only), so a
+    /// clip *can* be dragged out there. Zoomed in against the far end it cannot:
+    /// the scroll clamp pins the bed's right edge to the duration, and the
+    /// pointer has no pixel past it. The upgrade is to let the scroll clamp
+    /// leave a screen of empty bed after the end, the way every NLE does.
     fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
         let session = self.session.as_ref()?;
         let clip = session.lane_clips(from).get(idx).copied()?;
@@ -2376,16 +2388,11 @@ impl Player {
         Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
     }
 
-    /// [`SNAP_PX`] in timeline frames at the zoom the bed is drawn at: a snap is
-    /// a distance on screen, so zoomed right in it is worth less than a frame
-    /// (no snap at all, which is what a hand placing single frames wants) and
-    /// zoomed out to the whole timeline it is worth many.
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
+    /// own width drops out of it, since a pixel is now worth the same stretch of
+    /// timeline wherever the view sits.
     fn snap_frames(&self) -> u32 {
-        let bed = f64::from(f32::from(self.ruler.get().size.width));
-        if bed <= 0. {
-            return 0;
-        }
-        (SNAP_PX / bed * self.view.span(self.drawn_duration()) * self.fps) as u32
+        self.scale.snap_frames(self.fps)
     }
 
     /// Opens the clip menu on the box under the pointer, from the right button
@@ -2454,14 +2461,13 @@ impl Player {
     }
 
     /// The timeline frame a pointer at window x is on: along the same bed the
-    /// ruler is measured on, through the same [`View`] every box is drawn
+    /// ruler is measured on, through the same [`Scale`] every box is drawn
     /// through, so a zoomed-in panel answers with the frame under the pointer
     /// and not with the one that would have been there unzoomed. The one
     /// question a trim, a grab and a drop all ask.
     fn frame_under(&self, x: Pixels) -> u32 {
-        let duration = self.drawn_duration();
         frame_at(
-            self.view.time_at(frac_along(x, self.ruler.get()), duration),
+            self.scale.time_at(px_along(x, self.ruler.get())),
             self.fps,
         )
     }
@@ -3121,9 +3127,12 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
+        // Clamped to the timeline here rather than in the mapping: there is bed
+        // past the last frame now, and a seek out there is a seek to the end.
         let t = self
-            .view
-            .time_at(frac_along(x, self.ruler.get()), session.timeline_duration());
+            .scale
+            .time_at(px_along(x, self.ruler.get()))
+            .clamp(0., session.timeline_duration());
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
@@ -3431,7 +3440,7 @@ impl Render for Player {
         // edit that shortens the timeline moves the far end of the view, and a
         // playhead that has run off the bed pulls the view after it -- which is
         // what makes a zoomed-in timeline scroll while it plays.
-        self.view = self.view.following(position, duration, self.fps);
+        self.scale = self.view().following(position);
 
         div()
             .track_focus(&self.focus)
@@ -4207,11 +4216,12 @@ impl Player {
         playing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Where the playhead is *on the bed*, which at the fit is where along
-        // the timeline it is and zoomed in is where along the visible slice.
-        // Clamped because it is drawn as a width as well as an offset, and the
-        // view follows the playhead anyway, so it is never off the bed.
-        let filled = self.view.frac_at(position, duration).clamp(0., 1.);
+        // Where the playhead is *on the bed*, in pixels from its left edge.
+        // Clamped to the bed because it is drawn as a width as well as an
+        // offset, and the view follows the playhead anyway, so it is never off
+        // the bed for long.
+        let bed_w = f32::from(self.ruler.get().size.width);
+        let filled = self.scale.px_at(position).clamp(0., bed_w);
         // An export owns the hint slot and the ruler while it runs: the
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
@@ -4234,7 +4244,7 @@ impl Player {
         // closure would hold it for as long as the iterator lives.
         let mut rows = Vec::new();
         for &lane in &lanes {
-            rows.push(self.lane_row(lane, duration, filled, cx));
+            rows.push(self.lane_row(lane, filled, cx));
         }
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
@@ -4451,13 +4461,17 @@ impl Player {
                     .child(control(
                         "zoom-fit",
                         None,
-                        format!("{:.1}x", self.view.zoom),
+                        // How much timeline is on the bed, not a multiple of
+                        // "the whole of it": the scale no longer knows what the
+                        // whole of it is, and a number that changed on every
+                        // import was a number that lied.
+                        span_label(self.view().span()),
                         format!(
                             "{} — fit the whole timeline; showing {} to {}",
                             key(ActionId::ZoomFit),
-                            timecode(self.view.start, self.fps),
+                            timecode(self.scale.start, self.fps),
                             timecode(
-                                (self.view.start + self.view.span(duration)).min(duration),
+                                (self.scale.start + self.view().span()).min(duration),
                                 self.fps
                             )
                         ),
@@ -4608,7 +4622,7 @@ impl Player {
                                     if dy == 0. {
                                         return;
                                     }
-                                    let anchor = frac_along(event.position.x, this.ruler.get());
+                                    let anchor = px_along(event.position.x, this.ruler.get());
                                     let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
                                     this.zoom(factor, Some(anchor), cx);
                                 },
@@ -4630,7 +4644,7 @@ impl Player {
                                     .child(
                                         div()
                                             .h_full()
-                                            .w(relative(filled))
+                                            .w(px(filled))
                                             .rounded(px(3.))
                                             .bg(rgb(ACCENT)),
                                     ),
@@ -6585,21 +6599,18 @@ impl Player {
     fn lane_row(
         &self,
         lane: Lane,
-        duration: f64,
+        // Where the playhead is on the bed, in pixels: worked out once by the
+        // panel so the ruler's line and every lane's draw the same one.
         filled: f32,
         cx: &mut Context<Self>,
         // Borrows nothing it was given (`use<>`): the rows are built one after
         // another into a list, and a row still holding `cx` would be the only
         // one that could be built.
     ) -> impl IntoElement + use<> {
-        // The bed's own width, measured last repaint off the ruler's bar: the
-        // two are laid out identically (same header offset, same `flex_1`), so
-        // one probe answers for both. Zero before the first paint, which only
-        // costs the labels one frame.
-        let bed_w = f32::from(self.ruler.get().size.width);
-        // The slice being shown, copied out once: every box in the row is
-        // placed through it, so all of them move together when it does.
-        let view = self.view;
+        // The mapping, copied out once: every box in the row is placed through
+        // it, so all of them move together when it does. No bed width is needed
+        // to place them any more -- a second is so many pixels wherever it is.
+        let scale = self.scale;
         let clips = self
             .session
             .as_ref()
@@ -6783,7 +6794,7 @@ impl Player {
                                 .and_then(|s| sources.iter().position(|o| o.path == s.path))
                                 .unwrap_or(clip.source),
                         );
-                        let width = view.width_frac(len, duration);
+                        let width = scale.width_px(len);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
@@ -6815,8 +6826,8 @@ impl Player {
                             // off the left edge: the bed clips what hangs out
                             // of it, so a half-visible clip is drawn as the
                             // half of itself that is on screen.
-                            .left(relative(view.frac_at(start, duration)))
-                            .w(relative(width))
+                            .left(px(scale.px_at(start)))
+                            .w(px(width))
                             .overflow_hidden()
                             .rounded(px(3.))
                             .border_1()
@@ -6945,7 +6956,7 @@ impl Player {
                                         .child(format!("{}", clip.speed)),
                                 )
                             })
-                            .when_some(label.filter(|_| show_label(bed_w * width)), |d, label| {
+                            .when_some(label.filter(|_| show_label(width)), |d, label| {
                                 d.child(
                                     div()
                                         .relative()
@@ -6971,12 +6982,8 @@ impl Player {
                                     .absolute()
                                     .top_0()
                                     .h_full()
-                                    .left(relative(
-                                        view.frac_at(f64::from(at) / self.fps, duration),
-                                    ))
-                                    .w(relative(
-                                        view.width_frac(f64::from(len) / self.fps, duration),
-                                    ))
+                                    .left(px(scale.px_at(f64::from(at) / self.fps)))
+                                    .w(px(scale.width_px(f64::from(len) / self.fps)))
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
@@ -6987,7 +6994,7 @@ impl Player {
                             .absolute()
                             .top_0()
                             .h_full()
-                            .left(relative(filled))
+                            .left(px(filled))
                             .w(px(1.))
                             .bg(rgb(ACCENT)),
                     ),
@@ -8042,10 +8049,6 @@ fn panel_h(lanes: usize) -> f32 {
     PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
 }
 
-fn width_frac(len: f64, total: f64) -> f32 {
-    if total > 0. { (len / total) as f32 } else { 1. }
-}
-
 /// One press of a zoom key, or one notch of ctrl+wheel.
 const ZOOM_STEP: f32 = 1.25;
 
@@ -8054,118 +8057,222 @@ const ZOOM_STEP: f32 = 1.25;
 /// not an edit surface.
 const ZOOM_MIN_FRAMES: f64 = 8.;
 
-/// Which slice of the timeline the ruler and the lanes are showing: `zoom` is
-/// how many times the whole of it the bed is now worth, and `start` the moment
-/// at the bed's left edge. The one place frames become pixels -- every box, the
-/// playhead, a seek and a trim all go through it, so none of them can drift
-/// away from the others when the view moves.
+/// How much timeline the bed may be widened out to hold. The far stop, and the
+/// counterpart of [`ZOOM_MIN_FRAMES`]: both are measured against the bed, never
+/// against what is on the timeline, so neither moves when a clip is added.
+const ZOOM_MAX_SECONDS: f64 = 4. * 3600.;
+
+/// How wide a second of timeline is drawn before anyone zooms: a five second
+/// import is 200 px of a bed several times that, so a short clip reads as
+/// short -- the thing a bed scaled to the content's own length cannot say.
+/// [`View::fit`] is the one way back to "the whole timeline across the bed".
+const PPS_DEFAULT: f64 = 40.;
+
+/// What the zoom button says it is showing: how much timeline fits on the bed,
+/// in the coarsest unit that still tells two zooms apart.
+fn span_label(span: f64) -> String {
+    match span {
+        s if !s.is_finite() || s <= 0. => "—".to_string(),
+        s if s >= 600. => format!("{:.0}m", s / 60.),
+        s if s >= 60. => format!("{:.1}m", s / 60.),
+        s if s >= 10. => format!("{s:.0}s"),
+        s => format!("{s:.1}s"),
+    }
+}
+
+/// The mapping the whole panel is drawn and clicked through: `pps` pixels to a
+/// second of timeline, `start` the moment at the bed's left edge. Absolute --
+/// how wide a clip is drawn depends on how long the clip is and on nothing
+/// else, so adding a second clip does not redraw the first one narrower and
+/// zooming out always makes every box smaller.
 ///
-/// [`View::default`] is the whole timeline across the bed, which is what the
-/// panel drew before there was a zoom at all: at zoom 1 `start` is pinned to 0
-/// and every fraction here is the one [`width_frac`] and `start_frac` gave.
+/// The one place seconds become pixels: every box, the playhead, a seek and a
+/// trim all go through it, so none of them can drift away from the others when
+/// the view moves. What clamps it -- the stops, the scroll, the fit -- needs the
+/// bed it is drawn on and lives on [`View`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct View {
-    zoom: f32,
+struct Scale {
+    pps: f64,
     start: f64,
 }
 
-impl Default for View {
+impl Default for Scale {
     fn default() -> Self {
-        View {
-            zoom: 1.,
+        Scale {
+            pps: PPS_DEFAULT,
             start: 0.,
         }
     }
 }
 
+impl Scale {
+    /// Where a moment sits on the bed, in pixels from its left edge. Negative
+    /// for a moment scrolled off to the left, which is exactly the offset a
+    /// half-visible clip is drawn at.
+    fn px_at(self, at: f64) -> f32 {
+        ((at - self.start) * self.pps) as f32
+    }
+
+    /// How wide a stretch of `len` seconds is drawn. Wider than the bed once
+    /// zoomed in, which is the point of zooming in; never negative, which gpui
+    /// has no meaning for.
+    fn width_px(self, len: f64) -> f32 {
+        (len * self.pps).max(0.) as f32
+    }
+
+    /// The moment `x` pixels along the bed is pointing at: the inverse of
+    /// [`Scale::px_at`], and what every seek and every trim reads. Clamped at
+    /// the head of the timeline only -- there is bed past the last frame now,
+    /// and a tail dragged into it is a longer clip, not an error.
+    fn time_at(self, x: f32) -> f64 {
+        if self.pps > 0. {
+            (self.start + f64::from(x) / self.pps).max(0.)
+        } else {
+            self.start
+        }
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: a snap
+    /// is a distance on screen, so zoomed right in it is worth less than a frame
+    /// (no snap at all, which is what a hand placing single frames wants) and
+    /// zoomed out it is worth many.
+    fn snap_frames(self, fps: f64) -> u32 {
+        if self.pps > 0. {
+            (SNAP_PX / self.pps * fps) as u32
+        } else {
+            0
+        }
+    }
+}
+
+/// A [`Scale`] against the bed it is drawn on and the timeline it is drawn
+/// from. The bed's width is what turns a scale into "how much is on screen",
+/// and that is all the stops, the scroll clamp and the fit are made of.
+///
+/// Built per use out of [`Player::view`] and thrown away again -- the state is
+/// the `Scale`, and this is what a bed of `bed` px showing `duration` seconds
+/// at `fps` may do to it. So no call site can measure a moment against a bed or
+/// a duration that another one did not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    scale: Scale,
+    bed: f32,
+    duration: f64,
+    fps: f64,
+}
+
 impl View {
     /// How much of the timeline is on the bed, in seconds.
-    fn span(self, duration: f64) -> f64 {
-        duration / f64::from(self.zoom)
-    }
-
-    /// The tightest this timeline may be zoomed: [`ZOOM_MIN_FRAMES`] across the
-    /// bed. Never under 1 -- a timeline shorter than that is already at its
-    /// floor, and a zoom that cannot fit the whole of it is not a zoom.
-    fn max_zoom(duration: f64, fps: f64) -> f32 {
-        let frames = duration * fps;
-        if frames > ZOOM_MIN_FRAMES {
-            (frames / ZOOM_MIN_FRAMES) as f32
-        } else {
-            1.
-        }
-    }
-
-    /// Where a moment sits along the bed, 0 at its left edge and 1 at its
-    /// right. Outside that range for a moment scrolled off the view, which is
-    /// exactly the negative offset a half-visible clip is drawn at.
-    fn frac_at(self, at: f64, duration: f64) -> f32 {
-        let span = self.span(duration);
-        if span > 0. {
-            ((at - self.start) / span) as f32
+    fn span(self) -> f64 {
+        if self.scale.pps > 0. {
+            f64::from(self.bed) / self.scale.pps
         } else {
             0.
         }
     }
 
-    /// How wide a stretch of `len` seconds is on the bed. More than the whole
-    /// bed once zoomed in, which is the point of zooming in.
-    fn width_frac(self, len: f64, duration: f64) -> f32 {
-        width_frac(len, self.span(duration))
+    /// The two stops, in pixels per second: [`ZOOM_MIN_FRAMES`] across the bed
+    /// is as tight as it goes, [`ZOOM_MAX_SECONDS`] across it as wide. `None`
+    /// on a bed that was never painted -- there is nothing to measure them
+    /// against yet, and a stop guessed off a zero width would throw away a zoom
+    /// the user asked for.
+    fn stops(self) -> Option<(f64, f64)> {
+        (self.bed > 0.).then(|| {
+            let bed = f64::from(self.bed);
+            let min = bed / ZOOM_MAX_SECONDS;
+            (min, (bed * self.fps / ZOOM_MIN_FRAMES).max(min))
+        })
     }
 
-    /// The moment a pointer at `frac` along the bed is pointing at: the inverse
-    /// of [`View::frac_at`], and what every seek and every trim reads.
-    fn time_at(self, frac: f32, duration: f64) -> f64 {
-        (self.start + f64::from(frac) * self.span(duration)).clamp(0., duration)
+    /// Clamped to the bed it draws on: between the two stops, and never
+    /// scrolled past either end of the timeline. Unlike the fractional view
+    /// this replaced, the *floor* is not the content -- a five second timeline
+    /// zooms out as far as an hour long one does.
+    fn settled(self) -> Scale {
+        let pps = match self.scale.pps.is_finite() && self.scale.pps > 0. {
+            true => self.scale.pps,
+            false => PPS_DEFAULT,
+        };
+        let start = match self.scale.start.is_finite() {
+            true => self.scale.start,
+            false => 0.,
+        };
+        let Some((min, max)) = self.stops() else {
+            return Scale {
+                pps,
+                start: start.max(0.),
+            };
+        };
+        let pps = pps.clamp(min, max);
+        let span = f64::from(self.bed) / pps;
+        Scale {
+            pps,
+            start: start.clamp(0., (self.duration - span).max(0.)),
+        }
     }
 
-    /// Zoomed by `factor` about `anchor` (0..1 along the bed): whatever moment
+    /// Zoomed by `factor` about `anchor` (pixels along the bed): whatever moment
     /// was under that point stays under it, so a zoom magnifies what was being
     /// looked at rather than throwing it off the edge.
-    fn zoomed(self, factor: f32, anchor: f32, duration: f64, fps: f64) -> Self {
-        let at = self.start + f64::from(anchor) * self.span(duration);
+    fn zoomed(self, factor: f32, anchor: f32) -> Scale {
+        let at = self.scale.time_at(anchor);
         // Clamped *before* the offset is worked out, not after: a press that
         // runs into either stop must still leave the anchor where it is, and a
-        // start measured against a zoom the stop then took away would slide it.
-        let zoom = (self.zoom * factor).clamp(1., Self::max_zoom(duration, fps));
-        let start = at - f64::from(anchor) * View { zoom, start: 0. }.span(duration);
-        View { zoom, start }.settled(duration, fps)
+        // start measured against a scale the stop then took away would slide it.
+        let raw = self.scale.pps * f64::from(factor);
+        let pps = match self.stops() {
+            Some((min, max)) => raw.clamp(min, max),
+            None => raw,
+        };
+        View {
+            scale: Scale {
+                pps,
+                start: at - f64::from(anchor) / pps,
+            },
+            ..self
+        }
+        .settled()
     }
 
-    /// Clamped to the timeline it draws: never wider than the whole of it (the
-    /// zoom-out floor is the fit), never tighter than [`View::max_zoom`], and
-    /// never scrolled past either end.
-    fn settled(self, duration: f64, fps: f64) -> Self {
-        let zoom = if self.zoom.is_finite() {
-            self.zoom.clamp(1., Self::max_zoom(duration, fps))
-        } else {
-            1.
+    /// The whole timeline across the bed. The one place the content's own
+    /// length sets the scale, and the only one -- everywhere else a second is a
+    /// second -- because this is a user pressing a key that asks for exactly
+    /// that.
+    fn fit(self) -> Scale {
+        let pps = match self.duration > 0. && self.bed > 0. {
+            true => f64::from(self.bed) / self.duration,
+            false => PPS_DEFAULT,
         };
-        let span = View { zoom, start: 0. }.span(duration);
-        let start = if self.start.is_finite() {
-            self.start.clamp(0., (duration - span).max(0.))
-        } else {
-            0.
-        };
-        View { zoom, start }
+        View {
+            scale: Scale { pps, start: 0. },
+            ..self
+        }
+        .settled()
     }
 
-    /// The view a playhead at `at` needs: the same one while it is on the bed,
+    /// The scale a playhead at `at` needs: the same one while it is on the bed,
     /// and one centred on it once it has run off -- which is how a zoomed-in
-    /// timeline scrolls, during playback and after a seek alike. At the fit
-    /// this can never fire, so an unzoomed panel is untouched by it.
-    fn following(self, at: f64, duration: f64, fps: f64) -> Self {
-        let view = self.settled(duration, fps);
-        let span = view.span(duration);
-        if at < view.start || at > view.start + span {
+    /// timeline scrolls, during playback and after a seek alike. With the whole
+    /// timeline on the bed this can never fire, so a panel showing all of it is
+    /// untouched by it.
+    fn following(self, at: f64) -> Scale {
+        // Nothing is drawn yet, so nothing has run off anything.
+        if self.bed <= 0. {
+            return self.scale;
+        }
+        let scale = self.settled();
+        let span = f64::from(self.bed) / scale.pps;
+        if at < scale.start || at > scale.start + span {
             View {
-                start: at - span / 2.,
-                ..view
+                scale: Scale {
+                    start: at - span / 2.,
+                    ..scale
+                },
+                ..self
             }
-            .settled(duration, fps)
+            .settled()
         } else {
-            view
+            scale
         }
     }
 }
@@ -8496,6 +8603,15 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
         return 0.;
     }
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
+}
+
+/// Where along an element a click landed, in pixels from its own left edge:
+/// [`frac_along`] in the units the timeline is drawn in, since a [`Scale`]
+/// measures in pixels and not in shares of a bed. Clamped to the element -- a
+/// drag that slid off the end names its end -- and an element that was never
+/// painted reads as its start.
+fn px_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    f32::from(x - bounds.left()).clamp(0., f32::from(bounds.size.width).max(0.))
 }
 
 /// The frame a dropped clip's head lands on: `raw`, unless one of `marks` is
@@ -8860,11 +8976,11 @@ mod tests {
         keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
         project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
         source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        unseen_sources, whole_take, window_title,
     };
     use super::{
-        LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
-        repeats, unscannable,
+        LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
+        file_name, file_uri, library_rows, px_along, repeats, span_label, unscannable,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -9921,10 +10037,10 @@ mod tests {
         assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
     }
 
-    /// What a drop reads: the frame under the pointer, through the same view
+    /// What a drop reads: the frame under the pointer, through the same scale
     /// the boxes are drawn through. Zoomed in, the same pixel is a different
     /// frame -- which is the whole reason `Player::frame_under` goes through
-    /// [`View`] rather than through the duration alone.
+    /// [`Scale`] rather than through the duration alone.
     #[test]
     fn a_drop_reads_the_frame_under_the_pointer_at_every_zoom() {
         // A 200 px bed inset by the panel's padding, 10 seconds at 30 fps.
@@ -9932,29 +10048,32 @@ mod tests {
             origin: point(px(12.), px(400.)),
             size: size(px(200.), px(6.)),
         };
-        let (duration, fps) = (10., 30.);
+        let fps = 30.;
         // The frame a pointer at window `x` names, exactly as `frame_under`
         // composes it.
-        let under =
-            |view: View, x: f32| frame_at(view.time_at(frac_along(px(x), bed), duration), fps);
+        let under = |scale: Scale, x: f32| frame_at(scale.time_at(px_along(px(x), bed)), fps);
 
-        // The whole timeline across the bed: halfway along is frame 150.
-        let fit = View::default();
+        // The whole 10 s timeline across the 200 px bed: 20 px to the second,
+        // so halfway along is frame 150.
+        let fit = Scale {
+            pps: 20.,
+            start: 0.,
+        };
         assert_eq!(under(fit, 12.), 0);
         assert_eq!(under(fit, 112.), 150);
         assert_eq!(under(fit, 212.), 300);
 
         // Four times in, starting at second 5: the same middle pixel is now the
         // frame in the middle of seconds 5..7.5, and the left edge is not 0.
-        let zoomed = View {
-            zoom: 4.,
+        let zoomed = Scale {
+            pps: 80.,
             start: 5.,
         };
         assert_eq!(under(zoomed, 12.), 150);
         assert_eq!(under(zoomed, 112.), 187);
         assert_eq!(under(zoomed, 212.), 225);
-        // ...and a drop past either end of the bed lands on the timeline, never
-        // outside it: `time_at` clamps.
+        // ...and a pointer that slid off either end of the bed names an end of
+        // the bed, never a pixel outside it.
         assert_eq!(under(zoomed, 0.), 150);
         assert_eq!(under(fit, 9999.), 300);
     }
@@ -10119,50 +10238,63 @@ mod tests {
         }
     }
 
+    /// The bed the view tests are drawn on: 200 px at 30 fps, as the drop test
+    /// above uses.
+    const TEST_BED: f32 = 200.;
+
+    /// A scale against that bed and a timeline `duration` seconds long.
+    fn test_view(scale: Scale, duration: f64) -> View {
+        View {
+            scale,
+            bed: TEST_BED,
+            duration,
+            fps: 30.,
+        }
+    }
+
     /// The mapping the whole panel is drawn and clicked through: a moment goes
-    /// to a fraction of the bed and comes back the same moment, at every zoom.
-    /// The fit is the invariant that matters most -- it must be the arithmetic
-    /// the panel did before there was a zoom at all.
+    /// to a pixel on the bed and comes back the same moment, at every zoom.
     #[test]
     fn a_moment_and_the_place_it_is_drawn_are_the_same_at_every_zoom() {
         let duration = 20.;
-        // The fit: what `start_frac`/`width_frac` used to answer, exactly.
-        let fit = View::default();
+        // The fit, which is the only scale the content's own length picks: 20 s
+        // across a 200 px bed is 10 px to the second, and a 5 s clip is a
+        // quarter of the bed -- the answer the fractional view gave for it.
+        let fit = test_view(Scale::default(), duration).fit();
+        assert_eq!(fit.pps, 10.);
+        assert_eq!(fit.width_px(5.), TEST_BED * 0.25);
         for t in [0., 5., 12.5, 20.] {
-            assert_eq!(
-                fit.frac_at(t, duration),
-                (t / duration) as f32,
-                "fit at {t}"
-            );
+            assert_eq!(fit.px_at(t), (t / duration) as f32 * TEST_BED, "fit at {t}");
         }
-        assert_eq!(fit.width_frac(5., duration), width_frac(5., duration));
-        for view in [
+        for scale in [
             fit,
-            View {
-                zoom: 2.,
+            Scale {
+                pps: 20.,
                 start: 4.,
             },
-            View {
-                zoom: 8.,
+            Scale {
+                pps: 80.,
                 start: 12.5,
             },
-            View {
-                zoom: 37.5,
+            Scale {
+                pps: 375.,
                 start: 19.,
             },
         ] {
-            let view = view.settled(duration, 30.);
-            for frac in [0., 0.25, 0.5, 1.] {
-                let at = view.time_at(frac, duration);
+            let scale = test_view(scale, duration).settled();
+            for x in [0., 50., 100., TEST_BED] {
+                let at = scale.time_at(x);
                 assert!(
-                    (f64::from(view.frac_at(at, duration)) - f64::from(frac)).abs() < 1e-6,
-                    "{view:?} round trip at {frac}"
+                    (f64::from(scale.px_at(at)) - f64::from(x)).abs() < 1e-3,
+                    "{scale:?} round trip at {x}"
                 );
             }
-            // A stretch is as wide as the share of the visible slice it takes.
+            // A stretch as long as what is on the bed is as wide as the bed.
             assert!(
-                (f64::from(view.width_frac(view.span(duration), duration)) - 1.).abs() < 1e-6,
-                "{view:?} spans the bed"
+                (f64::from(scale.width_px(test_view(scale, duration).span())) - f64::from(TEST_BED))
+                    .abs()
+                    < 1e-3,
+                "{scale:?} spans the bed"
             );
         }
     }
@@ -10172,70 +10304,98 @@ mod tests {
     /// ctrl+wheel.
     #[test]
     fn a_zoom_leaves_the_anchor_where_it_was_on_screen() {
-        let (duration, fps) = (20., 30.);
-        let mut view = View::default();
-        for anchor in [0.5f32, 0.25, 0.9] {
+        let duration = 20.;
+        let mut scale = test_view(Scale::default(), duration).settled();
+        // The same three points along the bed the fractional view held: a half,
+        // a quarter and nine tenths of 200 px.
+        for anchor in [100f32, 50., 180.] {
             // Well past the zoom-in stop: the anchor holds at the clamp too,
             // which is where it used to slide (the clamp came after the offset).
             for _ in 0..30 {
-                let at = view.time_at(anchor, duration);
-                let zoomed = view.zoomed(ZOOM_STEP, anchor, duration, fps);
+                let at = scale.time_at(anchor);
+                let view = test_view(scale, duration);
+                let zoomed = view.zoomed(ZOOM_STEP, anchor);
                 // Only where the anchor is not pinned by an edge of the
                 // timeline: a view already against an end cannot slide further.
-                let pinned = zoomed.start <= 0. || zoomed.start + zoomed.span(duration) >= duration;
+                let span = test_view(zoomed, duration).span();
+                let pinned = zoomed.start <= 0. || zoomed.start + span >= duration;
                 if !pinned {
                     assert!(
-                        (f64::from(zoomed.frac_at(at, duration)) - f64::from(anchor)).abs() < 1e-6,
-                        "{at} moved: {view:?} -> {zoomed:?}"
+                        (f64::from(zoomed.px_at(at)) - f64::from(anchor)).abs() < 1e-3,
+                        "{at} moved: {scale:?} -> {zoomed:?}"
                     );
                 }
-                assert!(zoomed.zoom >= view.zoom, "and it did zoom in");
-                view = zoomed;
+                assert!(zoomed.pps >= scale.pps, "and it did zoom in");
+                scale = zoomed;
             }
         }
     }
 
-    /// Both stops: out is the whole timeline (which is where the panel starts,
-    /// so nothing regressed for anyone who never zooms), in is a handful of
-    /// frames -- and neither can scroll off an end.
+    /// Both stops, and the point of the whole mapping: neither is the content's
+    /// own length any more. Out is [`ZOOM_MAX_SECONDS`] across the bed, in is
+    /// [`ZOOM_MIN_FRAMES`] across it -- so a short import can be zoomed out of
+    /// and a long one zoomed into, and neither can scroll off an end.
     #[test]
-    fn zoom_stops_at_the_whole_timeline_and_at_a_handful_of_frames() {
+    fn zoom_stops_at_a_bedful_of_time_and_at_a_handful_of_frames() {
         let (duration, fps) = (20., 30.);
-        let mut view = View::default();
+        let mut scale = Scale::default();
         for _ in 0..200 {
-            view = view.zoomed(1. / ZOOM_STEP, 0.5, duration, fps);
+            scale = test_view(scale, duration).zoomed(1. / ZOOM_STEP, 100.);
         }
-        assert_eq!(view, View::default(), "zoomed out is the fit");
+        assert!(
+            (test_view(scale, duration).span() - ZOOM_MAX_SECONDS).abs() < 1e-6,
+            "widest is a bedful of hours, not the 20 s that happen to be on it"
+        );
         for _ in 0..200 {
-            view = view.zoomed(ZOOM_STEP, 0.5, duration, fps);
+            scale = test_view(scale, duration).zoomed(ZOOM_STEP, 100.);
         }
         assert_eq!(
-            (view.span(duration) * fps).round(),
+            (test_view(scale, duration).span() * fps).round(),
             ZOOM_MIN_FRAMES,
             "tightest is a handful of frames"
         );
         // Against the far end, the slice still ends at the last frame.
-        let end = View {
-            zoom: view.zoom,
-            start: 1e6,
-        }
-        .settled(duration, fps);
-        assert!((end.start + end.span(duration) - duration).abs() < 1e-9);
-        assert!(
-            View {
-                zoom: view.zoom,
-                start: -5.
-            }
-            .settled(duration, fps)
-            .start
-                == 0.
+        let end = test_view(
+            Scale {
+                start: 1e6,
+                ..scale
+            },
+            duration,
         );
-        // A timeline too short to zoom into, and one with no length at all,
-        // both stay at the fit rather than dividing by nothing.
-        assert_eq!(View::max_zoom(0.1, fps), 1.);
-        assert_eq!(View::default().settled(0., fps), View::default());
-        assert_eq!(View::default().frac_at(3., 0.), 0.);
-        assert_eq!(View::default().time_at(0.5, 0.), 0.);
+        let end = (end.settled(), end.span());
+        assert!((end.0.start + end.1 - duration).abs() < 1e-9);
+        assert_eq!(
+            test_view(
+                Scale {
+                    start: -5.,
+                    ..scale
+                },
+                duration
+            )
+            .settled()
+            .start,
+            0.
+        );
+        // The dead zone the fractional view had: a timeline of a handful of
+        // frames could not be zoomed at all, because its own length was the
+        // floor *and* the ceiling. Both keys work on it now.
+        let tiny = test_view(Scale::default(), 0.1);
+        assert!(tiny.zoomed(ZOOM_STEP, 100.).pps > PPS_DEFAULT);
+        assert!(tiny.zoomed(1. / ZOOM_STEP, 100.).pps < PPS_DEFAULT);
+        // A timeline with no length at all divides by nothing and scrolls
+        // nowhere; the fit of one keeps the scale it had.
+        let empty = test_view(Scale::default(), 0.);
+        assert_eq!(empty.settled(), Scale::default());
+        assert_eq!(empty.fit(), Scale::default());
+        assert_eq!(Scale::default().px_at(0.), 0.);
+        // A bed that was never painted clamps nothing -- there is nothing to
+        // clamp against, and a zoom must survive the frame before the probe.
+        let unpainted = View {
+            bed: 0.,
+            ..test_view(Scale { pps: 4e6, start: 3. }, duration)
+        };
+        assert_eq!(unpainted.settled().pps, 4e6);
+        assert_eq!(unpainted.following(19.), unpainted.scale);
     }
 
     /// What makes a zoomed timeline follow the playing head: off the bed at
@@ -10243,53 +10403,96 @@ mod tests {
     /// view that jumped every frame would be unreadable.
     #[test]
     fn the_view_follows_a_playhead_that_runs_off_the_bed() {
-        let (duration, fps) = (20., 30.);
-        let view = View {
-            zoom: 4.,
-            start: 5.,
-        }
-        .settled(duration, fps);
-        assert_eq!(view.span(duration), 5.);
+        let duration = 20.;
+        // 5 s on a 200 px bed: 40 px to the second, starting at second 5.
+        let view = test_view(
+            Scale {
+                pps: 40.,
+                start: 5.,
+            },
+            duration,
+        );
+        let scale = view.settled();
+        assert_eq!(view.span(), 5.);
         // Inside: untouched, whichever part of the slice it is in.
         for at in [5., 7.5, 10.] {
-            assert_eq!(
-                view.following(at, duration, fps),
-                view,
-                "{at} is on the bed"
-            );
+            assert_eq!(view.following(at), scale, "{at} is on the bed");
         }
         // Past the right edge, as playback does it: the head comes back on the
-        // bed, and the zoom is not changed by the scroll.
-        let moved = view.following(12., duration, fps);
-        assert_eq!(moved.zoom, view.zoom);
-        assert!(moved.start > view.start, "scrolled forward");
+        // bed, and the scale is not changed by the scroll.
+        let moved = view.following(12.);
+        assert_eq!(moved.pps, scale.pps);
+        assert!(moved.start > scale.start, "scrolled forward");
         assert!(
-            moved.frac_at(12., duration) > 0. && moved.frac_at(12., duration) < 1.,
+            moved.px_at(12.) > 0. && moved.px_at(12.) < TEST_BED,
             "and the playhead is on screen"
         );
         // A seek back behind the slice does the same the other way.
-        let back = view.following(1., duration, fps);
-        assert!(back.start < view.start);
-        assert!(back.frac_at(1., duration) >= 0.);
-        // At the fit there is nothing to follow: the whole timeline is on the
-        // bed already, so no playhead can move it.
+        let back = view.following(1.);
+        assert!(back.start < scale.start);
+        assert!(back.px_at(1.) >= 0.);
+        // With the whole timeline on the bed there is nothing to follow.
+        let whole = test_view(Scale::default(), duration);
+        let fit = whole.fit();
         for at in [0., 10., 20.] {
             assert_eq!(
-                View::default().following(at, duration, fps),
-                View::default(),
+                test_view(fit, duration).following(at),
+                fit,
                 "the fit never scrolls"
             );
         }
     }
 
+    /// The bug this mapping exists for: the first import used to fill the whole
+    /// track whatever it was, because the bed *was* the timeline -- so a 5 s
+    /// clip was 100% of the lane, zooming out did nothing, and adding a second
+    /// clip silently halved the first one's box.
     #[test]
-    fn clip_boxes_split_the_lane_by_duration() {
-        // 1 s + 3 s of a 4 s timeline: a quarter and three quarters.
-        assert_eq!(width_frac(1., 4.), 0.25);
-        assert_eq!(width_frac(3., 4.), 0.75);
-        assert_eq!(width_frac(4., 4.), 1.);
-        // A timeline with no length must not hand gpui a NaN width.
-        assert_eq!(width_frac(0., 0.), 1.);
+    fn a_clip_is_drawn_the_same_width_whatever_else_is_on_the_timeline() {
+        let bed = 900.;
+        let of = |duration: f64| View {
+            scale: Scale::default(),
+            bed,
+            duration,
+            fps: 30.,
+        };
+        // One 5 s import, then a second clip after it: 20 s of timeline where
+        // there were 5, and the first box has not moved or narrowed.
+        let (alone, joined) = (of(5.).settled(), of(20.).settled());
+        assert_eq!(alone, joined);
+        assert_eq!(alone.width_px(5.), joined.width_px(5.));
+        assert_eq!(joined.px_at(5.), alone.width_px(5.));
+        // And it does not fill the track: a short clip reads as short.
+        assert!(
+            alone.width_px(5.) < bed / 2.,
+            "5 s at {} px/s is {} px of a {bed} px bed",
+            alone.pps,
+            alone.width_px(5.)
+        );
+        // Zooming out visibly shrinks it, however short the timeline is -- the
+        // press that used to be a no-op.
+        let out = of(5.).zoomed(1. / ZOOM_STEP, 0.);
+        assert!(
+            out.width_px(5.) < alone.width_px(5.),
+            "{} px is not smaller than {} px",
+            out.width_px(5.),
+            alone.width_px(5.)
+        );
+        // The way back to "the whole timeline across the bed" is still one key.
+        assert_eq!(of(5.).fit().width_px(5.), bed);
+    }
+
+    /// What the zoom button says: how much timeline is on the bed, in a unit
+    /// that tells two zooms apart.
+    #[test]
+    fn the_zoom_button_says_how_much_is_on_the_bed() {
+        assert_eq!(span_label(4.5), "4.5s");
+        assert_eq!(span_label(22.5), "22s");
+        assert_eq!(span_label(90.), "1.5m");
+        assert_eq!(span_label(3600.), "60m");
+        // Before the first paint there is no bed and so no answer to give.
+        assert_eq!(span_label(0.), "—");
+        assert_eq!(span_label(f64::NAN), "—");
     }
 
     #[test]
@@ -11337,10 +11540,11 @@ mod tests {
         assert!(show_label(LABEL_MIN_W));
         assert!(show_label(400.));
         assert!(!show_label(LABEL_MIN_W - 0.1));
-        // A timeline with no length must not put a box outside its lane.
-        let fit = View::default();
-        assert_eq!(fit.frac_at(3., 0.), 0.);
-        assert_eq!(fit.frac_at(1., 4.), 0.25);
+        // The label test is the box's own width in pixels now, which is what
+        // the scale hands it -- no bed width, and so nothing to be zero.
+        let scale = Scale::default();
+        assert!(show_label(scale.width_px(LABEL_MIN_W as f64 / PPS_DEFAULT)));
+        assert!(!show_label(scale.width_px(0.)));
     }
 
     #[test]
@@ -11708,9 +11912,10 @@ fn main() {
                     eos: false,
                     done: false,
                     ruler: Rc::default(),
-                    // The whole timeline across the bed, which is where a
-                    // project opens: zooming is something the user asks for.
-                    view: View::default(),
+                    // A second is [`PPS_DEFAULT`] pixels wide until someone
+                    // zooms or asks for the fit: a project opens at a scale, not
+                    // at whatever its first import happens to be long.
+                    scale: Scale::default(),
                     selected: None,
                     context_menu: None,
                     library_menu: None,
