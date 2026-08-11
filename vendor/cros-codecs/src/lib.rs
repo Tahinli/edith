@@ -222,6 +222,10 @@ pub enum DecodedFormat {
     I410,
     /// Y, U and V planes, 4:4:4 sampling, 16 bits per sample, LE. Only the 12 LSBs are used.
     I412,
+    /// One Y and one interleaved UV plane, 4:2:0 sampling, 16 bits per sample,
+    /// LE. Only the 10 MSBs are used. LOCAL PATCH (see /Cargo.toml
+    /// [patch.crates-io]): what an HEVC Main 10 stream decodes into.
+    P010,
     /// One Y and one interleaved UV plane, 4:2:0 sampling, 8 bits per sample.
     /// In a tiled format.
     MM21,
@@ -242,6 +246,7 @@ impl FromStr for DecodedFormat {
             "i212" | "I212" => Ok(DecodedFormat::I212),
             "i410" | "I410" => Ok(DecodedFormat::I410),
             "i412" | "I412" => Ok(DecodedFormat::I412),
+            "p010" | "P010" => Ok(DecodedFormat::P010),
             "mm21" | "MM21" => Ok(DecodedFormat::MM21),
             _ => Err("unrecognized output format. \
                 Valid values: i420, nv12, i422, i444, i010, i012, i210, i212, i410, i412, mm21"),
@@ -254,6 +259,7 @@ impl From<Fourcc> for DecodedFormat {
         match fourcc.to_string().as_str() {
             "I420" => DecodedFormat::I420,
             "NV12" | "NM12" => DecodedFormat::NV12,
+            "P010" => DecodedFormat::P010,
             "MM21" => DecodedFormat::MM21,
             _ => todo!("Fourcc {} not yet supported", fourcc),
         }
@@ -265,6 +271,7 @@ impl From<DecodedFormat> for Fourcc {
         match format {
             DecodedFormat::I420 => Fourcc::from(b"I420"),
             DecodedFormat::NV12 => Fourcc::from(b"NV12"),
+            DecodedFormat::P010 => Fourcc::from(b"P010"),
             DecodedFormat::MM21 => Fourcc::from(b"MM21"),
             _ => todo!(),
         }
@@ -417,6 +424,8 @@ pub fn decoded_frame_size(format: DecodedFormat, width: usize, height: usize) ->
             u_size + uv_size
         }
         DecodedFormat::I410 | DecodedFormat::I412 => (width * height * 2) * 3,
+        // LOCAL PATCH: NV12 with 16-bit samples.
+        DecodedFormat::P010 => decoded_frame_size(DecodedFormat::NV12, width, height) * 2,
         DecodedFormat::MM21 => panic!("Unable to convert to MM21"),
     }
 }
