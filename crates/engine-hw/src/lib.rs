@@ -46,7 +46,7 @@ use cros_codecs::{Fourcc, FrameLayout, PlaneLayout, Resolution};
 use gbm::{BufferObjectFlags, Format as GbmFormat};
 
 use engine::demux::{Codec, Demuxer};
-use engine::hw::{VhFrame, VhMeta};
+use engine::hw::{CAP_AV1, CAP_H264, CAP_HEVC, CAP_VP9, VhCaps, VhFrame, VhMeta};
 
 type PooledFrame = PooledVideoFrame<GenericDmaVideoFrame>;
 type Dec<C> = StatelessDecoder<C, VaapiBackend<PooledFrame>>;
@@ -560,6 +560,112 @@ pub unsafe extern "C" fn vh_close(session: *mut c_void) {
     }));
 }
 
+/// What each codec needs of the driver before this plugin can claim it: the
+/// 8-bit decode profiles, the 10-bit ones, and the profile the *encoder* here
+/// would open -- `None` for the two this plugin has no encoder for at all, so a
+/// GPU with an HEVC or VP9 encode entrypoint is never reported as one edith can
+/// reach. The encode profiles are the very ones [`EncSession::open_codec`]
+/// asks for, which is what keeps this a description of the plugin rather than a
+/// second opinion about it.
+const CAP_TABLE: [(u32, &[VAProfile::Type], &[VAProfile::Type], Option<VAProfile::Type>); 4] = [
+    (
+        CAP_H264,
+        &[
+            VAProfile::VAProfileH264ConstrainedBaseline,
+            VAProfile::VAProfileH264Main,
+            VAProfile::VAProfileH264High,
+        ],
+        &[],
+        Some(VAProfile::VAProfileH264Main),
+    ),
+    (
+        CAP_HEVC,
+        &[VAProfile::VAProfileHEVCMain],
+        &[VAProfile::VAProfileHEVCMain10],
+        None,
+    ),
+    (
+        CAP_VP9,
+        &[VAProfile::VAProfileVP9Profile0],
+        &[VAProfile::VAProfileVP9Profile2],
+        None,
+    ),
+    (
+        CAP_AV1,
+        &[VAProfile::VAProfileAV1Profile0],
+        // AV1 carries 8- and 10-bit in the same profile 0, so the profile bit
+        // is the same one and the P010 read-back is what decides.
+        &[VAProfile::VAProfileAV1Profile0],
+        Some(VAProfile::VAProfileAV1Profile0),
+    ),
+];
+
+/// This machine's decode and encode seats, asked of the driver rather than
+/// assumed: which profiles it has, which entrypoints each of those carries, and
+/// whether a P010 image exists to read a 10-bit picture back through. Only
+/// codecs this plugin actually implements can light up -- `CAP_TABLE` is that
+/// half of the intersection.
+///
+/// `None` when there is no display to ask at all, which is the same "software
+/// only" a missing plugin means.
+fn query_caps() -> Option<VhCaps> {
+    let (display, _gbm) = open_devices()?;
+    let profiles = display.query_config_profiles().ok()?;
+    let p010 = display
+        .query_image_formats()
+        .is_ok_and(|formats| formats.iter().any(|f| f.fourcc == VA_FOURCC_P010));
+    let has = |profile: VAProfile::Type, entrypoint: VAEntrypoint::Type| {
+        profiles.contains(&profile)
+            && display
+                .query_config_entrypoints(profile)
+                .is_ok_and(|e| e.contains(&entrypoint))
+    };
+    let decodes = |list: &[VAProfile::Type]| {
+        list.iter()
+            .any(|&p| has(p, VAEntrypoint::VAEntrypointVLD))
+    };
+    let mut caps = VhCaps::default();
+    for (bit, eight, ten, encode) in CAP_TABLE {
+        if decodes(eight) {
+            caps.decode |= bit;
+        }
+        if p010 && decodes(ten) {
+            caps.decode_10bit |= bit;
+        }
+        // Both entrypoints, exactly as the encoder's own open takes either.
+        if encode.is_some_and(|p| {
+            has(p, VAEntrypoint::VAEntrypointEncSlice) || has(p, VAEntrypoint::VAEntrypointEncSliceLP)
+        }) {
+            caps.encode |= bit;
+        }
+    }
+    Some(caps)
+}
+
+/// Fills `out` with what this machine and this plugin can do together. 0 on
+/// success, negative when there is nothing to report -- an *optional* symbol on
+/// purpose, so the caller resolving it is free to be older or newer than this.
+///
+/// Costs one VA-API init; the caller caches the answer.
+///
+/// # Safety
+/// `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vh_caps(out: *mut VhCaps) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return -1;
+        }
+        let Some(caps) = query_caps() else {
+            return -1;
+        };
+        // SAFETY: caller-guaranteed writable destination.
+        unsafe { *out = caps };
+        0
+    }))
+    .unwrap_or(-1)
+}
+
 fn align16(v: u32) -> u32 {
     v.div_ceil(16) * 16
 }
@@ -992,4 +1098,29 @@ pub unsafe extern "C" fn vh_enc_close(session: *mut c_void) {
             drop(unsafe { Box::from_raw(session as *mut EncSession) });
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs against whatever GPU this machine has -- and passes on one with no
+    /// VA-API at all, which is exactly what `None` means here. What it pins is
+    /// the *shape* of the answer, the contents being the driver's: nothing may
+    /// be claimed that this plugin cannot actually reach.
+    #[test]
+    fn the_caps_query_never_claims_more_than_this_plugin_implements() {
+        let Some(caps) = query_caps() else {
+            return;
+        };
+        eprintln!("{caps:?}");
+        // Encode is this plugin's two seats and no others, whatever entrypoints
+        // the driver has: an HEVC or VP9 EncSlice is not an encoder here.
+        assert_eq!(caps.encode & !(CAP_H264 | CAP_AV1), 0, "{caps:?}");
+        // A 10-bit claim is a decode claim -- same profile family, read back
+        // through P010 -- and there is no 10-bit encode path at all.
+        assert_eq!(caps.decode_10bit & !caps.decode, 0, "{caps:?}");
+        // H.264 here is 8-bit 4:2:0; the table has no 10-bit profile for it.
+        assert_eq!(caps.decode_10bit & CAP_H264, 0, "{caps:?}");
+    }
 }
