@@ -195,6 +195,24 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
     -map 0:v -map 1:a -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
     -ac 6 -c:a eac3 -b:a 384k assets/test_eac3.mkv
+# Dual audio in Matroska: the shape an anime remux has -- one picture and two
+# AAC tracks that differ in language and content and *agree* on rate and layout
+# (44.1k stereo), so either one can go on the same timeline. Stream 0 is
+# 440/880 Hz English, stream 1 is 220/330 Hz French; the tones are what a test
+# tells the two apart by, and getting the mapping wrong plays the other
+# language. test_multilang.mp4 is this file's mp4 twin.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -f lavfi -i "sine=frequency=220:duration=2" \
+    -f lavfi -i "sine=frequency=330:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a0];\
+[3:a][4:a]join=inputs=2:channel_layout=stereo[a1]" \
+    -map 0:v -map "[a0]" -map "[a1]" \
+    -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
+    -c:a aac -ar 44100 -ac 2 \
+    -metadata:s:a:0 language=eng -metadata:s:a:1 language=fra \
+    assets/test_multiaudio.mkv
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.

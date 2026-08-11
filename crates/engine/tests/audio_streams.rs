@@ -11,6 +11,11 @@ use engine::audio::{AudioSession, StreamInfo};
 /// See `scripts/gen_fixtures.sh`.
 const MULTI: &str = "test_multiaudio.mp4";
 
+/// Two audio streams in **Matroska**, the shape a dual-audio remux has: 0 is
+/// AAC 44.1k stereo 440/880 Hz English, 1 is the same shape at 220/330 Hz
+/// French. See `scripts/gen_fixtures.sh`.
+const MULTI_MKV: &str = "test_multiaudio.mkv";
+
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets")
@@ -88,6 +93,127 @@ fn probe_streams_lists_every_audio_track_in_file_order() {
         let again = AudioSession::probe_streams(asset(MULTI)).expect("probes");
         assert_eq!(again, streams);
     }
+}
+
+/// The same listing for the container a film actually arrives in. A Matroska
+/// file used to be worth exactly one row here -- whichever track the readers
+/// stumbled on first -- so the second language of a dual-audio remux was
+/// invisible, and the language it is in was never shown at all.
+#[test]
+fn probe_streams_lists_every_matroska_audio_track_with_its_language() {
+    let streams = AudioSession::probe_streams(asset(MULTI_MKV)).expect("probes");
+    assert_eq!(
+        streams,
+        vec![
+            StreamInfo {
+                index: 0,
+                codec: "aac".into(),
+                channels: 2,
+                sample_rate: 44100,
+                lang: Some("eng".into()),
+                decodable: true,
+            },
+            StreamInfo {
+                index: 1,
+                codec: "aac".into(),
+                channels: 2,
+                sample_rate: 44100,
+                lang: Some("fra".into()),
+                decodable: true,
+            },
+        ]
+    );
+}
+
+/// The stream index is a position in the file's `Tracks` element and the reader
+/// is pointed at that entry's *track number*; a mapping that drifts plays the
+/// other language and saves it into the project, so it is measured by the tones
+/// each track carries.
+#[test]
+fn a_named_matroska_stream_decodes_that_stream_and_not_the_first() {
+    // The left channel of each stream: 440 Hz on stream 0, 220 Hz on stream 1.
+    for (stream, hz) in [(0usize, 440.0f64), (1, 220.0)] {
+        let (meta, samples) = decode(MULTI_MKV, stream);
+        assert_eq!((meta.sample_rate, meta.channels), (44100, 2));
+        let left: Vec<f32> = samples.chunks(2).map(|c| c[0]).collect();
+        let middle = &left[left.len() / 4..left.len() * 3 / 4];
+        let expected = 2.0 * hz * middle.len() as f64 / 44100.0;
+        let crossings = zero_crossings(middle) as f64;
+        assert!(
+            (crossings - expected).abs() < 0.05 * expected,
+            "stream {stream} is {crossings} crossings, {hz} Hz would be {expected}"
+        );
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(rms > 0.01, "stream {stream} decoded silent: RMS {rms:.6}");
+    }
+
+    // Stream 0 is what the file has always played: the wrapper that names no
+    // stream and stream 0 are the same track, sample for sample.
+    let (wrapped, rx) = AudioSession::open(asset(MULTI_MKV))
+        .expect("opens")
+        .expect("audio");
+    let plain: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let (meta, named) = decode(MULTI_MKV, 0);
+    assert_eq!(wrapped, meta);
+    assert_eq!(plain, named);
+
+    // ...and a stream the file does not have is refused, not quietly served the
+    // first track.
+    let err = AudioSession::open_multi_streams(&[(asset(MULTI_MKV), 2)], &[(Some(0), 0.0, 1.0)])
+        .expect_err("stream 2 of 2 does not exist");
+    assert!(
+        err.to_string().contains("audio stream 2 of 2 streams"),
+        "unhelpful refusal: {err}"
+    );
+}
+
+/// The file the ask came from: a dual-audio Blu-ray rip, two AAC tracks, and
+/// the second one has to play. Existence-gated -- it is not in the repo.
+#[test]
+fn a_real_dual_audio_remux_lists_both_tracks_and_plays_the_second() {
+    let path = PathBuf::from(
+        "/path/to/\
+a-real-h264-dual-audio-film.mkv",
+    );
+    if !path.exists() {
+        eprintln!("skipped: {} is not on this machine", path.display());
+        return;
+    }
+    let streams = AudioSession::probe_streams(&path).expect("probes");
+    assert_eq!(streams.len(), 2, "two audio tracks: {streams:?}");
+    for (index, info) in streams.iter().enumerate() {
+        assert_eq!(info.index, index);
+        assert_eq!(info.codec, "aac", "{info:?}");
+        assert!(info.decodable, "{info:?}");
+    }
+    // A second of each track, ten seconds in (past the silence a title card
+    // opens on): both have to carry sound and they have to be *different*
+    // sound. The failure this guards against is a stream index that resolves to
+    // nothing, or to the first track again.
+    let mut takes = Vec::new();
+    for stream in [0, 1] {
+        let (meta, rx) =
+            AudioSession::open_multi_streams(&[(path.clone(), stream)], &[(Some(0), 10.0, 11.0)])
+                .expect("the stream opens")
+                .expect("the stream is there");
+        let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+        assert!(
+            samples.len() > meta.sample_rate as usize / 2,
+            "half a second of stream {stream} at least, got {}",
+            samples.len()
+        );
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(rms > 1e-4, "stream {stream} came out silent: RMS {rms:.8}");
+        takes.push(samples);
+    }
+    assert_ne!(
+        takes[0], takes[1],
+        "the two languages decoded to the same samples: the stream index picked one track twice"
+    );
 }
 
 #[test]
