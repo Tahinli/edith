@@ -266,6 +266,27 @@ ffmpeg -y -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 \
 ffmpeg -y -f lavfi -i "color=c=black:s=320x240:rate=25:duration=1,format=yuv420p,geq=lum='if(lt(Y,H/2),if(lt(X,W/2),144,181),100)':cb='if(lt(Y,H/2),128,90)':cr='if(lt(Y,H/2),128,200)',setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv" \
     -c:v libx264 -profile:v high -qp 1 -pix_fmt yuv420p \
     assets/test_pq.mp4
+# The HDR *metadata* fixtures: the same grade written three ways, so the three
+# places a film's real peak brightness can live each have a file with known
+# numbers in it. MaxCLL 1000, MaxFALL 400, mastering display 1000 nits down to
+# 0.005 (which is what x265's `L(10000000,50)` means: ten-thousandths of a nit).
+#
+# Two passes, and the second one is not optional: `-x265-params master-display`
+# only writes the SEI messages *inside the bitstream*, and ffmpeg's muxers write
+# a container's own MaxCLL/`mdcv` off stream side data, which exists only once a
+# decode has extracted those SEIs. Remuxing with `-c copy` does not do it --
+# verified, the `Colour` element comes back out with the code points and nothing
+# else. So: encode HEVC with the SEIs, then transcode into each container, which
+# is also what leaves test_hdr_sei.mkv carrying the SEI tier *alone* (H.264
+# writes no such SEI, so the transcoded pair carry the container tier alone).
+ffmpeg -y -f lavfi -i "color=c=black:s=320x240:rate=25:duration=0.4,format=yuv420p10le,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv" \
+    -c:v libx265 -pix_fmt yuv420p10le \
+    -x265-params "log-level=error:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50):max-cll=1000,400" \
+    assets/test_hdr_sei.mkv
+ffmpeg -y -i assets/test_hdr_sei.mkv -c:v libx264 -qp 20 -pix_fmt yuv420p \
+    assets/test_hdr_meta.mkv
+ffmpeg -y -i assets/test_hdr_sei.mkv -c:v libx264 -qp 20 -pix_fmt yuv420p \
+    assets/test_hdr_meta.mp4
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.
