@@ -369,6 +369,39 @@ impl Import {
     }
 }
 
+/// The silence scan a worker is running, as the card shows it. Same two clocks
+/// as an [`Import`] and for the same reason -- one proves the window answers,
+/// one says the read has stopped moving -- over a progress that *can* move:
+/// a decode knows how far into the sound it has come, so the card says so.
+struct SilenceScan {
+    /// Source and stream being scanned, which is the cache key the levels land
+    /// under and what tells a second open of the same clip from a new one.
+    key: (PathBuf, usize),
+    /// When the worker started, for the elapsed clock.
+    started: Instant,
+    /// Written by the worker, read here every repaint. The cancel flag in it is
+    /// this side's only word to a scan already running.
+    progress: Arc<engine::silence::Progress>,
+    /// The tenths-of-a-second mark the line last saw and when it last changed:
+    /// the stall detector, exactly [`Import::poll`]'s.
+    seen: u64,
+    since: Instant,
+}
+
+impl SilenceScan {
+    /// Reads the worker's mark and keeps the stall clock, restarting it only
+    /// when the mark actually moves -- [`Import::poll`]'s contract, over a
+    /// number instead of a stage.
+    fn poll(&mut self) -> f32 {
+        let scanned = self.progress.scanned.load(std::sync::atomic::Ordering::Relaxed);
+        if scanned != self.seen {
+            self.seen = scanned;
+            self.since = Instant::now();
+        }
+        self.since.elapsed().as_secs_f32()
+    }
+}
+
 /// A library row being dragged: the file and which of its audio streams that
 /// row is, which is the whole of what a row names. Where it lands does not
 /// change what is inserted.
@@ -1307,10 +1340,15 @@ struct Player {
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
     silence_marks: Vec<(u32, u32)>,
-    /// The levels of the last source scanned, kept so moving a threshold is
-    /// arithmetic rather than another decode. One entry: a card is open on one
-    /// clip, and the next one it opens on is the next thing worth holding.
-    silence_levels: Option<(PathBuf, usize, Arc<Vec<f32>>)>,
+    /// The levels of every source scanned this session, kept so moving a
+    /// threshold is arithmetic rather than another decode. Keyed by source and
+    /// stream, and not one entry: two films on one timeline would otherwise
+    /// evict each other, and the decode being paid twice is the fifty seconds
+    /// this card exists to not spend.
+    silence_levels: HashMap<(PathBuf, usize), Arc<Vec<f32>>>,
+    /// The scan a worker is running for the card, if one is. `None` means the
+    /// card is drawing numbers it already has.
+    silence_scan: Option<SilenceScan>,
     /// Which of the card's four sliders the arrow keys and a drag move. The
     /// card's own focus, since nothing in it takes gpui's (ledger:182).
     color_band: usize,
@@ -2177,9 +2215,12 @@ impl Player {
     /// Either half of a take will do: the scan reads the *source*, and both
     /// halves of an A/V take name the same file.
     ///
-    /// The scan runs at once, so the card is never up saying nothing: a clip
-    /// whose source has no audio track at all is refused by name instead, and
-    /// the card does not open on it.
+    /// The card is up on the next frame whatever the file is: a still is
+    /// refused by name here, where the answer costs a look at the path, and
+    /// everything the decoder has to open the file to know -- a track that is
+    /// not there, a read that fails -- is refused the same way when the scan
+    /// lands, because a fifty-second decode is not a thing to open a card
+    /// behind ([`Player::start_silence_scan`]).
     fn open_silence(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -2194,8 +2235,26 @@ impl Player {
             .or_else(|| session.video_clip_at(session.now()))
             .map(|clip| audio_half(session, clip))
         {
-            Some(clip) => {
-                self.silence_open = Some(clip);
+            Some((lane, idx)) => {
+                let source = self.session.as_ref().and_then(|session| {
+                    let clip = session.lane_clips(lane).get(idx)?;
+                    session.sources().get(clip.source).cloned()
+                });
+                // A still is asked *before* the decoder is: handing a png to the
+                // mp4 demuxer answers "a box with a larger size than it", which
+                // is a true sentence about a container and nothing a person can
+                // act on. A picture has no sound for the same reason a silent
+                // video has none, so it is refused in the same words.
+                let Some(source) = source else {
+                    cx.notify();
+                    return;
+                };
+                if engine::is_image(&source.path) {
+                    self.notice = Some(unscannable(lane, idx, &source.path).into());
+                    cx.notify();
+                    return;
+                }
+                self.silence_open = Some((lane, idx));
                 self.silence_field = 0;
                 // One card at a time, the rule the other four follow.
                 self.keys_open = false;
@@ -2204,7 +2263,16 @@ impl Player {
                 self.color_open = None;
                 self.speed_open = None;
                 self.context_menu = None;
-                self.scan_silences();
+                let key = (source.path.clone(), source.audio_stream);
+                match scan_plan(
+                    self.silence_levels.contains_key(&key),
+                    self.silence_scan.as_ref().map(|scan| &scan.key),
+                    &key,
+                ) {
+                    ScanPlan::Marks => self.scan_silences(),
+                    ScanPlan::Start => self.start_silence_scan(key, cx),
+                    ScanPlan::Wait => {}
+                }
             }
             None => self.notice = Some("no clip under the playhead to scan".into()),
         }
@@ -2295,20 +2363,97 @@ impl Player {
     fn close_silence(&mut self) {
         self.silence_open = None;
         self.silence_marks.clear();
+        self.cancel_silence_scan();
     }
 
-    /// Runs the scan and replaces the preview -- never stacks on it. The decode
-    /// happens once per source ([`engine::silence::levels`] is cached here), so
-    /// every later run is the settings applied to numbers already in hand,
-    /// which is what makes moving a threshold feel like moving a slider.
+    /// Tells the worker nobody is waiting any more. It gives up at its next
+    /// chunk and the levels it had are dropped: half a track is not an answer,
+    /// and the flag stays set on the [`Arc`] the landing closure holds, which is
+    /// how that closure knows to keep its hands off the card.
+    fn cancel_silence_scan(&mut self) {
+        if let Some(scan) = self.silence_scan.take() {
+            scan.progress
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Hands the decode to a worker and returns at once -- the card is drawn by
+    /// the very next frame, saying it is scanning. Fifty-one seconds on a 25 GB
+    /// film is what this used to cost on the render thread, with the card
+    /// marked open and nothing on screen.
+    ///
+    /// Whatever was scanning is cancelled first: one card, one scan, and the
+    /// clip that has just been asked about is the one worth the disk.
+    fn start_silence_scan(&mut self, key: (PathBuf, usize), cx: &mut Context<Self>) {
+        self.cancel_silence_scan();
+        self.silence_marks.clear();
+        let progress = Arc::new(engine::silence::Progress::default());
+        let scan = cx.background_executor().spawn({
+            let (key, progress) = (key.clone(), Arc::clone(&progress));
+            async move { engine::silence::levels_with_progress(&key.0, key.1, &progress) }
+        });
+        let now = Instant::now();
+        self.silence_scan = Some(SilenceScan {
+            key: key.clone(),
+            started: now,
+            progress: Arc::clone(&progress),
+            seen: 0,
+            since: now,
+        });
+        cx.spawn(async move |this, cx| {
+            let landed = scan.await;
+            this.update(cx, |this, cx| {
+                // Cancelled means the card moved on or closed: the levels are a
+                // prefix of a track nobody asked about any more.
+                if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                this.silence_scan = None;
+                match landed {
+                    Ok(Some(levels)) => {
+                        this.silence_levels.insert(key.clone(), Arc::new(levels));
+                        this.scan_silences();
+                    }
+                    // A source with no audio track is not one long silence: it
+                    // is a clip this card has nothing to say about, named so the
+                    // user knows which one it meant.
+                    Ok(None) => {
+                        if let Some((lane, idx)) = this.silence_open {
+                            this.notice = Some(unscannable(lane, idx, &key.0).into());
+                        }
+                        this.close_silence();
+                    }
+                    Err(e) => {
+                        this.close_silence();
+                        this.notice = Some(format!("SCAN FAILED: {e}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Keeps the scanning line's stall clock, for [`Player::poll_import`]'s
+    /// reason: sampled once per frame rather than while drawing.
+    fn poll_silence(&mut self) {
+        if let Some(scan) = &mut self.silence_scan {
+            scan.poll();
+        }
+    }
+
+    /// Applies the settings to levels already in hand and replaces the preview
+    /// -- never stacks on it. Arithmetic only: the decode is
+    /// [`Player::start_silence_scan`]'s and happens once per source, so every
+    /// run here is numbers already read, which is what makes moving a threshold
+    /// feel like moving a slider. A source still being scanned has no marks yet
+    /// and says so on the card.
     ///
     /// Changes nothing about the project: a preview is not an edit, and no undo
     /// step is spent until a button is pressed.
-    ///
-    /// ponytail: the first scan for a source runs on the render thread -- ~1700x
-    /// realtime, so a ten-minute take is well under a second and an hour-long
-    /// one would be felt. Upgrade path is the waveform's: hand it to
-    /// `cx.background_spawn` and repaint when it lands.
     fn scan_silences(&mut self) {
         let Some((lane, idx)) = self.silence_open else {
             return;
@@ -2322,44 +2467,14 @@ impl Player {
         }) else {
             return;
         };
-        // A still is asked *before* the decoder is: handing a png to the mp4
-        // demuxer answers "a box with a larger size than it", which is a true
-        // sentence about a container and nothing a person can act on. A picture
-        // has no sound for the same reason a silent video has none, so it is
-        // refused in the same words.
-        if engine::is_image(&source.path) {
-            self.silence_open = None;
-            self.notice = Some(unscannable(lane, idx, &source.path).into());
-            return;
-        }
-        let cached = self
+        // Nothing read yet: the worker is running and the card is drawing its
+        // line. The marks arrive with the levels.
+        let Some(levels) = self
             .silence_levels
-            .as_ref()
-            .filter(|(path, stream, _)| *path == source.path && *stream == source.audio_stream)
-            .map(|(_, _, levels)| levels.clone());
-        let levels = match cached {
-            Some(levels) => levels,
-            None => match engine::silence::levels(&source.path, source.audio_stream) {
-                Ok(Some(levels)) => {
-                    let levels = Arc::new(levels);
-                    self.silence_levels =
-                        Some((source.path.clone(), source.audio_stream, levels.clone()));
-                    levels
-                }
-                // A source with no audio track is not one long silence: it is a
-                // clip this card has nothing to say about, named so the user
-                // knows which one it meant.
-                Ok(None) => {
-                    self.silence_open = None;
-                    self.notice = Some(unscannable(lane, idx, &source.path).into());
-                    return;
-                }
-                Err(e) => {
-                    self.silence_open = None;
-                    self.notice = Some(format!("SCAN FAILED: {e}").into());
-                    return;
-                }
-            },
+            .get(&(source.path.clone(), source.audio_stream))
+            .cloned()
+        else {
+            return;
         };
         self.silence_marks = engine::silence::timeline_regions(
             &clip,
@@ -3694,8 +3809,8 @@ impl Player {
         self.waves.clear();
         self.streams.clear();
         self.sizes.clear();
-        // Scanned off a source that is not in the library any more.
-        self.silence_levels = None;
+        // Scanned off sources that are not in the library any more.
+        self.silence_levels.clear();
         // Every gesture in flight, dropped for `reset_after_reseek`'s reason
         // (it drops the trim below): a drag holds a bar, a clip or a band of a
         // timeline that has just stopped existing.
@@ -4558,6 +4673,7 @@ impl Render for Player {
         }
         self.poll_export();
         self.poll_import(cx);
+        self.poll_silence();
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
@@ -4588,6 +4704,10 @@ impl Render for Player {
             || self.seek_since.is_some()
             || self.export.is_some()
             || self.importing.is_some()
+            // A silence scan too: its progress and its two clocks only reach
+            // the screen on a repaint, and a still line is the very thing this
+            // card was rewritten to disprove.
+            || self.silence_scan.is_some()
         {
             window.request_animation_frame();
         }
@@ -8266,6 +8386,22 @@ impl Player {
         let found = self.silence_marks.len();
         let secs =
             f64::from(self.silence_marks.iter().map(|&(_, len)| len).sum::<u32>()) / self.fps;
+        // The line under the rows: where a scan still running has got to -- a
+        // card is up from the frame it is asked for, numbers or no numbers --
+        // or what the settings found in levels already read.
+        let status = match &self.silence_scan {
+            Some(scan) => silence_line(
+                scan.seen as f32 / 10.,
+                scan.progress.total.load(std::sync::atomic::Ordering::Relaxed) as f32 / 10.,
+                scan.started.elapsed().as_secs_f32(),
+                scan.since.elapsed().as_secs_f32(),
+            ),
+            None => match found {
+                0 => "nothing quiet enough for long enough".to_string(),
+                1 => format!("1 silence, {secs:.1}s"),
+                n => format!("{n} silences, {secs:.1}s"),
+            },
+        };
         let rows: Vec<_> = rows
             .into_iter()
             .enumerate()
@@ -8393,15 +8529,11 @@ impl Player {
                             div()
                                 .flex_none()
                                 .px(px(6.))
-                                .text_color(rgb(match found {
-                                    0 => INK_DIM,
-                                    _ => ACCENT,
+                                .text_color(rgb(match (&self.silence_scan, found) {
+                                    (None, 1..) => ACCENT,
+                                    _ => INK_DIM,
                                 }))
-                                .child(match found {
-                                    0 => "nothing quiet enough for long enough".to_string(),
-                                    1 => format!("1 silence, {secs:.1}s"),
-                                    n => format!("{n} silences, {secs:.1}s"),
-                                }),
+                                .child(status),
                         )
                         .child(div().flex().gap(px(4.)).children([
                             button(0, "Cut them out (enter)".into(), Self::cut_silences),
@@ -12739,6 +12871,54 @@ fn import_line(name: &str, stage: ImportStage, elapsed: f32, since: f32, waiting
     }
 }
 
+/// What opening the silence card on a source costs.
+#[derive(PartialEq, Eq, Debug)]
+enum ScanPlan {
+    /// Its levels are already read: the marks are arithmetic on this frame.
+    Marks,
+    /// Nothing read: a worker, and a card that says so meanwhile.
+    Start,
+    /// A worker is already reading this very source -- the other half of a take
+    /// names the same file, and a second card on it waits for the first read
+    /// rather than throwing away the minute already spent.
+    Wait,
+}
+
+/// Which of the three [`ScanPlan`]s opening the card on `key` means. The whole
+/// of the cache policy, and the reason a second film does not cost the first
+/// one its levels: what is cached is asked per source, never "the last one".
+fn scan_plan(cached: bool, running: Option<&(PathBuf, usize)>, key: &(PathBuf, usize)) -> ScanPlan {
+    match (cached, running) {
+        (true, _) => ScanPlan::Marks,
+        (false, Some(at)) if at == key => ScanPlan::Wait,
+        _ => ScanPlan::Start,
+    }
+}
+
+/// What the silence card says while its worker reads. Unlike an import this
+/// one *has* a fraction -- a decode knows how far into the sound it has come --
+/// so the line is where it is up to, out of what the header claims the track is
+/// (`total` of 0 for a header that does not say, drawn as nothing rather than
+/// as a guess). Both in seconds.
+///
+/// The stall clock is [`IMPORT_STALL`]'s, for its reason: past five seconds
+/// without the mark moving, a line that cannot move and a line that has stopped
+/// look identical, and only one of them is worth words.
+fn silence_line(scanned: f32, total: f32, elapsed: f32, since: f32) -> String {
+    let far = match total > 0. {
+        true => format!("{} of ~{} scanned", clock(scanned), clock(total)),
+        false => format!("{} scanned", clock(scanned)),
+    };
+    match since >= IMPORT_STALL {
+        true => format!(
+            "SCANNING · still reading the sound — a big film is minutes of decoding, and the \
+             window is not frozen · {far} · {} elapsed",
+            clock(elapsed)
+        ),
+        false => format!("SCANNING · {far} · {} elapsed", clock(elapsed)),
+    }
+}
+
 /// How often a progress mark is worth keeping, how far back the rate is
 /// measured, and the least span that may answer at all. An export crosses
 /// hardware and software segments that run at different speeds, so the
@@ -12816,8 +12996,8 @@ mod tests {
         ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
-        IMPORT_STALL, Import, ImportStage, SEEK_STALL, import_line, read_ahead, seek_line,
-        stash_or_write,
+        IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanPlan, SilenceScan, import_line,
+        read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
         trimmed_clip, unscannable,
         visible_slice,
@@ -16178,6 +16358,97 @@ mod tests {
         assert!(line.contains("0:09 elapsed"), "{line}");
     }
 
+    /// The silence card's own state machine, driven the way a repaint drives
+    /// it: a worker moves its mark, the poll notices and restarts the stall
+    /// clock, and the line says a read has stopped only when it actually has.
+    /// The card is up through all of it -- that is the whole change, since the
+    /// same decode used to run on the render thread and hold the frame for
+    /// fifty-one seconds on a 25 GB film.
+    #[test]
+    fn a_silence_card_is_up_while_its_scan_runs_and_says_where_it_has_got_to() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        let progress = Arc::new(engine::silence::Progress::default());
+        // Two hours and eight minutes, as the header claims it.
+        progress.total.store(7680, Relaxed);
+        let started = Instant::now() - Duration::from_secs(9);
+        let mut scan = SilenceScan {
+            key: (PathBuf::from("/films/A Film.mkv"), 0),
+            started,
+            progress: Arc::clone(&progress),
+            seen: 0,
+            since: started,
+        };
+        // Nine seconds and the mark has not moved: past the wait a person
+        // tolerates, so the line stops pretending it is a progress line.
+        let since = scan.poll();
+        assert!(since > IMPORT_STALL, "{since}");
+        let stalled = silence_line(0., 768., 9., since);
+        assert!(stalled.contains("still reading the sound"), "{stalled}");
+        assert!(stalled.contains("not frozen"), "{stalled}");
+        assert!(stalled.contains("0:00 of ~12:48 scanned"), "{stalled}");
+        assert!(stalled.contains("0:09 elapsed"), "{stalled}");
+        // The worker reports, and the stall clock restarts even though the
+        // elapsed one does not -- the two clocks' whole distinction.
+        let mut last = 0;
+        for deci in [83, 1_140, 4_002] {
+            progress.scanned.store(deci, Relaxed);
+            let since = scan.poll();
+            assert!(since < IMPORT_STALL, "{since}");
+            assert!(scan.seen > last, "{} after {last}", scan.seen);
+            last = scan.seen;
+        }
+        let moving = silence_line(scan.seen as f32 / 10., 768., 9., 0.2);
+        assert_eq!(moving, "SCANNING · 6:40 of ~12:48 scanned · 0:09 elapsed");
+        assert!(!moving.contains("still"), "{moving}");
+        // A header that does not say how long the track is says nothing rather
+        // than guessing at it.
+        let unknown = silence_line(60., 0., 61., 0.2);
+        assert_eq!(unknown, "SCANNING · 1:00 scanned · 1:01 elapsed");
+        // A mark that comes back the same is not the same fact as one that
+        // moved: the poll only restarts on a change.
+        let held = scan.since;
+        scan.poll();
+        assert_eq!(scan.since, held, "an unchanged mark must not reset it");
+    }
+
+    /// The cache is per source, which is what stops two films thrashing each
+    /// other's fifty seconds: A, then B, then A again is *one* decode of A.
+    /// And a source already being read is waited for rather than read twice --
+    /// both halves of an A/V take name the same file.
+    #[test]
+    fn a_second_film_does_not_cost_the_first_one_its_levels() {
+        let (a, b) = (
+            (PathBuf::from("/films/a.mkv"), 0),
+            (PathBuf::from("/films/b.mkv"), 0),
+        );
+        let mut cache: std::collections::HashMap<(PathBuf, usize), ()> =
+            std::collections::HashMap::new();
+        let mut started = Vec::new();
+        // What a card open does, three times over, with the worker landing
+        // between each: plan, and start what the plan says to start.
+        for key in [&a, &b, &a] {
+            match scan_plan(cache.contains_key(key), None, key) {
+                ScanPlan::Start => {
+                    started.push(key.clone());
+                    cache.insert(key.clone(), ());
+                }
+                ScanPlan::Marks => {}
+                ScanPlan::Wait => unreachable!("nothing is running"),
+            }
+        }
+        assert_eq!(started, vec![a.clone(), b.clone()], "A was decoded twice");
+        // The single-slot cache this replaced would have evicted A when B
+        // landed; both are held.
+        assert!(cache.contains_key(&a) && cache.contains_key(&b));
+        // A scan in flight on the same source is joined, not restarted -- and
+        // one on another source is not waited for.
+        assert_eq!(scan_plan(false, Some(&a), &a), ScanPlan::Wait);
+        assert_eq!(scan_plan(false, Some(&b), &a), ScanPlan::Start);
+        // Levels in hand beat a worker either way: the marks are arithmetic.
+        assert_eq!(scan_plan(true, Some(&a), &a), ScanPlan::Marks);
+    }
+
     /// The read-ahead is a *cache warmer* and nothing else: whatever it did or
     /// failed to do, the import that follows lands exactly the rows, lengths
     /// and refusals it landed before there was a worker at all.
@@ -17713,7 +17984,8 @@ fn main() {
                     // there was a choice about it.
                     silence_dbfs: true,
                     silence_marks: Vec::new(),
-                    silence_levels: None,
+                    silence_levels: HashMap::new(),
+                    silence_scan: None,
                     color_open: None,
                     color_band: 0,
                     color_dragging: false,
