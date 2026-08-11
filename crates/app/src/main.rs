@@ -21,9 +21,9 @@ use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
     FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size,
-    Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -40,6 +40,18 @@ const SELECTED: u32 = 0x2a4a6b;
 /// the lane stays in the dark family the rest of the chrome lives in
 /// (ledger:187), and the first source keeps `SURFACE` exactly.
 const SOURCE_TINTS: [u32; 4] = [SURFACE, 0x3b3329, 0x293b33, 0x33293b];
+/// The mirror of `SELECTED`: a drop the lane will not take, tinting the shadow
+/// a drag draws ([`Ghost`]) so a refusal is seen before the release rather than
+/// read afterwards. Same brightness as the rest of the chrome -- a warning, not
+/// an alarm.
+const REFUSE: u32 = 0x6b2a2a;
+/// How solid that shadow is (`0xRRGGBBAA`): enough to read as a box, little
+/// enough that the clip it is drawn over is still legible through it.
+const GHOST_ALPHA: u32 = 0x66;
+/// ...and the narrowest it is drawn: a library row whose length the engine has
+/// not measured yet has a landing place but no width, and a head marker says
+/// where it goes where a zero-width box would say nothing.
+const GHOST_MIN: f32 = 2.;
 /// One step lighter than whatever it sits on: the pointer's answer that this is
 /// clickable. Two of them, because buttons stand on `SURFACE` and the scrub
 /// strip stands on `CHROME`.
@@ -297,6 +309,29 @@ struct ClipDrag {
     clip: Clip,
 }
 
+/// Where the drag in flight would leave what it is carrying: the lane the
+/// pointer is over, the snapped head the release will commit ([`landing`]), and
+/// how long the thing is. Drawn on that lane as a translucent box the size of
+/// the take, so a landing is *seen* before the release rather than discovered
+/// after it -- the line ([`Player::snap_cue`]) marks the frame, this shows the
+/// body. `refused` is a drop the lane cannot take -- a picture over an audio
+/// track, a sound over a video one -- tinted rather than silent, because the
+/// refusal is coming at the release either way ([`lane_refuses`],
+/// [`Project::move_clip`]).
+#[derive(Clone, Copy, PartialEq)]
+struct Ghost {
+    lane: Lane,
+    start: u32,
+    /// Timeline frames, which a speed has already been counted into: the box is
+    /// as wide as the clip is *long where it lands*. Zero for a library row of
+    /// unknown length, drawn as a head marker.
+    frames: u32,
+    /// The swatch of the file being carried ([`Player::file_tint`]), so the
+    /// ghost reads as the thing in the hand.
+    tint: u32,
+    refused: bool,
+}
+
 /// A clip edge being dragged: which end of which clip, and the timeline frame
 /// the pointer has pulled it to. The box on screen is drawn from `to` while this
 /// is set and the engine hears about it once, at the release
@@ -495,6 +530,65 @@ fn keys_rows() -> Vec<KeyRow> {
         );
     }
     rows
+}
+
+/// [`keys_rows`] with a search applied: the rows whose label or whose stroke
+/// carries `needle`, and the heading each one lives under. A heading with
+/// nothing left beneath it goes with them -- an empty "Playback" over a gap
+/// reads as a list that lost its rows rather than as a search that found none.
+///
+/// Each row keeps the index it has in the unfiltered list, so an element id is
+/// the same one before and after a keystroke: filtering is a look at the list,
+/// and gpui's per-element state is keyed on that id.
+///
+/// Case-insensitive substring, on both columns: people look for an action by
+/// what it does ("vol") and for a stroke by what they pressed ("ctrl").
+fn keys_filter(needle: &str, keymap: &Keymap) -> Vec<(usize, KeyRow)> {
+    let needle = needle.trim().to_lowercase();
+    let rows = keys_rows().into_iter().enumerate();
+    if needle.is_empty() {
+        return rows.collect();
+    }
+    let hit = |label: &str, chord: &str| {
+        label.to_lowercase().contains(&needle) || chord.to_lowercase().contains(&needle)
+    };
+    let mut out: Vec<(usize, KeyRow)> = Vec::new();
+    // The heading above the row being looked at, until a row under it earns it
+    // a place -- then it goes in once, ahead of that row.
+    let mut pending: Option<(usize, KeyRow)> = None;
+    for (i, row) in rows {
+        match &row {
+            KeyRow::Head(_) => pending = Some((i, row)),
+            KeyRow::Act(action) => {
+                if hit(action.label(), &keymap.display(*action)) {
+                    out.extend(pending.take());
+                    out.push((i, row));
+                }
+            }
+            KeyRow::Fixed(f) => {
+                let fixed = &keymap::FIXED[*f];
+                if hit(fixed.label, fixed.chord) {
+                    out.extend(pending.take());
+                    out.push((i, row));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The character a stroke types into the actions card's search box, if it types
+/// one. gpui reports a printable key as itself and the space bar by name
+/// (platform.rs:866), and everything else -- the arrows, the function keys --
+/// is a word this must not spell into the box letter by letter.
+fn typed(key: &str) -> Option<char> {
+    match key {
+        "space" => Some(' '),
+        _ => key
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_graphic() && key.chars().count() == 1),
+    }
 }
 
 /// The project resolutions [`Player::cycle_resolution`] offers, largest first.
@@ -862,6 +956,11 @@ struct Player {
     /// runs off the render thread and only while the export card is up. The
     /// inner `None` is "asked, not answered yet".
     export_seat: Option<(ExportSettings, (u32, u32), Option<&'static str>)>,
+    /// What this machine's GPU decodes and encodes, as the plugin answered it:
+    /// asked once, off the render thread like `export_seat` and for the same
+    /// reason (a VA-API init), and kept for the life of the process because the
+    /// answer cannot change while we run. `None` is "not asked yet".
+    hw_caps: Option<SharedString>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -889,6 +988,12 @@ struct Player {
     /// happens rather than discovered after the release. Stale between gestures,
     /// which costs nothing -- it is drawn only while one is live.
     snap_cue: Option<u32>,
+    /// The box the same gesture is about to fill, or `None` while the pointer is
+    /// over no lane: the shadow every proper editor draws under a drag. Set by
+    /// the lane the pointer is actually over -- that is the one question the
+    /// line above does not answer -- and drawn only while a drag is live, for
+    /// [`Player::snap_cue`]'s reason.
+    ghost: Option<Ghost>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -898,6 +1003,11 @@ struct Player {
     /// handle is held until the worker settles, because its last act is to
     /// delete the output file and a second export must not be what it deletes.
     cancelling: bool,
+    /// When the running export started, and how far it had come at each sample
+    /// since, as `(elapsed, progress)` marks. The elapsed clock and the
+    /// rolling-window estimate the progress line reads; see [`note_progress`].
+    export_started: Option<Instant>,
+    export_marks: Vec<(f32, f32)>,
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
@@ -923,6 +1033,16 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
+    /// What has been typed into the card's search box, which is the card's own
+    /// input exactly as the export card's digits are (nothing in it takes
+    /// focus, so the root's key handler is the field). Emptied every time the
+    /// card opens: a search is a look at the list, not a setting.
+    keys_search: String,
+    /// Where that list is scrolled to. Held here rather than left to the
+    /// wheel alone: forty actions are four times what a 360 px window shows,
+    /// and the rows past the fold have to be reachable from the keyboard that
+    /// is already typing in the search box.
+    keys_scroll: ScrollHandle,
     /// The export options card is up: what the export action opens now, so
     /// nothing is written until the card's own button says so. One card at a
     /// time -- opening either closes the other, since both are the whole window
@@ -1185,6 +1305,10 @@ impl Player {
         // index would trim a clip nobody grabbed. Dropping it is the whole fix:
         // nothing has been written yet.
         self.trim = None;
+        // ...and the shadow a drag is drawn under promises a landing on a lane
+        // this edit has just reshaped. The next move of the drag draws it
+        // again; until then it says nothing.
+        self.ghost = None;
     }
 
     /// What an action does, wherever it was asked for -- a stroke, or the clip
@@ -1242,6 +1366,7 @@ impl Player {
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
+            ActionId::ShowActions => self.show_actions(cx),
         }
     }
 
@@ -1251,11 +1376,43 @@ impl Player {
     fn toggle_snap(&mut self, cx: &mut Context<Self>) {
         self.snap = !self.snap;
         self.snap_cue = None;
+        self.ghost = None;
         self.notice = Some(match self.snap {
             true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
             false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
         });
         cx.notify();
+    }
+
+    /// The actions card, from its key, from the panel button, or from its own
+    /// row: open, with an empty search box -- a card that opens showing the
+    /// last search would hide most of the list for a reason nobody remembers.
+    fn show_actions(&mut self, cx: &mut Context<Self>) {
+        self.keys_open = true;
+        self.keys_search.clear();
+        self.scroll_keys(None);
+        self.rebinding = None;
+        // One card at a time, the rule the other cards follow.
+        self.export_open = false;
+        cx.notify();
+    }
+
+    /// Moves the actions card's row list by `by` pixels, or puts it back at the
+    /// top (`None`). Back to the top after every keystroke that changes the
+    /// search: a filtered list is shorter than the offset a scrolled one left
+    /// behind, and a card showing the empty space past its last row reads as a
+    /// search that found nothing.
+    ///
+    /// Clamped to what there is to scroll, so the list cannot be pushed off
+    /// either end -- `max_offset` is what the last paint measured, which is the
+    /// only place that number exists.
+    fn scroll_keys(&self, by: Option<f32>) {
+        let at = match by {
+            Some(by) => (f32::from(self.keys_scroll.offset().y) + by)
+                .clamp(-f32::from(self.keys_scroll.max_offset().height), 0.),
+            None => 0.,
+        };
+        self.keys_scroll.set_offset(point(px(0.), px(at)));
     }
 
     /// Whether the editor can be asked for `action` right now, and why not when
@@ -2637,6 +2794,31 @@ impl Player {
         .detach();
     }
 
+    /// Asks the plugin what this machine's GPU can do, once, the first time the
+    /// export card is up to show it. Off the render thread for `cache_export_seat`'s
+    /// reason: the plugin initialises VA-API to answer, and a driver that is
+    /// slow to load must not be a frame the user waits for.
+    fn cache_hw_caps(&mut self, cx: &mut Context<Self>) {
+        if !self.export_open || self.hw_caps.is_some() {
+            return;
+        }
+        // Written before the spawn, exactly as the probes above are, so the
+        // repaints during it start no second one.
+        self.hw_caps = Some("asking the driver…".into());
+        let asked = cx
+            .background_executor()
+            .spawn(async move { engine::caps::hardware() });
+        cx.spawn(async move |this, cx| {
+            let line = asked.await;
+            this.update(cx, |this, cx| {
+                this.hw_caps = Some(line.into());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The group id of the clicked clip, which is what marks the other half.
     fn selected_link(&self) -> Option<u32> {
         let (lane, idx) = self.selected?;
@@ -2734,9 +2916,32 @@ impl Player {
     /// leave a screen of empty bed after the end, the way every NLE does.
     fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
         let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
-        let raw = self.frame_under(x).saturating_sub(self.grab);
         let marks = self.snap_targets(Some((from, idx)));
-        Some(self.snap_to(raw, clip.frames(), &marks))
+        Some(landing(
+            self.frame_under(x),
+            self.grab,
+            clip.frames(),
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        ))
+    }
+
+    /// The same answer for a library row on its way down: nothing is in the hand
+    /// yet, so there is no grab offset to take off and no length to snap by --
+    /// the file's own is not known until the engine has placed it -- and only
+    /// its head lands. Asked by the line, by the ghost and by the drop itself
+    /// ([`Player::insert_source`]), so all three name one frame.
+    fn place_frame(&self, x: Pixels) -> (u32, Option<u32>) {
+        let marks = self.snap_targets(None);
+        landing(
+            self.frame_under(x),
+            0,
+            0,
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        )
     }
 
     /// Which index the clip in the hand is at *now*: [`live_idx`] against the
@@ -2759,13 +2964,89 @@ impl Player {
     }
 
     /// The same line for a library row on its way to a lane: it goes down at
-    /// the frame it is let go on ([`Player::insert_source`]), so that frame is
-    /// what snaps and what is drawn. No length to snap by -- the file's own is
-    /// not known until the engine has placed it -- so only its head lands.
+    /// the frame it is let go on ([`Player::place_frame`]), so that frame is
+    /// what snaps and what is drawn.
     fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let marks = self.snap_targets(None);
-        let cue = self.snap_to(self.frame_under(x), 0, &marks).1;
+        let cue = self.place_frame(x).1;
         self.set_cue(cue, x, cx);
+    }
+
+    /// The shadow the clip in the hand would fill, on the lane the pointer is
+    /// over: its head where [`Player::drop_frame`] says the release will put it
+    /// -- the same call the drop makes, so the box drawn and the box committed
+    /// are one answer -- and its own length at this zoom. A lane of the other
+    /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
+    /// before the release does.
+    fn preview_ghost(&mut self, drag: &ClipDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = self
+            .dragged(drag)
+            .and_then(|idx| self.drop_frame(drag.lane, idx, x))
+            .map(|(start, _)| Ghost {
+                lane: to,
+                start,
+                frames: drag.clip.frames(),
+                tint: self.clip_tint(drag.clip.source),
+                refused: drag.lane.kind != to.kind,
+            });
+        self.set_ghost(ghost, cx);
+    }
+
+    /// The same shadow for a library row: its head at [`Player::place_frame`],
+    /// which is where the drop inserts it, and the file's own length for its
+    /// width -- the length the library row already reports. A file this lane
+    /// cannot hold ([`lane_refuses`]) is tinted as refused, which is the answer
+    /// the release would give in words.
+    fn preview_ghost_asset(&mut self, path: &Path, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = Ghost {
+            lane: to,
+            start: self.place_frame(x).0,
+            frames: self
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path)),
+            tint: self.file_tint(path),
+            refused: lane_refuses(path, to).is_some(),
+        };
+        self.set_ghost(Some(ghost), cx);
+    }
+
+    /// Sets the shadow, or takes it away, repainting only when it moved -- the
+    /// listeners below run it on every pointer sample of a drag. Cleared by the
+    /// root and set again by the lane under the pointer, in that order (gpui
+    /// runs the capture phase parent-first), so a pointer over no lane at all
+    /// leaves nothing drawn.
+    fn set_ghost(&mut self, ghost: Option<Ghost>, cx: &mut Context<Self>) {
+        if ghost != self.ghost {
+            self.ghost = ghost;
+            cx.notify();
+        }
+    }
+
+    /// The swatch a clip from source `n` wears: [`source_tint`] over the first
+    /// source entry naming that *file*, since two audio streams of one file are
+    /// two sources and one colour. Every box on a lane and every ghost a drag
+    /// draws asks this, so the shadow is recognisably the thing in the hand.
+    fn clip_tint(&self, source: usize) -> u32 {
+        match self.sources().get(source) {
+            Some(entry) => self.file_tint(&entry.path),
+            None => source_tint(source),
+        }
+    }
+
+    /// The same swatch asked by path, which is what a library row is named by.
+    fn file_tint(&self, path: &Path) -> u32 {
+        source_tint(
+            self.sources()
+                .iter()
+                .position(|s| s.path == path)
+                .unwrap_or(0),
+        )
+    }
+
+    fn sources(&self) -> &[Source] {
+        self.session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources)
     }
 
     /// Sets the line, or takes it away, and repaints only when it moved: a
@@ -2991,28 +3272,13 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        // A file with no picture belongs on an audio lane and nowhere else:
-        // dropped on a video lane it is refused by name, and asked for by the
-        // Add button (which names no lane) it goes to the audio one -- which is
-        // the engine's choice, in `place_stream_at`, not one made twice here.
-        if engine::is_audio(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Video) {
-            let name = file_name(path);
-            let lane = onto.expect("checked above").label();
-            self.notice = Some(
-                format!("NOT ON {lane} — {name} has no picture; drop it on an audio lane").into(),
-            );
-            cx.notify();
-            return;
-        }
-        // ...and the mirror of it: a still is silent, so an audio lane is the
-        // one place it cannot go. The engine puts it on `V1` regardless
-        // (`place_stream_at`); this is the word that says why it moved.
-        if engine::is_image(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Audio) {
-            let name = file_name(path);
-            let lane = onto.expect("checked above").label();
-            self.notice = Some(
-                format!("NOT ON {lane} — {name} is a still image; drop it on a video lane").into(),
-            );
+        // The lane the pointer named cannot hold this kind of file: refused by
+        // name, in the same words the ghost was tinted by on the way down
+        // ([`lane_refuses`]). The Add button names no lane and so is never
+        // refused here -- where a file goes when nobody says is the engine's
+        // choice, in `place_stream_at`, not one made twice here.
+        if let Some(why) = onto.and_then(|lane| lane_refuses(path, lane)) {
+            self.notice = Some(why.into());
             cx.notify();
             return;
         }
@@ -3789,6 +4055,10 @@ impl Player {
         }
         session.pause();
         self.export = Some(session.export_to_with(&self.export_path, &settings));
+        // The clock starts with the worker, not with the first repaint that
+        // happens to notice it.
+        self.export_started = Some(Instant::now());
+        self.export_marks.clear();
         // The card has been answered; the progress line takes the panel from
         // here, and it is the running export's escape that matters now.
         self.export_open = false;
@@ -3807,10 +4077,23 @@ impl Player {
     /// Takes the export's verdict once it has one. The only place the app
     /// touches the handle's completion side.
     fn poll_export(&mut self) {
+        // Sampled here rather than while drawing: a repaint stays a repaint,
+        // and this runs once per repaint either way.
+        if let (Some(progress), Some(started)) = (
+            self.exporting().map(ExportHandle::progress),
+            self.export_started,
+        ) {
+            note_progress(
+                &mut self.export_marks,
+                started.elapsed().as_secs_f32(),
+                progress,
+            );
+        }
         let Some(result) = self.export.as_ref().and_then(ExportHandle::result) else {
             return;
         };
         self.export = None;
+        self.export_started = None;
         // A cancellation is reported as an error, and the one who asked for it
         // has had the editor back since the keystroke. Nothing to say.
         if std::mem::take(&mut self.cancelling) {
@@ -3845,6 +4128,7 @@ impl Render for Player {
         // is the one place that has to notice a new one.
         self.cache_media(cx);
         self.cache_export_seat(cx);
+        self.cache_hw_caps(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
         let title = window_title(&self.name);
@@ -3930,14 +4214,37 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
-                // The overlay owns the keyboard while it is up: a stroke aimed
-                // at a row must not also cut the timeline, and the way out of it
-                // is the same key that gets out of a capture.
+                // The overlay owns the keyboard while it is up -- but it types
+                // now: a printable stroke is the search box's, which is why
+                // nothing here reaches the keymap. A waiting row is answered
+                // above and still wins, so a rebind onto "v" binds the key
+                // rather than typing it.
                 if this.keys_open {
                     if key == ESCAPE {
-                        this.keys_open = false;
-                        cx.notify();
+                        // Two steps out, the way a search box anywhere gets
+                        // out: the filter first -- the whole list back --
+                        // and the card only once there is no search to clear.
+                        if this.keys_search.is_empty() {
+                            this.keys_open = false;
+                        } else {
+                            this.keys_search.clear();
+                            this.scroll_keys(None);
+                        }
+                    // The rows past the fold, without a wheel: forty actions
+                    // are four times what the viewport shows, and the hand
+                    // typing in the search box is already on the keyboard.
+                    } else if key == "up" {
+                        this.scroll_keys(Some(KEYS_ROW_H));
+                    } else if key == "down" {
+                        this.scroll_keys(Some(-KEYS_ROW_H));
+                    } else if key == "backspace" {
+                        this.keys_search.pop();
+                        this.scroll_keys(None);
+                    } else if let Some(c) = typed(key) {
+                        this.keys_search.push(c);
+                        this.scroll_keys(None);
                     }
+                    cx.notify();
                     return;
                 }
                 // The export card owns it the same way, and for the same
@@ -4212,10 +4519,18 @@ impl Render for Player {
                 if let Some(idx) = this.dragged(&drag) {
                     this.preview_drop(drag.lane, idx, event.event.position.x, cx);
                 }
+                // The shadow belongs to a *lane*, and which lane the pointer is
+                // over is the one thing this element cannot see. Cleared here
+                // and drawn again by the lane the pointer is actually inside
+                // (`lane_row`), which gpui runs straight after this one: the
+                // capture phase goes parent first, so a pointer over no lane at
+                // all -- up in the library, say -- promises nothing.
+                this.set_ghost(None, cx);
             }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<AssetDrag>, _, cx| {
                     this.preview_place(event.event.position.x, cx);
+                    this.set_ghost(None, cx);
                 }),
             )
             // Scrubbing is tracked on the root because the pointer leaves the
@@ -4745,10 +5060,25 @@ impl Player {
         }
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
+            let elapsed = self
+                .export_started
+                .map_or(0., |t| t.elapsed().as_secs_f32());
+            // Two numbers that must both be honest: the one that counts up is
+            // measured, the one that counts down is a guess and says so.
+            let left = eta_secs(&self.export_marks, elapsed, progress).map_or_else(
+                || "estimating…".to_owned(),
+                |s| format!("~{} left", clock(s)),
+            );
             (
                 format!(
-                    "EXPORTING {}% · {} · {} — {} cancels",
+                    // Clocks, then the way out, then what is encoding: at the
+                    // 640 px floor the tail is what truncation eats, and the
+                    // codec pair is the one part of this line the card already
+                    // said. The escape must not be what goes missing.
+                    "EXPORTING {}% · {} elapsed · {left} — {} cancels · {} · {}",
                     (progress * 100.) as u32,
+                    clock(elapsed),
+                    key(ActionId::CancelExport),
                     // The row that was picked; the engine's line below names the
                     // seats alone, since the library is what identifies a codec.
                     format_label(self.format),
@@ -4757,7 +5087,6 @@ impl Player {
                     export
                         .encoders()
                         .unwrap_or_else(|| "opening the encoder".to_string()),
-                    key(ActionId::CancelExport)
                 ),
                 progress,
             )
@@ -5052,23 +5381,27 @@ impl Player {
                         live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
                     ))
-                    // No shortcut of its own -- and closed while an export runs,
-                    // which is what keeps a waiting row from swallowing the
-                    // escape the progress line promises cancels the export.
+                    // Closed while an export runs, which is what keeps a waiting
+                    // row from swallowing the escape the progress line promises
+                    // cancels the export.
                     .child(control(
                         "keys",
                         None,
                         "Actions",
                         // The pointer's way to every action there is, including
                         // the ones no button here has room for.
-                        "do any action, or change the key that does it".to_string(),
+                        format!(
+                            "{} — do any action, or change the key that does it",
+                            key(ActionId::ShowActions)
+                        ),
                         !exporting,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.keys_open = !this.keys_open;
-                            this.rebinding = None;
-                            // One card at a time, both ways round.
-                            this.export_open = false;
-                            cx.notify();
+                        cx.listener(|this, _: &ClickEvent, _, cx| match this.keys_open {
+                            true => {
+                                this.keys_open = false;
+                                this.rebinding = None;
+                                cx.notify();
+                            }
+                            false => this.show_actions(cx),
                         }),
                     )),
             )
@@ -5302,7 +5635,26 @@ impl Player {
                 .px(px(6.))
                 .rounded(px(3.))
         };
-        for (i, key_row) in keys_rows().into_iter().enumerate() {
+        let found = keys_filter(&self.keys_search, &self.keymap);
+        // What the search box says: the typed text, and how much of the list is
+        // left under it -- a filter that found nothing has to say so, or the
+        // card reads as a list that lost its rows.
+        let search = if self.keys_search.is_empty() {
+            "search: type to filter · ↑ ↓ scroll the list".to_string()
+        } else {
+            let rows = found
+                .iter()
+                .filter(|(_, r)| !matches!(r, KeyRow::Head(_)))
+                .count();
+            match rows {
+                0 => format!(
+                    "search: {} — nothing matches · {out} clears",
+                    self.keys_search
+                ),
+                n => format!("search: {} — {n} shown · {out} clears", self.keys_search),
+            }
+        };
+        for (i, key_row) in found {
             rows.push(match key_row {
                 KeyRow::Head(category) => div()
                     .flex_none()
@@ -5440,6 +5792,19 @@ impl Player {
                                         }),
                                 ),
                         )
+                        // The search box: no focus and no text field -- the
+                        // card's key handler is the field, exactly as the
+                        // export card's digits are typed into it. Its own line
+                        // above the list, so the rows below it are always the
+                        // answer to what it says.
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(search),
+                        )
                         // Capped and scrolling rather than as tall as the action
                         // list happens to be: the list grows with the editor,
                         // the smallest window does not.
@@ -5451,6 +5816,10 @@ impl Player {
                                 .gap(px(2.))
                                 .max_h(px(KEYS_ROWS_H))
                                 .overflow_y_scroll()
+                                // The wheel's offset and the arrow keys' are
+                                // the same one, so the two cannot disagree
+                                // about where the list is.
+                                .track_scroll(&self.keys_scroll)
                                 .children(rows),
                         ),
                 ),
@@ -5741,6 +6110,30 @@ impl Player {
                     .into_any_element(),
             );
         }
+        // What is doing the work, on this machine and in this build: the GPU
+        // half is asked of the driver through the plugin (a different answer on
+        // every machine, and "none" where there is no plugin at all), the build
+        // half is the crates that were compiled in. Last in the list, because it
+        // is what a user checks rather than what they pick -- and a listing
+        // rather than rows, since none of it can be clicked.
+        if self.export_grouped {
+            list.push(header("THIS MACHINE"));
+        }
+        let note = |text: String| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .py(px(2.))
+                .text_size(px(11.))
+                .text_color(rgb(INK_DIM))
+                .child(text)
+                .into_any_element()
+        };
+        list.push(note(format!(
+            "GPU: {}",
+            self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
+        )));
+        list.push(note(format!("Built in: {}", engine::caps::software())));
         // What the rows add up to, which is the one thing that has to be right:
         // codec, box, size, rate, sound, where it goes and about how big. Two
         // lines, outside the scrolling list, so it is on screen whatever the
@@ -7519,6 +7912,11 @@ impl Player {
             .snap_cue
             .filter(|_| self.trim.is_some() || cx.has_active_drag())
             .map(|frame| scale.px_at(f64::from(frame) / self.fps));
+        // The shadow, on the one lane the pointer is over -- and, like the line,
+        // only while the drag that asked for it is still in flight.
+        let ghost = self
+            .ghost
+            .filter(|g| g.lane == lane && cx.has_active_drag());
         let clips = self
             .session
             .as_ref()
@@ -7668,12 +8066,26 @@ impl Player {
                         // Onto the edges near it, exactly as a clip carried by
                         // hand lands: the line drawn while it was in flight is
                         // the frame it goes down on.
-                        let x = window.mouse_position().x;
-                        let marks = this.snap_targets(None);
-                        let (at, _) = this.snap_to(this.frame_under(x), 0, &marks);
+                        let at = this.place_frame(window.mouse_position().x).0;
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
+                    // The shadow of the row in flight, drawn by the lane the
+                    // pointer is inside: `on_drag_move` fires on every painted
+                    // element while a drag of its type is live, wherever the
+                    // pointer is, and hands each one its own box -- which is how
+                    // a lane knows the pointer is over *it* (gpui div.rs:282).
+                    // The root cleared it a moment ago, so exactly one lane
+                    // draws one.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let path = event.drag(cx).0.clone();
+                            this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
+                        },
+                    ))
                     // ...and a clip let go over a lane lands the same way: on
                     // the track it was dropped on, at the frame it was carried
                     // to -- its own included, which is the drag that moves a
@@ -7689,6 +8101,17 @@ impl Player {
                         this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
+                    // ...and the same shadow for the clip in the hand, seated on
+                    // this lane when the pointer is inside it.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let drag = *event.drag(cx);
+                            this.preview_ghost(&drag, lane, event.event.position.x, cx);
+                        },
+                    ))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         // The clip as the lane holds it, for the drag payload:
                         // what a drop looks itself up by has to be the placed
@@ -7712,12 +8135,7 @@ impl Player {
                         // Tinted by *file*, not by source entry: two audio
                         // streams of one file are two sources, and the library
                         // gives them one swatch because they are one file.
-                        let tint = source_tint(
-                            sources
-                                .get(clip.source)
-                                .and_then(|s| sources.iter().position(|o| o.path == s.path))
-                                .unwrap_or(clip.source),
-                        );
+                        let tint = self.clip_tint(clip.source);
                         let width = scale.width_px(len);
                         let left = scale.px_at(start);
                         // The slice of this box that is on the bed: where its
@@ -7965,6 +8383,34 @@ impl Player {
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
+                    // Where the thing in the hand would come to rest, at the size
+                    // it would come to rest at: the shadow a proper editor draws
+                    // under a drag. Over the clips (it is translucent, so what
+                    // it would cover shows through) and under the line, which
+                    // marks the frame this box merely fills.
+                    .children(ghost.map(|g| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(scale.px_at(f64::from(g.start) / self.fps)))
+                            // A row whose length the engine has not measured
+                            // draws a head marker rather than nothing: where it
+                            // lands is known, how long it is is not.
+                            .w(px(scale
+                                .width_px(f64::from(g.frames) / self.fps)
+                                .max(GHOST_MIN)))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(if g.refused { REFUSE } else { INK }))
+                            // The file's own swatch at a third of its weight, so
+                            // the box beneath is still legible through it -- and
+                            // the refusal red instead, for a lane that will not
+                            // take this drop at all.
+                            .bg(rgba(
+                                ((if g.refused { REFUSE } else { g.tint }) << 8) | GHOST_ALPHA,
+                            ))
+                    }))
                     // What the gesture in flight is about to land on, drawn on
                     // every lane so a clip lining up with a take one track over
                     // can be seen to line up with it. Under the playhead's line
@@ -8334,6 +8780,17 @@ struct Ctx {
 /// disagree about what an action needs -- exactly the reason [`Player::act`] is
 /// one table too.
 fn enable(action: ActionId, ctx: Ctx) -> Enable {
+    // The one action that is about the editor rather than about the timeline:
+    // the list of what everything does, and where a key is changed. An empty
+    // window has no clips and still has keys -- so this answers ahead of the
+    // timeline question, and only an export shuts it (a waiting row would
+    // swallow the escape the progress line promises cancels the export).
+    if action == ActionId::ShowActions {
+        return match ctx.exporting {
+            true => Enable::No("an export is running"),
+            false => Enable::Yes,
+        };
+    }
     if !ctx.timeline {
         return Enable::No("no timeline open");
     }
@@ -10023,6 +10480,44 @@ fn snap_cue(on: bool, raw: u32, len: u32, tol: u32, marks: &[u32]) -> (u32, Opti
     (start, mark)
 }
 
+/// Where a drag lands and the mark that pulled it there: the frame under the
+/// pointer, less however far into the box the hand grabbed it (so a clip travels
+/// with the pointer rather than jumping its head under it), snapped by
+/// [`snap_cue`]. One answer, asked by the shadow drawn in flight
+/// ([`Player::preview_ghost`]), by the line ([`Player::preview_drop`]) and by
+/// the drop that commits ([`Player::move_clip`]) -- which is what makes the
+/// promise and the landing the same frame.
+fn landing(
+    under: u32,
+    grab: u32,
+    len: u32,
+    on: bool,
+    tol: u32,
+    marks: &[u32],
+) -> (u32, Option<u32>) {
+    snap_cue(on, under.saturating_sub(grab), len, tol, marks)
+}
+
+/// Why this file may not go on that lane, in the words the refusal is told in --
+/// `None` when it may. A file with no picture belongs on an audio lane and
+/// nowhere else, and a still is silent, so an audio lane is the one place it
+/// cannot go. Asked twice: by the ghost tinting itself as refused on the way
+/// down, and by the insert that commits ([`Player::insert_source`]), so what is
+/// shown as impossible is exactly what is refused.
+fn lane_refuses(path: &Path, lane: Lane) -> Option<String> {
+    let name = file_name(path);
+    let label = lane.label();
+    match lane.kind {
+        LaneKind::Video if engine::is_audio(path) => {
+            Some(format!("NOT ON {label} — {name} has no picture; drop it on an audio lane"))
+        }
+        LaneKind::Audio if engine::is_image(path) => {
+            Some(format!("NOT ON {label} — {name} is a still image; drop it on a video lane"))
+        }
+        _ => None,
+    }
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -10373,6 +10868,57 @@ fn timecode(t: f64, fps: f64) -> String {
     )
 }
 
+/// Wall clock for a progress line: `M:SS`, minutes past the hour included
+/// rather than an hours field nobody reads on an export.
+fn clock(secs: f32) -> String {
+    let secs = secs.max(0.) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// How often a progress mark is worth keeping, how far back the rate is
+/// measured, and the least span that may answer at all. An export crosses
+/// hardware and software segments that run at different speeds, so the
+/// estimate is a window's average and never the instant's.
+const ETA_SAMPLE: f32 = 0.5;
+const ETA_WINDOW: f32 = 8.;
+const ETA_SPAN: f32 = 1.5;
+
+/// Records where the export has got to and forgets what has fallen out of the
+/// window. One mark per `ETA_SAMPLE`, a window's worth kept: a bounded list
+/// whichever way the encode goes.
+fn note_progress(marks: &mut Vec<(f32, f32)>, elapsed: f32, progress: f32) {
+    if marks.last().is_none_or(|&(t, _)| elapsed - t >= ETA_SAMPLE) {
+        marks.push((elapsed, progress));
+    }
+    while marks.len() > 2 && marks[0].0 < elapsed - ETA_WINDOW {
+        marks.remove(0);
+    }
+}
+
+/// Seconds left at the window's rate, or `None` while nothing measurable has
+/// happened yet -- which the line says as "estimating…" rather than as a
+/// number it would have to take back.
+fn eta_secs(marks: &[(f32, f32)], elapsed: f32, progress: f32) -> Option<f32> {
+    // A finished pass is not a guess: it is over.
+    if progress >= 1. {
+        return Some(0.);
+    }
+    if progress <= 0. || elapsed < ETA_SPAN {
+        return None;
+    }
+    // Two rates, averaged. The window's follows the encode across a
+    // hardware-to-software handover; the whole run's is what keeps a window
+    // that is all stall from throwing the number minutes out and back. Neither
+    // alone reads well: raw window rate spikes eightfold on either edge of a
+    // stall, and the run average alone never notices a segment change.
+    let overall = progress / elapsed;
+    let recent = marks
+        .first()
+        .filter(|&&(t, _)| elapsed - t >= ETA_SPAN)
+        .map_or(overall, |&(t, p)| (progress - p) / (elapsed - t));
+    Some(2. * (1. - progress) / (recent + overall))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -10390,19 +10936,20 @@ mod tests {
         enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
         estimated_mb, export_path, export_settings, format_key,
         format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
-        inserted_band, is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at,
-        next_audio_kbps, next_container,
-        normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, silence_rate, snap_cue, snap_marks, snapped, source_tint, span_partner,
-        speed_at, summary_head, summary_tail, timecode, transport, unseen_paths, unseen_sources,
+        inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
+        marked, menu_at, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
+        push_digit, retarget, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
+        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
+        typed, unseen_paths, unseen_sources,
         whole_take, window_title,
     };
     use super::{
-        Choice, Edge, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View,
-        ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, audio_rate_choices, file_name, file_uri,
-        fit_choices,
-        library_rows, live_idx, next_fit, next_resolution, px_along, repeats, resolution_choices,
-        resolution_ladder, span_label, trimmed_clip, unscannable, visible_slice,
+        Choice, ETA_SPAN, Edge, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View,
+        ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
+        fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
+        note_progress, px_along,
+        repeats, resolution_choices, resolution_ladder, span_label, trimmed_clip, unscannable,
+        visible_slice,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -11672,6 +12219,64 @@ mod tests {
         assert_eq!(snapped(2, 40, 4, &marks), 0);
     }
 
+    /// The shadow a drag draws and the drop that commits are one answer: both
+    /// ask [`landing`], so the box seen in flight is the box the release leaves
+    /// behind. What this pins down is the composition around the snap -- the
+    /// grab offset comes off *before* the magnet, or a clip taken by its tail
+    /// would land a boxful late.
+    #[test]
+    fn a_ghost_and_a_drop_are_one_landing() {
+        // A neighbour covering [100, 160), the playhead at 300, and a 40 frame
+        // clip taken hold of 12 frames in.
+        let marks = [100, 160, 300, 0];
+        let (len, grab, tol) = (40, 12, 4);
+        // Pointer at frame 170: the head is 12 frames behind it, at 158, which
+        // is a frame short of the neighbour's tail -- so both the ghost and the
+        // drop say 160, and the line stands on the mark that pulled it.
+        assert_eq!(landing(170, grab, len, true, tol, &marks), (160, Some(160)));
+        // Without the grab taken off first, the same pointer would land the
+        // box at 170 and no mark would be in reach: the offset is not cosmetic.
+        assert_eq!(landing(170, 0, len, true, tol, &marks), (170, None));
+        // A library row carries no grab and no length the engine has measured,
+        // which is how `Player::place_frame` asks: only its head lands, on the
+        // playhead here.
+        assert_eq!(landing(298, 0, 0, true, tol, &marks), (300, Some(300)));
+        // The magnet off, ghost and drop agree on the raw frame and no line is
+        // drawn -- the frame-by-frame placement the switch is for.
+        assert_eq!(landing(170, grab, len, false, tol, &marks), (158, None));
+        // A pointer nearer the bed's start than the hand is into the box cannot
+        // pull a head below zero.
+        assert_eq!(landing(3, grab, len, true, tol, &marks), (0, Some(0)));
+    }
+
+    /// Which lanes tint that shadow as refused: the two kinds of file a lane
+    /// cannot hold, in the words the release would say them in -- one rule, so
+    /// what is shown as impossible is exactly what is refused.
+    #[test]
+    fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
+        let (video, audio) = (Lane::V1, Lane::A1);
+        let sound = Path::new("/media/take.mp3");
+        let still = Path::new("/media/card.png");
+        let movie = Path::new("/media/take.mp4");
+        assert_eq!(
+            lane_refuses(sound, video).as_deref(),
+            Some("NOT ON V1 — take.mp3 has no picture; drop it on an audio lane")
+        );
+        assert_eq!(
+            lane_refuses(still, audio).as_deref(),
+            Some("NOT ON A1 — card.png is a still image; drop it on a video lane")
+        );
+        // ...and every lane a file *can* go on says nothing at all, which is a
+        // ghost drawn in the file's own colour.
+        assert_eq!(lane_refuses(sound, audio), None);
+        assert_eq!(lane_refuses(still, video), None);
+        assert_eq!(lane_refuses(movie, video), None);
+        // A file with a picture is not refused by an audio lane here: the
+        // engine takes its sound onto one, and the words for a video-only file
+        // are its own.
+        assert_eq!(lane_refuses(movie, audio), None);
+    }
+
     /// Where those edges come from: every lane, not the one being dropped on --
     /// and never the clip in the hand or the half of it one track down.
     #[test]
@@ -12211,18 +12816,105 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// The search box: what a typed word leaves standing. Forty actions is more
+    /// than a 360 px window shows at once, so this is the card's answer to
+    /// "where is the one I want" -- and a heading with nothing under it would
+    /// be worse than no filter at all.
+    #[test]
+    fn a_search_leaves_the_rows_it_names_under_their_own_headings() {
+        use keymap::{ActionId, Category, Keymap};
+        let keymap = Keymap::defaults();
+        let acts = |found: &[(usize, KeyRow)]| -> Vec<ActionId> {
+            found
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    KeyRow::Act(a) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        };
+        let heads = |found: &[(usize, KeyRow)]| -> Vec<Category> {
+            found
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    KeyRow::Head(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Nothing typed hides nothing, and every row keeps its place in the
+        // unfiltered list: an element id must not move under a keystroke.
+        let all = keys_filter("", &keymap);
+        assert_eq!(all.len(), keys_rows().len());
+        assert!(all.iter().enumerate().all(|(n, (i, _))| n == *i));
+        // The word the user types is the word on the row. The mix card names
+        // the track volumes, so it is an honest hit; the fixed row about the
+        // volume keys is another, and each comes with its own heading only.
+        let vol = keys_filter("vol", &keymap);
+        assert_eq!(
+            acts(&vol),
+            vec![ActionId::VolumeUp, ActionId::VolumeDown, ActionId::Mix]
+        );
+        assert_eq!(heads(&vol), vec![Category::Audio, Category::View]);
+        // Case is not part of the question, in either direction.
+        assert_eq!(keys_filter("VoL", &keymap).len(), vol.len());
+        // The stroke column is searched too -- "what did ctrl do again" -- and
+        // an unbound-looking word finds nothing rather than everything.
+        let ctrl = keys_filter("ctrl+", &keymap);
+        assert!(acts(&ctrl).contains(&ActionId::Save));
+        assert!(!acts(&ctrl).contains(&ActionId::Play));
+        assert!(
+            keys_filter("qzx", &keymap).is_empty(),
+            "headings left behind"
+        );
+        // The card's own door is on the card, by name and by stroke.
+        assert_eq!(
+            acts(&keys_filter("f1", &keymap)),
+            vec![ActionId::ShowActions]
+        );
+        assert_eq!(
+            acts(&keys_filter("all actions", &keymap)),
+            vec![ActionId::ShowActions]
+        );
+    }
+
+    /// What a keystroke means to that box: a letter is a letter, and a word
+    /// gpui reports for a key that prints nothing is not typed letter by
+    /// letter into the search.
+    #[test]
+    fn only_a_printable_stroke_types_into_the_search() {
+        assert_eq!(typed("a"), Some('a'));
+        assert_eq!(typed("-"), Some('-'));
+        assert_eq!(typed("1"), Some('1'));
+        // The one printable key gpui reports by name.
+        assert_eq!(typed("space"), Some(' '));
+        for word in ["left", "escape", "f1", "backspace", "tab", "delete", "home"] {
+            assert_eq!(typed(word), None, "{word}");
+        }
+    }
+
     #[test]
     fn the_keybindings_card_fits_the_smallest_window() {
         // The row list is capped and scrolls, so the card's height no longer
-        // depends on how many actions there are: a title, a status line and the
-        // viewport, inside the 640x360 the rest of the layout is sized for.
+        // depends on how many actions there are: a title, a status line, the
+        // search box and the viewport, inside the 640x360 the rest of the
+        // layout is sized for.
         let title = 17.; // 13 px text on its own line
         let status = 28.; // 11 px text, two lines: a refusal wraps
-        let gaps = 3. * 2.;
+        let search = 15.; // 11 px text, one line: it never wraps
+        let gaps = 4. * 2.;
         let padding = 24.;
         assert!(
-            title + status + KEYS_ROWS_H + gaps + padding <= 360.,
+            title + status + search + KEYS_ROWS_H + gaps + padding <= 360.,
             "card too tall"
+        );
+        // ...and the list is the only part that grows with the editor, so the
+        // rows past the fold are reached by scrolling that viewport (and, with
+        // forty of them, by the search box above it) rather than by a card
+        // taller than the window.
+        assert!(
+            keys_rows().len() as f32 * KEYS_ROW_H > KEYS_ROWS_H,
+            "the list outgrew the viewport long ago; the cap must still scroll"
         );
         // The cap is only honest if it is the taller list that scrolls, not the
         // card that grows: every action must be reachable by scrolling, and
@@ -13192,6 +13884,77 @@ mod tests {
         );
     }
 
+    /// The progress line's two clocks, driven the way a repaint drives them:
+    /// steady work, a stall where hardware hands over to software, then steady
+    /// work again. The estimate may not whipsaw, may not vanish once it has
+    /// been given, and must meet the elapsed clock at the end.
+    #[test]
+    fn the_export_estimate_rides_out_a_stall_and_converges() {
+        let (mut marks, mut elapsed, mut progress) = (Vec::new(), 0f32, 0f32);
+        // 2%/s, a 12 s stall at 40% -- longer than the window, so the window
+        // alone would have nothing left to measure -- and the same rate to the
+        // end: 62 s of wall clock for 50 s of work.
+        let rate = 0.02;
+        let (mut quiet, mut before_stall, mut after_stall, mut last) = (0f32, 0., 0., f32::MAX);
+        while progress < 1. {
+            let stalled = (20. ..32.).contains(&elapsed);
+            note_progress(&mut marks, elapsed, progress);
+            // What is really left, to hold every guess against.
+            let truth = (1. - progress) / rate + if stalled { 32. - elapsed } else { 0. };
+            match eta_secs(&marks, elapsed, progress) {
+                // "estimating…" is only allowed before there is a span to
+                // measure, and never again after the first number.
+                None => {
+                    assert!(elapsed < ETA_SPAN + 1., "estimate vanished at {elapsed}");
+                    quiet = elapsed;
+                }
+                Some(left) => {
+                    // No guess is ever wilder than four times the truth: that
+                    // is the eightfold spike a raw window rate throws on either
+                    // edge of the stall.
+                    assert!(left <= truth * 4., "at {elapsed}s: {left} vs {truth}");
+                    // While the rate holds, the answer is the true one and it
+                    // only ever counts down.
+                    if elapsed >= 5. && elapsed < 20. {
+                        assert!((left - truth).abs() <= truth * 0.15, "{elapsed}s: {left}");
+                        assert!(left < last, "estimate grew while the rate held");
+                    }
+                    // Eight seconds past the stall it has caught up again.
+                    if elapsed >= 40. {
+                        assert!((left - truth).abs() <= truth * 0.25, "{elapsed}s: {left}");
+                        assert!(left < last + 0.001, "estimate grew after the stall");
+                    }
+                    if (20. ..20.25).contains(&elapsed) {
+                        before_stall = left;
+                    }
+                    if (31.5..31.75).contains(&elapsed) {
+                        after_stall = left;
+                    }
+                    last = left;
+                }
+            }
+            // A window's worth of marks and no more, however long the encode.
+            assert!(marks.len() <= 20, "{} marks", marks.len());
+            elapsed += 0.25;
+            if !stalled {
+                progress = (progress + rate * 0.25).min(1.);
+            }
+        }
+        assert!(quiet > 0. && quiet < ETA_SPAN + 1.);
+        // The stall stretched the guess instead of erasing it, and by more than
+        // the stopped clock adds on its own.
+        assert!(
+            after_stall > before_stall + 12.,
+            "{before_stall} -> {after_stall}"
+        );
+        // Both clocks meet: a finished pass has nothing left.
+        assert_eq!(eta_secs(&marks, elapsed, 1.), Some(0.));
+        assert!((elapsed - 62.).abs() < 1., "{elapsed}");
+        assert_eq!(clock(83.4), "1:23");
+        assert_eq!(clock(114.), "1:54");
+        assert_eq!(clock(-1.), "0:00");
+    }
+
     #[test]
     fn every_codec_row_is_offered_or_says_why_not() {
         // One row per codec, and the boxes it can go in are the container row's
@@ -14071,20 +14834,26 @@ fn main() {
                     sizes: HashMap::new(),
                     decoders: HashMap::new(),
                     export_seat: None,
+                    hw_caps: None,
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
                     grab: 0,
                     snap: true,
                     snap_cue: None,
+                    ghost: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
                     cancelling: false,
+                    export_started: None,
+                    export_marks: Vec::new(),
                     export_path: out.clone(),
                     project_path: project.clone(),
                     keymap: keymap.clone(),
                     keys_open: false,
+                    keys_search: String::new(),
+                    keys_scroll: ScrollHandle::new(),
                     export_open: false,
                     export_grouped: true,
                     export_refusals_inline: false,
