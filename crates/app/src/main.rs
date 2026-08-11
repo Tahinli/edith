@@ -336,6 +336,39 @@ enum Wave {
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 
+/// The import a worker is reading, as the line above the panel shows it. No
+/// fraction anywhere: neither read reports how far into the file it has come,
+/// so what is honest is the file's name, the stage, and two clocks -- one that
+/// proves the window is answering, one that says the stage has not moved.
+struct Import {
+    path: PathBuf,
+    /// When the worker started, for the elapsed clock.
+    started: Instant,
+    /// Written by the worker between its two reads, read here every repaint.
+    stage: Arc<std::sync::atomic::AtomicU8>,
+    /// The stage the line last saw and when it last changed. The pair is the
+    /// whole stall detector: a stage older than [`IMPORT_STALL`] is what the
+    /// honest wording is for.
+    seen: ImportStage,
+    since: Instant,
+}
+
+impl Import {
+    /// Reads the worker's stage and keeps the stall clock: it restarts when the
+    /// stage actually changes and at no other time, which is what makes "has
+    /// not moved in five seconds" a fact rather than a guess about the elapsed
+    /// clock. Hands back how long the current stage has stood, so the line has
+    /// one place to ask.
+    fn poll(&mut self) -> f32 {
+        let stage = ImportStage::from_u8(self.stage.load(std::sync::atomic::Ordering::Relaxed));
+        if stage != self.seen {
+            self.seen = stage;
+            self.since = Instant::now();
+        }
+        self.since.elapsed().as_secs_f32()
+    }
+}
+
 /// A library row being dragged: the file and which of its audio streams that
 /// row is, which is the whole of what a row names. Where it lands does not
 /// change what is inserted.
@@ -1114,6 +1147,12 @@ struct Player {
     /// rolling-window estimate the progress line reads; see [`note_progress`].
     export_started: Option<Instant>,
     export_marks: Vec<(f32, f32)>,
+    /// The file an import worker is reading right now, and the files waiting
+    /// behind it in arrival order. Unlike an export, an import owns nothing:
+    /// the editor stays live, the timeline keeps playing, and the only thing
+    /// this holds is the line above the panel ([`Player::import_bar`]).
+    importing: Option<Import>,
+    imports: std::collections::VecDeque<PathBuf>,
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
@@ -3673,12 +3712,86 @@ impl Player {
         Some((info.sample_rate, info.channels))
     }
 
-    /// Takes a file into the library and nowhere else: the timeline is not
-    /// touched, and the row is dragged onto a lane when it is wanted there. A
-    /// drop is not a key press, so the export guard on the key handler does not
-    /// cover it and this checks for itself. Nothing moves, so nothing reseeks;
-    /// a refusal is shown as the engine worded it and changes nothing.
+    /// Queues a file for the library. Nothing is read here: the reading is
+    /// [`read_ahead`] on a worker, and [`Player::take_import`] is what finally
+    /// touches the timeline, one repaint later and with the pages warm. A drop
+    /// is not a key press, so the export guard on the key handler does not
+    /// cover it and this checks for itself.
+    ///
+    /// One file at a time, in arrival order: a drop can carry six and argv can
+    /// name more, and six header walks racing over one disk finish no sooner
+    /// than six in a row -- while the line above the panel has exactly one file
+    /// to name.
     fn import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        self.imports.push_back(path.to_path_buf());
+        self.start_import(cx);
+    }
+
+    /// Starts the worker for the next queued file, if no worker is running.
+    /// Called again as each import lands, which is what drains the queue.
+    fn start_import(&mut self, cx: &mut Context<Self>) {
+        if self.importing.is_some() {
+            return;
+        }
+        let Some(path) = self.imports.pop_front() else {
+            return;
+        };
+        let stage = Arc::new(std::sync::atomic::AtomicU8::new(ImportStage::Header as u8));
+        let read = cx.background_executor().spawn({
+            let (path, stage) = (path.clone(), Arc::clone(&stage));
+            async move { read_ahead(&path, &stage) }
+        });
+        let now = Instant::now();
+        self.importing = Some(Import {
+            path: path.clone(),
+            started: now,
+            stage,
+            seen: ImportStage::Header,
+            since: now,
+        });
+        cx.spawn(async move |this, cx| {
+            read.await;
+            this.update(cx, |this, cx| {
+                this.importing = None;
+                this.take_import(&path, cx);
+                // The next one is started by the repaint this notified, which
+                // is also what starts the files argv named ([`poll_import`]).
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Keeps the import line's two clocks honest: the elapsed one runs from the
+    /// worker, and the stall one from the last time the stage it is naming
+    /// actually changed. Sampled here rather than while drawing, for
+    /// [`Player::poll_export`]'s reason.
+    ///
+    /// ...and starts whatever is queued behind it, which is the one place the
+    /// files argv named can begin: they are put in the queue before there is a
+    /// context to spawn a worker from.
+    fn poll_import(&mut self, cx: &mut Context<Self>) {
+        match &mut self.importing {
+            Some(import) => {
+                import.poll();
+            }
+            None => self.start_import(cx),
+        }
+    }
+
+    /// Takes a read-ahead file into the library and nowhere else: the timeline
+    /// is not touched, and the row is dragged onto a lane when it is wanted
+    /// there. Nothing moves, so nothing reseeks; a refusal is shown as the
+    /// engine worded it and changes nothing.
+    ///
+    /// The export guard again, and not for the caller's sake: an export can
+    /// have started during the seconds the worker was reading, and a drop
+    /// during an export has always been a silent no-op.
+    fn take_import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
@@ -4371,6 +4484,7 @@ impl Render for Player {
         }
         self.pump(window);
         self.poll_export();
+        self.poll_import(cx);
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
@@ -4394,7 +4508,14 @@ impl Render for Player {
         // the screen on a repaint. A notice does not: it waits to be dismissed
         // rather than for a clock, so keeping the loop alive for it would spin
         // the GPU until someone answered it.
-        if state.is_playing() || self.pending_seek || self.export.is_some() {
+        // An import does too, and for the same reason: its clock and its sweep
+        // only reach the screen on a repaint, and a still line is the very
+        // thing it exists to disprove.
+        if state.is_playing()
+            || self.pending_seek
+            || self.export.is_some()
+            || self.importing.is_some()
+        {
             window.request_animation_frame();
         }
 
@@ -4981,7 +5102,10 @@ impl Render for Player {
                     ),
             )
             // Above the panel and only when there is one to show, so it costs
-            // the picture nothing the rest of the time.
+            // the picture nothing the rest of the time. The import's line sits
+            // over the notice's: a notice is about something that has already
+            // happened, and this is about something still happening.
+            .children(self.import_bar())
             .children(self.notice_bar(cx))
             .child(self.panel(position, duration, state, cx))
             // Over the panel it was opened on, and under the cards: it is only
@@ -6282,6 +6406,63 @@ impl Player {
             // along it -- and a strip that scrolled away with the sixth lane
             // would be a strip nobody could see while editing.
             .children(strip)
+    }
+
+    /// The running import holds its own bar above the notice's, for the notice
+    /// bar's reason: the message is the point. Not a notice, though -- nothing
+    /// dismisses it, because it is about work still going on, and it leaves by
+    /// itself when the file lands.
+    ///
+    /// The bar under the words is a *sweep*, not a fill: neither read reports
+    /// where in the file it is, so a fill would have to invent the one number
+    /// this cannot know. What it does say truthfully is "something is still
+    /// running", which is exactly the question a frozen-looking window raises.
+    fn import_bar(&self) -> Option<impl IntoElement> {
+        let import = self.importing.as_ref()?;
+        let elapsed = import.started.elapsed().as_secs_f32();
+        let line = import_line(
+            &file_name(&import.path),
+            import.seen,
+            elapsed,
+            import.since.elapsed().as_secs_f32(),
+            self.imports.len(),
+        );
+        // A quarter of the bar, crossing it every three seconds and wrapping.
+        // Tied to the elapsed clock, so it moves for as long as the read does
+        // and stops dead the instant the file lands.
+        const SWEEP: f32 = 0.25;
+        let at = (elapsed / 3.).fract() * (1. + SWEEP) - SWEEP;
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .px(px(12.))
+                .py(px(6.))
+                .bg(rgb(SURFACE))
+                .child(div().flex_1().min_w(px(0.)).child(line))
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(2.))
+                        .bg(rgb(HOVER))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(relative(at.max(0.)))
+                                // Clipped at both ends by hand: the segment
+                                // enters from the left edge and leaves past the
+                                // right one, and a width that overhung would
+                                // paint outside the track.
+                                .w(relative((at + SWEEP).min(1.) - at.max(0.)))
+                                .h(px(2.))
+                                .bg(rgb(ACCENT)),
+                        ),
+                ),
+        )
     }
 
     /// A notice holds its own bar, full width, until it is answered: any key
@@ -9535,6 +9716,43 @@ fn is_matroska(path: &std::path::Path) -> bool {
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
 }
 
+/// Reads, off the UI thread, exactly what the import that follows is about to
+/// read -- and throws every byte away. The point is the page cache: a cold
+/// header walk of a 29 GB remux is 11 s and a warm one is 150 ms (measured,
+/// `a real 4K HEVC film` 2160p h265), so this call is the eleven seconds and
+/// [`Player::take_import`] is the hundred and fifty milliseconds. The window
+/// keeps painting through the eleven.
+///
+/// Errors are dropped on purpose: a file that cannot be read is refused by the
+/// engine a moment later, in the engine's own words, and a refusal read twice
+/// is a refusal worded twice.
+///
+/// `stage` is what the line above the panel is naming while this runs.
+///
+/// ponytail: the cache is the whole handoff, so a machine that evicts those
+/// pages between this read and the next frame pays the cold walk on the UI
+/// thread after all. Ceiling: memory pressure inside one repaint of a 25 GB
+/// file. The upgrade is an engine door that takes the header this already
+/// parsed ([`PlaybackSession::import`] opens the demuxer again today).
+fn read_ahead(path: &std::path::Path, stage: &std::sync::atomic::AtomicU8) {
+    use std::sync::atomic::Ordering::Relaxed;
+    stage.store(ImportStage::Header as u8, Relaxed);
+    // The three doors an import goes through, each warmed by the call the
+    // engine will make: a song is measured by its duration, a still by its
+    // header, and everything else by the container's.
+    if engine::is_audio(path) {
+        engine::AudioSession::duration_secs(path).ok();
+    } else if !engine::is_image(path) && !is_subtitle(path) {
+        engine::demux::Demuxer::open(path).ok();
+    }
+    stage.store(ImportStage::Subtitles as u8, Relaxed);
+    // ...and the tracks inside it, which `subtitle_notice` walks straight
+    // after. A standalone `.srt` is small enough to be nobody's wait.
+    if is_matroska(path) {
+        engine::subtitle::of_matroska(path).ok();
+    }
+}
+
 /// The subtitle tracks a media file carries, taken into the session as it is
 /// opened, and the tail the notice grows for them: an mkv with subtitles in it
 /// arrives with its subtitles, because a track nobody imported is a track nobody
@@ -9543,10 +9761,11 @@ fn is_matroska(path: &std::path::Path) -> bool {
 /// A refusal is a tail too, never a failure of the open: the picture and the
 /// sound of a film whose subtitle tracks cannot be walked are still the film.
 ///
-/// ponytail: the walk reads the whole file for its cues
-/// (`engine::subtitle::of_matroska`), so a long film pauses at the open it is
-/// part of. Ceiling: a two-hour remux. The upgrade is the background executor
-/// the waveforms already use, with the rows arriving when it lands.
+/// The walk reads the whole file for its cues
+/// (`engine::subtitle::of_matroska`) -- ~200 ms on a two-hour 4K remux, and an
+/// *import* pays it on a worker first ([`read_ahead`]), so what happens here is
+/// the warm second pass. A file *opened* at launch still pays it cold: there is
+/// no window yet to say so in.
 fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Option<String> {
     if !is_matroska(path) {
         return None;
@@ -12288,6 +12507,69 @@ fn clock(secs: f32) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
+/// How long a stage may sit without moving before the import line stops
+/// reading like a progress line and says outright that the wait is the file's,
+/// not the window's. Five seconds: a 25 GB remux spends eleven in its header
+/// alone, and a person watching a still line for that long has already decided
+/// the editor hung.
+const IMPORT_STALL: f32 = 5.;
+
+/// Which of an import's two reads the worker is inside. Travels as one atomic,
+/// the way an export's progress does ([`engine::ExportHandle`]) -- there is no
+/// fraction to send, because neither read reports where in the file it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ImportStage {
+    /// The container header: the sample tables, the cue index, the frame count.
+    /// Eleven seconds on a cold 29 GB remux, a hundred and fifty milliseconds
+    /// once the pages are warm -- the whole reason this runs off the UI thread.
+    Header,
+    /// The subtitle tracks inside a Matroska, which is a walk over the file's
+    /// blocks rather than a header read (~200 ms on a two-hour film).
+    Subtitles,
+}
+
+impl ImportStage {
+    /// The atomic the worker writes; `u8` because that is what an
+    /// [`AtomicU8`](std::sync::atomic::AtomicU8) carries.
+    fn from_u8(n: u8) -> Self {
+        match n {
+            0 => Self::Header,
+            _ => Self::Subtitles,
+        }
+    }
+
+    /// What the line calls this stage.
+    fn what(self) -> &'static str {
+        match self {
+            Self::Header => "reading the header",
+            Self::Subtitles => "reading the subtitle tracks",
+        }
+    }
+}
+
+/// The whole of what an import shows while it runs: which file, which stage,
+/// the clock that proves the window is still answering, and what is behind it
+/// in the queue.
+///
+/// `since` is how long the *stage* has stood still, which is the only movement
+/// an unmeasurable read has: past [`IMPORT_STALL`] the line says so in words,
+/// because a bar that cannot move and a bar that has stopped look identical.
+fn import_line(name: &str, stage: ImportStage, elapsed: f32, since: f32, waiting: usize) -> String {
+    let tail = match waiting {
+        0 => String::new(),
+        n => format!(" · {n} more waiting"),
+    };
+    let what = stage.what();
+    match since >= IMPORT_STALL {
+        true => format!(
+            "IMPORTING {name} · still {what} — a big file is minutes of reading, and the window is \
+             not frozen · {} elapsed{tail}",
+            clock(elapsed)
+        ),
+        false => format!("IMPORTING {name} · {what} · {} elapsed{tail}", clock(elapsed)),
+    }
+}
+
 /// How often a progress mark is worth keeping, how far back the rate is
 /// measured, and the least span that may answer at all. An export crosses
 /// hardware and software segments that run at different speeds, so the
@@ -12365,6 +12647,7 @@ mod tests {
         ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
+        IMPORT_STALL, Import, ImportStage, import_line, read_ahead,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
         trimmed_clip, unscannable,
         visible_slice,
@@ -15547,6 +15830,110 @@ mod tests {
         assert_eq!(clock(-1.), "0:00");
     }
 
+    /// The import line's own state machine, driven the way a repaint drives
+    /// it: the worker writes a stage, the poll notices it changed and restarts
+    /// the stall clock, and the line's words change only when a stage has
+    /// actually stood still. The whole point is that a stuck read reads as a
+    /// stuck read and never as a frozen window.
+    #[test]
+    fn an_import_line_says_a_stage_has_stopped_moving_and_only_then() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        let stage = Arc::new(AtomicU8::new(ImportStage::Header as u8));
+        let started = Instant::now() - Duration::from_secs(9);
+        let mut import = Import {
+            path: PathBuf::from("/films/A Film.mkv"),
+            started,
+            stage: Arc::clone(&stage),
+            seen: ImportStage::Header,
+            // As if the header had been running for those nine seconds.
+            since: started,
+        };
+        // Nine seconds inside one stage: past the wait a person tolerates, so
+        // the line stops pretending it is a progress line.
+        let since = import.poll();
+        assert!(since > IMPORT_STALL, "{since}");
+        let stalled = import_line("A Film.mkv", import.seen, 9., since, 0);
+        assert!(stalled.contains("still reading the header"), "{stalled}");
+        assert!(stalled.contains("not frozen"), "{stalled}");
+        assert!(stalled.contains("0:09 elapsed"), "{stalled}");
+        // The worker moves on: the stall clock restarts even though the elapsed
+        // one does not, which is the distinction the two clocks exist for.
+        stage.store(ImportStage::Subtitles as u8, Relaxed);
+        let since = import.poll();
+        assert_eq!(import.seen, ImportStage::Subtitles);
+        assert!(since < IMPORT_STALL, "{since}");
+        let moving = import_line("A Film.mkv", import.seen, 9., since, 2);
+        assert!(
+            moving.starts_with("IMPORTING A Film.mkv · reading the subtitle tracks"),
+            "{moving}"
+        );
+        assert!(!moving.contains("still"), "{moving}");
+        // ...and what is behind it in the queue, which is what a drop of three
+        // files or an argv of three files leaves waiting.
+        assert!(moving.ends_with("· 2 more waiting"), "{moving}");
+        assert!(!stalled.ends_with("waiting"), "an empty queue says nothing");
+        // A stage that does not move is not the same fact as a stage that came
+        // back to the same value: the poll only restarts on a change.
+        let held = import.since;
+        import.poll();
+        assert_eq!(import.since, held, "an unchanged stage must not reset it");
+    }
+
+    /// The read-ahead is a *cache warmer* and nothing else: whatever it did or
+    /// failed to do, the import that follows lands exactly the rows, lengths
+    /// and refusals it landed before there was a worker at all.
+    #[test]
+    fn reading_ahead_changes_nothing_about_what_an_import_lands() {
+        use std::sync::atomic::AtomicU8;
+        let stage = AtomicU8::new(ImportStage::Header as u8);
+        let plain = {
+            let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+            session.set_gain(0.0);
+            session.import(&asset("test_av2.mp4")).expect("av2 matches");
+            (
+                session.sources().to_vec(),
+                session.file_frames(&asset("test_av2.mp4")),
+                session.timeline_duration(),
+            )
+        };
+        let warmed = {
+            let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+            session.set_gain(0.0);
+            read_ahead(&asset("test_av2.mp4"), &stage);
+            session.import(&asset("test_av2.mp4")).expect("av2 matches");
+            (
+                session.sources().to_vec(),
+                session.file_frames(&asset("test_av2.mp4")),
+                session.timeline_duration(),
+            )
+        };
+        assert_eq!(plain, warmed);
+        // ...and it leaves the stage where the line can read it: a worker that
+        // never announced its second read would show one that never ends.
+        assert_eq!(
+            ImportStage::from_u8(stage.load(std::sync::atomic::Ordering::Relaxed)),
+            ImportStage::Subtitles
+        );
+        // A refusal is still the engine's refusal, warmed or not: a file of
+        // another rate is no more importable for having been read first.
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+        session.set_gain(0.0);
+        read_ahead(&asset("test_25fps.mp4"), &stage);
+        let warmed = session.import(&asset("test_25fps.mp4"));
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+        session.set_gain(0.0);
+        assert_eq!(
+            warmed.map_err(|e| e.to_string()),
+            session
+                .import(&asset("test_25fps.mp4"))
+                .map_err(|e| e.to_string())
+        );
+        // A path nothing can read is the worker's business to survive, not to
+        // report: the engine says so a moment later, in its own words.
+        read_ahead(std::path::Path::new("/no/such/film.mkv"), &stage);
+    }
+
     #[test]
     fn every_codec_row_is_offered_or_says_why_not() {
         // One row per codec, and the boxes it can go in are the container row's
@@ -16863,36 +17250,17 @@ fn main() {
     }
     // The first file makes the timeline -- naming a file to open is a decision
     // about what to watch -- and the rest are imports like any other: rows in
-    // the library, dragged onto a lane when they are wanted there. A refusal is
-    // not fatal -- the others still load -- but the window must not open
-    // silently pretending the file was taken, so the first one seeds the notice.
-    for extra in std::env::args().skip(2) {
-        let extra = PathBuf::from(&extra);
-        // Only reachable with a first argument, so there is a timeline.
-        let Some(session) = &mut session else {
-            continue;
-        };
-        // A subtitle file named on the command line is not a source: it goes
-        // through the engine's other door, exactly as a dropped one does.
-        let imported = match is_subtitle(&extra) {
-            true => session.import_subtitles(&extra).map(|_| 0),
-            false => session.import(&extra),
-        };
-        match imported {
-            // The file's own tracks with it, as every other import door takes
-            // them.
-            Ok(_) => {
-                if let Some(text) = subtitle_notice(session, &extra) {
-                    eprintln!("{}: {text}", extra.display());
-                }
-            }
-            Err(e) => {
-                let text = format!("IMPORT FAILED: {e}");
-                eprintln!("{}: {text}", extra.display());
-                notice.get_or_insert(text);
-            }
-        }
-    }
+    // the library, dragged onto a lane when they are wanted there.
+    //
+    // Queued rather than read here: three 25 GB remuxes on the command line
+    // used to be half a minute of *no window at all*, and a window that has
+    // not opened cannot say why. They go through the same door a drop does
+    // ([`Player::import`]), which is the door with a progress line on it, and
+    // the refusals arrive in the notice bar as a drop's do.
+    let extras: Vec<PathBuf> = session
+        .is_some()
+        .then(|| std::env::args().skip(2).map(PathBuf::from).collect())
+        .unwrap_or_default();
     // The subtitle tracks inside the file that *is* the timeline, taken at the
     // launch the window opens from -- the same pickup the drop and the Import
     // button make (`open_media`).
@@ -16960,6 +17328,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                let extras = extras.clone();
                 let player = cx.new(|cx| Player {
                     // A file named on the command line owes its first frame the
                     // same repaint a seek's still owes: nothing plays by
@@ -17066,6 +17435,10 @@ fn main() {
                     rebinding: None,
                     notice: notice.clone().map(SharedString::from),
                     exported: None,
+                    // The rest of argv, waiting for the first repaint to start
+                    // them: the window is up before a byte of them is read.
+                    importing: None,
+                    imports: extras.into(),
                     // Nothing pushed yet, and never a real title: the first
                     // render is what names the window.
                     titled: String::new(),
