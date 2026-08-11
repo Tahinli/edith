@@ -329,15 +329,18 @@ impl Mp4Demuxer {
     }
 }
 
-/// One Matroska block of the video track: where its bytes are and whether a
-/// decoder may start on it. 16 bytes an entry, so an hour of 30 fps costs ~1.7
-/// MB of index -- the price of knowing the frame count and the sync points of a
+/// One Matroska block of an indexed track: where its bytes are, whether a
+/// decoder may start on it, and when it is presented (in `TimestampScale`
+/// ticks, which is what a sound track seeks against -- Matroska indexes no
+/// samples either). 24 bytes an entry, so an hour of 30 fps costs ~2.6 MB of
+/// index -- the price of knowing the frame count and the sync points of a
 /// container that indexes neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Block {
     at: u64,
     len: usize,
     key: bool,
+    ts: i64,
 }
 
 /// AV1, HEVC or H.264 out of a Matroska file (`.mkv`/`.webm`).
@@ -378,7 +381,7 @@ impl MkvDemuxer {
         let mut file = File::open(path)?;
         let end = file.metadata()?.len();
         let segment = mkv_segment(&mut file, end)?;
-        let (video, _, other) = mkv_tracks(&mut file, segment)?;
+        let (video, _, other, _) = mkv_tracks(&mut file, segment)?;
         let video = match video {
             Some(video) => video,
             // Named, because "no video track" is a lie about a file that has one
@@ -487,13 +490,99 @@ impl MkvDemuxer {
 
 /// The codec id of `path`'s first audio track (`A_AAC`, `A_OPUS`, ...), or
 /// `None` for a Matroska file with no sound at all. Header only, and only worth
-/// calling once a session has come up silent: no audio track of a Matroska file
-/// is decoded yet, so this exists to say which one is being left out.
+/// calling once a session has come up silent: a Matroska file's sound is read
+/// by symphonia, or by the Dolby decoder where it is AC-3 ([`MkvAudio`]), and
+/// this exists to say which codec neither of them took.
 pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
     let mut file = File::open(path)?;
     let end = file.metadata()?.len();
     let segment = mkv_segment(&mut file, end)?;
-    Ok(mkv_tracks(&mut file, segment)?.1)
+    Ok(mkv_tracks(&mut file, segment)?.1.map(|(_, codec)| codec))
+}
+
+/// The AC-3 / E-AC-3 sound of a Matroska file: every block of its first audio
+/// track, in storage order, with the timestamp a seek resolves against. The
+/// same walk the picture costs ([`MkvDemuxer`]), on the other track number, and
+/// the two keep their own file handle and their own index -- the sound is
+/// opened by the audio worker and the picture by the decoder, never together.
+///
+/// Matroska carries no sample table, so a block's own timestamp is the only
+/// thing a window can be resolved against; [`Self::block_at`] is what an `stts`
+/// lookup is on the mp4 side.
+pub struct MkvAudio {
+    file: File,
+    blocks: Vec<Block>,
+    /// The `oxideav-ac3` codec id these blocks are packets of: `ac3` or `eac3`.
+    pub codec: &'static str,
+    /// Seconds one `TimestampScale` tick is worth, resolved once at open.
+    secs_per_tick: f64,
+}
+
+impl MkvAudio {
+    /// `Ok(None)` when `path` has no audio track at all, or when its first one
+    /// is in a codec nothing here decodes -- that file is the silent source it
+    /// has always been, and [`crate::audio::AudioSession::unsupported`] names
+    /// the codec. An `Err` is a track that *is* AC-3 and could not be read.
+    pub fn open(path: &Path) -> crate::Result<Option<Self>> {
+        let mut file = File::open(path)?;
+        let end = file.metadata()?.len();
+        let segment = mkv_segment(&mut file, end)?;
+        let (_, audio, _, timestamp_scale) = mkv_tracks(&mut file, segment)?;
+        let Some((number, codec)) = audio else {
+            return Ok(None);
+        };
+        let codec = match codec.as_str() {
+            "A_AC3" => "ac3",
+            "A_EAC3" => "eac3",
+            _ => return Ok(None),
+        };
+        let (blocks, _) = mkv_blocks(&mut file, segment, number)?;
+        if blocks.is_empty() {
+            return Err("the AC-3 track in this Matroska file has no blocks".into());
+        }
+        Ok(Some(Self {
+            file,
+            blocks,
+            codec,
+            secs_per_tick: timestamp_scale as f64 / 1e9,
+        }))
+    }
+
+    /// How many blocks the track has; one syncframe each, lacing being refused
+    /// in [`mkv_blocks`].
+    pub fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The bytes of block `index` -- one whole packet for the decoder, an
+    /// E-AC-3 frame's dependent substreams included. `None` past the last one.
+    pub fn frame(&mut self, index: usize) -> crate::Result<Option<Vec<u8>>> {
+        let Some(&block) = self.blocks.get(index) else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0u8; block.len];
+        read_exact_at(&mut self.file, block.at, &mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// When block `index` is presented, in seconds on the file's own clock. The
+    /// last block's time for anything past the end, which is what a duration
+    /// wants.
+    pub fn secs(&self, index: usize) -> f64 {
+        let index = index.min(self.blocks.len().saturating_sub(1));
+        self.blocks.get(index).map_or(0.0, |b| b.ts as f64) * self.secs_per_tick
+    }
+
+    /// The block a decoder is started from to hear `secs`: the last one at or
+    /// before it, `pre_roll` blocks earlier so the decoder has something to warm
+    /// up on before the audible part. Blocks are in storage order, which for a
+    /// sound track is presentation order (no reordering exists in AC-3).
+    pub fn block_at(&self, secs: f64, pre_roll: usize) -> usize {
+        let ticks = (secs / self.secs_per_tick) as i64;
+        self.blocks
+            .partition_point(|b| b.ts <= ticks)
+            .saturating_sub(1 + pre_roll)
+    }
 }
 
 /// What the `Tracks` element says about the video track.
@@ -543,17 +632,19 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
     Err("no Segment element: not a Matroska file".into())
 }
 
-/// The video track of `segment`, the codec id of its first audio track, and the
-/// codec id of a video track this cannot read -- the last two are what tell a
-/// user why a file plays silent ([`crate::audio::AudioSession::unsupported`])
-/// or refuses to open at all.
+/// The video track of `segment`, the number and codec id of its first audio
+/// track, the codec id of a video track this cannot read, and the segment's
+/// `TimestampScale` in nanoseconds. The audio pair is what [`MkvAudio`] reads a
+/// sound track from; it and the other codec id are what tell a user why a file
+/// plays silent ([`crate::audio::AudioSession::unsupported`]) or refuses to
+/// open at all.
 ///
 /// Header only: the walk stops at the first `Cluster`, so this costs a handful
 /// of seeks whatever the file weighs.
 fn mkv_tracks(
     file: &mut File,
     segment: (u64, u64),
-) -> crate::Result<(Option<MkvVideo>, Option<String>, Option<String>)> {
+) -> crate::Result<(Option<MkvVideo>, Option<(u64, String)>, Option<String>, u64)> {
     let (mut video, mut audio, mut other) = (None, None, None);
     let mut timestamp_scale = 1_000_000;
     let mut at = segment.0;
@@ -576,7 +667,9 @@ fn mkv_tracks(
                         match mkv_track_entry(file, e.1, e.2, timestamp_scale)? {
                             MkvEntry::Video(track) if video.is_none() => video = Some(track),
                             MkvEntry::OtherVideo(codec) if other.is_none() => other = Some(codec),
-                            MkvEntry::Audio(codec) if audio.is_none() => audio = Some(codec),
+                            MkvEntry::Audio(number, codec) if audio.is_none() => {
+                                audio = Some((number, codec))
+                            }
                             _ => {}
                         }
                     }
@@ -587,7 +680,7 @@ fn mkv_tracks(
         }
         at = stop;
     }
-    Ok((video, audio, other))
+    Ok((video, audio, other, timestamp_scale))
 }
 
 /// What one `TrackEntry` turned out to be.
@@ -595,8 +688,9 @@ enum MkvEntry {
     Video(MkvVideo),
     /// A video track in a codec this does not read, by the name it gives itself.
     OtherVideo(String),
-    /// An audio track, likewise by its codec id (`A_AAC`, `A_OPUS`, ...).
-    Audio(String),
+    /// An audio track: its track number, which is what [`MkvAudio`] indexes the
+    /// blocks of, and its codec id (`A_AAC`, `A_EAC3`, ...).
+    Audio(u64, String),
     /// Subtitles, buttons: nobody's here.
     Other,
 }
@@ -658,7 +752,7 @@ fn mkv_track_entry(
             (Codec::H264, nal_length, sets, 8)
         }
         (1, _) => return Ok(MkvEntry::OtherVideo(codec)),
-        (2, _) => return Ok(MkvEntry::Audio(codec)),
+        (2, _) => return Ok(MkvEntry::Audio(number, codec)),
         _ => return Ok(MkvEntry::Other),
     };
     Ok(MkvEntry::Video(MkvVideo {
@@ -807,11 +901,17 @@ fn mkv_blocks(
             if block.number != number {
                 continue;
             }
-            // Lacing packs several frames into one block. Audio muxers use it,
-            // video ones do not, and guessing at frame boundaries inside a laced
-            // block is not something to do silently.
+            // Lacing packs several frames into one block, behind a header of
+            // frame sizes this does not read. Video muxers write none; an audio
+            // muxer may, and guessing at frame boundaries inside a laced block
+            // is not something to do silently.
+            //
+            // ponytail: a laced audio track is refused by name rather than
+            // played. The upgrade path is the three lace headers of the spec
+            // (Xiph, fixed, EBML) read here into one `Block` per frame; ffmpeg,
+            // which writes the fixtures and most remuxes, laces nothing.
             if block.flags & 0x06 != 0 {
-                return Err("laced video blocks are not supported".into());
+                return Err("laced Matroska blocks are not supported".into());
             }
             let ts = cluster_ts + i64::from(block.rel);
             span = Some(match span {
@@ -822,6 +922,7 @@ fn mkv_blocks(
                 at: block.at,
                 len: block.len,
                 key,
+                ts,
             });
         }
     }
