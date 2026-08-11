@@ -339,6 +339,38 @@ struct LibraryMenu {
     details: bool,
 }
 
+/// An open choice list: which setting it offers and where it hangs. What a
+/// button that stepped one value on per click used to be -- a setting with more
+/// than two values is a list to look at, not a thing to click round. Placed by
+/// [`menu_at`] and closed by a stroke, exactly like the two menus above it.
+#[derive(Clone, Copy, PartialEq)]
+struct Picker {
+    of: Pick,
+    at: Point<Pixels>,
+}
+
+/// Which setting an open list is offering. The fit policy names the clip it is
+/// about, like the clip menu it opens from -- indices move under every edit, so
+/// the list closes on the first stroke as that menu does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pick {
+    Resolution,
+    Fit(Lane, usize),
+}
+
+/// One value a list offers, carrying everything picking it needs -- so a click
+/// goes straight to the value rather than to a position in a list that was
+/// built somewhere else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Choice {
+    Size(u32, u32),
+    Fit(Lane, usize, FitPolicy),
+}
+
+/// One row of an open list: the value, its name, the small print beside it, and
+/// whether it is the one in force.
+type ChoiceRow = (Choice, SharedString, SharedString, bool);
+
 /// What a library row's menu offers, in the order it lists them. Unlike the clip
 /// menu's items none of these is a stroke -- there is no keyboard way to a row --
 /// so the label and the hint are written here rather than read off the keymap.
@@ -735,6 +767,10 @@ struct Player {
     /// `selected` does, so it is closed by anything that can move indices --
     /// every stroke, and every item of its own.
     context_menu: Option<ContextMenu>,
+    /// The choice list a click on an enumerated setting opened, if one is up:
+    /// the project resolution or a clip's fit policy, every value on screen at
+    /// once. Closed by anything that closes the menus, and for the same reason.
+    picker: Option<Picker>,
     /// The library menu a right-click on a row opened, if one is up. Names its
     /// row by file and stream rather than by position, so it acts on the row it
     /// was opened on however the list is rebuilt under it.
@@ -1259,9 +1295,18 @@ impl Player {
             return;
         };
         let next = next_fit(session.fit_of(lane, idx));
-        if session.set_fit(lane, idx, next) {
+        self.apply_fit(lane, idx, next, cx);
+    }
+
+    /// One clip's fit policy set, whichever asked: the stroke that steps to the
+    /// next one and the list that names one outright come through here, so they
+    /// cannot differ in what they do or in what they say they did.
+    fn apply_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session
+            && session.set_fit(lane, idx, fit)
+        {
             let (w, h) = session.resolution();
-            self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(next)).into());
+            self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -1316,11 +1361,57 @@ impl Player {
             return;
         };
         let (width, height) = next_resolution(session.resolution(), session.native_resolution());
-        if session.set_resolution(width, height) {
+        self.apply_resolution(width, height, cx);
+    }
+
+    /// The project resized, whichever asked: the stroke that steps to the next
+    /// size and the list that names one outright come through here.
+    fn apply_resolution(&mut self, width: u32, height: u32, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session
+            && session.set_resolution(width, height)
+        {
             self.notice = Some(format!("PROJECT: {width}x{height}").into());
             self.reset_after_reseek();
         }
         cx.notify();
+    }
+
+    /// Opens a choice list on a setting, where it was asked for. One floating
+    /// thing at a time: the click that opens it is the click that closes
+    /// whatever menu it was opened from.
+    fn open_picker(&mut self, of: Pick, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.library_menu = None;
+        self.picker = Some(Picker { of, at });
+        cx.notify();
+    }
+
+    /// A row of the open list was picked. Closes the list first -- the rule
+    /// every menu item here follows -- then does exactly what the stroke for
+    /// that setting does, through the same door.
+    fn choose(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        self.picker = None;
+        match choice {
+            Choice::Size(w, h) => self.apply_resolution(w, h, cx),
+            Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
+        }
+    }
+
+    /// Every value the open list offers, in the order it lists them. Empty
+    /// without a timeline, which is the state where nothing here has a value to
+    /// offer -- and where the surfaces that open the list are dimmed anyway.
+    fn choices(&self, of: Pick) -> Vec<ChoiceRow> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        match of {
+            Pick::Resolution => {
+                resolution_choices(session.resolution(), session.native_resolution())
+            }
+            Pick::Fit(lane, idx) => {
+                fit_choices(lane, idx, session.fit_of(lane, idx), session.resolution())
+            }
+        }
     }
 
     /// Opens the colour card on the clip a grade would go on: the clip that was
@@ -3837,9 +3928,12 @@ impl Render for Player {
                 // Both menus, taken rather than short-circuited: the library's
                 // one names a row the edits below can remove, so it closes on a
                 // stroke exactly as the clip menu does.
+                // A choice list goes the same way and for the same reason: it
+                // names a clip index too, and escape is the way out of it.
                 let clip_menu = this.context_menu.take().is_some();
                 let row_menu = this.library_menu.take().is_some();
-                if clip_menu || row_menu {
+                let list = this.picker.take().is_some();
+                if clip_menu || row_menu || list {
                     cx.notify();
                     if key == ESCAPE {
                         return;
@@ -4057,6 +4151,9 @@ impl Render for Player {
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
             .children(self.mix_card(cx))
+            // Last, so it floats over whatever opened it -- the panel's button
+            // or a clip menu -- rather than under it.
+            .children(self.picker_card(window.viewport_size(), cx))
     }
 }
 
@@ -4570,23 +4667,26 @@ impl Player {
                     ))
                     .child(separator())
                     // The size every clip is composed onto, which is also the
-                    // size the export comes out at: the one project setting a
-                    // stroke used to be the only way to. Cycles exactly as the
-                    // key does, and says where it is now rather than opening a
-                    // list to close again.
+                    // size the export comes out at. Five sizes, so a click opens
+                    // the list of them with this one marked and picks whichever
+                    // was meant: a button that stepped one on per press made the
+                    // user click round the ladder to get back to where they
+                    // were. The stroke still steps, for the hand already on it.
                     .child(control(
                         "resolution",
                         None,
                         resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
                         match resolution {
                             Some((w, h)) => format!(
-                                "{} — the project is {w}x{h}; cycles source → 2160p → 1080p → 720p → 480p",
+                                "click to pick a size — the project is {w}x{h}; {} steps to the next",
                                 key(ActionId::Resolution)
                             ),
                             None => format!("{} — open a file first", key(ActionId::Resolution)),
                         },
                         live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_resolution(cx)),
+                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.open_picker(Pick::Resolution, event.position(), cx)
+                        }),
                     ))
                     // How much of the timeline the panel below is showing --
                     // beside the resolution, since neither of them edits
@@ -6682,11 +6782,24 @@ impl Player {
                         .when(enabled, |d| {
                             d.cursor_pointer()
                                 .hover(|s| s.bg(rgb(HOVER)))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                     // Closed first: the action moves the very
                                     // indices this menu is holding.
                                     this.context_menu = None;
-                                    this.act(action, cx);
+                                    // The one item that is a *choice* and not a
+                                    // doing: four policies, so the pointer gets
+                                    // the list of them on this clip rather than
+                                    // the next one stepped to behind the click.
+                                    // The stroke still steps -- same door.
+                                    if action == ActionId::Fit {
+                                        this.open_picker(
+                                            Pick::Fit(menu.lane, menu.idx),
+                                            event.position(),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.act(action, cx);
+                                    }
                                 }))
                         })
                         .into_any_element(),
@@ -6776,6 +6889,137 @@ impl Player {
                         .child(
                             div()
                                 .id("menu-rows")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(MENU_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
+                ),
+        )
+    }
+
+    /// The open choice list: every value of one enumerated setting at once, the
+    /// one in force marked, and a click on any of them picks *that* one -- what
+    /// a button stepping one value on per click could never say. Built on the
+    /// clip menu's machinery down to the scrim, the placement and the scroll
+    /// cap, so it hangs and closes exactly as the menus do and fits the same
+    /// 640x360 floor. The stroke for the setting is untouched: this is the
+    /// pointer's door to it, not a second setting.
+    fn picker_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let picker = self.picker?;
+        let rows: Vec<AnyElement> = self
+            .choices(picker.of)
+            .into_iter()
+            .enumerate()
+            .map(|(n, (choice, label, detail, picked))| {
+                div()
+                    .id(("picker-row", n))
+                    .flex()
+                    // The floor, not the height, and `HIT_MIN` of it: a row of a
+                    // list is a click target like every other one here (WCAG
+                    // 2.5.8).
+                    .min_h(px(MENU_ROW_H))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    // The mark is a glyph as well as a highlight, like the
+                    // export card's rows: a background alone is gone under a
+                    // hover and invisible to anyone who cannot tell the two
+                    // greys apart (WCAG 1.4.1).
+                    .when(picked, |d| d.bg(rgb(SELECTED)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().w(px(10.)).child(match picked {
+                                true => "✓",
+                                false => " ",
+                            }))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            // On the picked row the dim ink sits on the
+                            // highlight, where it is only 3.3:1 (WCAG 1.4.3).
+                            .text_color(rgb(match picked {
+                                true => INK,
+                                false => INK_DIM,
+                            }))
+                            .child(detail),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.choose(choice, cx)),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let (x, y) = menu_at(
+            picker.at,
+            viewport,
+            // Past the cap the list scrolls and the card stops growing, exactly
+            // as the menus and the export list do.
+            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
+        );
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                // Click away closes it, either button, swallowed so nothing
+                // under the list also takes the press -- the clip menu's rule.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.picker = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.picker = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("picker-card")
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(MENU_W))
+                        .flex()
+                        .flex_col()
+                        .p(px(MENU_PAD))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        // Painted after the scrim, so this listener runs first
+                        // and a press meant for a row never closes the list out
+                        // from under its own click (`context_card`).
+                        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation()
+                        })
+                        .child(
+                            div()
+                                .id("picker-rows")
                                 .flex()
                                 .flex_col()
                                 .max_h(px(MENU_ROWS_H))
@@ -8070,6 +8314,16 @@ fn band_mut(params: &mut ColorParams, band: usize) -> &mut f32 {
 /// The line under the rows: what the picked format really writes, in the terms
 /// a file is judged by afterwards.
 /// The next policy round the cycle, in the order the action's label reads.
+/// Every fit policy, in the order the list offers them -- which is the order
+/// [`next_fit`] steps through them, pinned by the test below: a list and a
+/// stroke that disagreed about what comes next would be two settings.
+const FITS: [FitPolicy; 4] = [
+    FitPolicy::Fit,
+    FitPolicy::Fill,
+    FitPolicy::Stretch,
+    FitPolicy::Center,
+];
+
 fn next_fit(fit: FitPolicy) -> FitPolicy {
     match fit {
         FitPolicy::Fit => FitPolicy::Fill,
@@ -8089,11 +8343,11 @@ fn fit_label(fit: FitPolicy) -> &'static str {
     }
 }
 
-/// The next project resolution after `current`, over [`RESOLUTIONS`] with the
-/// media's own size cycled in at its place by size -- so the trip round always
-/// comes back to the media, whatever odd shape it is, and a project already at a
-/// listed size does not see it twice.
-fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
+/// Every project resolution on offer, largest first: [`RESOLUTIONS`] with the
+/// media's own size cycled in at its place by size -- so a project already at a
+/// listed size does not see it twice, and the media's own shape, whatever it is,
+/// is always on the list. The one order both the stroke and the list use.
+fn resolution_ladder(native: (u32, u32)) -> Vec<(u32, u32)> {
     let mut sizes: Vec<(u32, u32)> = RESOLUTIONS.to_vec();
     if !sizes.contains(&native) {
         // By area, descending, like the list itself: the cycle then reads as one
@@ -8106,6 +8360,57 @@ fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
             .unwrap_or(sizes.len());
         sizes.insert(at, native);
     }
+    sizes
+}
+
+/// The resolution list's rows: every rung of the ladder, the media's own said
+/// so, and the one in force marked. A size is named by its height the way the
+/// button that opens the list names it, with the full figure beside it.
+fn resolution_choices(current: (u32, u32), native: (u32, u32)) -> Vec<ChoiceRow> {
+    resolution_ladder(native)
+        .into_iter()
+        .map(|(w, h)| {
+            (
+                Choice::Size(w, h),
+                format!("{h}p").into(),
+                match (w, h) == native {
+                    // Short enough to sit beside the label inside `MENU_W`:
+                    // the longer phrase lost its last word to the truncation.
+                    true => format!("{w}x{h} · the media's own"),
+                    false => format!("{w}x{h}"),
+                }
+                .into(),
+                (w, h) == current,
+            )
+        })
+        .collect()
+}
+
+/// The fit list's rows: all four policies against the canvas they place a
+/// picture on, since the word alone ("fill") says nothing about the size it is
+/// filling -- which is the very thing the notice says after a stroke.
+fn fit_choices(lane: Lane, idx: usize, current: FitPolicy, (w, h): (u32, u32)) -> Vec<ChoiceRow> {
+    FITS.into_iter()
+        .map(|fit| {
+            (
+                Choice::Fit(lane, idx, fit),
+                fit_label(fit).into(),
+                // The canvas alone, worded as the resolution list words a size:
+                // the policy names are long and anything wordier here loses its
+                // tail to the truncation.
+                format!("{w}x{h}").into(),
+                fit == current,
+            )
+        })
+        .collect()
+}
+
+/// The next project resolution after `current`, over [`RESOLUTIONS`] with the
+/// media's own size cycled in at its place by size -- so the trip round always
+/// comes back to the media, whatever odd shape it is, and a project already at a
+/// listed size does not see it twice.
+fn next_resolution(current: (u32, u32), native: (u32, u32)) -> (u32, u32) {
+    let sizes = resolution_ladder(native);
     let at = sizes.iter().position(|&s| s == current);
     // A project at a size nobody listed (a hand-edited file) joins the cycle at
     // the top rather than being stuck.
@@ -9283,8 +9588,10 @@ mod tests {
         summary_tail, timecode, transport, unseen_paths, unseen_sources, whole_take, window_title,
     };
     use super::{
-        LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
-        file_name, file_uri, library_rows, px_along, repeats, span_label, unscannable,
+        Choice, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View, ZOOM_MAX_SECONDS,
+        ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, fit_choices, library_rows, next_fit,
+        next_resolution, px_along, repeats, resolution_choices, resolution_ladder, span_label,
+        unscannable,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -11638,6 +11945,89 @@ mod tests {
         assert_eq!(silence_rate(4000), Speed::MAX);
     }
 
+    /// The choice lists that replaced two click-to-cycle surfaces: every value
+    /// on offer at once, exactly one of them marked as the one in force, the
+    /// same order the stroke steps through, and the open list inside the
+    /// 640x360 floor with every row a `HIT_MIN` target.
+    #[test]
+    fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
+        // Odd media: its own size is on the ladder, in its place by area, and
+        // nothing else moved.
+        let native = (1440, 1080);
+        let ladder = resolution_ladder(native);
+        assert_eq!(
+            ladder,
+            [
+                (3840, 2160),
+                (1920, 1080),
+                (1440, 1080),
+                (1280, 720),
+                (854, 480)
+            ]
+        );
+        for size in RESOLUTIONS {
+            assert!(ladder.contains(&size), "{size:?} is not on offer");
+        }
+        // Media already at a listed size is on the ladder once, not twice.
+        assert_eq!(resolution_ladder((1920, 1080)).len(), RESOLUTIONS.len());
+
+        // The rows say the same thing the ladder does, and mark the one in
+        // force -- exactly one row, whichever rung the project is on.
+        let rows = resolution_choices((1280, 720), native);
+        assert_eq!(rows.len(), ladder.len());
+        assert_eq!(rows.iter().filter(|(.., picked)| *picked).count(), 1);
+        for ((choice, label, detail, picked), size) in rows.iter().zip(&ladder) {
+            assert_eq!(*choice, Choice::Size(size.0, size.1));
+            assert_eq!(label.as_ref(), format!("{}p", size.1));
+            assert!(detail.contains(&format!("{}x{}", size.0, size.1)));
+            assert_eq!(*picked, *size == (1280, 720));
+        }
+        // The media's own size says so: it is the one rung a person cannot read
+        // off a number they chose.
+        let (.., native_detail, _) = &rows[2];
+        assert!(
+            native_detail.contains("the media's own"),
+            "{native_detail}"
+        );
+        // A project at a size nobody listed still gets the whole list, with
+        // nothing marked rather than a wrong row marked.
+        assert!(
+            resolution_choices((1000, 1000), native)
+                .iter()
+                .all(|(.., picked)| !picked)
+        );
+        // Picking a row means that row, and stepping means the next one: the
+        // list and the stroke read the same ladder.
+        assert_eq!(next_resolution(ladder[1], native), ladder[2]);
+
+        // The fit list, on a clip: all four policies, in the order the stroke
+        // steps through them, the clip's own marked and every row naming the
+        // canvas it would place the picture on.
+        let mut fit = FITS[0];
+        for next in FITS.into_iter().skip(1).chain([FITS[0]]) {
+            assert_eq!(next_fit(fit), next, "the stroke skips a policy");
+            fit = next;
+        }
+        let fits = fit_choices(Lane::V1, 3, FITS[2], (1920, 1080));
+        assert_eq!(fits.len(), FITS.len());
+        assert_eq!(fits.iter().filter(|(.., picked)| *picked).count(), 1);
+        assert_eq!(fits[2].0, Choice::Fit(Lane::V1, 3, FITS[2]));
+        assert!(fits[2].3, "the clip's own policy is not marked");
+        assert!(fits[0].2.contains("1920x1080"), "{}", fits[0].2);
+
+        // The open list fits the floor the menus are measured against: the
+        // longest of them is the resolution ladder, and it hangs at the pointer
+        // with every row on screen. Rows are click targets (WCAG 2.5.8).
+        assert!(MENU_ROW_H >= HIT_MIN);
+        let tall = MENU_PAD * 2. + ladder.len() as f32 * MENU_ROW_H;
+        assert!(tall <= 360., "the list is taller than the floor");
+        assert_eq!(
+            menu_at(point(px(600.), px(340.)), size(px(640.), px(360.)), tall),
+            (640. - MENU_W, 360. - tall),
+            "the list would hang off the smallest window"
+        );
+    }
+
     #[test]
     fn the_export_card_fits_the_smallest_window() {
         // Same 640x360 floor the keybindings card is measured against: the
@@ -12425,6 +12815,7 @@ fn main() {
                     scale: Scale::default(),
                     selected: None,
                     context_menu: None,
+                    picker: None,
                     library_menu: None,
                     selected_asset: None,
                     waves: HashMap::new(),
