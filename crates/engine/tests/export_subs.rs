@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
+use engine::scratch::Scratch;
 use engine::subtitle::{self, Cue, SubtitleTrack};
 use engine::{ExportHandle, Project};
 
@@ -38,11 +39,8 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn out_path(name: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("ve_subs_export_{name}_{}.mkv", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    path
+fn out_path(name: &str) -> Scratch {
+    Scratch::file(&format!("ve_subs_export_{name}"), "mkv")
 }
 
 fn pin_software() {
@@ -110,7 +108,7 @@ fn project() -> Project {
 
 /// Exports `project` as an HEVC Matroska carrying subtitle track `pick`, and
 /// hands back what our own reader finds in the file.
-fn exported(name: &str, project: Project, pick: Option<usize>) -> (PathBuf, Vec<Cue>) {
+fn exported(name: &str, project: Project, pick: Option<usize>) -> (Scratch, Vec<Cue>) {
     pin_software();
     let out = out_path(name);
     let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");

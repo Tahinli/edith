@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::{Edge, Lane, Rate, Speed};
+use engine::scratch::Scratch;
 use engine::{DecodeSession, Frame, PlaybackSession};
 
 /// The timeline's rate, which `test_av.mp4` (30 fps, 5 s) defines.
@@ -313,14 +314,13 @@ fn a_mixed_rate_project_reloads_unchanged() {
     import_and_place(&mut session, &pal);
     let duration = session.timeline_duration();
     let spans = session.clip_spans();
-    let path = std::env::temp_dir().join(format!("edith-mixed-{}.edith", std::process::id()));
+    let path = Scratch::file("edith-mixed", "edith");
     session.save_project(&path).expect("save");
 
     let reloaded = PlaybackSession::open_project(&path).expect("a mixed-rate project reopens");
     assert_eq!(reloaded.clip_spans(), spans, "the same clips, in seconds");
     assert!((reloaded.timeline_duration() - duration).abs() < 1e-9);
     assert_eq!(reloaded.file_frames(&pal), 60, "the length was recomputed");
-    std::fs::remove_file(&path).ok();
 }
 
 /// The project's rate is the user's to pick, exactly as its resolution is. The
@@ -360,7 +360,7 @@ fn the_project_rate_is_picked_and_the_timeline_is_conformed_to_it() {
         assert_eq!((v.start, v.len()), (a.start, a.len()), "{v:?} vs {a:?}");
     }
 
-    let path = std::env::temp_dir().join(format!("edith-rate-{}.edith", std::process::id()));
+    let path = Scratch::file("edith-rate", "edith");
     session.save_project(&path).expect("save");
     let reloaded = PlaybackSession::open_project(&path).expect("a retimed project reopens");
     assert_eq!(reloaded.meta().frame_rate, 24.0, "the rate it was cut at");
@@ -402,7 +402,7 @@ fn an_export_runs_at_the_rate_the_project_was_cut_at() {
     let total = (session.timeline_duration() * 24.0).round() as u32;
     assert_eq!(total, 24, "one second, in 24ths");
 
-    let out = std::env::temp_dir().join(format!("edith-rate-{}.mp4", std::process::id()));
+    let out = Scratch::file("edith-rate", "mp4");
     wait(&session.export_to_with(
         &out,
         &ExportSettings {
@@ -454,7 +454,7 @@ fn an_export_of_two_rates_runs_at_the_speed_it_was_shot() {
     let total = (session.timeline_duration() * FPS).round() as u32;
     assert_eq!(total, 45, "15 frames of 30 fps and 30 of the 25 fps clip");
 
-    let out = std::env::temp_dir().join(format!("edith-mixed-{}.mp4", std::process::id()));
+    let out = Scratch::file("edith-mixed", "mp4");
     wait(&session.export_to_with(
         &out,
         &ExportSettings {

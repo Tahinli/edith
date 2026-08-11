@@ -25,6 +25,7 @@ use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
+use engine::scratch::Scratch;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
@@ -134,10 +135,8 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
     handle.result().expect("a finished export has an outcome")
 }
 
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_eq_{name}_{}.{ext}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    path
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("ve_eq_{name}"), ext)
 }
 
 fn meta() -> engine::VideoMeta {

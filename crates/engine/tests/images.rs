@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::{Edge, Lane, LaneKind};
+use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession};
 
 /// test_av.mp4's rate, which every fixture here shares.
@@ -117,7 +118,7 @@ fn importing_a_still_fills_the_library_and_places_nothing() {
     assert_eq!(session.file_frames(&asset("test_still.png")), CAP);
 
     // A file that is not a picture at all is refused at the same door, by name.
-    let broken = std::env::temp_dir().join(format!("ve_not_a_png_{}.png", std::process::id()));
+    let broken = Scratch::file("ve_not_a_png", "png");
     std::fs::write(&broken, b"this is not a PNG").expect("write the decoy");
     let refused = session.import(&broken).expect_err("not a picture");
     assert!(
@@ -125,7 +126,6 @@ fn importing_a_still_fills_the_library_and_places_nothing() {
         "the refusal names the file: {refused}"
     );
     assert_eq!(session.sources().len(), 2, "a refusal registers nothing");
-    let _ = std::fs::remove_file(&broken);
 }
 
 /// The picture itself: placed on a canvas twice its size, the still comes back
@@ -241,9 +241,7 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
 #[test]
 fn pasting_a_copied_still_never_reaches_the_audio_lane() {
     pin_software();
-    let dir = std::env::temp_dir().join(format!("ve_images_paste_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_images_paste");
     let media = dir.join("test_av.mp4");
     let still = dir.join("test_still.png");
     std::fs::copy(asset("test_av.mp4"), &media).expect("copy the video");
@@ -312,9 +310,7 @@ fn pasting_a_copied_still_never_reaches_the_audio_lane() {
 #[test]
 fn a_still_survives_the_project_round_trip() {
     pin_software();
-    let dir = std::env::temp_dir().join(format!("ve_images_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_images");
     let media = dir.join("test_av.mp4");
     let still = dir.join("test_still.png");
     std::fs::copy(asset("test_av.mp4"), &media).expect("copy the video");
@@ -371,9 +367,7 @@ fn a_still_survives_the_project_round_trip() {
 #[test]
 fn a_still_at_saved_source_zero_keeps_the_rate_and_the_sound() {
     pin_software();
-    let dir = std::env::temp_dir().join(format!("ve_still_first_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_still_first");
     let media = dir.join("test_25fps.mp4");
     let still = dir.join("test_still.png");
     std::fs::copy(asset("test_25fps.mp4"), &media).expect("copy the video");
@@ -471,8 +465,7 @@ fn a_mixed_timeline_exports_the_still_at_the_cut() {
     assert_eq!(session.lane_clips(Lane::V1).len(), 2);
     assert_eq!(session.resolution(), (640, 360));
 
-    let out = std::env::temp_dir().join(format!("ve_images_export_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_images_export", "mp4");
     wait(&session.export_to(&out), Duration::from_secs(300)).expect("export");
 
     let (meta, frames) = DecodeSession::open(&out).expect("reopen the export");

@@ -21,6 +21,7 @@ use mp4::{MediaType, Mp4Reader};
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
+use engine::scratch::Scratch;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
@@ -31,13 +32,10 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Per-run unique, like the mp4 suite's: two suites at once must not delete
-/// each other's output.
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_audio_{name}_{}.{ext}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(part_path(&path));
-    path
+/// Its own directory, gone with the value: two suites at once must not delete
+/// each other's output, and nothing may outlive the test that wrote it.
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("ve_audio_{name}"), ext)
 }
 
 fn part_path(out: &Path) -> PathBuf {
@@ -900,7 +898,7 @@ fn a_mono_timeline_exports_as_dual_mono_ogg() {
     std::fs::write(&src, &wav).expect("write the mono fixture");
 
     let project = Project::from_parts(
-        vec![Source::new(src.clone(), 0)],
+        vec![Source::new(src.to_path_buf(), 0)],
         vec![(
             LaneKind::Audio,
             vec![Clip {

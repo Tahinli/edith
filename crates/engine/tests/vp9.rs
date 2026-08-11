@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use engine::demux::{Codec, Demuxer};
 use engine::export::ExportSettings;
+use engine::scratch::Scratch;
 use engine::{AudioSession, DecodeSession, PlaybackSession, Project};
 
 /// 1280x720@30, 2 s -- see `scripts/gen_fixtures.sh`.
@@ -143,8 +144,7 @@ fn a_vp9_source_exports_as_h264() {
     let session = PlaybackSession::open(asset("test_vp9.mp4")).expect("open test_vp9.mp4");
     let meta = *session.meta();
     let project = Project::single(asset("test_vp9.mp4"), meta.frame_count);
-    let out = std::env::temp_dir().join(format!("ve_export_vp9_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_export_vp9", "mp4");
 
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let started = Instant::now();

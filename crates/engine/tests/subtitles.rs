@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use engine::scratch::Scratch;
 use engine::subtitle::{self, Cue};
 
 fn asset(name: &str) -> PathBuf {
@@ -23,11 +24,8 @@ fn data(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ve_subs_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+fn scratch(name: &str) -> Scratch {
+    Scratch::dir(&format!("ve_subs_{name}"))
 }
 
 /// The three cues both hand-written fixtures hold, with the markup resolved:

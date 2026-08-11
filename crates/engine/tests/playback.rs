@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
+use engine::scratch::Scratch;
 use engine::{Codec, DecodeSession, Frame, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
@@ -1056,8 +1057,7 @@ fn a_placement_at_eos_revives_the_session() {
 /// and the timeline still ends, instead of stalling on the missing file.
 #[test]
 fn a_vanished_source_is_skipped() {
-    let scratch =
-        std::env::temp_dir().join(format!("video_editor_vanish_{}.mp4", std::process::id()));
+    let scratch = Scratch::file("video_editor_vanish", "mp4");
     std::fs::copy(asset("test_av2.mp4"), &scratch).expect("copy the fixture");
     let mut session = open(asset("test_av.mp4"));
     let first = session.meta().frame_count;
@@ -1315,7 +1315,8 @@ fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
     // in the *same* words whichever format asked, because the fence sits in
     // `export::start` ahead of the format, not in the mp4 path alone.
     for format in [Format::Mp4, Format::Wav, Format::Flac] {
-        let out = std::env::temp_dir().join(format!("ve_nothing_{}", std::process::id()));
+        let dir = Scratch::dir("ve_nothing");
+        let out = dir.join("ve_nothing");
         let handle = session.export_to_with(
             &out,
             &ExportSettings {
@@ -1341,9 +1342,7 @@ fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
 
     // It saves and loads back -- still a project, still two lanes, and still
     // naming the file whose frame rate the timeline counts in.
-    let dir = std::env::temp_dir().join(format!("ve_empty_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_empty");
     let project = dir.join("empty.edith");
     session
         .save_project(&project)

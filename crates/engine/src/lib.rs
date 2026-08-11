@@ -17,6 +17,7 @@ pub mod mux;
 pub mod playback;
 pub mod project;
 pub mod scale;
+pub mod scratch;
 pub mod silence;
 pub mod subtitle;
 pub mod waveform;

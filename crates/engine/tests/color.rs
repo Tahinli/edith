@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use engine::color::ColorParams;
 use engine::export::ExportSettings;
 use engine::project::Lane;
+use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession};
 
 const FPS: f64 = 30.0;
@@ -154,8 +155,7 @@ fn an_exported_grade_is_the_one_that_was_watched() {
     }
     let mut session = graded();
     session.pause();
-    let out = std::env::temp_dir().join(format!("ve_color_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_color", "mp4");
     let handle = session.export_to_with(&out, &ExportSettings::default());
     wait(&handle, Duration::from_secs(180)).expect("export");
 

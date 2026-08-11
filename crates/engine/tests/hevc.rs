@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use engine::demux::{Codec, Demuxer};
 use engine::export::ExportSettings;
+use engine::scratch::Scratch;
 use engine::{AudioSession, DecodeSession, PlaybackSession, Project};
 
 /// 1280x720@30, 2 s -- see `scripts/gen_fixtures.sh`.
@@ -217,8 +218,7 @@ fn an_h264_take_plays_and_exports_on_an_hevc_timeline() {
     // re-encodes both to one H.264 track.
     let frames =
         (session.timeline_duration() * f64::from(session.meta().frame_rate as f32)).round() as u32;
-    let out = std::env::temp_dir().join(format!("ve_export_mixed_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_export_mixed", "mp4");
     let handle = session.export_to_with(&out, &ExportSettings::default());
     let started = Instant::now();
     while !handle.is_finished() {
@@ -240,8 +240,7 @@ fn an_hevc_source_exports_as_h264() {
     let session = PlaybackSession::open(asset("test_hevc.mp4")).expect("open test_hevc.mp4");
     let meta = *session.meta();
     let project = Project::single(asset("test_hevc.mp4"), meta.frame_count);
-    let out = std::env::temp_dir().join(format!("ve_export_hevc_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_export_hevc", "mp4");
 
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let started = Instant::now();

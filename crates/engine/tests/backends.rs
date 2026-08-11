@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use engine::Codec;
 use engine::decode::{Backend, probe};
 use engine::export::{ExportSettings, Format};
+use engine::scratch::Scratch;
 use engine::{ExportHandle, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
@@ -22,11 +23,8 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_backend_{name}_{}.{ext}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.part", path.display()));
-    path
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("ve_backend_{name}"), ext)
 }
 
 /// A still has no coded stream and no decoder to pick, and it must say so

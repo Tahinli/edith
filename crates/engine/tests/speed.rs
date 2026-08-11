@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, Speed};
+use engine::scratch::Scratch;
 use engine::{AudioSession, Clip, DecodeSession, ExportHandle, Project};
 
 const RATE: u32 = 44_100;
@@ -96,8 +97,8 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
     handle.result().expect("a finished export has an outcome")
 }
 
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("edith-speed-{name}-{}.{ext}", std::process::id()))
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("edith-speed-{name}"), ext)
 }
 
 /// The headline: a clip at 2x is half as long on the timeline, plays the same
