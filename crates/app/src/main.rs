@@ -19,11 +19,11 @@ use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
+    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -749,6 +749,16 @@ struct Player {
     /// the value being dragged, and stale between drags, which costs nothing --
     /// no drag starts without a press on the box it moves.
     grab: u32,
+    /// Whether a drag or a trim is pulled onto the edges near it. On by
+    /// default, because clips meeting exactly is what a timeline is for, and off
+    /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
+    /// no magnet may take away.
+    snap: bool,
+    /// The frame the live gesture is about to land on, or `None` while it is
+    /// over open bed: the line every lane draws so the snap is seen before it
+    /// happens rather than discovered after the release. Stale between gestures,
+    /// which costs nothing -- it is drawn only while one is live.
+    snap_cue: Option<u32>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -1092,10 +1102,24 @@ impl Player {
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
             ActionId::Mix => self.open_mix(None, cx),
+            ActionId::ToggleSnap => self.toggle_snap(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
         }
+    }
+
+    /// The magnet off and on again, in words: a snap that stops working
+    /// silently reads as a bug, and one that starts working silently reads as
+    /// one too. The line goes with it -- nothing is being promised any more.
+    fn toggle_snap(&mut self, cx: &mut Context<Self>) {
+        self.snap = !self.snap;
+        self.snap_cue = None;
+        self.notice = Some(match self.snap {
+            true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
+            false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
+        });
+        cx.notify();
     }
 
     /// The one place a clip becomes *the* selected one: a click, a right-click
@@ -2378,8 +2402,8 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let (Some(start), Some(was)) = (
-            self.drop_frame(from, idx, to, x),
+        let (Some((start, _)), Some(was)) = (
+            self.drop_frame(from, idx, x),
             self.session
                 .as_ref()
                 .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.start)),
@@ -2441,26 +2465,60 @@ impl Player {
     /// the scroll clamp pins the bed's right edge to the duration, and the
     /// pointer has no pixel past it. The upgrade is to let the scroll clamp
     /// leave a screen of empty bed after the end, the way every NLE does.
-    fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
-        let session = self.session.as_ref()?;
-        let clip = session.lane_clips(from).get(idx).copied()?;
+    fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
+        let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
         let raw = self.frame_under(x).saturating_sub(self.grab);
-        // The edges worth landing on: both ends of every clip already on the
-        // lane it is being let go over, the playhead, and the head of the
-        // timeline. Never the group's own boxes -- a clip does not snap to
-        // where it already is.
-        let mut marks: Vec<u32> = session
-            .lane_clips(to)
-            .iter()
-            .enumerate()
-            .filter(|&(i, c)| {
-                (to, i) != (from, idx) && !(clip.link.is_some() && c.link == clip.link)
-            })
-            .flat_map(|(_, c)| [c.start, c.end()])
-            .collect();
-        marks.push(frame_at(session.now(), self.fps));
-        marks.push(0);
-        Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
+        let marks = self.snap_targets(Some((from, idx)));
+        Some(self.snap_to(raw, clip.frames(), &marks))
+    }
+
+    /// The line while the clip is still in the hand: the very answer
+    /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
+    /// so what the eye was promised is where the release puts it. A pointer that
+    /// has wandered off the bed promises nothing.
+    fn preview_drop(&mut self, from: Lane, idx: usize, x: Pixels, cx: &mut Context<Self>) {
+        let cue = self.drop_frame(from, idx, x).and_then(|(_, cue)| cue);
+        self.set_cue(cue, x, cx);
+    }
+
+    /// The same line for a library row on its way to a lane: it goes down at
+    /// the frame it is let go on ([`Player::insert_source`]), so that frame is
+    /// what snaps and what is drawn. No length to snap by -- the file's own is
+    /// not known until the engine has placed it -- so only its head lands.
+    fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let marks = self.snap_targets(None);
+        let cue = self.snap_to(self.frame_under(x), 0, &marks).1;
+        self.set_cue(cue, x, cx);
+    }
+
+    /// Sets the line, or takes it away, and repaints only when it moved: a
+    /// pointer dragged off the bed (up to the library, say) is not promising a
+    /// landing any more.
+    fn set_cue(&mut self, cue: Option<u32>, x: Pixels, cx: &mut Context<Self>) {
+        let bed = self.ruler.get();
+        let cue = cue.filter(|_| x >= bed.left() && x <= bed.right());
+        if cue != self.snap_cue {
+            self.snap_cue = cue;
+            cx.notify();
+        }
+    }
+
+    /// Every edge this timeline offers a gesture: [`snap_marks`] over all of its
+    /// lanes, so a clip meets a take one track over as readily as one beside it.
+    fn snap_targets(&self, skip: Option<(Lane, usize)>) -> Vec<u32> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let lanes = session.lanes();
+        let clips: Vec<&[Clip]> = lanes.iter().map(|&lane| session.lane_clips(lane)).collect();
+        let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
+        snap_marks(&clips, skip, frame_at(session.now(), self.fps))
+    }
+
+    /// Where a gesture at `raw` lands and the mark that pulled it there, with
+    /// the switch honoured: snapping off, nothing moves and no line is drawn.
+    fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
+        snap_cue(self.snap, raw, len, self.snap_frames(), marks)
     }
 
     /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
@@ -2524,14 +2582,25 @@ impl Player {
     /// against the same duration the boxes are drawn to, so the edge tracks the
     /// pointer exactly.
     fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let at = self.frame_under(x);
-        let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
+        let Some(trim) = self.trim else {
             return;
         };
-        let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
+        // The edge is pulled onto the same marks a whole clip is, by itself:
+        // there is no other end travelling with it, so it snaps at length zero.
+        let marks = self.snap_targets(Some((trim.lane, trim.idx)));
+        let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
+        let Some((lo, hi)) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.trim_room(trim.lane, trim.idx, trim.edge))
+        else {
             return;
         };
-        trim.to = at.clamp(lo, hi);
+        let to = at.clamp(lo, hi);
+        // The line only stands where the edge actually stopped: a mark the
+        // engine's own room clamped away was never reached.
+        self.set_cue(cue.filter(|_| to == at), x, cx);
+        self.trim = Some(Trim { to, ..trim });
         cx.notify();
     }
 
@@ -3806,6 +3875,21 @@ impl Render for Player {
                     }
                 }
             }))
+            // A drop event carries no path of its own -- gpui only tells the
+            // target that something landed -- so the line that promises where
+            // it will land is fed by the drag's own moves, which do carry the
+            // pointer (gpui div.rs:282). On the root, because a drag crosses
+            // the window: it starts on a clip or on a library row and ends over
+            // a lane, and only an ancestor of both hears all of it.
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                let ClipDrag { lane, idx } = *event.drag(cx);
+                this.preview_drop(lane, idx, event.event.position.x, cx);
+            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                    this.preview_place(event.event.position.x, cx);
+                }),
+            )
             // Scrubbing is tracked on the root because the pointer leaves the
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
@@ -4570,6 +4654,25 @@ impl Player {
                         ),
                         live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
+                    ))
+                    // The magnet, beside the zoom for the zoom's own reason: it
+                    // changes nothing on the timeline, it changes how the hand
+                    // meets it. The label is the state, as the volume's is --
+                    // a toggle that looks the same either way says nothing.
+                    .child(control(
+                        "snap",
+                        None,
+                        if self.snap { "Snap" } else { "No snap" },
+                        format!(
+                            "{} — {}",
+                            key(ActionId::ToggleSnap),
+                            match self.snap {
+                                true => "drags and trims land on clip edges, the playhead and the start",
+                                false => "drags and trims land exactly where the hand leaves them",
+                            }
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
                     ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
@@ -6693,6 +6796,14 @@ impl Player {
         // it, so all of them move together when it does. No bed width is needed
         // to place them any more -- a second is so many pixels wherever it is.
         let scale = self.scale;
+        // Where the snap line stands, in the same pixels every box is placed
+        // through -- and only while a gesture is actually live: gpui drops a
+        // drag without telling anyone, so this asks whether one is in flight
+        // (`App::has_active_drag`) rather than remembering that one was.
+        let cue = self
+            .snap_cue
+            .filter(|_| self.trim.is_some() || cx.has_active_drag())
+            .map(|frame| scale.px_at(f64::from(frame) / self.fps));
         let clips = self
             .session
             .as_ref()
@@ -6839,7 +6950,12 @@ impl Player {
                     // the window, which took it from the release that fired
                     // this (gpui window.rs:3602).
                     .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
-                        let at = this.frame_under(window.mouse_position().x);
+                        // Onto the edges near it, exactly as a clip carried by
+                        // hand lands: the line drawn while it was in flight is
+                        // the frame it goes down on.
+                        let x = window.mouse_position().x;
+                        let marks = this.snap_targets(None);
+                        let (at, _) = this.snap_to(this.frame_under(x), 0, &marks);
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
@@ -7083,6 +7199,20 @@ impl Player {
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
+                    // What the gesture in flight is about to land on, drawn on
+                    // every lane so a clip lining up with a take one track over
+                    // can be seen to line up with it. Under the playhead's line
+                    // and in another colour, since the two mean different
+                    // things and often stand on the same pixel.
+                    .children(cue.map(|x| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(x))
+                            .w(px(1.))
+                            .bg(rgb(INK))
+                    }))
                     // Last, so it is over the clips: the same fraction in both
                     // lanes, which is the playhead being one line.
                     .child(
@@ -8732,6 +8862,56 @@ fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
     best.map_or(raw, |(_, start)| start)
 }
 
+/// The edges worth landing on, off *every* lane: both ends of every clip on the
+/// timeline, less `skip` -- the clip being dragged, which does not snap to where
+/// it already is -- and less the other halves of its group, which travel with
+/// it. `skip` is a lane's place in `lanes` and an index into it. The playhead
+/// and the head of the timeline go on the end: a clip meets the cursor and the
+/// start of the show as readily as it meets another take.
+///
+/// All lanes rather than the one being dropped on, because a cut is made across
+/// the timeline: a title on V2 lines up with the shot under it, and a sound
+/// effect lines up with the frame it belongs to.
+fn snap_marks(lanes: &[&[Clip]], skip: Option<(usize, usize)>, playhead: u32) -> Vec<u32> {
+    let link = skip
+        .and_then(|(lane, idx)| lanes.get(lane)?.get(idx))
+        .and_then(|clip| clip.link);
+    let mut marks: Vec<u32> = lanes
+        .iter()
+        .enumerate()
+        .flat_map(|(lane, clips)| {
+            clips
+                .iter()
+                .enumerate()
+                .filter(move |&(idx, clip)| {
+                    Some((lane, idx)) != skip && !(link.is_some() && clip.link == link)
+                })
+                .flat_map(|(_, clip)| [clip.start, clip.end()])
+        })
+        .collect();
+    marks.push(playhead);
+    marks.push(0);
+    marks
+}
+
+/// [`snapped`], and the mark that pulled it there -- the line the bed draws
+/// while the hand is still moving. `None` when nothing was near enough: a line
+/// standing over open bed would promise a landing that is not going to happen.
+/// The head is read before the tail, exactly as [`snapped`] prefers it.
+///
+/// `on` is the switch ([`ActionId::ToggleSnap`]): off, the gesture lands raw and
+/// draws no line at all, which is the whole point of being able to turn it off.
+fn snap_cue(on: bool, raw: u32, len: u32, tol: u32, marks: &[u32]) -> (u32, Option<u32>) {
+    if !on {
+        return (raw, None);
+    }
+    let start = snapped(raw, len, tol, marks);
+    let mark = [start, start.saturating_add(len)]
+        .into_iter()
+        .find(|mark| marks.contains(mark));
+    (start, mark)
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -9073,9 +9253,9 @@ mod tests {
         estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
         fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
         keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
-        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
-        unseen_paths, unseen_sources, whole_take, window_title,
+        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snap_cue,
+        snap_marks, snapped, source_tint, span_partner, speed_at, summary_head, summary_tail,
+        timecode, transport, unseen_paths, unseen_sources, whole_take, window_title,
     };
     use super::{
         LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
@@ -9503,6 +9683,9 @@ mod tests {
                         source.contains("this.remove_lane(lane, cx)")
                     }
                     ActionId::ToggleMute => element("volume"),
+                    // The button beside the zoom, which says which way it is
+                    // set as well as setting it.
+                    ActionId::ToggleSnap => element("snap"),
                     // The fader on every audio track's own header, which is
                     // also what opens the card the limiter is on.
                     ActionId::Mix => element("mix-lane"),
@@ -10201,6 +10384,62 @@ mod tests {
         // ...and a mark closer to the head than `len` cannot pull the clip to a
         // negative start.
         assert_eq!(snapped(2, 40, 4, &marks), 0);
+    }
+
+    /// Where those edges come from: every lane, not the one being dropped on --
+    /// and never the clip in the hand or the half of it one track down.
+    #[test]
+    fn the_marks_are_every_lane_the_playhead_and_the_start() {
+        let clip = |start: u32, frames: u32, link| Clip {
+            start,
+            in_frame: 0,
+            out_frame: frames,
+            source: 0,
+            link,
+            eq: None,
+            color: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        // A grouped take across two lanes at 100..160, and a lone one on the
+        // audio lane at 400..430.
+        let video = [clip(100, 60, Some(7))];
+        let audio = [clip(100, 60, Some(7)), clip(400, 30, None)];
+        let lanes: [&[Clip]; 2] = [&video, &audio];
+
+        // Nothing in the hand: both lanes' edges, the playhead, and 0.
+        let mut all = snap_marks(&lanes, None, 300);
+        all.sort_unstable();
+        assert_eq!(all, [0, 100, 100, 160, 160, 300, 400, 430]);
+
+        // The video half in the hand: its own edges are gone, and so are its
+        // group's on the other lane -- both boxes travel with the drag. The
+        // lone audio clip is still a target, which is the whole point: a take
+        // being carried on V1 lands flush with a sound on A1.
+        let mut carried = snap_marks(&lanes, Some((0, 0)), 300);
+        carried.sort_unstable();
+        assert_eq!(carried, [0, 300, 400, 430]);
+
+        // An index that names no clip skips nothing and still answers.
+        assert_eq!(snap_marks(&[], Some((3, 9)), 0), [0, 0]);
+    }
+
+    /// The line the bed draws, and the switch that turns the whole thing off.
+    #[test]
+    fn the_snap_names_the_mark_it_landed_on_unless_it_is_switched_off() {
+        let marks = [100, 160, 300, 0];
+        // Pulled by the tail: the clip lands at 60 and the line stands on the
+        // edge its *tail* met, 100 -- not on the head it happens to have.
+        assert_eq!(snap_cue(true, 62, 40, 4, &marks), (60, Some(100)));
+        // Pulled by the head: line and landing are the same frame.
+        assert_eq!(snap_cue(true, 158, 40, 4, &marks), (160, Some(160)));
+        // A trim carries no length, so only its own edge lands.
+        assert_eq!(snap_cue(true, 298, 0, 4, &marks), (300, Some(300)));
+        // Open bed: nothing moves and nothing is drawn.
+        assert_eq!(snap_cue(true, 200, 40, 4, &marks), (200, None));
+        // Switched off, a gesture that would have snapped lands raw and draws
+        // no line -- the frame-by-frame placement the toggle is for.
+        assert_eq!(snap_cue(false, 158, 40, 4, &marks), (158, None));
     }
 
     #[test]
@@ -12115,6 +12354,8 @@ fn main() {
                     scrubbing: false,
                     trim: None,
                     grab: 0,
+                    snap: true,
+                    snap_cue: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
