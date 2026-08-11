@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use engine::demux::{Codec, Demuxer};
 use engine::export::ExportSettings;
+use engine::scratch::Scratch;
 use engine::{AudioSession, DecodeSession, PlaybackSession, Project};
 
 /// 1280x720@30, 2 s, keyframes 30 apart -- see `scripts/gen_fixtures.sh`.
@@ -271,8 +272,7 @@ fn an_mp4_export_of_a_matroska_source_carries_its_sound() {
     // A short one: the picture is re-encoded frame by frame and what is under
     // test here is the sound reaching the file, not H.264 throughput.
     let project = Project::single(asset("test_av1.mkv"), 15);
-    let out = std::env::temp_dir().join(format!("ve_export_av1_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+    let out = Scratch::file("ve_export_av1", "mp4");
 
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let started = Instant::now();
@@ -322,9 +322,8 @@ fn exported(
     name: &str,
     settings: &ExportSettings,
     limit: Duration,
-) -> PathBuf {
-    let out = std::env::temp_dir().join(format!("ve_av1_{name}_{}.mkv", std::process::id()));
-    let _ = std::fs::remove_file(&out);
+) -> Scratch {
+    let out = Scratch::file(&format!("ve_av1_{name}"), "mkv");
     let started = Instant::now();
     let handle = session.export_to_with(&out, settings);
     while !handle.is_finished() {
@@ -405,8 +404,7 @@ fn an_av1_export_carries_the_timelines_sound_in_either_container() {
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av");
         assert!(session.cut_at(2.0 / 30.0), "two frames of it");
         assert!(session.delete_clip(engine::project::Lane::V1, 1));
-        let out = std::env::temp_dir().join(format!("ve_av1_sound_{}.{ext}", std::process::id()));
-        let _ = std::fs::remove_file(&out);
+        let out = Scratch::file("ve_av1_sound", ext);
         let settings = ExportSettings {
             format,
             force_sw: true,
@@ -448,7 +446,7 @@ fn an_av1_export_carries_the_timelines_sound_in_either_container() {
 #[test]
 fn an_av1_export_of_an_audio_only_timeline_is_refused_by_name() {
     let session = PlaybackSession::open(asset("test_tone.wav")).expect("open the tone");
-    let out = std::env::temp_dir().join(format!("ve_av1_refused_{}.mkv", std::process::id()));
+    let out = Scratch::file("ve_av1_refused", "mkv");
     let handle = session.export_to_with(&out, &av1_settings());
     while !handle.is_finished() {
         std::thread::sleep(Duration::from_millis(10));

@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use engine::project::{Lane, LaneKind, Speed};
+use engine::scratch::Scratch;
 use engine::silence::{self, Settings};
 use engine::{Clip, Project};
 
@@ -356,8 +357,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
 
     // What a jumpcut leaves is ordinary clips, so the file it saves to is the
     // same dialect it always was -- no wire change went with this feature.
-    let dir = std::env::temp_dir().join(format!("edith-silence-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a place to save");
+    let dir = Scratch::dir("edith-silence");
     let file = dir.join("cut.edith");
     let (sources, lanes, eq, color) = p.without_orphan_sources();
     engine::edith::save(

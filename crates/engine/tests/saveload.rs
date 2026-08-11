@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use engine::PlaybackSession;
 use engine::project::{Lane, Source};
+use engine::scratch::Scratch;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -18,13 +19,9 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// A fresh directory to litter. Canonical, because the saved paths are
-/// relative to it and `Project` canonicalises what it is handed.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ve_saveload_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    std::fs::canonicalize(&dir).expect("canonical scratch dir")
+/// A fresh directory to litter, deleted when the test that holds it ends.
+fn scratch(name: &str) -> Scratch {
+    Scratch::dir(&format!("ve_saveload_{name}"))
 }
 
 fn copy_in(dir: &Path, name: &str) -> PathBuf {

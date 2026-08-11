@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use engine::demux::{Codec, Demuxer};
 use engine::export::{ExportSettings, Format};
+use engine::scratch::Scratch;
 use engine::{AudioSession, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
@@ -34,11 +35,8 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn out_path(name: &str, ext: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_hevc_{name}_{}.{ext}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(format!("{}.part", path.display()));
-    path
+fn out_path(name: &str, ext: &str) -> Scratch {
+    Scratch::file(&format!("ve_hevc_{name}"), ext)
 }
 
 /// Runs an export to completion, failing on the deadline rather than hanging.
@@ -275,7 +273,7 @@ fn probe(path: &Path) -> Option<String> {
 /// A two-second 1920x1080 H.264 fixture in the temp directory -- the assets are
 /// all 720p, which is a multiple of 16 in both directions and would leave the
 /// crop path untested. `None` where ffmpeg is not installed.
-fn fixture_1080p() -> Option<PathBuf> {
+fn fixture_1080p() -> Option<Scratch> {
     let path = out_path("source1080", "mp4");
     let made = Command::new("ffmpeg")
         .args([

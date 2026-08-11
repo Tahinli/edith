@@ -1960,10 +1960,8 @@ mod tests {
             "a bare filename is saved into the working directory"
         );
 
-        let dir = std::env::temp_dir().join(format!("ve_edith_link_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::scratch::Scratch::dir("ve_edith_link");
         std::fs::create_dir_all(dir.join("real")).expect("scratch dir");
-        let dir = std::fs::canonicalize(&dir).expect("canonical scratch dir");
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("symlink");
         let source = dir.join("real/a.mp4");
         let path = dir.join("link/p.edith");

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
+use engine::scratch::Scratch;
 use engine::{AudioSession, Clip, PlaybackSession};
 
 /// The fixtures `scripts/gen_fixtures.sh` writes: 3 s of 440 Hz left / 880 Hz
@@ -233,14 +234,11 @@ fn a_song_is_a_timeline_of_its_own() {
 /// timeline: refused at the door, in the words of whatever refused it.
 #[test]
 fn a_file_with_no_picture_and_no_sound_is_still_refused() {
-    let dir = std::env::temp_dir().join(format!("ve_audio_bad_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_audio_bad");
     let fake = dir.join("not_really.mp3");
     std::fs::write(&fake, b"this is not an mp3").expect("write");
     let e = refusal(PlaybackSession::open(&fake));
     assert!(e.starts_with(&fake.display().to_string()), "{e}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The whole audio-only round trip a user makes: open a song, place a second
@@ -248,9 +246,7 @@ fn a_file_with_no_picture_and_no_sound_is_still_refused() {
 /// format that needs a picture cannot have one.
 #[test]
 fn an_audio_only_project_saves_reloads_and_exports_its_sound() {
-    let dir = std::env::temp_dir().join(format!("ve_audio_only_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_audio_only");
 
     let mut session = open(asset("test_tone.mp3"));
     // A second song joins it, the same way one joins a timeline of video: no
@@ -440,9 +436,7 @@ fn an_export_refuses_audio_it_cannot_copy() {
 
 #[test]
 fn a_song_survives_a_save_and_a_reload() {
-    let dir = std::env::temp_dir().join(format!("ve_audio_files_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_audio_files");
     let copy = |name: &str| {
         let to = dir.join(name);
         std::fs::copy(asset(name), &to).expect("copy the fixture");
@@ -508,9 +502,7 @@ fn a_song_survives_a_save_and_a_reload() {
 /// hand-editing anywhere in it.
 #[test]
 fn a_pasted_song_never_lands_on_the_video_lane() {
-    let dir = std::env::temp_dir().join(format!("ve_audio_paste_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = Scratch::dir("ve_audio_paste");
     let copy = |name: &str| {
         let to = dir.join(name);
         std::fs::copy(asset(name), &to).expect("copy the fixture");

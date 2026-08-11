@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use engine::audio::AudioSession;
+use engine::scratch::Scratch;
 
 const RATE: u32 = 44100;
 const SECONDS: u32 = 5;
@@ -297,7 +298,7 @@ fn a_matroska_with_no_track_is_silent_and_a_broken_one_is_an_error() {
 
     // ...and a file that will not parse at all, under the same extension: an
     // `Err` a front-end can show, not a silent import.
-    let broken = std::env::temp_dir().join(format!("ve_broken_{}.mkv", std::process::id()));
+    let broken = Scratch::file("ve_broken", "mkv");
     std::fs::write(&broken, b"\x1a\x45\xdf\xa3not a matroska file at all").expect("write");
     let err = AudioSession::probe(&broken, 0)
         .expect_err("a broken file must not pass for a silent one")

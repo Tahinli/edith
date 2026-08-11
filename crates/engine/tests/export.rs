@@ -24,6 +24,7 @@ use engine::hw::HwEncoder;
 use engine::mux::{Mp4Muxer, VideoParams, parameter_sets};
 use engine::project::{Lane, Source, Speed};
 use engine::scale::FitPolicy;
+use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
 
 const FPS: f64 = 30.0;
@@ -34,13 +35,11 @@ fn asset(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Per-run unique: two suite runs at once (a release sweep beside a debug one,
-/// or two agents) would otherwise write and delete each other's export.
-fn out_path(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("ve_export_{name}_{}.mp4", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(part_path(&path));
-    path
+/// Its own directory, gone with the value: two suite runs at once (a release
+/// sweep beside a debug one, or two agents) would otherwise write and delete
+/// each other's export, and nothing may outlive the test that wrote it.
+fn out_path(name: &str) -> Scratch {
+    Scratch::file(&format!("ve_export_{name}"), "mp4")
 }
 
 /// What the worker actually writes to until it succeeds; the engine appends the
@@ -486,7 +485,7 @@ fn a_higher_bitrate_writes_a_bigger_file() {
 fn a_vanished_source_fails_the_export() {
     pin_software();
     let baseline = asset("test_baseline.mp4");
-    let doomed = std::env::temp_dir().join("ve_export_vanished_source.mp4");
+    let doomed = Scratch::file("ve_export_vanished_source", "mp4");
     std::fs::copy(&baseline, &doomed).expect("copy a second source");
     let (meta, _) = engine::demux::Demuxer::open(&baseline).unwrap();
 
