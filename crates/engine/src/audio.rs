@@ -802,8 +802,9 @@ impl AudioSession {
 }
 
 /// One AAC-LC access unit of silence, for the gaps in an exported timeline —
-/// the export copies packets and has no AAC encoder, so the only silence it can
-/// write is one spelled out by hand.
+/// this is the *copy* path, which never encodes anything, so the only silence it
+/// can write is one spelled out by hand. (The re-encode path next door has a
+/// real encoder and needs none of this: its gaps are zero samples.)
 ///
 /// It is the shortest legal `raw_data_block` there is: one element carrying
 /// `max_sfb = 0`, which is "no scalefactor bands", which is a frame with no
@@ -848,11 +849,12 @@ fn source_at<'a>(
 
 /// A source's track for the *copy* path, which needs raw AAC access units.
 ///
-/// An mp3, a wav, a flac — anything the export cannot copy — is refused here by
-/// name and by format rather than exported silent or, worse, exported as noise:
-/// there is no AAC encoder in this project (see [`AudioSession::copy_segments`]),
-/// so a timeline carrying one of those simply cannot become an mp4 today. The
-/// wording is what a front-end shows.
+/// An mp3, a wav, a flac — anything this cannot copy — is an `Err` here, by name
+/// and by format. That is no longer the end of the road: `export::copy_audio`
+/// takes it as the answer "not copyable" and decodes and re-encodes the timeline
+/// instead, so these words are a fallback's reason rather than a user's refusal.
+/// They are still worded for a person, because a caller with no encoder to fall
+/// back on shows them verbatim.
 ///
 /// `Ok(None)` for a file with no audio at all, which is a silent export.
 fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
@@ -862,16 +864,18 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         // A Matroska source gets its own words: its packets *are* AAC, so
         // "export needs AAC audio today" would read as a contradiction. What
         // they are not is packets of an mp4 sample table, which is what the
-        // copy walks -- and refusing beats writing a film with no sound in it.
+        // copy walks. The export decodes such a source and encodes it again
+        // rather than showing this, so a film's sound reaches an mp4 either way;
+        // the words stay for a caller that copies and cannot re-encode.
         //
         // ponytail: the ceiling is the copy path being written against the mp4
-        // reader, not anything about the bytes. Upgrade path is the same one
-        // every other refusal here names -- an AAC encoder, or a `copy_segments`
-        // that walks a Matroska track -- and either would let this through.
+        // reader, not anything about the bytes. Upgrade path is a
+        // `copy_segments` that walks a Matroska track, which would make this a
+        // copy again instead of a re-encode.
         Some(Track::Sym(_)) if crate::demux::is_matroska(path) => Err(format!(
-            "{}'s sound is AAC inside a Matroska file, which an mp4 export cannot copy: \
-             it copies packets out of an mp4's own sample table. Export WAV or FLAC for \
-             the sound, or AV1 for the picture alone",
+            "{}'s sound is AAC inside a Matroska file, which no packet copy reaches: \
+             a copy walks an mp4's own sample table. It is decoded and encoded again \
+             instead",
             path.file_name()
                 .unwrap_or(path.as_os_str())
                 .to_string_lossy(),
@@ -879,17 +883,18 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         .into()),
         Some(Track::Sym(track)) => Err(uncopyable(path, track.codec)),
         // Decoded, never copied: an AC-3 syncframe is not something an `mp4a`
-        // sample table can hold, and there is no AAC encoder here to turn it
-        // into one. A WAV/FLAC export of the same timeline decodes fine.
+        // sample table can hold. The export decodes it and encodes AAC, exactly
+        // as it does for every other source no copy reaches.
         Some(Track::Ac3(_)) => Err(uncopyable(path, "AC-3")),
     }
 }
 
-/// The one wording for "this source's audio cannot be copied into an mp4",
-/// shared by every format that cannot be: a front-end shows it verbatim.
+/// The one wording for "this source's audio cannot be *copied* into an mp4",
+/// shared by every format that cannot be. What the export does about it is
+/// decode and re-encode; this is the reason it had to.
 fn uncopyable(path: &Path, codec: &str) -> crate::Error {
     format!(
-        "export needs AAC audio today; {} is {codec}",
+        "a packet copy needs AAC in an mp4; {} is {codec}",
         path.file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy(),

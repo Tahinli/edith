@@ -1,26 +1,32 @@
-//! Export: the edit list rendered back out as one mp4 or one AV1-in-Matroska —
-//! or, picture left behind, as one WAV or FLAC of the timeline's audio alone.
+//! Export: the edit list rendered back out as one mp4 (H.264 or AV1) or one
+//! AV1-in-Matroska — or, picture left behind, as one WAV, FLAC or MP3 of the
+//! timeline's audio alone.
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
 //! is impossible — while audio is copied packet for packet wherever a copy can
 //! say what the timeline says: a copy is exact, free and never a generation of
-//! loss. Where it *cannot* — an equalized lane, which is sample math no packet
-//! copy can reach — that lane is decoded, mixed and encoded again with
-//! `rusty_aac` ([`encode_audio`]). The audio-only formats have no such split:
-//! `hound` writes PCM and `flacenc` encodes FLAC, so those are always *decoded*
-//! out of the timeline. The worker owns everything: the caller gets an
+//! loss. Where it *cannot* — a second audio lane to mix in, a speeded clip, an
+//! equalized one, a source that is not AAC inside an mp4's own sample table —
+//! the sound is decoded, mixed and encoded again with `rusty_aac`
+//! ([`encode_audio`]). The audio-only formats have no such split: `hound` writes
+//! PCM, `flacenc` encodes FLAC and `rusty_mp3` encodes MP3, so those are always
+//! *decoded* out of the timeline. The worker owns everything: the caller gets an
 //! [`ExportHandle`] and polls it from its render loop.
+//!
+//! **Every video format here carries the timeline's sound**, in whichever
+//! container: the mp4 muxer writes an AAC track and so does the Matroska one.
+//! Nothing is written picture-only and nothing is left silent without saying so
+//! — the only sound that does not come out is sound this engine cannot decode at
+//! all (Opus and AC-3 inside a Matroska file), and that is an error by name.
 //!
 //! A **speeded** clip splits along the same line, and for the same reason. The
 //! picture is re-encoded, so the frame walk honours a rate: it takes the source
 //! frame each timeline frame shows ([`crate::project::Speed::source_at`], the
 //! very frame preview holds there) and encodes a held one again rather than
-//! decoding it twice. The sound is *copied* unless a filter forces a decode, and
-//! a packet carries no rate -- so a speeded clip on the one audio lane an mp4
-//! copies is refused by name ([`copy_audio`]) rather than written out at 1.00x
-//! under a re-timed picture.
-//! AV1 carries no audio at all and never meets that refusal; WAV and FLAC are
-//! decoded and resampled, so they honour a rate like the picture does.
+//! decoding it twice. The sound is *copied* unless something forces a decode,
+//! and a packet carries no rate — so a speeded lane is one of the things that
+//! forces one ([`copy_audio`]) rather than being written out at 1.00x under a
+//! re-timed picture.
 //!
 //! Nothing partial survives a failure: the worker writes to `<out>.part` and
 //! renames it onto `out` only once the file is closed and complete, so the
@@ -30,6 +36,8 @@
 //! behind (only in-process cleanup is promised), which is an orphan a user can
 //! delete rather than a file that plays for two seconds and stops.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,37 +69,42 @@ const MAX_BITRATE: u64 = 20_000_000;
 /// on a build with no assembly, which is what this one is.
 const AV1_SPEED: u8 = 10;
 
-/// What an export writes. Four, not more: H.264-in-mp4 and AV1-in-Matroska are
-/// the only *video* pairs with both an encoder and a decoder under this
-/// project's no-install rule, and WAV and FLAC are the only *standalone* audio
-/// formats with a pure-Rust encoder at all. MP3 has one (`shine-rs`) under
-/// LGPL-2.0, which is a licensing decision this project has not taken; Vorbis
-/// and Opus have none. (AAC does -- `rusty_aac`, which is what an equalized mp4
-/// track is encoded with -- but AAC is an mp4's own audio, never a file of its
-/// own here.) HEVC and VP9 have no encoder here at all (`hevc`/`vp9` import
-/// through the plugin and stop there). A front-end says so rather than hiding
-/// the rows.
+/// What an export writes. H.264-in-mp4 and AV1 -- in Matroska or in mp4, the
+/// user's pick of container -- are the only *video* pairs with both an encoder
+/// and a decoder under this project's no-install rule, and WAV, FLAC and MP3 are
+/// the standalone audio formats with a pure-Rust encoder: `hound`, `flacenc` and
+/// `rusty_mp3`. Vorbis and Opus have none. (AAC does -- `rusty_aac`, which is
+/// what a re-encoded video track's sound leaves through -- but AAC is a
+/// container's own audio, never a file of its own here.) HEVC and VP9 have no
+/// encoder here at all (`hevc`/`vp9` import through the plugin and stop there).
+/// A front-end says so rather than hiding the rows.
+///
+/// **Every video format carries sound.** Which way it carries it is the only
+/// difference: copied packet for packet where a copy can say what the timeline
+/// says, decoded and encoded again ([`encode_audio`]) where it cannot.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
     /// Picture and sound: video re-encoded, AAC copied -- or re-encoded too,
-    /// where a copy could not carry the edit (an equalized lane). Either way it
-    /// carries **one** audio lane: a timeline whose sound is spread over two is
-    /// refused by name here and mixed by the other two formats, which decode.
+    /// where a copy could not carry the edit (a second audio lane to mix in, a
+    /// speeded clip, an equalized one, a source no mp4 sample table holds).
     #[default]
     Mp4,
-    /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
-    /// this project can *write*: this engine's Matroska writer has no audio
-    /// track at all, and the copy path walks an mp4 sample table, which a
-    /// Matroska file has none of. (*Reading* one's AAC is a different question,
-    /// and since this engine gained a Matroska demuxer the answer is yes --
-    /// `audio::Track::open` does it through symphonia's mkv reader.) The sound
-    /// of an AV1 export is a WAV or FLAC beside it, which a front-end says up
-    /// front.
+    /// AV1 in Matroska, with the timeline's AAC beside it: this engine's
+    /// Matroska writer carries an audio track ([`crate::mux::MkvMuxer`]) and its
+    /// reader reads one back, symphonia's `mkv` reader being what
+    /// `audio::Track::open` opens it with.
     Av1,
-    /// The audio lane alone, 16-bit PCM.
+    /// The same AV1 stream in an mp4, for everything that plays mp4 and not
+    /// Matroska. The sample entry `mp4 0.14` cannot write is written by hand
+    /// ([`crate::mux::Mp4Muxer::create_av1`]); the sound is the mp4 path's own,
+    /// unchanged.
+    Av1Mp4,
+    /// The audio lanes alone, 16-bit PCM.
     Wav,
-    /// The audio lane alone, losslessly compressed.
+    /// The audio lanes alone, losslessly compressed.
     Flac,
+    /// The audio lanes alone, MPEG-1 Layer III at 256 kbps CBR (`rusty_mp3`).
+    Mp3,
 }
 
 impl Format {
@@ -99,26 +112,36 @@ impl Format {
     /// the destination path from it, so the name never disagrees with the bytes.
     pub fn ext(self) -> &'static str {
         match self {
-            Self::Mp4 => "mp4",
+            Self::Mp4 | Self::Av1Mp4 => "mp4",
             Self::Av1 => "mkv",
             Self::Wav => "wav",
             Self::Flac => "flac",
+            Self::Mp3 => "mp3",
         }
     }
 
     /// Whether this format carries the picture. The bitrate settings are video
-    /// settings and mean nothing to the audio two.
+    /// settings and mean nothing to the audio-only ones.
     pub fn has_video(self) -> bool {
-        matches!(self, Self::Mp4 | Self::Av1)
+        matches!(self, Self::Mp4 | Self::Av1 | Self::Av1Mp4)
+    }
+
+    /// Whether the picture in it is AV1 rather than H.264 -- which encoder runs
+    /// and which of the two AV1 containers is being written are separate
+    /// questions, and this is the first.
+    fn is_av1(self) -> bool {
+        matches!(self, Self::Av1 | Self::Av1Mp4)
     }
 
     /// What the format is called where a refusal names it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Mp4 => "an mp4",
-            Self::Av1 => "an AV1 export",
+            Self::Av1 => "an AV1 Matroska",
+            Self::Av1Mp4 => "an AV1 mp4",
             Self::Wav => "a WAV",
             Self::Flac => "a FLAC",
+            Self::Mp3 => "an MP3",
         }
     }
 }
@@ -227,12 +250,12 @@ pub fn start(
                 Err("the timeline is empty: there is nothing to export".into())
             }
             format if format.has_video() && !has_picture(&project) => Err(format!(
-                "the timeline has no picture: {} would be black. Export WAV or \
-                 FLAC, which are the sound itself",
+                "the timeline has no picture: {} would be black. Export WAV, \
+                 FLAC or MP3, which are the sound itself",
                 format.name()
             )
             .into()),
-            Format::Mp4 | Format::Av1 => run(&project, &meta, &part, &worker, &settings),
+            format if format.has_video() => run(&project, &meta, &part, &worker, &settings),
             format => run_audio(&project, &meta, &part, &worker, format),
         };
         let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
@@ -265,10 +288,16 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
     shared.finished.store(true, Ordering::Release);
 }
 
-/// The timeline's one audio lane, copied packet for packet: the mp4 path's
-/// sound, and the reason that path carries only one lane of it. A lane an
-/// equalizer has been put on cannot be *copied* at all and leaves through
-/// [`encode_audio`] instead; every other timeline keeps this copy, bit for bit.
+/// The timeline's audio track for a file that carries picture: copied packet for
+/// packet where a copy says exactly what the timeline says, and decoded, mixed
+/// and encoded again ([`encode_audio`]) where it cannot -- a second audio lane,
+/// a speeded clip, an equalizer, a source that is not AAC inside an mp4 sample
+/// table. Nothing is refused for being uncopyable any more; the only refusals
+/// left below the copy are about sound this engine cannot *decode* either, and
+/// those come out of the decode path by name.
+///
+/// The copy is still the default and still bit-exact: a timeline nobody has
+/// touched leaves as the very packets its source holds.
 ///
 /// ponytail: this holds the whole exported AAC track in memory (~3 kB per
 /// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
@@ -288,16 +317,10 @@ fn copy_audio(
     // is the same list `PlaybackSession::seek` hands the decoder, so an export
     // of a timeline playing a file's second audio track carries *that* track.
     //
-    // One lane, because this path *copies* AAC packets and a mix is not a copy:
-    // summing two lanes means decoding both, and only the one thing a copy
-    // cannot express at all -- an equalizer -- is decoded here today. Refused by
-    // name rather than silently exporting the first lane, which is a file
-    // missing half its sound: the one failure a user would not notice.
-    //
-    // ponytail: the ceiling is this routing, not the codec any more.
-    // [`encode_audio`] already mixes *every* audio lane (it is the WAV path's
-    // own opener), so lifting this refusal is routing a second case to it --
-    // deliberately not done here, where the change under test is the equalizer.
+    // One lane is the only shape a *copy* has: summing two means decoding both,
+    // and a sum is not a copy. Two or more go to [`encode_audio`], which is the
+    // very mix the WAV path writes -- it used to be a refusal, and a refusal is
+    // what a file missing half its sound deserves, not what a mix does.
     //
     // *Which* lane is the same question `audio_segments_from` answers for
     // playback, and it is asked here rather than assumed: the lane that holds
@@ -307,57 +330,44 @@ fn copy_audio(
     // whole comment is about.
     let lanes = project.audio_segments_from(0, meta.frame_rate);
     let [segments] = &lanes[..] else {
-        return Err(format!(
-            "this timeline has {} audio lanes and an mp4 export copies one: \
-             export WAV or FLAC, which are mixed, or put the sound on one lane",
-            lanes.len()
-        )
-        .into());
+        return encode_audio(project, meta);
     };
     // ...and the same list names *which* lane those clips sit on, which is the
     // only way to ask what has been done to them.
     let lane = project.audio_lanes()[0];
     // ...and the same list decides whether any clip this would copy plays at a
-    // rate other than the one it was recorded at. A copy hands the mp4 the very
-    // AAC packets the source holds and there is no rate inside a packet to
+    // rate other than the one it was recorded at. A copy hands the muxer the
+    // very AAC packets the source holds and there is no rate inside a packet to
     // change: the picture would come out re-timed (the walk in [`run`] honours
     // it) over sound at 1.00x, which is the drift a person finds only after the
-    // file has gone somewhere. Refused by name -- and only *here*, on the lane
-    // being copied: AV1 carries no audio at all and never reaches this, so it
-    // honours a speed like WAV and FLAC do.
+    // file has gone somewhere. Decoded and resampled instead, by the same worker
+    // playback feeds from.
     //
-    // ponytail: the ceiling is the packet copy itself, not the rate, and the way
-    // off it is now next door -- [`encode_audio`] resamples exactly as the WAV
-    // path does, so routing a speeded lane there is the one line the equalizer
-    // below takes. Left refused because this change is the equalizer's, and a
-    // speeded export turning silently from a copy into a re-encode is a change
-    // of its own to make on purpose.
-    if let Some((at, speed)) = project
-        .lane(lane)
-        .iter()
-        .find(|c| !c.speed.is_normal())
-        .map(|c| (c.start, c.speed))
-    {
-        return Err(format!(
-            "the clip at {} plays at {speed} and an mp4 export copies AAC packets, which carry \
-             no rate: export WAV or FLAC, which are decoded and resampled, or set it back to 1.00x",
-            timecode(at, meta.frame_rate)
-        )
-        .into());
-    }
-    // ...and last, whether any clip on it carries an equalizer. An EQ is sample
-    // math and a copy never decodes, so copying such a lane would write the clip
-    // *flat*, silently -- the failure a missing audio track is. This lane is
-    // decoded, filtered, mixed and encoded again instead ([`encode_audio`]), and
-    // only this case is: a timeline nobody has equalized still leaves through
-    // the copy below, packet for packet, so no passthrough quietly becomes a
-    // generation of loss.
+    // ...and whether any clip on it carries an equalizer, which is sample math a
+    // copy never reaches: copying such a lane would write the clip *flat*,
+    // silently.
+    //
+    // Only these: a timeline nobody has touched still leaves through the copy
+    // below, packet for packet, so no passthrough quietly becomes a generation
+    // of loss.
+    let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
     let equalized = (0..project.lane(lane).len())
         .any(|idx| project.eq_of(lane, idx).is_some_and(|eq| !eq.is_identity()));
-    if equalized {
+    if speeded || equalized {
         return encode_audio(project, meta);
     }
-    AudioSession::copy_multi_streams(&project.audio_sources(), segments)
+    // What is left is a copy the *sources* may still not be able to give: AAC
+    // inside a Matroska file (readable, but not out of a sample table this walks
+    // -- there is none), an mp3 or a wav on the timeline, an AC-3 track, two
+    // sources whose AAC parameters disagree. Every one of them decodes, and what
+    // decodes can be encoded again, so the copy's refusal is now a route: the
+    // error a *decode* cannot get past -- Opus or AC-3 inside a Matroska file,
+    // which symphonia has no decoder for at any version -- is the one that comes
+    // back, by name, from [`encode_audio`].
+    match AudioSession::copy_multi_streams(&project.audio_sources(), segments) {
+        Ok(copied) => Ok(copied),
+        Err(_) => encode_audio(project, meta),
+    }
 }
 
 /// The same lane, *decoded*: what a packet copy cannot carry comes out here as
@@ -393,7 +403,8 @@ fn encode_audio(
     };
     let freq_index = rusty_aac::sf_index_for_rate(audio.sample_rate).ok_or_else(|| {
         format!(
-            "{} Hz is not an AAC sample rate: export WAV or FLAC, which write it as it is",
+            "{} Hz is not an AAC sample rate: export WAV, FLAC or MP3, which write it as \
+             it is",
             audio.sample_rate
         )
     })?;
@@ -455,19 +466,19 @@ fn run(
     let total = project.timeline_frames();
     let sources = project.sources();
     // Audio first: a track has to be declared when the muxer is created, which
-    // happens as soon as the first coded picture arrives. None of it for AV1 --
-    // that one is picture only, for the reason [`Format::Av1`] states -- and no
-    // refusal of it either: a timeline with sound is exported as the video it
-    // also is, and the front-end says the sound is not in the file *before* the
-    // export starts rather than failing it here.
-    let audio = match settings.format {
-        Format::Av1 => None,
-        _ => copy_audio(project, meta)?,
-    };
+    // happens as soon as the first coded picture arrives -- and the Matroska
+    // muxer wants the packets themselves that early too, because it interleaves
+    // them into the clusters as it writes. Every video format gets the same
+    // track: none of them is picture-only any more.
+    let audio = copy_audio(project, meta)?;
     let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
         freq_index: track.freq_index,
         chan_conf: track.chan_conf,
+        sample_rate: track.sample_rate,
     });
+    // Taken by the Matroska muxer at creation; the mp4 one writes its track
+    // after the picture, so for that path this is still `Some` at the end.
+    let mut packets = audio.map(|(_, packets)| packets);
 
     let mut encoder = Enc::open(meta, settings)?;
     let mut muxer = None;
@@ -577,6 +588,7 @@ fn run(
                         meta,
                         settings,
                         audio_params.as_ref(),
+                        &mut packets,
                         au,
                         key,
                     )?;
@@ -596,6 +608,7 @@ fn run(
             meta,
             settings,
             audio_params.as_ref(),
+            &mut packets,
             au,
             key,
         )?;
@@ -607,8 +620,10 @@ fn run(
     let Some(muxer) = muxer else {
         return Err("export produced no coded pictures".into());
     };
-    let muxer = match (muxer, audio) {
-        (Muxer::Mp4(mut mp4), Some((_, packets))) => {
+    // The mp4's audio track after its picture -- the Matroska one interleaved
+    // its own as it went and left `packets` empty behind it.
+    let muxer = match (muxer, packets) {
+        (Muxer::Mp4(mut mp4), Some(packets)) => {
             for packet in packets {
                 mp4.write_audio_packet(&packet.bytes)?;
             }
@@ -620,18 +635,6 @@ fn run(
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
-}
-
-/// Where a clip sits on the timeline as a person reads it: `mm:ss`, short
-/// enough to sit inside a refusal and exact enough to go and find the clip.
-/// Not the app's frame-accurate timecode -- an engine refusal is prose, and a
-/// `00:00:12:07` in the middle of a sentence is a serial number.
-fn timecode(frame: u32, fps: f64) -> String {
-    let secs = match fps.is_finite() && fps > 0.0 {
-        true => (f64::from(frame) / fps) as u32,
-        false => 0,
-    };
-    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 /// The audio lanes alone, summed, as a WAV or a FLAC.
@@ -704,7 +707,10 @@ fn run_audio(
     match format {
         Format::Wav => write_wav(out, &samples, &audio)?,
         Format::Flac => write_flac(out, &samples, &audio)?,
-        Format::Mp4 | Format::Av1 => unreachable!("the picture formats are `run`"),
+        Format::Mp3 => write_mp3(out, &samples, &audio)?,
+        Format::Mp4 | Format::Av1 | Format::Av1Mp4 => {
+            unreachable!("the picture formats are `run`")
+        }
     }
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
@@ -728,6 +734,42 @@ fn write_wav(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
     // Not `drop`: this is what rewrites the RIFF sizes in the header, and its
     // failure is the difference between a finished file and a truncated one.
     writer.finalize()?;
+    Ok(())
+}
+
+/// The same samples as MPEG-1 Layer III, `rusty_mp3` doing the encoding -- pure
+/// Rust like every other encoder here, and the reason this format is a row at
+/// all: the LGPL `shine-rs` was the only one when it was not.
+///
+/// 256 kbps CBR, for [`encode_audio`]'s reason: an export is a master a person
+/// edits from again, not a delivery file, and this is a lossy generation over
+/// sources that may already have been one. The rate is snapped to a legal Layer
+/// III value by the encoder, and a sample rate MPEG has no frame for (anything
+/// but 8-48 kHz) is refused there by name rather than written as something else.
+///
+/// ponytail: CBR only, and no rate is offered to the caller -- the export card
+/// has one bitrate control and it is the *picture's*. Upgrade path is
+/// `Mp3EncoderConfig::vbr_quality` behind a setting of its own.
+fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()> {
+    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+        bitrate_kbps: 256,
+        vbr_quality: None,
+    });
+    // The samples are the 16-bit ones a WAV of this timeline holds, so the two
+    // files are one mix -- and `push_pcm_s16` divides by 32768 exactly as this
+    // engine's own decoders do.
+    let pcm: Vec<i16> = samples.iter().map(|&s| s as i16).collect();
+    encoder
+        .push_pcm_s16(&pcm, audio.channels, audio.sample_rate)
+        .map_err(|e| format!("mp3 encode: {e}"))?;
+    encoder.finish();
+    let mut file = BufWriter::new(File::create(out)?);
+    // `next_packet` after `finish` yields frames until `Eof`, the Xing/Info
+    // header first: the loop ends on the only error it can see.
+    while let Ok(frame) = encoder.next_packet() {
+        file.write_all(&frame)?;
+    }
+    file.flush()?;
     Ok(())
 }
 
@@ -831,34 +873,59 @@ fn write_video(
     meta: &VideoMeta,
     settings: &ExportSettings,
     audio: Option<&AudioParams>,
+    packets: &mut Option<Vec<crate::AacPacket>>,
     au: &[u8],
     key: bool,
 ) -> crate::Result<()> {
-    if settings.format == Format::Av1 {
+    if settings.format.is_av1() {
+        // Every AV1 stream opens on a keyframe, and a keyframe carries the
+        // sequence header the track has to declare: an encoder that handed back
+        // neither has produced nothing a decoder can start. The same header goes
+        // into a `CodecPrivate` and into an `av1C` -- one record, two containers.
+        fn params<'a>(meta: &VideoMeta, au: &'a [u8]) -> crate::Result<Av1Params<'a>> {
+            Ok(Av1Params {
+                width: meta.width,
+                height: meta.height,
+                frame_rate: meta.frame_rate,
+                config: crate::mux::av1_sequence_header(au)
+                    .ok_or("the first coded picture carries no AV1 sequence header")?,
+            })
+        }
+        if settings.format == Format::Av1 {
+            let muxer = match muxer {
+                Some(Muxer::Mkv(mkv)) => mkv,
+                Some(Muxer::Mp4(_)) => unreachable!("the format picks the muxer once"),
+                none => {
+                    // The sound with it, all of it: the Matroska muxer writes the
+                    // packets into the clusters of the pictures they play under.
+                    let sound = audio.zip(packets.take());
+                    let Muxer::Mkv(mkv) = none.insert(Muxer::Mkv(MkvMuxer::create(
+                        out,
+                        &params(meta, au)?,
+                        sound,
+                    )?)) else {
+                        unreachable!("just inserted a Matroska muxer")
+                    };
+                    mkv
+                }
+            };
+            return muxer.write_frame(au, key);
+        }
         let muxer = match muxer {
-            Some(Muxer::Mkv(mkv)) => mkv,
-            Some(Muxer::Mp4(_)) => unreachable!("the format picks the muxer once"),
+            Some(Muxer::Mp4(mp4)) => mp4,
+            Some(Muxer::Mkv(_)) => unreachable!("the format picks the muxer once"),
             none => {
-                // Every AV1 stream opens on a keyframe, and a keyframe carries
-                // the sequence header the track has to declare: an encoder that
-                // handed back neither has produced nothing a decoder can start.
-                let config = crate::mux::av1_sequence_header(au)
-                    .ok_or("the first coded picture carries no AV1 sequence header")?;
-                let Muxer::Mkv(mkv) = none.insert(Muxer::Mkv(MkvMuxer::create(
+                let Muxer::Mp4(mp4) = none.insert(Muxer::Mp4(Mp4Muxer::create_av1(
                     out,
-                    &Av1Params {
-                        width: meta.width,
-                        height: meta.height,
-                        frame_rate: meta.frame_rate,
-                        config,
-                    },
+                    &params(meta, au)?,
+                    audio,
                 )?)) else {
-                    unreachable!("just inserted a Matroska muxer")
+                    unreachable!("just inserted an mp4 muxer")
                 };
-                mkv
+                mp4
             }
         };
-        return muxer.write_frame(au, key);
+        return muxer.write_av1_frame(au, key);
     }
     if !crate::mux::has_coded_slice(au) {
         return Ok(());
@@ -928,7 +995,9 @@ enum Enc {
 
 impl Enc {
     fn open(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
-        if settings.format == Format::Av1 {
+        // Which *codec* the picture is, not which container it goes in: both AV1
+        // formats run the same encoder.
+        if settings.format.is_av1() {
             return Self::open_av1(meta, settings);
         }
         // A caller's number goes through the same clamp as the computed one: a

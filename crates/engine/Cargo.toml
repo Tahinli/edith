@@ -35,6 +35,11 @@ rusty_h264 = { version = "0.8", default-features = false }
 # Fraunhofer's C library, which this project's no-install rule forbids. Built
 # from `vendor/rusty_aac` -- see the patch table in the workspace manifest.
 rusty_aac = "0.5"
+# The MP3 encoder, so that format is a row a user can pick rather than a licence
+# note: pure Rust, Apache-2.0, CBR and VBR. The decoder side of mp3 is
+# symphonia's below -- an mp3 has always been importable here, and until this it
+# was the one format the editor could read and never write.
+rusty_mp3 = "0.6"
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
