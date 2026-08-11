@@ -28,7 +28,9 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
@@ -150,6 +152,67 @@ pub struct StreamInfo {
     /// grey-out rule, mirroring the refusals `Track::open` and `Track::channels`
     /// make one file at a time.
     pub decodable: bool,
+}
+
+/// The mix settings a *running* mixer reads: what each lane is turned by on its
+/// way into the sum and the ceiling the sum comes out through, both swappable
+/// while the stream plays.
+///
+/// This is what keeps a fader off the reseek path. Everything else a timeline
+/// says lives inside a decode worker -- a segment's window, its curve, its rate
+/// -- and can only be changed by rebuilding it, which is a flush, a re-open and
+/// a hole in the sound. These two live at the sum, where nothing is decoded, so
+/// the mixer can pick them up between one block and the next: an arrow key held
+/// down on a fader moves the level and nothing else moves at all.
+///
+/// One of these belongs to one mixer thread. [`is_live`](MixControls::is_live)
+/// is what says whether a mixer is actually reading it -- a single lane at
+/// unity with the limiter off is not mixed at all
+/// ([`AudioSession::open_mixed_streams_master`]), and a caller that finds this
+/// dead has to reopen the stream to be heard.
+pub struct MixControls {
+    /// Bumped by every change; the mixer reloads when the number it last saw
+    /// is not this one, so an unchanged mix costs one relaxed load per block.
+    version: AtomicU64,
+    /// The lane amplitudes and the limiter, together: they are set together and
+    /// a mixer that read half of one change and half of the next would be
+    /// mixing a state nobody asked for.
+    state: Mutex<(Vec<f32>, Limiter)>,
+    /// A mixer thread has these; see the type docs.
+    live: AtomicBool,
+}
+
+impl MixControls {
+    pub fn new(gains: Vec<f32>, limiter: Limiter) -> Arc<Self> {
+        Arc::new(Self {
+            version: AtomicU64::new(0),
+            state: Mutex::new((gains, limiter)),
+            live: AtomicBool::new(false),
+        })
+    }
+
+    /// Hands the running mixer a new mix. Cheap enough for a key repeat: a lock
+    /// held for a `Vec` swap and an atomic.
+    pub fn set(&self, gains: Vec<f32>, limiter: Limiter) {
+        *self.state.lock().unwrap() = (gains, limiter);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether a mixer thread is reading this at all.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The mix, if it has moved since `seen`. `None` -- the every-block case --
+    /// takes no lock.
+    fn changed(&self, seen: &mut u64) -> Option<(Vec<f32>, Limiter)> {
+        let now = self.version.load(Ordering::Acquire);
+        if now == *seen {
+            return None;
+        }
+        *seen = now;
+        Some(self.state.lock().unwrap().clone())
+    }
 }
 
 pub struct AudioSession;
@@ -498,6 +561,26 @@ impl AudioSession {
         gains: &[f32],
         limiter: Limiter,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_live(sources, lanes, eqs, speeds, gains, limiter, None)
+    }
+
+    /// [`open_mixed_streams_master`](Self::open_mixed_streams_master) with the
+    /// mix left *reachable*: `live` is the handle the mixer picks its gains and
+    /// its limiter off between blocks, so a fader moved while the stream plays
+    /// is heard without the stream being rebuilt ([`MixControls`]).
+    ///
+    /// `gains`/`limiter` still say what it starts as -- they are what decides
+    /// whether there is a mixer at all -- and the handle is marked live only
+    /// when there is one. An export passes `None`: nothing can move under it.
+    pub fn open_mixed_streams_live(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+        gains: &[f32],
+        limiter: Limiter,
+        live: Option<&Arc<MixControls>>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, rest @ ..] = lanes else {
             return Ok(None);
         };
@@ -540,12 +623,20 @@ impl AudioSession {
         let mut gains = gains.to_vec();
         gains.resize(lanes.len(), 1.0);
         // Built here, off the thread that will run it, where the rate is known.
-        let limiter = limiter
+        let state = limiter
             .is_active()
             .then(|| LimiterState::new(&limiter, meta.sample_rate, channels));
+        // Marked before the spawn rather than inside it: a caller asks this the
+        // moment the open returns, and a flag set on the far thread would still
+        // read dead.
+        let live = live.map(|live| {
+            live.live.store(true, Ordering::Release);
+            live.clone()
+        });
+        let rate = meta.sample_rate;
         thread::Builder::new()
             .name("audio-mix".into())
-            .spawn(move || mix(&rxs, channels, &gains, limiter, &tx))?;
+            .spawn(move || mix(&rxs, channels, gains, state, rate, live.as_deref(), &tx))?;
         Ok(Some((meta, rx)))
     }
 
@@ -2124,10 +2215,15 @@ struct Worker {
 fn mix(
     rxs: &[Receiver<AudioChunk>],
     channels: usize,
-    gains: &[f32],
+    mut gains: Vec<f32>,
     mut limiter: Option<LimiterState>,
+    rate: u32,
+    controls: Option<&MixControls>,
     tx: &SyncSender<AudioChunk>,
 ) {
+    // The version of the mix these gains and this limiter came from; see the
+    // reload at the head of the loop.
+    let mut seen = 0;
     let mut pending: Vec<Vec<f32>> = rxs.iter().map(|_| Vec::new()).collect();
     let mut live: Vec<bool> = rxs.iter().map(|_| true).collect();
     // Numbering follows lane 0, whose first chunk says where it starts.
@@ -2135,6 +2231,24 @@ fn mix(
     let mut emitted = 0;
     let mut out: Vec<f32> = Vec::new();
     loop {
+        // A mix moved while the stream plays, picked up between two blocks:
+        // the levels change at a block boundary and nothing else changes at
+        // all -- no flush, no re-open, no hole. The limiter is *retuned* rather
+        // than rebuilt, so its delay line keeps running and the sample count
+        // the master clock is made of does not move ([`LimiterState::retune`]).
+        if let Some((next, params)) = controls.and_then(|c| c.changed(&mut seen)) {
+            gains = next;
+            gains.resize(rxs.len(), 1.0);
+            match limiter.as_mut() {
+                Some(state) => state.retune(&params),
+                // First time it has ever been switched in on this stream: the
+                // one that swallows nothing, for the count's sake.
+                None if params.is_active() => {
+                    limiter = Some(LimiterState::engaged(&params, rate, channels));
+                }
+                None => {}
+            }
+        }
         for (i, rx) in rxs.iter().enumerate() {
             while live[i] && pending[i].is_empty() {
                 match rx.recv() {

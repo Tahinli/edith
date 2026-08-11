@@ -12,7 +12,7 @@
 //! the renderer decides which frame that means.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,6 +31,13 @@ use crate::scale::{Composer, FitPolicy};
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
 const RING_FULL_WAIT: Duration = Duration::from_millis(10);
+
+/// How long the feeder waits out a ring that took *nothing*: the flush of a
+/// restart, which only the device's own callback can clear (`engine-audio`
+/// refuses a write queued behind one). Short, because this is the gap at the
+/// head of every restart and the ear is in it -- one wakeup per millisecond,
+/// for the millisecond or two it lasts.
+const FLUSH_WAIT: Duration = Duration::from_millis(1);
 
 /// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
 /// nothing was shot on it, so it is the canvas a *later* import meets rather
@@ -91,6 +98,18 @@ struct Audio {
     /// Bumped by every seek. A feeder only owns the device while this still
     /// matches the value it started with; see [`feed`].
     epoch: Arc<AtomicU64>,
+    /// The device position the *current* stream's first real sample was queued
+    /// at, `-1` until the feeder has queued one. Written by the feeder under the
+    /// device lock, read by [`tick`](PlaybackSession::tick).
+    ///
+    /// This is what keeps a restart out of the timeline. Between a flush and the
+    /// first sample of the new stream the device plays silence -- a decoder open
+    /// is tens of milliseconds -- and that silence is elapsed *device* time
+    /// ([`crate::ao`] counts it, as it must: it really was played). It is not
+    /// elapsed *timeline* time, and a clock anchored on the first poll after a
+    /// seek counts it as such, which is a permanent offset between the picture
+    /// and the sound, re-rolled by every edit made while playing.
+    content_at: Arc<AtomicI64>,
     /// The last [`TAP_SAMPLES`] mono samples handed to the device, oldest
     /// first: what a meter or an analyser draws. Written by the feeder, which
     /// is not the device's own callback -- the plugin's RT thread never sees
@@ -158,6 +177,11 @@ pub struct PlaybackSession {
     /// starts here, and a caller offering sizes to pick from needs the media's
     /// own among them or a project moved off it could never come back.
     native: (u32, u32),
+    /// ...and the scaffolding source's own frame rate, kept for exactly that
+    /// reason: the project rate starts here, and the list a caller offers rates
+    /// from needs the media's own on it or a project moved off it has no way
+    /// back ([`PlaybackSession::set_frame_rate`] is not an undo step either).
+    native_fps: f64,
     frames: Receiver<Frame>,
     /// The current decode worker.
     worker: Worker,
@@ -228,6 +252,39 @@ pub struct PlaybackSession {
     span: Option<Span>,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
+    /// The mix the running mixer is reading, when there is one: what lets a
+    /// fader and the master ceiling move without rebuilding the audio pipeline
+    /// at all ([`crate::audio::MixControls`]). `None` for a timeline that is
+    /// not mixed -- one audio lane at unity with the limiter off, which is the
+    /// bit-exact single-stream path -- and the first move off that reopens the
+    /// stream once, mixed, and lives from there.
+    mix: Option<Arc<crate::audio::MixControls>>,
+    /// An audio stream has been started and has not yet played a sample: the
+    /// window [`tick`](Self::tick) holds the clock still through, so the silence
+    /// of a restart is never counted as timeline time. See
+    /// [`Audio::content_at`].
+    priming: bool,
+}
+
+/// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
+/// change to be seen or heard, and, far more to the point, which half must not
+/// be.
+///
+/// Rebuilding a half is expensive and *audible*: the video worker costs a
+/// decoder open (98 ms of VA-API init, worst case, measured) and the audio one
+/// costs a flush, a re-open and a hole in the sound. A grade changes no sample
+/// and a fader changes no picture, so neither may pay the other's price -- that
+/// is the whole of this type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dirty {
+    /// The picture only: a grade, a fit policy, the project resolution. The
+    /// sound keeps playing, untouched, and the clock never moves.
+    Picture,
+    /// The sound only: a clip's equalizer. The picture keeps playing.
+    Sound,
+    /// The timeline itself -- what is where, how long, how fast. Both halves
+    /// are rebuilt, because both are decoding the wrong thing.
+    Both,
 }
 
 impl PlaybackSession {
@@ -277,6 +334,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
+            native_fps: meta.frame_rate,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -291,6 +349,8 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             eos: false,
+            mix: None,
+            priming: false,
         })
     }
 
@@ -375,6 +435,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (width, height),
+            native_fps: frame_rate,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -395,6 +456,8 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             eos: false,
+            mix: None,
+            priming: false,
         })
     }
 
@@ -451,6 +514,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
+            native_fps: IMAGE_ONLY_RATE,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -465,6 +529,8 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             eos: false,
+            mix: None,
+            priming: false,
         })
     }
 
@@ -585,6 +651,32 @@ impl PlaybackSession {
             meta.width = width;
             meta.height = height;
         }
+        // ...and the project's own *rate*, which is the scaffold's unless the
+        // file says otherwise. The two made-up rates above already took the
+        // saved one (their counts are computed from it); a scaffold with a
+        // picture keeps its own here, so a project cut at a rate nobody picked
+        // is the file it always was -- and one where a rate *was* picked
+        // ([`set_frame_rate`](Self::set_frame_rate)) comes back at it rather
+        // than at the media's, which would leave every clip number counted in
+        // frames the timeline no longer has.
+        let native_fps = match crate::is_audio(&first.path) {
+            true => AUDIO_ONLY_CANVAS.2,
+            false if crate::is_image(&first.path) => IMAGE_ONLY_RATE,
+            false => meta.frame_rate,
+        };
+        if let Some(fps) = saved_fps {
+            meta.frame_rate = fps;
+        }
+        // A song and a still have no rate of their own to be conformed from:
+        // their length above was counted in the timeline's frames already,
+        // whatever those are. A file with pictures is read through [`Rate`] like
+        // any other source when the project is cut at another rate.
+        let made_up = crate::is_audio(&first.path) || crate::is_image(&first.path);
+        let scaffold_rate = match made_up || native_fps == meta.frame_rate {
+            true => Rate::REAL_TIME,
+            false => Rate::from_fps(native_fps, meta.frame_rate)
+                .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+        };
         let first_audio = first_audio_of(&doc.sources)?;
 
         // In source order, with the scaffold's own count in its own slot: the
@@ -599,8 +691,8 @@ impl PlaybackSession {
         let mut rates = Vec::with_capacity(doc.sources.len());
         for (i, source) in doc.sources.iter().enumerate() {
             if i == scaffold {
-                counts.push(meta.frame_count);
-                rates.push(Rate::REAL_TIME);
+                counts.push(scaffold_rate.timeline_at(meta.frame_count));
+                rates.push(scaffold_rate);
                 continue;
             }
             // A still has neither a rate to match nor a track to match with:
@@ -704,6 +796,7 @@ impl PlaybackSession {
         let mut session = Self {
             meta,
             native,
+            native_fps,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -720,6 +813,8 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             eos: false,
+            mix: None,
+            priming: false,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -750,6 +845,33 @@ impl PlaybackSession {
     /// plugin open and lives in [`crate::export::planned_video`].
     pub fn planned_audio(&self, format: crate::export::Format) -> &'static str {
         crate::export::planned_audio(&self.project, format)
+    }
+
+    /// What an export would do about the subtitle track at `pick` --
+    /// [`crate::export::planned_subtitles`], asked of the project a front-end is
+    /// holding, and pure for the same reason. `pick` is a row of
+    /// [`subtitles`](Self::subtitles).
+    pub fn planned_subtitles(&self, format: crate::export::Format, pick: Option<usize>) -> String {
+        crate::export::planned_subtitles(&self.project, format, pick)
+    }
+
+    /// Where the cues of the track at `pick` land on *this* timeline --
+    /// [`crate::export::timeline_cues`], the very map an export writes the file
+    /// with, so a front-end that draws these draws what the file will say. On a
+    /// rippled or cut timeline that is the whole point: an embedded track rides
+    /// the spans that still play it, and a standalone `.srt` keeps the
+    /// timeline's own clock, clipped to its length.
+    ///
+    /// Empty for a row that is not there and for a track that could not be read.
+    /// Pure and file-free, so it may be asked per repaint; the cost is a walk of
+    /// the spans and of the cues.
+    pub fn timeline_cues(&self, pick: usize) -> Vec<crate::subtitle::Cue> {
+        self.project
+            .subtitles()
+            .get(pick)
+            .map_or_else(Vec::new, |t| {
+                crate::export::timeline_cues(&self.project, t, self.meta.frame_rate)
+            })
     }
 
     /// Why the sound's rate is not a choice for this timeline in this format --
@@ -899,8 +1021,20 @@ impl PlaybackSession {
         }
     }
 
-    /// Whether the timeline has been played out. Any seek clears it, so an edit
-    /// after the end (which reseeks) revives the session.
+    /// Whether the timeline has been played out: the picture worker ran to the
+    /// end and there was no next clip. It is exactly that and nothing more,
+    /// which is what decides who clears it -- **starting a picture does**
+    /// (`start_picture`), so a seek clears it and so does every edit that
+    /// rebuilds the picture (`Dirty::Picture`, `Dirty::Both` -- a paste or a
+    /// placement past the end revives the session, and it has a new picture to
+    /// show for it).
+    ///
+    /// A **sound-only** edit does not (`Dirty::Sound`: an equalizer, a fader):
+    /// it rebuilds the sound where the playhead stands and starts no picture
+    /// worker, so the last frame is still the last frame and this is still the
+    /// end. A front-end's `Ended` therefore survives an EQ tweak made after the
+    /// timeline ran out -- the parameters are on the project either way, and the
+    /// next press restarts from the top with them, which is what `Ended` means.
     pub fn is_eos(&self) -> bool {
         self.eos
     }
@@ -1031,15 +1165,29 @@ impl PlaybackSession {
                 gap.map_or(1, |s| s.len),
             )),
         };
-        if let Ok(stream) = opened {
-            // Receiver first, worker second: the drop of the *old* receiver is
-            // what wakes the outgoing worker if it is parked in `send`, and only
-            // then can it return and be reaped by a later sweep. Nothing here
-            // joins, so this ordering costs the seek nothing.
-            self.frames = stream.frames;
-            self.backend = stream.backend;
-            self.retire(stream.worker);
-        }
+        let Ok(stream) = opened else {
+            // The file would not open. The span still goes in -- the timeline
+            // moves on, there are simply no more pictures -- but the *frames*
+            // must not: the old channel's pictures are numbered in the old
+            // source's frames, and presenting them under the new mapping would
+            // put the wrong picture at the wrong time (and leave
+            // [`decode_backend`](Self::decode_backend) describing a worker that
+            // is no longer feeding anything). A dead receiver instead, which is
+            // what carries the session on to the next span. The old worker stays
+            // parked in `self.worker` where the caller already cancelled it; the
+            // next span retires it.
+            self.frames = std::sync::mpsc::channel().1;
+            self.backend = BackendCell::new(Backend::Gap);
+            self.span = span;
+            return;
+        };
+        // Receiver first, worker second: the drop of the *old* receiver is
+        // what wakes the outgoing worker if it is parked in `send`, and only
+        // then can it return and be reaped by a later sweep. Nothing here
+        // joins, so this ordering costs the seek nothing.
+        self.frames = stream.frames;
+        self.backend = stream.backend;
+        self.retire(stream.worker);
         self.span = span;
     }
 
@@ -1158,18 +1306,20 @@ impl PlaybackSession {
     }
 
     /// Gives that clip an equalizer, or takes it off with `None`. One undo step,
-    /// like every other edit -- and, like every other edit, it *reseeks*: the
-    /// audio workers are rebuilt from the new curves right where the playhead
+    /// like every other edit -- and it rebuilds the **sound** where the playhead
     /// is, so a band changed during playback is heard from the next chunk on
-    /// rather than at the next play. `false` for a bad index or a non-finite
-    /// band, and nothing changes.
+    /// rather than at the next play. The picture is not touched: the video
+    /// worker keeps decoding through it ([`Dirty`]). `false` for a bad index or
+    /// a non-finite band, and nothing changes.
     ///
-    /// ponytail: the reseek is what makes it live, so the cost of a change is a
-    /// decoder restart -- inaudible at a drag's end, but too much to call once
-    /// per pointer sample (a caller commits one change per gesture). Upgrade
-    /// path is an `Arc` swap the running worker polls per chunk.
+    /// ponytail: the audio rebuild is what makes it live, so the cost of a
+    /// change is a decoder restart -- inaudible at a drag's end, but too much to
+    /// call once per pointer sample (a caller commits one change per gesture).
+    /// Upgrade path is the per-segment twin of [`crate::audio::MixControls`],
+    /// which the lane worker would poll per chunk the way the mixer polls the
+    /// gains.
     pub fn set_eq(&mut self, lane: Lane, idx: usize, params: Option<EqParams>) -> bool {
-        self.edit(|p| p.set_eq(lane, idx, params))
+        self.edit(Dirty::Sound, |p| p.set_eq(lane, idx, params))
     }
 
     /// How loud that lane plays, in dB -- everything on it, every frequency of
@@ -1178,12 +1328,36 @@ impl PlaybackSession {
         self.project.lane_gain_db(lane)
     }
 
-    /// Sets it. One undo step and a reseek, the equalizer's rule for the
-    /// equalizer's reason: the mixer is rebuilt from the new volumes right
-    /// where the playhead is, so a track turned down during playback is heard
-    /// turned down from the next chunk on.
+    /// Sets it. One undo step -- and **nothing is rebuilt**: a lane's volume
+    /// lives at the sum, so the running mixer is handed the new number and
+    /// picks it up at its next block ([`crate::audio::MixControls`]). A fader
+    /// held down under an arrow key therefore moves the level and nothing else:
+    /// no flush, no decoder restart, no hole in the sound and no blink in the
+    /// picture.
+    ///
+    /// The one exception is the timeline that is not mixed at all -- a single
+    /// audio lane at unity with the limiter off, which plays through the
+    /// bit-exact single-stream path and has no mixer to talk to. Moving *that*
+    /// off unity opens one, once; every move after it is live.
     pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
-        self.edit(|p| p.set_lane_gain_db(lane, db))
+        if !self.project.set_lane_gain_db(lane, db) {
+            return false;
+        }
+        self.push_mix();
+        true
+    }
+
+    /// Hands the mix the running mixer is reading its new settings -- the whole
+    /// of what a fader and a ceiling cost. With no mixer listening (the
+    /// single-lane flat path, and a session with no sound at all) the sound is
+    /// rebuilt instead, which is what opens one.
+    fn push_mix(&mut self) {
+        let gains = self.project.audio_gains();
+        let limiter = self.project.limiter();
+        match &self.mix {
+            Some(mix) => mix.set(gains, limiter),
+            None => self.reseek_audio(),
+        }
     }
 
     /// The master limiter the whole mix is summed through.
@@ -1192,9 +1366,25 @@ impl PlaybackSession {
     }
 
     /// Sets it, live like a lane volume and for the same reason -- the ceiling
-    /// a person is dragging has to be the ceiling they are hearing.
+    /// a person is dragging has to be the ceiling they are hearing. Nothing is
+    /// rebuilt: the running limiter is *retuned* between two blocks
+    /// ([`crate::limiter::LimiterState::retune`]), so its delay line keeps
+    /// running and the sample count the master clock is made of does not move.
+    ///
+    /// ponytail: not an undo step, and deliberately -- [`Project::undo`]
+    /// restores the lane list, and the limiter is not in it, so snapshotting
+    /// here would push a step whose undo changes nothing a person can see or
+    /// hear (the twin [`set_lane_gain_db`](Self::set_lane_gain_db) *is*
+    /// undoable only because a lane volume lives in that list). The project
+    /// resolution is outside undo for the same reason and says so. Upgrade path
+    /// is a history that carries the mix beside the lanes, which every existing
+    /// snapshot site would then have to fill in.
     pub fn set_limiter(&mut self, limiter: crate::limiter::Limiter) -> bool {
-        self.edit(|p| p.set_limiter(limiter))
+        if !self.project.set_limiter(limiter) {
+            return false;
+        }
+        self.push_mix();
+        true
     }
 
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
@@ -1203,7 +1393,7 @@ impl PlaybackSession {
     /// the last placement there is empties the timeline, which is a state
     /// ([`is_empty`](Self::is_empty)) and one undo away.
     pub fn lift_clip(&mut self, lane: Lane, idx: usize) -> bool {
-        self.edit(|p| p.lift(lane, idx))
+        self.edit(Dirty::Both, |p| p.lift(lane, idx))
     }
 
     /// Moves that clip onto lane `to` with its head at timeline frame `start` --
@@ -1219,7 +1409,7 @@ impl PlaybackSession {
     /// pointer on a frame, and converting it back through seconds would be a
     /// rounding step between the box let go of and the box committed.
     pub fn move_clip_to(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
-        self.edit(|p| p.move_clip(from, idx, to, start))
+        self.edit(Dirty::Both, |p| p.move_clip(from, idx, to, start))
     }
 
     /// Drags one end of that clip to timeline frame `to`, changing how much of
@@ -1401,7 +1591,7 @@ impl PlaybackSession {
     /// without the caller having to nudge the playhead itself. `false` for an
     /// index that is not there and for a value that is not finite.
     pub fn set_color(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
-        self.edit(|p| p.set_color(lane, idx, params))
+        self.edit(Dirty::Picture, |p| p.set_color(lane, idx, params))
     }
 
     /// The same grade and the same reseek without the undo step
@@ -1409,7 +1599,7 @@ impl PlaybackSession {
     /// through, so the frame regrades under the hand and the whole gesture is
     /// still a single `z`.
     pub fn set_color_live(&mut self, lane: Lane, idx: usize, params: Option<ColorParams>) -> bool {
-        self.edit(|p| p.set_color_live(lane, idx, params))
+        self.edit(Dirty::Picture, |p| p.set_color_live(lane, idx, params))
     }
 
     /// The project's resolution: what every clip is composed onto, what the
@@ -1426,10 +1616,13 @@ impl PlaybackSession {
         self.native
     }
 
-    /// Sets it. Reseeks like an edit, so the frame on screen is recomposed at
-    /// the new size at once, paused or playing. `false` for a size that is not a
-    /// picture -- zero either way, or past 8K, which is where the per-frame
-    /// buffers stop being a sane thing to allocate from a keystroke.
+    /// Sets it. Rebuilds the **picture** where the playhead is, so the frame on
+    /// screen is recomposed at the new size at once, paused or playing -- and
+    /// the sound is not touched at all: the size of the canvas is not something
+    /// a sample can carry, so resizing a 4K film mid-play costs neither a hole
+    /// in the audio nor an offset against it ([`Dirty`]). `false` for a size
+    /// that is not a picture -- zero either way, or past 8K, which is where the
+    /// per-frame buffers stop being a sane thing to allocate from a keystroke.
     ///
     /// ponytail: not an undo step. The project resolution is not in the lane
     /// snapshots [`Project::undo`] restores, so cycling it back is one more
@@ -1444,6 +1637,61 @@ impl PlaybackSession {
         }
         self.meta.width = width;
         self.meta.height = height;
+        self.invalidate(Dirty::Picture);
+        true
+    }
+
+    /// The scaffolding source's own frame rate -- what the project rate started
+    /// as, and the one rate a caller offering a list of them must not leave out
+    /// ([`native_resolution`](Self::native_resolution)'s reason).
+    pub fn native_frame_rate(&self) -> f64 {
+        self.native_fps
+    }
+
+    /// Cuts this timeline at `fps` from here on: every clip is *conformed* to
+    /// the new rate ([`Project::retime`]), every source is read through a
+    /// [`Rate`] against it, and an export written from this session comes out at
+    /// it. The edit survives as the same seconds of the same footage on a finer
+    /// or coarser grid -- a 30 fps take on a timeline moved to 24 keeps its
+    /// length and its sync, it is simply counted in 24ths now.
+    ///
+    /// Reseeks like [`set_resolution`](Self::set_resolution), so the picture and
+    /// the sound under the playhead are already the new rate's when this
+    /// returns. `false` -- changing nothing -- for a rate that is not a rate, for
+    /// the one already in force, and for one no timescale can name
+    /// ([`crate::mux::frame_timing`], the same wall a file of an unnameable rate
+    /// is refused at).
+    ///
+    /// ponytail: not an undo step, exactly as the project resolution is not --
+    /// and this one *moves the frame numbers*, so the way back is picking the
+    /// old rate (or the media's, [`native_frame_rate`](Self::native_frame_rate))
+    /// rather than a `z`, and it lands within a frame of where it started rather
+    /// than on it (see [`Project::retime`]). Upgrade path is the same one: the
+    /// project's settings snapshotted beside the lanes.
+    pub fn set_frame_rate(&mut self, fps: f64) -> bool {
+        if !fps.is_finite() || fps <= 0.0 || fps == self.meta.frame_rate {
+            return false;
+        }
+        // Old timeline frames per new one, exactly -- the one map every frame
+        // number on every lane goes through. Built before anything is touched,
+        // since a rate no timescale can name is a refusal and not a half-retimed
+        // project.
+        let Ok(k) = Rate::from_fps(self.meta.frame_rate, fps) else {
+            return false;
+        };
+        // Lengths first: the retime holds every clip inside its source's *new*
+        // length, so a clip that played to the last frame of its file still
+        // does rather than naming one past the end.
+        for count in &mut self.counts {
+            *count = k.timeline_at(*count).max(1);
+        }
+        self.project.retime(k, &self.counts);
+        // A file's own rate has not changed; what it is *against* has.
+        for rate in &mut self.rates {
+            *rate = rate.then(k);
+        }
+        self.meta.frame_rate = fps;
+        self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
         let now = self.now();
         self.seek(now);
         true
@@ -1458,7 +1706,7 @@ impl PlaybackSession {
     /// grade: the picture on screen is recomposed through the new policy without
     /// the caller nudging the playhead. `false` for an index that is not there.
     pub fn set_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy) -> bool {
-        self.edit(|p| p.set_fit(lane, idx, fit))
+        self.edit(Dirty::Picture, |p| p.set_fit(lane, idx, fit))
     }
 
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
@@ -1473,7 +1721,7 @@ impl PlaybackSession {
     /// the end of the timeline the clip is appended. One undo step.
     pub fn paste_at(&mut self, timeline_secs: f64, clip: Clip) -> bool {
         let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
-        self.edit(|p| p.paste(at, clip))
+        self.edit(Dirty::Both, |p| p.paste(at, clip))
     }
 
     /// Places the whole of `path` played on its audio `stream` at
@@ -1632,7 +1880,7 @@ impl PlaybackSession {
     /// and it reseeks like every other edit.
     pub fn place_at(&mut self, lane: Lane, timeline_secs: f64, clip: Clip) -> bool {
         let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
-        self.edit(|p| p.place(lane, at, clip))
+        self.edit(Dirty::Both, |p| p.place(lane, at, clip))
     }
 
     /// Removes `lane`'s clip at `idx` and everything under it, closing the gap
@@ -1646,12 +1894,12 @@ impl PlaybackSession {
     /// not `V1`'s, and a front-end that could only say "the third clip" would
     /// delete the wrong one the moment a second lane exists.
     pub fn delete_clip(&mut self, lane: Lane, idx: usize) -> bool {
-        self.edit(|p| p.delete_in(lane, idx))
+        self.edit(Dirty::Both, |p| p.delete_in(lane, idx))
     }
 
     /// Undoes the last successful edit, and reseeks like a delete.
     pub fn undo(&mut self) -> bool {
-        self.edit(Project::undo)
+        self.edit(Dirty::Both, Project::undo)
     }
 
     /// Takes `path` into the **library**: it becomes a source of this session,
@@ -1743,16 +1991,34 @@ impl PlaybackSession {
         Ok(source)
     }
 
-    /// Applies an edit and, if it took, reseeks onto the new mapping. `seek`
-    /// clamps to the new duration and keeps playing playing, so a delete that
-    /// shortens the timeline past the playhead lands on the last frame.
-    fn edit(&mut self, f: impl FnOnce(&mut Project) -> bool) -> bool {
+    /// Applies an edit and, if it took, rebuilds **what it dirtied** and nothing
+    /// else ([`Dirty`]). A structural edit reseeks: `seek` clamps to the new
+    /// duration and keeps playing playing, so a delete that shortens the
+    /// timeline past the playhead lands on the last frame. A grade or a fit
+    /// policy rebuilds the picture where it stands, with the sound running
+    /// through it untouched -- no flush, no re-open, no hole -- and an
+    /// equalizer the other way round.
+    fn edit(&mut self, dirty: Dirty, f: impl FnOnce(&mut Project) -> bool) -> bool {
         if !f(&mut self.project) {
             return false;
         }
-        let now = self.now();
-        self.seek(now);
+        self.invalidate(dirty);
         true
+    }
+
+    /// Rebuilds the dirtied half (or both) at the playhead.
+    fn invalidate(&mut self, dirty: Dirty) {
+        match dirty {
+            Dirty::Picture => {
+                let (_, target) = self.landing(self.now());
+                self.start_picture(target);
+            }
+            Dirty::Sound => self.reseek_audio(),
+            Dirty::Both => {
+                let now = self.now();
+                self.seek(now);
+            }
+        }
     }
 
     /// Current timeline position in seconds.
@@ -1856,25 +2122,33 @@ impl PlaybackSession {
     /// Playing stays playing and paused stays paused -- but a paused seek still
     /// decodes, so the caller can show the frame it landed on.
     pub fn seek(&mut self, secs: f64) {
+        let (t, target) = self.landing(secs);
+        let was_playing = self.clock.is_playing();
+        self.stop_audio();
+        self.start_picture(target);
+        let audio_running = self.start_audio(target);
+        // Same invariant as `play`: position the clock before audio restarts.
+        if audio_running && self.clock.source() != ClockSource::Audio {
+            self.clock.switch_to_audio();
+        }
+        self.clock.seek_to(t);
+        self.resume(was_playing);
+    }
+
+    /// Where a seek to `secs` lands: the clamped timeline position and the
+    /// timeline frame it means. The one place the clamp lives, so every
+    /// invalidation below lands on the same frame a seek would.
+    fn landing(&self, secs: f64) -> (f64, u32) {
         let fps = self.meta.frame_rate;
         let total = self.project.timeline_frames();
         let t = secs.clamp(0.0, f64::from(total) / fps);
-        let target = secs_to_frame(t, fps).min(total.saturating_sub(1));
-        let was_playing = self.clock.is_playing();
+        (t, secs_to_frame(t, fps).min(total.saturating_sub(1)))
+    }
 
-        if let Some(audio) = &self.audio {
-            let ao = audio.ao.lock().unwrap();
-            ao.set_active(false);
-            // Bumped and flushed while holding the device lock, because the
-            // feeder re-checks the epoch inside that same lock: whatever it is
-            // carrying can no longer reach the ring after this point.
-            audio.epoch.fetch_add(1, Ordering::Release);
-            ao.flush();
-            // The flushed samples are not being played any more, so nothing may
-            // still be drawn from them.
-            audio.tap.lock().unwrap().clear();
-        }
-
+    /// Rebuilds the **picture** at `target` and touches nothing else: the sound
+    /// keeps playing out of the same stream, the clock keeps running, and a
+    /// grade dragged during playback is therefore silent.
+    fn start_picture(&mut self, target: u32) {
         // Cancel first, drop second: the old worker may be parked in `send` on
         // the bounded channel, where only the disconnect wakes it -- and it
         // then finds the flag already set. It is then parked, not joined; see
@@ -1886,8 +2160,45 @@ impl PlaybackSession {
         // the emptied timeline, black too, and `start_span` says so.
         self.start_span(self.project.composite_span_at(target));
         self.eos = false;
+    }
 
+    /// Silences the device and supersedes whatever is feeding it: the first half
+    /// of every audio restart, and the only thing that ever discards queued
+    /// sound.
+    fn stop_audio(&mut self) {
+        self.mix = None;
+        if let Some(audio) = &self.audio {
+            let ao = audio.ao.lock().unwrap();
+            ao.set_active(false);
+            // Bumped and flushed while holding the device lock, because the
+            // feeder re-checks the epoch inside that same lock: whatever it is
+            // carrying can no longer reach the ring after this point.
+            audio.epoch.fetch_add(1, Ordering::Release);
+            // Nothing of the new stream has been played yet, by definition.
+            audio.content_at.store(-1, Ordering::Release);
+            ao.flush();
+            // The flushed samples are not being played any more, so nothing may
+            // still be drawn from them.
+            audio.tap.lock().unwrap().clear();
+        }
+    }
+
+    /// Puts the device back where it was: playing if it was playing, and with
+    /// the clock held until the new stream is really audible (see
+    /// [`Audio::content_at`]).
+    fn resume(&mut self, was_playing: bool) {
+        self.priming = true;
+        if was_playing && let Some(audio) = &self.audio {
+            audio.ao.lock().unwrap().set_active(true);
+        }
+    }
+
+    /// Rebuilds the **sound** from `target` -- the second half of a restart --
+    /// and says whether anything will be fed.
+    fn start_audio(&mut self, target: u32) -> bool {
+        let fps = self.meta.frame_rate;
         let mut audio_running = false;
+        let mut live = None;
         if let Some(audio) = &self.audio
             && !audio.died.load(Ordering::Acquire)
         {
@@ -1921,32 +2232,58 @@ impl PlaybackSession {
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
             // ...and the mix settings over the lot: each lane's own volume on
-            // its way into the sum and the master limiter over the sum, both
-            // rebuilt here like the curves above, which is what makes a lane
-            // fader and a ceiling audible while the timeline runs.
+            // its way into the sum and the master limiter over the sum. These
+            // two are handed over *live* as well as at the open: they sit at
+            // the sum, where nothing is decoded, so a fader moved later is a
+            // number the running mixer picks up rather than a stream rebuilt
+            // under the ear ([`crate::audio::MixControls`]).
             let gains = self.project.audio_gains();
             let limiter = self.project.limiter();
-            audio_running = match AudioSession::open_mixed_streams_master(
-                &sources, &segs, &eqs, &speeds, &gains, limiter,
+            let controls = crate::audio::MixControls::new(gains.clone(), limiter);
+            audio_running = match AudioSession::open_mixed_streams_live(
+                &sources,
+                &segs,
+                &eqs,
+                &speeds,
+                &gains,
+                limiter,
+                Some(&controls),
             ) {
                 Ok(Some((_, rx))) => audio.spawn_feeder(rx),
                 _ => false,
             };
+            // Only a mixed timeline has a mixer to talk to; the single-lane
+            // flat path is the bit-exact one and has none.
+            live = (audio_running && controls.is_live()).then_some(controls);
             if !audio_running {
                 // Nothing will ever be fed again; let `tick` fall to wall time
                 // instead of waiting on a device that has no more work coming.
                 audio.fed_all.store(true, Ordering::Release);
             }
         }
+        self.mix = live;
+        audio_running
+    }
 
-        // Same invariant as `play`: position the clock before audio restarts.
+    /// Rebuilds the sound alone, from where the playhead is: what a change that
+    /// no picture can show goes through. The video worker is left decoding, so
+    /// the picture does not blink -- and the clock, held still by
+    /// [`resume`](Self::resume) until the new stream is audible, puts the sound
+    /// back exactly where the picture already is.
+    ///
+    /// End of stream is deliberately left alone -- no picture worker is started
+    /// here, so a timeline that was played out still is; see
+    /// [`is_eos`](Self::is_eos).
+    fn reseek_audio(&mut self) {
+        let (t, target) = self.landing(self.now());
+        let was_playing = self.clock.is_playing();
+        self.stop_audio();
+        let audio_running = self.start_audio(target);
         if audio_running && self.clock.source() != ClockSource::Audio {
             self.clock.switch_to_audio();
         }
         self.clock.seek_to(t);
-        if was_playing && let Some(audio) = &self.audio {
-            audio.ao.lock().unwrap().set_active(true);
-        }
+        self.resume(was_playing);
     }
 
     /// Renders the edited timeline to `out` on a worker thread. The session is
@@ -2000,10 +2337,35 @@ impl PlaybackSession {
             // Audio EOF. Wall time carries the same timeline on from here, with
             // no jump, and this branch cannot be reached again.
             self.clock.switch_to_wall();
-        } else {
-            self.clock
-                .set_audio_position(position as u64, audio.sample_rate);
+            return;
         }
+        if self.priming {
+            // A stream that has been started and has not been heard yet: the
+            // device is playing the silence of its own restart, and none of it
+            // is timeline time ([`Audio::content_at`]). The clock holds where
+            // the seek left it -- so the picture holds too, on the frame it
+            // landed on, rather than sliding ahead of a sound that has not
+            // started.
+            let started = audio.content_at.load(Ordering::Acquire);
+            if started < 0 {
+                return;
+            }
+            // ...and then the *first sample of the stream* becomes the
+            // reference, not whatever position this poll happened to catch: the
+            // clock's own anchor is its first report ([`PlaybackClock`]), and
+            // anchoring it here is what makes a mid-play edit cost no offset.
+            //
+            // ponytail: `started` is the position when the sample was queued,
+            // and it is heard at the next callback -- up to one quantum (5-21
+            // ms) later, so that much of the restart is still counted. Upgrade
+            // path is the position at the first *pop* of real audio, which only
+            // the plugin's RT thread can see.
+            self.clock
+                .set_audio_position(started as u64, audio.sample_rate);
+            self.priming = false;
+        }
+        self.clock
+            .set_audio_position(position as u64, audio.sample_rate);
     }
 }
 
@@ -2232,6 +2594,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         fed_all: Arc::new(AtomicBool::new(false)),
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
+        content_at: Arc::new(AtomicI64::new(-1)),
         tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
@@ -2257,21 +2620,39 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             if audio.epoch.load(Ordering::Acquire) != epoch {
                 return;
             }
-            match ao.write(&pending) {
+            let accepted = match ao.write(&pending) {
                 Some(n) => n,
                 None => {
                     // Output died; flag it so `tick` moves the clock to wall time.
                     audio.died.store(true, Ordering::Release);
                     return;
                 }
+            };
+            // The first sample of this stream to reach the ring, stamped with
+            // what the device had played by then: everything before it was the
+            // silence of the restart, and [`PlaybackSession::tick`] anchors the
+            // clock here so that silence is never timeline time. Under the
+            // device lock, with the epoch already checked, so the stamp and the
+            // sample belong to the same stream.
+            if accepted > 0 && audio.content_at.load(Ordering::Acquire) < 0 {
+                let at = ao.position().unwrap_or(0).max(0);
+                audio.content_at.store(at, Ordering::Release);
             }
+            accepted
         };
         audio.fed.fetch_add(accepted as u64, Ordering::Relaxed);
         audio.note_tap(&pending[..accepted]);
         pending.drain(..accepted);
         if !pending.is_empty() {
-            // Ring full: nothing to do but let the device drain it.
-            thread::sleep(RING_FULL_WAIT);
+            // Ring full: nothing to do but let the device drain it. Except when
+            // *nothing* was taken, which after a flush means the ring is still
+            // waiting for the device to consume the flush flag rather than
+            // being full: that is the head of a restart, and every millisecond
+            // spent parked there is a millisecond of silence.
+            match accepted {
+                0 => thread::sleep(FLUSH_WAIT),
+                _ => thread::sleep(RING_FULL_WAIT),
+            }
         }
     }
 }

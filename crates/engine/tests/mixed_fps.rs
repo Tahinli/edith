@@ -323,6 +323,115 @@ fn a_mixed_rate_project_reloads_unchanged() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The project's rate is the user's to pick, exactly as its resolution is. The
+/// timeline is *conformed* to it -- the same seconds of the same footage,
+/// counted on a new grid -- every source is read through a [`Rate`] against it,
+/// the media's own rate stays reachable, and a save comes back at the rate it
+/// was cut at rather than at the media's.
+#[test]
+fn the_project_rate_is_picked_and_the_timeline_is_conformed_to_it() {
+    let pal = asset("test_25fps.mp4");
+    let mut session = open(asset("test_av.mp4"));
+    import_and_place(&mut session, &pal);
+    let duration = session.timeline_duration();
+    assert_eq!(session.native_frame_rate(), FPS, "the media's own rate");
+    assert!(!session.set_frame_rate(FPS), "the rate already in force");
+    assert!(!session.set_frame_rate(0.0), "not a rate at all");
+
+    assert!(
+        session.set_frame_rate(24.0),
+        "24 is a rate a timescale can name"
+    );
+    assert_eq!(session.meta().frame_rate, 24.0);
+    assert!(
+        (session.timeline_duration() - duration).abs() < 1.0 / 24.0,
+        "the timeline is {} s where it was {duration} s",
+        session.timeline_duration()
+    );
+    // Both files are read through a rate against the new grid now: 5 s and 2 s,
+    // in 24ths.
+    assert_eq!(session.file_frames(&asset("test_av.mp4")), 120, "5 s at 24");
+    assert_eq!(session.file_frames(&pal), 48, "2 s at 24");
+    // ...and each take is still one take on both lanes: every frame number goes
+    // through one map, so a picture cannot drift off its sound.
+    let (video, audio) = (session.lane_clips(Lane::V1), session.lane_clips(Lane::A1));
+    assert_eq!(video.len(), 2, "the 30 fps take and the 25 fps one");
+    for (v, a) in video.iter().zip(audio) {
+        assert_eq!((v.start, v.len()), (a.start, a.len()), "{v:?} vs {a:?}");
+    }
+
+    let path = std::env::temp_dir().join(format!("edith-rate-{}.edith", std::process::id()));
+    session.save_project(&path).expect("save");
+    let reloaded = PlaybackSession::open_project(&path).expect("a retimed project reopens");
+    assert_eq!(reloaded.meta().frame_rate, 24.0, "the rate it was cut at");
+    assert_eq!(
+        reloaded.clip_spans(),
+        session.clip_spans(),
+        "the same clips"
+    );
+    assert_eq!(reloaded.file_frames(&pal), 48, "recomputed against 24");
+    assert_eq!(
+        reloaded.native_frame_rate(),
+        FPS,
+        "the way back is still there"
+    );
+    std::fs::remove_file(&path).ok();
+
+    // ...and that way back is a pick like any other: the media's own rate.
+    let native = session.native_frame_rate();
+    assert!(session.set_frame_rate(native), "back to the media's own");
+    assert_eq!(session.file_frames(&pal), 60, "2 s at 30 again");
+    assert!(
+        (session.timeline_duration() - duration).abs() < 1.0 / 24.0,
+        "{} s after the round trip, {duration} s before",
+        session.timeline_duration()
+    );
+}
+
+/// ...and an export of it comes out at that rate: the file is written at 24 fps,
+/// as many frames as the conformed timeline has, with its sound as long as its
+/// picture.
+#[test]
+fn an_export_runs_at_the_rate_the_project_was_cut_at() {
+    let mut session = open(asset("test_av.mp4"));
+    assert!(
+        session.trim_clip(Lane::V1, 0, Edge::End, 30),
+        "one second of the 30 fps take"
+    );
+    assert!(session.set_frame_rate(24.0), "cut it at 24 instead");
+    let total = (session.timeline_duration() * 24.0).round() as u32;
+    assert_eq!(total, 24, "one second, in 24ths");
+
+    let out = std::env::temp_dir().join(format!("edith-rate-{}.mp4", std::process::id()));
+    wait(&session.export_to_with(
+        &out,
+        &ExportSettings {
+            format: Format::Mp4,
+            ..ExportSettings::default()
+        },
+    ))
+    .expect("the export");
+
+    let (meta, _rx, _cancel) = DecodeSession::open_range(&out, 0, u32::MAX).expect("reopen");
+    assert!(
+        (meta.frame_rate - 24.0).abs() < 0.01,
+        "the export runs at the picked rate: {}",
+        meta.frame_rate
+    );
+    assert_eq!(
+        meta.frame_count, total,
+        "the export is the timeline's length"
+    );
+    let secs = engine::AudioSession::duration_secs(&out)
+        .expect("probe the export")
+        .expect("the export has sound");
+    assert!(
+        (secs - f64::from(total) / 24.0).abs() < 0.05,
+        "sound is {secs} s under a second of picture"
+    );
+    std::fs::remove_file(&out).ok();
+}
+
 /// The export is what was watched: as many frames as the timeline has, and the
 /// 25 fps clip walked through its file at 25 fps -- 25 pictures over 30 frames,
 /// not 30 of them and not 25 held to the end.
