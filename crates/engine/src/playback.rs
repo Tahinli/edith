@@ -1000,8 +1000,12 @@ impl PlaybackSession {
     /// one [`PlaybackSession::now`] is in.
     ///
     /// `None` means "nothing right now": the decoder is behind, or a clip
-    /// boundary is being reopened (~80 ms, during which the caller simply keeps
-    /// showing its last frame). End of stream is [`PlaybackSession::is_eos`].
+    /// boundary is being reopened -- and *that* now happens entirely on the new
+    /// worker ([`DecodeSession::open_worker_deferred`]), so it costs this
+    /// thread a thread spawn and the caller simply keeps showing its last frame
+    /// for however long the source takes to open (hundreds of milliseconds on a
+    /// big film, seconds off a cold cache). End of stream is
+    /// [`PlaybackSession::is_eos`].
     pub fn try_frame(&mut self) -> Option<Frame> {
         loop {
             match self.frames.try_recv() {
@@ -1103,7 +1107,9 @@ impl PlaybackSession {
     ///
     /// A source that will not open leaves the *span* installed anyway: the
     /// timeline still moves, there are simply no more pictures, and the
-    /// disconnected receiver carries the session on to the next span.
+    /// disconnected receiver carries the session on to the next span. For a
+    /// video that is now the worker's own doing -- it opens the file, so it is
+    /// the one that finds out -- and nothing on this thread waits to hear it.
     fn start_span(&mut self, span: Option<Span>) {
         // Which file's frames the worker about to be opened will number its
         // pictures in: the span's own source, and real time for a gap, whose
@@ -1147,7 +1153,7 @@ impl PlaybackSession {
                 start,
                 from: Some((source, in_frame)),
                 ..
-            }) => DecodeSession::open_worker(
+            }) => Ok(DecodeSession::open_worker_deferred(
                 &self.project.sources()[source].path,
                 // The file's own frames, which is the only place they exist:
                 // a clip counts the timeline's ([`Rate`]).
@@ -1176,9 +1182,7 @@ impl PlaybackSession {
                 // the project's own and constant across the span for that reason
                 // too.
                 self.project.tone(),
-            )
-            .map(|(_, stream)| stream)
-            .inspect_err(|e| eprintln!("timeline frame {start}: video open failed: {e}")),
+            )),
             // A gap: black for as long as it runs. An emptied timeline has no
             // span at all and gets one frame of it -- enough to put black on
             // screen, and it ends where the timeline does, at once.
