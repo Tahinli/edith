@@ -246,7 +246,7 @@ fn the_hdr_film_renders_tone_mapped() {
     // The funnel's own budget at this size: the map plus the conversion, which
     // is what an HDR frame costs on top of the decode. Fastest of five, for the
     // reason `tonemap::perf_4k_and_1080p` documents.
-    let mapper = ToneMapper::new(Transfer::Pq, engine::tonemap::Preset::default());
+    let mapper = ToneMapper::new(Transfer::Pq, engine::tonemap::Preset::default(), None);
     let sdr = ColorDescription {
         matrix: Matrix::Bt709,
         transfer: engine::colorspace::Transfer::Sdr,
