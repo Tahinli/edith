@@ -291,7 +291,7 @@ struct Block {
     key: bool,
 }
 
-/// AV1 out of a Matroska file (`.mkv`/`.webm`).
+/// AV1 or H.264 out of a Matroska file (`.mkv`/`.webm`).
 ///
 /// The whole segment is walked once at open -- element *headers* only, the block
 /// payloads are seeked over -- because Matroska carries no sample table: the
@@ -305,7 +305,12 @@ pub struct MkvDemuxer {
     /// repeats its sequence header at every keyframe anyway, and cros-codecs
     /// ignores one identical to the sequence in force (`av1.rs:381`), so this is
     /// free when the encoder already wrote one and load-bearing when it did not.
+    /// For H.264 it is the Annex-B SPS/PPS out of `avcC` instead, re-injected the
+    /// same way and for the same reason.
     config: Vec<u8>,
+    /// Bytes of the NAL length prefix an H.264 block is written with, off
+    /// `avcC`. Zero for AV1, whose blocks are handed over as they lie.
+    nal_length: usize,
     next: usize,
 }
 
@@ -316,11 +321,15 @@ impl MkvDemuxer {
         let segment = mkv_segment(&mut file, end)?;
         let (video, _) = mkv_tracks(&mut file, segment)?;
         let video = video.ok_or(
-            "no AV1 video track in this Matroska file — AV1 is the only codec read from one",
+            "no AV1 or H.264 video track in this Matroska file — those are the codecs read from one",
         )?;
         let (blocks, span) = mkv_blocks(&mut file, segment, video.number)?;
         if blocks.is_empty() {
-            return Err("the AV1 track in this Matroska file has no frames".into());
+            return Err(format!(
+                "the {} track in this Matroska file has no frames",
+                video.codec.name()
+            )
+            .into());
         }
         // Timing, in this order: what the track declares, then what its own
         // timestamps say. `DefaultDuration` is nanoseconds and exact -- 33333333
@@ -350,7 +359,7 @@ impl MkvDemuxer {
             height: video.height,
             frame_rate,
             frame_count: blocks.len() as u32,
-            codec: Codec::Av1,
+            codec: video.codec,
         };
         Ok((
             meta,
@@ -358,6 +367,7 @@ impl MkvDemuxer {
                 file,
                 blocks,
                 config: video.config,
+                nal_length: video.nal_length,
                 next: 0,
             },
         ))
@@ -369,6 +379,17 @@ impl MkvDemuxer {
         };
         self.next += 1;
         let head = if block.key { self.config.len() } else { 0 };
+        // An H.264 block is `avcC`-framed like an mp4 sample, so it is reframed
+        // to Annex-B behind the parameter sets exactly as `Mp4Demuxer` does. An
+        // AV1 one is a temporal unit already and goes over as it lies, below.
+        if self.nal_length > 0 {
+            let mut block_bytes = vec![0u8; block.len];
+            read_exact_at(&mut self.file, block.at, &mut block_bytes)?;
+            let mut au = Vec::with_capacity(head + block.len + 16);
+            au.extend_from_slice(&self.config[..head]);
+            append_annex_b(&block_bytes, self.nal_length, &mut au)?;
+            return Ok(Some(au));
+        }
         let mut au = vec![0u8; head + block.len];
         au[..head].copy_from_slice(&self.config[..head]);
         read_exact_at(&mut self.file, block.at, &mut au[head..])?;
@@ -401,14 +422,16 @@ pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
     Ok(mkv_tracks(&mut file, segment)?.1)
 }
 
-/// What the `Tracks` element says about the AV1 track.
+/// What the `Tracks` element says about the video track.
 struct MkvVideo {
     number: u64,
     width: u32,
     height: u32,
     default_duration: Option<u64>,
     timestamp_scale: u64,
+    codec: Codec,
     config: Vec<u8>,
+    nal_length: usize,
 }
 
 // Matroska element IDs, written with the leading length marker they carry in
@@ -490,8 +513,8 @@ fn mkv_tracks(
     Ok((video, audio))
 }
 
-/// One `TrackEntry`: `Some` video only for an 8-bit AV1 track, and the codec id
-/// of an audio track otherwise.
+/// One `TrackEntry`: `Some` video only for an 8-bit AV1 or an H.264 track, and
+/// the codec id of an audio track otherwise.
 fn mkv_track_entry(
     file: &mut File,
     body: u64,
@@ -528,21 +551,72 @@ fn mkv_track_entry(
         at = stop;
     }
     // 1 is video, 2 is audio; the rest (subtitles, buttons) are nobody's here.
-    match (kind, codec.as_str()) {
-        (1, "V_AV1") => Ok((
-            Some(MkvVideo {
-                number,
-                width,
-                height,
-                default_duration,
-                timestamp_scale,
-                config: parse_av1c(&config)?,
-            }),
-            None,
-        )),
-        (2, _) => Ok((None, Some(codec))),
-        _ => Ok((None, None)),
+    let (codec, config, nal_length) = match (kind, codec.as_str()) {
+        (1, "V_AV1") => (Codec::Av1, parse_av1c(&config)?, 0),
+        // The same `avcC` an mp4 carries, `CodecPrivate` being where Matroska
+        // puts it: length-prefixed blocks and the SPS/PPS out of the record.
+        (1, "V_MPEG4/ISO/AVC") => {
+            let (nal_length, sets) = parse_avcc(&config)?;
+            (Codec::H264, sets, nal_length)
+        }
+        (2, _) => return Ok((None, Some(codec))),
+        _ => return Ok((None, None)),
+    };
+    Ok((
+        Some(MkvVideo {
+            number,
+            width,
+            height,
+            default_duration,
+            timestamp_scale,
+            codec,
+            config,
+            nal_length,
+        }),
+        None,
+    ))
+}
+
+/// AVCDecoderConfigurationRecord (ISO 14496-15 §5.3.3.1) -> the NAL length
+/// prefix width and the SPS/PPS as one Annex-B blob, which is [`parse_hvcc`]'s
+/// job for HEVC. The mp4 path gets both out of `mp4 0.14`'s `AvcCBox`; a
+/// Matroska file carries the identical record in `CodecPrivate`, unparsed.
+fn parse_avcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>)> {
+    // 0 configurationVersion .. 4 lengthSizeMinusOne, 5 numOfSequenceParameterSets.
+    let (&flags, &sps_count) = rec
+        .get(4)
+        .zip(rec.get(5))
+        .ok_or("avcC record shorter than its fixed header")?;
+    let mut sets = Vec::new();
+    let mut src = &rec[6..];
+    // The SPS array, whose count is the low 5 bits of byte 5, and then the PPS
+    // array, whose count is a byte of its own.
+    let mut count = usize::from(sps_count & 0x1f);
+    for array in 0..2 {
+        if array == 1 {
+            let (&pps_count, rest) = src
+                .split_first()
+                .ok_or("avcC record ends before its PPS count")?;
+            count = usize::from(pps_count);
+            src = rest;
+        }
+        for _ in 0..count {
+            let len = usize::from(u16::from_be_bytes(
+                src.get(..2)
+                    .ok_or("avcC NAL length past the record")?
+                    .try_into()
+                    .unwrap(),
+            ));
+            let nal = src.get(2..2 + len).ok_or("avcC NAL past the record")?;
+            sets.extend_from_slice(&START_CODE);
+            sets.extend_from_slice(nal);
+            src = &src[2 + len..];
+        }
     }
+    if sets.is_empty() {
+        return Err("avcC record carries no SPS/PPS".into());
+    }
+    Ok((usize::from(flags & 0x3) + 1, sets))
 }
 
 /// The configuration OBUs of an `AV1CodecConfigurationRecord` (AV1-ISOBMFF
@@ -1071,6 +1145,37 @@ mod tests {
         // Nothing is read past the end of a truncated box.
         assert!(parse_hvcc(&rec[..20]).is_err());
         assert!(parse_hvcc(&rec[..rec.len() - 1]).is_err());
+    }
+
+    /// The `avcC` parse: prefix width out of byte 4, and both arrays -- the SPS
+    /// count is five bits of byte 5, the PPS count a byte of its own, and taking
+    /// the second for the first is the mistake this checks against.
+    #[test]
+    fn reads_parameter_sets_out_of_an_avcc_record() {
+        let mut rec = vec![1, 0x42, 0x00, 0x1f, 0xfc | 0x1, 0xe0 | 2];
+        for (kind, nal) in [(7u8, 0xAAu8), (7, 0xBB)] {
+            rec.extend_from_slice(&2u16.to_be_bytes());
+            rec.extend_from_slice(&[kind, nal]);
+        }
+        rec.push(1); // numOfPictureParameterSets
+        rec.extend_from_slice(&2u16.to_be_bytes());
+        rec.extend_from_slice(&[8, 0xCC]);
+
+        let (len, sets) = parse_avcc(&rec).unwrap();
+        assert_eq!(len, 2, "lengthSizeMinusOne == 1");
+        assert_eq!(
+            sets,
+            [
+                0, 0, 0, 1, 7, 0xAA, // SPS
+                0, 0, 0, 1, 7, 0xBB, // the second SPS, which a one-array read loses
+                0, 0, 0, 1, 8, 0xCC, // PPS
+            ]
+        );
+        // Nothing is read past the end of a truncated record, and a Matroska
+        // file with no `CodecPrivate` at all is refused rather than started.
+        assert!(parse_avcc(&rec[..5]).is_err());
+        assert!(parse_avcc(&rec[..rec.len() - 1]).is_err());
+        assert!(parse_avcc(&[]).is_err());
     }
 
     /// EBML's variable-length integers, which every Matroska read starts with:
