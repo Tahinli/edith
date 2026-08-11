@@ -333,7 +333,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 21] = [
+pub const FIXED: [Fixed; 26] = [
     // Not a chord at all but a way of pressing one, and the only place the
     // editor can say so: holding a key that moves a *value* runs it, and
     // holding anything else still does what one press did.
@@ -401,7 +401,7 @@ pub const FIXED: [Fixed; 21] = [
     // its own: a band nothing but a drag can reach is a band half the users of
     // this editor cannot move at all. Card-local, so none of them is bindable.
     Fixed {
-        chord: "1–5",
+        chord: "1–9, 0",
         label: "Pick an equalizer band",
         category: Category::Audio,
     },
@@ -413,6 +413,31 @@ pub const FIXED: [Fixed; 21] = [
     Fixed {
         chord: "down",
         label: "Lower the picked band 1 dB",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "← / →",
+        label: "Move the picked band down or up in frequency",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "shift ← / →",
+        label: "Widen or narrow the picked band (its Q)",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "a",
+        label: "Add an equalizer band beside the picked one",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "x",
+        label: "Remove the picked equalizer band",
+        category: Category::Audio,
+    },
+    Fixed {
+        chord: "f",
+        label: "Flatten the picked band (double-click does the same)",
         category: Category::Audio,
     },
     Fixed {
