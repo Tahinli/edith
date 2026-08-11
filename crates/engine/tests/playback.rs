@@ -267,6 +267,48 @@ fn rapid_seeks_settle_on_the_last_one() {
     );
 }
 
+/// The storm the deferred open exists for: 40 seeks with nothing in between.
+/// Each one abandons a worker and starts another, and since the open moved onto
+/// the worker (`DecodeSession::open_worker_deferred`) not one of them reads the
+/// file on this thread -- so the whole storm is 40 thread spawns, the parked
+/// workers are still reaped as they go (the thread count says so), and the last
+/// seek still decides what is on screen.
+#[test]
+fn a_storm_of_seeks_stays_bounded_and_the_last_one_wins() {
+    let mut session = open(asset("test_av.mp4"));
+    let fps = session.meta().frame_rate;
+    let mut last_index = None;
+
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+    let before = threads();
+
+    let storm = Instant::now();
+    for i in 0..39 {
+        session.seek(f64::from(i % 5) * 0.8);
+    }
+    session.seek(2.0);
+    let issued = storm.elapsed();
+    eprintln!("40 seeks issued in {issued:?} ({before} threads before)");
+    assert!(
+        issued < Duration::from_secs(1),
+        "40 seeks cost the caller {issued:?} -- a seek is opening a file again"
+    );
+    assert_eq!(
+        next_index(&mut session, "40 rapid seeks"),
+        (2.0 * fps) as u32,
+        "the last seek is the one that decides"
+    );
+
+    sleep(Duration::from_millis(500)); // abandoned workers exit within an AU
+    let after = threads();
+    eprintln!("seek storm: {before} threads -> {after}");
+    assert!(
+        after <= before + 3,
+        "the retired list grew with the storm: {before} threads -> {after}"
+    );
+}
+
 /// The audio path proper: needs a PipeWire daemon and the output plugin next to
 /// the test binary (`LD_LIBRARY_PATH=target/release`).
 #[test]
