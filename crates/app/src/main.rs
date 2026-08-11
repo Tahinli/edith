@@ -40,6 +40,18 @@ const SELECTED: u32 = 0x2a4a6b;
 /// the lane stays in the dark family the rest of the chrome lives in
 /// (ledger:187), and the first source keeps `SURFACE` exactly.
 const SOURCE_TINTS: [u32; 4] = [SURFACE, 0x3b3329, 0x293b33, 0x33293b];
+/// The mirror of `SELECTED`: a drop the lane will not take, tinting the shadow
+/// a drag draws ([`Ghost`]) so a refusal is seen before the release rather than
+/// read afterwards. Same brightness as the rest of the chrome -- a warning, not
+/// an alarm.
+const REFUSE: u32 = 0x6b2a2a;
+/// How solid that shadow is (`0xRRGGBBAA`): enough to read as a box, little
+/// enough that the clip it is drawn over is still legible through it.
+const GHOST_ALPHA: u32 = 0x66;
+/// ...and the narrowest it is drawn: a library row whose length the engine has
+/// not measured yet has a landing place but no width, and a head marker says
+/// where it goes where a zero-width box would say nothing.
+const GHOST_MIN: f32 = 2.;
 /// One step lighter than whatever it sits on: the pointer's answer that this is
 /// clickable. Two of them, because buttons stand on `SURFACE` and the scrub
 /// strip stands on `CHROME`.
@@ -295,6 +307,29 @@ struct ClipDrag {
     /// the release, and the drag would move a clip nobody touched (see
     /// [`live_idx`]).
     clip: Clip,
+}
+
+/// Where the drag in flight would leave what it is carrying: the lane the
+/// pointer is over, the snapped head the release will commit ([`landing`]), and
+/// how long the thing is. Drawn on that lane as a translucent box the size of
+/// the take, so a landing is *seen* before the release rather than discovered
+/// after it -- the line ([`Player::snap_cue`]) marks the frame, this shows the
+/// body. `refused` is a drop the lane cannot take -- a picture over an audio
+/// track, a sound over a video one -- tinted rather than silent, because the
+/// refusal is coming at the release either way ([`lane_refuses`],
+/// [`Project::move_clip`]).
+#[derive(Clone, Copy, PartialEq)]
+struct Ghost {
+    lane: Lane,
+    start: u32,
+    /// Timeline frames, which a speed has already been counted into: the box is
+    /// as wide as the clip is *long where it lands*. Zero for a library row of
+    /// unknown length, drawn as a head marker.
+    frames: u32,
+    /// The swatch of the file being carried ([`Player::file_tint`]), so the
+    /// ghost reads as the thing in the hand.
+    tint: u32,
+    refused: bool,
 }
 
 /// A clip edge being dragged: which end of which clip, and the timeline frame
@@ -849,6 +884,12 @@ struct Player {
     /// happens rather than discovered after the release. Stale between gestures,
     /// which costs nothing -- it is drawn only while one is live.
     snap_cue: Option<u32>,
+    /// The box the same gesture is about to fill, or `None` while the pointer is
+    /// over no lane: the shadow every proper editor draws under a drag. Set by
+    /// the lane the pointer is actually over -- that is the one question the
+    /// line above does not answer -- and drawn only while a drag is live, for
+    /// [`Player::snap_cue`]'s reason.
+    ghost: Option<Ghost>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -1139,6 +1180,10 @@ impl Player {
         // index would trim a clip nobody grabbed. Dropping it is the whole fix:
         // nothing has been written yet.
         self.trim = None;
+        // ...and the shadow a drag is drawn under promises a landing on a lane
+        // this edit has just reshaped. The next move of the drag draws it
+        // again; until then it says nothing.
+        self.ghost = None;
     }
 
     /// What an action does, wherever it was asked for -- a stroke, or the clip
@@ -1205,6 +1250,7 @@ impl Player {
     fn toggle_snap(&mut self, cx: &mut Context<Self>) {
         self.snap = !self.snap;
         self.snap_cue = None;
+        self.ghost = None;
         self.notice = Some(match self.snap {
             true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
             false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
@@ -2619,9 +2665,32 @@ impl Player {
     /// leave a screen of empty bed after the end, the way every NLE does.
     fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
         let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
-        let raw = self.frame_under(x).saturating_sub(self.grab);
         let marks = self.snap_targets(Some((from, idx)));
-        Some(self.snap_to(raw, clip.frames(), &marks))
+        Some(landing(
+            self.frame_under(x),
+            self.grab,
+            clip.frames(),
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        ))
+    }
+
+    /// The same answer for a library row on its way down: nothing is in the hand
+    /// yet, so there is no grab offset to take off and no length to snap by --
+    /// the file's own is not known until the engine has placed it -- and only
+    /// its head lands. Asked by the line, by the ghost and by the drop itself
+    /// ([`Player::insert_source`]), so all three name one frame.
+    fn place_frame(&self, x: Pixels) -> (u32, Option<u32>) {
+        let marks = self.snap_targets(None);
+        landing(
+            self.frame_under(x),
+            0,
+            0,
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        )
     }
 
     /// Which index the clip in the hand is at *now*: [`live_idx`] against the
@@ -2644,13 +2713,89 @@ impl Player {
     }
 
     /// The same line for a library row on its way to a lane: it goes down at
-    /// the frame it is let go on ([`Player::insert_source`]), so that frame is
-    /// what snaps and what is drawn. No length to snap by -- the file's own is
-    /// not known until the engine has placed it -- so only its head lands.
+    /// the frame it is let go on ([`Player::place_frame`]), so that frame is
+    /// what snaps and what is drawn.
     fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let marks = self.snap_targets(None);
-        let cue = self.snap_to(self.frame_under(x), 0, &marks).1;
+        let cue = self.place_frame(x).1;
         self.set_cue(cue, x, cx);
+    }
+
+    /// The shadow the clip in the hand would fill, on the lane the pointer is
+    /// over: its head where [`Player::drop_frame`] says the release will put it
+    /// -- the same call the drop makes, so the box drawn and the box committed
+    /// are one answer -- and its own length at this zoom. A lane of the other
+    /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
+    /// before the release does.
+    fn preview_ghost(&mut self, drag: &ClipDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = self
+            .dragged(drag)
+            .and_then(|idx| self.drop_frame(drag.lane, idx, x))
+            .map(|(start, _)| Ghost {
+                lane: to,
+                start,
+                frames: drag.clip.frames(),
+                tint: self.clip_tint(drag.clip.source),
+                refused: drag.lane.kind != to.kind,
+            });
+        self.set_ghost(ghost, cx);
+    }
+
+    /// The same shadow for a library row: its head at [`Player::place_frame`],
+    /// which is where the drop inserts it, and the file's own length for its
+    /// width -- the length the library row already reports. A file this lane
+    /// cannot hold ([`lane_refuses`]) is tinted as refused, which is the answer
+    /// the release would give in words.
+    fn preview_ghost_asset(&mut self, path: &Path, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = Ghost {
+            lane: to,
+            start: self.place_frame(x).0,
+            frames: self
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path)),
+            tint: self.file_tint(path),
+            refused: lane_refuses(path, to).is_some(),
+        };
+        self.set_ghost(Some(ghost), cx);
+    }
+
+    /// Sets the shadow, or takes it away, repainting only when it moved -- the
+    /// listeners below run it on every pointer sample of a drag. Cleared by the
+    /// root and set again by the lane under the pointer, in that order (gpui
+    /// runs the capture phase parent-first), so a pointer over no lane at all
+    /// leaves nothing drawn.
+    fn set_ghost(&mut self, ghost: Option<Ghost>, cx: &mut Context<Self>) {
+        if ghost != self.ghost {
+            self.ghost = ghost;
+            cx.notify();
+        }
+    }
+
+    /// The swatch a clip from source `n` wears: [`source_tint`] over the first
+    /// source entry naming that *file*, since two audio streams of one file are
+    /// two sources and one colour. Every box on a lane and every ghost a drag
+    /// draws asks this, so the shadow is recognisably the thing in the hand.
+    fn clip_tint(&self, source: usize) -> u32 {
+        match self.sources().get(source) {
+            Some(entry) => self.file_tint(&entry.path),
+            None => source_tint(source),
+        }
+    }
+
+    /// The same swatch asked by path, which is what a library row is named by.
+    fn file_tint(&self, path: &Path) -> u32 {
+        source_tint(
+            self.sources()
+                .iter()
+                .position(|s| s.path == path)
+                .unwrap_or(0),
+        )
+    }
+
+    fn sources(&self) -> &[Source] {
+        self.session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources)
     }
 
     /// Sets the line, or takes it away, and repaints only when it moved: a
@@ -2876,28 +3021,13 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        // A file with no picture belongs on an audio lane and nowhere else:
-        // dropped on a video lane it is refused by name, and asked for by the
-        // Add button (which names no lane) it goes to the audio one -- which is
-        // the engine's choice, in `place_stream_at`, not one made twice here.
-        if engine::is_audio(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Video) {
-            let name = file_name(path);
-            let lane = onto.expect("checked above").label();
-            self.notice = Some(
-                format!("NOT ON {lane} — {name} has no picture; drop it on an audio lane").into(),
-            );
-            cx.notify();
-            return;
-        }
-        // ...and the mirror of it: a still is silent, so an audio lane is the
-        // one place it cannot go. The engine puts it on `V1` regardless
-        // (`place_stream_at`); this is the word that says why it moved.
-        if engine::is_image(path) && onto.is_some_and(|lane| lane.kind == LaneKind::Audio) {
-            let name = file_name(path);
-            let lane = onto.expect("checked above").label();
-            self.notice = Some(
-                format!("NOT ON {lane} — {name} is a still image; drop it on a video lane").into(),
-            );
+        // The lane the pointer named cannot hold this kind of file: refused by
+        // name, in the same words the ghost was tinted by on the way down
+        // ([`lane_refuses`]). The Add button names no lane and so is never
+        // refused here -- where a file goes when nobody says is the engine's
+        // choice, in `place_stream_at`, not one made twice here.
+        if let Some(why) = onto.and_then(|lane| lane_refuses(path, lane)) {
+            self.notice = Some(why.into());
             cx.notify();
             return;
         }
@@ -4058,10 +4188,18 @@ impl Render for Player {
                 if let Some(idx) = this.dragged(&drag) {
                     this.preview_drop(drag.lane, idx, event.event.position.x, cx);
                 }
+                // The shadow belongs to a *lane*, and which lane the pointer is
+                // over is the one thing this element cannot see. Cleared here
+                // and drawn again by the lane the pointer is actually inside
+                // (`lane_row`), which gpui runs straight after this one: the
+                // capture phase goes parent first, so a pointer over no lane at
+                // all -- up in the library, say -- promises nothing.
+                this.set_ghost(None, cx);
             }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<AssetDrag>, _, cx| {
                     this.preview_place(event.event.position.x, cx);
+                    this.set_ghost(None, cx);
                 }),
             )
             // Scrubbing is tracked on the root because the pointer leaves the
@@ -7179,6 +7317,11 @@ impl Player {
             .snap_cue
             .filter(|_| self.trim.is_some() || cx.has_active_drag())
             .map(|frame| scale.px_at(f64::from(frame) / self.fps));
+        // The shadow, on the one lane the pointer is over -- and, like the line,
+        // only while the drag that asked for it is still in flight.
+        let ghost = self
+            .ghost
+            .filter(|g| g.lane == lane && cx.has_active_drag());
         let clips = self
             .session
             .as_ref()
@@ -7328,12 +7471,26 @@ impl Player {
                         // Onto the edges near it, exactly as a clip carried by
                         // hand lands: the line drawn while it was in flight is
                         // the frame it goes down on.
-                        let x = window.mouse_position().x;
-                        let marks = this.snap_targets(None);
-                        let (at, _) = this.snap_to(this.frame_under(x), 0, &marks);
+                        let at = this.place_frame(window.mouse_position().x).0;
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
+                    // The shadow of the row in flight, drawn by the lane the
+                    // pointer is inside: `on_drag_move` fires on every painted
+                    // element while a drag of its type is live, wherever the
+                    // pointer is, and hands each one its own box -- which is how
+                    // a lane knows the pointer is over *it* (gpui div.rs:282).
+                    // The root cleared it a moment ago, so exactly one lane
+                    // draws one.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let path = event.drag(cx).0.clone();
+                            this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
+                        },
+                    ))
                     // ...and a clip let go over a lane lands the same way: on
                     // the track it was dropped on, at the frame it was carried
                     // to -- its own included, which is the drag that moves a
@@ -7349,6 +7506,17 @@ impl Player {
                         this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
+                    // ...and the same shadow for the clip in the hand, seated on
+                    // this lane when the pointer is inside it.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let drag = *event.drag(cx);
+                            this.preview_ghost(&drag, lane, event.event.position.x, cx);
+                        },
+                    ))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
                         // The clip as the lane holds it, for the drag payload:
                         // what a drop looks itself up by has to be the placed
@@ -7372,12 +7540,7 @@ impl Player {
                         // Tinted by *file*, not by source entry: two audio
                         // streams of one file are two sources, and the library
                         // gives them one swatch because they are one file.
-                        let tint = source_tint(
-                            sources
-                                .get(clip.source)
-                                .and_then(|s| sources.iter().position(|o| o.path == s.path))
-                                .unwrap_or(clip.source),
-                        );
+                        let tint = self.clip_tint(clip.source);
                         let width = scale.width_px(len);
                         let left = scale.px_at(start);
                         // The slice of this box that is on the bed: where its
@@ -7625,6 +7788,34 @@ impl Player {
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
+                    // Where the thing in the hand would come to rest, at the size
+                    // it would come to rest at: the shadow a proper editor draws
+                    // under a drag. Over the clips (it is translucent, so what
+                    // it would cover shows through) and under the line, which
+                    // marks the frame this box merely fills.
+                    .children(ghost.map(|g| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(scale.px_at(f64::from(g.start) / self.fps)))
+                            // A row whose length the engine has not measured
+                            // draws a head marker rather than nothing: where it
+                            // lands is known, how long it is is not.
+                            .w(px(scale
+                                .width_px(f64::from(g.frames) / self.fps)
+                                .max(GHOST_MIN)))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(if g.refused { REFUSE } else { INK }))
+                            // The file's own swatch at a third of its weight, so
+                            // the box beneath is still legible through it -- and
+                            // the refusal red instead, for a lane that will not
+                            // take this drop at all.
+                            .bg(rgba(
+                                ((if g.refused { REFUSE } else { g.tint }) << 8) | GHOST_ALPHA,
+                            ))
+                    }))
                     // What the gesture in flight is about to land on, drawn on
                     // every lane so a clip lining up with a take one track over
                     // can be seen to line up with it. Under the playhead's line
@@ -9568,6 +9759,44 @@ fn snap_cue(on: bool, raw: u32, len: u32, tol: u32, marks: &[u32]) -> (u32, Opti
     (start, mark)
 }
 
+/// Where a drag lands and the mark that pulled it there: the frame under the
+/// pointer, less however far into the box the hand grabbed it (so a clip travels
+/// with the pointer rather than jumping its head under it), snapped by
+/// [`snap_cue`]. One answer, asked by the shadow drawn in flight
+/// ([`Player::preview_ghost`]), by the line ([`Player::preview_drop`]) and by
+/// the drop that commits ([`Player::move_clip`]) -- which is what makes the
+/// promise and the landing the same frame.
+fn landing(
+    under: u32,
+    grab: u32,
+    len: u32,
+    on: bool,
+    tol: u32,
+    marks: &[u32],
+) -> (u32, Option<u32>) {
+    snap_cue(on, under.saturating_sub(grab), len, tol, marks)
+}
+
+/// Why this file may not go on that lane, in the words the refusal is told in --
+/// `None` when it may. A file with no picture belongs on an audio lane and
+/// nowhere else, and a still is silent, so an audio lane is the one place it
+/// cannot go. Asked twice: by the ghost tinting itself as refused on the way
+/// down, and by the insert that commits ([`Player::insert_source`]), so what is
+/// shown as impossible is exactly what is refused.
+fn lane_refuses(path: &Path, lane: Lane) -> Option<String> {
+    let name = file_name(path);
+    let label = lane.label();
+    match lane.kind {
+        LaneKind::Video if engine::is_audio(path) => {
+            Some(format!("NOT ON {label} — {name} has no picture; drop it on an audio lane"))
+        }
+        LaneKind::Audio if engine::is_image(path) => {
+            Some(format!("NOT ON {label} — {name} is a still image; drop it on a video lane"))
+        }
+        _ => None,
+    }
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -9944,8 +10173,8 @@ mod tests {
     };
     use super::{
         Edge, LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES,
-        ZOOM_STEP, file_name, file_uri, library_rows, live_idx, px_along, repeats, span_label,
-        trimmed_clip, unscannable, visible_slice,
+        ZOOM_STEP, file_name, file_uri, landing, lane_refuses, library_rows, live_idx, px_along,
+        repeats, span_label, trimmed_clip, unscannable, visible_slice,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -11128,6 +11357,64 @@ mod tests {
         // ...and a mark closer to the head than `len` cannot pull the clip to a
         // negative start.
         assert_eq!(snapped(2, 40, 4, &marks), 0);
+    }
+
+    /// The shadow a drag draws and the drop that commits are one answer: both
+    /// ask [`landing`], so the box seen in flight is the box the release leaves
+    /// behind. What this pins down is the composition around the snap -- the
+    /// grab offset comes off *before* the magnet, or a clip taken by its tail
+    /// would land a boxful late.
+    #[test]
+    fn a_ghost_and_a_drop_are_one_landing() {
+        // A neighbour covering [100, 160), the playhead at 300, and a 40 frame
+        // clip taken hold of 12 frames in.
+        let marks = [100, 160, 300, 0];
+        let (len, grab, tol) = (40, 12, 4);
+        // Pointer at frame 170: the head is 12 frames behind it, at 158, which
+        // is a frame short of the neighbour's tail -- so both the ghost and the
+        // drop say 160, and the line stands on the mark that pulled it.
+        assert_eq!(landing(170, grab, len, true, tol, &marks), (160, Some(160)));
+        // Without the grab taken off first, the same pointer would land the
+        // box at 170 and no mark would be in reach: the offset is not cosmetic.
+        assert_eq!(landing(170, 0, len, true, tol, &marks), (170, None));
+        // A library row carries no grab and no length the engine has measured,
+        // which is how `Player::place_frame` asks: only its head lands, on the
+        // playhead here.
+        assert_eq!(landing(298, 0, 0, true, tol, &marks), (300, Some(300)));
+        // The magnet off, ghost and drop agree on the raw frame and no line is
+        // drawn -- the frame-by-frame placement the switch is for.
+        assert_eq!(landing(170, grab, len, false, tol, &marks), (158, None));
+        // A pointer nearer the bed's start than the hand is into the box cannot
+        // pull a head below zero.
+        assert_eq!(landing(3, grab, len, true, tol, &marks), (0, Some(0)));
+    }
+
+    /// Which lanes tint that shadow as refused: the two kinds of file a lane
+    /// cannot hold, in the words the release would say them in -- one rule, so
+    /// what is shown as impossible is exactly what is refused.
+    #[test]
+    fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
+        let (video, audio) = (Lane::V1, Lane::A1);
+        let sound = Path::new("/media/take.mp3");
+        let still = Path::new("/media/card.png");
+        let movie = Path::new("/media/take.mp4");
+        assert_eq!(
+            lane_refuses(sound, video).as_deref(),
+            Some("NOT ON V1 — take.mp3 has no picture; drop it on an audio lane")
+        );
+        assert_eq!(
+            lane_refuses(still, audio).as_deref(),
+            Some("NOT ON A1 — card.png is a still image; drop it on a video lane")
+        );
+        // ...and every lane a file *can* go on says nothing at all, which is a
+        // ghost drawn in the file's own colour.
+        assert_eq!(lane_refuses(sound, audio), None);
+        assert_eq!(lane_refuses(still, video), None);
+        assert_eq!(lane_refuses(movie, video), None);
+        // A file with a picture is not refused by an audio lane here: the
+        // engine takes its sound onto one, and the words for a video-only file
+        // are its own.
+        assert_eq!(lane_refuses(movie, audio), None);
     }
 
     /// Where those edges come from: every lane, not the one being dropped on --
@@ -13389,6 +13676,7 @@ fn main() {
                     grab: 0,
                     snap: true,
                     snap_cue: None,
+                    ghost: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,
