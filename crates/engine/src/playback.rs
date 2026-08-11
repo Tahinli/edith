@@ -22,7 +22,7 @@ use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
-use crate::decode::{DecodeSession, Frame, Worker};
+use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed};
@@ -161,6 +161,11 @@ pub struct PlaybackSession {
     frames: Receiver<Frame>,
     /// The current decode worker.
     worker: Worker,
+    /// What that worker opened -- hardware, software, a still, a gap -- written
+    /// by the worker itself and read by [`decode_backend`](Self::decode_backend).
+    /// Replaced with the stream at every seek, so it always describes the
+    /// pictures currently arriving and never the clip before them.
+    backend: BackendCell,
     /// Workers cancelled by a seek or a clip change, waiting to be reaped.
     /// Joining one inline costs whatever VA-API init it is still inside (98 ms
     /// measured worst case), which is a visible hitch on the caller's thread;
@@ -274,6 +279,7 @@ impl PlaybackSession {
             native: (meta.width, meta.height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(source),
             audio,
@@ -371,6 +377,7 @@ impl PlaybackSession {
             native: (width, height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             // The song keeps the clock, as a video's own sound does -- and wall
             // time keeps it on a machine with no device, where the picture
@@ -446,6 +453,7 @@ impl PlaybackSession {
             native: (meta.width, meta.height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(ClockSource::Wall),
             audio: None,
@@ -681,6 +689,7 @@ impl PlaybackSession {
             native,
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
@@ -706,6 +715,24 @@ impl PlaybackSession {
 
     pub fn meta(&self) -> &VideoMeta {
         &self.meta
+    }
+
+    /// What the pictures now arriving are being decoded by: the clip under the
+    /// playhead, since one video worker feeds the composite at a time. An
+    /// atomic load -- a front-end may ask it every repaint -- and it is what
+    /// *opened*, so a clip whose hardware session fell back to software reads
+    /// [`Backend::Software`] from the frame that fallback happened.
+    pub fn decode_backend(&self) -> Backend {
+        self.backend.get()
+    }
+
+    /// What an export of this timeline would encode the *sound* with, before
+    /// one is started: the copy an mp4 normally makes, or the software encoder
+    /// the format (or an equalized lane) forces. Pure -- no probe, no file
+    /// opened -- so a card may ask it per repaint; the picture's half costs a
+    /// plugin open and lives in [`crate::export::planned_video`].
+    pub fn planned_audio(&self, format: crate::export::Format) -> &'static str {
+        crate::export::planned_audio(&self.project, format)
     }
 
     /// Why this session plays silent although the file has sound -- an audio
@@ -932,6 +959,7 @@ impl PlaybackSession {
             // then can it return and be reaped by a later sweep. Nothing here
             // joins, so this ordering costs the seek nothing.
             self.frames = stream.frames;
+            self.backend = stream.backend;
             self.retire(stream.worker);
         }
         self.span = span;
