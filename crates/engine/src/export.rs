@@ -578,12 +578,15 @@ fn export_subtitles(
 ///   is the timeline's own clock, which is where it was drawn while editing
 ///   (`Player::subtitle_overlay`). Clipped to the exported length and no more.
 ///
-/// ponytail: the overlay draws *every* track on the timeline's clock, so on a
-/// rippled timeline what the picture shows and what an embedded track exports
-/// now disagree. The upgrade path is this function: the overlay should ask it
-/// too, at which point both halves move together. It is left because the app is
-/// another lane's file this week.
-fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<Cue> {
+/// This is also what the *preview* draws: the plate over the picture and the
+/// timeline strip both ask it through
+/// [`PlaybackSession::timeline_cues`](crate::PlaybackSession::timeline_cues), so
+/// what a rippled timeline shows and what its export writes are one answer by
+/// construction rather than two maps kept in step by hand.
+///
+/// Pure and cheap enough to ask per repaint (a walk of the spans and of the
+/// cues, no file opened), which is how a front-end asks it.
+pub fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<Cue> {
     let frames = project.timeline_frames();
     let us = |frame: u32| (f64::from(frame) / fps * 1e6).round() as i64;
     let end = us(frames);
