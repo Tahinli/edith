@@ -1189,6 +1189,14 @@ struct Player {
     /// this holds is the line above the panel ([`Player::import_bar`]).
     importing: Option<Import>,
     imports: std::collections::VecDeque<PathBuf>,
+    /// The file argv named, until its read lands. It goes through the queue
+    /// above like any other file -- that is what puts the window on screen
+    /// before a byte of a 25 GB film is read -- and this is what tells
+    /// [`Player::take_import`] that this one is an *open* and not an import:
+    /// it becomes the timeline, and the clock, the title and the export path
+    /// come from it. Cleared the moment it lands, so a later drop of the very
+    /// same path is an import like any other.
+    opening: Option<PathBuf>,
     /// Where an export writes. Built once from the source path, which is not
     /// otherwise kept.
     export_path: PathBuf,
@@ -3923,9 +3931,16 @@ impl Player {
             return;
         };
         let stage = Arc::new(std::sync::atomic::AtomicU8::new(ImportStage::Header as u8));
+        // The fork is made here, once, and carried to the landing: an import is
+        // *read* on the worker and opened again warm, while the file argv named
+        // is *opened* on the worker and handed over whole. Both leave the UI
+        // thread free for the twelve seconds a cold 25 GB header walk takes;
+        // opening the timeline outright is what keeps it from paying the walk
+        // twice on a warm one.
+        let what = arrival(self.opening.as_deref(), &path);
         let read = cx.background_executor().spawn({
             let (path, stage) = (path.clone(), Arc::clone(&stage));
-            async move { read_ahead(&path, &stage) }
+            async move { open_ahead(what, &path, &stage) }
         });
         let now = Instant::now();
         self.importing = Some(Import {
@@ -3936,10 +3951,10 @@ impl Player {
             since: now,
         });
         cx.spawn(async move |this, cx| {
-            read.await;
+            let landed = read.await;
             this.update(cx, |this, cx| {
                 this.importing = None;
-                this.take_import(&path, cx);
+                this.take_import(&path, landed, cx);
                 // The next one is started by the repaint this notified, which
                 // is also what starts the files argv named ([`poll_import`]).
             })
@@ -3974,9 +3989,44 @@ impl Player {
     /// The export guard again, and not for the caller's sake: an export can
     /// have started during the seconds the worker was reading, and a drop
     /// during an export has always been a silent no-op.
-    fn take_import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+    fn take_import(&mut self, path: &std::path::Path, landed: Landed, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
+        }
+        // The file argv named is the one file in the queue that is not an
+        // import: it *is* the timeline, and the worker has already opened it.
+        // All that is left here is to hang everything derived from it off the
+        // window -- the clock, the title, where an export and a save go -- and
+        // that is arithmetic, not a read.
+        match landed {
+            Landed::Read => {}
+            what => {
+                self.opening = None;
+                match what {
+                    Landed::Project(opened) => self.install_project(path, opened, cx),
+                    Landed::Media(opened) => {
+                        let text = self.install_media(path, opened, true);
+                        eprintln!("{text}");
+                        self.notice = Some(text.into());
+                        cx.notify();
+                    }
+                    Landed::Read => unreachable!("matched above"),
+                }
+                // The line a launch has always printed, now printed when the
+                // file actually arrives: it is the mark that says the timeline
+                // is up, as the window's own appearance is the other one.
+                if let Some(meta) = self.session.as_ref().map(PlaybackSession::meta) {
+                    println!(
+                        "{}: {}x{} @ {:.2} fps, {} samples",
+                        path.display(),
+                        meta.width,
+                        meta.height,
+                        meta.frame_rate,
+                        meta.frame_count
+                    );
+                }
+                return;
+            }
         }
         // An empty window has no library to add to yet: the file opens one, and
         // the timeline under it stays empty, because an import is an import
@@ -4042,19 +4092,26 @@ impl Player {
     /// *opened* is the timeline, one *imported* into an empty window fills the
     /// library and leaves the lanes empty for a drag.
     fn open_media(&mut self, path: &std::path::Path, place: bool) -> String {
-        let opened = match place {
-            true => PlaybackSession::open(path),
-            false => PlaybackSession::open_library(path),
-        };
+        self.install_media(path, open_session(path, place), place)
+    }
+
+    /// The second half of it: everything the window derives from a session that
+    /// has already been opened. Split from the open itself because the file
+    /// argv named is opened on a worker ([`open_ahead`]) -- the twelve seconds
+    /// of a cold header walk are not the UI thread's to spend -- and lands
+    /// here, where nothing is read and nothing blocks.
+    fn install_media(
+        &mut self,
+        path: &std::path::Path,
+        opened: Result<(PlaybackSession, String), String>,
+        place: bool,
+    ) -> String {
         match opened {
-            Ok(mut session) => {
+            Ok((session, subs)) => {
                 self.fps = session.meta().frame_rate;
                 // Read before the session moves: a file that plays silent says
                 // so here or nowhere.
                 let silent = audio_notice(&session);
-                // ...and the subtitle tracks the file carries inside it, taken
-                // now: nothing else ever opens this container again.
-                let subs = subtitle_notice(&mut session, path).unwrap_or_default();
                 // A file replaces the one that was open, and track 3 of that one
                 // is not track 3 of this.
                 self.sub_track = 0;
@@ -4117,10 +4174,23 @@ impl Player {
     /// The new session is built before anything is replaced, so a refusal is
     /// shown as the engine worded it and leaves what is playing alone.
     fn load_project(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let opened = PlaybackSession::open_project(path).map_err(|e| e.to_string());
+        self.install_project(path, opened, cx);
+    }
+
+    /// The second half of it, for [`Player::install_media`]'s reason: a
+    /// `.edith` named on the command line is opened on a worker and only
+    /// installed here.
+    fn install_project(
+        &mut self,
+        path: &std::path::Path,
+        opened: Result<PlaybackSession, String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
             return;
         }
-        let text = match PlaybackSession::open_project(path) {
+        let text = match opened {
             Ok(session) => {
                 self.fps = session.meta().frame_rate;
                 let silent = audio_notice(&session);
@@ -6631,6 +6701,7 @@ impl Player {
             elapsed,
             import.since.elapsed().as_secs_f32(),
             self.imports.len(),
+            arrival(self.opening.as_deref(), &import.path) != Landing::Import,
         );
         // A quarter of the bar, crossing it every three seconds and wrapping.
         // Tied to the elapsed clock, so it moves for as long as the read does
@@ -9994,6 +10065,68 @@ fn is_matroska(path: &std::path::Path) -> bool {
         .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
 }
 
+/// What a worker hands back, which is the fork [`arrival`] made when it was
+/// started. An import is *read* and thrown away; the file argv named is opened
+/// outright, because nothing else is going to open it afterwards.
+enum Landed {
+    /// An import: pages warmed, nothing kept. [`Player::take_import`] opens the
+    /// file again, warm, and that second open is the 150 ms one.
+    Read,
+    /// The media argv named, with the tail its subtitle tracks earn: a whole
+    /// timeline, ready to be hung off the window, or the engine's refusal.
+    Media(Result<(PlaybackSession, String), String>),
+    /// The `.edith` argv named, restored.
+    Project(Result<PlaybackSession, String>),
+}
+
+/// A media file opened as a session, with the subtitle tracks it carries inside
+/// it taken in the same breath -- the two reads a file costs, in the one place
+/// both doors ([`Player::open_media`] and the worker below) go through.
+///
+/// `place` is which door: a file *opened* is the timeline, one *imported* into
+/// an empty window fills the library and leaves the lanes empty for a drag.
+fn open_session(path: &std::path::Path, place: bool) -> Result<(PlaybackSession, String), String> {
+    let opened = match place {
+        true => PlaybackSession::open(path),
+        false => PlaybackSession::open_library(path),
+    };
+    let mut session = opened.map_err(|e| e.to_string())?;
+    let subs = subtitle_notice(&mut session, path).unwrap_or_default();
+    Ok((session, subs))
+}
+
+/// The whole of what a queued file costs, off the UI thread. An import only
+/// needs its pages warmed ([`read_ahead`]); the file argv named is *opened*
+/// here instead, and that is the difference between a warm launch paying for
+/// one header walk and paying for two -- the window is up either way.
+fn open_ahead(
+    what: Landing,
+    path: &std::path::Path,
+    stage: &std::sync::atomic::AtomicU8,
+) -> Landed {
+    use std::sync::atomic::Ordering::Relaxed;
+    match what {
+        Landing::Import => {
+            read_ahead(path, stage);
+            Landed::Read
+        }
+        Landing::Project => {
+            let opened = PlaybackSession::open_project(path).map_err(|e| e.to_string());
+            Landed::Project(opened)
+        }
+        Landing::Open => {
+            let opened = PlaybackSession::open(path).map_err(|e| e.to_string());
+            // The same two stages a read reports, because they are the same two
+            // reads: the container, and then the tracks inside it.
+            stage.store(ImportStage::Subtitles as u8, Relaxed);
+            Landed::Media(opened.map(|mut session| {
+                let subs = subtitle_notice(&mut session, path).unwrap_or_default();
+                (session, subs)
+            }))
+        }
+    }
+}
+
 /// Reads, off the UI thread, exactly what the import that follows is about to
 /// read -- and throws every byte away. The point is the page cache: a cold
 /// header walk of a 29 GB remux is 11 s and a warm one is 150 ms (measured,
@@ -10042,8 +10175,9 @@ fn read_ahead(path: &std::path::Path, stage: &std::sync::atomic::AtomicU8) {
 /// The walk reads the whole file for its cues
 /// (`engine::subtitle::of_matroska`) -- ~200 ms on a two-hour 4K remux, and an
 /// *import* pays it on a worker first ([`read_ahead`]), so what happens here is
-/// the warm second pass. A file *opened* at launch still pays it cold: there is
-/// no window yet to say so in.
+/// the warm second pass. A file *opened* at launch pays it cold and pays it
+/// once -- this runs on the worker beside the open itself ([`open_ahead`]),
+/// with the window already up and naming the read.
 fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Option<String> {
     if !is_matroska(path) {
         return None;
@@ -12848,6 +12982,44 @@ impl ImportStage {
     }
 }
 
+/// argv sorted into the file that becomes the timeline and the queue every
+/// named file is read through, in the order they were named. The whole of what
+/// a launch does before the window is on screen -- and it touches no disk,
+/// which is the point: the header walk happens on a worker with the window
+/// already up ([`Player::take_import`]).
+fn launch_queue(
+    args: impl Iterator<Item = PathBuf>,
+) -> (Option<PathBuf>, std::collections::VecDeque<PathBuf>) {
+    let queue: std::collections::VecDeque<PathBuf> = args.collect();
+    (queue.front().cloned(), queue)
+}
+
+/// What a queued file turns into. Every file goes through one queue -- argv's
+/// first file, argv's extras, a drop, the Import button -- and this is the fork
+/// its worker is started on.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum Landing {
+    /// The media argv named: it becomes the timeline, and the canvas, the fps,
+    /// the title and the export path come from it.
+    Open,
+    /// A `.edith` argv named: a whole timeline restored, not a source.
+    Project,
+    /// Everything else: a row in the library, the timeline untouched.
+    Import,
+}
+
+/// Which of the three a queued file is (`landing` above is the drag's).
+/// `opening` is the one path argv named and is cleared as it lands, so a second
+/// arrival of the same path -- a drop of the film that is already open -- is an
+/// import, which is what a drop has always been.
+fn arrival(opening: Option<&std::path::Path>, path: &std::path::Path) -> Landing {
+    match opening == Some(path) {
+        false => Landing::Import,
+        true if is_project(path) => Landing::Project,
+        true => Landing::Open,
+    }
+}
+
 /// The whole of what an import shows while it runs: which file, which stage,
 /// the clock that proves the window is still answering, and what is behind it
 /// in the queue.
@@ -12855,19 +13027,35 @@ impl ImportStage {
 /// `since` is how long the *stage* has stood still, which is the only movement
 /// an unmeasurable read has: past [`IMPORT_STALL`] the line says so in words,
 /// because a bar that cannot move and a bar that has stopped look identical.
-fn import_line(name: &str, stage: ImportStage, elapsed: f32, since: f32, waiting: usize) -> String {
+///
+/// `opening` is the file argv named, which is read through the same queue and
+/// says so in the same words -- except that it is being *opened*, and a line
+/// that called it an import would be describing the wrong thing to the one
+/// person who typed the name.
+fn import_line(
+    name: &str,
+    stage: ImportStage,
+    elapsed: f32,
+    since: f32,
+    waiting: usize,
+    opening: bool,
+) -> String {
     let tail = match waiting {
         0 => String::new(),
         n => format!(" · {n} more waiting"),
     };
     let what = stage.what();
+    let verb = match opening {
+        true => "OPENING",
+        false => "IMPORTING",
+    };
     match since >= IMPORT_STALL {
         true => format!(
-            "IMPORTING {name} · still {what} — a big file is minutes of reading, and the window is \
+            "{verb} {name} · still {what} — a big file is minutes of reading, and the window is \
              not frozen · {} elapsed{tail}",
             clock(elapsed)
         ),
-        false => format!("IMPORTING {name} · {what} · {} elapsed{tail}", clock(elapsed)),
+        false => format!("{verb} {name} · {what} · {} elapsed{tail}", clock(elapsed)),
     }
 }
 
@@ -12997,6 +13185,7 @@ mod tests {
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
         IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanPlan, SilenceScan, import_line,
+        Landing, arrival, launch_queue,
         read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
         trimmed_clip, unscannable,
@@ -16267,7 +16456,7 @@ mod tests {
         // the line stops pretending it is a progress line.
         let since = import.poll();
         assert!(since > IMPORT_STALL, "{since}");
-        let stalled = import_line("A Film.mkv", import.seen, 9., since, 0);
+        let stalled = import_line("A Film.mkv", import.seen, 9., since, 0, false);
         assert!(stalled.contains("still reading the header"), "{stalled}");
         assert!(stalled.contains("not frozen"), "{stalled}");
         assert!(stalled.contains("0:09 elapsed"), "{stalled}");
@@ -16277,7 +16466,7 @@ mod tests {
         let since = import.poll();
         assert_eq!(import.seen, ImportStage::Subtitles);
         assert!(since < IMPORT_STALL, "{since}");
-        let moving = import_line("A Film.mkv", import.seen, 9., since, 2);
+        let moving = import_line("A Film.mkv", import.seen, 9., since, 2, false);
         assert!(
             moving.starts_with("IMPORTING A Film.mkv · reading the subtitle tracks"),
             "{moving}"
@@ -16292,6 +16481,74 @@ mod tests {
         let held = import.since;
         import.poll();
         assert_eq!(import.since, held, "an unchanged stage must not reset it");
+    }
+
+    /// The launch, from argv to the window being up: nothing named on the
+    /// command line is read before there is a window, so all a launch does is
+    /// sort argv into the file that becomes the timeline and the queue that is
+    /// read through -- and a run with no arguments has neither, exactly as it
+    /// had none before.
+    #[test]
+    fn a_launch_queues_the_file_it_names_instead_of_opening_it() {
+        let film = PathBuf::from("/films/Dune.mkv");
+        let extra = PathBuf::from("/films/Titles.mov");
+        let (arg, queue) = launch_queue([film.clone(), extra.clone()].into_iter());
+        assert_eq!(arg.as_deref(), Some(film.as_path()), "argv[1] is the open");
+        // In the order they were named, the timeline's file first: six header
+        // walks racing over one disk finish no sooner than six in a row, and
+        // the one the person is waiting to watch goes first.
+        assert_eq!(queue, [film, extra], "argv, in arrival order");
+        // ...and no argument at all is still the empty window: nothing to open
+        // and nothing to read.
+        let (arg, queue) = launch_queue(std::iter::empty());
+        assert_eq!(arg, None);
+        assert!(queue.is_empty(), "no argv, nothing queued");
+    }
+
+    /// Which door a queued file goes through. One queue carries the file argv
+    /// named and every import behind it, so this fork -- made when the worker
+    /// starts and carried to the landing as a [`Landed`] -- is the whole state
+    /// machine: the named file becomes the timeline (a `.edith` restoring a
+    /// whole one), everything else joins the library, including the very same
+    /// film dropped again once the open has landed.
+    #[test]
+    fn the_file_argv_named_lands_as_the_timeline_and_everything_behind_it_as_imports() {
+        let film = PathBuf::from("/films/Dune.mkv");
+        let extra = PathBuf::from("/films/Titles.mov");
+        let project = PathBuf::from("/films/Dune.edith");
+        assert_eq!(arrival(Some(&film), &film), Landing::Open);
+        assert_eq!(arrival(Some(&project), &project), Landing::Project);
+        assert_eq!(arrival(Some(&film), &extra), Landing::Import);
+        // Cleared as it lands: a drop of the film already on the timeline is an
+        // import, which is what a drop has always been.
+        assert_eq!(arrival(None, &film), Landing::Import);
+        // A window opened empty has no named file at all, and everything that
+        // arrives at it is an import.
+        assert_eq!(arrival(None, &project), Landing::Import);
+    }
+
+    /// What the window says while the file argv named is being read: the file's
+    /// name, the read that is running, and a clock proving the window is
+    /// answering -- in the *opening* wording, because the one person who typed
+    /// that name is not importing anything.
+    #[test]
+    fn the_named_file_is_read_under_an_opening_line_not_an_importing_one() {
+        let opening = import_line("Dune.mkv", ImportStage::Header, 0.4, 0.4, 1, true);
+        assert!(
+            opening.starts_with("OPENING Dune.mkv · reading the header"),
+            "{opening}"
+        );
+        assert!(opening.ends_with("· 1 more waiting"), "{opening}");
+        // Twelve seconds into a cold 25 GB header walk, which is the whole
+        // reason the window is up: it says the read is still moving through the
+        // same stage and that this is not a freeze.
+        let stalled = import_line("Dune.mkv", ImportStage::Header, 12., 12., 0, true);
+        assert!(stalled.starts_with("OPENING Dune.mkv · still"), "{stalled}");
+        assert!(stalled.contains("not frozen"), "{stalled}");
+        assert!(stalled.contains("0:12 elapsed"), "{stalled}");
+        // The files behind it are imports and still say so.
+        let import = import_line("Titles.mov", ImportStage::Header, 0.4, 0.4, 0, false);
+        assert!(import.starts_with("IMPORTING Titles.mov"), "{import}");
     }
 
     /// One gesture over the real gate, with the plumbing around it spelled out:
@@ -17784,103 +18041,40 @@ mod tests {
 }
 
 fn main() {
-    let arg = std::env::args().nth(1).map(PathBuf::from);
-    // A `.edith` restores a whole timeline, anything else *is* the timeline.
-    // Either way the rest of argv is imported into its library. No argument at
-    // all opens the window empty -- the library then arrives by drop or by the
-    // Import button, and everything below is derived from it at that point
-    // instead.
-    let mut session = match &arg {
-        Some(arg) => {
-            let opened = if is_project(arg) {
-                PlaybackSession::open_project(arg)
-            } else {
-                PlaybackSession::open(arg)
-            };
-            match opened {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    // A failed load by drop leaves the running session alone;
-                    // here a file was named and could not be opened, so the
-                    // refusal is the whole run.
-                    eprintln!("cannot open {}: {e}", arg.display());
-                    std::process::exit(1);
-                }
-            }
-        }
-        None => None,
-    };
     // A keymap file that cannot be read leaves the defaults in force, and takes
-    // the notice slot ahead of an import refusal below: it is about every key
-    // the window has, and the import refusal is on stderr either way.
-    let (keymap, mut notice) = Keymap::load();
+    // the notice slot ahead of an open or import refusal: it is about every key
+    // the window has, and those refusals are on stderr either way.
+    let (keymap, notice) = Keymap::load();
     if let Some(text) = &notice {
         eprintln!("{text}");
     }
-    // The first file makes the timeline -- naming a file to open is a decision
-    // about what to watch -- and the rest are imports like any other: rows in
-    // the library, dragged onto a lane when they are wanted there.
+    // Nothing named on the command line is read here. The first file makes the
+    // timeline -- a `.edith` restores a whole one, anything else *is* one --
+    // and the rest are imports like any other: rows in the library, dragged
+    // onto a lane when they are wanted there. All of them go through the queue
+    // a drop uses ([`Player::import`]), which is the door with a progress line
+    // on it, and their refusals arrive in the notice bar as a drop's do.
     //
-    // Queued rather than read here: three 25 GB remuxes on the command line
-    // used to be half a minute of *no window at all*, and a window that has
-    // not opened cannot say why. They go through the same door a drop does
-    // ([`Player::import`]), which is the door with a progress line on it, and
-    // the refusals arrive in the notice bar as a drop's do.
-    let extras: Vec<PathBuf> = session
-        .is_some()
-        .then(|| std::env::args().skip(2).map(PathBuf::from).collect())
-        .unwrap_or_default();
-    // The subtitle tracks inside the file that *is* the timeline, taken at the
-    // launch the window opens from -- the same pickup the drop and the Import
-    // button make (`open_media`).
-    if let (Some(session), Some(arg)) = (&mut session, &arg)
-        && let Some(text) = subtitle_notice(session, arg)
-    {
-        eprintln!("{text}");
-    }
-    // A file that plays silent is as much news at launch as it is on a drop, and
-    // behind the keymap notice for the same reason an import refusal is.
-    if let Some(reason) = session
-        .as_ref()
-        .and_then(PlaybackSession::audio_disabled_reason)
-    {
-        let text = format!("NO AUDIO: {reason}");
-        eprintln!("{text}");
-        notice.get_or_insert(text);
-    }
-    let meta = session.as_ref().map(|session| *session.meta());
-    // Beside the media even for a project: an export has never landed anywhere
-    // but next to the picture it came from.
-    let out = session.as_ref().map_or_else(PathBuf::new, |session| {
-        export_path(&session.sources()[0].path)
-    });
-    let project = match &arg {
-        Some(arg) if is_project(arg) => arg.clone(),
-        Some(arg) => project_path(arg),
-        // Chosen with the file, once there is one to choose it from.
-        None => PathBuf::new(),
-    };
+    // Queued rather than opened because a 25 GB film cold is twelve seconds of
+    // header walk, and it used to be twelve seconds of *no window at all* -- a
+    // window that has not opened cannot say what it is waiting for. Now the
+    // window is up in the time it takes to make one, naming the file and the
+    // read that is running, and the timeline appears when that read lands
+    // ([`Player::take_import`]).
+    //
+    // No argument at all opens the window empty, exactly as before: the library
+    // then arrives by drop or by the Import button.
+    let (arg, queue) = launch_queue(std::env::args().skip(1).map(PathBuf::from));
     let name: SharedString = arg
         .as_deref()
         .map_or_else(|| NO_FILE.into(), |arg| file_name(arg).into());
-    if let (Some(arg), Some(meta)) = (&arg, &meta) {
-        println!(
-            "{}: {}x{} @ {:.2} fps, {} samples",
-            arg.display(),
-            meta.width,
-            meta.height,
-            meta.frame_rate,
-            meta.frame_count
-        );
-    }
 
     Application::new().run(move |cx: &mut App| {
-        // The picture's own size, or 720p when there is no picture yet: the
-        // empty window is a landing pad, not a sliver.
-        let (w, h) = meta.map_or((1280., 720.), |meta| {
-            (meta.width as f32, meta.height as f32)
-        });
-        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
+        // 720p: the picture's own size is not known yet -- knowing it is the
+        // twelve seconds this window exists to be up during -- and a window
+        // that resized itself under a hand already dragging it would be worse
+        // than one that opened at the size the empty window has always used.
+        let bounds = Bounds::centered(None, size(px(1280.), px(720.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -17897,14 +18091,14 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let extras = extras.clone();
+                let queue = queue.clone();
                 let player = cx.new(|cx| Player {
-                    // A file named on the command line owes its first frame the
-                    // same repaint a seek's still owes: nothing plays by
-                    // itself, so this is what carries the poster frame to the
-                    // screen. An empty window has none to wait for.
-                    seek_since: session.is_some().then(Instant::now),
-                    session,
+                    // Nothing to wait for yet: the file named on the command
+                    // line is still queued, and the repaint that carries its
+                    // poster frame to the screen is asked for when it lands
+                    // (`open_media` -> `reset_after_reseek`).
+                    seek_since: None,
+                    session: None,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
@@ -17912,7 +18106,10 @@ fn main() {
                     volume_dragging: false,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
-                    fps: meta.map_or(30., |meta| meta.frame_rate),
+                    fps: 30.,
+                    // The file being opened, from the first frame the window
+                    // draws: the title bar and the header name it while its
+                    // header is still being read.
                     name: name.clone(),
                     image: None,
                     sub_image: None,
@@ -17948,8 +18145,11 @@ fn main() {
                     cancelling: false,
                     export_started: None,
                     export_marks: Vec::new(),
-                    export_path: out.clone(),
-                    project_path: project.clone(),
+                    // Both derived from the file when it lands, by the same
+                    // `open_media`/`load_project` a drop goes through: an
+                    // export beside the picture, a save beside it too.
+                    export_path: PathBuf::new(),
+                    project_path: PathBuf::new(),
                     keymap: keymap.clone(),
                     keys_open: false,
                     keys_search: String::new(),
@@ -18007,10 +18207,11 @@ fn main() {
                     rebinding: None,
                     notice: notice.clone().map(SharedString::from),
                     exported: None,
-                    // The rest of argv, waiting for the first repaint to start
-                    // them: the window is up before a byte of them is read.
+                    // The whole of argv, waiting for the first repaint to start
+                    // it: the window is up before a byte of it is read.
                     importing: None,
-                    imports: extras.into(),
+                    imports: queue,
+                    opening: arg.clone(),
                     // Nothing pushed yet, and never a real title: the first
                     // render is what names the window.
                     titled: String::new(),
