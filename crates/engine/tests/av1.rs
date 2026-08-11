@@ -195,39 +195,45 @@ fn a_seek_lands_on_the_frame_it_asked_for() {
     assert_eq!(frames[0].index, KEYFRAME + 7, "the frame asked for");
 }
 
-/// An mp4 export of a Matroska source is refused by name, and says where the
-/// sound can go instead.
+/// An mp4 export of a Matroska source carries its sound.
 ///
-/// It used to *succeed*, silently, and only because this engine could not read
-/// a Matroska file's audio at all: the export wrote picture with no sound in it
-/// and nobody was told. Now that the sound is read (`tests/hevc_mkv.rs`), the
-/// rule the whole mp4 path is built on applies to it like to any other source
-/// it cannot copy -- an AC-3 mp4 has always been refused in the same breath.
-/// The picture half of the same export is [`an_av1_export_reopens_through_our_own_demuxer`].
+/// Three lives, this one. It used to *succeed* silently and write picture with
+/// no sound, because this engine could not read a Matroska file's audio at all.
+/// Then the sound became readable and this became a refusal by name, because
+/// the mp4 path could only *copy* AAC out of an mp4's own sample table and a
+/// Matroska file has none. Now the copy that cannot be made is a decode and a
+/// re-encode (`export::copy_audio` -> `encode_audio`), so the export carries the
+/// film's sound instead of naming what it cannot do with it. The picture half of
+/// the same export is [`an_av1_export_reopens_through_our_own_demuxer`].
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
-fn an_mp4_export_of_a_matroska_source_is_refused_by_name() {
+fn an_mp4_export_of_a_matroska_source_carries_its_sound() {
     let session = PlaybackSession::open(asset("test_av1.mkv")).expect("open test_av1.mkv");
     let meta = *session.meta();
-    let project = Project::single(asset("test_av1.mkv"), meta.frame_count);
+    // A short one: the picture is re-encoded frame by frame and what is under
+    // test here is the sound reaching the file, not H.264 throughput.
+    let project = Project::single(asset("test_av1.mkv"), 15);
     let out = std::env::temp_dir().join(format!("ve_export_av1_{}.mp4", std::process::id()));
     let _ = std::fs::remove_file(&out);
 
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let started = Instant::now();
     while !handle.is_finished() {
-        assert!(started.elapsed() < Duration::from_secs(120), "export hung");
+        assert!(started.elapsed() < Duration::from_secs(300), "export hung");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let refused = handle
+    handle
         .result()
         .expect("outcome")
-        .expect_err("an mkv's AAC cannot be copied into an mp4")
-        .to_string();
-    assert!(refused.contains("test_av1.mkv"), "{refused}");
-    assert!(refused.contains("Matroska"), "{refused}");
-    assert!(refused.contains("WAV or FLAC"), "{refused}");
-    assert!(!out.exists(), "a refused export leaves no file behind");
+        .expect("an mkv's AAC is decoded and encoded again into the mp4");
+    let (audio, chunks) = AudioSession::open(&out)
+        .expect("reopen the export")
+        .expect("the export has an audio track");
+    let samples: Vec<f32> = chunks.into_iter().flat_map(|c| c.samples).collect();
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+    println!("mkv -> mp4: {} Hz, rms {rms:.4}", audio.sample_rate);
+    assert!(rms > 0.001, "the film's sound is in the mp4 (rms {rms})");
+    std::fs::remove_file(&out).unwrap();
 }
 
 /// A short timeline out of the H.264 fixture, which is what the AV1 export tests
@@ -321,6 +327,62 @@ fn an_av1_export_reopens_through_our_own_demuxer() {
         "one GOP, one sync point"
     );
     std::fs::remove_file(&out).unwrap();
+}
+
+/// A timeline with sound, exported as AV1 into **both** containers: the file
+/// carries the picture *and* the timeline's audio, and this project's own
+/// readers are what say so -- the demuxer for the picture, the audio session for
+/// the sound. An AV1 export used to be picture only, which is a file whose sound
+/// went missing with nobody told.
+///
+/// Two frames of 720p: `rav1e` is built here without its assembly, so the length
+/// of the timeline is the length of the test, and what is under test is the
+/// wiring from the format to the muxer, not the encoder.
+#[test]
+fn an_av1_export_carries_the_timelines_sound_in_either_container() {
+    for (format, ext) in [
+        (engine::export::Format::Av1, "mkv"),
+        (engine::export::Format::Av1Mp4, "mp4"),
+    ] {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av");
+        assert!(session.cut_at(2.0 / 30.0), "two frames of it");
+        assert!(session.delete_clip(engine::project::Lane::V1, 1));
+        let out = std::env::temp_dir().join(format!("ve_av1_sound_{}.{ext}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let settings = ExportSettings {
+            format,
+            force_sw: true,
+            ..Default::default()
+        };
+        let handle = session.export_to_with(&out, &settings);
+        let started = Instant::now();
+        while !handle.is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(300), "export hung");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        handle.result().expect("outcome").expect("an AV1 export");
+
+        // The picture, through the demuxer an import comes in by -- an `av01`
+        // sample entry in the mp4 and a `V_AV1` track in the Matroska file, both
+        // of them written by hand and read back by hand.
+        let (meta, _) = Demuxer::open(&out).expect("reopen the export");
+        assert_eq!(meta.codec, Codec::Av1, "{ext}: an AV1 export is AV1");
+        assert_eq!((meta.width, meta.height), (1280, 720), "{ext}");
+        assert_eq!(meta.frame_count, 2, "{ext}: every timeline frame is there");
+
+        // ...and the sound beside it, which is the half that used to be absent.
+        let (audio, chunks) = AudioSession::open(&out)
+            .expect("reopen for its sound")
+            .expect("an AV1 export has an audio track");
+        let samples: Vec<f32> = chunks.into_iter().flat_map(|c| c.samples).collect();
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+        println!(
+            "{ext}: {} Hz x{}, rms {rms:.4}",
+            audio.sample_rate, audio.channels
+        );
+        assert!(rms > 0.001, "{ext}: the sound is in the file (rms {rms})");
+        std::fs::remove_file(&out).unwrap();
+    }
 }
 
 /// An audio-only timeline is refused an AV1 export by name, exactly as it is
