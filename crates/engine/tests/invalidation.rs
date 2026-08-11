@@ -250,3 +250,59 @@ fn an_equalizer_rebuilds_the_sound_and_only_the_sound() {
     eprintln!("{frames} frames across an equalizer change, clock at {:.3}s", session.now());
     assert!(frames > 0, "the picture stopped when the sound was rebuilt");
 }
+
+/// The same classification asked at the one place it decides something a person
+/// can see: **after the timeline has played out**. A sound edit rebuilds the
+/// sound and starts no picture worker, so end of stream stands -- the last frame
+/// is still the last frame, the transport is still `Ended`, and the next press
+/// restarts from the top with the new curve on it. A revival here would spend
+/// that state on an edit with nothing new to show, leaving a play press to run
+/// the clock off the end instead of starting the film again.
+#[test]
+fn a_sound_edit_after_the_end_leaves_the_end_where_it_is() {
+    let mut session = open(&asset("test_av.mp4"));
+    // A breath short of the end: the tail is what this is about.
+    session.seek(4.8);
+    session.play();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !session.is_eos() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached the end of a 5 s file"
+        );
+        session.tick();
+        while session.try_frame().is_some() {}
+    }
+    // What the front-end does on the crossing (`Player::pump`): stopped, on the
+    // out point, and still ended.
+    session.halt_at_end();
+    let ended_at = session.now();
+    assert_eq!(ended_at, session.timeline_duration());
+
+    let mut curve = engine::eq::EqParams::default_layout();
+    curve.bands[0].gain_db = 6.0;
+    assert!(session.set_eq(Lane::A1, 0, Some(curve)), "equalize at the end");
+    assert!(
+        session.is_eos(),
+        "an equalizer past the end revived the session: nothing new to show"
+    );
+    assert!(!session.is_playing(), "...and it started the transport again");
+    assert!(
+        (session.now() - ended_at).abs() < 1e-9,
+        "the playhead left the out point: {:.6}s",
+        session.now()
+    );
+    // The parameters landed all the same -- that is what "the edit took" means.
+    assert!(session.eq_of(Lane::A1, 0).is_some(), "the curve did not apply");
+
+    // The fader's first move at the end goes down the same road (no mix is
+    // running to push it into, so it reseeks the audio too).
+    assert!(session.set_lane_gain_db(Lane::A1, -6.0), "fader at the end");
+    assert!(session.is_eos(), "a fader past the end revived the session");
+    assert_eq!(session.lane_gain_db(Lane::A1), -6.0);
+
+    // And the restart off that end is still there, which is what the state was
+    // being kept for.
+    session.seek(0.0);
+    assert!(!session.is_eos(), "a seek revives a played-out session");
+}
