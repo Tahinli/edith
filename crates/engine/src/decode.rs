@@ -414,15 +414,6 @@ impl DecodeSession {
             return Err(meta.codec.needs_plugin().into());
         }
         let end_frame = end_frame.min(meta.frame_count);
-        // Read off the file once, here, and carried into the worker: it is a
-        // property of the stream, so it cannot change while one range decodes.
-        let source_color = meta.color;
-        // ...and with it what the film says its own brightest picture is
-        // ([`Demuxer::light`]): the tone map's assumed peak on the reference
-        // rendition, so a 1759 cd/m^2 grade is converted at 1759 rather than at
-        // the 1000 a file that declared nothing is assumed at. Read here
-        // because the demuxer is moved into the worker below.
-        let declared_peak = demuxer.light().peak();
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
         // decoder run ahead of the display without limit.
         let (tx, rx) = sync_channel(2);
@@ -450,46 +441,18 @@ impl DecodeSession {
         let handle = thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
-                // Cancelled before this thread was even scheduled -- do not
-                // enter VA-API initialisation at all, because that is the one
-                // stretch a cancel cannot interrupt (~65-90 ms of driver setup
-                // that would then have to be torn down again).
-                if worker_cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut render = Render::new(color, source_color, canvas, tone, declared_peak);
-                // The plugin has to be opened on the thread that uses it: its
-                // VA-API state is not `Send`-safe across a later hand-off.
-                if let Some(hw) = open_hw(&path, start_frame) {
-                    // Cancelled *during* init: close the session (dropping `hw`
-                    // does it) and leave without decoding anything.
-                    if worker_cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    eprintln!("decode backend: hardware (VA-API plugin)");
-                    worker_backend.set(Backend::Hardware);
-                    if run_hw(hw, &tx, start_frame, end_frame, &mut render, &worker_cancel) {
-                        return;
-                    }
-                    // A driver that opens but cannot decode a single frame is
-                    // still a fallback case, not a dead session.
-                    eprintln!("hardware decode failed before any frame, falling back to software");
-                }
-                // ...except where there is nothing to fall back to. Feeding HEVC
-                // or VP9 bytes to `rusty_h264` would be garbage, not a fallback.
-                if meta.codec != Codec::H264 {
-                    eprintln!("{}", meta.codec.needs_plugin());
-                    return;
-                }
-                eprintln!("decode backend: software (rusty_h264)");
-                worker_backend.set(Backend::Software);
-                run(
+                decode_span(
+                    &path,
                     demuxer,
-                    tx,
+                    meta,
                     start_frame,
                     end_frame,
-                    &mut render,
+                    color,
+                    canvas,
+                    tone,
+                    tx,
                     &worker_cancel,
+                    &worker_backend,
                 )
             })?;
         Ok((
@@ -504,6 +467,141 @@ impl DecodeSession {
             },
         ))
     }
+
+    /// As [`open_worker`](Self::open_worker), but the *file* is opened on the
+    /// worker too: nothing here touches the disk, so the caller pays a thread
+    /// spawn and not a demux -- 550-750 ms warm on a 25 GB film, seconds cold,
+    /// which is what a seek or a clip boundary used to cost the UI thread.
+    ///
+    /// The price is that there is no [`VideoMeta`] to return and no synchronous
+    /// refusal either: a file that will not open, and a codec no decoder here
+    /// takes (the plugin probe is skipped -- the worker's own refusal below
+    /// covers it), simply drop the sender. The disconnected receiver is what
+    /// carries a session on to the next span, which is exactly what a failed
+    /// open did on this path before. Callers that must *tell* the user why --
+    /// an import at the door -- keep the sync opener.
+    pub(crate) fn open_worker_deferred(
+        path: impl AsRef<Path>,
+        start_frame: u32,
+        end_frame: u32,
+        color: ColorParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+    ) -> FrameStream {
+        let path = path.as_ref().to_path_buf();
+        let (tx, rx) = sync_channel(2);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let backend = BackendCell::default();
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_backend = backend.clone();
+        let handle = thread::Builder::new()
+            .name("decode".into())
+            .spawn(move || {
+                // Cancelled before this thread was even scheduled: do not open
+                // the file at all. A scrub abandons workers by the dozen and
+                // this is where all but the last of them stop.
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let (meta, demuxer) = match Demuxer::open(&path) {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        eprintln!("video open failed: {e}");
+                        // Dropping `tx` disconnects the receiver, which is the
+                        // session's "walk on to the next span".
+                        worker_backend.set(Backend::Gap);
+                        return;
+                    }
+                };
+                decode_span(
+                    &path,
+                    demuxer,
+                    meta,
+                    start_frame,
+                    // The clamp the sync opener does with the metadata it read
+                    // on the caller's thread; here the metadata arrives first.
+                    end_frame.min(meta.frame_count),
+                    color,
+                    canvas,
+                    tone,
+                    tx,
+                    &worker_cancel,
+                    &worker_backend,
+                )
+            })
+            .ok();
+        FrameStream {
+            frames: rx,
+            worker: Worker { cancel, handle },
+            backend,
+        }
+    }
+}
+
+/// One worker thread's whole job, on that thread: pick the decoder, decode
+/// `[start_frame, end_frame)`, send the pictures. Both openers end here -- the
+/// sync one, which demuxed on the caller's thread, and the deferred one, which
+/// demuxed on this one -- so there is exactly one description of what a decode
+/// worker does, whoever opened the file.
+#[allow(clippy::too_many_arguments)]
+fn decode_span(
+    path: &PathBuf,
+    demuxer: Demuxer,
+    meta: VideoMeta,
+    start_frame: u32,
+    end_frame: u32,
+    color: ColorParams,
+    canvas: Composer,
+    tone: tonemap::Preset,
+    tx: SyncSender<Frame>,
+    cancel: &AtomicBool,
+    backend: &BackendCell,
+) {
+    // An empty range decodes nothing and must send nothing: `run_hw` counts a
+    // frame *out* before it compares, so without this a zero-length span would
+    // emit one picture. The sync opener never even spawns for this case.
+    if end_frame <= start_frame {
+        return;
+    }
+    // Cancelled before this thread was even scheduled -- do not enter VA-API
+    // initialisation at all, because that is the one stretch a cancel cannot
+    // interrupt (~65-90 ms of driver setup that would then have to be torn
+    // down again).
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    // The stream's own colour, and with it what the film says its brightest
+    // picture is ([`Demuxer::light`]): the tone map's assumed peak on the
+    // reference rendition, so a 1759 cd/m^2 grade is converted at 1759 rather
+    // than at the 1000 a file that declared nothing is assumed at. Both are
+    // properties of the stream, so neither can change while one range decodes.
+    let mut render = Render::new(color, meta.color, canvas, tone, demuxer.light().peak());
+    // The plugin has to be opened on the thread that uses it: its VA-API state
+    // is not `Send`-safe across a later hand-off.
+    if let Some(hw) = open_hw(path, start_frame) {
+        // Cancelled *during* init: close the session (dropping `hw` does it)
+        // and leave without decoding anything.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        eprintln!("decode backend: hardware (VA-API plugin)");
+        backend.set(Backend::Hardware);
+        if run_hw(hw, &tx, start_frame, end_frame, &mut render, cancel) {
+            return;
+        }
+        // A driver that opens but cannot decode a single frame is still a
+        // fallback case, not a dead session.
+        eprintln!("hardware decode failed before any frame, falling back to software");
+    }
+    // ...except where there is nothing to fall back to. Feeding HEVC or VP9
+    // bytes to `rusty_h264` would be garbage, not a fallback.
+    if meta.codec != Codec::H264 {
+        eprintln!("{}", meta.codec.needs_plugin());
+        return;
+    }
+    eprintln!("decode backend: software (rusty_h264)");
+    backend.set(Backend::Software);
+    run(demuxer, tx, start_frame, end_frame, &mut render, cancel)
 }
 
 /// One clip's pictures on their way to the renderer: graded, placed on the
@@ -811,12 +909,94 @@ fn run_hw(
 mod tests {
     use super::*;
     use std::sync::mpsc::RecvTimeoutError;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// Drops `path` from the page cache, so the open below really goes to disk
+    /// -- the case the deferred opener exists for, and the one that costs
+    /// seconds on a 25 GB film. Unprivileged (`posix_fadvise(DONTNEED)`), and a
+    /// no-op wherever `python3` is not around: the assertions hold either way,
+    /// the numbers printed are simply the warm ones.
+    fn evict(path: &Path) {
+        let _ = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import os,sys\n\
+                 fd=os.open(sys.argv[1],os.O_RDONLY)\n\
+                 os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)\n\
+                 os.close(fd)",
+            )
+            .arg(path)
+            .status();
+    }
+
+    /// The whole point of [`DecodeSession::open_worker_deferred`]: the caller
+    /// gets its stream back in the time a thread takes to spawn, and the file
+    /// is opened behind it -- so the first frame necessarily arrives *after*
+    /// the call returned, and the sync opener on the same cold file pays on the
+    /// calling thread what this one does not.
+    #[test]
+    fn a_deferred_open_costs_the_caller_a_thread_and_not_a_demux() {
+        let path = asset("test_baseline.mp4");
+        evict(&path);
+        let start = Instant::now();
+        let stream = DecodeSession::open_worker_deferred(
+            &path,
+            0,
+            u32::MAX,
+            ColorParams::default(),
+            Composer::passthrough(),
+            tonemap::Preset::default(),
+        );
+        let returned = start.elapsed();
+        let frame = stream
+            .frames
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first frame");
+        let first_frame = start.elapsed();
+
+        // The same file, equally cold, through the door the import path keeps:
+        // that one hands back metadata, and the demux it reads to do so is on
+        // this thread.
+        evict(&path);
+        let sync_start = Instant::now();
+        let sync = DecodeSession::open_worker(
+            &path,
+            0,
+            u32::MAX,
+            ColorParams::default(),
+            Composer::passthrough(),
+            tonemap::Preset::default(),
+        )
+        .expect("sync open");
+        let sync_returned = sync_start.elapsed();
+        drop(sync);
+
+        eprintln!(
+            "deferred open returned in {returned:?}, first frame at {first_frame:?}; \
+             sync open returned in {sync_returned:?}"
+        );
+        assert_eq!(frame.index, 0, "the deferred worker starts where it is told");
+        assert!(
+            returned < Duration::from_millis(10),
+            "the caller waited {returned:?} -- something is still being read \
+             from the file before this returns"
+        );
+        assert!(
+            first_frame > returned,
+            "the first frame arrived within the call ({first_frame:?} vs \
+             {returned:?}), which cannot happen if the open is deferred"
+        );
+        assert!(
+            returned < sync_returned,
+            "the deferred open ({returned:?}) cost as much as the sync one \
+             ({sync_returned:?}): the demux is still on the caller's thread"
+        );
     }
 
     /// Dropping a [`FrameStream`] whose frames nobody ever took must not wait.
