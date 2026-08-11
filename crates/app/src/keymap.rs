@@ -77,13 +77,14 @@ pub enum ActionId {
     Equalizer,
     Speed,
     Silence,
+    Mix,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 38] = [
+    pub const ALL: [ActionId; 39] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -121,6 +122,7 @@ impl ActionId {
         ActionId::Equalizer,
         ActionId::Speed,
         ActionId::Silence,
+        ActionId::Mix,
         ActionId::CancelExport,
     ];
 
@@ -164,6 +166,7 @@ impl ActionId {
             ActionId::Equalizer => "Equalizer",
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
+            ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -209,6 +212,7 @@ impl ActionId {
             ActionId::Equalizer => "equalizer",
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
+            ActionId::Mix => "mix",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -265,7 +269,12 @@ impl ActionId {
             ActionId::ToggleMute
             | ActionId::VolumeUp
             | ActionId::VolumeDown
-            | ActionId::Equalizer => Category::Audio,
+            | ActionId::Equalizer
+            // The mix is the project's sound -- what every track plays at and
+            // what the whole of it is held under -- where the three above it
+            // are this machine's monitoring. Both are audio, and the card says
+            // which is which.
+            | ActionId::Mix => Category::Audio,
             ActionId::Save | ActionId::Export | ActionId::CancelExport => Category::File,
         }
     }
@@ -602,6 +611,11 @@ impl Keymap {
                 // delete (x and delete) -- what it opens is a card that can cut
                 // forty places at once.
                 b(ActionId::Silence, "u", false),
+                // The mix card takes "f", for the faders on it: "m" would be
+                // the word but it is the monitoring mute, which is this
+                // machine's volume and not the project's -- two things one key
+                // must not mean.
+                b(ActionId::Mix, "f", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -864,7 +878,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 40);
+        assert_eq!(k.entries().len(), 41);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -1098,7 +1112,7 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 38);
+        assert_eq!(ActionId::ALL.len(), 39);
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
 
