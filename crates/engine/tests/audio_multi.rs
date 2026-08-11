@@ -250,18 +250,19 @@ fn the_join_carries_no_second_priming_packet() {
 }
 
 #[test]
-fn a_source_without_the_timeline_audio_is_refused() {
-    // Import refuses these up front (same rate, same layout, or both silent);
+fn a_source_that_disagrees_on_rate_or_layout_is_refused() {
+    // Import refuses these up front (one output device, one set of parameters);
     // the copy and the decode paths refuse them again rather than mislabel one
-    // esds for two different tracks.
-    let mixed = [asset("test_av.mp4"), asset("test_mismatch.mp4")];
+    // esds for two different tracks. Stream 1 of the multi-audio fixture is
+    // 22.05 kHz mono against the timeline's 44.1 kHz stereo.
+    let mixed = [(asset("test_av.mp4"), 0), (asset("test_multiaudio.mp4"), 1)];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     // (`.err()`, not `unwrap_err`: neither Ok payload is `Debug`.)
     for e in [
-        AudioSession::copy_multi_segments(&mixed, &segs).err(),
-        AudioSession::open_multi_segments(&mixed, &segs).err(),
+        AudioSession::copy_multi_streams(&mixed, &segs).err(),
+        AudioSession::open_multi_streams(&mixed, &segs).err(),
     ]
-    .map(|e| e.expect("a source with no audio track must be refused"))
+    .map(|e| e.expect("a source at another rate must be refused"))
     {
         let msg = e.to_string();
         assert!(msg.contains("source 1"), "{msg}");
@@ -269,4 +270,63 @@ fn a_source_without_the_timeline_audio_is_refused() {
     // An out-of-range index is an error, not a panic.
     assert!(AudioSession::copy_multi_segments(&sources(), &[(Some(2), 0.0, 1.0)]).is_err());
     assert!(AudioSession::open_multi_segments(&sources(), &[(Some(2), 0.0, 1.0)]).is_err());
+}
+
+/// A source with **no** track is not a refusal at all: its segments are the
+/// same silence a gap is, in both paths. That is what a silent clip on an audio
+/// lane is -- a picture over a hole -- and the timeline lets one in
+/// (`PlaybackSession::import`) precisely because these two agree here.
+#[test]
+fn a_silent_source_is_silence_and_not_a_refusal() {
+    let mixed = [asset("test_av.mp4"), asset("test_mismatch.mp4")];
+    let segs = [
+        (Some(0), 0.0, 1.0),
+        (Some(1), 0.0, 1.0),
+        (Some(0), 0.0, 1.0),
+    ];
+
+    // Decoded: three seconds, the middle one exact zero, and the chunks still
+    // arrive contiguous (`drain` asserts that), so the clock is fed through it.
+    let (_, rx) = AudioSession::open_multi_segments(&mixed, &segs)
+        .expect("a silent source opens")
+        .expect("the first source has an audio track");
+    let (samples, _, _) = drain(rx);
+    let frames = samples.len() / CHANNELS;
+    assert!(
+        (frames as i64 - 3 * RATE as i64).unsigned_abs() < PACKET,
+        "{frames} frames for three seconds"
+    );
+    let second = |n: usize| {
+        let at = |s: usize| (s * RATE as usize * CHANNELS).min(samples.len());
+        &samples[at(n)..at(n + 1)]
+    };
+    assert!(
+        second(0).iter().any(|s| *s != 0.0),
+        "the first second plays"
+    );
+    assert!(
+        second(1).iter().all(|s| *s == 0.0),
+        "the silent source is exact silence"
+    );
+    assert!(second(2).iter().any(|s| *s != 0.0), "and it comes back");
+
+    // Copied: the same shape in packets, so an mp4 export of that timeline is
+    // as long as the timeline and quiet where the silent clip is.
+    let (params, packets) = AudioSession::copy_multi_segments(&mixed, &segs)
+        .expect("a silent source copies")
+        .expect("the timeline has an audible source");
+    let copied = packets.len() as u64 * PACKET;
+    assert!(
+        (copied as i64 - 3 * RATE as i64).unsigned_abs() < 2 * PACKET,
+        "{copied} samples for three seconds, priming included"
+    );
+    assert_eq!(
+        params.sample_rate, RATE as u32,
+        "the audible source's track"
+    );
+    let silence: Vec<_> = packets[44..44 + 43].iter().map(|p| &p.bytes).collect();
+    assert!(
+        silence.iter().all(|b| b.len() <= 7),
+        "the hole is written as the hand-made silent packet, not as audio"
+    );
 }
