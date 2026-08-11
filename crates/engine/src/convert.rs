@@ -1,8 +1,79 @@
-//! I420 -> BGRA8 (straight alpha), BT.601 limited range.
+//! I420 -> BGRA8 (straight alpha), in the matrix and range the *stream* says
+//! its samples were coded against (see [`crate::colorspace`]).
+
+use crate::colorspace::{ColorDescription, Matrix};
+
+/// One stream's YUV->RGB matrix as 8.8 fixed point, derived once per frame so
+/// the loop below stays the multiply-and-shift it always was.
+struct Coeffs {
+    /// What luma is measured from: 16 for limited range, 0 for full.
+    y_off: i32,
+    y: i32,
+    rv: i32,
+    gu: i32,
+    gv: i32,
+    bu: i32,
+}
+
+impl Coeffs {
+    /// The inverse of the matrix itself, out of its two luma weights (ITU-R
+    /// BT.601 §2.5.1, BT.709 §3, BT.2020 Table 4), with `Kg = 1 - Kr - Kb`:
+    ///
+    /// ```text
+    /// R = Y                    + 2(1 - Kr)          Cr
+    /// G = Y - 2Kb(1 - Kb)/Kg Cb - 2Kr(1 - Kr)/Kg    Cr
+    /// B = Y + 2(1 - Kb)      Cb
+    /// ```
+    ///
+    /// where `Y` is 0..1 and `Cb`/`Cr` are -0.5..0.5. What turns bytes into
+    /// those is the *range* (ITU-T H.273 §5.4): limited-range luma spans codes
+    /// 16..235 and chroma 16..240, so a code is worth 255/219 and 255/224 of
+    /// the scale respectively; full-range samples span the whole byte and both
+    /// scales are 1, which is what a JFIF still or a `-color_range pc` encode
+    /// carries.
+    ///
+    /// BT.601 limited comes out as exactly the 298/409/-100/-208/516 this
+    /// engine hardcoded before it read a single colour tag, so SD material is
+    /// byte for byte the picture it always was (`bt601_limited_is_the_legacy_matrix`).
+    fn new(color: &ColorDescription) -> Self {
+        // tonemap lands here: a PQ or HLG stream is converted with its own
+        // matrix and then shown as if its curve were SDR -- which is what this
+        // engine did with it before, only in the wrong matrix. The curve is a
+        // pass over the RGB coming out of the loop, not a coefficient.
+        let (kr, kb) = match color.matrix {
+            Matrix::Bt601 => (0.299, 0.114),
+            Matrix::Bt709 => (0.2126, 0.0722),
+            Matrix::Bt2020Ncl => (0.2627, 0.0593),
+        };
+        let kg = 1.0 - kr - kb;
+        let (y_off, y_scale, c_scale) = if color.full_range {
+            (0, 1.0, 1.0)
+        } else {
+            (16, 255.0 / 219.0, 255.0 / 224.0)
+        };
+        let q = |v: f64| (v * 256.0).round() as i32;
+        Self {
+            y_off,
+            y: q(y_scale),
+            rv: q(2.0 * (1.0 - kr) * c_scale),
+            gu: q(2.0 * kb * (1.0 - kb) / kg * c_scale),
+            gv: q(2.0 * kr * (1.0 - kr) / kg * c_scale),
+            bu: q(2.0 * (1.0 - kb) * c_scale),
+        }
+    }
+}
 
 /// Converts a planar I420 frame (stride == width, chroma at half resolution)
 /// into tightly packed BGRA8. Returns `width * height * 4` bytes.
-pub fn i420_to_bgra(y: &[u8], u: &[u8], v: &[u8], width: usize, height: usize) -> Vec<u8> {
+pub fn i420_to_bgra(
+    color: &ColorDescription,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let k = Coeffs::new(color);
     let cw = width.div_ceil(2);
     let mut out = vec![0u8; width * height * 4];
 
@@ -10,14 +81,14 @@ pub fn i420_to_bgra(y: &[u8], u: &[u8], v: &[u8], width: usize, height: usize) -
         let y_row = row * width;
         let c_row = (row / 2) * cw;
         for col in 0..width {
-            let c = y[y_row + col] as i32 - 16;
+            let c = y[y_row + col] as i32 - k.y_off;
             let ci = c_row + col / 2;
             let d = u[ci] as i32 - 128;
             let e = v[ci] as i32 - 128;
 
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+            let r = ((k.y * c + k.rv * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((k.y * c - k.gu * d - k.gv * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((k.y * c + k.bu * d + 128) >> 8).clamp(0, 255) as u8;
 
             let o = (y_row + col) * 4;
             out[o] = b;
@@ -37,6 +108,7 @@ pub fn i420_to_bgra(y: &[u8], u: &[u8], v: &[u8], width: usize, height: usize) -
 ///
 /// Identity params take the ungraded loop above, byte for byte.
 pub fn i420_to_bgra_with(
+    color: &ColorDescription,
     params: &crate::color::ColorParams,
     y: &[u8],
     u: &[u8],
@@ -45,8 +117,9 @@ pub fn i420_to_bgra_with(
     height: usize,
 ) -> Vec<u8> {
     if params.is_identity() {
-        return i420_to_bgra(y, u, v, width, height);
+        return i420_to_bgra(color, y, u, v, width, height);
     }
+    let k = Coeffs::new(color);
     let lut = crate::color::Lut::new(params);
     let cw = width.div_ceil(2);
     let mut out = vec![0u8; width * height * 4];
@@ -55,14 +128,14 @@ pub fn i420_to_bgra_with(
         let y_row = row * width;
         let c_row = (row / 2) * cw;
         for col in 0..width {
-            let c = lut.y[y[y_row + col] as usize] as i32 - 16;
+            let c = lut.y[y[y_row + col] as usize] as i32 - k.y_off;
             let ci = c_row + col / 2;
             let d = lut.u[u[ci] as usize] as i32 - 128;
             let e = lut.v[v[ci] as usize] as i32 - 128;
 
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+            let r = ((k.y * c + k.rv * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((k.y * c - k.gu * d - k.gv * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((k.y * c + k.bu * d + 128) >> 8).clamp(0, 255) as u8;
 
             let o = (y_row + col) * 4;
             out[o] = b;
@@ -79,6 +152,27 @@ mod tests {
     use super::*;
     use crate::color::ColorParams;
 
+    /// BT.601 limited: what the tests that predate the colour tags measured,
+    /// and what they have to keep measuring.
+    const SD: ColorDescription = ColorDescription {
+        matrix: Matrix::Bt601,
+        transfer: crate::colorspace::Transfer::Sdr,
+        full_range: false,
+    };
+
+    /// Limited-range BT.601, the one every stream was converted as before the
+    /// colour tags were read: the derivation has to land on the exact integers
+    /// that were hardcoded, or SD material shifts under a change that was only
+    /// ever meant to leave it alone.
+    #[test]
+    fn bt601_limited_is_the_legacy_matrix() {
+        let k = Coeffs::new(&ColorDescription::default());
+        assert_eq!(
+            (k.y_off, k.y, k.rv, k.gu, k.gv, k.bu),
+            (16, 298, 409, 100, 208, 516)
+        );
+    }
+
     /// The render path's half of the charter invariant: an ungraded segment is
     /// the untouched converter, not a grade that happens to round back.
     #[test]
@@ -87,8 +181,8 @@ mod tests {
         let u: Vec<u8> = (0..32 * 24).map(|i| (i % 256) as u8).collect();
         let v: Vec<u8> = (0..32 * 24).map(|i| (255 - i % 256) as u8).collect();
         assert_eq!(
-            i420_to_bgra_with(&ColorParams::default(), &y, &u, &v, 64, 48),
-            i420_to_bgra(&y, &u, &v, 64, 48)
+            i420_to_bgra_with(&SD, &ColorParams::default(), &y, &u, &v, 64, 48),
+            i420_to_bgra(&SD, &y, &u, &v, 64, 48)
         );
     }
 
@@ -106,9 +200,9 @@ mod tests {
         let mut y: Vec<u8> = (0..64 * 48).map(|i| (i % 256) as u8).collect();
         let mut u: Vec<u8> = (0..32 * 24).map(|i| (i % 256) as u8).collect();
         let mut v: Vec<u8> = (0..32 * 24).map(|i| (255 - i % 256) as u8).collect();
-        let fused = i420_to_bgra_with(&params, &y, &u, &v, 64, 48);
+        let fused = i420_to_bgra_with(&SD, &params, &y, &u, &v, 64, 48);
         crate::color::apply_yuv(&params, &mut y, &mut u, &mut v);
-        assert_eq!(fused, i420_to_bgra(&y, &u, &v, 64, 48));
+        assert_eq!(fused, i420_to_bgra(&SD, &y, &u, &v, 64, 48));
     }
 
     /// Not asserted, printed: the numbers in `i420_to_bgra_with`'s docs come
@@ -139,13 +233,13 @@ mod tests {
         bench(
             "i420_to_bgra       ",
             Box::new(|| {
-                std::hint::black_box(i420_to_bgra(&y, &u, &v, w, h));
+                std::hint::black_box(i420_to_bgra(&SD, &y, &u, &v, w, h));
             }),
         );
         bench(
             "i420_to_bgra_with  ",
             Box::new(|| {
-                std::hint::black_box(i420_to_bgra_with(&params, &y, &u, &v, w, h));
+                std::hint::black_box(i420_to_bgra_with(&SD, &params, &y, &u, &v, w, h));
             }),
         );
         bench(
@@ -158,17 +252,38 @@ mod tests {
         );
     }
 
+    fn desc(matrix: Matrix, full_range: bool) -> ColorDescription {
+        ColorDescription {
+            matrix,
+            full_range,
+            ..ColorDescription::default()
+        }
+    }
+
+    /// Each matrix against its own red primary -- the sample the matrices
+    /// disagree about most, and the one a wrong matrix turns visibly orange --
+    /// plus the two neutrals, which is where a wrong *range* shows instead.
     #[test]
     fn known_colors() {
         // 2x2 blocks so each shares one chroma sample.
-        // Black (limited range Y=16), white (Y=235), and a saturated red.
-        let cases: [([u8; 3], [u8; 3]); 3] = [
-            ([16, 128, 128], [0, 0, 0]),
-            ([235, 128, 128], [255, 255, 255]),
-            ([82, 90, 240], [255, 0, 0]), // BT.601 red primary -> R=255,G~0,B~0
+        let cases: [(ColorDescription, [u8; 3], [u8; 3]); 9] = [
+            // Limited range: black is Y=16, white Y=235.
+            (desc(Matrix::Bt601, false), [16, 128, 128], [0, 0, 0]),
+            (desc(Matrix::Bt601, false), [235, 128, 128], [255, 255, 255]),
+            (desc(Matrix::Bt601, false), [82, 90, 240], [255, 0, 0]),
+            (desc(Matrix::Bt709, false), [16, 128, 128], [0, 0, 0]),
+            (desc(Matrix::Bt709, false), [235, 128, 128], [255, 255, 255]),
+            // BT.709's red primary sits at a *lower* luma than BT.601's (0.2126
+            // against 0.299): read with the 601 matrix it comes out dark.
+            (desc(Matrix::Bt709, false), [63, 102, 240], [255, 0, 0]),
+            (desc(Matrix::Bt2020Ncl, false), [74, 97, 240], [255, 0, 0]),
+            // Full range: no headroom, so Y=16 is a dark grey rather than black
+            // -- the case a limited-range conversion crushes to 0.
+            (desc(Matrix::Bt601, true), [16, 128, 128], [16, 16, 16]),
+            (desc(Matrix::Bt601, true), [76, 85, 255], [255, 0, 0]),
         ];
-        for ([yv, uv, vv], [r, g, b]) in cases {
-            let out = i420_to_bgra(&[yv; 4], &[uv], &[vv], 2, 2);
+        for (color, [yv, uv, vv], [r, g, b]) in cases {
+            let out = i420_to_bgra(&color, &[yv; 4], &[uv], &[vv], 2, 2);
             assert_eq!(out.len(), 2 * 2 * 4);
             for px in out.chunks_exact(4) {
                 assert!(px[0].abs_diff(b) <= 2, "B {} vs {}", px[0], b);

@@ -10,6 +10,7 @@ use std::thread;
 use rusty_h264::Decoder;
 
 use crate::color::ColorParams;
+use crate::colorspace::ColorDescription;
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
@@ -319,7 +320,10 @@ impl DecodeSession {
         }
         // The one conversion, on this thread: it is a few milliseconds and the
         // error it could raise has already been raised by `Still::open`.
-        let first = Render::new(color, canvas).frame(
+        // BT.601 limited, because that is what `rgb_to_i420` above wrote these
+        // planes in: a still round-trips through the pair, not through the
+        // colour of whatever file is on the timeline beside it.
+        let first = Render::new(color, ColorDescription::default(), canvas).frame(
             start_frame,
             &still.y,
             &still.u,
@@ -388,6 +392,9 @@ impl DecodeSession {
             return Err(meta.codec.needs_plugin().into());
         }
         let end_frame = end_frame.min(meta.frame_count);
+        // Read off the file once, here, and carried into the worker: it is a
+        // property of the stream, so it cannot change while one range decodes.
+        let source_color = meta.color;
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
         // decoder run ahead of the display without limit.
         let (tx, rx) = sync_channel(2);
@@ -422,7 +429,7 @@ impl DecodeSession {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut render = Render::new(color, canvas);
+                let mut render = Render::new(color, source_color, canvas);
                 // The plugin has to be opened on the thread that uses it: its
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
@@ -484,6 +491,10 @@ impl DecodeSession {
 /// project resolution, byte for byte and allocation for allocation.
 struct Render {
     color: ColorParams,
+    /// What the source's samples mean -- the stream's own matrix and range,
+    /// which is what the conversion below is done in rather than the BT.601 it
+    /// used to assume of every file.
+    desc: ColorDescription,
     canvas: Composer,
     /// The graded copy of the source planes, refilled per frame and kept across
     /// the worker's whole range. Empty unless the clip is both graded *and*
@@ -492,9 +503,10 @@ struct Render {
 }
 
 impl Render {
-    fn new(color: ColorParams, canvas: Composer) -> Self {
+    fn new(color: ColorParams, desc: ColorDescription, canvas: Composer) -> Self {
         Self {
             color,
+            desc,
             canvas,
             graded: (Vec::new(), Vec::new(), Vec::new()),
         }
@@ -514,7 +526,15 @@ impl Render {
                 index,
                 width,
                 height,
-                bgra: i420_to_bgra_with(&self.color, y, u, v, width as usize, height as usize),
+                bgra: i420_to_bgra_with(
+                    &self.desc,
+                    &self.color,
+                    y,
+                    u,
+                    v,
+                    width as usize,
+                    height as usize,
+                ),
             };
         }
         let (gy, gu, gv) = &mut self.graded;
@@ -537,7 +557,7 @@ impl Render {
             height,
             // Ungraded on purpose: the grade is already in the pixels above and
             // the canvas around them must stay the black it was filled with.
-            bgra: i420_to_bgra(y, u, v, width as usize, height as usize),
+            bgra: i420_to_bgra(&self.desc, y, u, v, width as usize, height as usize),
         }
     }
 }
@@ -612,8 +632,11 @@ pub fn image_size(path: &Path) -> crate::Result<(u32, u32)> {
 }
 
 /// Packed RGB8 -> tightly packed I420, BT.601 limited range: the exact inverse
-/// of [`crate::convert::i420_to_bgra`], so a still round-trips to the colour it
-/// was authored in (`images::still_pixels_match_the_source_image` measures it).
+/// of [`crate::convert::i420_to_bgra`] *in that matrix*, which is why
+/// [`DecodeSession::open_still`] hands the renderer a BT.601 description and
+/// not the timeline's. A still has no stream to be tagged by; it round-trips to
+/// the colour it was authored in through this pair and nothing else sees these
+/// planes (`images::still_pixels_match_the_source_image` measures it).
 ///
 /// Chroma is the 2x2 box average, and an odd edge averages the samples it has --
 /// the planes come out `(w + 1) / 2` by `(h + 1) / 2`, which is the shape
