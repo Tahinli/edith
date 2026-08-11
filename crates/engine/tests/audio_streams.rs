@@ -169,6 +169,72 @@ fn a_named_matroska_stream_decodes_that_stream_and_not_the_first() {
     );
 }
 
+/// Stream 0 is the track the file already played, not the first one in the
+/// file: a remux flags the language it wants heard with `FlagDefault` on
+/// whichever track it likes, every reader here picked with that flag, and an
+/// `.edith` project saved before this listing existed must keep playing what it
+/// was saved with. Numbering by file position outright would switch its audio
+/// silently.
+///
+/// The flag is byte-patched in rather than muxed: ffmpeg writes `FlagDefault`
+/// only to say *0*, so the fixture's second track carries `88 81 00` and the
+/// one byte is flipped here -- same length, same offsets, a file mkvmerge could
+/// have written.
+#[test]
+fn flag_default_on_a_later_track_is_still_stream_0() {
+    let mut bytes = std::fs::read(asset(MULTI_MKV)).expect("read the fixture");
+    // `TrackLanguage` "fra" is the second audio `TrackEntry`; its `FlagDefault`
+    // sits right behind it.
+    let language = b"\x22\xb5\x9c\x83fra";
+    let at = bytes
+        .windows(language.len())
+        .position(|w| w == language)
+        .expect("the fixture's French track")
+        + language.len();
+    assert_eq!(
+        &bytes[at..at + 3],
+        b"\x88\x81\x00",
+        "the fixture stopped carrying an explicit FlagDefault=0"
+    );
+    bytes[at + 2] = 1;
+    let patched = std::env::temp_dir().join(format!("ve_flagdefault_{}.mkv", std::process::id()));
+    std::fs::write(&patched, &bytes).expect("write the patched file");
+
+    // The flagged track leads: it is what `AudioSession::open` played before
+    // any of this, so it is stream 0 -- and the other one is still listed,
+    // behind it.
+    let streams = AudioSession::probe_streams(&patched).expect("probes");
+    assert_eq!(
+        streams.iter().map(|s| s.lang.clone()).collect::<Vec<_>>(),
+        vec![Some("fra".into()), Some("eng".into())],
+        "the default track has to lead: {streams:?}"
+    );
+    assert_eq!((streams[0].index, streams[1].index), (0, 1));
+
+    // ...and it decodes to what it always decoded to: 220 Hz, the French
+    // track's tone, sample for sample what the wrapper hands out.
+    let (wrapped, rx) = AudioSession::open(&patched).expect("opens").expect("audio");
+    let played: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let sources = [(patched.clone(), 0)];
+    let (meta, stream_0) = {
+        let (meta, rx) = AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])
+            .expect("opens")
+            .expect("audio");
+        (meta, rx.into_iter().flat_map(|c| c.samples).collect::<Vec<f32>>())
+    };
+    assert_eq!(wrapped, meta);
+    assert_eq!(played, stream_0, "stream 0 is not what the file plays");
+    let left: Vec<f32> = stream_0.chunks(2).map(|c| c[0]).collect();
+    let middle = &left[left.len() / 4..left.len() * 3 / 4];
+    let expected = 2.0 * 220.0 * middle.len() as f64 / 44100.0;
+    let crossings = zero_crossings(middle) as f64;
+    assert!(
+        (crossings - expected).abs() < 0.05 * expected,
+        "stream 0 is {crossings} crossings, the French track's 220 Hz would be {expected}"
+    );
+    std::fs::remove_file(&patched).unwrap();
+}
+
 /// The file the ask came from: a dual-audio Blu-ray rip, two AAC tracks, and
 /// the second one has to play. Existence-gated -- it is not in the repo.
 #[test]
