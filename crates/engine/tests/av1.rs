@@ -57,28 +57,19 @@ fn the_demuxer_reports_an_av1_track_in_matroska() {
     assert_eq!(vp9.codec, Codec::Vp9);
 }
 
-/// The delivered audio scope, as an assert: this slice reads a Matroska file's
-/// picture and not its sound, so the fixture's AAC track is *named* in the
-/// notice a session shows rather than half-played or reported as an mp4 error.
+/// The delivered audio scope, as an assert: a Matroska file's AAC track is read
+/// like any other file's (`tests/hevc_mkv.rs` is where that lives), and its
+/// *picture* being AV1 changes nothing about it.
 #[test]
-fn matroska_audio_is_not_wired_and_says_so() {
+fn matroska_audio_is_read_whatever_the_picture_is() {
     let path = asset("test_av1.mkv");
-    assert!(
-        AudioSession::probe(&path, 0)
-            .expect("probe must not fail")
-            .is_none(),
-        "an mkv is a silent source for now, not an error"
-    );
-    assert!(
-        AudioSession::probe_streams(&path)
-            .expect("streams")
-            .is_empty()
-    );
-    let reason = AudioSession::unsupported(&path)
-        .expect("unsupported")
-        .expect("the fixture has an AAC track to name");
-    assert!(reason.contains("A_AAC"), "{reason}");
-    assert!(reason.contains("not wired"), "{reason}");
+    let probe = AudioSession::probe(&path, 0)
+        .expect("probe must not fail")
+        .expect("the fixture has an AAC track");
+    assert_eq!((probe.sample_rate, probe.channels), (44_100, 2));
+    let streams = AudioSession::probe_streams(&path).expect("streams");
+    assert_eq!(streams.len(), 1, "one readable audio stream: {streams:?}");
+    assert!(streams[0].decodable);
 }
 
 /// Every block comes back, keyframes carry the sequence header, and the sync
@@ -204,11 +195,18 @@ fn a_seek_lands_on_the_frame_it_asked_for() {
     assert_eq!(frames[0].index, KEYFRAME + 7, "the frame asked for");
 }
 
-/// Export re-encodes to H.264 whatever the source was coded with -- and out of
-/// a Matroska source it also has to write an mp4 the demuxer reads back.
+/// An mp4 export of a Matroska source is refused by name, and says where the
+/// sound can go instead.
+///
+/// It used to *succeed*, silently, and only because this engine could not read
+/// a Matroska file's audio at all: the export wrote picture with no sound in it
+/// and nobody was told. Now that the sound is read (`tests/hevc_mkv.rs`), the
+/// rule the whole mp4 path is built on applies to it like to any other source
+/// it cannot copy -- an AC-3 mp4 has always been refused in the same breath.
+/// The picture half of the same export is [`an_av1_export_reopens_through_our_own_demuxer`].
 #[test]
 #[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
-fn an_av1_source_exports_as_h264() {
+fn an_mp4_export_of_a_matroska_source_is_refused_by_name() {
     let session = PlaybackSession::open(asset("test_av1.mkv")).expect("open test_av1.mkv");
     let meta = *session.meta();
     let project = Project::single(asset("test_av1.mkv"), meta.frame_count);
@@ -221,13 +219,15 @@ fn an_av1_source_exports_as_h264() {
         assert!(started.elapsed() < Duration::from_secs(120), "export hung");
         std::thread::sleep(Duration::from_millis(20));
     }
-    handle.result().expect("outcome").expect("export");
-
-    let (written, _) = Demuxer::open(&out).expect("reopen the export");
-    assert_eq!(written.codec, Codec::H264, "the default format is H.264");
-    assert_eq!(written.frame_count, FRAMES, "every timeline frame written");
-    assert_eq!((written.width, written.height), (1280, 720));
-    let _ = std::fs::remove_file(&out);
+    let refused = handle
+        .result()
+        .expect("outcome")
+        .expect_err("an mkv's AAC cannot be copied into an mp4")
+        .to_string();
+    assert!(refused.contains("test_av1.mkv"), "{refused}");
+    assert!(refused.contains("Matroska"), "{refused}");
+    assert!(refused.contains("WAV or FLAC"), "{refused}");
+    assert!(!out.exists(), "a refused export leaves no file behind");
 }
 
 /// A short timeline out of the H.264 fixture, which is what the AV1 export tests

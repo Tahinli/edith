@@ -80,11 +80,13 @@ pub enum Format {
     #[default]
     Mp4,
     /// Picture alone, AV1 in Matroska. Alone because Matroska carries no sound
-    /// this project can write: this engine's Matroska writer has no audio track
-    /// at all, and an AAC track written into one would be one *this engine's own
-    /// reader* leaves silent
-    /// (`audio::AudioSession::open` refuses Matroska audio). The sound of an AV1
-    /// export is a WAV or FLAC beside it, which a front-end says up front.
+    /// this project can *write*: this engine's Matroska writer has no audio
+    /// track at all, and the copy path walks an mp4 sample table, which a
+    /// Matroska file has none of. (*Reading* one's AAC is a different question,
+    /// and since this engine gained a Matroska demuxer the answer is yes --
+    /// `audio::Track::open` does it through symphonia's mkv reader.) The sound
+    /// of an AV1 export is a WAV or FLAC beside it, which a front-end says up
+    /// front.
     Av1,
     /// The audio lane alone, 16-bit PCM.
     Wav,
