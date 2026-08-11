@@ -959,7 +959,7 @@ fn run(
     // samples *mean* ([`ColorDescription`]), which is what decides whether they
     // are remapped on the way in. Real time for a still, a song and a
     // single-rate project, where every conversion below is the identity.
-    let rates: Vec<(Rate, ColorDescription)> = sources
+    let rates: Vec<(Rate, ColorDescription, Option<f32>)> = sources
         .iter()
         .map(|source| source_rate(&source.path, meta.frame_rate))
         .collect();
@@ -970,17 +970,18 @@ fn run(
     // is the difference between paying that once and paying it per cut. An SDR
     // source -- the whole of an ordinary project -- builds no table at all.
     //
-    // Through the project's own preset ([`tonemap::Preset`]), which is the same
-    // one playback's decode funnel builds its tables with: preview and export
-    // are the same rendition of the same film because they are told the same
-    // thing, not because two numbers happen to agree.
+    // Through the project's own preset ([`tonemap::Preset`]) and each source's
+    // own declared peak, which is the pair playback's decode funnel builds its
+    // tables with: preview and export are the same rendition of the same film
+    // because they are told the same two things, not because two numbers happen
+    // to agree.
     let preset = project.tone();
     let tone: Vec<Option<ToneMapper>> = rates
         .iter()
-        .map(|(_, color)| match color.transfer {
+        .map(|(_, color, peak)| match color.transfer {
             Transfer::Sdr => None,
-            Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset)),
-            Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset)),
+            Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset, *peak)),
+            Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset, *peak)),
         })
         .collect();
     // ...and the one space they are all written in, the same rule a reader with
@@ -1016,7 +1017,7 @@ fn run(
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                let (rate, color) = rates[source];
+                let (rate, color, _peak) = rates[source];
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
                 let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
@@ -1233,24 +1234,29 @@ fn remap_into(
 /// -- a still, a song -- and for one that will not open here: the decoder is
 /// opened a few lines later and fails the export by name, which is a better
 /// error than this one could raise.
-fn source_rate(path: &Path, timeline_fps: f64) -> (Rate, ColorDescription) {
+fn source_rate(path: &Path, timeline_fps: f64) -> (Rate, ColorDescription, Option<f32>) {
     if crate::is_image(path) || crate::is_audio(path) {
         // A still is BT.601 by construction whatever it was authored as:
         // `decode::rgb_to_i420` is the one matrix that turns its pixels into
         // planes. A song has no picture and the answer is never read.
-        return (Rate::REAL_TIME, ColorDescription::default());
+        return (Rate::REAL_TIME, ColorDescription::default(), None);
     }
     match Demuxer::open(path) {
         // ...and one whose rate cannot be named against the timeline's, which
         // `matches_timeline` refuses at import, so nothing on a timeline is on
         // this arm either.
-        Ok((meta, _)) => (
+        //
+        // The declared peak comes off the same open the space does, which is
+        // what keeps export on the number playback's decode funnel read: one
+        // header parse, both answers.
+        Ok((meta, demuxer)) => (
             Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
             meta.color,
+            demuxer.light().peak(),
         ),
         // Unreadable here means unreadable below too, where the span dies with a
         // real message; the file's own space is the least of that.
-        Err(_) => (Rate::REAL_TIME, ColorDescription::default()),
+        Err(_) => (Rate::REAL_TIME, ColorDescription::default(), None),
     }
 }
 

@@ -99,7 +99,13 @@ fn spread(px: [u8; 3]) -> u8 {
 /// to render it: tone-mapped first, then graded, then converted as BT.709 SDR.
 /// `grade` is applied in whichever domain `before` says -- which is the point of
 /// [`the_grade_lands_after_the_tone_map`].
-fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool, preset: Preset) -> [u8; 3] {
+fn by_hand(
+    codes: [u8; 3],
+    grade: &ColorParams,
+    before: bool,
+    preset: Preset,
+    peak: Option<f32>,
+) -> [u8; 3] {
     let (w, h) = (8usize, 8usize);
     let mut y = vec![codes[0]; w * h];
     let mut u = vec![codes[1]; w / 2 * h / 2];
@@ -107,7 +113,7 @@ fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool, preset: Preset) ->
     if before {
         apply_yuv(grade, &mut y, &mut u, &mut v);
     }
-    ToneMapper::new(Hdr::Pq, preset).map(&mut y, &mut u, &mut v, w, h);
+    ToneMapper::new(Hdr::Pq, preset, peak).map(&mut y, &mut u, &mut v, w, h);
     if !before {
         apply_yuv(grade, &mut y, &mut u, &mut v);
     }
@@ -256,8 +262,8 @@ fn the_grade_lands_after_the_tone_map() {
 
     for (name, patch) in [("diffuse white", DIFFUSE), ("red", RED)] {
         let shown = pixel(&frame, patch.1);
-        let after = by_hand(patch.0, &grade, false, Preset::default());
-        let before = by_hand(patch.0, &grade, true, Preset::default());
+        let after = by_hand(patch.0, &grade, false, Preset::default(), None);
+        let before = by_hand(patch.0, &grade, true, Preset::default(), None);
         for (i, channel) in ["B", "G", "R"].iter().enumerate() {
             assert!(
                 shown[i].abs_diff(after[i]) <= 2,
@@ -269,4 +275,66 @@ fn the_grade_lands_after_the_tone_map() {
             "{name}: grading before the map gives the same pixel, so this proves nothing"
         );
     }
+}
+
+/// The film's own declared peak, all the way to the window: `test_hdr_bright.mkv`
+/// carries the same four patches as `test_pq.mp4` and a container MaxCLL of
+/// 4000 cd/m^2, so a funnel that read the metadata renders it at 4000 and one
+/// that ignored it renders it at the 1000 an undeclared file is assumed at --
+/// two plainly different pictures, which is why that fixture says 4000 and the
+/// older metadata ones say the 1000 nothing can tell apart from the fallback.
+///
+/// Both sides are computed by hand through the same `ToneMapper`, so what is
+/// asserted is which number the *funnel* built its table with, not where Method
+/// A puts a patch.
+#[test]
+fn a_films_declared_peak_reaches_the_window() {
+    let mut session = open("test_hdr_bright.mkv");
+    assert_eq!(session.meta().color.transfer, Transfer::Pq, "fixture tags");
+    assert_eq!(session.tone(), Preset::Reference, "nobody has picked yet");
+    let frame = next_frame(&mut session, "an open");
+    let flat = ColorParams::default();
+    for (patch, name) in [(DIFFUSE, "diffuse white"), (HIGHLIGHT, "the highlight")] {
+        let shown = luma_code(pixel(&frame, patch.1));
+        let declared = luma_code(by_hand(patch.0, &flat, false, Preset::Reference, Some(4000.0)));
+        let ignored = luma_code(by_hand(patch.0, &flat, false, Preset::Reference, None));
+        assert!(
+            shown.abs_diff(declared) <= 2,
+            "{name} rendered at {shown}, {declared} at the film's declared 4000 cd/m^2"
+        );
+        assert!(
+            shown.abs_diff(ignored) > 8,
+            "{name}: {shown} is indistinguishable from the {ignored} of an ignored peak"
+        );
+    }
+}
+
+/// ...and both tiers a peak can live in reach the table, on the fixtures that
+/// exist for each: `test_hdr_meta.mkv` declares its 1000 in the container,
+/// `test_hdr_sei.mkv` only inside the HEVC bitstream. Neither can be told apart
+/// from the fallback in a *picture* (1000 is what an undeclared file is assumed
+/// at, and both are black), so what is asserted is the number the table is
+/// built at -- the same `Demuxer::light().peak()` hand-off the decode funnel
+/// and the export table make.
+#[test]
+fn either_tier_of_metadata_is_what_the_table_is_built_at() {
+    for (name, tier) in [
+        ("test_hdr_meta.mkv", "container"),
+        ("test_hdr_meta.mp4", "container"),
+        ("test_hdr_sei.mkv", "bitstream SEI"),
+        ("test_hdr_bright.mkv", "container"),
+    ] {
+        let (_, demuxer) = engine::demux::Demuxer::open(&asset(name)).expect("open");
+        let peak = demuxer.light().peak();
+        let want = match name {
+            "test_hdr_bright.mkv" => 4000.0,
+            _ => 1000.0,
+        };
+        assert_eq!(peak, Some(want), "{name} ({tier} tier)");
+        let mapper = ToneMapper::new(Hdr::Pq, Preset::Reference, peak);
+        assert_eq!(mapper.peak(), want, "{name}: the table's assumed peak");
+    }
+    // An SDR file declares nothing, and nothing is what the map is told.
+    let (_, demuxer) = engine::demux::Demuxer::open(&asset("test_av.mp4")).expect("open");
+    assert_eq!(demuxer.light().peak(), None, "an SDR file's peak");
 }

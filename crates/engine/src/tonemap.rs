@@ -40,8 +40,10 @@
 //! everything -- and *which* answer a project wants is a matter of taste, not of
 //! correctness: a reference rendition and a vivid one are both honest pictures
 //! of the same film. So it is a [`Preset`] the viewer picks rather than a
-//! constant, and never the stream's own metadata, which this module is never
-//! handed (it is given pixels).
+//! constant -- read, on the faithful one, against the peak the film itself
+//! declares (`declared_peak` at [`ToneMapper::new`], the demuxer's MaxCLL or
+//! mastering-display maximum). The picked rendition still decides; the metadata
+//! only says what "the peak the content really has" is for this film.
 //!
 //! # Why a 3D LUT
 //!
@@ -107,9 +109,23 @@ const CHROMA_FRAC: u32 = 16;
 /// player looks; told a lower one it lifts the whole picture. The gain is
 /// applied *after* the map, on the SDR colour differences, so it enriches the
 /// picture a viewer is shown rather than bending a stage of the standard.
+///
+/// # How a film's own metadata composes with the pick
+///
+/// Only [`Reference`](Preset::Reference) reads it, and that is the rule rather
+/// than an omission: it is the rendition that promises *the mastering peak the
+/// content really has*, so a film that declares 1759 cd/m^2 is converted at
+/// 1759 and its 1000 is a fallback for a file that declared nothing.
+/// [`Standard`](Preset::Standard) and [`Vivid`](Preset::Vivid) name a fixed
+/// exposure -- 400 and 250 -- which is the whole of what a viewer picks them
+/// for; letting a film's metadata move those numbers would make the same pick
+/// mean a different brightness on every file, which is the opposite of what
+/// picking one is for. So: metadata is read *against* the picked preset, never
+/// in place of it, and two of the three are deliberately deaf to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preset {
-    /// The published conversion, at the mastering peak the content really has.
+    /// The published conversion, at the mastering peak the content really has
+    /// -- the film's own declared peak where it has one (see the note above).
     /// The default: what the document says, and what a second reference can be
     /// checked against.
     #[default]
@@ -127,12 +143,30 @@ impl Preset {
     /// last.
     pub const ALL: [Preset; 3] = [Preset::Reference, Preset::Standard, Preset::Vivid];
 
-    /// The mastering peak Method A is told to assume, cd/m^2.
+    /// The mastering peak Method A is told to assume, cd/m^2: this rendition's
+    /// own number, before a file gets a say ([`Self::master_nits_for`]).
     pub fn master_nits(self) -> f32 {
         match self {
             Preset::Reference => 1000.0,
             Preset::Standard => 400.0,
             Preset::Vivid => 250.0,
+        }
+    }
+
+    /// The peak Method A is really run at, given what the file declared
+    /// ([`crate::demux::Demuxer::light`] -> [`crate::colorspace::ContentLight::peak`]).
+    /// The composition rule is on the enum: the reference rendition takes the
+    /// film's number, the other two keep their own.
+    ///
+    /// A declared peak is a stranger's number, so it is checked before it
+    /// becomes the divisor of every pixel: below SDR white the whole picture
+    /// clips to white, and a NaN would poison the entire table into black.
+    /// Out of range -- or a NaN, which no comparison admits -- is treated as
+    /// not declared. The ceiling is PQ's own 10 000 cd/m^2.
+    pub fn master_nits_for(self, declared_peak: Option<f32>) -> f32 {
+        match (self, declared_peak) {
+            (Preset::Reference, Some(peak)) if (SDR_NITS..=10_000.0).contains(&peak) => peak,
+            _ => self.master_nits(),
         }
     }
 
@@ -186,10 +220,18 @@ pub struct ToneMapper {
     /// The same for chroma, four fields: U at `i`, U at `i + 1`, V at `i`, V at
     /// `i + 1`. One `u64` multiply does what four `u8` ones did.
     chroma: Box<[u64]>,
+    /// The peak this table was really built at, cd/m^2 -- the picked preset's
+    /// read against what the file declared ([`Preset::master_nits_for`]). Kept
+    /// so a caller can say which number a picture came out of.
+    peak: f32,
 }
 
 impl ToneMapper {
-    pub fn new(transfer: Transfer, preset: Preset) -> Self {
+    /// `declared_peak` is the film's own peak brightness where it has one
+    /// ([`crate::demux::Demuxer::light`]), [`None`] for a file that declared
+    /// nothing. Which renditions act on it is [`Preset`]'s composition rule.
+    pub fn new(transfer: Transfer, preset: Preset, declared_peak: Option<f32>) -> Self {
+        let peak = preset.master_nits_for(declared_peak);
         let cells = LUMA_NODES * CHROMA_NODES * CHROMA_NODES;
         let (mut y_node, mut uv_node) = (vec![0u8; cells], vec![[0u8; 2]; cells]);
         for kv in 0..CHROMA_NODES {
@@ -202,6 +244,7 @@ impl ToneMapper {
                     let out = map_code(
                         transfer,
                         preset,
+                        peak,
                         (iy << LUMA_STEP) as f32,
                         (ju << CHROMA_STEP) as f32,
                         (kv << CHROMA_STEP) as f32,
@@ -233,7 +276,15 @@ impl ToneMapper {
         Self {
             luma: luma.into_boxed_slice(),
             chroma: chroma.into_boxed_slice(),
+            peak,
         }
+    }
+
+    /// The mastering peak this table was built at, cd/m^2: the film's own where
+    /// the rendition reads it, the rendition's own otherwise. What a test -- or
+    /// a caller wanting to say which number a picture came out of -- asks.
+    pub fn peak(&self) -> f32 {
+        self.peak
     }
 
     /// Maps one tightly packed 8-bit I420 frame in place: `y` is `width *
@@ -346,8 +397,14 @@ fn byte(value: f32) -> u8 {
 /// The whole float pipeline, from one triple of input codes to one triple of
 /// BT.709 limited-range output codes. Runs at build time only; the module note
 /// walks the stages.
-fn map_code(transfer: Transfer, preset: Preset, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
-    let master_nits = preset.master_nits();
+fn map_code(
+    transfer: Transfer,
+    preset: Preset,
+    master_nits: f32,
+    yc: f32,
+    uc: f32,
+    vc: f32,
+) -> [f32; 3] {
     // 1. limited-range BT.2020 Y'C'bC'r -> R'G'B' signal.
     let luma = (yc - 16.0) / 219.0;
     let cb = (uc - 128.0) / 224.0;
@@ -368,14 +425,11 @@ fn map_code(transfer: Transfer, preset: Preset, yc: f32, uc: f32, vc: f32) -> [f
     // Clamping instead walks a too-bright pixel toward white, which is what a
     // highlight past the display's reach should do.
     //
-    // ponytail: the ceiling is that the assumed peak is an exposure *choice*
-    // (now the viewer's, [`Preset`]), not a measurement. Everything the content
-    // masters above it -- which at 400 is most of an HDR10 grade's highlight
-    // range -- walks to white here. The upgrade is the stream's own
-    // MaxCLL/mastering-display metadata reaching this module beside the preset,
-    // as the measured ceiling the picked one is read against: nothing else in
-    // the pipeline changes.
-    let lin = display_light(transfer, preset, [r, g, b]);
+    // The reference rendition is now told the film's own declared peak
+    // ([`Preset::master_nits_for`]), so what walks to white here is what the
+    // film says it never masters above; the two fixed renditions keep their
+    // exposure and still clamp an HDR10 grade's top end into white on purpose.
+    let lin = display_light(transfer, master_nits, [r, g, b]);
     let gam = lin.map(|c| (c / master_nits).clamp(0.0, 1.0).powf(1.0 / GAMMA));
 
     // 4. BT.2020 luma and colour differences, in that domain.
@@ -427,16 +481,16 @@ fn map_code(transfer: Transfer, preset: Preset, yc: f32, uc: f32, vc: f32) -> [f
 }
 
 /// Signal -> display light in cd/m^2.
-fn display_light(transfer: Transfer, preset: Preset, rgb: [f32; 3]) -> [f32; 3] {
+fn display_light(transfer: Transfer, master_nits: f32, rgb: [f32; 3]) -> [f32; 3] {
     match transfer {
         Transfer::Pq => rgb.map(pq_eotf),
         Transfer::Hlg => {
             // BT.2100: inverse OETF to scene light, then the OOTF, whose system
             // gamma is 1.2 at a 1000 cd/m^2 display and follows the display
-            // peak from there by the standard's own log term -- so the peak the
-            // preset names is the peak the OOTF is built for, rather than a
-            // number the choice silently invalidates.
-            let master_nits = preset.master_nits();
+            // peak from there by the standard's own log term -- so the peak in
+            // force, the picked rendition's read against the film's declared
+            // one, is the peak the OOTF is built for rather than a number the
+            // choice or the metadata silently invalidates.
             let scene = rgb.map(hlg_scene);
             let ys = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
             let gamma = 1.2 + 0.42 * (master_nits / 1000.0).log10();
@@ -445,7 +499,9 @@ fn display_light(transfer: Transfer, preset: Preset, rgb: [f32; 3]) -> [f32; 3] 
             // `ys^(gamma - 1)` term diverges as the scene goes black and the
             // `0 * inf` that follows is a NaN -- which byte-casts to 0 and puts
             // a hole where black belongs (measured: HLG black rendered code 0
-            // under the vivid preset before this line).
+            // under the vivid preset before this line). Kept above 1000 too,
+            // where a declared peak puts the gamma over 1 and the term is
+            // merely 0: the guard costs one comparison at build time.
             let ys = ys.max(0.0);
             let gain = match ys > 0.0 {
                 true => master_nits * ys.powf(gamma - 1.0),
@@ -538,9 +594,8 @@ mod tests {
     /// reason the reference rendition reads dark), 205 at 400, 226 at 250. The
     /// day one of these moves, the transcription moved with it.
     ///
-    /// The last row of each is the ceiling the `map_code` ponytail names,
-    /// asserted rather than described: everything above the assumed peak is
-    /// white.
+    /// The last row of each says what happens above the assumed peak, asserted
+    /// rather than described: it is white.
     #[test]
     fn pq_anchors_land_where_method_a_puts_them() {
         for (preset, diffuse) in [
@@ -549,7 +604,7 @@ mod tests {
             (Preset::Vivid, 226),
         ] {
             let peak = preset.master_nits();
-            let mapper = ToneMapper::new(Transfer::Pq, preset);
+            let mapper = ToneMapper::new(Transfer::Pq, preset, None);
             for (nits, expected) in [(0.0, 16u8), (203.0, diffuse), (peak, 235), (10000.0, 235)] {
                 let code = byte(pq_code(nits));
                 let (y, _, _) = mapped(&mapper, code, 128, 128);
@@ -572,7 +627,15 @@ mod tests {
     fn a_brighter_preset_is_brighter_and_a_vivid_one_is_richer() {
         // BT.2408 diffuse white, and a saturated BT.2020 red beside it.
         let (diffuse, red) = (byte(pq_code(203.0)), (100u8, 90u8, 200u8));
-        let luma = |preset| mapped(&ToneMapper::new(Transfer::Pq, preset), diffuse, 128, 128).0;
+        let luma = |preset| {
+            mapped(
+                &ToneMapper::new(Transfer::Pq, preset, None),
+                diffuse,
+                128,
+                128,
+            )
+            .0
+        };
         let (reference, standard, vivid) = (
             luma(Preset::Reference),
             luma(Preset::Standard),
@@ -583,7 +646,12 @@ mod tests {
             "reference {reference}, standard {standard}, vivid {vivid}"
         );
         let colour = |preset| {
-            let (_, u, v) = mapped(&ToneMapper::new(Transfer::Pq, preset), red.0, red.1, red.2);
+            let (_, u, v) = mapped(
+                &ToneMapper::new(Transfer::Pq, preset, None),
+                red.0,
+                red.1,
+                red.2,
+            );
             (u.abs_diff(128), v.abs_diff(128))
         };
         let (flat, rich) = (colour(Preset::Standard), colour(Preset::Vivid));
@@ -605,12 +673,19 @@ mod tests {
     fn the_grid_is_the_pipeline_on_its_nodes() {
         for preset in Preset::ALL {
             for transfer in [Transfer::Pq, Transfer::Hlg] {
-                let mapper = ToneMapper::new(transfer, preset);
+                let mapper = ToneMapper::new(transfer, preset, None);
                 for yc in (0..=248u8).step_by(1 << LUMA_STEP) {
                     for uc in (0..=240u8).step_by(1 << CHROMA_STEP) {
                         for vc in (0..=240u8).step_by(1 << CHROMA_STEP) {
                             let got = mapped(&mapper, yc, uc, vc);
-                            let want = map_code(transfer, preset, yc.into(), uc.into(), vc.into());
+                            let want = map_code(
+                                transfer,
+                                preset,
+                                mapper.peak(),
+                                yc.into(),
+                                uc.into(),
+                                vc.into(),
+                            );
                             let want = (byte(want[0]), byte(want[1]), byte(want[2]));
                             assert_eq!(got, want, "{preset:?} {transfer:?} node {yc}/{uc}/{vc}");
                         }
@@ -639,7 +714,7 @@ mod tests {
             .into_iter()
             .flat_map(|t| Preset::ALL.map(|p| (t, p)))
         {
-            let mapper = ToneMapper::new(transfer, preset);
+            let mapper = ToneMapper::new(transfer, preset, None);
             for yc in (3..=255u8).step_by(23) {
                 for uc in (5..=255u8).step_by(29) {
                     for vc in (7..=255u8).step_by(31) {
@@ -658,6 +733,7 @@ mod tests {
                                     let out = map_code(
                                         transfer,
                                         preset,
+                                        mapper.peak(),
                                         node(yc, LUMA_STEP) + dy,
                                         node(uc, CHROMA_STEP) + du,
                                         node(vc, CHROMA_STEP) + dv,
@@ -695,7 +771,7 @@ mod tests {
             .into_iter()
             .flat_map(|t| Preset::ALL.map(|p| (t, p)))
         {
-            let mapper = ToneMapper::new(transfer, preset);
+            let mapper = ToneMapper::new(transfer, preset, None);
             let mut last = 0u8;
             for code in 0..=255u8 {
                 let (y, _, _) = mapped(&mapper, code, 128, 128);
@@ -718,7 +794,7 @@ mod tests {
             .into_iter()
             .flat_map(|t| Preset::ALL.map(|p| (t, p)))
         {
-            let mapper = ToneMapper::new(transfer, preset);
+            let mapper = ToneMapper::new(transfer, preset, None);
             for code in (16..=235u8).step_by(7) {
                 let (_, u, v) = mapped(&mapper, code, 128, 128);
                 assert!(
@@ -748,7 +824,7 @@ mod tests {
             (Preset::Standard, 170),
             (Preset::Vivid, 170),
         ] {
-            let mapper = ToneMapper::new(Transfer::Hlg, preset);
+            let mapper = ToneMapper::new(Transfer::Hlg, preset, None);
             let code = |signal: f32| byte(16.0 + 219.0 * signal);
             let (black, _, _) = mapped(&mapper, code(0.0), 128, 128);
             let (diffuse, _, _) = mapped(&mapper, code(0.75), 128, 128);
@@ -766,7 +842,7 @@ mod tests {
     /// size at all returns instead of panicking on a zero-length band.
     #[test]
     fn a_frame_that_does_not_measure_up_is_untouched() {
-        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default(), None);
         let mut y = vec![128u8; 8 * 8 - 1];
         let mut u = vec![128u8; 4 * 4];
         let mut v = vec![128u8; 4 * 4];
@@ -781,7 +857,7 @@ mod tests {
     /// off the end.
     #[test]
     fn odd_sizes_map_every_pixel() {
-        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default(), None);
         let (w, h) = (7usize, 5usize);
         let mut y = vec![200u8; w * h];
         let mut u = vec![128u8; w.div_ceil(2) * h.div_ceil(2)];
@@ -803,7 +879,7 @@ mod tests {
     /// time", and the reason a plain mean here would be a coin flip.
     #[test]
     fn perf_4k_and_1080p() {
-        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default(), None);
         for (w, h, budget) in [(3840usize, 1600usize, 25.0f64), (1920, 1080, 8.0)] {
             let mut y: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
             let mut u: Vec<u8> = (0..w / 2 * h / 2).map(|i| (i % 256) as u8).collect();
@@ -824,6 +900,124 @@ mod tests {
                     "{w}x{h}: {best:.3} ms/frame over {budget} ms"
                 );
             }
+        }
+    }
+
+    /// The paid debt: the film's own declared peak is what the reference
+    /// rendition converts at. 1759 cd/m^2 is a real number -- the MaxCLL of the
+    /// HDR10 grade of *a real film*, which the container never says
+    /// and the HEVC SEI does -- and every anchor moves with it, downward,
+    /// because a peak this far above the 1000 an undeclared file is assumed at
+    /// is *headroom*: the same code is a smaller fraction of a brighter peak.
+    ///
+    /// The row that matters most is 1000 cd/m^2. Told 1000, Method A puts it at
+    /// SDR white and everything above it is gone; told the film's 1759 it lands
+    /// at 215 and the 759 nits above it are still a picture. That is the whole
+    /// of what reading the metadata buys.
+    #[test]
+    fn the_reference_rendition_converts_at_the_films_own_peak() {
+        const FILM: f32 = 1759.0;
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::Reference, Some(FILM));
+        assert_eq!(
+            mapper.peak(),
+            FILM,
+            "the table was built at the film's peak"
+        );
+        // Anchors, cd/m^2 -> limited-range SDR luma, at 1759 rather than 1000:
+        // black is still black, the film's own peak is SDR white, and BT.2408
+        // diffuse white lands at 145 instead of 166.
+        for (nits, expected) in [
+            (0.0, 16u8),
+            (203.0, 145),
+            (1000.0, 215),
+            (FILM, 235),
+            (10000.0, 235),
+        ] {
+            let code = byte(pq_code(nits));
+            let (y, _, _) = mapped(&mapper, code, 128, 128);
+            assert!(
+                y.abs_diff(expected) <= 3,
+                "{nits} cd/m^2 (code {code}) -> {y}, expected {expected} at a {FILM} peak"
+            );
+        }
+        // ...and the direction, on every code rather than on the anchors: a
+        // higher assumed peak is never brighter, and somewhere it is plainly
+        // darker. The fallback is what the same file gets with its metadata
+        // stripped, which is the control.
+        let fallback = ToneMapper::new(Transfer::Pq, Preset::Reference, None);
+        assert_eq!(fallback.peak(), 1000.0, "an undeclared file's assumption");
+        let mut lower = 0;
+        for code in 0..=255u8 {
+            let (declared, _, _) = mapped(&mapper, code, 128, 128);
+            let (assumed, _, _) = mapped(&fallback, code, 128, 128);
+            assert!(
+                declared <= assumed,
+                "code {code}: the film's peak lifted it, {declared} over {assumed}"
+            );
+            lower += u32::from(declared < assumed);
+        }
+        assert!(lower > 128, "only {lower} of 256 codes moved at all");
+        // HLG's OOTF follows the same peak, and the black guard has to hold
+        // above 1000 as well as below it: a system gamma over 1 makes the
+        // `ys^(gamma - 1)` term zero rather than infinite, and a hole where
+        // black belongs is the failure either way.
+        let hlg = ToneMapper::new(Transfer::Hlg, Preset::Reference, Some(FILM));
+        let (black, _, _) = mapped(&hlg, byte(16.0), 128, 128);
+        let (near_black, _, _) = mapped(&hlg, byte(16.0 + 219.0 * 0.02), 128, 128);
+        let (white, _, _) = mapped(&hlg, 235, 128, 128);
+        assert!(black.abs_diff(16) <= 3, "HLG black at {FILM} -> {black}");
+        assert!(near_black > 16, "HLG near-black at {FILM} -> {near_black}");
+        assert!(white.abs_diff(235) <= 3, "HLG peak at {FILM} -> {white}");
+    }
+
+    /// The composition rule on [`Preset`], asserted: the two fixed renditions
+    /// are deaf to the metadata, byte for byte, and the reference one is not.
+    /// A "read the peak" change that reached all three would make the same pick
+    /// mean a different exposure on every file, and this is what catches it.
+    #[test]
+    fn only_the_reference_rendition_reads_the_declared_peak() {
+        for transfer in [Transfer::Pq, Transfer::Hlg] {
+            for preset in Preset::ALL {
+                let declared = ToneMapper::new(transfer, preset, Some(1759.0));
+                let assumed = ToneMapper::new(transfer, preset, None);
+                let deaf = preset != Preset::Reference;
+                assert_eq!(
+                    declared.peak() == assumed.peak(),
+                    deaf,
+                    "{preset:?} {transfer:?}: peak {} against {}",
+                    declared.peak(),
+                    assumed.peak()
+                );
+                assert_eq!(
+                    declared.luma == assumed.luma && declared.chroma == assumed.chroma,
+                    deaf,
+                    "{preset:?} {transfer:?}: the tables"
+                );
+            }
+        }
+    }
+
+    /// A declared peak is a number out of a stranger's file, so the two ways it
+    /// can be nonsense are checked rather than divided by: a peak under SDR
+    /// white would clip the whole picture to white, and a NaN -- which no
+    /// comparison admits, hence no clamp catches -- would build a table of
+    /// zeroes, i.e. a black frame. Both fall back to the rendition's own.
+    #[test]
+    fn a_nonsense_declared_peak_is_not_believed() {
+        for junk in [0.0, 1.0, 99.0, 10_001.0, f32::NAN, f32::INFINITY] {
+            let mapper = ToneMapper::new(Transfer::Pq, Preset::Reference, Some(junk));
+            assert_eq!(mapper.peak(), 1000.0, "declared {junk} was believed");
+            let (white, _, _) = mapped(&mapper, byte(pq_code(1000.0)), 128, 128);
+            assert!(
+                white.abs_diff(235) <= 3,
+                "declared {junk}: 1000 nits -> {white}"
+            );
+        }
+        // ...and the range's own ends are believed, which is what says the
+        // guard rejects nonsense rather than everything unusual.
+        for good in [100.0, 4000.0, 10_000.0] {
+            let mapper = ToneMapper::new(Transfer::Pq, Preset::Reference, Some(good));
+            assert_eq!(mapper.peak(), good, "declared {good} was refused");
         }
     }
 }

@@ -287,6 +287,25 @@ ffmpeg -y -i assets/test_hdr_sei.mkv -c:v libx264 -qp 20 -pix_fmt yuv420p \
     assets/test_hdr_meta.mkv
 ffmpeg -y -i assets/test_hdr_sei.mkv -c:v libx264 -qp 20 -pix_fmt yuv420p \
     assets/test_hdr_meta.mp4
+# ...and one whose declared peak is a number nothing assumes: the three above
+# say 1000, which is exactly what a file that declared *nothing* is assumed at,
+# so no picture made from them can show that the metadata was read. This one is
+# mastered at 4000 (`L(40000000,50)`, MaxCLL 4000) over the same four patches
+# `test_pq.mp4` carries -- ten-bit codes here, four times the eight-bit ones --
+# so a tone map told 4000 lands them visibly elsewhere than one told 1000.
+#
+# Same two passes for the same reason, and the H.264 second one is what makes it
+# software-decodable: the render tests that read it must not need a VA-API
+# plugin. `-qp 1` on flat patches so the codes arrive as written (measured: 144,
+# 181 and 100 come back exactly).
+bright_sei="$(mktemp -t edith_hdr_bright_XXXXXX.mkv)"
+ffmpeg -y -f lavfi -i "color=c=black:s=320x240:rate=25:duration=0.4,format=yuv420p10le,geq=lum='if(lt(Y,H/2),if(lt(X,W/2),576,724),400)':cb='if(lt(Y,H/2),512,360)':cr='if(lt(Y,H/2),512,800)',setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv" \
+    -c:v libx265 -pix_fmt yuv420p10le \
+    -x265-params "log-level=error:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(40000000,50):max-cll=4000,400" \
+    "$bright_sei"
+ffmpeg -y -i "$bright_sei" -c:v libx264 -qp 1 -pix_fmt yuv420p \
+    assets/test_hdr_bright.mkv
+rm -f "$bright_sei"
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.
