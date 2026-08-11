@@ -22,6 +22,7 @@ use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
+use crate::colorspace::ColorDescription;
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
@@ -404,6 +405,9 @@ impl PlaybackSession {
             frame_count: audio_frames(path, frame_rate)
                 .map_err(|e| format!("{}: {e}", path.display()))?,
             codec: Codec::H264,
+            // A canvas this engine drew itself, not a stream that was read:
+            // the default description is what it is drawn in.
+            color: ColorDescription::default(),
         };
         let (audio, audio_disabled) = open_audio(path, 0);
         // Through `from_parts` rather than `Project::single`, which is the
@@ -481,6 +485,7 @@ impl PlaybackSession {
             // playing time is -- see [`image_frames`].
             frame_count: image_frames(IMAGE_ONLY_RATE),
             codec: Codec::H264,
+            color: ColorDescription::default(),
         };
         let clip = Clip {
             start: 0,
@@ -608,6 +613,7 @@ impl PlaybackSession {
                     frame_count: audio_frames(&first.path, frame_rate)
                         .map_err(|e| format!("source {}: {e}", first.path.display()))?,
                     codec: Codec::H264,
+                    color: ColorDescription::default(),
                 };
                 (meta, DecodeSession::open_black(width, height, 1))
             }
@@ -624,6 +630,7 @@ impl PlaybackSession {
                     frame_rate,
                     frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
+                    color: ColorDescription::default(),
                 };
                 let stream = DecodeSession::open_still(
                     &first.path,

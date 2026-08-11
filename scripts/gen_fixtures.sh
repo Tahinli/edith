@@ -213,6 +213,43 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
     -c:a aac -ar 44100 -ac 2 \
     -metadata:s:a:0 language=eng -metadata:s:a:1 language=fra \
     assets/test_multiaudio.mkv
+# Colour-tag fixtures. The picture is irrelevant here -- what is measured is
+# what the file *says* its numbers mean (`engine::colorspace`), so these are
+# one-second clips with nothing in them.
+#
+# First pair: SMPTE 170M (BT.601) tagged in the container, at 720 lines, where
+# the resolution heuristic would have said BT.709. That is the point: it is the
+# fixture that shows the container tags being read and outranking the guess.
+# Both containers, because the `colr` box and the Matroska `Colour` element are
+# parsed by different code.
+for out in assets/test_bt601.mp4 assets/test_bt601.mkv; do
+    ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=1 \
+        -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+        -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m \
+        "$out"
+done
+# ...and the tier below it: BT.709 written into the *bitstream* by the encoder
+# and nowhere else. Passing the codes through `-x264-params`/`-x265-params`/
+# `-svtav1-params` rather than through ffmpeg's stream tags leaves the muxer
+# with nothing to write, so these files have no `colr` box at all -- checked by
+# the test. 480 lines, so the heuristic would say BT.601 and a pass means the
+# VUI (or AV1 `color_config`) was really read. The HEVC one asks for
+# `scaling-lists=default` on purpose: a set of scaling lists sits between the
+# SPS header and its VUI, and a walk that counts them wrongly reads the colour
+# out of the middle of a coefficient. (x264 writes its quant matrices into the
+# PPS instead, so the H.264 side of that is a synthetic SPS in the unit tests.)
+ffmpeg -y -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 \
+    -c:v libx264 -profile:v high -pix_fmt yuv420p \
+    -x264-params colormatrix=bt709:transfer=bt709:colorprim=bt709 \
+    assets/test_vui_h264.mp4
+ffmpeg -y -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 \
+    -c:v libx265 -pix_fmt yuv420p \
+    -x265-params log-level=error:scaling-lists=default:colormatrix=bt709:transfer=bt709:colorprim=bt709 \
+    assets/test_vui_hevc.mp4
+ffmpeg -y -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 \
+    -c:v libsvtav1 -preset 8 -pix_fmt yuv420p \
+    -svtav1-params color-primaries=1:transfer-characteristics=1:matrix-coefficients=1 \
+    assets/test_vui_av1.mp4
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.

@@ -2432,6 +2432,7 @@ mod tests {
             frame_rate,
             frame_count: 1,
             codec: crate::demux::Codec::H264,
+            color: Default::default(),
         };
         // 1280 * 720 * 30 * 0.1
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
@@ -2446,6 +2447,7 @@ mod tests {
             frame_rate: 30.0,
             frame_count: 1,
             codec: crate::demux::Codec::H264,
+            color: Default::default(),
         }
     }
 

@@ -19,6 +19,7 @@ use std::path::Path;
 use mp4::{MediaType, Mp4Reader, Mp4Track, TrackType};
 
 use crate::audio::{edit_media_time, packet_at, stts_pairs};
+use crate::colorspace::{ColorDescription, Tags, bitstream_tags};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -63,6 +64,10 @@ pub struct VideoMeta {
     pub frame_rate: f64,
     pub frame_count: u32,
     pub codec: Codec,
+    /// What this stream's samples mean -- which matrix, which transfer curve,
+    /// which range -- resolved off the container's tags, the bitstream's, and
+    /// the resolution, in that order. See [`crate::colorspace`].
+    pub color: ColorDescription,
 }
 
 /// The file, whichever container it came in. Which one is decided by the
@@ -193,6 +198,9 @@ impl Mp4Demuxer {
             frame_rate: frame_rate(track),
             frame_count: 0,
             codec,
+            // Filled below, once the parameter sets the bitstream tier reads are
+            // in hand.
+            color: ColorDescription::default(),
         };
         let first_sample = first_frame_sample(stts_pairs(track), trim_ticks(track));
         let mut parameter_sets = Vec::new();
@@ -261,6 +269,11 @@ impl Mp4Demuxer {
                 // The samples the edit list trims off the front are not frames of
                 // the presentation, so they are not counted as ones.
                 frame_count: sample_count.saturating_sub(first_sample - 1),
+                color: ColorDescription::resolve(
+                    colr_tags(path, track_id).unwrap_or_default(),
+                    bitstream_tags(codec, &parameter_sets),
+                    meta.height,
+                ),
                 ..meta
             },
             Self {
@@ -441,6 +454,14 @@ impl MkvDemuxer {
             frame_rate,
             frame_count: blocks.len() as u32,
             codec: video.codec,
+            // `config` is the parameter sets by now -- Annex-B for H.264 and
+            // HEVC, the sequence header OBU for AV1 -- which is what the
+            // bitstream tier reads.
+            color: ColorDescription::resolve(
+                video.tags,
+                bitstream_tags(video.codec, &video.config),
+                video.height,
+            ),
         };
         Ok((
             meta,
@@ -667,6 +688,8 @@ struct MkvVideo {
     number: u64,
     width: u32,
     height: u32,
+    /// What the track's `Colour` element declared, empty when it has none.
+    tags: Tags,
     default_duration: Option<u64>,
     timestamp_scale: u64,
     codec: Codec,
@@ -801,6 +824,13 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+// The `Colour` element and the three of its children this reads. Byte-verified
+// against real files rather than taken off a spec table: published tables that
+// list Range as 0x55B3 are describing ChromaSubsamplingHorz.
+const COLOUR: u32 = 0x55B0;
+const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const RANGE: u32 = 0x55B9;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
 const TRACK_LANGUAGE: u32 = 0x22B59C;
 const TRACK_NAME: u32 = 0x536E;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
@@ -903,6 +933,7 @@ fn mkv_track_entry(
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
     let (mut language, mut name) = (String::new(), String::new());
+    let mut tags = Tags::default();
     let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
@@ -925,6 +956,27 @@ fn mkv_track_entry(
                     match e.0 {
                         PIXEL_WIDTH => width = ebml_uint(file, e.1, e.2)? as u32,
                         PIXEL_HEIGHT => height = ebml_uint(file, e.1, e.2)? as u32,
+                        // `Colour`: what the file says its picture's numbers
+                        // mean, in the same H.273 code points the bitstream
+                        // uses. An element the file leaves out stays 0, which
+                        // is "unspecified" in every one of those tables and
+                        // falls to the tier below (see [`crate::colorspace`]).
+                        COLOUR => {
+                            let (mut matrix, mut transfer, mut range) = (0, 0, 0);
+                            let mut at = e.1;
+                            while let Some(c) = ebml_element(file, at, e.2)? {
+                                match c.0 {
+                                    MATRIX_COEFFICIENTS => matrix = ebml_uint(file, c.1, c.2)?,
+                                    TRANSFER_CHARACTERISTICS => {
+                                        transfer = ebml_uint(file, c.1, c.2)?
+                                    }
+                                    RANGE => range = ebml_uint(file, c.1, c.2)?,
+                                    _ => {}
+                                }
+                                at = c.2;
+                            }
+                            tags = Tags::from_codes(matrix, transfer, range);
+                        }
                         _ => {}
                     }
                     at = e.2;
@@ -976,6 +1028,7 @@ fn mkv_track_entry(
         number,
         width,
         height,
+        tags,
         default_duration,
         timestamp_scale,
         codec,
@@ -1473,6 +1526,36 @@ fn hvcc_record(path: &Path, track_id: u32) -> crate::Result<Vec<u8>> {
     let hvcc = child(entry.get(78..).unwrap_or_default(), b"hvcC")
         .ok_or("no hvcC box in the HEVC sample entry")?;
     Ok(hvcc.to_vec())
+}
+
+/// The `colr` box of `track_id`'s sample entry (ISO 14496-12 §12.1.5), which is
+/// where an mp4 says what its picture's numbers mean. `nclx` is what every
+/// muxer writes now and carries a range flag; `nclc`, QuickTime's older twin,
+/// is the same three code points with no range byte after them. Anything else
+/// (`rICC`, `prof`: ICC profiles) is not a code-point description at all and is
+/// left to the tier below.
+///
+/// [`None`] rather than an error for a file with no such box, which is most of
+/// them -- an untagged mp4 is not a broken one.
+fn colr_tags(path: &Path, track_id: u32) -> Option<Tags> {
+    let (_, entry) = sample_entry(path, track_id).ok()?;
+    // The same fixed 78-byte VisualSampleEntry header `hvcC` sits behind.
+    let colr = child(entry.get(78..).unwrap_or_default(), b"colr")?;
+    let kind: &[u8; 4] = colr.get(..4)?.try_into().ok()?;
+    if kind != b"nclx" && kind != b"nclc" {
+        return None;
+    }
+    let code = |at: usize| -> Option<u64> {
+        Some(u64::from(u16::from_be_bytes(
+            colr.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    // Matroska's Range codes are 1 limited / 2 full; a `colr` flag is a bit.
+    let range = match kind {
+        b"nclx" => colr.get(10).map_or(0, |b| 1 + u64::from(b >> 7)),
+        _ => 0,
+    };
+    Some(Tags::from_codes(code(8)?, code(6)?, range))
 }
 
 /// The four-character code of `track_id`'s first `stsd` sample entry and that
