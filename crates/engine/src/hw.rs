@@ -62,11 +62,39 @@ impl Default for VhFrame {
     }
 }
 
+/// What *this machine* takes, as far as the plugin implements it: one bit per
+/// codec ([`CAP_H264`] and its three neighbours) in each mask, so a caller reads
+/// "H.264 decodes and encodes here, HEVC only decodes" off three `u32`s.
+///
+/// The intersection is the plugin's to compute, never the driver's alone: a GPU
+/// with an HEVC *encode* entrypoint is still not an HEVC encoder here -- the
+/// plugin has no such entry point -- and a capability nothing can reach would be
+/// a lie in whatever the front-end draws from this.
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VhCaps {
+    pub decode: u32,
+    pub encode: u32,
+    /// Codecs whose 10-bit profiles decode: the driver has the profile *and* a
+    /// P010 image format for the read-back, which is the pair the plugin's
+    /// 10-bit path needs.
+    pub decode_10bit: u32,
+}
+
+pub const CAP_H264: u32 = 1 << 0;
+pub const CAP_HEVC: u32 = 1 << 1;
+pub const CAP_VP9: u32 = 1 << 2;
+pub const CAP_AV1: u32 = 1 << 3;
+
 struct Plugin {
     open_at: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
     meta: unsafe extern "C" fn(*mut c_void, *mut VhMeta) -> i32,
     next_frame: unsafe extern "C" fn(*mut c_void, *mut VhFrame) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
+    /// The capability query, and the one symbol of this table that may be
+    /// missing: a plugin built before it exports the four above and not this,
+    /// which costs a front-end the listing and never a decode.
+    caps: Option<unsafe extern "C" fn(*mut VhCaps) -> i32>,
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
 }
@@ -102,6 +130,7 @@ fn load() -> Option<Plugin> {
                     meta: *lib.get(b"vh_meta\0").ok()?,
                     next_frame: *lib.get(b"vh_next_frame\0").ok()?,
                     close: *lib.get(b"vh_close\0").ok()?,
+                    caps: lib.get(b"vh_caps\0").ok().map(|s| *s),
                     _lib: lib,
                 })
             })()
@@ -111,6 +140,29 @@ fn load() -> Option<Plugin> {
         }
     }
     None
+}
+
+/// What the plugin says this machine decodes and encodes, asked once per
+/// process and cached: the answer cannot change while we run.
+///
+/// `None` on every way there is no answer -- no plugin, a plugin older than the
+/// symbol (optional exactly as `vh_enc_av1_open` is: such a plugin still
+/// decodes), no driver, a driver that refuses the query -- and a caller says
+/// "software only" for all of them, which is what they mean.
+///
+/// Costs one VA-API init (~90 ms) the first time: ask it off a render thread.
+pub fn caps() -> Option<VhCaps> {
+    static CAPS: OnceLock<Option<VhCaps>> = OnceLock::new();
+    *CAPS.get_or_init(|| {
+        let query = plugin()?.caps?;
+        let mut caps = VhCaps::default();
+        // SAFETY: the plugin writes the struct it is handed and reports "no
+        // answer" as a negative code; nothing is borrowed across the call.
+        match unsafe { query(&mut caps) } {
+            0 => Some(caps),
+            _ => None,
+        }
+    })
 }
 
 /// An open hardware decode session. Dropping it closes the plugin session.
