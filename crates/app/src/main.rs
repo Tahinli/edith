@@ -19,11 +19,11 @@ use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px,
-    relative, rgb, rgba, size,
+    AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
+    FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -85,6 +85,13 @@ const WAVE_BPS: u32 = 40;
 /// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
 /// and a path with a point per pixel is a path per repaint.
 const WAVE_COL: f32 = 2.;
+/// The most columns one envelope is ever built from. A waveform is drawn into
+/// the slice of its box that is on the bed ([`visible_slice`]), and a bed is a
+/// screen wide, so nothing on screen ever reaches this -- it is the backstop for
+/// a box laid out wider than any screen, whose path would otherwise cost a point
+/// per two pixels of a width nobody can see and stall the repaint that was
+/// meant to draw the wave.
+const WAVE_COLS_MAX: usize = 4096;
 /// WCAG 2.5.8: nothing clickable is smaller than this. The scrub bar stays 6 px
 /// to look at -- `RULER_HIT_H` is the strip that has to be hit.
 const HIT_MIN: f32 = 24.;
@@ -281,6 +288,13 @@ struct AssetDrag(PathBuf, usize);
 struct ClipDrag {
     lane: Lane,
     idx: usize,
+    /// The clip that was picked up, so the drop can find it again: gpui freezes
+    /// the payload for the whole gesture, and an edit made *during* one -- a
+    /// stroke deletes, undoes or pastes, none of which a drag blocks -- ripples
+    /// the indices under it. The index alone would then name a different take at
+    /// the release, and the drag would move a clip nobody touched (see
+    /// [`live_idx`]).
+    clip: Clip,
 }
 
 /// A clip edge being dragged: which end of which clip, and the timeline frame
@@ -601,6 +615,36 @@ const EQ_FREQ_HIGH: f32 = 20_000.;
 /// and short enough that the card still fits a 360 px window.
 const EQ_GRAPH_H: f32 = 132.;
 
+/// How wide the equalizer card is allowed to get. It is the one card that is a
+/// *graph*: every pixel across is frequency resolution, and at the 320 px the
+/// other cards use, a third of an octave was a couple of pixels. Past this the
+/// curve stops gaining anything and the card starts reading as a wall.
+const EQ_W_MAX: f32 = 720.;
+
+/// The gap the card leaves either side of it, so it reads as a card on a scrim
+/// rather than as a second window: it takes the width it can get inside that.
+const EQ_W_MARGIN: f32 = 32.;
+
+/// How many bands one clip's equalizer may carry from this card. Ten because
+/// the keyboard picks a band with a digit and a keyboard has ten of them --
+/// past that a band would be reachable by pointer only. The engine itself caps
+/// nothing (`EqParams::bands` is a plain `Vec`), so a file may still carry more
+/// and this card will draw and edit every one it finds.
+const EQ_BANDS_MAX: usize = 10;
+
+/// One press of the frequency keys, as a factor: a sixth of an octave, so a
+/// band walks the whole axis in about sixty presses and still lands close
+/// enough to a named frequency to aim at one.
+const EQ_FREQ_STEP: f32 = 1.122_462;
+
+/// One press of the Q keys, as a factor, and the range they move in. Below the
+/// bottom a peak is barely a peak any more; above the top it is a whistle on
+/// one frequency. 0.707 -- the flat-shelf value, and the default -- sits inside
+/// them, so nothing a file carries has to be dragged into range first.
+const EQ_Q_STEP: f32 = 1.25;
+const EQ_Q_LOW: f32 = 0.3;
+const EQ_Q_HIGH: f32 = 12.;
+
 /// How many points the curve is drawn from. One per ~3 px across the card:
 /// past that the line is smooth and the extra biquad evaluations are wasted.
 const EQ_CURVE_STEPS: usize = 96;
@@ -648,6 +692,11 @@ const EQ_SPECTRUM_INK: u32 = 0x7f95ad66;
 /// The area under the response curve, same accent as the line at a tenth of
 /// its weight: it is what makes a boost read as a hill rather than as a wire.
 const EQ_FILL_INK: u32 = 0x4a9eff26;
+
+/// One band's own response, drawn under the sum: a dim thread per band, so a
+/// boost pushed against a cut can be *seen* as two bands rather than as the
+/// flat line their total makes.
+const EQ_BELL_INK: u32 = 0x4a9eff66;
 
 /// The colour card's four controls, in the order it lists them: what each is
 /// called and the range it moves in. The order is `ColorParams`' own, which is
@@ -826,6 +875,16 @@ struct Player {
     /// the value being dragged, and stale between drags, which costs nothing --
     /// no drag starts without a press on the box it moves.
     grab: u32,
+    /// Whether a drag or a trim is pulled onto the edges near it. On by
+    /// default, because clips meeting exactly is what a timeline is for, and off
+    /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
+    /// no magnet may take away.
+    snap: bool,
+    /// The frame the live gesture is about to land on, or `None` while it is
+    /// over open bed: the line every lane draws so the snap is seen before it
+    /// happens rather than discovered after the release. Stale between gestures,
+    /// which costs nothing -- it is drawn only while one is live.
+    snap_cue: Option<u32>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -1169,10 +1228,24 @@ impl Player {
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
             ActionId::Mix => self.open_mix(None, cx),
+            ActionId::ToggleSnap => self.toggle_snap(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
         }
+    }
+
+    /// The magnet off and on again, in words: a snap that stops working
+    /// silently reads as a bug, and one that starts working silently reads as
+    /// one too. The line goes with it -- nothing is being promised any more.
+    fn toggle_snap(&mut self, cx: &mut Context<Self>) {
+        self.snap = !self.snap;
+        self.snap_cue = None;
+        self.notice = Some(match self.snap {
+            true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
+            false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
+        });
+        cx.notify();
     }
 
     /// Whether the editor can be asked for `action` right now, and why not when
@@ -1192,6 +1265,12 @@ impl Player {
             action,
             Ctx {
                 clip,
+                image: clip.is_some_and(|(clip, _)| {
+                    session
+                        .sources()
+                        .get(clip.source)
+                        .is_some_and(|s| engine::is_image(&s.path))
+                }),
                 playhead: frame_at(session.now(), self.fps),
                 timeline: true,
                 clipboard: self.clipboard.is_some(),
@@ -2101,41 +2180,78 @@ impl Player {
         cx.notify();
     }
 
-    /// Moves one band and says whether anything changed. Live only: the write
-    /// is [`commit_eq`](Player::commit_eq)'s.
-    fn set_band(&mut self, band: usize, gain_db: f32) -> bool {
-        let gain_db = gain_db.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
-        match self.eq_params.bands.get_mut(band) {
-            Some(b) if b.gain_db != gain_db => {
-                b.gain_db = gain_db;
-                true
-            }
-            _ => false,
-        }
+    /// Changes the picked band in place and says whether anything moved. Every
+    /// edit of a band goes through here -- the drag, each key, each stepper
+    /// button -- so the card has exactly one place that clamps a band into what
+    /// the graph can draw, and no caller has to remember the limits.
+    fn set_band(&mut self, change: impl FnOnce(&mut Band)) -> bool {
+        let Some(band) = self.eq_params.bands.get_mut(self.eq_band) else {
+            return false;
+        };
+        let was = *band;
+        change(band);
+        band.freq_hz = band.freq_hz.clamp(EQ_FREQ_LOW, EQ_FREQ_HIGH);
+        band.gain_db = band.gain_db.clamp(-EQ_GAIN_LIMIT, EQ_GAIN_LIMIT);
+        band.q = band.q.clamp(EQ_Q_LOW, EQ_Q_HIGH);
+        *band != was
     }
 
-    /// The keyboard's version of a drag: one step on the picked band, committed
-    /// straight away -- a keystroke has no release to wait for.
-    fn nudge_band(&mut self, by: f32, cx: &mut Context<Self>) {
-        let gain = self
-            .eq_params
-            .bands
-            .get(self.eq_band)
-            .map_or(0., |b| b.gain_db);
-        if self.set_band(self.eq_band, gain + by) {
+    /// The keyboard's and the buttons' version of a drag: one step on the picked
+    /// band, committed straight away -- neither has a release to wait for.
+    fn nudge_band(&mut self, change: impl FnOnce(&mut Band), cx: &mut Context<Self>) {
+        if self.set_band(change) {
             self.commit_eq(cx);
         }
     }
 
-    /// Where the pointer sits down the graph, as a gain on the picked band: the
-    /// middle is flat and the top and bottom edges are the limit either way.
-    /// Called on every pointer sample, so the curve bends under the hand; the
-    /// write is the release's ([`commit_eq`](Player::commit_eq)).
-    fn drag_band(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        let gain = (0.5 - frac_down(y, self.eq_graph.get())) * 2. * EQ_GAIN_LIMIT;
-        if self.set_band(self.eq_band, gain) {
+    /// Where the pointer sits in the graph, as the picked band's frequency and
+    /// gain: across is the frequency axis and down is the gain one, so the
+    /// handle follows the hand both ways rather than sliding up a rail. Called
+    /// on every pointer sample, so the curve bends under it; the write is the
+    /// release's ([`commit_eq`](Player::commit_eq)).
+    fn drag_band(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let bounds = self.eq_graph.get();
+        let gain = (0.5 - frac_down(at.y, bounds)) * 2. * EQ_GAIN_LIMIT;
+        let freq = eq_freq(frac_along(at.x, bounds));
+        if self.set_band(|b| {
+            b.gain_db = gain;
+            b.freq_hz = freq;
+        }) {
             cx.notify();
         }
+    }
+
+    /// A band added beside the picked one, at the frequency with the most room
+    /// around it ([`inserted_band`]), and picked so the next keystroke moves the
+    /// band that was just made. Refused rather than silently ignored at the cap.
+    fn add_band(&mut self, cx: &mut Context<Self>) {
+        if self.eq_params.bands.len() >= EQ_BANDS_MAX {
+            self.notice = Some(
+                format!(
+                    "EQUALIZER FULL — {EQ_BANDS_MAX} bands is all this card holds; move one instead"
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let band = inserted_band(&self.eq_params.bands, self.eq_band);
+        self.eq_band = (self.eq_band + 1).min(self.eq_params.bands.len());
+        self.eq_params.bands.insert(self.eq_band, band);
+        self.commit_eq(cx);
+    }
+
+    /// Takes the picked band out. The last one stays: an equalizer of no bands
+    /// is a card with nothing to edit, and flattening is what "off" means here.
+    fn remove_band(&mut self, cx: &mut Context<Self>) {
+        if self.eq_params.bands.len() <= 1 {
+            self.notice = Some("LAST BAND — flatten it instead (r), or close the card".into());
+            cx.notify();
+            return;
+        }
+        self.eq_params.bands.remove(self.eq_band);
+        self.eq_band = self.eq_band.min(self.eq_params.bands.len() - 1);
+        self.commit_eq(cx);
     }
 
     /// Which band a press on the graph grabs: the nearest one along the
@@ -2535,8 +2651,8 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let (Some(start), Some(was)) = (
-            self.drop_frame(from, idx, to, x),
+        let (Some((start, _)), Some(was)) = (
+            self.drop_frame(from, idx, x),
             self.session
                 .as_ref()
                 .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.start)),
@@ -2598,26 +2714,70 @@ impl Player {
     /// the scroll clamp pins the bed's right edge to the duration, and the
     /// pointer has no pixel past it. The upgrade is to let the scroll clamp
     /// leave a screen of empty bed after the end, the way every NLE does.
-    fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
-        let session = self.session.as_ref()?;
-        let clip = session.lane_clips(from).get(idx).copied()?;
+    fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
+        let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
         let raw = self.frame_under(x).saturating_sub(self.grab);
-        // The edges worth landing on: both ends of every clip already on the
-        // lane it is being let go over, the playhead, and the head of the
-        // timeline. Never the group's own boxes -- a clip does not snap to
-        // where it already is.
-        let mut marks: Vec<u32> = session
-            .lane_clips(to)
-            .iter()
-            .enumerate()
-            .filter(|&(i, c)| {
-                (to, i) != (from, idx) && !(clip.link.is_some() && c.link == clip.link)
-            })
-            .flat_map(|(_, c)| [c.start, c.end()])
-            .collect();
-        marks.push(frame_at(session.now(), self.fps));
-        marks.push(0);
-        Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
+        let marks = self.snap_targets(Some((from, idx)));
+        Some(self.snap_to(raw, clip.frames(), &marks))
+    }
+
+    /// Which index the clip in the hand is at *now*: [`live_idx`] against the
+    /// lane the drag named, since a stroke during the gesture moves the indices
+    /// gpui froze into the payload. Both halves of a drag ask it -- the line
+    /// drawn in flight and the drop that commits -- so the promise and the
+    /// landing are made about one clip.
+    fn dragged(&self, drag: &ClipDrag) -> Option<usize> {
+        let session = self.session.as_ref()?;
+        live_idx(session.lane_clips(drag.lane), drag.idx, drag.clip)
+    }
+
+    /// The line while the clip is still in the hand: the very answer
+    /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
+    /// so what the eye was promised is where the release puts it. A pointer that
+    /// has wandered off the bed promises nothing.
+    fn preview_drop(&mut self, from: Lane, idx: usize, x: Pixels, cx: &mut Context<Self>) {
+        let cue = self.drop_frame(from, idx, x).and_then(|(_, cue)| cue);
+        self.set_cue(cue, x, cx);
+    }
+
+    /// The same line for a library row on its way to a lane: it goes down at
+    /// the frame it is let go on ([`Player::insert_source`]), so that frame is
+    /// what snaps and what is drawn. No length to snap by -- the file's own is
+    /// not known until the engine has placed it -- so only its head lands.
+    fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let marks = self.snap_targets(None);
+        let cue = self.snap_to(self.frame_under(x), 0, &marks).1;
+        self.set_cue(cue, x, cx);
+    }
+
+    /// Sets the line, or takes it away, and repaints only when it moved: a
+    /// pointer dragged off the bed (up to the library, say) is not promising a
+    /// landing any more.
+    fn set_cue(&mut self, cue: Option<u32>, x: Pixels, cx: &mut Context<Self>) {
+        let bed = self.ruler.get();
+        let cue = cue.filter(|_| x >= bed.left() && x <= bed.right());
+        if cue != self.snap_cue {
+            self.snap_cue = cue;
+            cx.notify();
+        }
+    }
+
+    /// Every edge this timeline offers a gesture: [`snap_marks`] over all of its
+    /// lanes, so a clip meets a take one track over as readily as one beside it.
+    fn snap_targets(&self, skip: Option<(Lane, usize)>) -> Vec<u32> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let lanes = session.lanes();
+        let clips: Vec<&[Clip]> = lanes.iter().map(|&lane| session.lane_clips(lane)).collect();
+        let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
+        snap_marks(&clips, skip, frame_at(session.now(), self.fps))
+    }
+
+    /// Where a gesture at `raw` lands and the mark that pulled it there, with
+    /// the switch honoured: snapping off, nothing moves and no line is drawn.
+    fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
+        snap_cue(self.snap, raw, len, self.snap_frames(), marks)
     }
 
     /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
@@ -2681,14 +2841,25 @@ impl Player {
     /// against the same duration the boxes are drawn to, so the edge tracks the
     /// pointer exactly.
     fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let at = self.frame_under(x);
-        let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
+        let Some(trim) = self.trim else {
             return;
         };
-        let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
+        // The edge is pulled onto the same marks a whole clip is, by itself:
+        // there is no other end travelling with it, so it snaps at length zero.
+        let marks = self.snap_targets(Some((trim.lane, trim.idx)));
+        let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
+        let Some((lo, hi)) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.trim_room(trim.lane, trim.idx, trim.edge))
+        else {
             return;
         };
-        trim.to = at.clamp(lo, hi);
+        let to = at.clamp(lo, hi);
+        // The line only stands where the edge actually stopped: a mark the
+        // engine's own room clamped away was never reached.
+        self.set_cue(cue.filter(|_| to == at), x, cx);
+        self.trim = Some(Trim { to, ..trim });
         cx.notify();
     }
 
@@ -2730,39 +2901,13 @@ impl Player {
         }) else {
             return clip;
         };
-        match trim.edge {
-            // A still grows forward from source frame 0 instead, exactly as
-            // `Project::trim` writes it: with the in-point clamped at 0 the box
-            // below would slide left rather than stretch, and the release would
-            // then commit a wider clip than the drag drew.
-            Edge::Start
-                if self.session.as_ref().is_some_and(|session| {
-                    session
-                        .sources()
-                        .get(clip.source)
-                        .is_some_and(|s| engine::is_image(&s.path))
-                }) =>
-            {
-                Clip {
-                    in_frame: 0,
-                    out_frame: clip.end().saturating_sub(trim.to).max(1),
-                    start: trim.to,
-                    ..clip
-                }
-            }
-            // The in-point follows the head, exactly as `Project::trim` moves
-            // it: what stays on screen plays what it always played.
-            Edge::Start => Clip {
-                in_frame: (i64::from(clip.in_frame) + i64::from(trim.to) - i64::from(clip.start))
-                    .clamp(0, i64::from(clip.out_frame - 1)) as u32,
-                start: trim.to,
-                ..clip
-            },
-            Edge::End => Clip {
-                out_frame: clip.in_frame + trim.to.saturating_sub(clip.start).max(1),
-                ..clip
-            },
-        }
+        let still = self.session.as_ref().is_some_and(|session| {
+            session
+                .sources()
+                .get(clip.source)
+                .is_some_and(|s| engine::is_image(&s.path))
+        });
+        trimmed_clip(clip, trim.edge, trim.to, still)
     }
 
     /// How long the timeline is *drawn* as: its own length, and while a tail is
@@ -2770,6 +2915,15 @@ impl Player {
     /// at the last frame has nowhere to put a pointer that means "longer", so
     /// without this the last clip on the timeline could be pulled in and never
     /// let back out.
+    ///
+    /// Scroll room only, now that a second is an absolute number of pixels
+    /// ([`Scale`]): the extra length loosens [`View::settled`]'s clamp, which is
+    /// where the pixels past the last frame come from, and moves no box by a
+    /// pixel. It is still the *only* headroom at the tail -- zoomed in against
+    /// the end, that clamp pins the bed's right edge to the duration and an
+    /// End-trim of the last clip would have nowhere to be dragged to. What it
+    /// must not do is be read as a length anyone is told: the timecode reads
+    /// `PlaybackSession::timeline_duration` for exactly that reason.
     fn drawn_duration(&self) -> f64 {
         let Some(session) = &self.session else {
             return 0.;
@@ -3800,31 +3954,55 @@ impl Render for Player {
                 // cannot move at all, and every one of them is listed in the
                 // keys menu (keymap.rs `FIXED`) rather than being a secret.
                 if this.eq_open.is_some() {
+                    // Shift makes the two horizontal keys Q instead of
+                    // frequency: both are the *width* of the same hump, so they
+                    // sit on the same axis rather than on two keys nobody would
+                    // guess. Wider is a lower Q, which is why left widens.
+                    let shift = event.keystroke.modifiers.shift;
                     if key == ESCAPE {
                         // Nothing to undo: every change is already at the clip,
                         // and undo is undo's own key.
                         this.eq_open = None;
                         this.eq_dragging = false;
                     } else if key == "up" {
-                        this.nudge_band(EQ_STEP, cx);
+                        this.nudge_band(|b| b.gain_db += EQ_STEP, cx);
                     } else if key == "down" {
-                        this.nudge_band(-EQ_STEP, cx);
+                        this.nudge_band(|b| b.gain_db -= EQ_STEP, cx);
+                    } else if key == "left" && shift {
+                        this.nudge_band(|b| b.q /= EQ_Q_STEP, cx);
+                    } else if key == "right" && shift {
+                        this.nudge_band(|b| b.q *= EQ_Q_STEP, cx);
+                    } else if key == "left" {
+                        this.nudge_band(|b| b.freq_hz /= EQ_FREQ_STEP, cx);
+                    } else if key == "right" {
+                        this.nudge_band(|b| b.freq_hz *= EQ_FREQ_STEP, cx);
                     } else if key == "r" {
                         for band in &mut this.eq_params.bands {
                             band.gain_db = 0.;
                         }
                         this.commit_eq(cx);
+                    } else if key == "f" {
+                        // This one band back to flat, which is the undo of one
+                        // hand movement -- `r` is the undo of the whole card.
+                        this.nudge_band(|b| b.gain_db = 0., cx);
+                    } else if key == "a" {
+                        this.add_band(cx);
+                    } else if key == "x" {
+                        this.remove_band(cx);
                     } else if key == "s" {
                         // The analyser off and on. Nothing is committed: it is
                         // what the card *shows*, so it survives no further than
                         // this window.
                         this.eq_spectrum = !this.eq_spectrum;
                     } else if let Ok(digit) = key.parse::<usize>() {
-                        // 1-based, as the rows are numbered on screen; a digit
-                        // past the last band picks nothing rather than panics.
-                        if let Some(band) = digit.checked_sub(1)
-                            && band < this.eq_params.bands.len()
-                        {
+                        // As the keys are laid out: 1-9 then 0 for the tenth,
+                        // which is the cap ([`EQ_BANDS_MAX`]). A digit past the
+                        // last band picks nothing rather than panics.
+                        let band = match digit {
+                            0 => EQ_BANDS_MAX - 1,
+                            n => n - 1,
+                        };
+                        if band < this.eq_params.bands.len() {
                             this.eq_band = band;
                         }
                     }
@@ -3966,6 +4144,26 @@ impl Render for Player {
                     }
                 }
             }))
+            // A drop event carries no path of its own -- gpui only tells the
+            // target that something landed -- so the line that promises where
+            // it will land is fed by the drag's own moves, which do carry the
+            // pointer (gpui div.rs:282). On the root, because a drag crosses
+            // the window: it starts on a clip or on a library row and ends over
+            // a lane, and only an ancestor of both hears all of it.
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                // The clip the payload named, wherever an edit mid-drag has
+                // since put it ([`Player::dragged`]): the line has to promise a
+                // landing for the take actually in the hand.
+                let drag = *event.drag(cx);
+                if let Some(idx) = this.dragged(&drag) {
+                    this.preview_drop(drag.lane, idx, event.event.position.x, cx);
+                }
+            }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                    this.preview_place(event.event.position.x, cx);
+                }),
+            )
             // Scrubbing is tracked on the root because the pointer leaves the
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
@@ -3974,7 +4172,7 @@ impl Render for Player {
                 // the equalizer drag is tracked here for the ruler's reason.
                 if this.eq_dragging {
                     if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_band(event.position.y, cx);
+                        this.drag_band(event.position, cx);
                     } else {
                         // Released outside the window: the up below never came,
                         // so this is where the gesture ends -- and it still owes
@@ -4044,7 +4242,7 @@ impl Render for Player {
                     if std::mem::take(&mut this.eq_dragging) {
                         // The release lands exactly, then the gesture is written
                         // once -- the append-only table's whole reason.
-                        this.drag_band(event.position.y, cx);
+                        this.drag_band(event.position, cx);
                         this.commit_eq(cx);
                         return;
                     }
@@ -4146,7 +4344,7 @@ impl Render for Player {
             // column, and only one of the two is ever up.
             .children(self.keys_overlay(cx))
             .children(self.export_card(window.viewport_size(), cx))
-            .children(self.eq_card(cx))
+            .children(self.eq_card(window.viewport_size(), cx))
             .children(self.color_card(cx))
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
@@ -4737,6 +4935,25 @@ impl Player {
                         live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
                     ))
+                    // The magnet, beside the zoom for the zoom's own reason: it
+                    // changes nothing on the timeline, it changes how the hand
+                    // meets it. The label is the state, as the volume's is --
+                    // a toggle that looks the same either way says nothing.
+                    .child(control(
+                        "snap",
+                        None,
+                        if self.snap { "Snap" } else { "No snap" },
+                        format!(
+                            "{} — {}",
+                            key(ActionId::ToggleSnap),
+                            match self.snap {
+                                true => "drags and trims land on clip edges, the playhead and the start",
+                                false => "drags and trims land exactly where the hand leaves them",
+                            }
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
+                    ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
                     // which one is the real one.
@@ -4809,10 +5026,20 @@ impl Player {
                     .gap(px(12.))
                     // Fixed width and one line: changing digits must not push
                     // the row around, nor wrap and change its height.
+                    // The timeline's own length, never the drawn one: a tail
+                    // being dragged inflates the bed to the room that edge has
+                    // ([`Player::drawn_duration`]), and for a still that room is
+                    // ten minutes -- a total that jumped to 10:00:00 the moment
+                    // a picture's edge was pressed, and back on release.
                     .child(div().flex_none().w(px(TIME_W)).truncate().child(format!(
                         "{} / {}",
                         timecode(position, self.fps),
-                        timecode(duration, self.fps)
+                        timecode(
+                            self.session
+                                .as_ref()
+                                .map_or(0., PlaybackSession::timeline_duration),
+                            self.fps
+                        )
                     )))
                     .child(
                         div()
@@ -5592,20 +5819,28 @@ impl Player {
     }
 
     /// The equalizer of one audio clip: its frequency response drawn as a
-    /// curve, a handle per band sitting on it, and a row that flattens them
-    /// all. The curve is the clip's actual filter (`EqParams::response_db`
-    /// reads the coefficients the samples go through), and it is redrawn on
-    /// every pointer sample of a drag, so the shape bends under the hand.
+    /// curve, a handle per band sitting on it, each band's own bell under the
+    /// sum, and a row that reads and moves the picked band's three numbers. The
+    /// curve is the clip's actual filter (`EqParams::response_db` reads the
+    /// coefficients the samples go through), and it is redrawn on every pointer
+    /// sample of a drag, so the shape bends under the hand.
     ///
-    /// The same scrim and width as the other two cards, and the same plain divs
-    /// -- nothing here takes focus, so the root keeps the keyboard and the
-    /// card's own strokes (`1`–`5`, up, down, `r`) reach it.
+    /// Wider than the other cards and wider still on a bigger window
+    /// ([`eq_card_w`]): every pixel across is frequency resolution, which none
+    /// of the row-shaped cards have any use for. The same scrim and the same
+    /// plain divs -- nothing here takes focus, so the root keeps the keyboard
+    /// and the card's own strokes (a digit, the arrows, `a`, `x`, `f`, `r`,
+    /// `s`) reach it.
     ///
     /// Every change is written at the clip as it is made
     /// ([`Player::commit_eq`]), so what the card shows is always what is
     /// playing: there is no OK button to forget, and closing it changes
     /// nothing. What takes a curve back off is undo, like every other edit.
-    fn eq_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn eq_card(
+        &self,
+        viewport: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let (lane, idx) = self.eq_open?;
         // The rate the engine filters this timeline at, so the drawn curve is
         // the one those coefficients make -- near the top of the axis a 44.1 kHz
@@ -5659,13 +5894,20 @@ impl Player {
             .bg(rgb(HOVER_DIM))
             .cursor_pointer()
             // The press picks the band under it *and* is already the first
-            // sample of the drag, so a plain click sets a value.
+            // sample of the drag, so a plain click sets a value. A second click
+            // takes that band back to flat instead: the gesture that undoes one
+            // handle, with no modifier to remember.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
                     this.eq_band = this.nearest_band(event.position.x);
+                    if event.click_count >= 2 {
+                        this.eq_dragging = false;
+                        this.nudge_band(|b| b.gain_db = 0., cx);
+                        return;
+                    }
                     this.eq_dragging = true;
-                    this.drag_band(event.position.y, cx);
+                    this.drag_band(event.position, cx);
                 }),
             )
             .child(bounds_probe(self.eq_graph.clone()))
@@ -5757,7 +5999,7 @@ impl Player {
                 })
                 .child(
                     div()
-                        .w(px(KEYS_W))
+                        .w(px(eq_card_w(f32::from(viewport.width))))
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -5778,28 +6020,15 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag the curve, or 1–5 then up/down — s hides the spectrum, esc closes".into()
+                                    "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum, esc closes".into()
                                 })),
                         )
                         .child(graph)
-                        // Which band the keyboard is holding and what it is set
-                        // to: the curve shows the sum, and a band pushed against
-                        // one pulling the other way is not readable off it.
-                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
-                            match picked {
-                                // Q as well as the two the curve shows: it is
-                                // how wide the hump under the handle is, and
-                                // nothing else on the card says so.
-                                Some(band) => format!(
-                                    "{} {} {:+.1} dB — Q {:.2}",
-                                    self.eq_band + 1,
-                                    band_label(band),
-                                    band.gain_db,
-                                    band.q
-                                ),
-                                None => "no bands".into(),
-                            },
-                        ))
+                        // Which band the keyboard is holding and every number it
+                        // is set to, each with the pair of buttons that moves it:
+                        // the curve shows the sum, and a band pushed against one
+                        // pulling the other way is not readable off it.
+                        .child(self.eq_numbers(picked, cx))
                         .child(
                             div()
                                 .mt(px(4.))
@@ -5823,7 +6052,45 @@ impl Player {
                                             }
                                             this.commit_eq(cx);
                                         }))
-                                        .child("Flatten"),
+                                        .child("Flatten all"),
+                                )
+                                // The two that change how many bands there are.
+                                // The engine takes any cascade -- the count was
+                                // only ever fixed because this card had no way
+                                // to say otherwise.
+                                .child(
+                                    div()
+                                        .id("eq-add")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(CHROME))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.add_band(cx)
+                                        }))
+                                        .child("Add band"),
+                                )
+                                .child(
+                                    div()
+                                        .id("eq-remove")
+                                        .flex()
+                                        .flex_1()
+                                        .h(px(CONTROL_H))
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(CHROME))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(HOVER)))
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.remove_band(cx)
+                                        }))
+                                        .child("Remove band"),
                                 )
                                 // The analyser's switch, next to the one other
                                 // button the card has: `s` does the same, and a
@@ -5855,6 +6122,103 @@ impl Player {
                                 ),
                         ),
                 ),
+        )
+    }
+
+    /// The picked band's three numbers -- where it sits, how far it pushes and
+    /// how wide it is -- each beside the pair of buttons that moves it. The
+    /// arrows do the same three things, but a value only a key can change is a
+    /// value a hand on the pointer cannot reach at all, which is the same reason
+    /// [`Player::mbps_steppers`] exists.
+    fn eq_numbers(&self, picked: Option<&Band>, cx: &mut Context<Self>) -> impl IntoElement {
+        let row = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(6.))
+            .text_size(px(11.));
+        let Some(band) = picked.copied() else {
+            return row.child("no bands — a adds one");
+        };
+        let step = |id: &'static str,
+                    label: &'static str,
+                    change: fn(&mut Band),
+                    cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .w(px(HIT_MIN))
+                .h(px(HIT_MIN))
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .bg(rgb(CHROME))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.nudge_band(change, cx)
+                }))
+                .child(label)
+        };
+        let number = |value: String,
+                      ids: (&'static str, &'static str),
+                      by: (fn(&mut Band), fn(&mut Band)),
+                      cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(div().child(value))
+                .child(step(ids.0, "−", by.0, cx))
+                .child(step(ids.1, "+", by.1, cx))
+        };
+        row.child(format!(
+            "Band {} of {}",
+            self.eq_band + 1,
+            self.eq_params.bands.len()
+        ))
+        .child(number(
+            band_label(&band),
+            ("eq-freq-down", "eq-freq-up"),
+            (
+                |b| b.freq_hz /= EQ_FREQ_STEP,
+                |b| b.freq_hz *= EQ_FREQ_STEP,
+            ),
+            cx,
+        ))
+        .child(number(
+            format!("{:+.1} dB", band.gain_db),
+            ("eq-gain-down", "eq-gain-up"),
+            (|b| b.gain_db -= EQ_STEP, |b| b.gain_db += EQ_STEP),
+            cx,
+        ))
+        // Q is width, so its buttons are labelled by what they *do* to the
+        // hump rather than by which way the number goes: a wider band is a
+        // smaller Q, and nobody should have to know that to use the card.
+        .child(number(
+            format!("Q {:.2}", band.q),
+            ("eq-q-wider", "eq-q-narrower"),
+            (|b| b.q /= EQ_Q_STEP, |b| b.q *= EQ_Q_STEP),
+            cx,
+        ))
+        .child(
+            div()
+                .id("eq-flat-band")
+                .flex()
+                .h(px(HIT_MIN))
+                .px(px(8.))
+                .items_center()
+                .rounded(px(3.))
+                .bg(rgb(CHROME))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(HOVER)))
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.nudge_band(|b| b.gain_db = 0., cx)
+                    }),
+                )
+                .child("Flatten this"),
         )
     }
 
@@ -6752,6 +7116,15 @@ impl Player {
                 // dims a row with -- and a row that takes no click says *why*
                 // rather than printing a stroke that would do nothing.
                 let refusal = self.enable(action, Some((menu.lane, menu.idx)));
+                // A grade on a waveform, an equalizer on a picture, a silence
+                // scan on a still: things that do not exist for what was
+                // right-clicked, so the menu is the list of what this clip can
+                // do rather than the registry with most of it struck through.
+                // The state refusals below stay, dimmed and saying why -- the
+                // next click of the playhead lights them.
+                if !refusal.listed() {
+                    continue;
+                }
                 let enabled = refusal.yes();
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
@@ -7052,6 +7425,19 @@ impl Player {
         // it, so all of them move together when it does. No bed width is needed
         // to place them any more -- a second is so many pixels wherever it is.
         let scale = self.scale;
+        // How much bed there is to be seen on, measured off the ruler's own
+        // probe like every other question about it: what a box draws *inside*
+        // itself is clipped to this ([`visible_slice`]), because a box at a deep
+        // zoom is far wider than the strip it is being watched through.
+        let bed = f32::from(self.ruler.get().size.width);
+        // Where the snap line stands, in the same pixels every box is placed
+        // through -- and only while a gesture is actually live: gpui drops a
+        // drag without telling anyone, so this asks whether one is in flight
+        // (`App::has_active_drag`) rather than remembering that one was.
+        let cue = self
+            .snap_cue
+            .filter(|_| self.trim.is_some() || cx.has_active_drag())
+            .map(|frame| scale.px_at(f64::from(frame) / self.fps));
         let clips = self
             .session
             .as_ref()
@@ -7198,7 +7584,12 @@ impl Player {
                     // the window, which took it from the release that fired
                     // this (gpui window.rs:3602).
                     .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
-                        let at = this.frame_under(window.mouse_position().x);
+                        // Onto the edges near it, exactly as a clip carried by
+                        // hand lands: the line drawn while it was in flight is
+                        // the frame it goes down on.
+                        let x = window.mouse_position().x;
+                        let marks = this.snap_targets(None);
+                        let (at, _) = this.snap_to(this.frame_under(x), 0, &marks);
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
@@ -7207,10 +7598,21 @@ impl Player {
                     // to -- its own included, which is the drag that moves a
                     // take along its track.
                     .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
-                        this.move_clip(drag.lane, drag.idx, lane, window.mouse_position().x, cx)
+                        // Against the lane as it is *now* ([`Player::dragged`]),
+                        // and then snapped by `move_clip` like any other drop:
+                        // which clip is being moved and where it lands are two
+                        // questions, and this is the first one.
+                        let Some(idx) = this.dragged(drag) else {
+                            return;
+                        };
+                        this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
+                        // The clip as the lane holds it, for the drag payload:
+                        // what a drop looks itself up by has to be the placed
+                        // clip, never the preview an edge drag is drawing.
+                        let placed = *clip;
                         // What a drag on an edge is showing, which is the clip
                         // itself while nothing is being dragged.
                         let clip = &self.trimmed(lane, i, *clip);
@@ -7236,15 +7638,30 @@ impl Player {
                                 .unwrap_or(clip.source),
                         );
                         let width = scale.width_px(len);
+                        let left = scale.px_at(start);
+                        // The slice of this box that is on the bed: where its
+                        // name, its badge and its waveform go, so none of the
+                        // three is drawn out at a zoomed-in box's own edges.
+                        let (vis_x, vis_w) = visible_slice(left, width, bed);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
                             .and_then(|s| self.waves.get(&(s.path.clone(), s.audio_stream)))
                             .cloned();
-                        let (from, to) = (
-                            f64::from(clip.in_frame) / self.fps,
-                            f64::from(clip.out_frame) / self.fps,
-                        );
+                        // The source seconds that slice plays -- not the clip's
+                        // whole range: the envelope is drawn for the part of the
+                        // box that can be seen, at the resolution of the pixels
+                        // it actually has, and never one column per two pixels
+                        // of a box millions of pixels wide.
+                        let along = |x: f32| match width > 0. {
+                            true => {
+                                f64::from(clip.in_frame)
+                                    + f64::from(clip.out_frame - clip.in_frame)
+                                        * f64::from(x / width)
+                            }
+                            false => f64::from(clip.in_frame),
+                        };
+                        let (from, to) = (along(vis_x) / self.fps, along(vis_x + vis_w) / self.fps);
                         let tip = tip.clone();
                         // What the pointer carries on the way to another lane:
                         // the file the box is showing, the same ghost a library
@@ -7267,7 +7684,7 @@ impl Player {
                             // off the left edge: the bed clips what hangs out
                             // of it, so a half-visible clip is drawn as the
                             // half of itself that is on screen.
-                            .left(px(scale.px_at(start)))
+                            .left(px(left))
                             .w(px(width))
                             .overflow_hidden()
                             .rounded(px(3.))
@@ -7288,9 +7705,14 @@ impl Player {
                             // starts the drag still selects, so picking a clip
                             // up and putting it back down where it was is
                             // exactly a click.
-                            .on_drag(ClipDrag { lane, idx: i }, move |_, _, _, cx| {
-                                cx.new(|_| Tip(ghost.clone()))
-                            })
+                            .on_drag(
+                                ClipDrag {
+                                    lane,
+                                    idx: i,
+                                    clip: placed,
+                                },
+                                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone())),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -7349,7 +7771,7 @@ impl Player {
                                 zone
                             }))
                             // Under the label row, never through it.
-                            .children(wave.filter(|_| audio).and_then(|wave| {
+                            .children(wave.filter(|_| audio && vis_w > 0.).and_then(|wave| {
                                 let inner: AnyElement = match wave {
                                     Wave::Peaks(peaks) => {
                                         waveform(peaks, from, to).into_any_element()
@@ -7385,8 +7807,8 @@ impl Player {
                                 Some(
                                     div()
                                         .absolute()
-                                        .left_0()
-                                        .right_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
                                         .top(px(LABEL_H))
                                         .bottom_0()
                                         .child(inner),
@@ -7397,24 +7819,44 @@ impl Player {
                             // cannot say whether a short clip is a trim or a
                             // clip at 4x, and that is the difference between a
                             // cut and a re-time.
-                            .when(!clip.speed.is_normal(), |d| {
+                            // Against the right edge of what is *visible* of the
+                            // box, not of the box: zoomed in, the box's own
+                            // right edge is off the screen and the badge with
+                            // it, which is a clip that stops saying it is
+                            // speeded exactly when it is being looked at
+                            // closely.
+                            .when(!clip.speed.is_normal() && vis_w > 0., |d| {
                                 d.child(
                                     div()
                                         .absolute()
                                         .top_0()
-                                        .right_0()
-                                        .px(px(3.))
-                                        .rounded(px(3.))
-                                        .bg(rgb(ACCENT))
-                                        .text_size(px(9.))
-                                        .text_color(rgb(SURFACE))
-                                        .child(format!("{}", clip.speed)),
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
+                                        .flex()
+                                        .justify_end()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .px(px(3.))
+                                                .rounded(px(3.))
+                                                .bg(rgb(ACCENT))
+                                                .text_size(px(9.))
+                                                .text_color(rgb(SURFACE))
+                                                .child(format!("{}", clip.speed)),
+                                        ),
                                 )
                             })
-                            .when_some(label.filter(|_| show_label(width)), |d, label| {
+                            // ...and the name sits at the left edge of the same
+                            // slice, for the same reason: a box scrolled half
+                            // off names itself on the half that is on screen.
+                            .when_some(label.filter(|_| show_label(vis_w)), |d, label| {
                                 d.child(
                                     div()
-                                        .relative()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
                                         .h(px(LABEL_H))
                                         .px(px(4.))
                                         .truncate()
@@ -7442,6 +7884,20 @@ impl Player {
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
+                    // What the gesture in flight is about to land on, drawn on
+                    // every lane so a clip lining up with a take one track over
+                    // can be seen to line up with it. Under the playhead's line
+                    // and in another colour, since the two mean different
+                    // things and often stand on the same pixel.
+                    .children(cue.map(|x| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(x))
+                            .w(px(1.))
+                            .bg(rgb(INK))
+                    }))
                     // Last, so it is over the clips: the same fraction in both
                     // lanes, which is the playhead being one line.
                     .child(
@@ -7666,6 +8122,36 @@ fn eq_x(freq_hz: f32) -> f32 {
     ((freq_hz.max(1.) / EQ_FREQ_LOW).log10() / span).clamp(0., 1.)
 }
 
+/// The frequency at a fraction across the graph -- [`eq_x`] backwards, which is
+/// how a drag and the curve's own sample points read one. Clamped to the axis
+/// either way, so a pointer that leaves the box stops at 20 Hz or 20 kHz.
+fn eq_freq(along: f32) -> f32 {
+    EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along.clamp(0., 1.))
+}
+
+/// The band an "add" makes: a flat peak half way -- in octaves, which is what
+/// the log axis draws -- between the picked band and whatever sits above it, so
+/// a new band lands in the gap on screen rather than on top of its neighbour.
+/// Above the topmost band the gap is the rest of the axis.
+fn inserted_band(bands: &[Band], after: usize) -> Band {
+    let below = bands.get(after).map_or(1000., |b| b.freq_hz);
+    let above = bands
+        .iter()
+        .map(|b| b.freq_hz)
+        .filter(|f| *f > below)
+        .min_by(f32::total_cmp)
+        .unwrap_or(EQ_FREQ_HIGH);
+    Band {
+        freq_hz: (below * above).sqrt().clamp(EQ_FREQ_LOW, EQ_FREQ_HIGH),
+        gain_db: 0.,
+        // A shade narrower than the flat-shelf 0.707 the defaults use: a band
+        // someone asked for is a band they mean to aim, and a wide one aimed at
+        // 300 Hz is really a band at everything.
+        q: 1.,
+        kind: BandKind::Peak,
+    }
+}
+
 /// Where a gain sits *down* the graph, 0..1 from the top: flat is the middle,
 /// so a cut reads as a dip below the line it is a cut from. The inverse of
 /// [`Player::drag_band`]'s reading of the pointer, and clamped like it, so a
@@ -7675,14 +8161,24 @@ fn eq_y(gain_db: f32) -> f32 {
     0.5 - (gain_db / EQ_GAIN_LIMIT).clamp(-1., 1.) / 2.
 }
 
+/// A frequency as the card writes it. Two decimals of a kHz at most, with the
+/// zeroes trimmed, so "1 kHz" stays "1 kHz" and a band nudged off it reads as
+/// 1.12 kHz rather than as the same "1 kHz" it was before the keystroke -- a
+/// number that does not move under an edit is worse than no number.
+fn eq_freq_label(freq_hz: f32) -> String {
+    if freq_hz < 1000. {
+        return format!("{freq_hz:.0} Hz");
+    }
+    let khz = format!("{:.2}", freq_hz / 1000.);
+    let khz = khz.trim_end_matches('0').trim_end_matches('.');
+    format!("{khz} kHz")
+}
+
 /// What a band row calls itself: the corner or centre frequency, and for a
 /// shelf the fact that it tilts everything past it -- which is the difference
 /// between "12 kHz" moving the last octave and moving one band inside it.
 fn band_label(band: &Band) -> String {
-    let freq = match band.freq_hz >= 1000. {
-        true => format!("{:.0} kHz", band.freq_hz / 1000.),
-        false => format!("{:.0} Hz", band.freq_hz),
-    };
+    let freq = eq_freq_label(band.freq_hz);
     match band.kind {
         BandKind::LowShelf => format!("{freq} low shelf"),
         BandKind::HighShelf => format!("{freq} high shelf"),
@@ -7694,9 +8190,11 @@ fn band_label(band: &Band) -> String {
 /// kinds of no: `Hidden` is about the *kind* of thing the action was aimed at
 /// -- an audio clip has no picture, so a grade is not a thing that exists for
 /// it, whatever the editor does next -- and `No` is about the state of this
-/// moment, which the next click of the playhead can change. Both dim their row
-/// today; a menu that wants to leave the class refusals out and keep the state
-/// ones has only to match on which of the two it got.
+/// moment, which the next click of the playhead can change. The clip menu
+/// leaves the class refusals *out* and dims the state ones ([`Enable::listed`]);
+/// the actions card, which is the whole registry laid out, dims both with their
+/// reason -- an action missing from the one surface that lists everything would
+/// read as an action that does not exist.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Enable {
     Yes,
@@ -7708,6 +8206,13 @@ impl Enable {
     /// Whether the row takes a click.
     fn yes(self) -> bool {
         self == Enable::Yes
+    }
+
+    /// Whether a menu *about this clip* draws the row at all: a class refusal
+    /// is a thing that does not exist for what was clicked, and a row nothing
+    /// the user does could ever light is noise between the ones they came for.
+    fn listed(self) -> bool {
+        !matches!(self, Enable::Hidden(_))
     }
 
     /// What the row says instead of its stroke, if it says anything.
@@ -7730,6 +8235,10 @@ struct Ctx {
     /// and the clip-relative answers stand aside: those actions find their own
     /// clip under the playhead and word their own refusal.
     clip: Option<(Clip, Lane)>,
+    /// The clip plays a still ([`engine::is_image`]), which has no sound to
+    /// reach at all -- not the lane's business, because a still sits on a video
+    /// lane exactly like a take whose sound is one lane down.
+    image: bool,
     playhead: u32,
     /// A timeline is open.
     timeline: bool,
@@ -7769,6 +8278,11 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
             Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
             _ => Enable::Yes,
         },
+        // The scan reads samples, and a still has none -- ever, unlike a video
+        // clip whose sound may be one lane down or simply silent. Exactly what
+        // `unscannable` says after the fact, said before the row is drawn so
+        // there is no row left to click.
+        ActionId::Silence if ctx.image => Enable::Hidden("this clip is a still"),
         // -- state: true of this clip now, and the next playhead click or the
         // next selection changes the answer. Splits this clip only from inside
         // it: at either edge there is nothing to split off -- and, on a speeded
@@ -8035,6 +8549,15 @@ fn unusable(info: &StreamInfo, timeline_audio: Option<(u32, u16)>) -> Option<Str
             layout(channels).unwrap_or_else(|| "silent".to_string())
         )
     })
+}
+
+/// How wide the equalizer card is drawn in a window this wide: all of it bar a
+/// margin, up to [`EQ_W_MAX`]. The card is a graph, and a graph of twenty
+/// thousand hertz on 320 px spends four pixels on the octave below middle C --
+/// so it takes the room a big window has and stays inside a small one. Floored
+/// at the other cards' width, which is the last size the rows still read at.
+fn eq_card_w(window_w: f32) -> f32 {
+    (window_w - EQ_W_MARGIN).clamp(KEYS_W, EQ_W_MAX)
 }
 
 /// What the media list is given of the window. A share of it, so a narrow
@@ -8965,6 +9488,97 @@ fn show_label(w: f32) -> bool {
     w >= LABEL_MIN_W
 }
 
+/// The clip a trim is *showing*, worked out the way `Project::trim` will write
+/// it: the timeline room the edge leaves is turned into source frames by the one
+/// conversion that exists for it ([`Speed::fit`]), and the box is drawn from
+/// that. The preview and the commit are then the same arithmetic -- a box let go
+/// of stays where the hand left it at every rate. Assigning the timeline count
+/// straight to the source field, as this used to, drew a speeded clip's tail
+/// moving at the wrong rate (it snapped on release) and drew a *head* trim
+/// moving the clip's other edge, since the length it implied was not the length
+/// the release would commit.
+///
+/// A still grows forward from source frame 0 instead: every frame of it is the
+/// same picture, so there is no earlier one for an in-point to walk back to.
+///
+/// Room too narrow to hold one source frame is the edit the engine refuses, and
+/// the box is drawn unchanged rather than as something that will not be
+/// committed.
+fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip {
+    // An edge that has not moved is not an edit, and `Project::trim` refuses it
+    // as one: the press that starts a drag must draw the clip it pressed, not a
+    // clip a rounding narrower.
+    if to
+        == match edge {
+            Edge::Start => clip.start,
+            Edge::End => clip.end(),
+        }
+    {
+        return clip;
+    }
+    match edge {
+        Edge::Start => {
+            // What survives is measured from the *end* -- the frames that stay
+            // play what they always played, which is what makes this a trim.
+            let Some(keep) = clip.speed.fit(clip.end().saturating_sub(to)) else {
+                return clip;
+            };
+            match still {
+                true => Clip {
+                    in_frame: 0,
+                    out_frame: keep,
+                    start: to,
+                    ..clip
+                },
+                false => Clip {
+                    in_frame: clip.out_frame - keep.min(clip.out_frame),
+                    start: to,
+                    ..clip
+                },
+            }
+        }
+        Edge::End => match clip.speed.fit(to.saturating_sub(clip.start)) {
+            Some(keep) => Clip {
+                out_frame: clip.in_frame + keep,
+                ..clip
+            },
+            None => clip,
+        },
+    }
+}
+
+/// Which index on its own lane a dragged clip is at *now*: the one it was picked
+/// up at while nothing has moved, and wherever the clip itself has slid to when
+/// an edit during the drag rippled the lane's indices -- a delete, an undo or a
+/// paste from a stroke, none of which gpui's frozen drag payload hears about.
+/// `None` when the clip is gone altogether, and then the drop is not an edit at
+/// all: moving whatever slid into its place is the one thing the hand did not
+/// ask for. A lane's clips are disjoint and sorted, so at most one of them can
+/// be the clip that was picked up.
+fn live_idx(clips: &[Clip], idx: usize, clip: Clip) -> Option<usize> {
+    match clips.get(idx) {
+        Some(&at) if at == clip => Some(idx),
+        _ => clips.iter().position(|&c| c == clip),
+    }
+}
+
+/// The part of a clip's box that is on the bed, in the box's own pixels:
+/// `(left, width)` of its intersection with the visible strip. Everything drawn
+/// *inside* a box -- its waveform, its name, its speed badge -- is placed in
+/// here rather than at the box's own edges, which at a deep zoom sit thousands
+/// of pixels off either side of the screen: a label out there is a label nobody
+/// can read, and a waveform out there is a path with a point per two pixels of a
+/// width nobody can see. A bed that has not been measured yet answers with the
+/// whole box, which is what was drawn before there was a bed to clip to.
+fn visible_slice(left: f32, width: f32, bed: f32) -> (f32, f32) {
+    if bed <= 0. {
+        return (0., width);
+    }
+    let from = (-left).clamp(0., width);
+    let to = (bed - left).clamp(from, width);
+    (from, to - from)
+}
+
 /// Scales an envelope to its own loudest sample, so a quietly mastered source
 /// still draws as a shape. The fixtures peak around an eighth of full scale, and
 /// an eighth of a 30 px lane is a flat line -- which says "silent" about a file
@@ -8989,7 +9603,7 @@ fn envelope(peaks: &[(f32, f32)], from: f64, to: f64, w: f32, h: f32) -> Vec<(f3
     if peaks.is_empty() || w <= 0. || h <= 0. {
         return Vec::new();
     }
-    let cols = (w / WAVE_COL).ceil().max(1.) as usize;
+    let cols = ((w / WAVE_COL).ceil().max(1.) as usize).min(WAVE_COLS_MAX);
     let mid = h / 2.;
     (0..=cols)
         .map(|col| {
@@ -9242,6 +9856,56 @@ fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
     best.map_or(raw, |(_, start)| start)
 }
 
+/// The edges worth landing on, off *every* lane: both ends of every clip on the
+/// timeline, less `skip` -- the clip being dragged, which does not snap to where
+/// it already is -- and less the other halves of its group, which travel with
+/// it. `skip` is a lane's place in `lanes` and an index into it. The playhead
+/// and the head of the timeline go on the end: a clip meets the cursor and the
+/// start of the show as readily as it meets another take.
+///
+/// All lanes rather than the one being dropped on, because a cut is made across
+/// the timeline: a title on V2 lines up with the shot under it, and a sound
+/// effect lines up with the frame it belongs to.
+fn snap_marks(lanes: &[&[Clip]], skip: Option<(usize, usize)>, playhead: u32) -> Vec<u32> {
+    let link = skip
+        .and_then(|(lane, idx)| lanes.get(lane)?.get(idx))
+        .and_then(|clip| clip.link);
+    let mut marks: Vec<u32> = lanes
+        .iter()
+        .enumerate()
+        .flat_map(|(lane, clips)| {
+            clips
+                .iter()
+                .enumerate()
+                .filter(move |&(idx, clip)| {
+                    Some((lane, idx)) != skip && !(link.is_some() && clip.link == link)
+                })
+                .flat_map(|(_, clip)| [clip.start, clip.end()])
+        })
+        .collect();
+    marks.push(playhead);
+    marks.push(0);
+    marks
+}
+
+/// [`snapped`], and the mark that pulled it there -- the line the bed draws
+/// while the hand is still moving. `None` when nothing was near enough: a line
+/// standing over open bed would promise a landing that is not going to happen.
+/// The head is read before the tail, exactly as [`snapped`] prefers it.
+///
+/// `on` is the switch ([`ActionId::ToggleSnap`]): off, the gesture lands raw and
+/// draws no line at all, which is the whole point of being able to turn it off.
+fn snap_cue(on: bool, raw: u32, len: u32, tol: u32, marks: &[u32]) -> (u32, Option<u32>) {
+    if !on {
+        return (raw, None);
+    }
+    let start = snapped(raw, len, tol, marks);
+    let mark = [start, start.saturating_add(len)]
+        .into_iter()
+        .find(|mark| marks.contains(mark));
+    (start, mark)
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -9445,11 +10109,15 @@ fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
     .size_full()
 }
 
-/// The cascade's frequency response, drawn as one line across the graph.
+/// The cascade's frequency response, drawn as one line across the graph, with
+/// each band's own response threaded dimly under it.
 ///
 /// Every point comes from `EqParams::response_db`, which reads the very
 /// coefficients the samples are filtered through: the curve cannot drift from
-/// what is heard, because there is no second copy of the maths.
+/// what is heard, because there is no second copy of the maths. A single band's
+/// thread is that same call on a cascade of one, so the two cannot disagree
+/// either -- and it is what makes a boost sitting inside a cut visible at all,
+/// where the sum alone would draw a flat line and say nothing.
 ///
 /// ponytail: bands that overlap can sum past the ±`EQ_GAIN_LIMIT` axis and the
 /// curve then rides the edge of the box; upgrade = a wider dB axis with the
@@ -9459,16 +10127,37 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
         |_, _, _| (),
         move |bounds, _, window, _| {
             let (o, s) = (bounds.origin, bounds.size);
-            let points: Vec<_> = (0..=EQ_CURVE_STEPS)
-                .map(|step| {
-                    let along = step as f32 / EQ_CURVE_STEPS as f32;
-                    let freq = EQ_FREQ_LOW * (EQ_FREQ_HIGH / EQ_FREQ_LOW).powf(along);
-                    point(
-                        o.x + s.width * along,
-                        o.y + s.height * eq_y(params.response_db(freq, sample_rate)),
-                    )
+            let line = |of: &EqParams| -> Vec<_> {
+                (0..=EQ_CURVE_STEPS)
+                    .map(|step| {
+                        let along = step as f32 / EQ_CURVE_STEPS as f32;
+                        point(
+                            o.x + s.width * along,
+                            o.y + s.height
+                                * eq_y(of.response_db(eq_freq(along), sample_rate)),
+                        )
+                    })
+                    .collect()
+            };
+            // One thread per band, first, so the sum is drawn over them.
+            for band in &params.bands {
+                let mut bell = PathBuilder::stroke(px(1.));
+                for (step, at) in line(&EqParams {
+                    bands: vec![*band],
                 })
-                .collect();
+                .into_iter()
+                .enumerate()
+                {
+                    match step {
+                        0 => bell.move_to(at),
+                        _ => bell.line_to(at),
+                    }
+                }
+                if let Ok(bell) = bell.build() {
+                    window.paint_path(bell, rgba(EQ_BELL_INK));
+                }
+            }
+            let points = line(&params);
             // The area between the curve and 0 dB, closed along that line: a
             // boost and a cut wind opposite ways around it, which is exactly
             // what makes both of them fill and the flat parts stay empty.
@@ -9570,28 +10259,32 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, Ctx,
-        EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE,
-        EQ_SPECTRUM_DB, EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, FORMATS,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, Ctx, EQ_BANDS_MAX,
+        EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H,
+        EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE,
+        EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, FORMATS,
         Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
         INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
         LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
         MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
-        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, band_label, bitrate_refusal,
-        can_add, cancels_export, clipboard_after_remove, color_snap, containers, enable, envelope,
-        eq_spectrum, eq_x, eq_y, estimated_mb, export_path, export_settings, format_key,
+        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
+        bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, containers,
+        enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
+        estimated_mb, export_path, export_settings, format_key,
         format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
-        is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at, next_container,
+        inserted_band, is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at,
+        next_container,
         normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, silence_rate, snapped, source_tint, span_partner, speed_at, summary_head,
-        summary_tail, timecode, transport, unseen_paths, unseen_sources, whole_take, window_title,
+        show_label, silence_rate, snap_cue, snap_marks, snapped, source_tint, span_partner,
+        speed_at, summary_head, summary_tail, timecode, transport, unseen_paths, unseen_sources,
+        whole_take, window_title,
     };
     use super::{
-        Choice, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View, ZOOM_MAX_SECONDS,
-        ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, fit_choices, library_rows, next_fit,
-        next_resolution, px_along, repeats, resolution_choices, resolution_ladder, span_label,
-        unscannable,
+        Choice, Edge, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View,
+        ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, fit_choices,
+        library_rows, live_idx, next_fit, next_resolution, px_along, repeats, resolution_choices,
+        resolution_ladder, span_label, trimmed_clip, unscannable, visible_slice,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -9954,37 +10647,121 @@ mod tests {
         // clip wherever the playhead is, dimmed on a waveform.
         assert!(offered(&clip, v1, ActionId::Color, 0));
         assert!(!offered(&clip, a1, ActionId::Color, 60));
-        // The two kinds of no, which is what the row can be told apart by: a
-        // grade on a waveform is a *class* answer -- an audio clip has no
-        // picture and never will, so a menu may leave the item out -- where a
-        // cut at the clip's edge is this moment's answer and the next click of
-        // the playhead changes it, so that one is dimmed and stays.
-        assert!(matches!(
-            on(&clip, a1, ActionId::Color, 60),
-            Enable::Hidden(_)
-        ));
-        assert!(matches!(
-            on(&clip, a1, ActionId::Fit, 60),
-            Enable::Hidden(_)
-        ));
-        assert!(matches!(
-            on(&clip, v1, ActionId::Equalizer, 60),
-            Enable::Hidden(_)
-        ));
+        // The two kinds of no, which is what the row is told apart by: a grade
+        // on a waveform is a *class* answer -- an audio clip has no picture and
+        // never will, so the menu leaves the item out entirely -- where a cut at
+        // the clip's edge is this moment's answer and the next click of the
+        // playhead changes it, so that one is drawn, dimmed, and says why.
+        //
+        // What the menu draws for a clip of each kind, in order: the render
+        // loop's `continue`, as a list.
+        let menu = |lane, image, playhead| {
+            MENU_ITEMS
+                .into_iter()
+                .filter(|&action| {
+                    enable(
+                        action,
+                        Ctx {
+                            clip: Some((clip, lane)),
+                            image,
+                            playhead,
+                            timeline: true,
+                            ..Ctx::default()
+                        },
+                    )
+                    .listed()
+                })
+                .collect::<Vec<_>>()
+        };
+        // Sound: no grade and no fit policy, and the equalizer that is the
+        // whole reason an audio clip has a menu of its own.
+        let sound = menu(a1, false, 60);
+        assert!(!sound.contains(&ActionId::Color), "{sound:?}");
+        assert!(!sound.contains(&ActionId::Fit), "{sound:?}");
+        assert!(sound.contains(&ActionId::Equalizer));
+        assert!(sound.contains(&ActionId::Silence));
+        // Picture: the mirror of it. The sound of a take is the audio lane's,
+        // clip for clip, so the equalizer is not this clip's business -- but the
+        // silence scan is, because it opens on the half it is grouped with.
+        let picture = menu(v1, false, 60);
+        assert!(!picture.contains(&ActionId::Equalizer), "{picture:?}");
+        assert!(picture.contains(&ActionId::Color));
+        assert!(picture.contains(&ActionId::Fit));
+        assert!(picture.contains(&ActionId::Silence));
+        // A still: picture with no sound anywhere, ever. Graded, fitted and
+        // re-timed like any other clip (a speed reaches a still through the same
+        // rewrite), scanned like none.
+        let still = menu(v1, true, 60);
+        assert!(!still.contains(&ActionId::Silence), "{still:?}");
+        assert!(!still.contains(&ActionId::Equalizer), "{still:?}");
+        assert!(still.contains(&ActionId::Color));
+        assert!(still.contains(&ActionId::Fit));
+        assert!(still.contains(&ActionId::Speed));
+        // ...and the state refusals are on all three, dimmed rather than gone:
+        // at 30 the playhead is on this clip's head, where a cut has nothing to
+        // split off -- a row the next click of the playhead lights.
+        for rows in [menu(a1, false, 30), menu(v1, false, 30), menu(v1, true, 30)] {
+            assert!(rows.contains(&ActionId::Cut), "{rows:?}");
+            assert!(rows.contains(&ActionId::Detach), "{rows:?}");
+        }
+        // The actions card is the other half of the rule: it lists the whole
+        // registry, so a class refusal is dimmed there with its reason and never
+        // dropped -- an action missing from the one surface that lists
+        // everything would read as an action that does not exist.
+        let listed: Vec<ActionId> = keys_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        for (lane, action) in [
+            (a1, ActionId::Color),
+            (a1, ActionId::Fit),
+            (v1, ActionId::Equalizer),
+        ] {
+            assert!(matches!(on(&clip, lane, action, 60), Enable::Hidden(_)));
+            assert!(listed.contains(&action), "{action:?} left the actions card");
+            assert!(on(&clip, lane, action, 60).why().is_some());
+        }
         assert!(matches!(on(&clip, v1, ActionId::Cut, 30), Enable::No(_)));
         assert!(matches!(on(&clip, v1, ActionId::Regroup, 60), Enable::No(_)));
         assert!(matches!(on(&clip, v1, ActionId::Detach, 0), Enable::No(_)));
         // Every refusal says something, and says it short enough to sit in the
-        // menu's right-hand column beside a label.
+        // menu's right-hand column beside a label -- the still's included, which
+        // the card dims with while the menu leaves the row out.
         for action in MENU_ITEMS {
-            for lane in [v1, a1] {
+            for (lane, image) in [(v1, false), (a1, false), (v1, true)] {
                 for playhead in [0, 30, 60, 90] {
-                    if let Some(why) = on(&clip, lane, action, playhead).why() {
+                    let refusal = enable(
+                        action,
+                        Ctx {
+                            clip: Some((clip, lane)),
+                            image,
+                            playhead,
+                            timeline: true,
+                            ..Ctx::default()
+                        },
+                    );
+                    if let Some(why) = refusal.why() {
                         assert!(!why.is_empty() && why.len() <= 30, "{action:?}: {why:?}");
                     }
                 }
             }
         }
+        assert!(matches!(
+            enable(
+                ActionId::Silence,
+                Ctx {
+                    clip: Some((clip, v1)),
+                    image: true,
+                    playhead: 60,
+                    timeline: true,
+                    ..Ctx::default()
+                }
+            ),
+            Enable::Hidden(_)
+        ));
         // The editor as a whole, which is how the actions card asks: with no
         // timeline nothing is offered, an export leaves only its own cancel,
         // and the three that act on the marked clip say so when none is.
@@ -10090,6 +10867,10 @@ mod tests {
                 "{action:?} is reachable by keyboard only"
             );
         }
+        // The snap has a door of its own as well as its row on the card: the
+        // button beside the zoom, which says which way it is set as well as
+        // setting it.
+        assert!(element("snap"), "no snap button beside the zoom");
         // And the card is a door the pointer can open: the panel's own button.
         assert!(element("keys"), "no way to open the actions card");
         // The card-local strokes have the same rule, and each of them is a thing
@@ -10231,11 +11012,12 @@ mod tests {
         // Silent like the engine suite: this opens the real device.
         session.set_gain(0.0);
         assert_eq!(session.sources().len(), 1);
-        // 640x360 would join now (the project canvas places it); this file is
-        // also silent, and a silent file cannot join a timeline with sound.
+        // 640x360 joins now (the project canvas places it), and so does a file
+        // with no sound (it plays silence over its span). What is left is one
+        // output device: a mono track cannot join a stereo timeline.
         let refusal = session
-            .import(&asset("test_mismatch.mp4"))
-            .expect_err("a silent file must not join a timeline with audio")
+            .import(&asset("test_ac3.mp4"))
+            .expect_err("a mono track must not join a stereo timeline")
             .to_string();
         assert!(refusal.contains("audio"), "refusal must name it: {refusal}");
         assert_eq!(session.sources().len(), 1, "a refusal added a row");
@@ -10770,6 +11552,62 @@ mod tests {
         // ...and a mark closer to the head than `len` cannot pull the clip to a
         // negative start.
         assert_eq!(snapped(2, 40, 4, &marks), 0);
+    }
+
+    /// Where those edges come from: every lane, not the one being dropped on --
+    /// and never the clip in the hand or the half of it one track down.
+    #[test]
+    fn the_marks_are_every_lane_the_playhead_and_the_start() {
+        let clip = |start: u32, frames: u32, link| Clip {
+            start,
+            in_frame: 0,
+            out_frame: frames,
+            source: 0,
+            link,
+            eq: None,
+            color: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        // A grouped take across two lanes at 100..160, and a lone one on the
+        // audio lane at 400..430.
+        let video = [clip(100, 60, Some(7))];
+        let audio = [clip(100, 60, Some(7)), clip(400, 30, None)];
+        let lanes: [&[Clip]; 2] = [&video, &audio];
+
+        // Nothing in the hand: both lanes' edges, the playhead, and 0.
+        let mut all = snap_marks(&lanes, None, 300);
+        all.sort_unstable();
+        assert_eq!(all, [0, 100, 100, 160, 160, 300, 400, 430]);
+
+        // The video half in the hand: its own edges are gone, and so are its
+        // group's on the other lane -- both boxes travel with the drag. The
+        // lone audio clip is still a target, which is the whole point: a take
+        // being carried on V1 lands flush with a sound on A1.
+        let mut carried = snap_marks(&lanes, Some((0, 0)), 300);
+        carried.sort_unstable();
+        assert_eq!(carried, [0, 300, 400, 430]);
+
+        // An index that names no clip skips nothing and still answers.
+        assert_eq!(snap_marks(&[], Some((3, 9)), 0), [0, 0]);
+    }
+
+    /// The line the bed draws, and the switch that turns the whole thing off.
+    #[test]
+    fn the_snap_names_the_mark_it_landed_on_unless_it_is_switched_off() {
+        let marks = [100, 160, 300, 0];
+        // Pulled by the tail: the clip lands at 60 and the line stands on the
+        // edge its *tail* met, 100 -- not on the head it happens to have.
+        assert_eq!(snap_cue(true, 62, 40, 4, &marks), (60, Some(100)));
+        // Pulled by the head: line and landing are the same frame.
+        assert_eq!(snap_cue(true, 158, 40, 4, &marks), (160, Some(160)));
+        // A trim carries no length, so only its own edge lands.
+        assert_eq!(snap_cue(true, 298, 0, 4, &marks), (300, Some(300)));
+        // Open bed: nothing moves and nothing is drawn.
+        assert_eq!(snap_cue(true, 200, 40, 4, &marks), (200, None));
+        // Switched off, a gesture that would have snapped lands raw and draws
+        // no line -- the frame-by-frame placement the toggle is for.
+        assert_eq!(snap_cue(false, 158, 40, 4, &marks), (158, None));
     }
 
     #[test]
@@ -11352,6 +12190,9 @@ mod tests {
                 "12 kHz high shelf"
             ]
         );
+        // A band moved off a round number reads as where it *is*: a keystroke
+        // that changes the filter and not the number on the card is a keystroke
+        // nobody can aim.
         assert_eq!(
             band_label(&Band {
                 freq_hz: 2600.,
@@ -11359,23 +12200,38 @@ mod tests {
                 q: 1.,
                 kind: BandKind::Peak
             }),
-            "3 kHz",
-            "rounded, because a band label is not a measurement"
+            "2.6 kHz"
+        );
+        assert_eq!(eq_freq_label(1122.), "1.12 kHz");
+        assert_eq!(eq_freq_label(12000.), "12 kHz", "no zeroes to read past");
+        assert_eq!(eq_freq_label(80.), "80 Hz");
+
+        // The card fits the smallest window and takes the room a bigger one has
+        // -- it is a graph, and the width *is* the frequency resolution.
+        assert!(eq_card_w(640.) <= 640. - 24., "card too wide for 640");
+        assert!(eq_card_w(1280.) > eq_card_w(640.), "card ignores the window");
+        assert_eq!(eq_card_w(1920.), EQ_W_MAX, "card grows without end");
+        assert!(eq_card_w(320.) >= KEYS_W, "card narrower than a row of text");
+        // At the smallest window the graph is still a graph: three across for
+        // one down, so an octave is wide enough to put a handle in.
+        assert!(
+            eq_card_w(640.) - 24. >= 3. * EQ_GRAPH_H,
+            "graph too square to aim at"
         );
 
         // The same shape as the other two cards, so it fits where they do: the
         // graph stands where the export card's rows do, and is shorter than
-        // they are.
-        let (title, status, readout, gaps, padding) = (17., 28., 17., 4. * 2., 24.);
+        // they are. The numbers row is a row of buttons now, so it is one of
+        // those tall rather than one line of text.
+        let (title, status, gaps, padding) = (17., 28., 4. * 2., 24.);
         assert!(
-            title + status + EQ_GRAPH_H + readout + gaps + padding + CONTROL_H <= 360.,
+            title + status + EQ_GRAPH_H + HIT_MIN + gaps + padding + CONTROL_H <= 360.,
             "card too tall"
         );
         assert!(
             EQ_GRAPH_H <= EXPORT_ROWS_H,
             "graph taller than a card of rows"
         );
-        assert!(KEYS_W <= 640., "card too wide");
         // What is dragged is the whole graph -- the handle is a 10 px dot, but
         // a press anywhere in the box takes the band nearest it -- so WCAG
         // 2.5.8 is satisfied by the box, which is far past the minimum.
@@ -11385,6 +12241,83 @@ mod tests {
             "a dot that size would want its own hitbox"
         );
         assert!(KEYS_ROW_H >= HIT_MIN);
+    }
+
+    /// Editing a band, which is what the card is *for*: the pointer reads a
+    /// frequency off the axis the same way the axis draws one, a new band lands
+    /// in the gap beside the picked one rather than on top of it, and every band
+    /// the card will hold has a digit that picks it.
+    #[test]
+    fn a_band_can_be_moved_added_and_reached() {
+        use engine::eq::{Band, BandKind, EqParams};
+        // Across the graph and back: a drag sets the frequency the handle is
+        // then drawn at, so the two mappings have to be one another's inverse or
+        // the handle walks away from the pointer.
+        for freq in [20., 80., 250., 1000., 4000., 12000., 20000.] {
+            let read = eq_freq(eq_x(freq));
+            assert!(
+                (read / freq - 1.).abs() < 1e-3,
+                "{freq} Hz read back as {read}"
+            );
+        }
+        // Off the box either end stops at the axis, never past it.
+        assert_eq!(eq_freq(-1.), EQ_FREQ_LOW);
+        assert_eq!(eq_freq(2.), EQ_FREQ_HIGH);
+
+        // A step of the frequency keys is a real move on screen -- a keystroke
+        // that changes nothing visible is a keystroke that reads as broken --
+        // and small enough to aim with.
+        let step = eq_x(1000. * EQ_FREQ_STEP) - eq_x(1000.);
+        assert!(step > 0.01 && step < 0.06, "frequency key steps {step}");
+
+        // A new band lands between the picked one and the next one up, in
+        // octaves: 250 Hz and 1 kHz put it at 500, which is a gap on screen.
+        let bands = EqParams::default_layout().bands;
+        let added = inserted_band(&bands, 1);
+        assert!((added.freq_hz - 500.).abs() < 1., "landed at {added:?}");
+        assert_eq!(added.gain_db, 0., "a new band changes nothing until moved");
+        assert_eq!(added.kind, BandKind::Peak, "a new band is not a shelf");
+        assert!(eq_x(added.freq_hz) - eq_x(bands[1].freq_hz) > 0.1);
+        // Above the topmost band the gap is the rest of the axis, and the band
+        // still lands on it rather than off the end.
+        let top = inserted_band(&bands, bands.len() - 1);
+        assert!(
+            top.freq_hz > bands[4].freq_hz && top.freq_hz <= EQ_FREQ_HIGH,
+            "landed at {top:?}"
+        );
+        // Bands out of frequency order (a drag may cross two over) still get a
+        // sane neighbour: the next one *up*, not the next one along the list.
+        let crossed = vec![
+            Band {
+                freq_hz: 4000.,
+                gain_db: 0.,
+                q: 1.,
+                kind: BandKind::Peak,
+            },
+            Band {
+                freq_hz: 100.,
+                gain_db: 0.,
+                q: 1.,
+                kind: BandKind::Peak,
+            },
+        ];
+        let between = inserted_band(&crossed, 1);
+        assert!(
+            (between.freq_hz - 632.).abs() < 2.,
+            "landed at {between:?}, not between 100 and 4000"
+        );
+
+        // Every band the card will hold is one digit away: the keyboard has ten
+        // digits, which is exactly why the cap is what it is.
+        assert!(
+            EQ_BANDS_MAX <= 10,
+            "a band past the tenth has no key that picks it"
+        );
+        assert!(EQ_BANDS_MAX > EqParams::default_layout().bands.len());
+        // The Q range holds the default, so a file's band never opens out of
+        // range and needs dragging back in before it can be edited.
+        assert!((EQ_Q_LOW..=EQ_Q_HIGH).contains(&0.707));
+        assert!(EQ_Q_STEP > 1.);
     }
 
     /// The analyser drawn behind the curve: a tone has to land on its own
@@ -12479,6 +13412,141 @@ mod tests {
         assert!(!envelope(&peaks, 0., 99., w, h).is_empty());
     }
 
+    /// A box laid out wider than any screen -- a long clip at a deep zoom -- is
+    /// still one screen's worth of columns: the path a repaint has to build is
+    /// bounded by what can be seen, not by what the layout says the box is.
+    /// Unbounded, a 5 s clip zoomed to the frame is a path of millions of points
+    /// per frame, and the repaint that stalls on it is the waveform that
+    /// "disappeared".
+    #[test]
+    fn an_envelope_never_costs_more_points_than_a_screen_can_show() {
+        let peaks: Vec<(f32, f32)> = (0..200).map(|i| (-(i as f32) / 199., 1.)).collect();
+        // The width a 5 s clip is laid out at when the bed shows 8 frames of it.
+        let huge = 5. * 30. / 8. * 1200.;
+        let cols = envelope(&peaks, 0., 5., huge, 30.);
+        assert!(
+            cols.len() <= WAVE_COLS_MAX + 1,
+            "{} columns for a {huge} px box",
+            cols.len()
+        );
+        // ...and the slice actually painted is the part of the box on the bed,
+        // which is where that width stops mattering: a column per two visible
+        // pixels, at every zoom.
+        let (x, w) = visible_slice(-huge / 2., huge, 1200.);
+        assert_eq!((x, w), (huge / 2., 1200.));
+        assert_eq!(envelope(&peaks, 0., 5., w, 30.).len(), 601);
+        // A box entirely off the bed has no slice, and one that has never been
+        // measured is drawn whole -- what was drawn before there was a bed.
+        assert_eq!(visible_slice(2000., 500., 1200.), (0., 0.));
+        assert_eq!(visible_slice(-3000., 500., 1200.), (500., 0.));
+        assert_eq!(visible_slice(-40., 500., 0.), (0., 500.));
+        // Half on, at either edge.
+        assert_eq!(visible_slice(-100., 500., 1200.), (100., 400.));
+        assert_eq!(visible_slice(1000., 500., 1200.), (0., 200.));
+    }
+
+    /// The box a trim draws is the box its release commits, at every speed. The
+    /// preview used to hand the *timeline* frame count to a source-frame field:
+    /// at 2x a tail moved twice as fast as the pointer and snapped back on
+    /// release, and a head drag moved the clip's other edge.
+    #[test]
+    fn a_trim_preview_lands_where_the_release_commits() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        for permille in SPEED_PRESETS {
+            // Live, so the loop owes it no undo step: the speeds are the axis
+            // this walks, and the trims below are what is undone.
+            session
+                .set_speed_live(Lane::V1, 0, Speed::from_permille(permille))
+                .expect("a clip alone on its lane may be speeded");
+            for edge in [Edge::Start, Edge::End] {
+                let clip = session.lane_clips(Lane::V1)[0];
+                let (lo, hi) = session
+                    .trim_room(Lane::V1, 0, edge)
+                    .expect("clip 0 is there");
+                // Both walls and the middle of the room: the whole range a
+                // pointer can be clamped to.
+                for to in [lo, (lo + hi) / 2, hi] {
+                    let preview = trimmed_clip(clip, edge, to, false);
+                    // The drag is one edit and one undo step, so the next `to`
+                    // is measured from the same clip this one was.
+                    if session.trim_clip(Lane::V1, 0, edge, to) {
+                        assert_eq!(
+                            preview,
+                            session.lane_clips(Lane::V1)[0],
+                            "{edge:?} to {to} at {permille} per mille"
+                        );
+                        assert!(session.undo(), "the trim is one undo step");
+                    } else {
+                        // An edge already where it was asked to go is not an
+                        // edit, and the preview draws the clip unchanged.
+                        assert_eq!(preview, clip, "{edge:?} to {to} at {permille} per mille");
+                    }
+                    assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+                }
+            }
+        }
+    }
+
+    /// A still trims the same way, and the preview knows it: its head grows
+    /// forward from source frame 0 -- every frame of it is the same picture --
+    /// so the box stretches instead of sliding left.
+    #[test]
+    fn a_stills_trim_preview_grows_forward_like_the_commit() {
+        let mut session = PlaybackSession::open(asset("test_still.png")).expect("a picture opens");
+        for edge in [Edge::Start, Edge::End] {
+            let clip = session.lane_clips(Lane::V1)[0];
+            let (lo, hi) = session
+                .trim_room(Lane::V1, 0, edge)
+                .expect("clip 0 is there");
+            for to in [lo, (lo + hi) / 2, hi] {
+                let preview = trimmed_clip(clip, edge, to, true);
+                match session.trim_clip(Lane::V1, 0, edge, to) {
+                    true => {
+                        assert_eq!(
+                            preview,
+                            session.lane_clips(Lane::V1)[0],
+                            "a still {edge:?} to {to}"
+                        );
+                        assert!(session.undo(), "the trim is one undo step");
+                    }
+                    false => assert_eq!(preview, clip, "a still {edge:?} to {to}"),
+                }
+                assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+            }
+        }
+    }
+
+    /// gpui freezes a drag's payload for the whole gesture, and nothing stops a
+    /// stroke from editing the lane under it: the drop has to find the clip that
+    /// was picked up, not whatever slid into its index.
+    #[test]
+    fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
+        let at = |start: u32| Clip {
+            start,
+            in_frame: 0,
+            out_frame: 30,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::Fit,
+            speed: Speed::NORMAL,
+        };
+        let lane = [at(0), at(30), at(60)];
+        let dragged = lane[2];
+        assert_eq!(live_idx(&lane, 2, dragged), Some(2), "nothing moved");
+        // A delete in front of it: the clip is now index 1, and the index the
+        // drag froze names a clip nobody grabbed.
+        let after = [at(0), at(60)];
+        assert_eq!(live_idx(&after, 2, dragged), Some(1));
+        assert_eq!(live_idx(&after, 1, dragged), Some(1));
+        // Deleted mid-drag: there is nothing to move, and moving its neighbour
+        // instead is exactly the bug this exists for.
+        assert_eq!(live_idx(&[at(0)], 2, dragged), None);
+        assert_eq!(live_idx(&[], 0, dragged), None);
+    }
+
     #[test]
     fn a_quiet_source_still_draws_as_a_shape() {
         // An eighth of full scale, which is about where the fixtures sit.
@@ -12827,6 +13895,8 @@ fn main() {
                     scrubbing: false,
                     trim: None,
                     grab: 0,
+                    snap: true,
+                    snap_cue: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,

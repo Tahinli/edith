@@ -112,17 +112,35 @@ fn the_software_path_refuses_hevc_by_name() {
     assert!(h264, "software H.264 decode still opens");
 }
 
-/// A timeline is refused a source coded differently, in the same words a
-/// resolution mismatch is refused in: a front-end shows the string as it is.
+/// A timeline is *not* refused a source coded differently -- every clip opens
+/// its own decoder, so H.264 and HEVC share one timeline. What survives is the
+/// reason the codec gate existed: on a machine that cannot decode HEVC the file
+/// is refused at the door, by the decoder's own name, rather than becoming a
+/// clip of black frames with the complaint on stderr.
 #[test]
-fn a_timeline_refuses_the_other_codec() {
+fn a_timeline_takes_the_other_codec_or_names_the_missing_decoder() {
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av.mp4");
+    // The no-plugin machine, forced: the refusal must still arrive, and it must
+    // be the decoder's words and not the timeline's.
+    // SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
     let refused = session
         .import(&asset("test_hevc.mp4"))
-        .expect_err("HEVC must not join an H.264 timeline")
+        .expect_err("no HEVC decoder means no HEVC clip")
         .to_string();
-    assert!(refused.contains("HEVC"), "{refused}");
-    assert!(refused.contains("H.264"), "{refused}");
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(refused, Codec::Hevc.needs_plugin());
+    assert!(
+        !refused.contains("H.264"),
+        "the timeline's own codec is no longer a reason: {refused}"
+    );
+    assert_eq!(session.sources().len(), 1, "a refusal left no row");
+
+    // ...and where a decoder exists, it simply joins.
+    match session.import(&asset("test_hevc.mp4")) {
+        Ok(_) => assert_eq!(session.sources().len(), 2, "HEVC beside H.264"),
+        Err(e) => assert_eq!(e.to_string(), Codec::Hevc.needs_plugin()),
+    }
 }
 
 /// The end-to-end user path: opening the file yields pictures, all of them,
@@ -153,6 +171,65 @@ fn the_plugin_decodes_every_hevc_frame() {
         first.chunks_exact(4).any(|px| px != &first[..4]),
         "frame 0 is a single colour -- no picture was decoded"
     );
+}
+
+/// The mixed-codec timeline, end to end: an H.264 take joins an HEVC one, both
+/// spans really decode (a decoder each, opened at the span), and the export --
+/// which re-encodes -- writes every frame of both. The refusal that used to
+/// stand here would have made this whole timeline impossible.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with HEVC decode"]
+fn an_h264_take_plays_and_exports_on_an_hevc_timeline() {
+    let hevc = asset("test_hevc.mp4");
+    let h264 = asset("test_av.mp4");
+    let mut session = PlaybackSession::open(&hevc).expect("open test_hevc.mp4");
+    session.set_gain(0.0);
+    session.import(&h264).expect("H.264 joins an HEVC timeline");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &h264, 0, None)
+            .expect("a file just imported is on this timeline"),
+        "drag it onto the end"
+    );
+    assert_eq!(session.clip_spans().len(), 2, "two takes, two codecs");
+
+    // One picture out of each span, which is one decoder each: the HEVC clip
+    // through the plugin, the H.264 one through either backend.
+    for (at, what) in [(1.0, "the HEVC take"), (end + 1.0, "the H.264 take")] {
+        session.seek(at);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let frame = loop {
+            if let Some(frame) = session.try_frame() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "no frame from {what}");
+            std::thread::sleep(Duration::from_millis(4));
+        };
+        assert_eq!(
+            (frame.width, frame.height),
+            session.resolution(),
+            "{what} came out at the project size"
+        );
+    }
+
+    // ...and the export -- the one a front-end starts, off the session itself --
+    // re-encodes both to one H.264 track.
+    let frames =
+        (session.timeline_duration() * f64::from(session.meta().frame_rate as f32)).round() as u32;
+    let out = std::env::temp_dir().join(format!("ve_export_mixed_{}.mp4", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let handle = session.export_to_with(&out, &ExportSettings::default());
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(started.elapsed() < Duration::from_secs(240), "export hung");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    handle.result().expect("outcome").expect("the mixed export");
+    let (written, _) = Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(written.codec, Codec::H264, "exports are always H.264");
+    assert_eq!(written.frame_count, frames, "both takes were written");
+    let _ = std::fs::remove_file(&out);
 }
 
 /// Export re-encodes to H.264 whatever the source was coded with: the packet
