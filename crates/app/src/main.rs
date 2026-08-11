@@ -1156,6 +1156,12 @@ impl Player {
             action,
             Ctx {
                 clip,
+                image: clip.is_some_and(|(clip, _)| {
+                    session
+                        .sources()
+                        .get(clip.source)
+                        .is_some_and(|s| engine::is_image(&s.path))
+                }),
                 playhead: frame_at(session.now(), self.fps),
                 timeline: true,
                 clipboard: self.clipboard.is_some(),
@@ -6652,6 +6658,15 @@ impl Player {
                 // dims a row with -- and a row that takes no click says *why*
                 // rather than printing a stroke that would do nothing.
                 let refusal = self.enable(action, Some((menu.lane, menu.idx)));
+                // A grade on a waveform, an equalizer on a picture, a silence
+                // scan on a still: things that do not exist for what was
+                // right-clicked, so the menu is the list of what this clip can
+                // do rather than the registry with most of it struck through.
+                // The state refusals below stay, dimmed and saying why -- the
+                // next click of the playhead lights them.
+                if !refusal.listed() {
+                    continue;
+                }
                 let enabled = refusal.yes();
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
@@ -7450,9 +7465,11 @@ fn band_label(band: &Band) -> String {
 /// kinds of no: `Hidden` is about the *kind* of thing the action was aimed at
 /// -- an audio clip has no picture, so a grade is not a thing that exists for
 /// it, whatever the editor does next -- and `No` is about the state of this
-/// moment, which the next click of the playhead can change. Both dim their row
-/// today; a menu that wants to leave the class refusals out and keep the state
-/// ones has only to match on which of the two it got.
+/// moment, which the next click of the playhead can change. The clip menu
+/// leaves the class refusals *out* and dims the state ones ([`Enable::listed`]);
+/// the actions card, which is the whole registry laid out, dims both with their
+/// reason -- an action missing from the one surface that lists everything would
+/// read as an action that does not exist.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Enable {
     Yes,
@@ -7464,6 +7481,13 @@ impl Enable {
     /// Whether the row takes a click.
     fn yes(self) -> bool {
         self == Enable::Yes
+    }
+
+    /// Whether a menu *about this clip* draws the row at all: a class refusal
+    /// is a thing that does not exist for what was clicked, and a row nothing
+    /// the user does could ever light is noise between the ones they came for.
+    fn listed(self) -> bool {
+        !matches!(self, Enable::Hidden(_))
     }
 
     /// What the row says instead of its stroke, if it says anything.
@@ -7486,6 +7510,10 @@ struct Ctx {
     /// and the clip-relative answers stand aside: those actions find their own
     /// clip under the playhead and word their own refusal.
     clip: Option<(Clip, Lane)>,
+    /// The clip plays a still ([`engine::is_image`]), which has no sound to
+    /// reach at all -- not the lane's business, because a still sits on a video
+    /// lane exactly like a take whose sound is one lane down.
+    image: bool,
     playhead: u32,
     /// A timeline is open.
     timeline: bool,
@@ -7525,6 +7553,11 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
             Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
             _ => Enable::Yes,
         },
+        // The scan reads samples, and a still has none -- ever, unlike a video
+        // clip whose sound may be one lane down or simply silent. Exactly what
+        // `unscannable` says after the fact, said before the row is drawn so
+        // there is no row left to click.
+        ActionId::Silence if ctx.image => Enable::Hidden("this clip is a still"),
         // -- state: true of this clip now, and the next playhead click or the
         // next selection changes the answer. Splits this clip only from inside
         // it: at either edge there is nothing to split off -- and, on a speeded
@@ -9647,37 +9680,121 @@ mod tests {
         // clip wherever the playhead is, dimmed on a waveform.
         assert!(offered(&clip, v1, ActionId::Color, 0));
         assert!(!offered(&clip, a1, ActionId::Color, 60));
-        // The two kinds of no, which is what the row can be told apart by: a
-        // grade on a waveform is a *class* answer -- an audio clip has no
-        // picture and never will, so a menu may leave the item out -- where a
-        // cut at the clip's edge is this moment's answer and the next click of
-        // the playhead changes it, so that one is dimmed and stays.
-        assert!(matches!(
-            on(&clip, a1, ActionId::Color, 60),
-            Enable::Hidden(_)
-        ));
-        assert!(matches!(
-            on(&clip, a1, ActionId::Fit, 60),
-            Enable::Hidden(_)
-        ));
-        assert!(matches!(
-            on(&clip, v1, ActionId::Equalizer, 60),
-            Enable::Hidden(_)
-        ));
+        // The two kinds of no, which is what the row is told apart by: a grade
+        // on a waveform is a *class* answer -- an audio clip has no picture and
+        // never will, so the menu leaves the item out entirely -- where a cut at
+        // the clip's edge is this moment's answer and the next click of the
+        // playhead changes it, so that one is drawn, dimmed, and says why.
+        //
+        // What the menu draws for a clip of each kind, in order: the render
+        // loop's `continue`, as a list.
+        let menu = |lane, image, playhead| {
+            MENU_ITEMS
+                .into_iter()
+                .filter(|&action| {
+                    enable(
+                        action,
+                        Ctx {
+                            clip: Some((clip, lane)),
+                            image,
+                            playhead,
+                            timeline: true,
+                            ..Ctx::default()
+                        },
+                    )
+                    .listed()
+                })
+                .collect::<Vec<_>>()
+        };
+        // Sound: no grade and no fit policy, and the equalizer that is the
+        // whole reason an audio clip has a menu of its own.
+        let sound = menu(a1, false, 60);
+        assert!(!sound.contains(&ActionId::Color), "{sound:?}");
+        assert!(!sound.contains(&ActionId::Fit), "{sound:?}");
+        assert!(sound.contains(&ActionId::Equalizer));
+        assert!(sound.contains(&ActionId::Silence));
+        // Picture: the mirror of it. The sound of a take is the audio lane's,
+        // clip for clip, so the equalizer is not this clip's business -- but the
+        // silence scan is, because it opens on the half it is grouped with.
+        let picture = menu(v1, false, 60);
+        assert!(!picture.contains(&ActionId::Equalizer), "{picture:?}");
+        assert!(picture.contains(&ActionId::Color));
+        assert!(picture.contains(&ActionId::Fit));
+        assert!(picture.contains(&ActionId::Silence));
+        // A still: picture with no sound anywhere, ever. Graded, fitted and
+        // re-timed like any other clip (a speed reaches a still through the same
+        // rewrite), scanned like none.
+        let still = menu(v1, true, 60);
+        assert!(!still.contains(&ActionId::Silence), "{still:?}");
+        assert!(!still.contains(&ActionId::Equalizer), "{still:?}");
+        assert!(still.contains(&ActionId::Color));
+        assert!(still.contains(&ActionId::Fit));
+        assert!(still.contains(&ActionId::Speed));
+        // ...and the state refusals are on all three, dimmed rather than gone:
+        // at 30 the playhead is on this clip's head, where a cut has nothing to
+        // split off -- a row the next click of the playhead lights.
+        for rows in [menu(a1, false, 30), menu(v1, false, 30), menu(v1, true, 30)] {
+            assert!(rows.contains(&ActionId::Cut), "{rows:?}");
+            assert!(rows.contains(&ActionId::Detach), "{rows:?}");
+        }
+        // The actions card is the other half of the rule: it lists the whole
+        // registry, so a class refusal is dimmed there with its reason and never
+        // dropped -- an action missing from the one surface that lists
+        // everything would read as an action that does not exist.
+        let listed: Vec<ActionId> = keys_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        for (lane, action) in [
+            (a1, ActionId::Color),
+            (a1, ActionId::Fit),
+            (v1, ActionId::Equalizer),
+        ] {
+            assert!(matches!(on(&clip, lane, action, 60), Enable::Hidden(_)));
+            assert!(listed.contains(&action), "{action:?} left the actions card");
+            assert!(on(&clip, lane, action, 60).why().is_some());
+        }
         assert!(matches!(on(&clip, v1, ActionId::Cut, 30), Enable::No(_)));
         assert!(matches!(on(&clip, v1, ActionId::Regroup, 60), Enable::No(_)));
         assert!(matches!(on(&clip, v1, ActionId::Detach, 0), Enable::No(_)));
         // Every refusal says something, and says it short enough to sit in the
-        // menu's right-hand column beside a label.
+        // menu's right-hand column beside a label -- the still's included, which
+        // the card dims with while the menu leaves the row out.
         for action in MENU_ITEMS {
-            for lane in [v1, a1] {
+            for (lane, image) in [(v1, false), (a1, false), (v1, true)] {
                 for playhead in [0, 30, 60, 90] {
-                    if let Some(why) = on(&clip, lane, action, playhead).why() {
+                    let refusal = enable(
+                        action,
+                        Ctx {
+                            clip: Some((clip, lane)),
+                            image,
+                            playhead,
+                            timeline: true,
+                            ..Ctx::default()
+                        },
+                    );
+                    if let Some(why) = refusal.why() {
                         assert!(!why.is_empty() && why.len() <= 30, "{action:?}: {why:?}");
                     }
                 }
             }
         }
+        assert!(matches!(
+            enable(
+                ActionId::Silence,
+                Ctx {
+                    clip: Some((clip, v1)),
+                    image: true,
+                    playhead: 60,
+                    timeline: true,
+                    ..Ctx::default()
+                }
+            ),
+            Enable::Hidden(_)
+        ));
         // The editor as a whole, which is how the actions card asks: with no
         // timeline nothing is offered, an export leaves only its own cancel,
         // and the three that act on the marked clip say so when none is.
