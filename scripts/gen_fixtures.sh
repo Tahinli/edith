@@ -123,6 +123,24 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_h264.mkv
+# Subtitles in Matroska: the two text codecs a film carries, muxed out of the
+# hand-written files the tests also parse standalone
+# (`crates/engine/tests/data/`), so the embedded cues and the external ones can
+# be compared to each other and both to the source. Track 2 is S_TEXT/UTF8 and
+# track 3 is S_TEXT/ASS -- the same three cues, one of them with markup, which
+# is what makes "the markup is resolved, not carried" measurable.
+#
+# No bitmap track here: ffmpeg cannot encode text subtitles into pictures, so
+# the PGS refusal is checked against a Matroska file the test writes itself
+# (`crates/engine/tests/subtitles.rs`).
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=5 \
+    -i crates/engine/tests/data/test_subs.srt \
+    -i crates/engine/tests/data/test_subs.ass \
+    -map 0:v -map 1:0 -map 2:0 \
+    -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
+    -c:s:0 srt -metadata:s:s:0 language=eng \
+    -c:s:1 ass -metadata:s:s:1 language=fra -metadata:s:s:1 title=Signs \
+    assets/test_subs.mkv
 # HEVC in Matroska: the shape a film off a disc arrives in. Same A/V shape as
 # test_hevc.mp4 so the tests measure the container and nothing else, `-g 30` for
 # the same reason test_av1.mkv has it (a second keyframe to seek to), and the
