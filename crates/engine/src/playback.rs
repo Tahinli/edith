@@ -158,6 +158,11 @@ pub struct PlaybackSession {
     /// starts here, and a caller offering sizes to pick from needs the media's
     /// own among them or a project moved off it could never come back.
     native: (u32, u32),
+    /// ...and the scaffolding source's own frame rate, kept for exactly that
+    /// reason: the project rate starts here, and the list a caller offers rates
+    /// from needs the media's own on it or a project moved off it has no way
+    /// back ([`PlaybackSession::set_frame_rate`] is not an undo step either).
+    native_fps: f64,
     frames: Receiver<Frame>,
     /// The current decode worker.
     worker: Worker,
@@ -277,6 +282,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
+            native_fps: meta.frame_rate,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -375,6 +381,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (width, height),
+            native_fps: frame_rate,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -451,6 +458,7 @@ impl PlaybackSession {
         Ok(Self {
             meta,
             native: (meta.width, meta.height),
+            native_fps: IMAGE_ONLY_RATE,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -585,6 +593,32 @@ impl PlaybackSession {
             meta.width = width;
             meta.height = height;
         }
+        // ...and the project's own *rate*, which is the scaffold's unless the
+        // file says otherwise. The two made-up rates above already took the
+        // saved one (their counts are computed from it); a scaffold with a
+        // picture keeps its own here, so a project cut at a rate nobody picked
+        // is the file it always was -- and one where a rate *was* picked
+        // ([`set_frame_rate`](Self::set_frame_rate)) comes back at it rather
+        // than at the media's, which would leave every clip number counted in
+        // frames the timeline no longer has.
+        let native_fps = match crate::is_audio(&first.path) {
+            true => AUDIO_ONLY_CANVAS.2,
+            false if crate::is_image(&first.path) => IMAGE_ONLY_RATE,
+            false => meta.frame_rate,
+        };
+        if let Some(fps) = saved_fps {
+            meta.frame_rate = fps;
+        }
+        // A song and a still have no rate of their own to be conformed from:
+        // their length above was counted in the timeline's frames already,
+        // whatever those are. A file with pictures is read through [`Rate`] like
+        // any other source when the project is cut at another rate.
+        let made_up = crate::is_audio(&first.path) || crate::is_image(&first.path);
+        let scaffold_rate = match made_up || native_fps == meta.frame_rate {
+            true => Rate::REAL_TIME,
+            false => Rate::from_fps(native_fps, meta.frame_rate)
+                .map_err(|e| format!("source {}: {e}", first.path.display()))?,
+        };
         let first_audio = first_audio_of(&doc.sources)?;
 
         // In source order, with the scaffold's own count in its own slot: the
@@ -599,8 +633,8 @@ impl PlaybackSession {
         let mut rates = Vec::with_capacity(doc.sources.len());
         for (i, source) in doc.sources.iter().enumerate() {
             if i == scaffold {
-                counts.push(meta.frame_count);
-                rates.push(Rate::REAL_TIME);
+                counts.push(scaffold_rate.timeline_at(meta.frame_count));
+                rates.push(scaffold_rate);
                 continue;
             }
             // A still has neither a rate to match nor a track to match with:
@@ -704,6 +738,7 @@ impl PlaybackSession {
         let mut session = Self {
             meta,
             native,
+            native_fps,
             frames: stream.frames,
             worker: stream.worker,
             backend: stream.backend,
@@ -1437,6 +1472,62 @@ impl PlaybackSession {
         }
         self.meta.width = width;
         self.meta.height = height;
+        let now = self.now();
+        self.seek(now);
+        true
+    }
+
+    /// The scaffolding source's own frame rate -- what the project rate started
+    /// as, and the one rate a caller offering a list of them must not leave out
+    /// ([`native_resolution`](Self::native_resolution)'s reason).
+    pub fn native_frame_rate(&self) -> f64 {
+        self.native_fps
+    }
+
+    /// Cuts this timeline at `fps` from here on: every clip is *conformed* to
+    /// the new rate ([`Project::retime`]), every source is read through a
+    /// [`Rate`] against it, and an export written from this session comes out at
+    /// it. The edit survives as the same seconds of the same footage on a finer
+    /// or coarser grid -- a 30 fps take on a timeline moved to 24 keeps its
+    /// length and its sync, it is simply counted in 24ths now.
+    ///
+    /// Reseeks like [`set_resolution`](Self::set_resolution), so the picture and
+    /// the sound under the playhead are already the new rate's when this
+    /// returns. `false` -- changing nothing -- for a rate that is not a rate, for
+    /// the one already in force, and for one no timescale can name
+    /// ([`crate::mux::frame_timing`], the same wall a file of an unnameable rate
+    /// is refused at).
+    ///
+    /// ponytail: not an undo step, exactly as the project resolution is not --
+    /// and this one *moves the frame numbers*, so the way back is picking the
+    /// old rate (or the media's, [`native_frame_rate`](Self::native_frame_rate))
+    /// rather than a `z`, and it lands within a frame of where it started rather
+    /// than on it (see [`Project::retime`]). Upgrade path is the same one: the
+    /// project's settings snapshotted beside the lanes.
+    pub fn set_frame_rate(&mut self, fps: f64) -> bool {
+        if !fps.is_finite() || fps <= 0.0 || fps == self.meta.frame_rate {
+            return false;
+        }
+        // Old timeline frames per new one, exactly -- the one map every frame
+        // number on every lane goes through. Built before anything is touched,
+        // since a rate no timescale can name is a refusal and not a half-retimed
+        // project.
+        let Ok(k) = Rate::from_fps(self.meta.frame_rate, fps) else {
+            return false;
+        };
+        // Lengths first: the retime holds every clip inside its source's *new*
+        // length, so a clip that played to the last frame of its file still
+        // does rather than naming one past the end.
+        for count in &mut self.counts {
+            *count = k.timeline_at(*count).max(1);
+        }
+        self.project.retime(k, &self.counts);
+        // A file's own rate has not changed; what it is *against* has.
+        for rate in &mut self.rates {
+            *rate = rate.then(k);
+        }
+        self.meta.frame_rate = fps;
+        self.meta.frame_count = k.timeline_at(self.meta.frame_count).max(1);
         let now = self.now();
         self.seek(now);
         true

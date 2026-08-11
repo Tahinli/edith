@@ -369,15 +369,20 @@ struct Picker {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Pick {
     Resolution,
+    Fps,
     Fit(Lane, usize),
 }
 
 /// One value a list offers, carrying everything picking it needs -- so a click
 /// goes straight to the value rather than to a position in a list that was
 /// built somewhere else.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `Eq` is off it for the rate: a frame rate is the `f64` the engine is told,
+/// bit for bit (23.976023976... is not 23.976), and nothing here keys a map on a
+/// choice -- comparing two is all a list row ever does.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Choice {
     Size(u32, u32),
+    Fps(f64),
     Fit(Lane, usize, FitPolicy),
 }
 
@@ -497,6 +502,23 @@ fn keys_rows() -> Vec<KeyRow> {
 /// A short list of the sizes people name; the media's own is cycled in beside
 /// them, which is what makes the trip round come back to where it started.
 const RESOLUTIONS: [(u32, u32); 4] = [(3840, 2160), (1920, 1080), (1280, 720), (854, 480)];
+
+/// The project frame rates the list offers, slowest first: the rates footage is
+/// actually shot and delivered at, the NTSC ones written as the ratios they are
+/// (`24000/1001`, not `23.976`) -- the engine conforms the timeline to the very
+/// number it is handed, so a rate rounded here would be a rate no timescale can
+/// name. The media's own is cycled in beside them
+/// ([`frame_rate_ladder`]), which is what keeps the way back on the list.
+const FRAME_RATES: [f64; 8] = [
+    24_000. / 1001.,
+    24.,
+    25.,
+    30_000. / 1001.,
+    30.,
+    50.,
+    60_000. / 1001.,
+    60.,
+];
 
 /// How far a band may be pushed either way, in dB. The engine clamps nothing
 /// here -- it will filter whatever it is given -- so this is a UI decision:
@@ -1455,6 +1477,23 @@ impl Player {
         cx.notify();
     }
 
+    /// The project cut at another rate: the list names one and this is where it
+    /// happens, the way [`apply_resolution`](Self::apply_resolution) is for a
+    /// size. The whole timeline is conformed to it by the engine
+    /// ([`PlaybackSession::set_frame_rate`]) -- same seconds, same footage --
+    /// and the rate the app itself counts frames in follows, since every
+    /// timecode, ruler mark and step key here is measured in it.
+    fn apply_frame_rate(&mut self, fps: f64, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session
+            && session.set_frame_rate(fps)
+        {
+            self.fps = session.meta().frame_rate;
+            self.notice = Some(format!("PROJECT: {} fps", fps_label(fps)).into());
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
     /// Opens a choice list on a setting, where it was asked for. One floating
     /// thing at a time: the click that opens it is the click that closes
     /// whatever menu it was opened from.
@@ -1472,6 +1511,7 @@ impl Player {
         self.picker = None;
         match choice {
             Choice::Size(w, h) => self.apply_resolution(w, h, cx),
+            Choice::Fps(fps) => self.apply_frame_rate(fps, cx),
             Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
         }
     }
@@ -1487,6 +1527,7 @@ impl Player {
             Pick::Resolution => {
                 resolution_choices(session.resolution(), session.native_resolution())
             }
+            Pick::Fps => fps_choices(session.meta().frame_rate, session.native_frame_rate()),
             Pick::Fit(lane, idx) => {
                 fit_choices(lane, idx, session.fit_of(lane, idx), session.resolution())
             }
@@ -4884,6 +4925,30 @@ impl Player {
                         live,
                         cx.listener(|this, event: &ClickEvent, _, cx| {
                             this.open_picker(Pick::Resolution, event.position(), cx)
+                        }),
+                    ))
+                    // The rate every clip is counted in, which is also the rate
+                    // the export is written at -- the other half of "the project
+                    // is not the media", and the one the panel could only ever
+                    // read out before. A click opens the rates with this one
+                    // marked; picking one conforms the whole timeline to it.
+                    .child(control(
+                        "fps",
+                        None,
+                        match self.session.is_some() {
+                            true => format!("{} fps", fps_label(self.fps)),
+                            false => "Rate".to_string(),
+                        },
+                        match self.session.is_some() {
+                            true => format!(
+                                "click to pick a frame rate — the project is cut at {} fps",
+                                fps_label(self.fps)
+                            ),
+                            false => "the project's frame rate — open a file first".to_string(),
+                        },
+                        live,
+                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.open_picker(Pick::Fps, event.position(), cx)
                         }),
                     ))
                     // How much of the timeline the panel below is showing --
@@ -8909,6 +8974,53 @@ fn resolution_choices(current: (u32, u32), native: (u32, u32)) -> Vec<ChoiceRow>
         .collect()
 }
 
+/// Every project frame rate on offer, slowest first: [`FRAME_RATES`] with the
+/// media's own cycled in at its place by speed, so a project already cut at a
+/// listed rate does not see it twice and the media's own rate -- the one a
+/// project moved off it has no other way back to -- is always there.
+/// [`resolution_ladder`]'s rule, for the other setting the project has of its
+/// own.
+fn frame_rate_ladder(native: f64) -> Vec<f64> {
+    let mut rates = FRAME_RATES.to_vec();
+    // Bit for bit: 23.976023976... is not 23.976, and a rate that read as
+    // "already listed" when it is not would take the media's own off the list.
+    if !rates.contains(&native) {
+        let at = rates
+            .iter()
+            .position(|&fps| fps > native)
+            .unwrap_or(rates.len());
+        rates.insert(at, native);
+    }
+    rates
+}
+
+/// The rate list's rows: every rung of the ladder, the media's own said so, and
+/// the one in force marked. Named as a person writes a rate ([`fps_label`]),
+/// with what it is for beside it -- short, or the row loses its tail to the
+/// truncation the resolution list already met.
+fn fps_choices(current: f64, native: f64) -> Vec<ChoiceRow> {
+    frame_rate_ladder(native)
+        .into_iter()
+        .map(|fps| {
+            (
+                Choice::Fps(fps),
+                format!("{} fps", fps_label(fps)).into(),
+                match fps == native {
+                    true => "the media's own".to_string(),
+                    // The rates that are a ratio are the ones nobody can tell
+                    // from their neighbour by the label alone.
+                    false => match (fps - fps.round()).abs() < 0.001 {
+                        true => String::new(),
+                        false => "NTSC".to_string(),
+                    },
+                }
+                .into(),
+                fps == current,
+            )
+        })
+        .collect()
+}
+
 /// The fit list's rows: all four policies against the canvas they place a
 /// picture on, since the word alone ("fill") says nothing about the size it is
 /// filling -- which is the very thing the notice says after a stroke.
@@ -10272,7 +10384,8 @@ mod tests {
         bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, containers,
         enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
         estimated_mb, export_path, export_settings, format_key,
-        format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
+        format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
+        frame_rate_ladder, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at,
         next_container,
         normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
@@ -10281,7 +10394,7 @@ mod tests {
         whole_take, window_title,
     };
     use super::{
-        Choice, Edge, FITS, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View,
+        Choice, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat, Scale, View,
         ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, fit_choices,
         library_rows, live_idx, next_fit, next_resolution, px_along, repeats, resolution_choices,
         resolution_ladder, span_label, trimmed_clip, unscannable, visible_slice,
@@ -12948,10 +13061,35 @@ mod tests {
         assert!(fits[2].3, "the clip's own policy is not marked");
         assert!(fits[0].2.contains("1920x1080"), "{}", fits[0].2);
 
+        // The rate list, the other setting the project has of its own: every
+        // rate on offer, the media's own cycled in at its place by speed and
+        // said so, and the one the timeline is cut at marked. The value carried
+        // is the `f64` the engine conforms to, not the rounded label -- 23.976
+        // is not 24000/1001, and a rate the timescales cannot name is refused.
+        let ntsc = 24_000. / 1001.;
+        let rates = frame_rate_ladder(25.);
+        assert_eq!(rates.len(), FRAME_RATES.len(), "25 is already on the list");
+        let odd = frame_rate_ladder(48.);
+        assert_eq!(odd[5], 48., "the media's own, in its place by speed");
+        assert_eq!(odd.len(), FRAME_RATES.len() + 1);
+        let fps = fps_choices(ntsc, 48.);
+        assert_eq!(fps.len(), odd.len());
+        assert_eq!(fps.iter().filter(|(.., picked)| *picked).count(), 1);
+        assert_eq!(fps[0].0, Choice::Fps(ntsc), "the ratio, not 23.976");
+        assert_eq!(fps[0].1.as_ref(), "23.976 fps");
+        assert!(fps[0].3, "the rate in force is not marked");
+        assert!(fps[5].2.contains("the media's own"), "{}", fps[5].2);
+        for (.., detail, _) in &fps {
+            assert!(detail.chars().count() < 26, "{detail} loses its tail");
+        }
+
         // The open list fits the floor the menus are measured against: the
-        // longest of them is the resolution ladder, and it hangs at the pointer
-        // with every row on screen. Rows are click targets (WCAG 2.5.8).
+        // longest of them is the rate ladder with an odd rate cycled in, and it
+        // hangs at the pointer with every row on screen. Rows are click targets
+        // (WCAG 2.5.8).
         assert!(MENU_ROW_H >= HIT_MIN);
+        assert!(odd.len() > ladder.len(), "the longest list moved");
+        assert!(MENU_PAD * 2. + odd.len() as f32 * MENU_ROW_H <= 360.);
         let tall = MENU_PAD * 2. + ladder.len() as f32 * MENU_ROW_H;
         assert!(tall <= 360., "the list is taller than the floor");
         assert_eq!(
