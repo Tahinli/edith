@@ -163,7 +163,7 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
 /// export is not a progress line with nothing to say.
 #[test]
 fn an_audio_only_job_names_its_encoder() {
-    for format in [Format::Wav, Format::Flac, Format::Mp3] {
+    for format in [Format::Wav, Format::Flac, Format::Mp3, Format::Ogg] {
         audio_only_job_names_its_encoder(format);
     }
 }

@@ -379,7 +379,7 @@ pub const FIXED: [Fixed; 28] = [
     },
     Fixed {
         chord: "m / a / h / w / f / p",
-        label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC or MP3",
+        label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC, MP3 or OGG",
         category: Category::File,
     },
     // The rest of the export card's own rows, each on the letter its row is

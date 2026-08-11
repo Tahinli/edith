@@ -141,7 +141,12 @@ fn rms(samples: &[f32], channels: usize, from: f64, to: f64) -> f64 {
 /// timeline, silent where the timeline is empty, and audible where it is not --
 /// with the fixtures' 1 Hz pulse still in it, which is what says the samples are
 /// the *edit's* and not just noise of the right length.
-fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32]) {
+///
+/// `gap_ceiling` is how loud the hole in the middle may be as a fraction of the
+/// first second: `0.0` for a lossless format, where the silence is the samples
+/// themselves, and a real fraction for a lossy one, where a block straddling the
+/// cut rings into it. Never an absolute level -- the fixtures peak around 0.12.
+fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32], gap_ceiling: f64) {
     assert_eq!((meta.sample_rate, meta.channels), (RATE, 2), "as decoded");
     let channels = usize::from(meta.channels);
     // Three seconds of timeline, to the sample: the segments round their own
@@ -163,7 +168,10 @@ fn assert_timeline_shape(meta: &engine::AudioMeta, samples: &[f32]) {
     println!("rms: av {av:.4}  gap {gap:.6}  mp3 {tone:.4}");
     assert!(av > 0.01, "the first second is audible");
     assert!(tone > 0.01, "the mp3 second is audible");
-    assert_eq!(gap, 0.0, "the gap is exact silence");
+    assert!(
+        gap <= av * gap_ceiling,
+        "the gap is silence: {gap:.6} against {av:.4} of first second"
+    );
 
     // The 1 Hz pulse: `volume = 0.5 + 0.5 sin(2 pi t)`, so a peak sits at
     // t = 0.25 and the dip at t = 0.75. Ratio, never an absolute level.
@@ -223,7 +231,7 @@ fn exports_the_timeline_as_a_wav() {
     assert!(!part_path(&out).exists(), "the .part was renamed away");
 
     let (meta, samples) = decode(&out);
-    assert_timeline_shape(&meta, &samples);
+    assert_timeline_shape(&meta, &samples, 0.0);
     assert_wav_header(&out, samples.len() / usize::from(meta.channels));
     std::fs::remove_file(&out).unwrap();
 }
@@ -248,7 +256,7 @@ fn exports_the_timeline_as_a_flac() {
     // Lossless is a claim about the samples, so it is checked on the samples:
     // the same shape the WAV of the same timeline has.
     let (meta, samples) = decode(&out);
-    assert_timeline_shape(&meta, &samples);
+    assert_timeline_shape(&meta, &samples, 0.0);
     // Smaller than the PCM it encodes, or the whole point of the row is gone.
     let pcm = samples.len() * 2;
     println!("flac {} bytes for {pcm} bytes of PCM", bytes.len());
@@ -813,4 +821,141 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
         .sqrt();
     assert!(energy > 0.005, "the exported AC-3 is silence: RMS {energy:.6}");
     std::fs::remove_file(&out).unwrap();
+}
+
+/// The fourth audio row, and the one that used to be a refusal: Vorbis in an Ogg
+/// container, `rusty_vorbis` encoding and `oxideav-ogg` paging, read straight
+/// back through the engine's own reader like every other export here.
+///
+/// The shape is asserted *exactly* -- `assert_timeline_shape`, the same the WAV
+/// and the FLAC are held to, and not the MP3's within-a-frame slack. That is the
+/// whole point of the two corrections in `export::write_ogg`: the encoder's own
+/// granule numbering puts every sample a block early and its block grid overruns
+/// the tail, so written straight through, this file would be a hop out of step
+/// and short of the timeline. The 1 Hz pulse is what proves the *timing* rather
+/// than merely the length -- a stream shifted by a block lands its peak nearer
+/// where the dip belongs.
+#[test]
+fn exports_the_timeline_as_an_ogg_vorbis() {
+    let out = out_path("ogg", "ogg");
+    let handle = engine::export::start(
+        mixed_project(),
+        meta(),
+        &out,
+        &ExportSettings {
+            format: Format::Ogg,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(180)).expect("ogg export");
+    assert_eq!(handle.progress(), 1.0, "finished at full progress");
+    assert!(!part_path(&out).exists(), "the .part was renamed away");
+
+    let bytes = std::fs::read(&out).expect("read the ogg back");
+    assert_eq!(&bytes[0..4], b"OggS", "an Ogg stream, by its own magic");
+    // Lossy, so a block straddling the cut rings into the hole: the same
+    // 1/20-of-the-signal bar the MP3 row is held to.
+    let (meta, samples) = decode(&out);
+    assert_timeline_shape(&meta, &samples, 0.05);
+    // Lossy, so it had better be well under the PCM it stands for: the
+    // 2026-08-11 bench measured 144-176 kbps across this suite's fixtures at
+    // this quality, against 1411 kbps of 44.1 kHz stereo PCM.
+    let pcm = samples.len() * 2;
+    println!("ogg {} bytes for {pcm} bytes of PCM", bytes.len());
+    assert!(bytes.len() < pcm / 4, "lossy: {} vs {pcm}", bytes.len());
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// A **mono** timeline through the same door. `rusty_vorbis` ships one embedded
+/// setup header and it is a stereo profile -- a mono push is refused outright
+/// ("bad coupling channels") -- so `export::write_ogg` writes the mix as dual
+/// mono. This is the test that it is *dual mono* and not a widening: both
+/// channels come back bit-identical, so folding the file back down gives exactly
+/// what was mixed.
+#[test]
+fn a_mono_timeline_exports_as_dual_mono_ogg() {
+    // A mono fixture, written here because the suite has none: one second of
+    // 440 Hz at -6 dBFS, 44.1 kHz, as plain a RIFF header as hound writes.
+    let src = out_path("mono_src", "wav");
+    let frames = RATE as usize;
+    let data = (frames * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + frames * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // one channel
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data.to_le_bytes());
+    for i in 0..frames {
+        let t = i as f64 / f64::from(RATE);
+        let s = (0.5 * (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 32767.0) as i16;
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(&src, &wav).expect("write the mono fixture");
+
+    let project = Project::from_parts(
+        vec![Source::new(src.clone(), 0)],
+        vec![(
+            LaneKind::Audio,
+            vec![Clip {
+                start: 0,
+                in_frame: 0,
+                out_frame: 30,
+                source: 0,
+                link: None,
+                eq: None,
+                color: None,
+                fit: FitPolicy::default(),
+                speed: Speed::NORMAL,
+            }],
+        )],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a one-source mono project");
+
+    let out = out_path("mono", "ogg");
+    let handle = engine::export::start(
+        project,
+        meta(),
+        &out,
+        &ExportSettings {
+            format: Format::Ogg,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(180)).expect("ogg export of a mono timeline");
+
+    let (meta, samples) = decode(&out);
+    assert_eq!(meta.channels, 2, "written as stereo, since Vorbis must be");
+    assert_eq!(meta.sample_rate, RATE);
+    // One second of clip, to the sample: the mono path gets the same trim the
+    // stereo one does.
+    assert_eq!(
+        samples.len() / 2,
+        RATE as usize,
+        "one second, to the sample"
+    );
+    let worst = samples
+        .chunks_exact(2)
+        .map(|lr| f64::from(lr[0] - lr[1]).abs())
+        .fold(0.0f64, f64::max);
+    println!("dual mono: worst |L-R| = {worst:e}");
+    assert_eq!(worst, 0.0, "both channels are the same signal, to the bit");
+    let energy = (samples
+        .iter()
+        .map(|s| f64::from(*s) * f64::from(*s))
+        .sum::<f64>()
+        / samples.len() as f64)
+        .sqrt();
+    println!("dual mono rms {energy:.4} (the source's own is 0.354)");
+    assert!(energy > 0.25, "the mono export is silence: RMS {energy:.6}");
+    std::fs::remove_file(&out).unwrap();
+    std::fs::remove_file(&src).unwrap();
 }
