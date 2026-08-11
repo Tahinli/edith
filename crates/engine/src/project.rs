@@ -2253,9 +2253,12 @@ impl Project {
     /// Insert `clip` into the first lane of each kind at `timeline_frame` as one
     /// new group, pushing everything from there on later by its length in
     /// *every* lane -- the grouped, rippling paste a clipboard does. Mid-clip
-    /// the clip it lands in is split around it; at or past the end of the
-    /// timeline it is appended, because a paste means "put it here", not "put it
-    /// here and leave black in front".
+    /// the clip it lands in is split around it; past the end of the timeline it
+    /// goes down where it was asked for, with black in front of it -- which is
+    /// what a library row let go on the open bed means, and what the ghost under
+    /// the pointer promised. A clipboard means "put it here", not "here and
+    /// black in front", and clamps to the end at its own door
+    /// ([`crate::PlaybackSession::paste_at`]).
     /// Use [`place`](Project::place) to paste into one lane, or to make a gap.
     ///
     /// `V1` and `A1` and no other lane, because a take is one picture and one
@@ -2287,7 +2290,12 @@ impl Project {
         // worker tries to demux -- which silences the *whole session*, not just
         // that clip -- and a save the engine's own `open_project` then refuses.
         let picture_only = crate::is_image(&source.path);
-        let at = timeline_frame.min(self.timeline_frames());
+        // The frame it was asked for and no other: a row let go on the empty
+        // bed past the last clip lands *there*, under the ghost that promised
+        // it, with black in front. Clamping to the end here made every drop on
+        // open bed an append -- the clipboard's rule, applied to a hand that
+        // had named a place.
+        let at = timeline_frame;
         // The room it takes on the timeline, which its speed decides -- not the
         // source range it reads.
         let len = clip.frames();
@@ -3510,13 +3518,17 @@ mod tests {
         assert_eq!(p.map_timeline(0), Some((0, 100)));
         assert_eq!(p.map_timeline(2), Some((1, 0)));
 
-        // At the end and past it both append -- a paste never leaves black in
-        // front of itself; `place` is the call that makes a gap.
+        // At the end: appended, there being nothing in front to leave black.
         let mut p = three();
         assert!(p.paste(9, PASTED));
         assert_eq!(p.clip_spans(), vec![(0, 3), (3, 2), (5, 4), (9, 2)]);
+        // Past it: down on the frame it was asked for, black in front of it --
+        // a row let go on the open bed lands under the ghost that promised it.
+        // The clipboard's clamp lives in `PlaybackSession::paste_at`.
         assert!(p.paste(1_000, PASTED));
-        assert_eq!(p.timeline_frames(), 13);
+        assert_eq!(p.timeline_frames(), 1_002);
+        assert_eq!(p.lane(Lane::V1).last().expect("the pasted clip").start, 1_000);
+        assert_eq!(p.lane(Lane::A1).last().expect("its other half").start, 1_000);
 
         // An empty clip is the one thing refused, and it pushes no history.
         let mut p = three();

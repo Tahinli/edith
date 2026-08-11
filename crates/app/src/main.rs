@@ -12625,6 +12625,70 @@ mod tests {
         assert_eq!(session.file_frames(&path), frames);
     }
 
+    /// The drop a hand actually makes: a library row let go on the *empty* bed
+    /// past the last clip, which is most of the bed on any timeline shorter
+    /// than the window. The whole chain the release runs, minus gpui's own
+    /// pointer read -- [`Player::place_frame`]'s [`landing`], the frame back
+    /// through the rate as [`Player::insert_source`] hands it over, and the one
+    /// engine door a row goes through -- and the head lands on the frame the
+    /// ghost was drawn on, black in front of it. It used to be swallowed by the
+    /// clipboard's clamp inside `Project::paste` and appended after the last
+    /// clip wherever it was let go, which is the bug this pins.
+    #[test]
+    fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let second = session.sources()[1].path.clone();
+        let fps = session.meta().frame_rate;
+        assert_eq!(session.timeline_duration(), 5.0);
+        // 5 s of timeline on a bed 30 s wide: the open bed past the last clip
+        // is five sixths of it.
+        let bed: Bounds<Pixels> = Bounds {
+            origin: point(px(12.), px(400.)),
+            size: size(px(600.), px(LANE_H)),
+        };
+        let scale = Scale {
+            pps: 20.,
+            start: 0.,
+        };
+
+        // What `Player::place_frame` answers for a pointer 200 px along the
+        // bed: ten seconds in, five seconds past the end of the timeline, and
+        // no mark anywhere near enough to pull it back.
+        let clips = [session.lane_clips(Lane::V1), session.lane_clips(Lane::A1)];
+        let marks = snap_marks(&clips, None, frame_at(session.now(), fps));
+        let under = frame_at(scale.time_at(px_along(px(212.), bed)), fps);
+        let (at, cue) = landing(under, 0, 0, true, scale.snap_frames(fps), &marks);
+        assert_eq!((at, cue), (300, None), "the pointer is on frame 300");
+
+        // ...and what the release does with it: the frame back through the same
+        // rate every box is drawn at, into the door the Add button uses too.
+        assert!(
+            session
+                .place_stream_at(f64::from(at) / fps, &second, 0, None)
+                .expect("av2 is already on this timeline")
+        );
+        let head = |lane| {
+            session
+                .lane_clips(lane)
+                .last()
+                .copied()
+                .expect("the dropped clip")
+        };
+        assert_eq!(
+            head(Lane::V1).start,
+            at,
+            "the drop landed somewhere other than under the pointer"
+        );
+        assert_eq!(head(Lane::A1).start, at, "...and its sound with it");
+        assert!(head(Lane::V1).link.is_some(), "one grouped take");
+        assert_eq!(head(Lane::V1).link, head(Lane::A1).link);
+        // The bed in front of it stays black: nothing was stretched to reach
+        // it, and the 4 s file is the whole of what was added.
+        assert_eq!(session.timeline_duration(), 14.0);
+    }
+
     /// Remove from library, through the door the menu item uses
     /// ([`Player::remove_source`] calls exactly this): refused by name while
     /// clips play from the file, and once they do not the row leaves the list.
