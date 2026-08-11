@@ -80,12 +80,16 @@ pub enum ActionId {
     Mix,
     ToggleSnap,
     CancelExport,
+    /// Opens the actions card -- the list every other action is on. A door of
+    /// its own, because a card reachable only by a button in the panel is one a
+    /// hand on the keyboard has to leave the keyboard for.
+    ShowActions,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 40] = [
+    pub const ALL: [ActionId; 41] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -126,6 +130,7 @@ impl ActionId {
         ActionId::Mix,
         ActionId::ToggleSnap,
         ActionId::CancelExport,
+        ActionId::ShowActions,
     ];
 
     /// What a person calls it.
@@ -171,6 +176,7 @@ impl ActionId {
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::CancelExport => "Cancel export",
+            ActionId::ShowActions => "All actions and their keys…",
         }
     }
 
@@ -218,6 +224,7 @@ impl ActionId {
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::CancelExport => "cancel-export",
+            ActionId::ShowActions => "show-actions",
         }
     }
 
@@ -282,7 +289,12 @@ impl ActionId {
             // are this machine's monitoring. Both are audio, and the card says
             // which is which.
             | ActionId::Mix => Category::Audio,
-            ActionId::Save | ActionId::Export | ActionId::CancelExport => Category::File,
+            // Under the heading the panel button sits in, beside the save and
+            // the export it stands next to on screen.
+            ActionId::Save
+            | ActionId::Export
+            | ActionId::CancelExport
+            | ActionId::ShowActions => Category::File,
         }
     }
 }
@@ -681,6 +693,11 @@ impl Keymap {
                 // it with: free here, and nowhere near the two keys that delete.
                 b(ActionId::ToggleSnap, "n", false),
                 b(ActionId::CancelExport, "escape", false),
+                // The help key, where every program's list of what it can do
+                // has always been. Free -- gpui names it "f1"
+                // (platform.rs:880, the keysym's own name lowercased) -- and
+                // not a letter, so it takes nothing away from the clip keys.
+                b(ActionId::ShowActions, "f1", false),
             ],
         }
     }
@@ -942,7 +959,8 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 42);
+        assert_eq!(k.entries().len(), 43);
+        assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -1133,6 +1151,10 @@ mod tests {
         // Refused means unchanged, on both sides of the conflict.
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
+        // And the refusal is a name, not a shrug: it is the holder's own label
+        // the card prints back at the waiting row (`Player::capture`, "ALREADY
+        // BOUND — space is Play / Pause").
+        assert_eq!(ActionId::Play.label(), "Play / Pause");
         // A free stroke takes, and the old one stops meaning anything.
         assert_eq!(k.rebind_action(ActionId::Export, chord("w", true)), Ok(()));
         assert_eq!(k.lookup("w", true), Some(ActionId::Export));
@@ -1176,8 +1198,9 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 40);
+        assert_eq!(ActionId::ALL.len(), 41);
         assert_eq!(k.display(ActionId::ToggleSnap), "n");
+        assert_eq!(k.display(ActionId::ShowActions), "f1");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
 
