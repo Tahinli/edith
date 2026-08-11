@@ -54,6 +54,8 @@ use crate::encoder::loopfilter::{
     encode_sao_ctb, filter_frame, CtbShape, FilterInput, LoopFilterCfg,
 };
 use crate::encoder::nal::{annexb, nal_unit};
+// --- edith patch: the SPS's colour signalling reuses the parser's types ---
+use crate::vui::VideoSignalType;
 use crate::encoder::pcm::{level_idc_for, write_pps_lf, write_ptl, write_vps, write_vps_cfg};
 use crate::encoder::residual::encode_residual_coding;
 use crate::intra_mode_field::{IntraModeField, Neighbour};
@@ -157,6 +159,12 @@ pub(crate) struct SpsCfg {
     /// `conformance_window_flag = 0`, which is what upstream always
     /// wrote.
     pub conf_win: (u32, u32),
+    /// §E.2.1 `video_signal_type_present_flag` block, written into a
+    /// VUI of its own. `None` writes `vui_parameters_present_flag = 0`,
+    /// which is what upstream always wrote — and which makes a decoder
+    /// infer "unspecified" and render the picture BT.601 whatever the
+    /// container said.
+    pub signal: Option<VideoSignalType>,
     // --- end edith patch ---
 }
 
@@ -170,6 +178,7 @@ impl SpsCfg {
             min_cb_log2: CTB_LOG2,
             amp: false,
             conf_win: (0, 0),
+            signal: None,
         }
     }
 }
@@ -233,7 +242,37 @@ pub(crate) fn write_sps_cfg(
     w.put_bit(0); // long_term_ref_pics_present_flag
     w.put_bit(0); // sps_temporal_mvp_enabled_flag
     w.put_bit(0); // strong_intra_smoothing_enabled_flag
-    w.put_bit(0); // vui_parameters_present_flag
+    // --- edith patch: §E.2.1 VUI, colour signalling only (upstream
+    // always wrote 0). Everything else in the VUI stays absent, which
+    // §E.3.1 infers to exactly the values upstream's silence did.
+    match cfg.signal {
+        None => w.put_bit(0), // vui_parameters_present_flag
+        Some(signal) => {
+            w.put_bit(1); // vui_parameters_present_flag
+            w.put_bit(0); // aspect_ratio_info_present_flag
+            w.put_bit(0); // overscan_info_present_flag
+            w.put_bit(1); // video_signal_type_present_flag
+            w.put_bits(u32::from(signal.video_format), 3);
+            w.put_bit(u8::from(signal.video_full_range_flag));
+            match signal.colour_description {
+                None => w.put_bit(0), // colour_description_present_flag
+                Some(colour) => {
+                    w.put_bit(1); // colour_description_present_flag
+                    w.put_bits(u32::from(colour.colour_primaries), 8);
+                    w.put_bits(u32::from(colour.transfer_characteristics), 8);
+                    w.put_bits(u32::from(colour.matrix_coeffs), 8);
+                }
+            }
+            w.put_bit(0); // chroma_loc_info_present_flag
+            w.put_bit(0); // neutral_chroma_indication_flag
+            w.put_bit(0); // field_seq_flag
+            w.put_bit(0); // frame_field_info_present_flag
+            w.put_bit(0); // default_display_window_flag
+            w.put_bit(0); // vui_timing_info_present_flag
+            w.put_bit(0); // bitstream_restriction_flag
+        }
+    }
+    // --- end edith patch ---
     w.put_bit(0); // sps_extension_present_flag
     w.rbsp_trailing_bits();
     w.finish()
@@ -524,6 +563,10 @@ pub fn encode_idr_intra_au(
 /// size. Both crops must be even (4:2:0 addresses the window in chroma
 /// units) and smaller than 16.
 ///
+/// `signal` is the §E.2.1 colour signalling the SPS carries: a decoder
+/// reads the bitstream before it reads the container, so `None` renders
+/// as "unspecified" — BT.601 in libavcodec — however the file is tagged.
+///
 /// # Errors
 /// [`IntraEncodeError`] as [`encode_idr_intra_au`], plus
 /// [`IntraEncodeError::BadDimensions`] for an odd or oversized crop.
@@ -536,6 +579,7 @@ pub fn encode_idr_intra_au_cropped(
     qp: i32,
     crop_right: usize,
     crop_bottom: usize,
+    signal: Option<VideoSignalType>,
 ) -> Result<IntraEncodedAu, IntraEncodeError> {
     if crop_right % 2 != 0 || crop_bottom % 2 != 0 || crop_right >= CTB || crop_bottom >= CTB {
         return Err(IntraEncodeError::BadDimensions {
@@ -545,6 +589,7 @@ pub fn encode_idr_intra_au_cropped(
     }
     let mut cfg = SpsCfg::legacy(1);
     cfg.conf_win = ((crop_right / 2) as u32, (crop_bottom / 2) as u32);
+    cfg.signal = signal;
     encode_idr_intra_au_full(y, cb, cr, width, height, qp, &cfg, &LoopFilterCfg::off())
 }
 // --- end edith patch ---

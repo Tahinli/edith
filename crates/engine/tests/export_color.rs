@@ -6,10 +6,13 @@
 //! only this engine agrees with is not a tag:
 //!
 //! 1. every export declares a space (BT.709 at 720 lines and up, BT.601 below),
-//!    in the `Colour` element of a Matroska and the `colr` box of an mp4, and
+//!    in the `Colour` element of a Matroska and the `colr` box of an mp4, *and*
+//!    in the coded bitstream, which is the answer a decoder takes first;
 //! 2. a clip coded against the *other* matrix is rewritten into the file's, so
 //!    reading the export by its own tags gives back the picture that went in --
-//!    a reconcile, not a second conversion.
+//!    a reconcile, not a second conversion; and
+//! 3. a graded clip comes out of the export the way the preview showed it,
+//!    which is what makes a grade a decision and not a guess.
 //!
 //! ```text
 //! cargo test -p engine --release --test export_color
@@ -90,6 +93,52 @@ fn probed(path: &Path) -> Option<Vec<String>> {
             .map(|l| l.trim().to_string())
             .collect(),
     )
+}
+
+/// What ffprobe says the first *coded frame* is, which is the stream's own
+/// answer and not the container's: libavcodec fills a frame's colour in from the
+/// bitstream, so a codec that signalled nothing reads back "unknown" here even
+/// where the file is tagged. `None` when ffprobe is not installed.
+fn probed_frame(path: &Path) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-read_intervals",
+            "%+#1",
+            "-show_entries",
+            "frame=color_space",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    )
+}
+
+/// The session's first frame as BGRA, through this engine's own decode path --
+/// the very path the preview draws with, so a preview frame and a re-imported
+/// export frame are two measurements of one picture and nothing else.
+fn frame0_bgra(session: &mut PlaybackSession) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Some(frame) = session.try_frame() {
+            return frame.bgra;
+        }
+        assert!(Instant::now() < deadline, "no frame in 180 s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Frame 0 of `path` as planar 4:2:0 bytes, straight off the decoder with no
@@ -229,4 +278,83 @@ fn a_same_space_clip_is_left_alone() {
         "a same-space export moved the samples by {diff:.2}"
     );
     std::fs::remove_file(&out).unwrap();
+}
+
+/// The tag a *decoder* reads, on every format there is. A container's colour
+/// element is the second answer libavcodec looks at and the bitstream's is the
+/// first, so a stream that signals nothing is rendered BT.601 whatever the file
+/// says about itself -- which is a visible shift on a 709 export and was
+/// measured as one (9.78 mean codes off the right render against 2.27 off the
+/// wrong one, HEVC before its SPS carried a VUI).
+///
+/// All five video formats, because the gap was per-codec and a container-level
+/// check could not see it: the mp4 and Matroska tags were right the whole time.
+#[test]
+fn every_format_signals_its_space_in_the_bitstream() {
+    if probed_frame(&asset("test_bt601.mp4")).is_none() {
+        eprintln!("no ffprobe: skipping the frame-level colour check");
+        return;
+    }
+    for (format, ext, name) in [
+        (Format::Mp4, "mp4", "h264-mp4"),
+        (Format::Hevc, "mkv", "hevc-mkv"),
+        (Format::HevcMp4, "mp4", "hevc-mp4"),
+        (Format::Av1, "mkv", "av1-mkv"),
+        (Format::Av1Mp4, "mp4", "av1-mp4"),
+    ] {
+        let session = two_frames(&asset("test_bt601.mp4"));
+        let out = out_path(&format!("frametag_{name}"), ext);
+        export(&session, &out, format);
+        let got = probed_frame(&out).expect("ffprobe is installed");
+        eprintln!("{name}: frame colour_space {got}");
+        assert_eq!(got, "bt709", "{name}: what a decoder makes of the frame");
+        std::fs::remove_file(&out).unwrap();
+    }
+}
+
+/// Preview and export are the same picture, on the one path where they used to
+/// differ: a graded clip whose own space is not the file's. Playback grades in
+/// the source's space and converts for the screen, so an export that remapped
+/// *first* graded different numbers and came out 21.04 mean codes away from what
+/// the canvas had shown -- a saturation the user set against one picture,
+/// applied to another.
+///
+/// Measured through this engine's own decode of its own export, because that is
+/// the comparison the invariant is about; the ungraded control is what says the
+/// number belongs to the grade and not to the encoder.
+#[test]
+fn a_graded_clip_exports_the_picture_the_preview_showed() {
+    for (grade, label, ceiling) in [
+        (
+            Some(engine::color::ColorParams {
+                brightness: 0.0,
+                contrast: 1.0,
+                saturation: 0.0,
+                tint: 0.0,
+            }),
+            "saturation 0",
+            2.0,
+        ),
+        (None, "ungraded control", 2.0),
+    ] {
+        let mut session = two_frames(&asset("test_bt601.mp4"));
+        assert!(
+            session.set_color(engine::project::Lane::V1, 0, grade),
+            "{label}: the grade went on the clip"
+        );
+        let preview = frame0_bgra(&mut session);
+        let out = out_path("preview_vs_export", "mp4");
+        export(&session, &out, Format::Mp4);
+
+        let mut reopened = PlaybackSession::open(&*out).expect("reopen the export");
+        let exported = frame0_bgra(&mut reopened);
+        let diff = mean_abs_diff(&preview, &exported);
+        eprintln!("{label}: preview vs export {diff:.2} mean codes");
+        assert!(
+            diff <= ceiling,
+            "{label}: the export is {diff:.2} codes from what the preview showed"
+        );
+        drop(reopened);
+        std::fs::remove_file(&out).unwrap();
+    }
 }
