@@ -21,9 +21,9 @@ use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
     FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size,
-    Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    PathBuilder, Pixels, Point, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    canvas, div, img, point, prelude::*, px, relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -493,6 +493,65 @@ fn keys_rows() -> Vec<KeyRow> {
     rows
 }
 
+/// [`keys_rows`] with a search applied: the rows whose label or whose stroke
+/// carries `needle`, and the heading each one lives under. A heading with
+/// nothing left beneath it goes with them -- an empty "Playback" over a gap
+/// reads as a list that lost its rows rather than as a search that found none.
+///
+/// Each row keeps the index it has in the unfiltered list, so an element id is
+/// the same one before and after a keystroke: filtering is a look at the list,
+/// and gpui's per-element state is keyed on that id.
+///
+/// Case-insensitive substring, on both columns: people look for an action by
+/// what it does ("vol") and for a stroke by what they pressed ("ctrl").
+fn keys_filter(needle: &str, keymap: &Keymap) -> Vec<(usize, KeyRow)> {
+    let needle = needle.trim().to_lowercase();
+    let rows = keys_rows().into_iter().enumerate();
+    if needle.is_empty() {
+        return rows.collect();
+    }
+    let hit = |label: &str, chord: &str| {
+        label.to_lowercase().contains(&needle) || chord.to_lowercase().contains(&needle)
+    };
+    let mut out: Vec<(usize, KeyRow)> = Vec::new();
+    // The heading above the row being looked at, until a row under it earns it
+    // a place -- then it goes in once, ahead of that row.
+    let mut pending: Option<(usize, KeyRow)> = None;
+    for (i, row) in rows {
+        match &row {
+            KeyRow::Head(_) => pending = Some((i, row)),
+            KeyRow::Act(action) => {
+                if hit(action.label(), &keymap.display(*action)) {
+                    out.extend(pending.take());
+                    out.push((i, row));
+                }
+            }
+            KeyRow::Fixed(f) => {
+                let fixed = &keymap::FIXED[*f];
+                if hit(fixed.label, fixed.chord) {
+                    out.extend(pending.take());
+                    out.push((i, row));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The character a stroke types into the actions card's search box, if it types
+/// one. gpui reports a printable key as itself and the space bar by name
+/// (platform.rs:866), and everything else -- the arrows, the function keys --
+/// is a word this must not spell into the box letter by letter.
+fn typed(key: &str) -> Option<char> {
+    match key {
+        "space" => Some(' '),
+        _ => key
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_graphic() && key.chars().count() == 1),
+    }
+}
+
 /// The project resolutions [`Player::cycle_resolution`] offers, largest first.
 /// A short list of the sizes people name; the media's own is cycled in beside
 /// them, which is what makes the trip round come back to where it started.
@@ -919,6 +978,16 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
+    /// What has been typed into the card's search box, which is the card's own
+    /// input exactly as the export card's digits are (nothing in it takes
+    /// focus, so the root's key handler is the field). Emptied every time the
+    /// card opens: a search is a look at the list, not a setting.
+    keys_search: String,
+    /// Where that list is scrolled to. Held here rather than left to the
+    /// wheel alone: forty actions are four times what a 360 px window shows,
+    /// and the rows past the fold have to be reachable from the keyboard that
+    /// is already typing in the search box.
+    keys_scroll: ScrollHandle,
     /// The export options card is up: what the export action opens now, so
     /// nothing is written until the card's own button says so. One card at a
     /// time -- opening either closes the other, since both are the whole window
@@ -1232,6 +1301,7 @@ impl Player {
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
+            ActionId::ShowActions => self.show_actions(cx),
         }
     }
 
@@ -1246,6 +1316,37 @@ impl Player {
             false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
         });
         cx.notify();
+    }
+
+    /// The actions card, from its key, from the panel button, or from its own
+    /// row: open, with an empty search box -- a card that opens showing the
+    /// last search would hide most of the list for a reason nobody remembers.
+    fn show_actions(&mut self, cx: &mut Context<Self>) {
+        self.keys_open = true;
+        self.keys_search.clear();
+        self.scroll_keys(None);
+        self.rebinding = None;
+        // One card at a time, the rule the other cards follow.
+        self.export_open = false;
+        cx.notify();
+    }
+
+    /// Moves the actions card's row list by `by` pixels, or puts it back at the
+    /// top (`None`). Back to the top after every keystroke that changes the
+    /// search: a filtered list is shorter than the offset a scrolled one left
+    /// behind, and a card showing the empty space past its last row reads as a
+    /// search that found nothing.
+    ///
+    /// Clamped to what there is to scroll, so the list cannot be pushed off
+    /// either end -- `max_offset` is what the last paint measured, which is the
+    /// only place that number exists.
+    fn scroll_keys(&self, by: Option<f32>) {
+        let at = match by {
+            Some(by) => (f32::from(self.keys_scroll.offset().y) + by)
+                .clamp(-f32::from(self.keys_scroll.max_offset().height), 0.),
+            None => 0.,
+        };
+        self.keys_scroll.set_offset(point(px(0.), px(at)));
     }
 
     /// Whether the editor can be asked for `action` right now, and why not when
@@ -3888,14 +3989,37 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
-                // The overlay owns the keyboard while it is up: a stroke aimed
-                // at a row must not also cut the timeline, and the way out of it
-                // is the same key that gets out of a capture.
+                // The overlay owns the keyboard while it is up -- but it types
+                // now: a printable stroke is the search box's, which is why
+                // nothing here reaches the keymap. A waiting row is answered
+                // above and still wins, so a rebind onto "v" binds the key
+                // rather than typing it.
                 if this.keys_open {
                     if key == ESCAPE {
-                        this.keys_open = false;
-                        cx.notify();
+                        // Two steps out, the way a search box anywhere gets
+                        // out: the filter first -- the whole list back --
+                        // and the card only once there is no search to clear.
+                        if this.keys_search.is_empty() {
+                            this.keys_open = false;
+                        } else {
+                            this.keys_search.clear();
+                            this.scroll_keys(None);
+                        }
+                    // The rows past the fold, without a wheel: forty actions
+                    // are four times what the viewport shows, and the hand
+                    // typing in the search box is already on the keyboard.
+                    } else if key == "up" {
+                        this.scroll_keys(Some(KEYS_ROW_H));
+                    } else if key == "down" {
+                        this.scroll_keys(Some(-KEYS_ROW_H));
+                    } else if key == "backspace" {
+                        this.keys_search.pop();
+                        this.scroll_keys(None);
+                    } else if let Some(c) = typed(key) {
+                        this.keys_search.push(c);
+                        this.scroll_keys(None);
                     }
+                    cx.notify();
                     return;
                 }
                 // The export card owns it the same way, and for the same
@@ -4998,23 +5122,27 @@ impl Player {
                         live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
                     ))
-                    // No shortcut of its own -- and closed while an export runs,
-                    // which is what keeps a waiting row from swallowing the
-                    // escape the progress line promises cancels the export.
+                    // Closed while an export runs, which is what keeps a waiting
+                    // row from swallowing the escape the progress line promises
+                    // cancels the export.
                     .child(control(
                         "keys",
                         None,
                         "Actions",
                         // The pointer's way to every action there is, including
                         // the ones no button here has room for.
-                        "do any action, or change the key that does it".to_string(),
+                        format!(
+                            "{} — do any action, or change the key that does it",
+                            key(ActionId::ShowActions)
+                        ),
                         !exporting,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.keys_open = !this.keys_open;
-                            this.rebinding = None;
-                            // One card at a time, both ways round.
-                            this.export_open = false;
-                            cx.notify();
+                        cx.listener(|this, _: &ClickEvent, _, cx| match this.keys_open {
+                            true => {
+                                this.keys_open = false;
+                                this.rebinding = None;
+                                cx.notify();
+                            }
+                            false => this.show_actions(cx),
                         }),
                     )),
             )
@@ -5248,7 +5376,26 @@ impl Player {
                 .px(px(6.))
                 .rounded(px(3.))
         };
-        for (i, key_row) in keys_rows().into_iter().enumerate() {
+        let found = keys_filter(&self.keys_search, &self.keymap);
+        // What the search box says: the typed text, and how much of the list is
+        // left under it -- a filter that found nothing has to say so, or the
+        // card reads as a list that lost its rows.
+        let search = if self.keys_search.is_empty() {
+            "search: type to filter · ↑ ↓ scroll the list".to_string()
+        } else {
+            let rows = found
+                .iter()
+                .filter(|(_, r)| !matches!(r, KeyRow::Head(_)))
+                .count();
+            match rows {
+                0 => format!(
+                    "search: {} — nothing matches · {out} clears",
+                    self.keys_search
+                ),
+                n => format!("search: {} — {n} shown · {out} clears", self.keys_search),
+            }
+        };
+        for (i, key_row) in found {
             rows.push(match key_row {
                 KeyRow::Head(category) => div()
                     .flex_none()
@@ -5386,6 +5533,19 @@ impl Player {
                                         }),
                                 ),
                         )
+                        // The search box: no focus and no text field -- the
+                        // card's key handler is the field, exactly as the
+                        // export card's digits are typed into it. Its own line
+                        // above the list, so the rows below it are always the
+                        // answer to what it says.
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(search),
+                        )
                         // Capped and scrolling rather than as tall as the action
                         // list happens to be: the list grows with the editor,
                         // the smallest window does not.
@@ -5397,6 +5557,10 @@ impl Player {
                                 .gap(px(2.))
                                 .max_h(px(KEYS_ROWS_H))
                                 .overflow_y_scroll()
+                                // The wheel's offset and the arrow keys' are
+                                // the same one, so the two cannot disagree
+                                // about where the list is.
+                                .track_scroll(&self.keys_scroll)
                                 .children(rows),
                         ),
                 ),
@@ -8253,6 +8417,17 @@ struct Ctx {
 /// disagree about what an action needs -- exactly the reason [`Player::act`] is
 /// one table too.
 fn enable(action: ActionId, ctx: Ctx) -> Enable {
+    // The one action that is about the editor rather than about the timeline:
+    // the list of what everything does, and where a key is changed. An empty
+    // window has no clips and still has keys -- so this answers ahead of the
+    // timeline question, and only an export shuts it (a waiting row would
+    // swallow the escape the progress line promises cancels the export).
+    if action == ActionId::ShowActions {
+        return match ctx.exporting {
+            true => Enable::No("an export is running"),
+            false => Enable::Yes,
+        };
+    }
     if !ctx.timeline {
         return Enable::No("no timeline open");
     }
@@ -10273,11 +10448,11 @@ mod tests {
         enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
         estimated_mb, export_path, export_settings, format_key,
         format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
-        inserted_band, is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at,
-        next_container,
-        normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
-        show_label, silence_rate, snap_cue, snap_marks, snapped, source_tint, span_partner,
-        speed_at, summary_head, summary_tail, timecode, transport, unseen_paths, unseen_sources,
+        inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
+        marked, menu_at, next_container, normalise, nothing_to_play, panel_h, project_path,
+        push_digit, retarget, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
+        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
+        typed, unseen_paths, unseen_sources,
         whole_take, window_title,
     };
     use super::{
@@ -12093,18 +12268,105 @@ mod tests {
         assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
+    /// The search box: what a typed word leaves standing. Forty actions is more
+    /// than a 360 px window shows at once, so this is the card's answer to
+    /// "where is the one I want" -- and a heading with nothing under it would
+    /// be worse than no filter at all.
+    #[test]
+    fn a_search_leaves_the_rows_it_names_under_their_own_headings() {
+        use keymap::{ActionId, Category, Keymap};
+        let keymap = Keymap::defaults();
+        let acts = |found: &[(usize, KeyRow)]| -> Vec<ActionId> {
+            found
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    KeyRow::Act(a) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        };
+        let heads = |found: &[(usize, KeyRow)]| -> Vec<Category> {
+            found
+                .iter()
+                .filter_map(|(_, r)| match r {
+                    KeyRow::Head(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Nothing typed hides nothing, and every row keeps its place in the
+        // unfiltered list: an element id must not move under a keystroke.
+        let all = keys_filter("", &keymap);
+        assert_eq!(all.len(), keys_rows().len());
+        assert!(all.iter().enumerate().all(|(n, (i, _))| n == *i));
+        // The word the user types is the word on the row. The mix card names
+        // the track volumes, so it is an honest hit; the fixed row about the
+        // volume keys is another, and each comes with its own heading only.
+        let vol = keys_filter("vol", &keymap);
+        assert_eq!(
+            acts(&vol),
+            vec![ActionId::VolumeUp, ActionId::VolumeDown, ActionId::Mix]
+        );
+        assert_eq!(heads(&vol), vec![Category::Audio, Category::View]);
+        // Case is not part of the question, in either direction.
+        assert_eq!(keys_filter("VoL", &keymap).len(), vol.len());
+        // The stroke column is searched too -- "what did ctrl do again" -- and
+        // an unbound-looking word finds nothing rather than everything.
+        let ctrl = keys_filter("ctrl+", &keymap);
+        assert!(acts(&ctrl).contains(&ActionId::Save));
+        assert!(!acts(&ctrl).contains(&ActionId::Play));
+        assert!(
+            keys_filter("qzx", &keymap).is_empty(),
+            "headings left behind"
+        );
+        // The card's own door is on the card, by name and by stroke.
+        assert_eq!(
+            acts(&keys_filter("f1", &keymap)),
+            vec![ActionId::ShowActions]
+        );
+        assert_eq!(
+            acts(&keys_filter("all actions", &keymap)),
+            vec![ActionId::ShowActions]
+        );
+    }
+
+    /// What a keystroke means to that box: a letter is a letter, and a word
+    /// gpui reports for a key that prints nothing is not typed letter by
+    /// letter into the search.
+    #[test]
+    fn only_a_printable_stroke_types_into_the_search() {
+        assert_eq!(typed("a"), Some('a'));
+        assert_eq!(typed("-"), Some('-'));
+        assert_eq!(typed("1"), Some('1'));
+        // The one printable key gpui reports by name.
+        assert_eq!(typed("space"), Some(' '));
+        for word in ["left", "escape", "f1", "backspace", "tab", "delete", "home"] {
+            assert_eq!(typed(word), None, "{word}");
+        }
+    }
+
     #[test]
     fn the_keybindings_card_fits_the_smallest_window() {
         // The row list is capped and scrolls, so the card's height no longer
-        // depends on how many actions there are: a title, a status line and the
-        // viewport, inside the 640x360 the rest of the layout is sized for.
+        // depends on how many actions there are: a title, a status line, the
+        // search box and the viewport, inside the 640x360 the rest of the
+        // layout is sized for.
         let title = 17.; // 13 px text on its own line
         let status = 28.; // 11 px text, two lines: a refusal wraps
-        let gaps = 3. * 2.;
+        let search = 15.; // 11 px text, one line: it never wraps
+        let gaps = 4. * 2.;
         let padding = 24.;
         assert!(
-            title + status + KEYS_ROWS_H + gaps + padding <= 360.,
+            title + status + search + KEYS_ROWS_H + gaps + padding <= 360.,
             "card too tall"
+        );
+        // ...and the list is the only part that grows with the editor, so the
+        // rows past the fold are reached by scrolling that viewport (and, with
+        // forty of them, by the search box above it) rather than by a card
+        // taller than the window.
+        assert!(
+            keys_rows().len() as f32 * KEYS_ROW_H > KEYS_ROWS_H,
+            "the list outgrew the viewport long ago; the cap must still scroll"
         );
         // The cap is only honest if it is the taller list that scrolls, not the
         // card that grows: every action must be reachable by scrolling, and
@@ -13905,6 +14167,8 @@ fn main() {
                     project_path: project.clone(),
                     keymap: keymap.clone(),
                     keys_open: false,
+                    keys_search: String::new(),
+                    keys_scroll: ScrollHandle::new(),
                     export_open: false,
                     export_grouped: true,
                     export_refusals_inline: false,
