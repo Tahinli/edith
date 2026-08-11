@@ -805,6 +805,19 @@ impl Player {
             // state does, not just on the crossing: nothing else is coming.
             self.pending_seek = false;
             if was != Transport::Ended {
+                // Ended is a *stopped* transport, so the clock stops with it,
+                // on the out point the timecode and the playhead have been
+                // showing all along. Nothing else ever stopped it: past the
+                // last frame wall time takes over and `now()` walks off the end
+                // of the timeline for as long as the window is left open -- and
+                // the playhead is what a cut, a paste, an insert and the
+                // analyser all act at, so every one of them was aiming into
+                // empty space (measured: a 5 s timeline recognised its end at
+                // clock 17.5 s under a slow renderer). End of stream is left
+                // set, so this is still `Ended` and the next press restarts.
+                if let Some(session) = &mut self.session {
+                    session.halt_at_end();
+                }
                 let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
                 eprintln!(
                     "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
@@ -6810,7 +6823,7 @@ mod tests {
     use gpui::{Bounds, Pixels, point, px, size};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn asset(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8218,6 +8231,66 @@ mod tests {
         for state in [Transport::Playing, Transport::Paused, Transport::Stopped] {
             assert!(!state.restarts(), "{state:?} must toggle, not reseek");
         }
+    }
+
+    /// The half of `Ended` the eye cannot see: the clock. Wall time takes over
+    /// at the last frame and nothing used to stop it, so the playhead walked off
+    /// the end of the timeline in real time -- and the playhead is what a cut, a
+    /// paste, an insert and the analyser all act at. `pump` pauses on the
+    /// crossing; this is the engine contract that rests on, driven exactly as
+    /// the pump drives it.
+    #[test]
+    fn the_clock_stops_where_the_timeline_does_and_the_end_still_restarts() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Start a breath short of the end: the tail is what this is about, and
+        // playing the whole five seconds would say nothing more.
+        session.seek(4.8);
+        session.play();
+
+        // The pump's own loop -- tick, drain, ask where the transport is --
+        // with a deadline so a fixture that will not decode fails as a failure
+        // rather than as a hang.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut state = transport(session.is_playing(), session.is_eos());
+        while state != Transport::Ended {
+            assert!(Instant::now() < deadline, "never reached the end of a 5s file");
+            session.tick();
+            while session.try_frame().is_some() {}
+            state = transport(session.is_playing(), session.is_eos());
+        }
+
+        // What `pump` does on the crossing, and the whole point of it: the
+        // position holds still afterwards instead of counting on past the end,
+        // and it holds still *on the out point* -- where the timecode and the
+        // playhead have been showing it. The clock at the moment the end is
+        // recognised is not that: a slow renderer reaches EOF with the clock
+        // seconds past the timeline, which is why this repositions rather than
+        // only freezing.
+        session.halt_at_end();
+        let stopped_at = session.now();
+        assert_eq!(stopped_at, session.timeline_duration());
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(session.now(), stopped_at, "the clock kept running past EOF");
+        // And it is still the end: pausing must not spend the state the glyph
+        // and the restart both read.
+        assert!(session.is_eos());
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Ended
+        );
+
+        // The restart path off that frozen end, which is what the button and
+        // the play key do from `Ended`: back to the top, and running.
+        session.seek(0.);
+        session.play();
+        assert!(!session.is_eos(), "a seek revives the session");
+        assert!(session.now() < 1.0);
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Playing
+        );
+        session.pause();
     }
 
     /// Both ends hold under a key held down: the ABI only accepts `0.0..=1.0`,
