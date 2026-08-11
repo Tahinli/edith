@@ -1075,14 +1075,20 @@ impl PlaybackSession {
         self.edit(|p| p.lift(lane, idx))
     }
 
-    /// Moves that clip onto another lane of the same kind, keeping the frames it
-    /// covers -- the drag between tracks. One undo step, and it reseeks like
-    /// every other edit: which lane a clip sits on is what the compositor's
-    /// topmost-lane-wins rule reads, so the frame on screen is recomposed at
-    /// once. `false` for a bad index, for a move across kinds and for one that
-    /// would land on another clip; nothing changes.
-    pub fn move_clip_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
-        self.edit(|p| p.move_to_lane(from, idx, to))
+    /// Moves that clip onto lane `to` with its head at timeline frame `start` --
+    /// the drag that carries a take along its track or onto another one, and its
+    /// whole group with it. See [`Project::move_clip`] for the walls `start` is
+    /// clamped to and the ways a drop is refused. One undo step, and it reseeks
+    /// like every other edit: which lane a clip sits on is what the compositor's
+    /// topmost-lane-wins rule reads, and where it starts is what the playhead
+    /// reads, so the frame on screen is recomposed at once.
+    ///
+    /// A *frame*, where the rest of this type takes seconds, for
+    /// [`trim_clip`](Self::trim_clip)'s reason: the drag has already put the
+    /// pointer on a frame, and converting it back through seconds would be a
+    /// rounding step between the box let go of and the box committed.
+    pub fn move_clip_to(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        self.edit(|p| p.move_clip(from, idx, to, start))
     }
 
     /// Drags one end of that clip to timeline frame `to`, changing how much of
