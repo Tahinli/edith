@@ -78,13 +78,14 @@ pub enum ActionId {
     Speed,
     Silence,
     Mix,
+    ToggleSnap,
     CancelExport,
 }
 
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 39] = [
+    pub const ALL: [ActionId; 40] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -123,6 +124,7 @@ impl ActionId {
         ActionId::Speed,
         ActionId::Silence,
         ActionId::Mix,
+        ActionId::ToggleSnap,
         ActionId::CancelExport,
     ];
 
@@ -167,6 +169,7 @@ impl ActionId {
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
             ActionId::Mix => "Mix: track volumes and the limiter…",
+            ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::CancelExport => "Cancel export",
         }
     }
@@ -213,6 +216,7 @@ impl ActionId {
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
             ActionId::Mix => "mix",
+            ActionId::ToggleSnap => "toggle-snap",
             ActionId::CancelExport => "cancel-export",
         }
     }
@@ -265,6 +269,9 @@ impl ActionId {
             | ActionId::AddVideoLane
             | ActionId::AddAudioLane
             | ActionId::RemoveVideoLane
+            // Not a view setting despite being a pointer aid: it decides where
+            // a drag actually lands, which is an edit and not a magnification.
+            | ActionId::ToggleSnap
             | ActionId::RemoveAudioLane => Category::Editing,
             ActionId::ToggleMute
             | ActionId::VolumeUp
@@ -645,6 +652,9 @@ impl Keymap {
                 // machine's volume and not the project's -- two things one key
                 // must not mean.
                 b(ActionId::Mix, "f", false),
+                // The snap takes "n", which is what every other editor toggles
+                // it with: free here, and nowhere near the two keys that delete.
+                b(ActionId::ToggleSnap, "n", false),
                 b(ActionId::CancelExport, "escape", false),
             ],
         }
@@ -907,7 +917,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 41);
+        assert_eq!(k.entries().len(), 42);
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.
@@ -1141,7 +1151,8 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 39);
+        assert_eq!(ActionId::ALL.len(), 40);
+        assert_eq!(k.display(ActionId::ToggleSnap), "n");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
 
