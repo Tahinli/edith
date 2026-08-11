@@ -23,10 +23,14 @@
 //! picture is re-encoded, so the frame walk honours a rate: it takes the source
 //! frame each timeline frame shows ([`crate::project::Speed::source_at`], the
 //! very frame preview holds there) and encodes a held one again rather than
-//! decoding it twice. The sound is *copied* unless something forces a decode,
-//! and a packet carries no rate — so a speeded lane is one of the things that
-//! forces one ([`copy_audio`]) rather than being written out at 1.00x under a
-//! re-timed picture.
+//! decoding it twice. A clip whose *file* was shot at another rate than the
+//! timeline goes through the same walk with one more conversion on the end
+//! ([`crate::project::Rate`]), so it is encoded at the speed it was shot at.
+//! The sound is *copied* unless something forces a decode, and a packet carries
+//! no rate — so a speeded lane is one of the things that forces one
+//! ([`copy_audio`]) rather than being written out at 1.00x under a re-timed
+//! picture. WAV, FLAC and MP3 are decoded and resampled, so they honour a rate
+//! like the picture does.
 //!
 //! Nothing partial survives a failure: the worker writes to `<out>.part` and
 //! renames it onto `out` only once the file is closed and complete, so the
@@ -52,7 +56,7 @@ use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Av1Params, MkvMuxer, Mp4Muxer, VideoParams};
-use crate::project::{LaneKind, Project};
+use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
@@ -167,6 +171,10 @@ struct Shared {
     cancel: AtomicBool,
     finished: AtomicBool,
     outcome: Mutex<Option<crate::Result<()>>>,
+    /// The encoders this job really opened, published the moment they are
+    /// chosen and never changed after -- one seat for the whole file, which is
+    /// what [`Enc`] states. `None` until then.
+    encoders: Mutex<Option<String>>,
 }
 
 /// A running export. Poll [`is_finished`](ExportHandle::is_finished) once per
@@ -195,6 +203,13 @@ impl ExportHandle {
         self.shared.finished.load(Ordering::Acquire)
     }
 
+    /// What this export is encoding with -- the video seat and what the sound
+    /// is doing -- as the worker chose them, hardware fallback included.
+    /// `None` for the first instants of a job, before the encoder is open.
+    pub fn encoders(&self) -> Option<String> {
+        self.shared.encoders.lock().unwrap().clone()
+    }
+
     /// The outcome, once — taken out of the handle, so a caller that already
     /// reported it sees `None` afterwards. `None` while the export is running.
     pub fn result(&self) -> Option<crate::Result<()>> {
@@ -218,6 +233,7 @@ pub fn start(
         cancel: AtomicBool::new(false),
         finished: AtomicBool::new(false),
         outcome: Mutex::new(None),
+        encoders: Mutex::new(None),
     });
     let worker = Arc::clone(&shared);
     let out = out.to_path_buf();
@@ -282,10 +298,152 @@ fn has_picture(project: &Project) -> bool {
         .any(|lane| lane.kind == LaneKind::Video && !project.lane(lane).is_empty())
 }
 
+/// Whether any audio lane holds anything, [`has_picture`]'s pair: what tells a
+/// timeline whose export will carry sound from one whose file has none.
+fn has_sound(project: &Project) -> bool {
+    project
+        .lanes()
+        .into_iter()
+        .any(|lane| lane.kind == LaneKind::Audio && !project.lane(lane).is_empty())
+}
+
+/// Whether any equalizer on the sound is doing something -- the one edit a
+/// packet copy cannot carry, so an mp4 whose lane has one is decoded and
+/// re-encoded ([`encode_audio`]) instead of copied. Asked of every audio lane:
+/// the copy path has exactly one by the time it asks, and [`planned_audio`] is
+/// asked before that is settled.
+fn equalized(project: &Project) -> bool {
+    project.audio_lanes().into_iter().any(|lane| {
+        (0..project.lane(lane).len())
+            .any(|idx| project.eq_of(lane, idx).is_some_and(|eq| !eq.is_identity()))
+    })
+}
+
+/// The bitrate an export codes at: the caller's number through the same clamp
+/// as the computed one, for the reason [`Enc::open`] states.
+fn bitrate_of(meta: &VideoMeta, settings: &ExportSettings) -> u64 {
+    settings
+        .bitrate
+        .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE))
+}
+
+/// The hardware seat for these settings, opened exactly as the export opens it
+/// -- the same pins, the same AV1 opt-in, the same dimensions a driver may
+/// refuse -- or `None` where the software encoder takes the file. The single
+/// place that choice is made, which is what lets [`planned_video`] *measure* it
+/// instead of promising it.
+fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
+    if settings.force_sw || forced("VE_SW_ENC") {
+        return None;
+    }
+    let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate).ok()?;
+    let bitrate = bitrate_of(meta, settings);
+    match settings.format {
+        // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
+        // AV1 formats sit on it: the container is not the encoder's business.
+        format if format.is_av1() && !forced("VE_HW_AV1") => None,
+        format if format.is_av1() => {
+            HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
+        }
+        _ => HwEncoder::open(meta.width, meta.height, fps_num, fps_den, bitrate),
+    }
+}
+
+/// How a front-end names a video seat: which of the two encoders has the file,
+/// and which library that is. Not the codec -- a caller shows this beside the
+/// format it picked, and `rav1e` names AV1 as `rusty_h264` names H.264. One
+/// place, so what a card says before an export and what its progress line says
+/// during one cannot drift apart.
+fn video_label(format: Format, hw: bool) -> &'static str {
+    match (format.is_av1(), hw) {
+        (_, true) => "HW encode (VA-API)",
+        (true, false) => "SW encode (rav1e)",
+        (false, false) => "SW encode (rusty_h264)",
+    }
+}
+
+/// The cheap half of "does this timeline's sound have to be re-encoded": what
+/// the *edit* says, with no file opened. Two lanes are a mix and a mix is not a
+/// copy; a speeded lane is resampled; an equalizer is sample math. The other
+/// half -- whether the sources can be copied out of at all -- costs a file open
+/// each and belongs to [`copy_audio`], which may re-encode where this says copy.
+fn forces_encode(project: &Project) -> bool {
+    let lanes: Vec<_> = project
+        .audio_lanes()
+        .into_iter()
+        .filter(|&lane| !project.lane(lane).is_empty())
+        .collect();
+    lanes.len() > 1
+        || lanes
+            .iter()
+            .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
+        || equalized(project)
+}
+
+/// What the sound is written by. Every audio encoder here is software -- there
+/// is no hardware AAC, PCM, FLAC or MP3 seat -- so this names *which* one, and
+/// whether a container escapes encoding altogether by copying the packets it was
+/// given. Both AV1 formats are in it like the mp4: an AV1 export carries the
+/// timeline's sound too, so leaving it unnamed would be the old lie.
+///
+/// A prediction, and it says so: `copied` is what [`copy_audio`] *did*, which a
+/// card asking before the export has no way to know (a source that cannot be
+/// copied out of is only found by opening it). `None` predicts from the edit
+/// alone.
+fn audio_label(
+    project: &Project,
+    format: Format,
+    sound: bool,
+    copied: Option<bool>,
+) -> &'static str {
+    if !sound {
+        return "no sound to write";
+    }
+    match format {
+        Format::Wav => "PCM · SW (hound)",
+        Format::Flac => "FLAC · SW (flacenc)",
+        Format::Mp3 => "MP3 · SW (rusty_mp3)",
+        _ => match copied.unwrap_or(!forces_encode(project)) {
+            true => "AAC copy",
+            false => "AAC · SW encode (rusty_aac)",
+        },
+    }
+}
+
+/// What [`start`] would write this timeline's sound with, before one is
+/// started. Pure: no probe and no file opened, so a card may ask it per repaint.
+pub fn planned_audio(project: &Project, format: Format) -> &'static str {
+    audio_label(project, format, has_sound(project), None)
+}
+
+/// What [`start`] would encode the picture with, probed the way the export
+/// probes it -- the very encoder is opened and closed again -- so this is a
+/// measurement and not a promise. `None` for a format that carries no picture.
+///
+/// Costs that open (~100 ms here): ask it off a render thread and keep the
+/// answer until the format, the resolution or the bitrate changes.
+pub fn planned_video(meta: &VideoMeta, settings: &ExportSettings) -> Option<&'static str> {
+    settings
+        .format
+        .has_video()
+        .then(|| video_label(settings.format, hw_seat(meta, settings).is_some()))
+}
+
 fn settle(shared: &Shared, result: crate::Result<()>) {
     *shared.outcome.lock().unwrap() = Some(result);
     // Published last: a caller that sees the flag is guaranteed the outcome.
     shared.finished.store(true, Ordering::Release);
+}
+
+/// The audio track an export writes, and how it was made -- a copy is the
+/// source's own packets, bit for bit, and anything else is this project's
+/// encoder over the decoded mix. [`run`] publishes which of the two really
+/// happened, so the encoder line a user reads is measured and not promised.
+pub(crate) struct ExportAudio {
+    pub params: crate::AacTrackParams,
+    pub packets: Vec<crate::AacPacket>,
+    /// Whether those packets are the source's, untouched.
+    pub copied: bool,
 }
 
 /// The timeline's audio track for a file that carries picture: copied packet for
@@ -302,11 +460,7 @@ fn settle(shared: &Shared, result: crate::Result<()>) {
 /// ponytail: this holds the whole exported AAC track in memory (~3 kB per
 /// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
 /// `copy_segments` that yields packets instead of collecting them.
-#[allow(clippy::type_complexity)]
-fn copy_audio(
-    project: &Project,
-    meta: &VideoMeta,
-) -> crate::Result<Option<(crate::AacTrackParams, Vec<crate::AacPacket>)>> {
+fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<ExportAudio>> {
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
     // files stays in sync. A source whose AAC parameters disagree with the
@@ -347,13 +501,24 @@ fn copy_audio(
     // copy never reaches: copying such a lane would write the clip *flat*,
     // silently.
     //
+    // A frame *rate* of its own is not one of those, and that is deliberate: do
+    // not "fix" this into a re-encode. A clip counts the **timeline's** frames
+    // whatever its file was shot at ([`crate::project::Rate`]), so the window
+    // this copy trims a source's sound to is `start..end` in whole timeline
+    // frames -- exactly the seconds the picture covers -- and the file is read
+    // at the pitch it was recorded at, which is what playing at the rate it was
+    // shot at means. There is no per-clip stretch to express, so the packets are
+    // already the right sound in the right place; re-encoding a conformed lane
+    // would buy nothing and cost a generation of loss on every mixed-rate export
+    // (`tests/mixed_fps.rs`, `an_export_of_two_rates_runs_at_the_speed_it_was_shot`
+    // measures the copied sound against the picture). A *speed* is different
+    // because it resamples, which is why it leaves through the re-encode above.
+    //
     // Only these: a timeline nobody has touched still leaves through the copy
     // below, packet for packet, so no passthrough quietly becomes a generation
     // of loss.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
-    let equalized = (0..project.lane(lane).len())
-        .any(|idx| project.eq_of(lane, idx).is_some_and(|eq| !eq.is_identity()));
-    if speeded || equalized {
+    if speeded || equalized(project) {
         return encode_audio(project, meta);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
@@ -365,7 +530,11 @@ fn copy_audio(
     // which symphonia has no decoder for at any version -- is the one that comes
     // back, by name, from [`encode_audio`].
     match AudioSession::copy_multi_streams(&project.audio_sources(), segments) {
-        Ok(copied) => Ok(copied),
+        Ok(copied) => Ok(copied.map(|(params, packets)| ExportAudio {
+            params,
+            packets,
+            copied: true,
+        })),
         Err(_) => encode_audio(project, meta),
     }
 }
@@ -387,11 +556,7 @@ fn copy_audio(
 /// minute of 48 kHz stereo), for [`run_audio`]'s reason -- `rusty_aac` buffers
 /// the whole stream anyway, since it encodes its frames in parallel. Upgrade
 /// path is a chunked push once that encoder streams.
-#[allow(clippy::type_complexity)]
-fn encode_audio(
-    project: &Project,
-    meta: &VideoMeta,
-) -> crate::Result<Option<(crate::AacTrackParams, Vec<crate::AacPacket>)>> {
+fn encode_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<ExportAudio>> {
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
@@ -444,8 +609,8 @@ fn encode_audio(
             samples: packet.duration,
         });
     }
-    Ok(Some((
-        crate::AacTrackParams {
+    Ok(Some(ExportAudio {
+        params: crate::AacTrackParams {
             freq_index,
             // 1 and 2 are the ISO channel configurations for mono and stereo,
             // and the opener refuses anything wider than stereo already.
@@ -453,7 +618,8 @@ fn encode_audio(
             sample_rate: audio.sample_rate,
         },
         packets,
-    )))
+        copied: false,
+    }))
 }
 
 fn run(
@@ -471,16 +637,39 @@ fn run(
     // them into the clusters as it writes. Every video format gets the same
     // track: none of them is picture-only any more.
     let audio = copy_audio(project, meta)?;
-    let audio_params = audio.as_ref().map(|(track, _)| AudioParams {
-        freq_index: track.freq_index,
-        chan_conf: track.chan_conf,
-        sample_rate: track.sample_rate,
+    let audio_params = audio.as_ref().map(|track| AudioParams {
+        freq_index: track.params.freq_index,
+        chan_conf: track.params.chan_conf,
+        sample_rate: track.params.sample_rate,
     });
+    // What the track *is*, kept before the packets are handed to a muxer: the
+    // encoder line names a copy or an encode and only `copy_audio` knows which.
+    let sound = audio.as_ref().map(|track| track.copied);
     // Taken by the Matroska muxer at creation; the mp4 one writes its track
     // after the picture, so for that path this is still `Some` at the end.
-    let mut packets = audio.map(|(_, packets)| packets);
+    let mut packets = audio.map(|track| track.packets);
+
+    // One header parse per source, before any of them is decoded: what rate
+    // each file was shot at against the timeline's ([`Rate`]), which is how the
+    // clip's timeline frames below become frames of the file. Real time for a
+    // still, a song and a single-rate project, where every conversion below is
+    // the identity.
+    let rates: Vec<Rate> = sources
+        .iter()
+        .map(|source| source_rate(&source.path, meta.frame_rate))
+        .collect();
 
     let mut encoder = Enc::open(meta, settings)?;
+    // What this file is really being written by, for a progress line to name.
+    // Published *after* the seat is open, so a hardware encoder the driver
+    // refused reads as the software one that took over rather than as the hope
+    // it replaced -- and the sound says whether it was copied or encoded, which
+    // `copy_audio` decided a few lines up.
+    *shared.encoders.lock().unwrap() = Some(format!(
+        "{} · {}",
+        encoder.label(),
+        audio_label(project, settings.format, sound.is_some(), sound)
+    ));
     let mut muxer = None;
     let mut done = 0u32;
     let black = Black::new(meta);
@@ -494,14 +683,18 @@ fn run(
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
-        let mut pictures = match span.from {
+        let (mut pictures, rate, in_frame) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                Some(ClipDecoder::open(&entry.path, in_frame)?)
+                let rate = rates[source];
+                // Opened at the file's own frame, which is the only place the
+                // file's numbering is used -- the span's are the timeline's.
+                let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
+                (Some(pictures), rate, in_frame)
             }
-            None => None,
+            None => (None, Rate::REAL_TIME, 0),
         };
         // What this span is graded by -- the same answer playback's decoder
         // carries, so the export is the picture that was watched. `None` for a
@@ -532,10 +725,24 @@ fn run(
         let mut done_here = 0u32;
         // Source frames already taken out of this span's decoder.
         let mut taken = 0u32;
+        // The whole of the mapping, in the order it composes: the speed says
+        // which of the clip's (timeline-rate) frames a timeline frame shows,
+        // and the rate says which frame of the *file* that is -- counted from
+        // the one the decoder was opened at. At real time and at the timeline's
+        // own rate this is `Speed::source_at` and nothing else, which is the
+        // walk a single-rate project has always taken.
+        let opened_at = rate.source_at(in_frame);
+        let source_at =
+            |offset: u32| rate.source_at(in_frame + span.speed.source_at(offset)) - opened_at;
         while done_here < span.len {
             cancelled(shared)?;
-            let want = span.speed.source_at(done_here);
-            let repeats = span.speed.repeats(done_here, span.len);
+            let want = source_at(done_here);
+            // How many timeline frames from here show that same picture: one at
+            // real time, more when the clip is slowed or its file is slower
+            // than the timeline. Encoded again rather than decoded twice.
+            let repeats = (done_here..span.len)
+                .take_while(|&offset| source_at(offset) == want)
+                .count() as u32;
             let picture = match &mut pictures {
                 Some(pictures) => {
                     let mut ran_out = false;
@@ -637,6 +844,24 @@ fn run(
     Ok(())
 }
 
+/// What rate `path` was shot at against a timeline at `timeline_fps`
+/// ([`Rate`]). [`Rate::REAL_TIME`] for the files that have no rate of their own
+/// -- a still, a song -- and for one that will not open here: the decoder is
+/// opened a few lines later and fails the export by name, which is a better
+/// error than this one could raise.
+fn source_rate(path: &Path, timeline_fps: f64) -> Rate {
+    if crate::is_image(path) || crate::is_audio(path) {
+        return Rate::REAL_TIME;
+    }
+    match Demuxer::open(path) {
+        // ...and one whose rate cannot be named against the timeline's, which
+        // `matches_timeline` refuses at import, so nothing on a timeline is on
+        // this arm either.
+        Ok((meta, _)) => Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
+        Err(_) => Rate::REAL_TIME,
+    }
+}
+
 /// The audio lanes alone, summed, as a WAV or a FLAC.
 ///
 /// Nothing here re-derives the edit: the play lists are
@@ -676,6 +901,9 @@ fn run_audio(
     else {
         return Err("this timeline has no audio to export".into());
     };
+    // The picture path's line, for a file that is sound alone: there is sound
+    // by the line above, so this names the encoder writing it.
+    *shared.encoders.lock().unwrap() = Some(audio_label(project, format, true, None).to_string());
     let channels = usize::from(audio.channels);
     let frames = (f64::from(project.timeline_frames()) / meta.frame_rate
         * f64::from(audio.sample_rate))
@@ -994,6 +1222,18 @@ enum Enc {
 }
 
 impl Enc {
+    /// Which seat this *is*, said the way [`video_label`] says it -- so the
+    /// name a running export shows is the name the card showed, or the honest
+    /// difference where the probe and the open disagreed.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Hw(_) => video_label(Format::Mp4, true),
+            Self::Sw { .. } => video_label(Format::Mp4, false),
+            Self::Av1Hw(_) => video_label(Format::Av1, true),
+            Self::Av1Sw { .. } => video_label(Format::Av1, false),
+        }
+    }
+
     fn open(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
         // Which *codec* the picture is, not which container it goes in: both AV1
         // formats run the same encoder.
@@ -1003,18 +1243,13 @@ impl Enc {
         // A caller's number goes through the same clamp as the computed one: a
         // zero bitrate switches the software encoder's lookahead on, which would
         // break the one-picture-per-call contract `encode` documents below.
-        let bitrate = settings
-            .bitrate
-            .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE));
+        let bitrate = bitrate_of(meta, settings);
         // The plugin wants an exact rational, and the muxer already picks one
         // that is exact at every rate we can read -- `fps * 1000 / 1000` would
         // hand 24000/1001 over as a rounded 23.976, which is the same
         // truncation the container timing had.
-        let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
-        if !settings.force_sw
-            && !forced("VE_SW_ENC")
-            && let Some(hw) = HwEncoder::open(meta.width, meta.height, fps_num, fps_den, bitrate)
-        {
+        crate::mux::frame_timing(meta.frame_rate)?;
+        if let Some(hw) = hw_seat(meta, settings) {
             eprintln!("export encoder: hardware (VA-API plugin)");
             return Ok(Self::Hw(hw));
         }
@@ -1055,19 +1290,12 @@ impl Enc {
     /// cros-codecs release that fixes it) plus a probe encode of one frame at
     /// open, after which this can prefer hardware the way H.264 does.
     fn open_av1(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
-        let bitrate = settings
-            .bitrate
-            .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE));
+        let bitrate = bitrate_of(meta, settings);
         let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
         // Two seconds between keyframes, as the H.264 seat does: a seek may only
         // land on one, and this is what a cluster of the Matroska file is.
         let gop = (meta.frame_rate * 2.0).round().max(1.0) as u64;
-        if forced("VE_HW_AV1")
-            && !settings.force_sw
-            && !forced("VE_SW_ENC")
-            && let Some(hw) =
-                HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
-        {
+        if let Some(hw) = hw_seat(meta, settings) {
             eprintln!("export encoder: hardware AV1 (VA-API plugin)");
             return Ok(Self::Av1Hw(hw));
         }
