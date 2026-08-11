@@ -319,6 +319,15 @@ fn equalized(project: &Project) -> bool {
     })
 }
 
+/// Whether the *mix* is doing something -- a lane turned off unity, or a
+/// limiter in circuit. [`equalized`]'s pair, and a copy cannot carry either of
+/// them: both live where the lanes are summed
+/// ([`AudioSession::open_mixed_streams_master`]), and a copied packet was never
+/// summed at all. An mp4 whose timeline is mixed is decoded and re-encoded.
+fn mastered(project: &Project) -> bool {
+    project.limiter().is_active() || project.audio_gains().iter().any(|&g| g != 1.0)
+}
+
 /// The bitrate an export codes at: the caller's number through the same clamp
 /// as the computed one, for the reason [`Enc::open`] states.
 fn bitrate_of(meta: &VideoMeta, settings: &ExportSettings) -> u64 {
@@ -378,6 +387,7 @@ fn forces_encode(project: &Project) -> bool {
             .iter()
             .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
         || equalized(project)
+        || mastered(project)
 }
 
 /// What the sound is written by. Every audio encoder here is software -- there
@@ -517,8 +527,11 @@ fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Expor
     // Only these: a timeline nobody has touched still leaves through the copy
     // below, packet for packet, so no passthrough quietly becomes a generation
     // of loss.
+    // ...and whether the mix itself does anything a packet never went through:
+    // a lane volume is applied at the sum and a limiter over it, so copying
+    // such a lane would write it at unity and unlimited, silently.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
-    if speeded || equalized(project) {
+    if speeded || equalized(project) || mastered(project) {
         return encode_audio(project, meta);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
@@ -561,8 +574,14 @@ fn encode_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Exp
     let segs = project.audio_segments_from(0, meta.frame_rate);
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
     let speeds = project.audio_speeds_from(0, meta.frame_rate);
-    let Some((audio, chunks)) =
-        AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds)?
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master(
+        &sources,
+        &segs,
+        &eqs,
+        &speeds,
+        &project.audio_gains(),
+        project.limiter(),
+    )?
     else {
         return Ok(None); // no audio to write, exactly as a copy of nothing is
     };
@@ -896,8 +915,18 @@ fn run_audio(
     // 2x is half as long and holds the samples that were heard -- not a
     // second pass here that could disagree with what the ear got.
     let speeds = project.audio_speeds_from(0, meta.frame_rate);
-    let Some((audio, chunks)) =
-        AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds)?
+    // ...and the mix over both: each lane's volume into the sum, the master
+    // limiter out of it. The same opener playback's feeder reads from, so a
+    // file is written at the levels it was heard at -- there is no second
+    // place here that could mix it differently.
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master(
+        &sources,
+        &segs,
+        &eqs,
+        &speeds,
+        &project.audio_gains(),
+        project.limiter(),
+    )?
     else {
         return Err("this timeline has no audio to export".into());
     };
