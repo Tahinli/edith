@@ -1704,8 +1704,11 @@ impl Player {
     /// ceiling by the same, and the switch either way (a ring of two, like the
     /// silence card's unit row).
     ///
-    /// Every one of them goes through the session, so it reseeks: what the ear
-    /// hears while the arrow is held is the mix that is being set.
+    /// Every one of them goes through the session, which hands it straight to
+    /// the running mixer: what the ear hears while the arrow is held is the mix
+    /// that is being set, and nothing is rebuilt to make that true -- no reseek,
+    /// so no `reset_after_reseek` and no blink in the picture behind the card
+    /// ([`engine::PlaybackSession::set_lane_gain_db`]).
     fn nudge_mix(&mut self, steps: i32, cx: &mut Context<Self>) {
         let lanes = self.mix_lanes();
         let Some(session) = self.session.as_mut() else {
