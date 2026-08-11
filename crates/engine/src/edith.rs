@@ -19,10 +19,13 @@
 //! gain audio 1 -3.0
 //! ```
 //!
-//! The `fps` line is the rate the timeline was cut at, printed so it reads back
-//! bit-exactly. A file without one (every dialect before v9) means "whatever
-//! the scaffolding source runs at", which is what such a project always was and
-//! is an answer only a project holding a video has
+//! The `fps` line is the rate the timeline was cut at -- the scaffolding
+//! source's own unless a rate was picked
+//! ([`crate::PlaybackSession::set_frame_rate`]), and the *only* thing that says
+//! so once one was, since every clip number in the file is counted in it.
+//! Printed so it reads back bit-exactly. A file without one (every dialect
+//! before v9) means "whatever the scaffolding source runs at", which is what
+//! such a project always was and is an answer only a project holding a video has
 //! ([`crate::PlaybackSession::open_project`]).
 //!
 //! A `subtitle` line is `subtitle <track> <path>`: which track of that file the
