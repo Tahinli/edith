@@ -50,6 +50,7 @@ use symphonia_core::units;
 use symphonia_core::units::{Time, TimeBase};
 
 use crate::eq::{EqParams, EqState};
+use crate::limiter::{Limiter, LimiterState};
 
 /// ffmpeg's AAC-LC encoder delay, used when the file carries no edit list.
 /// (HE-AAC/iTunes files use 2112, but those are rejected as unsupported here.)
@@ -454,10 +455,40 @@ impl AudioSession {
         eqs: &[Vec<Option<EqParams>>],
         speeds: &[Vec<Option<crate::project::Stretch>>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_master(sources, lanes, eqs, speeds, &[], Limiter::default())
+    }
+
+    /// [`open_mixed_streams_speed`](Self::open_mixed_streams_speed) with the two
+    /// settings that belong to the *mix* rather than to a clip: what each lane
+    /// is turned up or down by on its way into the sum (`gains[i]`, an
+    /// amplitude, [`crate::Project::audio_gains`] builds it) and the master
+    /// limiter the sum comes out through.
+    ///
+    /// Both live at the sum and nowhere else, which is what makes a lane volume
+    /// a *lane* volume and a limiter a master one: a gain applied per segment
+    /// would have to agree with itself across a lane's cuts, and a limiter
+    /// applied per lane would pump each lane against the others. A short or
+    /// empty gain list means the rest play as they are, exactly as a short eq
+    /// list means flat.
+    ///
+    /// Flat settings take the same path the mixer always took, down to the bit:
+    /// one lane at unity with the limiter off is still `open_multi_streams`
+    /// verbatim, with no mixer thread at all. A lane that is *not* at unity, or
+    /// a limiter that is on, is what puts a single-lane timeline through the
+    /// mixer -- a sum of one, which is where both settings live.
+    pub fn open_mixed_streams_master(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+        gains: &[f32],
+        limiter: Limiter,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, rest @ ..] = lanes else {
             return Ok(None);
         };
-        if rest.is_empty() {
+        let mastered = limiter.is_active() || gains.iter().any(|&g| g != 1.0);
+        if rest.is_empty() && !mastered {
             let flat = Vec::new();
             let plain = Vec::new();
             return Self::open_multi_streams_speed(
@@ -487,12 +518,20 @@ impl AudioSession {
             meta = Some(lane_meta);
             rxs.push(rx);
         }
-        let meta = meta.expect("at least two lanes opened above");
+        let meta = meta.expect("at least one lane opened above");
         let (tx, rx) = sync_channel(32);
         let channels = usize::from(meta.channels);
+        // One per lane, in the lanes' own order, padded with unity: a short
+        // list is "as it is from here on", the eq list's rule.
+        let mut gains = gains.to_vec();
+        gains.resize(lanes.len(), 1.0);
+        // Built here, off the thread that will run it, where the rate is known.
+        let limiter = limiter
+            .is_active()
+            .then(|| LimiterState::new(&limiter, meta.sample_rate, channels));
         thread::Builder::new()
             .name("audio-mix".into())
-            .spawn(move || mix(&rxs, channels, &tx))?;
+            .spawn(move || mix(&rxs, channels, &gains, limiter, &tx))?;
         Ok(Some((meta, rx)))
     }
 
@@ -1855,7 +1894,13 @@ struct Worker {
 /// The accumulator is reused across turns; the one allocation per chunk is the
 /// buffer the channel takes ownership of, and none of this is the RT path (the
 /// device callback reads the ring the feeder has already filled).
-fn mix(rxs: &[Receiver<AudioChunk>], channels: usize, tx: &SyncSender<AudioChunk>) {
+fn mix(
+    rxs: &[Receiver<AudioChunk>],
+    channels: usize,
+    gains: &[f32],
+    mut limiter: Option<LimiterState>,
+    tx: &SyncSender<AudioChunk>,
+) {
     let mut pending: Vec<Vec<f32>> = rxs.iter().map(|_| Vec::new()).collect();
     let mut live: Vec<bool> = rxs.iter().map(|_| true).collect();
     // Numbering follows lane 0, whose first chunk says where it starts.
@@ -1890,10 +1935,30 @@ fn mix(rxs: &[Receiver<AudioChunk>], channels: usize, tx: &SyncSender<AudioChunk
         let block = frames * channels;
         out.clear();
         out.resize(block, 0.0);
-        for lane in pending.iter_mut().filter(|p| !p.is_empty()) {
+        for (i, lane) in pending
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+        {
+            // The lane's own volume, applied on its way into the sum: this is
+            // the one place every lane's samples pass through, so a lane that
+            // is turned down is turned down in an export exactly as it is in
+            // the room. Unity is a multiply by 1.0, which f32 leaves alone.
+            let gain = gains.get(i).copied().unwrap_or(1.0);
             for (sum, sample) in out.iter_mut().zip(lane.drain(..block)) {
-                *sum += sample;
+                *sum += sample * gain;
             }
+        }
+        // ...and the master limiter over the sum, before the clamp: what the
+        // clamp used to catch by squaring it off is held under the ceiling
+        // here instead ([`crate::limiter`]). Off, this is not even a branch
+        // per sample.
+        if let Some(limiter) = limiter.as_mut() {
+            limiter.process(&mut out);
+        }
+        let frames = out.len() / channels;
+        if frames == 0 {
+            continue; // the limiter's delay line is still filling
         }
         let chunk = AudioChunk {
             start_sample: base + emitted,
