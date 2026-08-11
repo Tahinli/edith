@@ -66,10 +66,6 @@ const PRE_ROLL: u32 = 2;
 /// Frames per channel one AAC-LC packet carries. Fixed by the codec.
 const SAMPLES_PER_PACKET: u32 = 1024;
 
-/// Frames per channel one AC-3 syncframe carries. Fixed by the codec (6 blocks
-/// of 256), the way 1024 is fixed for AAC-LC.
-const AC3_SAMPLES_PER_FRAME: u32 = 1536;
-
 /// Syncframes decoded and thrown away ahead of an AC-3 seek target: one, for the
 /// 256-sample overlap-add the target frame is reconstructed with.
 const AC3_PRE_ROLL: u32 = 1;
@@ -541,17 +537,26 @@ impl AudioSession {
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
-        // Matroska: AAC is read out of one ([`Track::open`]) and everything
-        // else -- Opus, AC-3, DTS, none of which symphonia decodes at any
-        // version -- is named rather than left playing silent with no reason
-        // given. A Matroska file with no audio track at all returns `None` here
-        // like any other silent file.
+        // Matroska: what symphonia reads out of one ([`Track::open`]) plus the
+        // AC-3 and E-AC-3 whose blocks are handed to the Dolby decoder
+        // ([`MkvAc3Track`]); everything else -- Opus, DTS, which no decoder here
+        // has at any version -- is named rather than left playing silent with no
+        // reason given. A Matroska file with no audio track at all returns
+        // `None` here like any other silent file.
         if crate::demux::is_matroska(path.as_ref()) {
-            return Ok(
-                crate::demux::matroska_audio_codec(path.as_ref())?.map(|codec| {
-                    format!("the {codec} track of this Matroska file cannot be decoded (AAC only)")
-                }),
-            );
+            let Some(codec) = crate::demux::matroska_audio_codec(path.as_ref())? else {
+                return Ok(None);
+            };
+            // An AC-3 track that came up silent all the same is one that could
+            // not be read -- a laced block, an unreadable syncframe -- and the
+            // reader's own words are the ones worth showing.
+            return Ok(Some(match MkvAc3Track::open(path.as_ref()) {
+                Ok(Some(_)) => return Ok(None),
+                Ok(None) => format!(
+                    "the {codec} track of this Matroska file cannot be decoded (AAC and AC-3 only)"
+                ),
+                Err(e) => format!("the {codec} track of this Matroska file cannot be decoded: {e}"),
+            }));
         }
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
@@ -599,10 +604,24 @@ impl AudioSession {
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
         // A Matroska file has exactly one readable audio stream here -- the
-        // reader's default track ([`SymTrack::open`]) -- so it lists like a
+        // reader's default track ([`SymTrack::open`]), or the AC-3 / E-AC-3 one
+        // symphonia has no decoder for ([`MkvAc3Track`]) -- so it lists like a
         // standalone audio file rather than like an mp4, and one with no
         // readable track at all lists as the silent source it is.
         if crate::demux::is_matroska(path) {
+            // The AC-3 row describes what the decoder *emits*, which is the
+            // stereo the §7.8 downmix hands the timeline, not the 5.1 the file
+            // carries -- exactly as the mp4 AC-3 rows do.
+            if let Ok(Some(track)) = MkvAc3Track::open(path) {
+                return Ok(vec![StreamInfo {
+                    index: 0,
+                    codec: if track.mkv.codec == "eac3" { "e-ac-3" } else { "ac-3" }.into(),
+                    channels: track.channels,
+                    sample_rate: track.sample_rate,
+                    lang: None,
+                    decodable: matches!(track.channels, 1 | 2),
+                }]);
+            }
             let Ok(track) = SymTrack::open(path) else {
                 return Ok(Vec::new());
             };
@@ -924,7 +943,7 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         // Decoded, never copied: an AC-3 syncframe is not something an `mp4a`
         // sample table can hold. The export decodes it and encodes AAC, exactly
         // as it does for every other source no copy reaches.
-        Some(Track::Ac3(_)) => Err(uncopyable(path, "AC-3")),
+        Some(Track::Ac3(_) | Track::Mkv(_)) => Err(uncopyable(path, "AC-3")),
     }
 }
 
@@ -947,6 +966,9 @@ fn uncopyable(path: &Path, codec: &str) -> crate::Error {
 enum Track {
     Aac(AacTrack),
     Ac3(Ac3Track),
+    /// The same AC-3 decoder, fed out of a Matroska file's blocks instead of an
+    /// mp4's sample table.
+    Mkv(MkvAc3Track),
     Sym(SymTrack),
 }
 
@@ -965,15 +987,26 @@ impl Track {
     /// has exactly one, so any `stream` above 0 there is a promise the file
     /// cannot keep — an `Err`, the same as naming a stream an mp4 does not have.
     fn open(path: &Path, stream: usize) -> crate::Result<Option<Self>> {
-        // A Matroska file goes straight to symphonia, whose `mkv` reader is the
-        // one thing here that reads its packets -- neither mp4 reader can open
-        // the file at all. Sound this cannot decode (Opus, AC-3, DTS: symphonia
-        // has no such decoder at any version) leaves the source the silent one
-        // it always was, which `AudioSession::unsupported` puts into words,
-        // rather than failing the import of a file whose picture is fine.
+        // A Matroska file goes to symphonia, whose `mkv` reader is the one thing
+        // here that reads its packets -- neither mp4 reader can open the file at
+        // all -- except for the two codecs symphonia has no decoder for at any
+        // version and this project does: AC-3 and E-AC-3 are handed to the Dolby
+        // decoder straight out of the blocks ([`MkvAc3Track`]). Sound neither
+        // one can decode (Opus, DTS) leaves the source the silent one it always
+        // was, which `AudioSession::unsupported` puts into words, rather than
+        // failing the import of a file whose picture is fine -- and so does an
+        // AC-3 track that will not open, a laced block say.
         if crate::demux::is_matroska(path) {
             if stream > 0 {
                 return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
+            }
+            match MkvAc3Track::open(path) {
+                Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
+                Ok(None) => {}
+                // Named on the way past for the same reason symphonia's failure
+                // is, below: an AC-3 track that broke is a bug, not a codec we
+                // never had.
+                Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
             }
             // Logged on the way past: "silent" here covers both a codec nothing
             // decodes and a track that genuinely broke, and only the second is a
@@ -1015,6 +1048,7 @@ impl Track {
         match self {
             Self::Aac(t) => t.sample_rate,
             Self::Ac3(t) => t.sample_rate,
+            Self::Mkv(t) => t.sample_rate,
             Self::Sym(t) => t.sample_rate,
         }
     }
@@ -1030,6 +1064,11 @@ impl Track {
                 1 | 2 => Ok(t.channels),
                 n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
             },
+            // Downmixed by the very same decoder, out of a Matroska file.
+            Self::Mkv(t) => match t.channels {
+                1 | 2 => Ok(t.channels),
+                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
+            },
             Self::Sym(t) => match t.channels {
                 1 | 2 => Ok(t.channels),
                 n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
@@ -1042,6 +1081,7 @@ impl Track {
         match self {
             Self::Aac(t) => t.total_samples,
             Self::Ac3(t) => t.total_samples,
+            Self::Mkv(t) => t.total_samples,
             Self::Sym(t) => t.total_samples,
         }
     }
@@ -1051,6 +1091,9 @@ impl Track {
         match self {
             Self::Aac(t) => t.priming,
             Self::Ac3(t) => t.priming,
+            // Matroska writes no edit list and AC-3 has no encoder delay:
+            // block 0 is sample 0.
+            Self::Mkv(_) => 0,
             Self::Sym(t) => t.priming,
         }
     }
@@ -1061,6 +1104,7 @@ impl Track {
         match self {
             Self::Aac(t) => t.segment(source, start_secs, end_secs),
             Self::Ac3(t) => t.segment(source, start_secs, end_secs),
+            Self::Mkv(t) => t.segment(source, start_secs, end_secs),
             Self::Sym(t) => {
                 let media_target = t.media(start_secs);
                 Segment {
@@ -1082,7 +1126,10 @@ impl Track {
                 AacDecoder::try_new(&t.params, &AudioDecoderOptions::default())?;
             }
             Self::Ac3(t) => {
-                ac3_decoder(t.requested)?;
+                ac3_decoder("ac3", t.requested)?;
+            }
+            Self::Mkv(t) => {
+                ac3_decoder(t.mkv.codec, t.requested)?;
             }
             Self::Sym(t) => {
                 t.decoder()?;
@@ -1335,9 +1382,9 @@ impl Ac3Track {
             .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?
             .nfchans;
         let requested = (nfchans > 1).then_some(2);
-        let mut decoder = ac3_decoder(requested)?;
+        let mut decoder = ac3_decoder("ac3", requested)?;
         let channels = decode_ac3(&mut decoder, &first.bytes)?
-            .map(|pcm| (pcm.len() / AC3_SAMPLES_PER_FRAME as usize) as u16)
+            .map(|(pcm, samples)| (pcm.len() as u64 / samples.max(1)) as u16)
             .filter(|&c| c > 0)
             .ok_or("the first AC-3 syncframe decoded to nothing")?;
 
@@ -1382,6 +1429,101 @@ impl Ac3Track {
     }
 }
 
+/// One source's AC-3 or E-AC-3 track out of a **Matroska** file: the very same
+/// decoder and the very same §7.8 stereo downmix [`Ac3Track`] runs, fed out of
+/// the container's blocks instead of an mp4 sample table. A 5.1 E-AC-3 remux
+/// therefore arrives on the timeline as an ordinary stereo source, exactly as
+/// the mp4 path's does, and the mono passthrough quirk is the same one.
+///
+/// Matroska indexes no samples, so what an `stts` walk answers on the mp4 side
+/// is answered here by the blocks' own timestamps ([`crate::demux::MkvAudio`]):
+/// one block is one packet, one packet is one syncframe, and a seek lands on
+/// the block at or before the target with [`AC3_PRE_ROLL`] blocks of warm-up in
+/// front of it.
+struct MkvAc3Track {
+    mkv: crate::demux::MkvAudio,
+    sample_rate: u32,
+    /// What comes *out* of the decoder, measured on the first frame — 2 for
+    /// anything from stereo to 5.1, 1 for a mono track (see `requested`).
+    channels: u16,
+    total_samples: Option<u64>,
+    /// What the decoder is asked to hand out, from this track's own layout:
+    /// `Some(2)` for anything with more than one front channel, `None` for a
+    /// mono track. The reason is [`ac3_decoder`]'s `ponytail`, not this file's.
+    requested: Option<u16>,
+}
+
+impl MkvAc3Track {
+    /// `Ok(None)` when the file's first audio track is not AC-3 or E-AC-3 —
+    /// that mkv is the silent source it has always been. An `Err` is a track
+    /// that is one and could not be read, which
+    /// [`AudioSession::unsupported`] quotes back to the user.
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
+        let Some(mut mkv) = crate::demux::MkvAudio::open(path)? else {
+            return Ok(None);
+        };
+        let first = mkv
+            .frame(0)?
+            .ok_or("the AC-3 track of this Matroska file has no blocks")?;
+        // Rate and layout come out of the bit stream, which is where AC-3
+        // states them: Matroska's `Audio` element repeats them and muxers get
+        // that wrong often enough that the frame is the better source.
+        // `nfchans` excludes the LFE in both syntaxes, which is what the
+        // downmix decision wants.
+        let (sample_rate, nfchans) = if mkv.codec == "eac3" {
+            // Annex E's BSI starts right after the 16-bit syncword.
+            let bsi = oxideav_ac3::eac3::bsi::parse(first.get(2..).unwrap_or_default())
+                .map_err(|e| format!("not a readable E-AC-3 bit stream information: {e:?}"))?;
+            (bsi.sample_rate, bsi.nfchans)
+        } else {
+            let sync = oxideav_ac3::syncinfo::parse(&first)
+                .map_err(|e| format!("not a readable AC-3 syncframe: {e:?}"))?;
+            let bsi = oxideav_ac3::bsi::parse(first.get(5..).unwrap_or_default())
+                .map_err(|e| format!("not a readable AC-3 bit stream information: {e:?}"))?;
+            (sync.sample_rate, bsi.nfchans)
+        };
+        let requested = (nfchans > 1).then_some(2);
+        let mut decoder = ac3_decoder(mkv.codec, requested)?;
+        let (pcm, samples) =
+            decode_ac3(&mut decoder, &first)?.ok_or("the first AC-3 syncframe decoded to nothing")?;
+        let channels = (pcm.len() as u64 / samples.max(1)) as u16;
+        if channels == 0 {
+            return Err("the first AC-3 syncframe decoded to nothing".into());
+        }
+        // The track runs to the last block's timestamp plus that block's own
+        // frame -- a container that indexes nothing states no duration either,
+        // and every frame of a syncframe stream is the same length.
+        let last = mkv.secs(mkv.blocks().saturating_sub(1));
+        Ok(Some(Self {
+            total_samples: Some((last * f64::from(sample_rate)) as u64 + samples),
+            sample_rate,
+            channels,
+            requested,
+            mkv,
+        }))
+    }
+
+    /// `secs` on this source's timeline into media samples. No priming: the
+    /// container carries no edit list and AC-3 no encoder delay.
+    fn media(&self, secs: f64) -> u64 {
+        (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+    }
+
+    /// One `[start, end)` window, resolved to blocks and media samples —
+    /// [`Ac3Track::segment`] against block timestamps instead of an `stts`.
+    fn segment(&self, source: usize, start_secs: f64, end_secs: f64) -> Segment {
+        let media_target = self.media(start_secs);
+        let start_id = self.mkv.block_at(start_secs, AC3_PRE_ROLL as usize);
+        Segment {
+            source: Some(source),
+            start_id: start_id as u32,
+            start_pos: self.media(self.mkv.secs(start_id)),
+            media_target,
+            media_end: self.media(end_secs).max(media_target),
+        }
+    }
+}
+
 /// A fresh AC-3 decoder handing out `channels`: `Some(2)` is the library's own
 /// A/52 §7.8 stereo downmix, which is the whole reason the timeline can carry a
 /// 5.1 track at all. Fresh per segment for the same reason every other decoder
@@ -1392,32 +1534,47 @@ impl Ac3Track {
 /// mono track asks for no downmix at all and stays the mono source it is. The
 /// upgrade path is `Some(2)` unconditionally once the library duplicates the
 /// centre channel; the caller ([`Ac3Track::open`]) is the only thing to change.
-fn ac3_decoder(channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
+///
+/// `codec` is the track's own id — `ac3` or `eac3`, which the library registers
+/// separately (E-AC-3 claims up to 8 channels where AC-3 claims 6). The struct
+/// behind both dispatches per packet on `bsid` in any case, so what this picks
+/// is the capability set, not the syntax.
+fn ac3_decoder(codec: &str, channels: Option<u16>) -> crate::Result<Box<dyn Decoder>> {
     let mut registry = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut registry);
-    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    let mut params = CodecParameters::audio(CodecId::new(codec));
     params.channels = channels;
     registry
         .first_decoder(&params)
         .map_err(|e| format!("no AC-3 decoder: {e:?}").into())
 }
 
-/// One syncframe in, one buffer of interleaved f32 out. `Ok(None)` when the
-/// decoder wants more input before it can hand a frame back, which is not an
-/// error. The library speaks S16 little-endian; `/32768` is the whole
-/// conversion, and it lands in the `[-1, 1)` every other reader here emits.
-fn decode_ac3(decoder: &mut Box<dyn Decoder>, bytes: &[u8]) -> crate::Result<Option<Vec<f32>>> {
+/// One syncframe in, one buffer of interleaved f32 out and the frames per
+/// channel it holds. `Ok(None)` when the decoder wants more input before it can
+/// hand a frame back, which is not an error. The library speaks S16
+/// little-endian; `/32768` is the whole conversion, and it lands in the
+/// `[-1, 1)` every other reader here emits.
+///
+/// The frame count comes back beside the samples because an E-AC-3 frame is not
+/// the fixed 1536 (6 blocks of 256) an AC-3 one is -- `numblkscod` may say 1, 2
+/// or 3 blocks instead of 6 -- and dividing by an assumed length would put the
+/// channel count and every media position after it out.
+fn decode_ac3(
+    decoder: &mut Box<dyn Decoder>,
+    bytes: &[u8],
+) -> crate::Result<Option<(Vec<f32>, u64)>> {
     let packet = Ac3Packet::new(0, oxideav_core::TimeBase::new(1, 48_000), bytes.to_vec());
     decoder
         .send_packet(&packet)
         .map_err(|e| format!("AC-3 decode failed: {e:?}"))?;
     match decoder.receive_frame() {
-        Ok(Frame::Audio(audio)) => Ok(Some(
+        Ok(Frame::Audio(audio)) => Ok(Some((
             audio.data[0]
                 .chunks_exact(2)
                 .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
                 .collect(),
-        )),
+            u64::from(audio.samples),
+        ))),
         Ok(other) => Err(format!("AC-3 decoder handed back {other:?}").into()),
         Err(oxideav_core::Error::NeedMore) => Ok(None),
         Err(e) => Err(format!("AC-3 decode failed: {e:?}").into()),
@@ -2035,6 +2192,21 @@ fn run(mut w: Worker) {
                 }
                 continue;
             }
+            Track::Mkv(track) => {
+                if !run_mkv_ac3(
+                    track,
+                    seg,
+                    eq.as_mut(),
+                    speed,
+                    channels,
+                    &mut timeline,
+                    &w.tx,
+                ) || !settle(speed, channels, &mut timeline, &w.tx)
+                {
+                    return; // consumer went away
+                }
+                continue;
+            }
             Track::Ac3(track) => {
                 if !run_ac3(
                     track,
@@ -2200,7 +2372,7 @@ fn run_ac3(
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
 ) -> bool {
-    let mut decoder = match ac3_decoder(track.requested) {
+    let mut decoder = match ac3_decoder("ac3", track.requested) {
         Ok(decoder) => decoder,
         Err(e) => {
             eprintln!("audio decoder init failed: {e}");
@@ -2209,7 +2381,6 @@ fn run_ac3(
     };
     let mut pos = seg.start_pos;
     for id in seg.start_id..=track.sample_count {
-        let mut interleaved;
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
@@ -2221,15 +2392,75 @@ fn run_ac3(
                 return true;
             }
         };
-        match decode_ac3(&mut decoder, &sample.bytes) {
-            Ok(Some(pcm)) => interleaved = pcm,
+        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &sample.bytes) {
+            Ok(Some(decoded)) => decoded,
             Ok(None) => continue, // the decoder wants another frame first
             Err(e) => {
                 eprintln!("audio decode error at sample {id}: {e}");
                 return true;
             }
+        };
+        let next = pos + samples;
+        if !emit(
+            &mut interleaved,
+            channels,
+            seg,
+            eq.as_deref_mut(),
+            speed.as_mut(),
+            pos,
+            next,
+            timeline,
+            tx,
+        ) {
+            return false;
         }
-        let next = pos + (interleaved.len() / channels) as u64;
+        pos = next;
+    }
+    true
+}
+
+/// One segment of a Matroska AC-3 / E-AC-3 track: [`run_ac3`] reading blocks
+/// instead of mp4 samples. The decoder, the window rules ([`emit`]) and the
+/// stereo downmix are the same ones; only where a packet comes from differs.
+/// `false` means the consumer went away.
+fn run_mkv_ac3(
+    track: &mut MkvAc3Track,
+    seg: &Segment,
+    mut eq: Option<&mut EqState>,
+    speed: &mut Option<Resample>,
+    channels: usize,
+    timeline: &mut u64,
+    tx: &SyncSender<AudioChunk>,
+) -> bool {
+    let mut decoder = match ac3_decoder(track.mkv.codec, track.requested) {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            eprintln!("audio decoder init failed: {e}");
+            return true;
+        }
+    };
+    let mut pos = seg.start_pos;
+    for id in seg.start_id as usize.. {
+        if pos >= seg.media_end {
+            return true; // segment done, on to the next one
+        }
+        let block = match track.mkv.frame(id) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return true, // end of the track
+            Err(e) => {
+                eprintln!("audio demux error at block {id}: {e}");
+                return true;
+            }
+        };
+        let (mut interleaved, samples) = match decode_ac3(&mut decoder, &block) {
+            Ok(Some(decoded)) => decoded,
+            Ok(None) => continue, // the decoder wants another frame first
+            Err(e) => {
+                eprintln!("audio decode error at block {id}: {e}");
+                return true;
+            }
+        };
+        let next = pos + samples;
         if !emit(
             &mut interleaved,
             channels,
