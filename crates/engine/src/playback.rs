@@ -782,13 +782,13 @@ impl PlaybackSession {
         // The subtitle files are read here rather than in the parser: a
         // `.edith` names them and holds no cues. One that has gone missing, or
         // whose track is a codec of pictures, comes back listed and refused by
-        // name ([`crate::subtitle::open`]) -- a project does not stop opening
-        // over a subtitle, and a re-save does not lose the row.
-        let subtitles = doc
-            .subtitles
-            .iter()
-            .map(|(path, track)| crate::subtitle::open(path, *track))
-            .collect();
+        // name ([`crate::subtitle::open_all`]) -- a project does not stop
+        // opening over a subtitle, and a re-save does not lose the row.
+        //
+        // All of them in one call, in saved order, because a file is walked
+        // whole to reach one track: a film whose project names many of its
+        // tracks is one walk here rather than one per row.
+        let subtitles = crate::subtitle::open_all(&doc.subtitles);
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
             .with_mix(&doc.gains, doc.limiter)
             .with_tone(doc.tone)
