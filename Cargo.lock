@@ -1637,6 +1637,7 @@ dependencies = [
  "mp4",
  "oxideav-ac3",
  "oxideav-core",
+ "oxideav-h265",
  "rav1e",
  "rusty_aac",
  "rusty_h264",
@@ -3948,6 +3949,13 @@ dependencies = [
  "bytemuck",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "oxideav-h265"
+version = "0.0.9"
+dependencies = [
+ "oxideav-core",
 ]
 
 [[package]]
