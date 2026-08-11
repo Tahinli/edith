@@ -66,7 +66,17 @@ use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
 use crate::eq::EqParams;
+use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
+
+/// How far down a lane's own volume goes ([`Project::set_lane_gain_db`]).
+/// -60 dB is a thousandth of the amplitude -- a track that is out of the mix
+/// for every purpose but the honest one, which is that it is still a level and
+/// not a mute.
+pub const MIN_GAIN_DB: f32 = -60.0;
+/// ...and how far up. +12 dB is four times the amplitude, which is as much as
+/// a mix bus can take before the limiter is doing all the work.
+pub const MAX_GAIN_DB: f32 = 12.0;
 
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
 /// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
@@ -477,21 +487,29 @@ struct LaneData {
     kind: LaneKind,
     /// Sorted by `start` and disjoint ([`sorted_disjoint`]).
     clips: Vec<Clip>,
+    /// How loud this lane plays, in dB, `0.0` for one nobody has touched --
+    /// [`Project::lane_gain_db`]. Whole-lane and whole-band, which is what
+    /// makes it a different thing from a clip's equalizer: it moves everything
+    /// on the track by the same amount, cuts included. Meaningless on a video
+    /// lane, where it is kept at 0 and asked by nothing.
+    gain_db: f32,
 }
 
 impl LaneData {
+    fn new(kind: LaneKind, clips: Vec<Clip>) -> Self {
+        Self {
+            kind,
+            clips,
+            gain_db: 0.0,
+        }
+    }
+
     /// The two lanes a project starts with: `V1` then `A1`, in display order.
     /// One place, because a freshly opened file is exactly this pair.
     fn two_lanes(video: Vec<Clip>, audio: Vec<Clip>) -> Vec<LaneData> {
         vec![
-            LaneData {
-                kind: LaneKind::Video,
-                clips: video,
-            },
-            LaneData {
-                kind: LaneKind::Audio,
-                clips: audio,
-            },
+            LaneData::new(LaneKind::Video, video),
+            LaneData::new(LaneKind::Audio, audio),
         ]
     }
 }
@@ -600,6 +618,12 @@ pub struct Project {
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
     next_link: u32,
+    /// The master limiter every lane's sound is summed *through*
+    /// ([`Project::limiter`]). Off by default, and not in the lane list, which
+    /// is what the history snapshots hold: it is a setting on the mix, like the
+    /// project's resolution is a setting on the picture, and neither is an undo
+    /// step.
+    limiter: Limiter,
 }
 
 impl Project {
@@ -628,6 +652,7 @@ impl Project {
             color: Vec::new(),
             history: Vec::new(),
             next_link: 1,
+            limiter: Limiter::default(),
         }
     }
 
@@ -665,7 +690,7 @@ impl Project {
         }
         let lanes: Vec<LaneData> = lanes
             .into_iter()
-            .map(|(kind, clips)| LaneData { kind, clips })
+            .map(|(kind, clips)| LaneData::new(kind, clips))
             .collect();
         for (data, lane) in lanes.iter().zip(handles(&lanes)) {
             let name = lane.label();
@@ -735,6 +760,7 @@ impl Project {
             color,
             history: Vec::new(),
             next_link,
+            limiter: Limiter::default(),
         })
     }
 
@@ -770,10 +796,7 @@ impl Project {
     /// ([`Project::from_parts`]); nothing plays until something is placed.
     pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
         self.snapshot();
-        self.lanes.push(LaneData {
-            kind,
-            clips: Vec::new(),
-        });
+        self.lanes.push(LaneData::new(kind, Vec::new()));
         Lane::new(kind, self.lane_count(kind) - 1)
     }
 
@@ -1051,6 +1074,92 @@ impl Project {
             eq,
             color,
         )
+    }
+
+    /// How loud `lane` plays, in dB: `0.0` for one nobody has touched, and for
+    /// a lane that is not there. Whole-lane and whole-band -- every clip on the
+    /// track moves by it, which is what makes it a different control from a
+    /// clip's equalizer (one frequency range of one take) and from the master
+    /// volume (what this machine monitors at, which no file carries).
+    pub fn lane_gain_db(&self, lane: Lane) -> f32 {
+        self.index(lane).map_or(0.0, |i| self.lanes[i].gain_db)
+    }
+
+    /// Sets that lane's volume, clamped to [`MIN_GAIN_DB`]..=[`MAX_GAIN_DB`].
+    /// One undo step like every other edit -- it is in the lane list, so an
+    /// undo restores it with the rest. `false`, and no history, for a lane that
+    /// is not there, for a value that is not finite, and for one already set.
+    pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
+        let Some(i) = self.index(lane) else {
+            return false;
+        };
+        if !db.is_finite() {
+            return false;
+        }
+        let db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+        if self.lanes[i].gain_db == db {
+            return false;
+        }
+        self.snapshot();
+        self.lanes[i].gain_db = db;
+        true
+    }
+
+    /// Every lane's volume in dB, in display order -- what a save writes,
+    /// beside the lanes [`Project::without_orphan_sources`] hands back.
+    pub fn lane_gains(&self) -> Vec<f32> {
+        self.lanes.iter().map(|l| l.gain_db).collect()
+    }
+
+    /// The mix settings a *load* puts back: lane volumes in display order (a
+    /// short list leaves the rest at unity) and the master limiter, both
+    /// clamped as their setters clamp them.
+    ///
+    /// The load's own door, beside [`from_parts`](Project::from_parts): the
+    /// setters push an undo step, and a project that arrives one undo away from
+    /// a state it was never in is a project whose first ctrl+z is a surprise.
+    pub fn with_mix(mut self, gains: &[f32], limiter: Limiter) -> Self {
+        for (data, &db) in self.lanes.iter_mut().zip(gains) {
+            if db.is_finite() {
+                data.gain_db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+            }
+        }
+        self.limiter = limiter.with_ceiling(limiter.ceiling_db);
+        self
+    }
+
+    /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
+    /// lanes is multiplied by on its way into the mix: the same lanes in the
+    /// same order, as *amplitudes*, so the mixer never sees a decibel. `1.0`
+    /// for a lane nobody has turned, which is a multiply f32 leaves alone --
+    /// the bit-exact path.
+    pub fn audio_gains(&self) -> Vec<f32> {
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| db_to_linear(self.lane_gain_db(lane)))
+            .collect()
+    }
+
+    /// The master limiter the mix is summed through. A project setting, not a
+    /// clip's and not a lane's: there is one mix.
+    pub fn limiter(&self) -> Limiter {
+        self.limiter
+    }
+
+    /// Sets it, with the ceiling clamped to what [`Limiter`] allows. `false`
+    /// for a setting already in force.
+    ///
+    /// ponytail: not an undo step, for the reason the project resolution is not
+    /// one ([`crate::PlaybackSession::set_resolution`]) -- it is not in the
+    /// lane list the history snapshots. Upgrade path is a history entry that
+    /// holds the mix settings beside the lanes.
+    pub fn set_limiter(&mut self, limiter: Limiter) -> bool {
+        let limiter = limiter.with_ceiling(limiter.ceiling_db);
+        if self.limiter == limiter {
+            return false;
+        }
+        self.limiter = limiter;
+        true
     }
 
     /// What the clip at `idx` of `lane` plays through, or `None` for one that
@@ -5342,14 +5451,8 @@ mod tests {
             speed: Speed::NORMAL,
         };
         let lanes = vec![
-            LaneData {
-                kind: LaneKind::Video,
-                clips: vec![linked(3, 4)],
-            },
-            LaneData {
-                kind: LaneKind::Video,
-                clips: vec![linked(5, 4)],
-            },
+            LaneData::new(LaneKind::Video, vec![linked(3, 4)]),
+            LaneData::new(LaneKind::Video, vec![linked(5, 4)]),
         ];
         assert_eq!(
             links_are_consistent(&lanes).unwrap_err().to_string(),
@@ -5364,7 +5467,7 @@ mod tests {
     /// checked at the untrusted door and no edit can produce these.
     #[test]
     fn a_group_may_span_any_lane() {
-        let lane = |kind, clips: Vec<Clip>| LaneData { kind, clips };
+        let lane = |kind, clips: Vec<Clip>| LaneData::new(kind, clips);
         let one = |start: u32, end: u32, link| Clip {
             start,
             in_frame: start,
