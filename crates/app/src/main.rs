@@ -85,6 +85,13 @@ const WAVE_BPS: u32 = 40;
 /// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
 /// and a path with a point per pixel is a path per repaint.
 const WAVE_COL: f32 = 2.;
+/// The most columns one envelope is ever built from. A waveform is drawn into
+/// the slice of its box that is on the bed ([`visible_slice`]), and a bed is a
+/// screen wide, so nothing on screen ever reaches this -- it is the backstop for
+/// a box laid out wider than any screen, whose path would otherwise cost a point
+/// per two pixels of a width nobody can see and stall the repaint that was
+/// meant to draw the wave.
+const WAVE_COLS_MAX: usize = 4096;
 /// WCAG 2.5.8: nothing clickable is smaller than this. The scrub bar stays 6 px
 /// to look at -- `RULER_HIT_H` is the strip that has to be hit.
 const HIT_MIN: f32 = 24.;
@@ -281,6 +288,13 @@ struct AssetDrag(PathBuf, usize);
 struct ClipDrag {
     lane: Lane,
     idx: usize,
+    /// The clip that was picked up, so the drop can find it again: gpui freezes
+    /// the payload for the whole gesture, and an edit made *during* one -- a
+    /// stroke deletes, undoes or pastes, none of which a drag blocks -- ripples
+    /// the indices under it. The index alone would then name a different take at
+    /// the release, and the drag would move a clip nobody touched (see
+    /// [`live_idx`]).
+    clip: Clip,
 }
 
 /// A clip edge being dragged: which end of which clip, and the timeline frame
@@ -2610,6 +2624,16 @@ impl Player {
         Some(self.snap_to(raw, clip.frames(), &marks))
     }
 
+    /// Which index the clip in the hand is at *now*: [`live_idx`] against the
+    /// lane the drag named, since a stroke during the gesture moves the indices
+    /// gpui froze into the payload. Both halves of a drag ask it -- the line
+    /// drawn in flight and the drop that commits -- so the promise and the
+    /// landing are made about one clip.
+    fn dragged(&self, drag: &ClipDrag) -> Option<usize> {
+        let session = self.session.as_ref()?;
+        live_idx(session.lane_clips(drag.lane), drag.idx, drag.clip)
+    }
+
     /// The line while the clip is still in the hand: the very answer
     /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
     /// so what the eye was promised is where the release puts it. A pointer that
@@ -2780,39 +2804,13 @@ impl Player {
         }) else {
             return clip;
         };
-        match trim.edge {
-            // A still grows forward from source frame 0 instead, exactly as
-            // `Project::trim` writes it: with the in-point clamped at 0 the box
-            // below would slide left rather than stretch, and the release would
-            // then commit a wider clip than the drag drew.
-            Edge::Start
-                if self.session.as_ref().is_some_and(|session| {
-                    session
-                        .sources()
-                        .get(clip.source)
-                        .is_some_and(|s| engine::is_image(&s.path))
-                }) =>
-            {
-                Clip {
-                    in_frame: 0,
-                    out_frame: clip.end().saturating_sub(trim.to).max(1),
-                    start: trim.to,
-                    ..clip
-                }
-            }
-            // The in-point follows the head, exactly as `Project::trim` moves
-            // it: what stays on screen plays what it always played.
-            Edge::Start => Clip {
-                in_frame: (i64::from(clip.in_frame) + i64::from(trim.to) - i64::from(clip.start))
-                    .clamp(0, i64::from(clip.out_frame - 1)) as u32,
-                start: trim.to,
-                ..clip
-            },
-            Edge::End => Clip {
-                out_frame: clip.in_frame + trim.to.saturating_sub(clip.start).max(1),
-                ..clip
-            },
-        }
+        let still = self.session.as_ref().is_some_and(|session| {
+            session
+                .sources()
+                .get(clip.source)
+                .is_some_and(|s| engine::is_image(&s.path))
+        });
+        trimmed_clip(clip, trim.edge, trim.to, still)
     }
 
     /// How long the timeline is *drawn* as: its own length, and while a tail is
@@ -2820,6 +2818,15 @@ impl Player {
     /// at the last frame has nowhere to put a pointer that means "longer", so
     /// without this the last clip on the timeline could be pulled in and never
     /// let back out.
+    ///
+    /// Scroll room only, now that a second is an absolute number of pixels
+    /// ([`Scale`]): the extra length loosens [`View::settled`]'s clamp, which is
+    /// where the pixels past the last frame come from, and moves no box by a
+    /// pixel. It is still the *only* headroom at the tail -- zoomed in against
+    /// the end, that clamp pins the bed's right edge to the duration and an
+    /// End-trim of the last clip would have nowhere to be dragged to. What it
+    /// must not do is be read as a length anyone is told: the timecode reads
+    /// `PlaybackSession::timeline_duration` for exactly that reason.
     fn drawn_duration(&self) -> f64 {
         let Some(session) = &self.session else {
             return 0.;
@@ -4044,8 +4051,13 @@ impl Render for Player {
             // the window: it starts on a clip or on a library row and ends over
             // a lane, and only an ancestor of both hears all of it.
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ClipDrag>, _, cx| {
-                let ClipDrag { lane, idx } = *event.drag(cx);
-                this.preview_drop(lane, idx, event.event.position.x, cx);
+                // The clip the payload named, wherever an edit mid-drag has
+                // since put it ([`Player::dragged`]): the line has to promise a
+                // landing for the take actually in the hand.
+                let drag = *event.drag(cx);
+                if let Some(idx) = this.dragged(&drag) {
+                    this.preview_drop(drag.lane, idx, event.event.position.x, cx);
+                }
             }))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<AssetDrag>, _, cx| {
@@ -4908,10 +4920,20 @@ impl Player {
                     .gap(px(12.))
                     // Fixed width and one line: changing digits must not push
                     // the row around, nor wrap and change its height.
+                    // The timeline's own length, never the drawn one: a tail
+                    // being dragged inflates the bed to the room that edge has
+                    // ([`Player::drawn_duration`]), and for a still that room is
+                    // ten minutes -- a total that jumped to 10:00:00 the moment
+                    // a picture's edge was pressed, and back on release.
                     .child(div().flex_none().w(px(TIME_W)).truncate().child(format!(
                         "{} / {}",
                         timecode(position, self.fps),
-                        timecode(duration, self.fps)
+                        timecode(
+                            self.session
+                                .as_ref()
+                                .map_or(0., PlaybackSession::timeline_duration),
+                            self.fps
+                        )
                     )))
                     .child(
                         div()
@@ -7144,6 +7166,11 @@ impl Player {
         // it, so all of them move together when it does. No bed width is needed
         // to place them any more -- a second is so many pixels wherever it is.
         let scale = self.scale;
+        // How much bed there is to be seen on, measured off the ruler's own
+        // probe like every other question about it: what a box draws *inside*
+        // itself is clipped to this ([`visible_slice`]), because a box at a deep
+        // zoom is far wider than the strip it is being watched through.
+        let bed = f32::from(self.ruler.get().size.width);
         // Where the snap line stands, in the same pixels every box is placed
         // through -- and only while a gesture is actually live: gpui drops a
         // drag without telling anyone, so this asks whether one is in flight
@@ -7312,10 +7339,21 @@ impl Player {
                     // to -- its own included, which is the drag that moves a
                     // take along its track.
                     .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
-                        this.move_clip(drag.lane, drag.idx, lane, window.mouse_position().x, cx)
+                        // Against the lane as it is *now* ([`Player::dragged`]),
+                        // and then snapped by `move_clip` like any other drop:
+                        // which clip is being moved and where it lands are two
+                        // questions, and this is the first one.
+                        let Some(idx) = this.dragged(drag) else {
+                            return;
+                        };
+                        this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
+                        // The clip as the lane holds it, for the drag payload:
+                        // what a drop looks itself up by has to be the placed
+                        // clip, never the preview an edge drag is drawing.
+                        let placed = *clip;
                         // What a drag on an edge is showing, which is the clip
                         // itself while nothing is being dragged.
                         let clip = &self.trimmed(lane, i, *clip);
@@ -7341,15 +7379,30 @@ impl Player {
                                 .unwrap_or(clip.source),
                         );
                         let width = scale.width_px(len);
+                        let left = scale.px_at(start);
+                        // The slice of this box that is on the bed: where its
+                        // name, its badge and its waveform go, so none of the
+                        // three is drawn out at a zoomed-in box's own edges.
+                        let (vis_x, vis_w) = visible_slice(left, width, bed);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
                             .and_then(|s| self.waves.get(&(s.path.clone(), s.audio_stream)))
                             .cloned();
-                        let (from, to) = (
-                            f64::from(clip.in_frame) / self.fps,
-                            f64::from(clip.out_frame) / self.fps,
-                        );
+                        // The source seconds that slice plays -- not the clip's
+                        // whole range: the envelope is drawn for the part of the
+                        // box that can be seen, at the resolution of the pixels
+                        // it actually has, and never one column per two pixels
+                        // of a box millions of pixels wide.
+                        let along = |x: f32| match width > 0. {
+                            true => {
+                                f64::from(clip.in_frame)
+                                    + f64::from(clip.out_frame - clip.in_frame)
+                                        * f64::from(x / width)
+                            }
+                            false => f64::from(clip.in_frame),
+                        };
+                        let (from, to) = (along(vis_x) / self.fps, along(vis_x + vis_w) / self.fps);
                         let tip = tip.clone();
                         // What the pointer carries on the way to another lane:
                         // the file the box is showing, the same ghost a library
@@ -7372,7 +7425,7 @@ impl Player {
                             // off the left edge: the bed clips what hangs out
                             // of it, so a half-visible clip is drawn as the
                             // half of itself that is on screen.
-                            .left(px(scale.px_at(start)))
+                            .left(px(left))
                             .w(px(width))
                             .overflow_hidden()
                             .rounded(px(3.))
@@ -7393,9 +7446,14 @@ impl Player {
                             // starts the drag still selects, so picking a clip
                             // up and putting it back down where it was is
                             // exactly a click.
-                            .on_drag(ClipDrag { lane, idx: i }, move |_, _, _, cx| {
-                                cx.new(|_| Tip(ghost.clone()))
-                            })
+                            .on_drag(
+                                ClipDrag {
+                                    lane,
+                                    idx: i,
+                                    clip: placed,
+                                },
+                                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone())),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -7454,7 +7512,7 @@ impl Player {
                                 zone
                             }))
                             // Under the label row, never through it.
-                            .children(wave.filter(|_| audio).and_then(|wave| {
+                            .children(wave.filter(|_| audio && vis_w > 0.).and_then(|wave| {
                                 let inner: AnyElement = match wave {
                                     Wave::Peaks(peaks) => {
                                         waveform(peaks, from, to).into_any_element()
@@ -7490,8 +7548,8 @@ impl Player {
                                 Some(
                                     div()
                                         .absolute()
-                                        .left_0()
-                                        .right_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
                                         .top(px(LABEL_H))
                                         .bottom_0()
                                         .child(inner),
@@ -7502,24 +7560,44 @@ impl Player {
                             // cannot say whether a short clip is a trim or a
                             // clip at 4x, and that is the difference between a
                             // cut and a re-time.
-                            .when(!clip.speed.is_normal(), |d| {
+                            // Against the right edge of what is *visible* of the
+                            // box, not of the box: zoomed in, the box's own
+                            // right edge is off the screen and the badge with
+                            // it, which is a clip that stops saying it is
+                            // speeded exactly when it is being looked at
+                            // closely.
+                            .when(!clip.speed.is_normal() && vis_w > 0., |d| {
                                 d.child(
                                     div()
                                         .absolute()
                                         .top_0()
-                                        .right_0()
-                                        .px(px(3.))
-                                        .rounded(px(3.))
-                                        .bg(rgb(ACCENT))
-                                        .text_size(px(9.))
-                                        .text_color(rgb(SURFACE))
-                                        .child(format!("{}", clip.speed)),
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
+                                        .flex()
+                                        .justify_end()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .px(px(3.))
+                                                .rounded(px(3.))
+                                                .bg(rgb(ACCENT))
+                                                .text_size(px(9.))
+                                                .text_color(rgb(SURFACE))
+                                                .child(format!("{}", clip.speed)),
+                                        ),
                                 )
                             })
-                            .when_some(label.filter(|_| show_label(width)), |d, label| {
+                            // ...and the name sits at the left edge of the same
+                            // slice, for the same reason: a box scrolled half
+                            // off names itself on the half that is on screen.
+                            .when_some(label.filter(|_| show_label(vis_w)), |d, label| {
                                 d.child(
                                     div()
-                                        .relative()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
                                         .h(px(LABEL_H))
                                         .px(px(4.))
                                         .truncate()
@@ -9072,6 +9150,97 @@ fn show_label(w: f32) -> bool {
     w >= LABEL_MIN_W
 }
 
+/// The clip a trim is *showing*, worked out the way `Project::trim` will write
+/// it: the timeline room the edge leaves is turned into source frames by the one
+/// conversion that exists for it ([`Speed::fit`]), and the box is drawn from
+/// that. The preview and the commit are then the same arithmetic -- a box let go
+/// of stays where the hand left it at every rate. Assigning the timeline count
+/// straight to the source field, as this used to, drew a speeded clip's tail
+/// moving at the wrong rate (it snapped on release) and drew a *head* trim
+/// moving the clip's other edge, since the length it implied was not the length
+/// the release would commit.
+///
+/// A still grows forward from source frame 0 instead: every frame of it is the
+/// same picture, so there is no earlier one for an in-point to walk back to.
+///
+/// Room too narrow to hold one source frame is the edit the engine refuses, and
+/// the box is drawn unchanged rather than as something that will not be
+/// committed.
+fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip {
+    // An edge that has not moved is not an edit, and `Project::trim` refuses it
+    // as one: the press that starts a drag must draw the clip it pressed, not a
+    // clip a rounding narrower.
+    if to
+        == match edge {
+            Edge::Start => clip.start,
+            Edge::End => clip.end(),
+        }
+    {
+        return clip;
+    }
+    match edge {
+        Edge::Start => {
+            // What survives is measured from the *end* -- the frames that stay
+            // play what they always played, which is what makes this a trim.
+            let Some(keep) = clip.speed.fit(clip.end().saturating_sub(to)) else {
+                return clip;
+            };
+            match still {
+                true => Clip {
+                    in_frame: 0,
+                    out_frame: keep,
+                    start: to,
+                    ..clip
+                },
+                false => Clip {
+                    in_frame: clip.out_frame - keep.min(clip.out_frame),
+                    start: to,
+                    ..clip
+                },
+            }
+        }
+        Edge::End => match clip.speed.fit(to.saturating_sub(clip.start)) {
+            Some(keep) => Clip {
+                out_frame: clip.in_frame + keep,
+                ..clip
+            },
+            None => clip,
+        },
+    }
+}
+
+/// Which index on its own lane a dragged clip is at *now*: the one it was picked
+/// up at while nothing has moved, and wherever the clip itself has slid to when
+/// an edit during the drag rippled the lane's indices -- a delete, an undo or a
+/// paste from a stroke, none of which gpui's frozen drag payload hears about.
+/// `None` when the clip is gone altogether, and then the drop is not an edit at
+/// all: moving whatever slid into its place is the one thing the hand did not
+/// ask for. A lane's clips are disjoint and sorted, so at most one of them can
+/// be the clip that was picked up.
+fn live_idx(clips: &[Clip], idx: usize, clip: Clip) -> Option<usize> {
+    match clips.get(idx) {
+        Some(&at) if at == clip => Some(idx),
+        _ => clips.iter().position(|&c| c == clip),
+    }
+}
+
+/// The part of a clip's box that is on the bed, in the box's own pixels:
+/// `(left, width)` of its intersection with the visible strip. Everything drawn
+/// *inside* a box -- its waveform, its name, its speed badge -- is placed in
+/// here rather than at the box's own edges, which at a deep zoom sit thousands
+/// of pixels off either side of the screen: a label out there is a label nobody
+/// can read, and a waveform out there is a path with a point per two pixels of a
+/// width nobody can see. A bed that has not been measured yet answers with the
+/// whole box, which is what was drawn before there was a bed to clip to.
+fn visible_slice(left: f32, width: f32, bed: f32) -> (f32, f32) {
+    if bed <= 0. {
+        return (0., width);
+    }
+    let from = (-left).clamp(0., width);
+    let to = (bed - left).clamp(from, width);
+    (from, to - from)
+}
+
 /// Scales an envelope to its own loudest sample, so a quietly mastered source
 /// still draws as a shape. The fixtures peak around an eighth of full scale, and
 /// an eighth of a 30 px lane is a flat line -- which says "silent" about a file
@@ -9096,7 +9265,7 @@ fn envelope(peaks: &[(f32, f32)], from: f64, to: f64, w: f32, h: f32) -> Vec<(f3
     if peaks.is_empty() || w <= 0. || h <= 0. {
         return Vec::new();
     }
-    let cols = (w / WAVE_COL).ceil().max(1.) as usize;
+    let cols = ((w / WAVE_COL).ceil().max(1.) as usize).min(WAVE_COLS_MAX);
     let mid = h / 2.;
     (0..=cols)
         .map(|col| {
@@ -9761,10 +9930,10 @@ mod tests {
         LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
         MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
-        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, band_label, bitrate_refusal,
-        can_add, cancels_export, clipboard_after_remove, color_snap, containers, enable, envelope,
-        eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y, estimated_mb, export_path,
-        export_settings, format_key,
+        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
+        bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, containers,
+        enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
+        estimated_mb, export_path, export_settings, format_key,
         format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at,
         next_container,
@@ -9774,8 +9943,9 @@ mod tests {
         whole_take, window_title,
     };
     use super::{
-        LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
-        file_name, file_uri, library_rows, px_along, repeats, span_label, unscannable,
+        Edge, LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES,
+        ZOOM_STEP, file_name, file_uri, library_rows, live_idx, px_along, repeats, span_label,
+        trimmed_clip, unscannable, visible_slice,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -12733,6 +12903,141 @@ mod tests {
         assert!(envelope(&peaks, 0., 1., 0., h).is_empty());
         // A clip whose range runs past the peaks clamps to the last bucket.
         assert!(!envelope(&peaks, 0., 99., w, h).is_empty());
+    }
+
+    /// A box laid out wider than any screen -- a long clip at a deep zoom -- is
+    /// still one screen's worth of columns: the path a repaint has to build is
+    /// bounded by what can be seen, not by what the layout says the box is.
+    /// Unbounded, a 5 s clip zoomed to the frame is a path of millions of points
+    /// per frame, and the repaint that stalls on it is the waveform that
+    /// "disappeared".
+    #[test]
+    fn an_envelope_never_costs_more_points_than_a_screen_can_show() {
+        let peaks: Vec<(f32, f32)> = (0..200).map(|i| (-(i as f32) / 199., 1.)).collect();
+        // The width a 5 s clip is laid out at when the bed shows 8 frames of it.
+        let huge = 5. * 30. / 8. * 1200.;
+        let cols = envelope(&peaks, 0., 5., huge, 30.);
+        assert!(
+            cols.len() <= WAVE_COLS_MAX + 1,
+            "{} columns for a {huge} px box",
+            cols.len()
+        );
+        // ...and the slice actually painted is the part of the box on the bed,
+        // which is where that width stops mattering: a column per two visible
+        // pixels, at every zoom.
+        let (x, w) = visible_slice(-huge / 2., huge, 1200.);
+        assert_eq!((x, w), (huge / 2., 1200.));
+        assert_eq!(envelope(&peaks, 0., 5., w, 30.).len(), 601);
+        // A box entirely off the bed has no slice, and one that has never been
+        // measured is drawn whole -- what was drawn before there was a bed.
+        assert_eq!(visible_slice(2000., 500., 1200.), (0., 0.));
+        assert_eq!(visible_slice(-3000., 500., 1200.), (500., 0.));
+        assert_eq!(visible_slice(-40., 500., 0.), (0., 500.));
+        // Half on, at either edge.
+        assert_eq!(visible_slice(-100., 500., 1200.), (100., 400.));
+        assert_eq!(visible_slice(1000., 500., 1200.), (0., 200.));
+    }
+
+    /// The box a trim draws is the box its release commits, at every speed. The
+    /// preview used to hand the *timeline* frame count to a source-frame field:
+    /// at 2x a tail moved twice as fast as the pointer and snapped back on
+    /// release, and a head drag moved the clip's other edge.
+    #[test]
+    fn a_trim_preview_lands_where_the_release_commits() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        for permille in SPEED_PRESETS {
+            // Live, so the loop owes it no undo step: the speeds are the axis
+            // this walks, and the trims below are what is undone.
+            session
+                .set_speed_live(Lane::V1, 0, Speed::from_permille(permille))
+                .expect("a clip alone on its lane may be speeded");
+            for edge in [Edge::Start, Edge::End] {
+                let clip = session.lane_clips(Lane::V1)[0];
+                let (lo, hi) = session
+                    .trim_room(Lane::V1, 0, edge)
+                    .expect("clip 0 is there");
+                // Both walls and the middle of the room: the whole range a
+                // pointer can be clamped to.
+                for to in [lo, (lo + hi) / 2, hi] {
+                    let preview = trimmed_clip(clip, edge, to, false);
+                    // The drag is one edit and one undo step, so the next `to`
+                    // is measured from the same clip this one was.
+                    if session.trim_clip(Lane::V1, 0, edge, to) {
+                        assert_eq!(
+                            preview,
+                            session.lane_clips(Lane::V1)[0],
+                            "{edge:?} to {to} at {permille} per mille"
+                        );
+                        assert!(session.undo(), "the trim is one undo step");
+                    } else {
+                        // An edge already where it was asked to go is not an
+                        // edit, and the preview draws the clip unchanged.
+                        assert_eq!(preview, clip, "{edge:?} to {to} at {permille} per mille");
+                    }
+                    assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+                }
+            }
+        }
+    }
+
+    /// A still trims the same way, and the preview knows it: its head grows
+    /// forward from source frame 0 -- every frame of it is the same picture --
+    /// so the box stretches instead of sliding left.
+    #[test]
+    fn a_stills_trim_preview_grows_forward_like_the_commit() {
+        let mut session = PlaybackSession::open(asset("test_still.png")).expect("a picture opens");
+        for edge in [Edge::Start, Edge::End] {
+            let clip = session.lane_clips(Lane::V1)[0];
+            let (lo, hi) = session
+                .trim_room(Lane::V1, 0, edge)
+                .expect("clip 0 is there");
+            for to in [lo, (lo + hi) / 2, hi] {
+                let preview = trimmed_clip(clip, edge, to, true);
+                match session.trim_clip(Lane::V1, 0, edge, to) {
+                    true => {
+                        assert_eq!(
+                            preview,
+                            session.lane_clips(Lane::V1)[0],
+                            "a still {edge:?} to {to}"
+                        );
+                        assert!(session.undo(), "the trim is one undo step");
+                    }
+                    false => assert_eq!(preview, clip, "a still {edge:?} to {to}"),
+                }
+                assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+            }
+        }
+    }
+
+    /// gpui freezes a drag's payload for the whole gesture, and nothing stops a
+    /// stroke from editing the lane under it: the drop has to find the clip that
+    /// was picked up, not whatever slid into its index.
+    #[test]
+    fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
+        let at = |start: u32| Clip {
+            start,
+            in_frame: 0,
+            out_frame: 30,
+            source: 0,
+            link: None,
+            eq: None,
+            color: None,
+            fit: FitPolicy::Fit,
+            speed: Speed::NORMAL,
+        };
+        let lane = [at(0), at(30), at(60)];
+        let dragged = lane[2];
+        assert_eq!(live_idx(&lane, 2, dragged), Some(2), "nothing moved");
+        // A delete in front of it: the clip is now index 1, and the index the
+        // drag froze names a clip nobody grabbed.
+        let after = [at(0), at(60)];
+        assert_eq!(live_idx(&after, 2, dragged), Some(1));
+        assert_eq!(live_idx(&after, 1, dragged), Some(1));
+        // Deleted mid-drag: there is nothing to move, and moving its neighbour
+        // instead is exactly the bug this exists for.
+        assert_eq!(live_idx(&[at(0)], 2, dragged), None);
+        assert_eq!(live_idx(&[], 0, dragged), None);
     }
 
     #[test]
