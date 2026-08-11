@@ -14,6 +14,7 @@ use engine::color::ColorParams;
 use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{ExportSettings, Format};
+use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
@@ -475,6 +476,16 @@ const SILENCE_SECS_STEP: f64 = 0.05;
 const SILENCE_DB_RANGE: (f32, f32) = (-80., 0.);
 const SILENCE_SECS_RANGE: (f64, f64) = (0., 5.);
 
+/// One press of a nudge key on the mix card, in dB: the step every fader and
+/// the limiter's ceiling moves by. A whole decibel, the smallest move anyone
+/// hears as a move -- and it lands on round numbers, so a track set by ear
+/// still reads as a number a person would say.
+const MIX_DB_STEP: f32 = 1.;
+
+/// The mix card's rows below the faders: the limiter's ceiling and its switch.
+/// One fader per audio track comes first, however many there are.
+const MIX_MASTER_ROWS: usize = 2;
+
 /// The speed-up rate is bounded *below* by real time: a "speed-up" that slows
 /// the silence down would make the timeline longer, which is the one thing
 /// neither button may do. The top is [`Speed::MAX`].
@@ -763,6 +774,14 @@ struct Player {
     /// The bar is being dragged. On the root like the colour card's, for the
     /// same reason: the pointer leaves a 4 px bar on the first move.
     speed_dragging: bool,
+    /// The mix card is up: every audio track's own volume and the master
+    /// limiter, which are project settings and not any clip's -- so unlike the
+    /// four clip cards there is no handle to hold, only whether it is open.
+    mix_open: bool,
+    /// Which of its rows the arrow keys move -- a fader, the limiter's ceiling
+    /// or its switch. The card's own focus, since nothing in it takes gpui's
+    /// (ledger:182).
+    mix_field: usize,
     /// The silence card is up on this clip -- the lane it is on and its index
     /// there, exactly as the speed card's handle is.
     silence_open: Option<(Lane, usize)>,
@@ -973,6 +992,7 @@ impl Player {
             ActionId::Equalizer => self.open_eq(cx),
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
+            ActionId::Mix => self.open_mix(None, cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -1381,6 +1401,82 @@ impl Player {
         cx.notify();
     }
 
+    /// Opens the mix card. `lane` is the row it lands on -- the track whose
+    /// header was clicked -- and `None` starts at the top, which is what the
+    /// stroke means.
+    ///
+    /// Nothing here is a clip's, so nothing is refused for want of a selection:
+    /// a timeline with no audio track at all still has a limiter to set, and a
+    /// fader on an empty track is the level the next take lands at.
+    fn open_mix(&mut self, lane: Option<Lane>, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        self.mix_open = true;
+        self.mix_field = lane
+            .and_then(|lane| self.mix_lanes().iter().position(|&l| l == lane))
+            .unwrap_or(0);
+        // One card at a time, the rule the other five follow.
+        self.keys_open = false;
+        self.export_open = false;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.close_silence();
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// The audio tracks the card shows a fader for, top to bottom: *every* one
+    /// of them, empty ones included -- what the timeline lays out, not what the
+    /// mixer happens to open (`Project::audio_lanes` leaves an empty track out,
+    /// and a fader that disappeared when a track was cleared would be a setting
+    /// nobody could reach).
+    fn mix_lanes(&self) -> Vec<Lane> {
+        self.session.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|l| l.kind == LaneKind::Audio)
+                .collect()
+        })
+    }
+
+    /// Moves the row the card has picked: a fader by [`MIX_DB_STEP`], the
+    /// ceiling by the same, and the switch either way (a ring of two, like the
+    /// silence card's unit row).
+    ///
+    /// Every one of them goes through the session, so it reseeks: what the ear
+    /// hears while the arrow is held is the mix that is being set.
+    fn nudge_mix(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let lanes = self.mix_lanes();
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        match lanes.get(self.mix_field) {
+            Some(&lane) => {
+                let at = session.lane_gain_db(lane) + steps as f32 * MIX_DB_STEP;
+                session.set_lane_gain_db(lane, at);
+            }
+            None => {
+                let limiter = session.limiter();
+                let at = match self.mix_field - lanes.len() {
+                    0 => Limiter {
+                        on: limiter.on,
+                        ..limiter
+                    }
+                    .with_ceiling(limiter.ceiling_db + steps as f32 * MIX_DB_STEP),
+                    _ => Limiter {
+                        on: !limiter.on,
+                        ..limiter
+                    },
+                };
+                session.set_limiter(at);
+            }
+        }
+        cx.notify();
+    }
+
     /// Closes it and drops the preview with it: marks left on the lane after
     /// the card is gone would name frames the next edit has already moved.
     fn close_silence(&mut self) {
@@ -1643,6 +1739,7 @@ impl Player {
             || self.color_open.is_some()
             || self.speed_open.is_some()
             || self.silence_open.is_some()
+            || self.mix_open
             || self.exporting().is_some()
     }
 
@@ -1662,6 +1759,7 @@ impl Player {
             || self.color_open.is_some()
             || self.speed_open.is_some()
             || self.silence_open.is_some()
+            || self.mix_open
         {
             Repeat::Card
         } else {
@@ -3478,6 +3576,25 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The mix card, the same way again: ↑↓ pick a row -- a track's
+                // fader, the limiter's ceiling or its switch -- and ←→ move it,
+                // held or pressed. Card-local like the four above it.
+                if this.mix_open {
+                    let rows = this.mix_lanes().len() + MIX_MASTER_ROWS;
+                    if key == ESCAPE {
+                        this.mix_open = false;
+                    } else if key == "down" {
+                        this.mix_field = (this.mix_field + 1) % rows;
+                    } else if key == "up" {
+                        this.mix_field = (this.mix_field + rows - 1) % rows;
+                    } else if key == "right" {
+                        this.nudge_mix(1, cx);
+                    } else if key == "left" {
+                        this.nudge_mix(-1, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
@@ -3704,6 +3821,7 @@ impl Render for Player {
             .children(self.color_card(cx))
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
+            .children(self.mix_card(cx))
     }
 }
 
@@ -5428,6 +5546,174 @@ impl Player {
         )
     }
 
+    /// The mix card: one fader per audio track and the master limiter under
+    /// them -- the two settings that belong to the *sound of the whole
+    /// timeline* rather than to any clip on it.
+    ///
+    /// A track's fader moves everything on that track by the same amount,
+    /// every frequency of it: it is not the equalizer (one take, one band) and
+    /// it is not the volume in the panel, which is what this machine monitors
+    /// at and is written to no file. The limiter is over the sum of them all,
+    /// which is where a mix can pass full scale and where a clamp used to
+    /// square it off.
+    ///
+    /// The silence card's shape, down to the steppers: a row is a label, a
+    /// value and the two presses that move it, and the arrows pick a row and
+    /// move it too. The rows scroll rather than the card growing past the
+    /// window -- a timeline may hold more tracks than a 360 px window has room
+    /// for faders.
+    fn mix_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.mix_open {
+            return None;
+        }
+        let session = self.session.as_ref();
+        let lanes = self.mix_lanes();
+        let limiter = session.map_or_else(Limiter::default, PlaybackSession::limiter);
+        let mut rows: Vec<(String, String)> = lanes
+            .iter()
+            .map(|&lane| {
+                let db = session.map_or(0., |s| s.lane_gain_db(lane));
+                (format!("{} plays at", lane.label()), format!("{db:+.0} dB"))
+            })
+            .collect();
+        // The ceiling in dBFS and the faders in dB, the silence card's rule:
+        // a ceiling is a level below full scale, a fader is a change.
+        rows.push((
+            "Limiter ceiling".into(),
+            format!("{:+.0} dBFS", limiter.ceiling_db),
+        ));
+        rows.push((
+            "Limiter".into(),
+            match limiter.on {
+                true => "on".into(),
+                false => "off".into(),
+            },
+        ));
+        let rows: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(n, (label, value))| {
+                div()
+                    .id(("mix-row", n))
+                    .flex()
+                    .flex_none()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .justify_between()
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .bg(rgb(match n == self.mix_field {
+                        true => SELECTED,
+                        false => CHROME,
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.mix_field = n;
+                        cx.notify();
+                    }))
+                    .child(div().text_color(rgb(INK_DIM)).child(label))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(value)
+                            .children([-1, 1].map(|steps: i32| {
+                                div()
+                                    .id(("mix-step", n * 2 + usize::from(steps > 0)))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h(px(KEYS_ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(CHROME))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        // Picked as well as moved, the silence
+                                        // card's rule: the row a press lands on
+                                        // is the row the arrows carry on from.
+                                        this.mix_field = n;
+                                        this.nudge_mix(steps, cx);
+                                    }))
+                                    .child(match steps > 0 {
+                                        true => "+",
+                                        false => "−",
+                                    })
+                            })),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(0x101010cc))
+                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation()
+                })
+                .child(
+                    div()
+                        .w(px(COLOR_W))
+                        .max_h(px(360. - 24.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(SURFACE))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .child("Mix — track volumes and the master limiter"),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; esc closes",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("mix-rows")
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                // What the choice *is*: the limiter's own line,
+                                // because "on" alone says nothing about what it
+                                // does to a mix that never reaches the ceiling.
+                                .child(match limiter.on {
+                                    true => format!(
+                                        "the mix is held under {:+.0} dBFS — quieter passages are untouched",
+                                        limiter.ceiling_db
+                                    ),
+                                    false => "the limiter is out of circuit — a hot mix clips at full scale".to_string(),
+                                }),
+                        ),
+                ),
+        )
+    }
+
     /// The silence card: what the scan is looking for, what it found, and the
     /// two things that can be done about it.
     ///
@@ -6045,6 +6331,19 @@ impl Player {
             .map_or(&[][..], PlaybackSession::sources);
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
+        // What this track plays at, on the header it belongs to: shown only
+        // when it is not unity, because a column 40 px wide has room for a
+        // number or for a name, and the name is what a header is for. The
+        // press opens the mix card on this very track.
+        let gain_db = self
+            .session
+            .as_ref()
+            .map_or(0., |session| session.lane_gain_db(lane));
+        let gain_tip: SharedString = format!(
+            "{name} plays at {gain_db:+.0} dB — opens the mix ({}); the whole track, every frequency, unlike the equalizer",
+            self.keymap.display(ActionId::Mix)
+        )
+        .into();
         let tip: SharedString = format!(
             "Select (or {} under the playhead, {}/{} along the lane) — drag it to move it, an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Select),
@@ -6075,7 +6374,35 @@ impl Player {
                     .bg(rgb(SURFACE))
                     .text_size(px(11.))
                     .text_color(rgb(INK_DIM))
-                    .child(div().flex_1().flex().items_center().child(name))
+                    .child(match audio {
+                        // A button, not a label: the one setting a track has of
+                        // its own used to be reachable from nowhere.
+                        true => div()
+                            .id(("mix-lane", lane.ord))
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(gain_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.open_mix(Some(lane), cx)
+                            }))
+                            .child(match gain_db == 0. {
+                                true => name.clone(),
+                                false => format!("{name} {gain_db:+.0}"),
+                            })
+                            .into_any_element(),
+                        false => div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .child(name.clone())
+                            .into_any_element(),
+                    })
                     // The one thing a header does: take this track away again.
                     // A `HIT_MIN` target rather than a glyph-sized one, and it
                     // stays put on a track holding clips instead of hiding --
@@ -8583,6 +8910,9 @@ mod tests {
                         source.contains("this.remove_lane(lane, cx)")
                     }
                     ActionId::ToggleMute => element("volume"),
+                    // The fader on every audio track's own header, which is
+                    // also what opens the card the limiter is on.
+                    ActionId::Mix => element("mix-lane"),
                     ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
                     // The ruler seeks anywhere the pointer points; the frame and
                     // the second are the keyboard's finer grain of that move.
@@ -8614,6 +8944,8 @@ mod tests {
             "speed-preset",
             "silence-row",
             "silence-step",
+            "mix-row",
+            "mix-step",
             "silence-apply",
             "export-confirm",
         ] {
@@ -10820,6 +11152,8 @@ fn main() {
                     speed_open: None,
                     speed_bar: Rc::default(),
                     speed_dragging: false,
+                    mix_open: false,
+                    mix_field: 0,
                     silence_open: None,
                     // The conservative defaults the engine documents: a first
                     // scan that leaves a little too much is one nobody undoes.
