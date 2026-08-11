@@ -79,6 +79,7 @@ fn track() -> SubtitleTrack {
         path: asset(MEDIA),
         track: Some(2),
         label: "eng".into(),
+        bitmap: false,
         cues: vec![
             Cue {
                 start_us: 500_000,

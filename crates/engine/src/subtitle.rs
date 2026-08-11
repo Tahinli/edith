@@ -94,12 +94,25 @@ impl CueImage {
         // back on. The times themselves are the block's and are already on the
         // `Cue`, so they are written as nothing.
         let mut sup = Vec::with_capacity(self.set.len() + 64);
+        // Up to and including the `END` that closes the first display set which
+        // composes an object, and no further: a block is normally one set, but
+        // a muxer that packs a composition and the erase after it into one would
+        // otherwise leave the *erase* as the last word and decode to an empty
+        // canvas -- the cue drawn as nothing at all.
+        let mut shows = false;
         for (kind, body) in segments(&self.set)? {
             sup.extend_from_slice(b"PG");
             sup.extend_from_slice(&[0; 8]);
             sup.push(kind);
             sup.extend_from_slice(&(body.len() as u16).to_be_bytes());
             sup.extend_from_slice(body);
+            match kind {
+                oxideav_sub_image::pgs::SEG_PCS => {
+                    shows = body.get(10).is_some_and(|&n| n > 0);
+                }
+                oxideav_sub_image::pgs::SEG_END if shows => break,
+                _ => {}
+            }
         }
         decoder
             .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), sup))
@@ -139,6 +152,15 @@ pub struct SubtitleTrack {
     pub label: String,
     /// In start order. Empty when [`refused`](Self::refused) says why.
     pub cues: Vec<Cue>,
+    /// This track is pictures rather than text (`S_HDMV/PGS`). Not a refusal:
+    /// it is drawn over the picture like any other track, and what it cannot do
+    /// is be *written* as text -- an SRT carries none of it.
+    ///
+    /// Read off the codec id at every open rather than off the cues, because a
+    /// PGS track whose display sets are all erases -- or one with no cues at
+    /// all -- is still a track of pictures, and calling it text would have an
+    /// export promise to write words it does not have.
+    pub bitmap: bool,
     /// Why this track has no cues, when it has none: a codec that is pictures
     /// rather than text, a file that has gone missing since the project was
     /// saved. `None` for one that parsed -- which a track with genuinely no
@@ -156,6 +178,7 @@ impl SubtitleTrack {
             track,
             label,
             cues: Vec::new(),
+            bitmap: false,
             refused: Some(why),
         }
     }
@@ -164,11 +187,8 @@ impl SubtitleTrack {
     /// off a remux. What it decides is where words are the only answer: an
     /// export writes a *text* track and cannot carry these
     /// ([`crate::export::planned_subtitles`] says so out loud).
-    ///
-    /// Read off the first cue rather than all of them, because a track is one
-    /// codec: PGS blocks are pictures to the last one.
     pub fn is_bitmap(&self) -> bool {
-        self.cues.first().is_some_and(|c| c.image.is_some())
+        self.bitmap
     }
 }
 
@@ -212,6 +232,8 @@ fn external(path: &Path) -> SubtitleTrack {
             track: None,
             label,
             cues,
+            // Every format `parse_file` reads is text.
+            bitmap: false,
             refused: None,
         },
         Err(why) => SubtitleTrack::refused(path, None, label, why.to_string()),
@@ -229,12 +251,14 @@ pub fn of_matroska(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
                 (false, "und") => t.name.clone(),
                 (false, lang) => format!("{lang} — {}", t.name),
             };
+            let bitmap = t.codec == crate::demux::PGS;
             match cues_of(&mut t) {
                 Ok(cues) => SubtitleTrack {
                     path: path.to_path_buf(),
                     track: Some(t.number),
                     label,
                     cues,
+                    bitmap,
                     refused: None,
                 },
                 Err(why) => SubtitleTrack::refused(path, Some(t.number), label, why),
