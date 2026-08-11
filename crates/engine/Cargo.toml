@@ -22,6 +22,12 @@ image = { version = "0.25", default-features = false, features = [
     "webp",
 ] }
 mp4 = "0.14"
+# zlib, for the one Matroska `ContentEncodings` scheme that is not a byte off
+# the front of every block: mkvmerge compressed subtitle tracks with it for
+# years. No new crate tree and nothing new to compile -- `image` above already
+# pulls this exact version in through `png`, and it is the pure-Rust inflate the
+# rest of the ecosystem is built on.
+miniz_oxide = "0.8"
 rusty_h264 = { version = "0.8", default-features = false }
 # Both halves of AAC, and the only crate here that is asked for both. The
 # *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
