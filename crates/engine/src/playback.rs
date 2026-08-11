@@ -741,6 +741,13 @@ impl PlaybackSession {
         crate::export::planned_audio(&self.project, format)
     }
 
+    /// Why the sound's rate is not a choice for this timeline in this format --
+    /// [`crate::export::audio_rate_refusal`], asked of the project a front-end
+    /// is holding, and pure for the same reason.
+    pub fn audio_rate_refusal(&self, format: crate::export::Format) -> Option<&'static str> {
+        crate::export::audio_rate_refusal(&self.project, format)
+    }
+
     /// Why this session plays silent although the file has sound -- an audio
     /// track in a codec we cannot decode, or one the decoder refused. `None`
     /// when there is audio, and for a file that never had any. A front-end

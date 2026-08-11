@@ -11,8 +11,12 @@
 //! No picture is decoded anywhere here, so nothing needs the plugin and the
 //! whole file runs on any machine.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use mp4::{MediaType, Mp4Reader};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::{Lane, LaneKind, Source, Speed};
@@ -509,6 +513,164 @@ fn a_cancelled_audio_export_leaves_no_file() {
     assert!(text.contains("cancelled"), "{text}");
     assert!(!out.exists(), "no output file");
     assert!(!part_path(&out).exists(), "no half-written .part either");
+}
+
+/// The rate an MP3 file *declares*, read out of its own frame headers -- the
+/// only place the claim can be checked, since a caller's kbps is a request until
+/// the bytes say so. MPEG-1 Layer III, whose bitrate index is the high nibble of
+/// the third header byte.
+fn mp3_declared_kbps(path: &Path) -> u32 {
+    const KBPS: [u32; 16] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+    ];
+    let bytes = std::fs::read(path).expect("read the mp3 back");
+    let at = bytes
+        .windows(4)
+        .position(|w| w[0] == 0xFF && w[1] & 0xE0 == 0xE0)
+        .expect("an MPEG frame sync");
+    let header = &bytes[at..at + 4];
+    assert_eq!(header[1] >> 3 & 0x3, 0b11, "MPEG-1");
+    assert_eq!(header[1] >> 1 & 0x3, 0b01, "Layer III");
+    let kbps = KBPS[usize::from(header[2] >> 4)];
+    assert!(kbps > 0, "a free-format or invalid bitrate index");
+    kbps
+}
+
+/// What an mp4's AAC track is really coded at: its sample bytes over the time
+/// they play, in kbps. Every AAC-LC packet is 1024 frames per channel, so the
+/// duration comes out of the packet count and needs no timescale of the file's
+/// own -- and the bytes are what a player downloads, which is what a bitrate is.
+fn mp4_aac_kbps(path: &Path, sample_rate: f64) -> f64 {
+    let file = File::open(path).expect("reopen the mp4");
+    let size = file.metadata().unwrap().len();
+    let mut reader = Mp4Reader::read_header(BufReader::new(file), size).expect("mp4 header");
+    let track = reader
+        .tracks()
+        .values()
+        .find(|t| matches!(t.media_type(), Ok(MediaType::AAC)))
+        .expect("an AAC track")
+        .track_id();
+    let count = reader.sample_count(track).expect("sample count");
+    let mut bytes = 0usize;
+    for id in 1..=count {
+        bytes += reader
+            .read_sample(track, id)
+            .expect("read a sample")
+            .expect("a sample at every id")
+            .bytes
+            .len();
+    }
+    let seconds = f64::from(count) * 1024.0 / sample_rate;
+    bytes as f64 * 8.0 / seconds / 1000.0
+}
+
+/// The sound's rate is the caller's, in both kinds of file -- and the file
+/// nobody asked a rate of is the one this program always wrote.
+///
+/// MP3 declares its rate in every frame header, so that half is exact. The AAC
+/// half is measured off the mp4's own sample table: a rate control lands *near*
+/// its target rather than on it, so the tolerance is a fifth, which is far
+/// tighter than the gap between two offered rates.
+#[test]
+fn the_sound_is_written_at_the_rate_that_was_asked_for() {
+    // Untouched settings first: this is the byte-behaviour a user who never
+    // opens the row is entitled to keep.
+    for (kbps, want) in [
+        (None, engine::export::DEFAULT_AUDIO_KBPS),
+        (Some(128), 128),
+        (Some(320), 320),
+    ] {
+        let out = out_path(&format!("mp3_{}", want), "mp3");
+        let handle = engine::export::start(
+            mixed_project(),
+            meta(),
+            &out,
+            &ExportSettings {
+                format: Format::Mp3,
+                audio_kbps: kbps,
+                ..Default::default()
+            },
+        );
+        wait(&handle, Duration::from_secs(120)).expect("mp3 export");
+        let got = mp3_declared_kbps(&out);
+        println!("mp3 asked {kbps:?}, header says {got} kbps");
+        assert_eq!(got, want, "the mp3 frames declare the rate that was picked");
+        // ...and it is still the edit, not just bytes at the right rate.
+        let (meta, samples) = decode(&out);
+        let channels = usize::from(meta.channels);
+        assert!(rms(&samples, channels, 0.05, 0.95) > 0.01, "audible");
+        std::fs::remove_file(&out).unwrap();
+    }
+
+    // The same choice inside a video export, where the sound is AAC: a song
+    // under a still, which no mp4 sample table can be copied from, so the
+    // encoder really runs.
+    let project = Project::from_parts(
+        vec![
+            Source::new(asset("test_still.png"), 0),
+            Source::new(asset("test_tone.mp3"), 0),
+        ],
+        vec![
+            (
+                LaneKind::Video,
+                vec![Clip {
+                    start: 0,
+                    in_frame: 0,
+                    out_frame: 60,
+                    source: 0,
+                    link: None,
+                    eq: None,
+                    color: None,
+                    fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
+                }],
+            ),
+            (
+                LaneKind::Audio,
+                vec![Clip {
+                    start: 0,
+                    in_frame: 0,
+                    out_frame: 60,
+                    source: 1,
+                    link: None,
+                    eq: None,
+                    color: None,
+                    fit: FitPolicy::default(),
+                    speed: Speed::NORMAL,
+                }],
+            ),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a still under a song");
+    let meta = engine::VideoMeta {
+        width: 640,
+        height: 360,
+        frame_rate: 30.0,
+        frame_count: 60,
+        codec: engine::Codec::H264,
+    };
+    for want in [128u32, 320] {
+        let out = out_path(&format!("mp4_aac_{want}"), "mp4");
+        let handle = engine::export::start(
+            project.clone(),
+            meta,
+            &out,
+            &ExportSettings {
+                audio_kbps: Some(want),
+                ..Default::default()
+            },
+        );
+        wait(&handle, Duration::from_secs(300)).expect("an mp4 of a still under a song");
+        let got = mp4_aac_kbps(&out, f64::from(RATE));
+        println!("mp4 asked {want} kbps, the track measures {got:.1}");
+        assert!(
+            (got - f64::from(want)).abs() < f64::from(want) / 5.0,
+            "{got:.1} kbps for a {want} kbps request"
+        );
+        std::fs::remove_file(&out).unwrap();
+    }
 }
 
 /// A silent timeline cannot become an audio file, and says so rather than

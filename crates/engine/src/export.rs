@@ -76,6 +76,21 @@ const BITS_PER_PIXEL: f64 = 0.1;
 const MIN_BITRATE: u64 = 1_000_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
+/// The rates the sound may be coded at, smallest first -- what a front-end
+/// offers and what [`ExportSettings::audio_kbps`] is clamped into. Every one of
+/// them is a legal MPEG-1 Layer III value, so the MP3 path writes the figure it
+/// was given rather than the nearest one `rusty_mp3` snaps to.
+pub const AUDIO_KBPS: [u32; 4] = [128, 192, 256, 320];
+
+/// What the sound is coded at when nobody picked: the rate this project wrote
+/// before the choice existed. 256 and not the encoders' own 128, because an
+/// export is a master a person edits from again and this is a second lossy
+/// generation over sources that may already have been one -- measured on the
+/// suite's fixtures, an untouched clip re-encoded moves 0.15 dB here against
+/// 0.46 dB at 128, and 32 KB/s beside a 2.76 Mbps picture is not a size anyone
+/// is counting.
+pub const DEFAULT_AUDIO_KBPS: u32 = 256;
+
 /// `rav1e`'s fastest preset. Anything slower is minutes per second of timeline
 /// on a build with no assembly, which is what this one is.
 const AV1_SPEED: u8 = 10;
@@ -137,7 +152,8 @@ pub enum Format {
     Wav,
     /// The audio lanes alone, losslessly compressed.
     Flac,
-    /// The audio lanes alone, MPEG-1 Layer III at 256 kbps CBR (`rusty_mp3`).
+    /// The audio lanes alone, MPEG-1 Layer III CBR (`rusty_mp3`) at the rate
+    /// [`ExportSettings::audio_kbps`] asks for.
     Mp3,
 }
 
@@ -205,6 +221,13 @@ pub struct ExportSettings {
     /// The file to write. Defaults to [`Format::Mp4`], which is what every
     /// caller wrote before there was a choice.
     pub format: Format,
+    /// What the *sound* is coded at, in kbps, wherever an encoder writes it --
+    /// the AAC of a video export as much as an MP3. `None` is
+    /// [`DEFAULT_AUDIO_KBPS`], which is what every caller wrote before there
+    /// was a choice, so a settings value nobody touched writes the same bytes
+    /// it used to. Means nothing to WAV and FLAC, which code no rate, and
+    /// nothing to a *copied* AAC track, which carries its source's.
+    pub audio_kbps: Option<u32>,
 }
 
 struct Shared {
@@ -313,7 +336,7 @@ pub fn start(
             )
             .into()),
             format if format.has_video() => run(&project, &meta, &part, &worker, &settings),
-            format => run_audio(&project, &meta, &part, &worker, format),
+            _ => run_audio(&project, &meta, &part, &worker, &settings),
         };
         let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
@@ -375,6 +398,16 @@ fn bitrate_of(meta: &VideoMeta, settings: &ExportSettings) -> u64 {
     settings
         .bitrate
         .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE))
+}
+
+/// The rate the sound codes at: the caller's pick clamped into the offered
+/// range, [`DEFAULT_AUDIO_KBPS`] where there was none. Clamped and not refused,
+/// for [`bitrate_of`]'s reason -- a number out of range is a caller's slip and
+/// not a file worth failing.
+fn audio_kbps_of(settings: &ExportSettings) -> u32 {
+    settings.audio_kbps.map_or(DEFAULT_AUDIO_KBPS, |k| {
+        k.clamp(AUDIO_KBPS[0], AUDIO_KBPS[3])
+    })
 }
 
 /// The hardware seat for these settings, opened exactly as the export opens it
@@ -473,6 +506,25 @@ pub fn planned_audio(project: &Project, format: Format) -> &'static str {
     audio_label(project, format, has_sound(project), None)
 }
 
+/// Why the sound's rate is nothing this timeline can be asked about in this
+/// format, or `None` where it is a real choice: there is no sound to write, the
+/// format codes the samples themselves, or the packets are the source's own and
+/// carry the rate *it* was coded at. Pure, like [`planned_audio`], and a
+/// prediction in the same way -- a copy that turns out impossible (a source no
+/// mp4 sample table holds) falls through to [`encode_audio`], which codes at
+/// [`ExportSettings::audio_kbps`] like every other encode. So the value travels
+/// even where this refuses; what it cannot do is silently write a rate nobody
+/// picked.
+pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static str> {
+    match format {
+        _ if !has_sound(project) => Some("no sound to write"),
+        Format::Wav | Format::Flac => Some("lossless — the samples themselves, at no rate"),
+        Format::Mp3 => None,
+        _ if forces_encode(project) => None,
+        _ => Some("the source's own packets are copied — at the rate they hold"),
+    }
+}
+
 /// What [`start`] would encode the picture with, probed the way the export
 /// probes it -- the very encoder is opened and closed again -- so this is a
 /// measurement and not a promise. `None` for a format that carries no picture.
@@ -517,7 +569,11 @@ pub(crate) struct ExportAudio {
 /// ponytail: this holds the whole exported AAC track in memory (~3 kB per
 /// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
 /// `copy_segments` that yields packets instead of collecting them.
-fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<ExportAudio>> {
+fn copy_audio(
+    project: &Project,
+    meta: &VideoMeta,
+    kbps: u32,
+) -> crate::Result<Option<ExportAudio>> {
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
     // files stays in sync. A source whose AAC parameters disagree with the
@@ -541,7 +597,7 @@ fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Expor
     // whole comment is about.
     let lanes = project.audio_segments_from(0, meta.frame_rate);
     let [segments] = &lanes[..] else {
-        return encode_audio(project, meta);
+        return encode_audio(project, meta, kbps);
     };
     // ...and the same list names *which* lane those clips sit on, which is the
     // only way to ask what has been done to them.
@@ -579,7 +635,7 @@ fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Expor
     // such a lane would write it at unity and unlimited, silently.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
     if speeded || equalized(project) || mastered(project) {
-        return encode_audio(project, meta);
+        return encode_audio(project, meta, kbps);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
     // inside a Matroska file (readable, but not out of a sample table this walks
@@ -595,7 +651,7 @@ fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Expor
             packets,
             copied: true,
         })),
-        Err(_) => encode_audio(project, meta),
+        Err(_) => encode_audio(project, meta, kbps),
     }
 }
 
@@ -616,7 +672,11 @@ fn copy_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Expor
 /// minute of 48 kHz stereo), for [`run_audio`]'s reason -- `rusty_aac` buffers
 /// the whole stream anyway, since it encodes its frames in parallel. Upgrade
 /// path is a chunked push once that encoder streams.
-fn encode_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<ExportAudio>> {
+fn encode_audio(
+    project: &Project,
+    meta: &VideoMeta,
+    kbps: u32,
+) -> crate::Result<Option<ExportAudio>> {
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
@@ -654,14 +714,10 @@ fn encode_audio(project: &Project, meta: &VideoMeta) -> crate::Result<Option<Exp
     }
     samples.resize(total, 0.0);
 
-    // 256 kbps, not the encoder's 128 default: this is a *second* generation of
-    // lossy coding over a source that was already AAC, and the export is a
-    // master a person edits from again, not a delivery file. Measured on the
-    // suite's fixtures, an untouched clip re-encoded here moves 0.15 dB at this
-    // rate against 0.46 dB at 128 -- and 32 KB/s beside a 2.76 Mbps picture is
-    // not a size anyone is counting.
+    // The caller's rate, never the encoder's own 128 default -- see
+    // [`DEFAULT_AUDIO_KBPS`] for why the untouched figure is 256.
     let mut encoder = rusty_aac::AacEncoder::new(rusty_aac::AacEncoderConfig {
-        bitrate_bps: 256_000,
+        bitrate_bps: kbps * 1_000,
         ..Default::default()
     });
     encoder.push_pcm(&samples, audio.channels.max(1), audio.sample_rate)?;
@@ -702,7 +758,7 @@ fn run(
     // muxer wants the packets themselves that early too, because it interleaves
     // them into the clusters as it writes. Every video format gets the same
     // track: none of them is picture-only any more.
-    let audio = copy_audio(project, meta)?;
+    let audio = copy_audio(project, meta, audio_kbps_of(settings))?;
     let audio_params = audio.as_ref().map(|track| AudioParams {
         freq_index: track.params.freq_index,
         chan_conf: track.params.chan_conf,
@@ -947,8 +1003,9 @@ fn run_audio(
     meta: &VideoMeta,
     out: &Path,
     shared: &Shared,
-    format: Format,
+    settings: &ExportSettings,
 ) -> crate::Result<()> {
+    let format = settings.format;
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
     // The equalizers with them, so what is written is what is heard down to the
@@ -1011,7 +1068,7 @@ fn run_audio(
     match format {
         Format::Wav => write_wav(out, &samples, &audio)?,
         Format::Flac => write_flac(out, &samples, &audio)?,
-        Format::Mp3 => write_mp3(out, &samples, &audio)?,
+        Format::Mp3 => write_mp3(out, &samples, &audio, audio_kbps_of(settings))?,
         _ => unreachable!("the picture formats are `run`"),
     }
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
@@ -1043,18 +1100,17 @@ fn write_wav(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
 /// Rust like every other encoder here, and the reason this format is a row at
 /// all: the LGPL `shine-rs` was the only one when it was not.
 ///
-/// 256 kbps CBR, for [`encode_audio`]'s reason: an export is a master a person
-/// edits from again, not a delivery file, and this is a lossy generation over
-/// sources that may already have been one. The rate is snapped to a legal Layer
-/// III value by the encoder, and a sample rate MPEG has no frame for (anything
-/// but 8-48 kHz) is refused there by name rather than written as something else.
+/// CBR at the caller's rate, [`DEFAULT_AUDIO_KBPS`] where there was none. Every
+/// offered rate is already a legal Layer III value, so the encoder's snap is a
+/// backstop and not a silent substitution; a sample rate MPEG has no frame for
+/// (anything but 8-48 kHz) is refused there by name rather than written as
+/// something else.
 ///
-/// ponytail: CBR only, and no rate is offered to the caller -- the export card
-/// has one bitrate control and it is the *picture's*. Upgrade path is
-/// `Mp3EncoderConfig::vbr_quality` behind a setting of its own.
-fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()> {
+/// ponytail: CBR only -- the card offers rates and not a quality index. Upgrade
+/// path is `Mp3EncoderConfig::vbr_quality` behind a setting of its own.
+fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta, kbps: u32) -> crate::Result<()> {
     let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
-        bitrate_kbps: 256,
+        bitrate_kbps: kbps,
         vbr_quality: None,
     });
     // The samples are the 16-bit ones a WAV of this timeline holds, so the two

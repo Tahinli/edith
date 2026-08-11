@@ -326,7 +326,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 21] = [
+pub const FIXED: [Fixed; 22] = [
     // Not a chord at all but a way of pressing one, and the only place the
     // editor can say so: holding a key that moves a *value* runs it, and
     // holding anything else still does what one press did.
@@ -363,6 +363,11 @@ pub const FIXED: [Fixed; 21] = [
     Fixed {
         chord: "q",
         label: "Step through the export quality rows",
+        category: Category::File,
+    },
+    Fixed {
+        chord: "b",
+        label: "Step through the export sound bitrates",
         category: Category::File,
     },
     Fixed {
