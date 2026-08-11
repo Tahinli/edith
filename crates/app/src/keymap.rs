@@ -345,7 +345,7 @@ pub struct Fixed {
     pub category: Category,
 }
 
-pub const FIXED: [Fixed; 27] = [
+pub const FIXED: [Fixed; 28] = [
     // Not a chord at all but a way of pressing one, and the only place the
     // editor can say so: holding a key that moves a *value* runs it, and
     // holding anything else still does what one press did.
@@ -360,8 +360,13 @@ pub const FIXED: [Fixed; 27] = [
         category: Category::View,
     },
     Fixed {
+        chord: "n",
+        label: "Open the custom export bitrate field — ↑↓ step it",
+        category: Category::File,
+    },
+    Fixed {
         chord: "0–9",
-        label: "Type a custom export bitrate",
+        label: "Type into that field — nothing outside it",
         category: Category::File,
     },
     Fixed {
@@ -406,12 +411,12 @@ pub const FIXED: [Fixed; 27] = [
     },
     Fixed {
         chord: "enter",
-        label: "Start the export the card is set to",
+        label: "Start the export — or commit the bitrate field",
         category: Category::File,
     },
     Fixed {
         chord: "backspace",
-        label: "Erase a bitrate digit",
+        label: "Erase a digit in the bitrate field",
         category: Category::File,
     },
     // The equalizer card's own input, for the same reason the export card has
