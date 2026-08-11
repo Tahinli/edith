@@ -38,8 +38,11 @@ const SELECTED: u32 = 0x2a4a6b;
 /// One per source, so a clip that came from an imported file reads as coming
 /// from somewhere else. Same brightness as `SURFACE` and only the hue moves:
 /// the lane stays in the dark family the rest of the chrome lives in
-/// (ledger:187), and the first source keeps `SURFACE` exactly.
-const SOURCE_TINTS: [u32; 4] = [SURFACE, 0x3b3329, 0x293b33, 0x33293b];
+/// (ledger:187). The first entry is a colour like the rest rather than `SURFACE`
+/// itself -- a first import whose swatch is the panel's own background is a
+/// swatch nobody can see, and a file with one colour is what the whole
+/// association is built on.
+const SOURCE_TINTS: [u32; 4] = [0x29333b, 0x3b3329, 0x293b33, 0x33293b];
 /// The mirror of `SELECTED`: a drop the lane will not take, tinting the shadow
 /// a drag draws ([`Ghost`]) so a refusal is seen before the release rather than
 /// read afterwards. Same brightness as the rest of the chrome -- a warning, not
@@ -352,7 +355,7 @@ struct Ghost {
     /// as wide as the clip is *long where it lands*. Zero for a library row of
     /// unknown length, drawn as a head marker.
     frames: u32,
-    /// The swatch of the file being carried ([`Player::file_tint`]), so the
+    /// The swatch of the file being carried ([`file_tint`]), so the
     /// ghost reads as the thing in the hand.
     tint: u32,
     refused: bool,
@@ -3144,7 +3147,9 @@ impl Player {
                 .session
                 .as_ref()
                 .map_or(0, |session| session.file_frames(path)),
-            tint: self.file_tint(path),
+            // A path with no source entry has no colour of its own, and the
+            // shadow wears the lane's own instead of borrowing another file's.
+            tint: file_tint(self.sources(), path).unwrap_or(SURFACE),
             refused: lane_refuses(path, to).is_some(),
         };
         self.set_ghost(Some(ghost), cx);
@@ -3167,20 +3172,10 @@ impl Player {
     /// two sources and one colour. Every box on a lane and every ghost a drag
     /// draws asks this, so the shadow is recognisably the thing in the hand.
     fn clip_tint(&self, source: usize) -> u32 {
-        match self.sources().get(source) {
-            Some(entry) => self.file_tint(&entry.path),
-            None => source_tint(source),
-        }
-    }
-
-    /// The same swatch asked by path, which is what a library row is named by.
-    fn file_tint(&self, path: &Path) -> u32 {
-        source_tint(
-            self.sources()
-                .iter()
-                .position(|s| s.path == path)
-                .unwrap_or(0),
-        )
+        self.sources()
+            .get(source)
+            .and_then(|entry| file_tint(self.sources(), &entry.path))
+            .unwrap_or_else(|| source_tint(source))
     }
 
     fn sources(&self) -> &[Source] {
@@ -9353,6 +9348,86 @@ fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
     }
 }
 
+/// Every subtitle track one file gave, kept together. Plain data, planned
+/// before anything is drawn -- the grouping is the branchy part and it is the
+/// same answer whatever a styling puts around it.
+///
+/// ponytail: nothing draws these yet -- [`Player::subtitle_section`] still
+/// lists the flat rows. Ceiling: the model is proven by its tests and by
+/// nothing on screen. The upgrade is that section rendering groups instead.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+struct SubGroup {
+    /// What the group is called: the file without its extension, which is what
+    /// a person named the film even when the subtitles came out of a remux.
+    name: String,
+    /// What the swatch is asked by ([`file_tint`]) -- the file, so a subtitle
+    /// row and the media rows of the same file wear one colour. `None` from
+    /// that lookup for a standalone `.srt`, which is nobody's stream.
+    path: PathBuf,
+    rows: Vec<SubRow>,
+}
+
+/// One subtitle track, as a row shows it.
+#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+struct SubRow {
+    /// Which track of the session's list this row is: the *flat* index into the
+    /// add-order Vec `PlaybackSession::subtitles` hands back, which is what a
+    /// click sets `sub_track` to and what a save writes into the `.edith`.
+    /// Grouping moves rows around on screen and never touches this number.
+    track: usize,
+    /// Which of *this file's* tracks it is, counted from 1 -- the numbering
+    /// [`row_name`] gives audio streams, for the same reason: two tracks off one
+    /// remux that both say "eng" are told apart by nothing else.
+    number: usize,
+    label: String,
+    /// The row's second line ([`subtitle_detail`]).
+    detail: String,
+    /// Why it cannot be shown, for a track that cannot: the only thing that
+    /// greys a row out. Listed all the same -- a picker that hides them is a
+    /// picker that lies.
+    refused: Option<String>,
+    /// Pictures rather than lines ([`engine::subtitle::SubtitleTrack::bitmap`]).
+    bitmap: bool,
+}
+
+/// The subtitle list as rows under the file each came out of: one group per
+/// distinct path, in the order the files first appear, and each file's tracks
+/// in the order they were added. Two remuxes' tracks arriving interleaved --
+/// which is what importing a second film does -- still read as two films.
+#[allow(dead_code)]
+fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<SubGroup> {
+    let mut groups: Vec<SubGroup> = Vec::new();
+    for (track, sub) in tracks.iter().enumerate() {
+        let group = match groups.iter().position(|g| g.path == sub.path) {
+            Some(i) => &mut groups[i],
+            None => {
+                groups.push(SubGroup {
+                    name: sub
+                        .path
+                        .file_stem()
+                        .map_or_else(|| file_name(&sub.path), |s| s.to_string_lossy().into()),
+                    path: sub.path.clone(),
+                    rows: Vec::new(),
+                });
+                groups.last_mut().expect("just pushed")
+            }
+        };
+        group.rows.push(SubRow {
+            track,
+            number: group.rows.len() + 1,
+            // A track whose only name is the tag for "nobody said" says that
+            // in words, here, rather than showing the tag itself.
+            label: lang_human(&sub.label).to_string(),
+            detail: subtitle_detail(sub),
+            refused: sub.refused.clone(),
+            bitmap: sub.is_bitmap(),
+        });
+    }
+    groups
+}
+
 /// Where a cue is drawn on the bed: left edge and width in pixels, through the
 /// same [`Scale`] every clip box goes through -- so a cue and the take it is
 /// spoken over line up at every zoom, which is the only reason the strip is
@@ -9832,13 +9907,24 @@ fn row_name(path: &Path, stream: usize, several: bool) -> String {
 fn stream_detail(info: &StreamInfo) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(lang) = &info.lang {
-        parts.push(lang.clone());
+        parts.push(lang_human(lang).to_string());
     }
     if info.sample_rate > 0 {
         parts.push(format!("{} kHz", f64::from(info.sample_rate) / 1000.));
     }
     parts.extend(layout(info.channels));
     parts.join(" ")
+}
+
+/// A language tag as a person reads it. Everything a file writes is passed
+/// through untouched bar the one tag that is not a language: "und" is what a
+/// muxer writes when nobody said, and a row showing it verbatim names a
+/// language nobody speaks.
+fn lang_human(lang: &str) -> &str {
+    match lang {
+        "und" => "unknown language",
+        lang => lang,
+    }
 }
 
 fn layout(channels: u16) -> Option<String> {
@@ -9909,6 +9995,20 @@ fn window_title(name: &str) -> String {
 /// bright enough to leave the family.
 fn source_tint(source: usize) -> u32 {
     SOURCE_TINTS[source % SOURCE_TINTS.len()]
+}
+
+/// The tint of a *file*, which is what a library row is named by: the first
+/// source entry naming it, since two audio streams of one file are two sources
+/// and one colour.
+///
+/// `None` for a path no source names -- a standalone `.srt` is on nobody's
+/// timeline, and painting it with the first file's colour would say it came out
+/// of that file. No swatch says what is true: it belongs to itself.
+fn file_tint(sources: &[Source], path: &Path) -> Option<u32> {
+    sources
+        .iter()
+        .position(|s| s.path == path)
+        .map(source_tint)
 }
 
 /// What the export card offers, top to bottom. Bitrate is the only thing the
@@ -11924,7 +12024,8 @@ mod tests {
     };
     use super::{
         SUB_BOTTOM, SUB_CUE_MIN_W, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H, SUB_TEXT, cue_box,
-        cues_at, is_matroska, is_subtitle, subtitle_detail, subtitle_notice, subtitle_strip_h,
+        cues_at, file_tint, is_matroska, is_subtitle, lang_human, subtitle_detail, subtitle_notice,
+        subtitle_rows, subtitle_strip_h,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -15909,8 +16010,10 @@ mod tests {
 
     #[test]
     fn source_tints_differ_per_source_and_cycle() {
-        // The file the session opened with is the unchanged lane colour.
-        assert_eq!(source_tint(0), SURFACE);
+        // The bug: the first entry *was* `SURFACE`, so the first file imported
+        // -- the one every session has -- wore the panel's own background and
+        // had no visible swatch at all.
+        assert_ne!(source_tint(0), SURFACE);
         // Neighbouring sources must not share one, or an import is invisible.
         assert_ne!(source_tint(0), source_tint(1));
         assert_ne!(source_tint(1), source_tint(2));
@@ -15919,6 +16022,187 @@ mod tests {
         assert_eq!(source_tint(4), source_tint(0));
         assert_eq!(source_tint(9), source_tint(1));
         assert_eq!(source_tint(usize::MAX), SOURCE_TINTS[usize::MAX % 4]);
+    }
+
+    /// Not "they are different numbers" -- different *enough to see*, against
+    /// each other and against the surface a swatch is drawn on. The palette is
+    /// deliberately dark and low-saturation, so the margin is thin and a new
+    /// tint picked by eye can land inside it without anyone noticing.
+    #[test]
+    fn source_tints_are_all_discernible() {
+        // Summed channel distance: `SURFACE` to the warm tint is 18, and that
+        // step is the one already accepted as readable on a lane.
+        let apart = |a: u32, b: u32| {
+            (0..3)
+                .map(|i| {
+                    let shift = i * 8;
+                    ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff)
+                })
+                .sum::<u32>()
+        };
+        for (i, &tint) in SOURCE_TINTS.iter().enumerate() {
+            assert!(
+                apart(tint, SURFACE) >= 16,
+                "tint {i} is {} from the panel it sits on",
+                apart(tint, SURFACE)
+            );
+            for (j, &other) in SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+                assert!(
+                    apart(tint, other) >= 16,
+                    "tints {i} and {j} are only {} apart",
+                    apart(tint, other)
+                );
+            }
+        }
+        // The two a person sees side by side first must be further apart than
+        // the floor: source 0 and source 1 are the first import and the second.
+        assert!(apart(SOURCE_TINTS[0], SOURCE_TINTS[1]) >= 32);
+    }
+
+    /// A `.srt` dropped on the window is nobody's stream: it has no source
+    /// entry, and the lookup that used to fall back to index 0 painted it with
+    /// the first file's colour -- a swatch saying it came out of a film it
+    /// never touched.
+    #[test]
+    fn a_standalone_subtitle_wears_no_file_tint() {
+        let sources = [
+            Source {
+                path: PathBuf::from("/films/a.mkv"),
+                audio_stream: 0,
+            },
+            Source {
+                path: PathBuf::from("/films/b.mp4"),
+                audio_stream: 0,
+            },
+            // A second stream of the first file is a second source and the
+            // same colour.
+            Source {
+                path: PathBuf::from("/films/a.mkv"),
+                audio_stream: 1,
+            },
+        ];
+        assert_eq!(
+            file_tint(&sources, Path::new("/films/a.mkv")),
+            Some(source_tint(0))
+        );
+        assert_eq!(
+            file_tint(&sources, Path::new("/films/b.mp4")),
+            Some(source_tint(1))
+        );
+        assert_eq!(file_tint(&sources, Path::new("/subs/a.eng.srt")), None);
+        assert_eq!(file_tint(&[], Path::new("/films/a.mkv")), None);
+    }
+
+    fn sub(path: &str, track: Option<u64>, label: &str) -> engine::subtitle::SubtitleTrack {
+        engine::subtitle::SubtitleTrack {
+            path: PathBuf::from(path),
+            track,
+            label: label.to_string(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        }
+    }
+
+    /// The list is in the order tracks were added, which is not the order a
+    /// person reads it in: importing a second film puts its tracks after the
+    /// first film's, and importing a third `.srt` for the first film puts that
+    /// one last of all. The rows still read as three sources.
+    #[test]
+    fn subtitle_rows_group_a_source_however_they_were_added() {
+        let tracks = [
+            sub("/films/a.mkv", Some(1), "eng"),
+            sub("/films/b.mkv", Some(1), "eng"),
+            sub("/films/a.mkv", Some(2), "fre"),
+            sub("/subs/late.srt", None, "late.srt"),
+            sub("/films/b.mkv", Some(3), "ger"),
+        ];
+        let groups = subtitle_rows(&tracks);
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "late"],
+            "one group per file, in the order the files first appear"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| g.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [vec!["eng", "fre"], vec!["eng", "ger"], vec!["late.srt"]],
+            "a file's tracks are contiguous and in add order"
+        );
+        // Numbered within the file, the way `row_name` numbers audio streams:
+        // two tracks that both say "eng" are told apart by nothing else.
+        assert_eq!(
+            groups
+                .iter()
+                .map(|g| g.rows.iter().map(|r| r.number).collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [vec![1, 2], vec![1, 2], vec![1]]
+        );
+        // The swatch key is the file, so a group and that file's media rows
+        // wear one colour -- and the standalone one has none.
+        let sources = [Source {
+            path: PathBuf::from("/films/a.mkv"),
+            audio_stream: 0,
+        }];
+        assert_eq!(
+            file_tint(&sources, &groups[0].path),
+            Some(source_tint(0)),
+            "the group carries the path the tint is asked by"
+        );
+        assert_eq!(file_tint(&sources, &groups[2].path), None);
+    }
+
+    /// The one thing regrouping must not break: `sub_track` is a flat index
+    /// into the add-order list, a click sets it and a save writes it into the
+    /// `.edith`. Every row must still name the track it was made from -- rows
+    /// for refused tracks included, because they take a number in that list
+    /// whether or not anyone can pick them.
+    #[test]
+    fn a_subtitle_row_names_the_flat_track_it_was_made_from() {
+        let mut tracks = vec![
+            sub("/films/a.mkv", Some(1), "eng"),
+            sub("/films/b.mkv", Some(1), "eng"),
+            sub("/films/a.mkv", Some(2), "fre"),
+        ];
+        // Track 1 of b is pictures: still a row, still index 1 of the list.
+        tracks[1].bitmap = true;
+        tracks[1].refused = Some("PGS subtitles are pictures".to_string());
+        let groups = subtitle_rows(&tracks);
+        let flat: Vec<(usize, &str)> = groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|r| (r.track, r.label.as_str())))
+            .collect();
+        assert_eq!(flat, [(0, "eng"), (2, "fre"), (1, "eng")]);
+        for (track, label) in flat {
+            assert_eq!(
+                tracks[track].label, label,
+                "row {track} picks the track it names"
+            );
+        }
+        // (c) The refused one is here, saying why, and greyable by that alone.
+        let refused = &groups[1].rows[0];
+        assert_eq!(
+            refused.refused.as_deref(),
+            Some("PGS subtitles are pictures")
+        );
+        assert_eq!(refused.detail, "PGS subtitles are pictures");
+        assert!(refused.bitmap);
+        // ...and it was counted: the row after it in add order is still 2.
+        assert_eq!(groups[0].rows[1].track, 2);
+    }
+
+    /// "und" is what a muxer writes when nobody said what the language is. A
+    /// row showing it verbatim names a language nobody speaks.
+    #[test]
+    fn an_untagged_language_says_it_is_unknown() {
+        assert_eq!(lang_human("und"), "unknown language");
+        assert_eq!(lang_human("eng"), "eng");
+        assert_eq!(lang_human("fre — Commentary"), "fre — Commentary");
+        // Reaching the subtitle rows too: a track whose only name was the tag.
+        let groups = subtitle_rows(&[sub("/films/a.mkv", Some(1), "und")]);
+        assert_eq!(groups[0].rows[0].label, "unknown language");
     }
 
     /// The bug: an empty timeline is end-of-stream from its one black frame
