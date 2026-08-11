@@ -640,7 +640,11 @@ impl AudioSession {
                     decodable: matches!(track.channels, 1 | 2),
                 }]);
             }
-            let Ok(track) = SymTrack::open(path) else {
+            // No audio track lists as the silent source it is; a track that
+            // will not open at all is an `Err` here, as it is in
+            // [`Track::open`] -- a listing that quietly came back empty for a
+            // broken file is how a lane ends up silent with nothing to go on.
+            let Some(track) = SymTrack::open(path)? else {
                 return Ok(Vec::new());
             };
             return Ok(vec![StreamInfo {
@@ -653,7 +657,7 @@ impl AudioSession {
             }]);
         }
         if crate::is_audio(path) {
-            let track = SymTrack::open(path)?;
+            let track = SymTrack::open_required(path)?;
             return Ok(vec![StreamInfo {
                 index: 0,
                 codec: track.codec.into(),
@@ -1025,8 +1029,8 @@ impl Track {
         // decoder straight out of the blocks ([`MkvAc3Track`]). Sound neither
         // one can decode (Opus, DTS) leaves the source the silent one it always
         // was, which `AudioSession::unsupported` puts into words, rather than
-        // failing the import of a file whose picture is fine -- and so does an
-        // AC-3 track that will not open, a laced block say.
+        // failing the import of a file whose picture is fine. A track that will
+        // not open at all is *not* in that group: see below.
         if crate::demux::is_matroska(path) {
             if stream > 0 {
                 return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
@@ -1034,24 +1038,27 @@ impl Track {
             match MkvAc3Track::open(path) {
                 Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
                 Ok(None) => {}
-                // Named on the way past for the same reason symphonia's failure
-                // is, below: an AC-3 track that broke is a bug, not a codec we
-                // never had.
+                // Named on the way past rather than returned: symphonia gets the
+                // same file next and may read the track perfectly well (a laced
+                // block is [`MkvAc3Track`]'s limitation, not the file's), and
+                // if it cannot either, *its* `Err` is the one that comes back.
                 Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
             }
-            // Logged on the way past: "silent" here covers both a codec nothing
-            // decodes and a track that genuinely broke, and only the second is a
-            // bug -- with no trace at all it reaches the user as a lane that
-            // drew no waveform and nothing else to go on.
-            return Ok(SymTrack::open(path)
-                .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
-                .ok()
-                .filter(|t| {
-                    t.decoder()
-                        .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
-                        .is_ok()
-                })
-                .map(Self::Sym));
+            // Two things are silent here and no more: a file with no audio
+            // track at all, and a track whose codec nothing in this project
+            // decodes (Opus, DTS -- [`AudioSession::unsupported`] is what puts
+            // that into words). A track that will not *open* is an `Err`, the
+            // same answer the mp4 arm gives: turned into silence it would play
+            // and export as a hole with only an eprintln to say why, which is a
+            // bug wearing a feature's clothes.
+            let Some(track) = SymTrack::open(path)? else {
+                return Ok(None);
+            };
+            if let Err(e) = track.decoder() {
+                eprintln!("matroska audio: {}: {e}", path.display());
+                return Ok(None);
+            }
+            return Ok(Some(Self::Sym(track)));
         }
         let audio_file = crate::is_audio(path);
         // Ahead of the AAC reader, because that one answers "not AAC" for a
@@ -1072,7 +1079,7 @@ impl Track {
         if stream > 0 {
             return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
         }
-        SymTrack::open(path).map(|track| Some(Self::Sym(track)))
+        SymTrack::open_required(path).map(|track| Some(Self::Sym(track)))
     }
 
     fn sample_rate(&self) -> u32 {
@@ -1197,7 +1204,13 @@ struct SymTrack {
 }
 
 impl SymTrack {
-    fn open(path: &Path) -> crate::Result<Self> {
+    /// `Ok(None)` for a container that opened and holds no audio track at all --
+    /// a silent source, which is a thing a file is allowed to be. Everything
+    /// else that goes wrong here is an `Err`: a file that will not open, will
+    /// not parse, or carries a track it cannot describe is *broken*, and the
+    /// difference matters because silence is played and exported without a word
+    /// while an `Err` is shown ([`Track::open`]).
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
         let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
         // The extension is a hint, not a decision: the probe reads the magic and
         // is free to disagree, which is what makes a mislabelled file work.
@@ -1211,9 +1224,9 @@ impl SymTrack {
             FormatOptions::default(),
             MetadataOptions::default(),
         )?;
-        let track = reader
-            .default_track(SymKind::Audio)
-            .ok_or_else(|| format!("{} has no audio track", path.display()))?;
+        let Some(track) = reader.default_track(SymKind::Audio) else {
+            return Ok(None);
+        };
         let (track_id, num_frames, delay) = (track.id, track.num_frames, track.delay);
         let time_base = track
             .time_base
@@ -1234,7 +1247,7 @@ impl SymTrack {
         let codec = symphonia::default::get_codecs()
             .get_audio_decoder(params.codec)
             .map_or("an unsupported format", |d| d.codec.info.short_name);
-        Ok(Self {
+        Ok(Some(Self {
             reader,
             track_id,
             sample_rate,
@@ -1248,7 +1261,14 @@ impl SymTrack {
             time_base,
             params,
             codec,
-        })
+        }))
+    }
+
+    /// [`open`](Self::open) where having no audio track is itself the error:
+    /// what a standalone audio file is held to, since a song with no sound in
+    /// it is a broken file and not a silent source.
+    fn open_required(path: &Path) -> crate::Result<Self> {
+        Self::open(path)?.ok_or_else(|| format!("{} has no audio track", path.display()).into())
     }
 
     /// A fresh decoder: seeking mid-stream leaves state that belongs to the
