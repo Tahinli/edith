@@ -66,7 +66,17 @@ use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
 use crate::eq::EqParams;
+use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
+
+/// How far down a lane's own volume goes ([`Project::set_lane_gain_db`]).
+/// -60 dB is a thousandth of the amplitude -- a track that is out of the mix
+/// for every purpose but the honest one, which is that it is still a level and
+/// not a mute.
+pub const MIN_GAIN_DB: f32 = -60.0;
+/// ...and how far up. +12 dB is four times the amplitude, which is as much as
+/// a mix bus can take before the limiter is doing all the work.
+pub const MAX_GAIN_DB: f32 = 12.0;
 
 /// How fast a clip plays, in **thousandths of real time**: 1000 is the speed it
 /// was shot at, 2000 twice that, 500 half. An integer and not an `f32` for
@@ -221,9 +231,120 @@ impl std::fmt::Display for Speed {
     }
 }
 
+/// What a file's own frame rate is against the timeline's, as an exact
+/// rational: how many frames of the *file* one frame of the timeline is worth.
+///
+/// Every frame number in this module counts **timeline** frames -- a clip's
+/// `in_frame` and `out_frame` included -- so a 23.976 fps file placed on a 30 fps
+/// timeline is as many frames long as the seconds it lasts, and every edit
+/// (trim, split, speed, paste) is the same arithmetic it always was. This is the
+/// one conversion, and it happens at the decoder's door: [`PlaybackSession`]
+/// opens a worker with it and [`crate::export`] pulls pictures through it. The
+/// file's own numbering exists nowhere else.
+///
+/// The same floor/ceil pair as [`Speed`], for the same reason: the frame an
+/// export encodes at a timeline frame has to be the frame playback is holding
+/// there. Composed *after* a speed rather than folded into it, so a 2x 24 fps
+/// clip on a 30 fps timeline is exactly both (`rate_composes_with_speed`).
+///
+/// Rational and not an `f64`, exactly: 24000/1001 over 30 is `800/1001` and
+/// stays `800/1001` however far the timeline runs, where a rate rounded to
+/// (say) milli-fps would leave a fraction of a frame per clip to pile up into a
+/// visible drift over an hour (`a_23_976_rate_is_exact_and_never_drifts`).
+///
+/// [`PlaybackSession`]: crate::PlaybackSession
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rate {
+    /// Frames of the file...
+    source: u32,
+    /// ...per this many frames of the timeline it plays on. Never zero.
+    timeline: u32,
+}
+
+impl Rate {
+    /// A file shot at the timeline's own rate: every conversion below is the
+    /// identity, which is the path a single-rate project is on.
+    pub const REAL_TIME: Self = Self {
+        source: 1,
+        timeline: 1,
+    };
+
+    /// The rate of a file at `source_fps` on a timeline at `timeline_fps`,
+    /// exactly.
+    ///
+    /// Both rates come out of a container as a division, so neither is ever the
+    /// number it means (`23.976023976...`); [`crate::mux::frame_timing`] is what
+    /// already knows how to name one exactly -- it is the same pair the muxer
+    /// counts an export's frames in -- and this is that pair divided by that
+    /// pair, reduced. A rate no timescale can name is an `Err` in that
+    /// function's own words rather than a silent 1:1 -- `matches_timeline` is
+    /// where a file carrying one is refused by name, beside the codec.
+    ///
+    /// Exactly [`REAL_TIME`](Self::REAL_TIME) when the two agree, which is every
+    /// timeline that had ever opened in this editor before mixed rates.
+    pub fn from_fps(source_fps: f64, timeline_fps: f64) -> crate::Result<Self> {
+        let (src_scale, src_ticks) = crate::mux::frame_timing(source_fps)?;
+        let (tl_scale, tl_ticks) = crate::mux::frame_timing(timeline_fps)?;
+        // fps is scale/ticks, so the ratio is (src_scale/src_ticks) / (tl_scale/tl_ticks).
+        let num = u64::from(src_scale) * u64::from(tl_ticks);
+        let den = u64::from(src_ticks) * u64::from(tl_scale);
+        let g = gcd(num, den);
+        let (mut num, mut den) = (num / g, den / g);
+        // A ratio no pair of real frame rates produces, but the fields are `u32`
+        // so that every multiplication below fits a `u64` at any frame count.
+        while num > u64::from(u32::MAX) || den > u64::from(u32::MAX) {
+            (num, den) = (num.div_ceil(2), den.div_ceil(2));
+        }
+        Ok(Self {
+            source: num.max(1) as u32,
+            timeline: den.max(1) as u32,
+        })
+    }
+
+    pub fn is_real_time(self) -> bool {
+        self.source == self.timeline
+    }
+
+    /// As a multiplier of the timeline's rate: what a *file's* own frame rate
+    /// is, given the timeline's, for a library row that names it.
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.source) / f64::from(self.timeline)
+    }
+
+    /// Which frame of the file the `frame`th timeline-rate frame of it is:
+    /// floored, [`Speed::source_at`]'s half of the pair.
+    pub fn source_at(self, frame: u32) -> u32 {
+        (u64::from(frame) * u64::from(self.source) / u64::from(self.timeline))
+            .min(u64::from(u32::MAX)) as u32
+    }
+
+    /// Its inverse, ceiled ([`Speed::timeline_at`]'s half): the first
+    /// timeline-rate frame that shows source frame `source_frame` -- which is
+    /// the stamp playback puts on a decoded picture, and, applied to a file's
+    /// frame *count*, how long that file is in timeline frames.
+    pub fn timeline_at(self, source_frame: u32) -> u32 {
+        (u64::from(source_frame) * u64::from(self.timeline))
+            .div_ceil(u64::from(self.source))
+            .min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Greatest common divisor, for reducing a [`Rate`] to the numbers that fit its
+/// fields. `a` for `gcd(a, 0)`, and never zero: something divides by it.
+fn gcd(a: u64, b: u64) -> u64 {
+    match b {
+        0 => a.max(1),
+        b => gcd(b, a % b),
+    }
+}
+
 /// A half-open `[in_frame, out_frame)` range of frames of source
 /// [`source`](Clip::source), placed at timeline frame [`start`](Clip::start).
 /// Never empty.
+///
+/// Counted at the **timeline's** frame rate, not the file's: a source shot at
+/// another rate is converted at the decoder's door ([`Rate`]), so every edit
+/// here is frames of one clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Clip {
     /// Timeline frame the clip's first frame is shown at. Meaningless on a
@@ -366,21 +487,29 @@ struct LaneData {
     kind: LaneKind,
     /// Sorted by `start` and disjoint ([`sorted_disjoint`]).
     clips: Vec<Clip>,
+    /// How loud this lane plays, in dB, `0.0` for one nobody has touched --
+    /// [`Project::lane_gain_db`]. Whole-lane and whole-band, which is what
+    /// makes it a different thing from a clip's equalizer: it moves everything
+    /// on the track by the same amount, cuts included. Meaningless on a video
+    /// lane, where it is kept at 0 and asked by nothing.
+    gain_db: f32,
 }
 
 impl LaneData {
+    fn new(kind: LaneKind, clips: Vec<Clip>) -> Self {
+        Self {
+            kind,
+            clips,
+            gain_db: 0.0,
+        }
+    }
+
     /// The two lanes a project starts with: `V1` then `A1`, in display order.
     /// One place, because a freshly opened file is exactly this pair.
     fn two_lanes(video: Vec<Clip>, audio: Vec<Clip>) -> Vec<LaneData> {
         vec![
-            LaneData {
-                kind: LaneKind::Video,
-                clips: video,
-            },
-            LaneData {
-                kind: LaneKind::Audio,
-                clips: audio,
-            },
+            LaneData::new(LaneKind::Video, video),
+            LaneData::new(LaneKind::Audio, audio),
         ]
     }
 }
@@ -489,6 +618,12 @@ pub struct Project {
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
     next_link: u32,
+    /// The master limiter every lane's sound is summed *through*
+    /// ([`Project::limiter`]). Off by default, and not in the lane list, which
+    /// is what the history snapshots hold: it is a setting on the mix, like the
+    /// project's resolution is a setting on the picture, and neither is an undo
+    /// step.
+    limiter: Limiter,
 }
 
 impl Project {
@@ -517,6 +652,7 @@ impl Project {
             color: Vec::new(),
             history: Vec::new(),
             next_link: 1,
+            limiter: Limiter::default(),
         }
     }
 
@@ -554,7 +690,7 @@ impl Project {
         }
         let lanes: Vec<LaneData> = lanes
             .into_iter()
-            .map(|(kind, clips)| LaneData { kind, clips })
+            .map(|(kind, clips)| LaneData::new(kind, clips))
             .collect();
         for (data, lane) in lanes.iter().zip(handles(&lanes)) {
             let name = lane.label();
@@ -624,6 +760,7 @@ impl Project {
             color,
             history: Vec::new(),
             next_link,
+            limiter: Limiter::default(),
         })
     }
 
@@ -659,11 +796,69 @@ impl Project {
     /// ([`Project::from_parts`]); nothing plays until something is placed.
     pub fn add_lane(&mut self, kind: LaneKind) -> Lane {
         self.snapshot();
-        self.lanes.push(LaneData {
-            kind,
-            clips: Vec::new(),
-        });
+        self.lanes.push(LaneData::new(kind, Vec::new()));
         Lane::new(kind, self.lane_count(kind) - 1)
+    }
+
+    /// Drops an *empty* lane -- [`add_lane`](Project::add_lane) taken back, and
+    /// one undo step like it, which restores the lane where it stood.
+    ///
+    /// Refused, changing nothing, while the lane holds anything: the refusal
+    /// names the clips (file and first frame), because a track removal that
+    /// deleted takes with it would be the one edit nobody sees coming. Refused
+    /// too for the last lane of its kind, which is `V1` or `A1`: those two are
+    /// where an import and a paste land ([`Project::paste`] takes lane 0 of each
+    /// kind and *skips* a kind that is not there), so a project without one
+    /// would swallow half of every file dropped on it, silently.
+    ///
+    /// The lanes below it move up one `ord`, so a handle a caller was holding
+    /// (a selection, an open card) names the lane after it from here on -- the
+    /// one thing a front-end owes this call.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        let Some(i) = self.index(lane) else {
+            return Err(format!("there is no {} to remove", lane.label()).into());
+        };
+        if self.lane_count(lane.kind) == 1 {
+            return Err(format!(
+                "{} is the only {} track: every import lands on it",
+                lane.label(),
+                match lane.kind {
+                    LaneKind::Video => "video",
+                    LaneKind::Audio => "audio",
+                }
+            )
+            .into());
+        }
+        let clips = &self.lanes[i].clips;
+        if !clips.is_empty() {
+            // Three names and a count: a lane can hold forty clips and a
+            // refusal nobody reads to the end says nothing at all.
+            let named: Vec<String> = clips
+                .iter()
+                .take(3)
+                .map(|c| {
+                    let name = self.sources.get(c.source).map_or_else(
+                        || format!("source {}", c.source),
+                        |s| s.path.display().to_string(),
+                    );
+                    format!("{name} at frame {}", c.start)
+                })
+                .collect();
+            let rest = match clips.len().saturating_sub(named.len()) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            return Err(format!(
+                "{} still holds {}{rest}: delete those clips (or drag them to \
+                 another track) first",
+                lane.label(),
+                named.join(", ")
+            )
+            .into());
+        }
+        self.snapshot();
+        self.lanes.remove(i);
+        Ok(())
     }
 
     /// Where `lane` sits in [`Project::lanes`], or `None` for a lane that is
@@ -748,10 +943,20 @@ impl Project {
     ///
     /// Refused, changing nothing, while any clip still plays from it: the
     /// refusal names the lanes and how many clips each holds, so a caller can
-    /// say what has to be deleted first. Refused too for the last entry left,
-    /// because a project that names no file cannot be reopened
-    /// (`PlaybackSession::open_project`) and the timeline's audio parameters
-    /// are read off source 0.
+    /// say what has to be deleted first. The *last* entry goes like any other
+    /// -- a project may name no file at all, which is an empty library over an
+    /// empty timeline (nothing can play, since a clip would have refused the
+    /// removal). What a front-end does with that is its own decision: `edith`'s
+    /// window goes back to the empty state it launches in, and
+    /// [`PlaybackSession::save_project`](crate::PlaybackSession::save_project)
+    /// refuses to write a project that names nothing, because no such file
+    /// could be opened again.
+    ///
+    /// Every index past `idx` moves down by one, so a caller holding a *raw*
+    /// source index of its own -- a clipboard, which is the one thing outside
+    /// this type that does -- has to fix it up or drop it, or a paste plays a
+    /// different file. [`PlaybackSession::remove_source`] hands back the index
+    /// that went for exactly that.
     ///
     /// ponytail: this retires the undo stack. `history` holds lanes alone, so a
     /// snapshot older than the removal can name the very source being removed
@@ -766,12 +971,6 @@ impl Project {
             return Err(format!("there is no source {idx} to remove").into());
         };
         let name = source.path.display().to_string();
-        // Asked before the clips are counted: with one file left the answer is
-        // the same whatever plays, and "the only file" is the more useful half
-        // of it.
-        if self.sources.len() == 1 {
-            return Err(format!("{name} is the only file this project names").into());
-        }
         let used: Vec<String> = handles(&self.lanes)
             .into_iter()
             .zip(&self.lanes)
@@ -815,9 +1014,16 @@ impl Project {
     /// only the ones a clip names.
     ///
     /// One exception, and it is the emptied timeline's: a project no clip plays
-    /// from still keeps source 0. It is the file a session is scaffolded from --
-    /// its frame rate is the timeline's and is written nowhere else -- so a save
-    /// that pruned it would write a project that cannot be loaded back at all.
+    /// from still keeps its first source, if it has one. A file is what a
+    /// reopened project scaffolds itself from -- the frame rate is written
+    /// nowhere else -- so a save that pruned the last of them would write a
+    /// project that cannot be loaded back at all.
+    ///
+    /// What comes out is *not* ordered by anything a reader may assume: first
+    /// use, lane by lane, means the entry at index 0 can be a still or a song
+    /// whatever the session was scaffolded from. `PlaybackSession::open_project`
+    /// picks its rate and its audio reference by what a source *is*, never by
+    /// where it sits.
     pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
@@ -868,6 +1074,92 @@ impl Project {
             eq,
             color,
         )
+    }
+
+    /// How loud `lane` plays, in dB: `0.0` for one nobody has touched, and for
+    /// a lane that is not there. Whole-lane and whole-band -- every clip on the
+    /// track moves by it, which is what makes it a different control from a
+    /// clip's equalizer (one frequency range of one take) and from the master
+    /// volume (what this machine monitors at, which no file carries).
+    pub fn lane_gain_db(&self, lane: Lane) -> f32 {
+        self.index(lane).map_or(0.0, |i| self.lanes[i].gain_db)
+    }
+
+    /// Sets that lane's volume, clamped to [`MIN_GAIN_DB`]..=[`MAX_GAIN_DB`].
+    /// One undo step like every other edit -- it is in the lane list, so an
+    /// undo restores it with the rest. `false`, and no history, for a lane that
+    /// is not there, for a value that is not finite, and for one already set.
+    pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
+        let Some(i) = self.index(lane) else {
+            return false;
+        };
+        if !db.is_finite() {
+            return false;
+        }
+        let db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+        if self.lanes[i].gain_db == db {
+            return false;
+        }
+        self.snapshot();
+        self.lanes[i].gain_db = db;
+        true
+    }
+
+    /// Every lane's volume in dB, in display order -- what a save writes,
+    /// beside the lanes [`Project::without_orphan_sources`] hands back.
+    pub fn lane_gains(&self) -> Vec<f32> {
+        self.lanes.iter().map(|l| l.gain_db).collect()
+    }
+
+    /// The mix settings a *load* puts back: lane volumes in display order (a
+    /// short list leaves the rest at unity) and the master limiter, both
+    /// clamped as their setters clamp them.
+    ///
+    /// The load's own door, beside [`from_parts`](Project::from_parts): the
+    /// setters push an undo step, and a project that arrives one undo away from
+    /// a state it was never in is a project whose first ctrl+z is a surprise.
+    pub fn with_mix(mut self, gains: &[f32], limiter: Limiter) -> Self {
+        for (data, &db) in self.lanes.iter_mut().zip(gains) {
+            if db.is_finite() {
+                data.gain_db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+            }
+        }
+        self.limiter = limiter.with_ceiling(limiter.ceiling_db);
+        self
+    }
+
+    /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
+    /// lanes is multiplied by on its way into the mix: the same lanes in the
+    /// same order, as *amplitudes*, so the mixer never sees a decibel. `1.0`
+    /// for a lane nobody has turned, which is a multiply f32 leaves alone --
+    /// the bit-exact path.
+    pub fn audio_gains(&self) -> Vec<f32> {
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| db_to_linear(self.lane_gain_db(lane)))
+            .collect()
+    }
+
+    /// The master limiter the mix is summed through. A project setting, not a
+    /// clip's and not a lane's: there is one mix.
+    pub fn limiter(&self) -> Limiter {
+        self.limiter
+    }
+
+    /// Sets it, with the ceiling clamped to what [`Limiter`] allows. `false`
+    /// for a setting already in force.
+    ///
+    /// ponytail: not an undo step, for the reason the project resolution is not
+    /// one ([`crate::PlaybackSession::set_resolution`]) -- it is not in the
+    /// lane list the history snapshots. Upgrade path is a history entry that
+    /// holds the mix settings beside the lanes.
+    pub fn set_limiter(&mut self, limiter: Limiter) -> bool {
+        let limiter = limiter.with_ceiling(limiter.ceiling_db);
+        if self.limiter == limiter {
+            return false;
+        }
+        self.limiter = limiter;
+        true
     }
 
     /// What the clip at `idx` of `lane` plays through, or `None` for one that
@@ -1541,42 +1833,106 @@ impl Project {
         true
     }
 
-    /// Move the clip at `idx` of `from` onto `to`, keeping the timeline frames
-    /// it covers: the drag that rearranges takes across tracks. One snapshot, so
-    /// one [`Project::undo`] puts it back where it was.
+    /// Move the clip at `idx` of `from` onto `to` with its head at timeline
+    /// frame `start`: the drag that rearranges takes, along a track and across
+    /// them alike. One snapshot, so one [`Project::undo`] puts it back where it
+    /// was. `start` at the clip's own is the pure lane change.
     ///
-    /// Its group id travels with it, and that is not a desync: a link means
-    /// "these cover one span on however many lanes" and names no lane at all
-    /// (see [`links_are_consistent`]), so a picture moved from `V1` to `V2` is
-    /// still the same take as the sound under it. The span never changes here --
-    /// only which lane draws it.
+    /// The whole group travels the same distance, each half on the lane it
+    /// already sits on -- a link means "these cover one span on however many
+    /// lanes" ([`links_are_consistent`]), so a picture that slid away from its
+    /// sound would be a group no save could load. Only the dragged half changes
+    /// lane, and that is not a desync: a link names no lane at all.
     ///
-    /// Refused, changing nothing, for a lane that is not there, an index that is
-    /// not there, a move onto the lane it is already on, a move across *kinds*
-    /// (a picture cannot play on an audio lane, and the save it wrote would not
-    /// open again), and a landing that would touch another clip -- a move that
-    /// overwrote what it landed on would destroy a take the pointer never named,
-    /// which is what [`place`](Project::place) may do and a drag may not.
-    pub fn move_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
-        if from.kind != to.kind || from == to || self.index(to).is_none() {
-            return false;
-        }
-        let Some(clip) = self.lane(from).get(idx).copied() else {
+    /// `start` is **clamped**, never refused, to the room the group has: no
+    /// member crosses a neighbour on the lane it lands on, exactly as
+    /// [`trim`](Project::trim) stops an edge at the clip in front of it. A hand
+    /// dragging past a neighbour means "as far as it goes", and butting up
+    /// against the take next door is how clips are laid end to end. The
+    /// tightest member's wall wins, so a sound half boxed in between two others
+    /// holds its picture still.
+    ///
+    /// Refused, changing nothing and costing no undo step, for a lane that is
+    /// not there, an index that is not there, a move across *kinds* (a picture
+    /// cannot play on an audio lane, and the save it wrote would not open
+    /// again), a head let go *inside* another clip or into a gap too narrow to
+    /// hold this one -- a move that overwrote what it landed on would destroy a
+    /// take the pointer never named, which is what [`place`](Project::place)
+    /// may do and a drag may not -- a half let go onto the lane its own partner
+    /// is on, and a drop that changes neither lane nor frame, which is a clip
+    /// picked up and put back down, i.e. a click.
+    pub fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        let (Some(dest), Some(clip)) = (self.index(to), self.lane(from).get(idx).copied()) else {
             return false;
         };
-        if self
-            .lane(to)
-            .iter()
-            .any(|c| c.start < clip.end() && clip.start < c.end())
-        {
+        if from.kind != to.kind {
+            return false;
+        }
+        let members = self.group_of(from, idx).expect("the clip was found");
+        let held = self.index(from).expect("the clip was found on it");
+        // The two halves of one group would land on one span of one lane, which
+        // is the one thing a link may never mean. Refused rather than clamped:
+        // the partner moves the same distance, so there is no room for it
+        // anywhere on that lane.
+        if dest != held && members.iter().any(|&(l, _)| l == dest) {
+            return false;
+        }
+        let want = i64::from(start) - i64::from(clip.start);
+        // How far the group may travel, in timeline frames and signed: every
+        // member narrows it to the gap it is landing in, and what is left is
+        // what the pointer is clamped to.
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for &(l, i) in &members {
+            let c = self.lanes[l].clips[i];
+            let land = if (l, i) == (held, idx) { dest } else { l };
+            // Which gap this member's walls are read off: its own place on the
+            // lane it stays on, and the frame the pointer named on the lane it
+            // is let go over.
+            let at = if land == l { c.start } else { start };
+            let (mut wall_lo, mut wall_hi) = (0, u32::MAX);
+            for (j, other) in self.lanes[land].clips.iter().enumerate() {
+                if members.contains(&(land, j)) {
+                    continue;
+                }
+                if other.start <= at && at < other.end() {
+                    return false;
+                }
+                match other.end() <= at {
+                    true => wall_lo = wall_lo.max(other.end()),
+                    false => wall_hi = wall_hi.min(other.start),
+                }
+            }
+            if wall_hi - wall_lo < c.frames() {
+                return false;
+            }
+            lo = lo.max(i64::from(wall_lo) - i64::from(c.start));
+            hi = hi.min(i64::from(wall_hi - c.frames()) - i64::from(c.start));
+        }
+        if lo > hi {
+            return false;
+        }
+        let delta = want.clamp(lo, hi);
+        if delta == 0 && dest == held {
             return false;
         }
         self.snapshot();
-        self.lane_mut(from).expect("checked above").remove(idx);
-        let clips = self.lane_mut(to).expect("checked above");
-        let at = clips.partition_point(|c| c.start < clip.start);
-        clips.insert(at, clip);
-        debug_assert!(sorted_disjoint(clips));
+        for &(l, i) in &members {
+            let c = &mut self.lanes[l].clips[i];
+            // In range by the walls above, which are `u32` frames throughout.
+            c.start = (i64::from(c.start) + delta) as u32;
+        }
+        if dest != held {
+            let clip = self.lanes[held].clips.remove(idx);
+            let clips = &mut self.lanes[dest].clips;
+            let at = clips.partition_point(|c| c.start < clip.start);
+            clips.insert(at, clip);
+        }
+        debug_assert!(sorted_disjoint(&self.lanes[dest].clips));
+        debug_assert!(
+            members
+                .iter()
+                .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips))
+        );
         true
     }
 
@@ -1658,8 +2014,19 @@ impl Project {
         }
         self.snapshot();
         for (&(l, i), keep) in members.iter().zip(fitted) {
+            let still = self.is_still(&self.lanes[l].clips[i]);
             let c = &mut self.lanes[l].clips[i];
             match edge {
+                // A still has no earlier frame to walk an in-point back to --
+                // every frame of it is the same picture -- so its head grows
+                // *forward*: the range it plays is however long the new room
+                // is, anchored at the source's frame 0. Bounded by `lo`, which
+                // is where the cap in `source_frames` is applied.
+                Edge::Start if still => {
+                    c.in_frame = 0;
+                    c.out_frame = keep;
+                    c.start = to;
+                }
                 Edge::Start => {
                     // Non-negative by `lo`, which is what keeps the in-point on
                     // the source.
@@ -1700,9 +2067,24 @@ impl Project {
                     // head than the timeline has room for -- a ripple delete
                     // slides a clip back to frame 0 with its in-point wherever
                     // the cut left it -- and frame 0 is the other wall.
-                    c.start
-                        .saturating_sub(c.speed.room(c.in_frame))
-                        .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                    //
+                    // A still is measured from its *tail* instead: it has no
+                    // in-point worth the name (every frame the same picture), so
+                    // its head reaches exactly as far as its tail does -- out to
+                    // the length the caller's table gives it, whole. Measured
+                    // from the in-point it would have no head room at all, which
+                    // is a placed picture whose left edge cannot be dragged out.
+                    // No entry in the table means no growth, as it does at the
+                    // other end.
+                    if self.is_still(&c) {
+                        c.end().saturating_sub(
+                            c.speed
+                                .room(source_frames.get(c.source).copied().unwrap_or(c.len())),
+                        )
+                    } else {
+                        c.start.saturating_sub(c.speed.room(c.in_frame))
+                    }
+                    .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
                     // One *frame of clip* always survives, and at a rate below
                     // real time one frame of clip is several frames of timeline
                     // ([`Speed::room`]): an edge dragged closer than that would
@@ -1737,6 +2119,16 @@ impl Project {
         // contains the edge's own place, and a caller's wrong `source_frames`
         // must not become an empty range (or a panicking `clamp`) here.
         Some((lo, hi.max(lo)))
+    }
+
+    /// Whether `clip` plays a still image ([`crate::is_image`]): a file whose
+    /// every frame is the same picture, so which frame of it a clip's in-point
+    /// names is not a question -- what [`Project::trim`] lets grow at either
+    /// end. `false` for a source that is not there.
+    fn is_still(&self, clip: &Clip) -> bool {
+        self.sources
+            .get(clip.source)
+            .is_some_and(|s| crate::is_image(&s.path))
     }
 
     /// The clips that move as one with the clip at `idx` of `lane` -- itself and
@@ -1881,7 +2273,12 @@ impl Project {
         // Nothing reaches past `at`: there is nothing to cut and nothing to
         // slide back, and a delete that changes nothing must not cost an undo
         // step (see [`snapshot`](Project::snapshot)).
-        if !self.lanes.iter().flat_map(|l| &l.clips).any(|c| c.end() > at) {
+        if !self
+            .lanes
+            .iter()
+            .flat_map(|l| &l.clips)
+            .any(|c| c.end() > at)
+        {
             return false;
         }
         self.snapshot();
@@ -3233,7 +3630,11 @@ mod tests {
         // A gap on one lane leaves the other's clip selectable there.
         assert!(p.lift(Lane::A1, 0));
         assert_eq!(p.lane_clip_at(Lane::A1, 0), None, "the gap holds nothing");
-        assert_eq!(p.lane_clip_at(Lane::A1, 3), Some(0), "indices moved with it");
+        assert_eq!(
+            p.lane_clip_at(Lane::A1, 3),
+            Some(0),
+            "indices moved with it"
+        );
         assert_eq!(p.lane_clip_at(Lane::V1, 0), Some(0));
         // A lane that is not there is not a panic.
         assert_eq!(p.lane_clip_at(Lane::new(LaneKind::Video, 1), 0), None);
@@ -3280,16 +3681,17 @@ mod tests {
         assert!(!p.place(Lane::V1, 0, clip(0, 7, 7, 0)), "empty clip");
     }
 
-    /// The drag between tracks: the clip keeps its frames, one undo takes it
-    /// back, and every way it can be refused leaves the project untouched.
+    /// The drag between tracks: let go at the frames it already covers the clip
+    /// keeps them, one undo takes it back, and every way it can be refused
+    /// leaves the project untouched.
     #[test]
-    fn move_to_lane_keeps_the_frames_and_refuses_the_rest() {
+    fn move_clip_keeps_the_frames_and_refuses_the_rest() {
         let v2 = Lane::new(LaneKind::Video, 1);
         let mut p = three();
         assert_eq!(p.add_lane(LaneKind::Video), v2);
         let before = shape(&p);
 
-        assert!(p.move_to_lane(Lane::V1, 1, v2), "V1's middle clip moves up");
+        assert!(p.move_clip(Lane::V1, 1, v2, 3), "V1's middle clip moves up");
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(5, 5, 9, 0)]);
         assert_eq!(shape(&p)[2], vec![clip(3, 3, 5, 0)], "same frames on V2");
         assert_eq!(shape(&p)[1], before[1], "the audio lane is untouched");
@@ -3298,17 +3700,21 @@ mod tests {
         assert!(p.undo());
         assert_eq!(shape(&p), before);
 
-        // A lane that is not there, the lane it is already on, an index that is
-        // not there, and a move across kinds: all refused, nothing changed.
+        // A lane that is not there, the lane and frame it is already at, an
+        // index that is not there, and a move across kinds: all refused,
+        // nothing changed.
         let history = p.history.len();
-        for (from, idx, to) in [
-            (Lane::V1, 1, Lane::new(LaneKind::Video, 7)),
-            (Lane::V1, 1, Lane::V1),
-            (Lane::V1, 9, v2),
-            (Lane::V1, 1, Lane::A1),
-            (Lane::A1, 1, v2),
+        for (from, idx, to, start) in [
+            (Lane::V1, 1, Lane::new(LaneKind::Video, 7), 3),
+            (Lane::V1, 1, Lane::V1, 3),
+            (Lane::V1, 9, v2, 3),
+            (Lane::V1, 1, Lane::A1, 3),
+            (Lane::A1, 1, v2, 3),
         ] {
-            assert!(!p.move_to_lane(from, idx, to), "{from:?} {idx} -> {to:?}");
+            assert!(
+                !p.move_clip(from, idx, to, start),
+                "{from:?} {idx} -> {to:?} at {start}"
+            );
         }
         assert_eq!(shape(&p), before);
         assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
@@ -3316,10 +3722,85 @@ mod tests {
         // Landing on another clip is refused rather than overwriting it: the
         // pointer named the lane, never the take already sitting there.
         assert!(p.place(v2, 3, clip(0, 100, 101, 0)), "V2 holds [3,4)");
-        assert!(!p.move_to_lane(Lane::V1, 1, v2), "[3,5) would land on it");
-        assert!(p.move_to_lane(Lane::V1, 0, v2), "[0,3) merely abuts it");
+        assert!(!p.move_clip(Lane::V1, 1, v2, 3), "let go inside it");
+        assert!(p.move_clip(Lane::V1, 0, v2, 0), "[0,3) merely abuts it");
         assert_eq!(shape(&p)[0], vec![clip(3, 3, 5, 0), clip(5, 5, 9, 0)]);
         assert_eq!(shape(&p)[2], vec![clip(0, 0, 3, 0), clip(3, 100, 101, 0)]);
+    }
+
+    /// The drag *along* a track, which is the one every other editor has: the
+    /// clip lands on the frame the pointer let it go at, and stops dead against
+    /// the neighbour rather than overwriting it.
+    #[test]
+    fn a_clip_slides_along_its_own_lane_and_butts_against_its_neighbour() {
+        let sources = vec![Source::new(FILE, 0)];
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 3, 0), clip(10, 3, 6, 0)]),
+            (LaneKind::Audio, vec![clip(0, 0, 3, 0)]),
+        ];
+        let mut p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
+        let before = shape(&p);
+
+        // Into the gap, exactly where it was let go -- nothing else moves.
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 5));
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(5, 3, 6, 0)]);
+        assert_eq!(shape(&p)[1], before[1], "the audio lane is untouched");
+        // Dragged past the clip in front of it: clamped to its wall, laid end
+        // to end with it, never over it.
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 0));
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(3, 3, 6, 0)]);
+        // One undo per drag, and both of them together are the state it started
+        // in -- the frames each clip plays never changed.
+        assert!(p.undo() && p.undo());
+        assert_eq!(shape(&p), before);
+
+        // A drop that changes nothing is a click, not an edit.
+        let history = p.history.len();
+        assert!(!p.move_clip(Lane::V1, 1, Lane::V1, 10));
+        assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
+    }
+
+    /// A drag carries the whole take: the sound half travels exactly as far as
+    /// the picture does, and the tighter of their two walls stops both.
+    #[test]
+    fn a_dragged_take_carries_its_sound_and_stops_at_the_tighter_wall() {
+        let mut p = three();
+        assert!(
+            p.lift(Lane::V1, 2) && p.lift(Lane::A1, 2),
+            "room to the right"
+        );
+        let link = p.lane(Lane::V1)[1].link.expect("a split hands out ids");
+        assert_eq!(p.lane(Lane::A1)[1].link, Some(link), "both halves grouped");
+        // Something in the sound's way, and nothing at all in the picture's.
+        assert!(p.place(Lane::A1, 10, clip(0, 0, 2, 0)), "A1 holds [10,12)");
+        let before = shape(&p);
+
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 30), "dragged far right");
+        assert_eq!(p.lane(Lane::V1)[1].start, 8, "stopped where the sound did");
+        assert_eq!(p.lane(Lane::A1)[1].start, 8, "and the sound came with it");
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+        assert!(p.undo());
+        assert_eq!(shape(&p), before, "one undo for the whole take");
+    }
+
+    /// The drag that does both at once -- another lane *and* another frame --
+    /// which is what a pointer let go over a lane always names.
+    #[test]
+    fn a_clip_dragged_to_another_lane_lands_on_the_pointers_frame() {
+        let v2 = Lane::new(LaneKind::Video, 1);
+        let mut p = three();
+        assert_eq!(p.add_lane(LaneKind::Video), v2);
+
+        assert!(p.move_clip(Lane::V1, 2, v2, 20), "[5,9) -> V2 at 20");
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(3, 3, 5, 0)]);
+        assert_eq!(shape(&p)[2], vec![clip(20, 5, 9, 0)], "at the pointer");
+        assert_eq!(
+            p.lane(Lane::A1)[2].start,
+            20,
+            "its sound travelled the same distance"
+        );
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+        assert_eq!(p.timeline_frames(), 24, "a move is not an insert");
     }
 
     /// How long `FILE` is, which is what a trim's tail is allowed to reach:
@@ -3344,8 +3825,15 @@ mod tests {
 
         // ...and back out, no further than the clip behind it.
         assert!(p.trim(Lane::V1, 1, Edge::End, 8, SRC));
-        assert_eq!(shape(&p)[0][1], clip(3, 3, 5, 0), "stopped at the neighbour");
-        assert!(!p.trim(Lane::V1, 1, Edge::End, 8, SRC), "already at the wall");
+        assert_eq!(
+            shape(&p)[0][1],
+            clip(3, 3, 5, 0),
+            "stopped at the neighbour"
+        );
+        assert!(
+            !p.trim(Lane::V1, 1, Edge::End, 8, SRC),
+            "already at the wall"
+        );
 
         // One frame of clip always survives, however far back the pointer went.
         assert!(p.trim(Lane::V1, 1, Edge::End, 0, SRC));
@@ -3369,7 +3857,11 @@ mod tests {
     fn trimming_the_head_moves_the_in_point() {
         let mut p = three();
         assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
-        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0), "two frames off the front");
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(2, 2, 3, 0),
+            "two frames off the front"
+        );
         assert_eq!(p.map(Lane::V1, 2), Some((0, 2)), "frame 2 still plays 2");
         assert_eq!(p.map(Lane::V1, 1), None, "and the front is a gap");
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "back out again");
@@ -3406,9 +3898,67 @@ mod tests {
         );
         assert!(!p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "already there");
         assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
-        assert_eq!(shape(&p)[0], vec![clip(2, 7, 9, 0)], "the in-point followed");
+        assert_eq!(
+            shape(&p)[0],
+            vec![clip(2, 7, 9, 0)],
+            "the in-point followed"
+        );
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "and back out");
         assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)]);
+    }
+
+    /// A still is trimmed from its head exactly as it is from its tail: it has
+    /// no earlier frame to walk an in-point back to, so the wall is the length
+    /// the caller's table allows it, measured back from the tail. Measured from
+    /// the in-point -- which a placed picture has at 0 -- its left edge could
+    /// never be dragged outwards at all.
+    #[test]
+    fn a_stills_head_stretches_out_like_its_tail() {
+        const STILL: &str = "/nonexistent/card.png";
+        /// What a still is held to, as `PlaybackSession` fills the table in.
+        const CAP: &[u32] = &[60];
+
+        let mut p = Project::single(STILL, 20);
+        assert!(p.lift(Lane::A1, 0), "a picture is silent");
+        assert!(p.lift(Lane::V1, 0), "and this one is not at frame 0");
+        assert!(p.place(Lane::V1, 100, clip(0, 0, 20, 0)));
+
+        // A source with no entry in the table may not grow, here as at the tail.
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, &[]),
+            Some((100, 119)),
+            "a length nobody told us buys no head room"
+        );
+        assert_eq!(
+            p.trim_room(Lane::V1, 0, Edge::Start, CAP),
+            Some((60, 119)),
+            "back to a whole cap's worth, one frame of clip surviving"
+        );
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 80, CAP));
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(80, 0, 40, 0),
+            "twenty frames longer, and still read from the source's first frame"
+        );
+        // Past the cap is clamped, exactly as the tail is -- not refused.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 0, CAP));
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(60, 0, 60, 0),
+            "a cap's worth, no more"
+        );
+        // ...and the clip in front is the nearer wall of the two: no head trim
+        // may open an overlap.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 90, CAP));
+        assert!(p.place(Lane::V1, 70, clip(0, 0, 15, 0)));
+        assert_eq!(
+            p.trim_room(Lane::V1, 1, Edge::Start, CAP),
+            Some((85, 119)),
+            "up to the neighbour's last frame and not over it"
+        );
+        assert!(p.trim(Lane::V1, 1, Edge::Start, 0, CAP));
+        assert_eq!(shape(&p)[0][1], clip(85, 0, 35, 0), "butted against it");
+        assert!(sorted_disjoint(p.lane(Lane::V1)), "no overlap");
     }
 
     /// Linked halves trim as one: a link is one span on however many lanes, so
@@ -3423,7 +3973,10 @@ mod tests {
         assert!(p.trim(Lane::V1, 2, Edge::Start, 7, SRC));
         assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0));
         assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0), "the sound followed");
-        assert!(p.trim(Lane::A1, 2, Edge::End, 8, SRC), "either half drags it");
+        assert!(
+            p.trim(Lane::A1, 2, Edge::End, 8, SRC),
+            "either half drags it"
+        );
         assert_eq!(shape(&p)[0][2], clip(7, 7, 8, 0), "and the picture follows");
         links_are_consistent(&p.lanes).expect("one id per lane, one span");
 
@@ -3458,13 +4011,13 @@ mod tests {
     /// A moved half stays in its group: a link names a span, not a lane, so the
     /// picture on `V2` is still the same take as the sound under it on `A1`.
     #[test]
-    fn move_to_lane_keeps_the_group() {
+    fn move_clip_keeps_the_group() {
         let v2 = Lane::new(LaneKind::Video, 1);
         let mut p = three();
         p.add_lane(LaneKind::Video);
         let link = p.lane(Lane::V1)[1].link.expect("a split hands out ids");
         assert_eq!(p.lane(Lane::A1)[1].link, Some(link), "both halves grouped");
-        assert!(p.move_to_lane(Lane::V1, 1, v2));
+        assert!(p.move_clip(Lane::V1, 1, v2, 3));
         assert_eq!(p.lane(v2)[0].link, Some(link), "the id travelled with it");
         links_are_consistent(&p.lanes).expect("one id per lane, one span");
         assert_eq!(
@@ -3784,10 +4337,10 @@ mod tests {
     }
 
     /// The two edges of a removal: it retires the undo stack (the ponytail on
-    /// [`Project::remove_source`]), and the last entry standing cannot go --
-    /// source 0 is where a reopened project reads its frame rate.
+    /// [`Project::remove_source`]), and the last entry goes like any other
+    /// once nothing plays it -- a project may name no file at all.
     #[test]
-    fn remove_source_retires_undo_and_keeps_the_last_file() {
+    fn remove_source_retires_undo_and_empties_the_library() {
         let mut p = two_sources();
         assert!(p.delete_in(Lane::V1, 3), "FILE2's take goes first");
         assert!(!p.history.is_empty(), "there is something to undo");
@@ -3798,18 +4351,25 @@ mod tests {
         );
         assert!(!p.undo(), "and so there is nothing left to undo");
 
-        // The last file standing stays, whatever plays from it:
-        // `PlaybackSession::open_project` refuses a project that names no
-        // sources at all, and the timeline's frame rate lives in source 0.
+        // The last file standing is held to the one rule every row is -- what
+        // plays cannot go -- and to no other.
         assert_eq!(p.sources().len(), 1);
         let refusal = p
             .remove_source(0)
-            .expect_err("the only source must stay")
+            .expect_err("its clips are still on the lanes")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
-        assert_eq!(p.sources().len(), 1);
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert_eq!(p.sources().len(), 1, "a refusal changes nothing");
+        while p.delete_in(Lane::V1, 0) {}
+        p.remove_source(0)
+            .expect("the last row goes like any other");
         assert!(
-            p.remove_source(1).is_err(),
+            p.sources().is_empty(),
+            "a project may name no file at all: an empty library over an empty timeline"
+        );
+        assert_eq!(p.timeline_frames(), 0);
+        assert!(
+            p.remove_source(0).is_err(),
             "and an index that is not there is refused, not panicked on"
         );
     }
@@ -4392,6 +4952,87 @@ mod tests {
         assert_eq!(Speed::from_permille(2500).to_string(), "2.50x");
     }
 
+    /// [`Rate`] is [`Speed`]'s pair again, over the *file's* rate: the frame an
+    /// export encodes at a timeline frame is the one playback is holding there,
+    /// a file is as long in timeline frames as the seconds it lasts, and the two
+    /// compose so a speeded clip at another rate is exactly both.
+    #[test]
+    fn rate_composes_with_speed() {
+        // 23.976 into 30 (the ratio that does not terminate), 30 into 23.976,
+        // 60 into 30, 25 into 30 -- and the timeline's own rate, which must be
+        // the identity map or a single-rate project would move.
+        for (source_fps, timeline_fps) in [
+            (24000. / 1001., 30.),
+            (30., 24000. / 1001.),
+            (60., 30.),
+            (25., 30.),
+            (30., 30.),
+        ] {
+            let rate = Rate::from_fps(source_fps, timeline_fps).expect("a nameable rate");
+            for n in 0..2000u32 {
+                let source = rate.source_at(n);
+                // The stamp is the *first* timeline-rate frame that shows it, so
+                // the picture on screen at `n` is the picture encoded at `n`.
+                let held = (0..=source + 4)
+                    .filter(|&s| rate.timeline_at(s) <= n)
+                    .next_back();
+                assert_eq!(held, Some(source), "{source_fps} on {timeline_fps} at {n}");
+            }
+            // A file of `count` frames is `timeline_at(count)` frames long here,
+            // and its last one still reads a frame the file has.
+            for count in 1..500u32 {
+                let frames = rate.timeline_at(count);
+                assert!(frames >= 1, "a file is never zero frames long");
+                assert!(
+                    rate.source_at(frames - 1) < count,
+                    "{source_fps} on {timeline_fps}: {count} frames reads past the file"
+                );
+            }
+            // No drift: the mapping is one exact division of the *rate itself*,
+            // not an accumulation and not a rounded rate, so an hour in is as
+            // true as the first second. (Held to the real ratio of the two rates
+            // the caller asked for -- `as_f64` would be true of a wrong rate.)
+            for n in [1u32, 100, 10_000, 500_000, 3_000_000] {
+                let want = f64::from(n) * source_fps / timeline_fps;
+                assert!(
+                    (f64::from(rate.source_at(n)) - want).abs() < 1.,
+                    "{source_fps} on {timeline_fps}: frame {n} drifted"
+                );
+            }
+        }
+        // The timeline's own rate is the identity, whichever way it is written.
+        assert!(Rate::from_fps(30., 30.).expect("30 over 30").is_real_time());
+        assert!(
+            Rate::from_fps(30.0004, 30.)
+                .expect("30.0004 over 30")
+                .is_real_time(),
+            "a rate is named by the muxer's timescales, and 30.0004 is 30030/1001"
+        );
+        // ...and a rate no timescale can name is an `Err`, not a silent 1:1: the
+        // one thing `matches_timeline` refuses a file for now that the rate gate
+        // is gone.
+        assert!(Rate::from_fps(0., 30.).is_err(), "not a rate at all");
+        assert!(Rate::from_fps(30., f64::NAN).is_err());
+        for n in 0..1000 {
+            assert_eq!(Rate::REAL_TIME.source_at(n), n);
+            assert_eq!(Rate::REAL_TIME.timeline_at(n), n);
+        }
+        // ...and the composition, in the order the decoder's door applies it:
+        // the speed picks the clip's (timeline-rate) frame, the rate picks the
+        // file's. A 2x clip of a 23.976 fps file on a 30 fps timeline reads two
+        // timeline frames per frame shown, each of them exactly 800/1001 of a
+        // file frame.
+        let rate = Rate::from_fps(24000. / 1001., 30.).expect("23.976 over 30");
+        let speed = Speed::from_permille(2000);
+        for d in 0..100u32 {
+            assert_eq!(
+                rate.source_at(speed.source_at(d)),
+                (u64::from(d) * 2 * 800 / 1001) as u32,
+                "2x of a 23.976 fps file at timeline frame {d}"
+            );
+        }
+    }
+
     /// The mapping a speed changes, and the one it does not: a 2x clip reads two
     /// source frames per timeline frame and still starts at its own in-point,
     /// and a half-speed one shows every source frame twice.
@@ -4521,7 +5162,12 @@ mod tests {
                 }
                 let lane = if next(2) == 0 { Lane::V1 } else { Lane::A1 };
                 let idx = next(4) as usize;
-                let _ = match next(15) {
+                let _ = match next(16) {
+                    // A clip dragged along its own lane to wherever the pointer
+                    // let it go: the op that moves a placement without changing
+                    // what it plays, so what it may not do is land on top of the
+                    // neighbour it was dragged at.
+                    15 => p.move_clip(lane, idx, lane, frame),
                     // ...and a second `place`, so a punch lands inside a clip
                     // far more often than one op in fourteen would put it there.
                     14 => p.place(lane, frame, copied),
@@ -4697,6 +5343,53 @@ mod tests {
         assert_eq!(shape(&p), shape(&three()));
     }
 
+    /// The add taken back: an empty lane comes off, a lane holding clips never
+    /// does (and says which clips), the last lane of a kind never does, the
+    /// lanes below the one that went move up an `ord`, and one undo puts it
+    /// back where it stood.
+    #[test]
+    fn an_empty_lane_comes_off_again() {
+        let mut p = three();
+        let v2 = p.add_lane(LaneKind::Video);
+        let v3 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v3, 0, clip(0, 0, 3, 0)));
+        let why = |r: crate::Result<()>| r.expect_err("refused").to_string();
+        let history = p.history.len();
+
+        // The last lane of its kind stays: `V1`/`A1` are where an import and a
+        // paste land, and a project missing one would swallow half of a file
+        // dropped on it.
+        assert!(why(p.remove_lane(Lane::A1)).contains("only audio track"));
+        assert_eq!(
+            why(p.remove_lane(Lane::new(LaneKind::Video, 9))),
+            "there is no V10 to remove"
+        );
+
+        // A lane with clips on it refuses and names them: a track removal never
+        // deletes a take.
+        let refusal = why(p.remove_lane(v3));
+        assert!(refusal.contains("V3 still holds"), "{refusal}");
+        assert!(refusal.contains(FILE), "{refusal}");
+        assert!(refusal.contains("at frame 0"), "{refusal}");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)], "the clip is still there");
+        assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
+
+        // The empty one in the middle goes, and `V3` becomes `V2` -- clip and
+        // all.
+        p.remove_lane(v2).expect("V2 is empty");
+        assert_eq!(p.lane_count(LaneKind::Video), 2);
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2]);
+        assert_eq!(p.lane_spans(v2), vec![(0, 3)], "the lane below moved up");
+        assert_eq!(p.history.len(), history + 1, "one snapshot per removal");
+        invariants_hold(&p, "remove V2");
+
+        // ...and one stroke puts the empty lane back above it.
+        assert!(p.undo());
+        assert_eq!(p.lane_count(LaneKind::Video), 3);
+        assert!(p.lane(v2).is_empty(), "back where it stood, still empty");
+        assert_eq!(p.lane_spans(v3), vec![(0, 3)]);
+    }
+
     /// The grouping rule across more than two lanes: a link id is one *span*,
     /// on however many lanes carry it -- not a video/audio pair and not a
     /// pairing by `ord`. So a split shares an id with every lane whose half
@@ -4758,14 +5451,8 @@ mod tests {
             speed: Speed::NORMAL,
         };
         let lanes = vec![
-            LaneData {
-                kind: LaneKind::Video,
-                clips: vec![linked(3, 4)],
-            },
-            LaneData {
-                kind: LaneKind::Video,
-                clips: vec![linked(5, 4)],
-            },
+            LaneData::new(LaneKind::Video, vec![linked(3, 4)]),
+            LaneData::new(LaneKind::Video, vec![linked(5, 4)]),
         ];
         assert_eq!(
             links_are_consistent(&lanes).unwrap_err().to_string(),
@@ -4780,7 +5467,7 @@ mod tests {
     /// checked at the untrusted door and no edit can produce these.
     #[test]
     fn a_group_may_span_any_lane() {
-        let lane = |kind, clips: Vec<Clip>| LaneData { kind, clips };
+        let lane = |kind, clips: Vec<Clip>| LaneData::new(kind, clips);
         let one = |start: u32, end: u32, link| Clip {
             start,
             in_frame: start,
@@ -4894,7 +5581,12 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = lanes[next(3) as usize];
                 let idx = next(4) as usize;
-                let _ = match next(13) {
+                let _ = match next(14) {
+                    // The drag, in the mix: a clip dragged along its own lane
+                    // and onto another one, at a frame the pointer picked --
+                    // which is where the group rule and the sorted+disjoint one
+                    // meet, since every half travels the same distance.
+                    13 => p.move_clip(lane, idx, lanes[next(3) as usize], frame),
                     10 => p.set_eq(lane, idx, Some(band_at(next(4)))),
                     11 => p.set_eq(lane, idx, None),
                     // A rate, which on many lanes is the group rule as well:
