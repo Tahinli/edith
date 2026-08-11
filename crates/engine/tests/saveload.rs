@@ -733,7 +733,7 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
     let dir = scratch("mismatch");
     copy_in(&dir, "test_av.mp4");
-    std::fs::copy(asset("test_mismatch.mp4"), dir.join("test_av2.mp4")).expect("substitute");
+    std::fs::copy(asset("test_ac3.mp4"), dir.join("test_av2.mp4")).expect("substitute");
     let path = dir.join("swapped.edith");
     std::fs::write(
         &path,
@@ -745,12 +745,15 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
         .expect("a source that stopped matching must not open")
         .to_string();
     // The suffix is `import`'s own refusal, word for word. The substitute is
-    // 640x360 *and* silent; only the second of those is a refusal now -- a
-    // resolution of its own is placed on the project canvas.
+    // mono, which is the shape of what is left: one output device means one
+    // rate and one layout. A resolution of its own is placed on the project
+    // canvas, a rate of its own is read through `Rate`, a codec of its own
+    // opens its own decoder and a file with no sound plays silence -- none of
+    // those is a refusal any more.
     assert_eq!(
         err,
         format!(
-            "source {}: the file is silent, the timeline has audio",
+            "source {}: audio 44100 Hz 1 ch does not match the timeline's 44100 Hz 2 ch",
             dir.join("test_av2.mp4").display()
         )
     );
