@@ -255,10 +255,7 @@ fn a_source_that_disagrees_on_rate_or_layout_is_refused() {
     // the copy and the decode paths refuse them again rather than mislabel one
     // esds for two different tracks. Stream 1 of the multi-audio fixture is
     // 22.05 kHz mono against the timeline's 44.1 kHz stereo.
-    let mixed = [
-        (asset("test_av.mp4"), 0),
-        (asset("test_multiaudio.mp4"), 1),
-    ];
+    let mixed = [(asset("test_av.mp4"), 0), (asset("test_multiaudio.mp4"), 1)];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     // (`.err()`, not `unwrap_err`: neither Ok payload is `Debug`.)
     for e in [
@@ -282,7 +279,11 @@ fn a_source_that_disagrees_on_rate_or_layout_is_refused() {
 #[test]
 fn a_silent_source_is_silence_and_not_a_refusal() {
     let mixed = [asset("test_av.mp4"), asset("test_mismatch.mp4")];
-    let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0), (Some(0), 0.0, 1.0)];
+    let segs = [
+        (Some(0), 0.0, 1.0),
+        (Some(1), 0.0, 1.0),
+        (Some(0), 0.0, 1.0),
+    ];
 
     // Decoded: three seconds, the middle one exact zero, and the chunks still
     // arrive contiguous (`drain` asserts that), so the clock is fed through it.
@@ -299,7 +300,10 @@ fn a_silent_source_is_silence_and_not_a_refusal() {
         let at = |s: usize| (s * RATE as usize * CHANNELS).min(samples.len());
         &samples[at(n)..at(n + 1)]
     };
-    assert!(second(0).iter().any(|s| *s != 0.0), "the first second plays");
+    assert!(
+        second(0).iter().any(|s| *s != 0.0),
+        "the first second plays"
+    );
     assert!(
         second(1).iter().all(|s| *s == 0.0),
         "the silent source is exact silence"
@@ -316,7 +320,10 @@ fn a_silent_source_is_silence_and_not_a_refusal() {
         (copied as i64 - 3 * RATE as i64).unsigned_abs() < 2 * PACKET,
         "{copied} samples for three seconds, priming included"
     );
-    assert_eq!(params.sample_rate, RATE as u32, "the audible source's track");
+    assert_eq!(
+        params.sample_rate, RATE as u32,
+        "the audible source's track"
+    );
     let silence: Vec<_> = packets[44..44 + 43].iter().map(|p| &p.bytes).collect();
     assert!(
         silence.iter().all(|b| b.len() <= 7),
