@@ -113,6 +113,22 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# Matroska sound: the two Dolby codecs that arrive in one and are read straight
+# out of its blocks (`demux::MkvAudio`). Stereo AC-3 for the plain syntax and
+# **5.1 E-AC-3** for Annex E -- the shape a remux has, and the one that must
+# come down to stereo through the same A/52 7.8 downmix the mp4 path uses.
+# 48 kHz both, which is the only rate E-AC-3 is written at in practice. Small
+# picture on purpose: these two are about the sound.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=2:sample_rate=48000" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a]" \
+    -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
+    -c:a ac3 -b:a 192k assets/test_ac3.mkv
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -map 0:v -map 1:a -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
+    -ac 6 -c:a eac3 -b:a 384k assets/test_eac3.mkv
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.
