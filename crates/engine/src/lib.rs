@@ -11,6 +11,7 @@ pub mod edith;
 pub mod eq;
 pub mod export;
 pub mod hw;
+pub mod limiter;
 pub mod mux;
 pub mod playback;
 pub mod project;

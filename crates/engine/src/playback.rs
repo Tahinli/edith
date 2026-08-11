@@ -496,11 +496,14 @@ impl PlaybackSession {
         // then refuses every file on it for not matching. The rule this and
         // [`audio_source_of`] share: nothing may assume what source 0 *is*.
         //
-        // ponytail: a timeline of nothing but stills, or of stills and songs,
-        // still comes back at the rate its scaffold implies rather than the one
-        // it was cut at -- the rate is written nowhere in the file. The upgrade
-        // path is a dialect that writes it (`crate::edith`), which is also what
-        // a project naming no file at all would need.
+        // A v9 file says what rate it was cut at, and that answer beats the
+        // scaffold's *where the scaffold has none to give*: a still and a song
+        // are both given a made-up rate (`IMAGE_ONLY_RATE`,
+        // `AUDIO_ONLY_CANVAS`), so a timeline of nothing but those used to come
+        // back at 30 fps however it was cut. A scaffold with a picture keeps
+        // defining the timeline as it always did -- it is the file every clip
+        // on the lane was conformed to, and the two agree by construction.
+        let saved_fps = doc.fps.filter(|f| f.is_finite() && *f > 0.0);
         let scaffold = doc
             .sources
             .iter()
@@ -530,7 +533,8 @@ impl PlaybackSession {
         // like every other worker opened here.
         let (mut meta, stream) = match crate::is_audio(&first.path) {
             true => {
-                let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+                let (width, height, canvas_fps) = AUDIO_ONLY_CANVAS;
+                let frame_rate = saved_fps.unwrap_or(canvas_fps);
                 let meta = VideoMeta {
                     width,
                     height,
@@ -547,11 +551,12 @@ impl PlaybackSession {
             false if crate::is_image(&first.path) => {
                 let still = crate::decode::Still::open(&first.path)
                     .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+                let frame_rate = saved_fps.unwrap_or(IMAGE_ONLY_RATE);
                 let meta = VideoMeta {
                     width: still.width,
                     height: still.height,
-                    frame_rate: IMAGE_ONLY_RATE,
-                    frame_count: image_frames(IMAGE_ONLY_RATE),
+                    frame_rate,
+                    frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
                 };
                 let stream = DecodeSession::open_still(
@@ -668,7 +673,8 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?;
+        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
+            .with_mix(&doc.gains, doc.limiter);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -769,9 +775,19 @@ impl PlaybackSession {
             path,
             &sources,
             &lanes,
+            // The lane volumes and the limiter with them: a mix that vanished
+            // on a reload would be a mix nobody could keep, and both are the
+            // project's, not this machine's (the monitoring volume is not
+            // written and never will be).
+            &self.project.lane_gains(),
             &eq,
             &color,
             (self.meta.width, self.meta.height),
+            // ...and the rate it was cut at, which nothing else in the file
+            // says: a timeline of stills and songs used to come back at
+            // whatever its scaffold implied (`open_project`).
+            Some(self.meta.frame_rate),
+            self.project.limiter(),
             playhead,
         )
     }
@@ -1092,6 +1108,31 @@ impl PlaybackSession {
     /// path is an `Arc` swap the running worker polls per chunk.
     pub fn set_eq(&mut self, lane: Lane, idx: usize, params: Option<EqParams>) -> bool {
         self.edit(|p| p.set_eq(lane, idx, params))
+    }
+
+    /// How loud that lane plays, in dB -- everything on it, every frequency of
+    /// it. See [`Project::lane_gain_db`] for what it is *not*.
+    pub fn lane_gain_db(&self, lane: Lane) -> f32 {
+        self.project.lane_gain_db(lane)
+    }
+
+    /// Sets it. One undo step and a reseek, the equalizer's rule for the
+    /// equalizer's reason: the mixer is rebuilt from the new volumes right
+    /// where the playhead is, so a track turned down during playback is heard
+    /// turned down from the next chunk on.
+    pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
+        self.edit(|p| p.set_lane_gain_db(lane, db))
+    }
+
+    /// The master limiter the whole mix is summed through.
+    pub fn limiter(&self) -> crate::limiter::Limiter {
+        self.project.limiter()
+    }
+
+    /// Sets it, live like a lane volume and for the same reason -- the ceiling
+    /// a person is dragging has to be the ceiling they are hearing.
+    pub fn set_limiter(&mut self, limiter: crate::limiter::Limiter) -> bool {
+        self.edit(|p| p.set_limiter(limiter))
     }
 
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
@@ -1797,11 +1838,18 @@ impl PlaybackSession {
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
-            audio_running =
-                match AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds) {
-                    Ok(Some((_, rx))) => audio.spawn_feeder(rx),
-                    _ => false,
-                };
+            // ...and the mix settings over the lot: each lane's own volume on
+            // its way into the sum and the master limiter over the sum, both
+            // rebuilt here like the curves above, which is what makes a lane
+            // fader and a ceiling audible while the timeline runs.
+            let gains = self.project.audio_gains();
+            let limiter = self.project.limiter();
+            audio_running = match AudioSession::open_mixed_streams_master(
+                &sources, &segs, &eqs, &speeds, &gains, limiter,
+            ) {
+                Ok(Some((_, rx))) => audio.spawn_feeder(rx),
+                _ => false,
+            };
             if !audio_running {
                 // Nothing will ever be fed again; let `tick` fall to wall time
                 // instead of waiting on a device that has no more work coming.
