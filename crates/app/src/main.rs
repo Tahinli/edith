@@ -19,9 +19,9 @@ use engine::{Clip, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, FocusHandle,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, RenderImage, SharedString, Size, Stateful, TextAlign, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px, relative, rgb, rgba,
-    size,
+    Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, img, point, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 
 /// Editor chrome: three grays and one accent, all darker than the picture so the
@@ -74,6 +74,11 @@ const LABEL_MIN_W: f32 = 36.;
 /// allocates one bucket per window, so a rate taken from anything the user can
 /// influence is an allocation bomb -- and 40 is already finer than the pixels a
 /// clip is ever given.
+///
+/// ponytail: "finer than the pixels" stops being true once the timeline is
+/// zoomed -- past ~25 ms per bucket the envelope reads as steps rather than as
+/// a shape. Ceiling: [`View::max_zoom`]'s 8 frames across the bed. The upgrade
+/// is a second, finer pass over the visible span only, cached like `waves` is.
 const WAVE_BPS: u32 = 40;
 /// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
 /// and a path with a point per pixel is a path per repaint.
@@ -120,6 +125,11 @@ const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
 const MENU_W: f32 = 260.;
 const MENU_ROW_H: f32 = HIT_MIN;
 const MENU_PAD: f32 = 6.;
+/// How much of the item list is on screen at once, capped and scrolling like the
+/// keybindings and export lists: every action the pointer can reach is an item
+/// here, and a menu taller than the 640x360 floor would hang its last items off
+/// the bottom edge, where nobody can click them.
+const MENU_ROWS_H: f32 = 12. * MENU_ROW_H;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -342,8 +352,13 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-const MENU_ITEMS: [ActionId; 11] = [
+const MENU_ITEMS: [ActionId; 14] = [
     ActionId::Cut,
+    // The clipboard pair, which had no door but a chord: copy takes the clip the
+    // menu names, and paste is the timeline's rather than this clip's -- the
+    // same kind of global item the mute below already is.
+    ActionId::Copy,
+    ActionId::Paste,
     ActionId::Delete,
     ActionId::Lift,
     ActionId::Regroup,
@@ -351,6 +366,10 @@ const MENU_ITEMS: [ActionId; 11] = [
     ActionId::Group,
     ActionId::Equalizer,
     ActionId::Speed,
+    // The scan is a clip card like the two above it -- opened on whichever half
+    // was clicked -- and a card only a stroke could open is one a pointer never
+    // finds.
+    ActionId::Silence,
     ActionId::Color,
     ActionId::Fit,
     ActionId::ToggleMute,
@@ -580,6 +599,10 @@ struct Player {
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
+    /// How much of the timeline the ruler and the lanes are showing. Held here
+    /// and nowhere else: every frame-to-pixel answer in the panel comes out of
+    /// it, so the boxes, the playhead and the pointer cannot disagree.
+    view: View,
     /// Which clip the edit keys act on: the lane it is in and its index there.
     /// The *clicked* half, not the group -- a group is what gets marked on
     /// screen, but Lift has to know which half it was aimed at. Indices move
@@ -902,6 +925,12 @@ impl Player {
             ActionId::Color => self.open_color(cx),
             ActionId::Fit => self.cycle_fit(cx),
             ActionId::Resolution => self.cycle_resolution(cx),
+            // The playhead is what a key zoom is aimed at: it is the one place
+            // on the timeline the user is certainly looking at, and keeping it
+            // still is what every editor does.
+            ActionId::ZoomIn => self.zoom(ZOOM_STEP, None, cx),
+            ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
+            ActionId::ZoomFit => self.zoom_fit(cx),
             ActionId::Undo => self.undo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
@@ -1022,6 +1051,26 @@ impl Player {
             self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(next)).into());
             self.reset_after_reseek();
         }
+        cx.notify();
+    }
+
+    /// Magnifies the timeline about a point that stays put: `anchor` is where
+    /// along the bed to hold still (a ctrl+wheel holds the pointer), and with
+    /// none it is the playhead -- so the frame being worked on is still the
+    /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
+    /// stops at the whole timeline, in at a handful of frames.
+    fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
+        let duration = self.drawn_duration();
+        let at = self.playhead(duration);
+        let anchor = anchor.unwrap_or_else(|| self.view.frac_at(at, duration).clamp(0., 1.));
+        self.view = self.view.zoomed(factor, anchor, duration, self.fps);
+        cx.notify();
+    }
+
+    /// All the way back out: the whole timeline across the bed, which is what
+    /// the panel shows before anyone has zoomed at all.
+    fn zoom_fit(&mut self, cx: &mut Context<Self>) {
+        self.view = View::default();
         cx.notify();
     }
 
@@ -1499,6 +1548,11 @@ impl Player {
         match session.cut_regions(&regions, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Every hole closed moves the clips after it up a place, so the
+                // selection now names a different clip than the one that is
+                // highlighted -- dropped here as after every other edit that
+                // moves indexes (a delete, a paste, an undo).
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -1533,6 +1587,10 @@ impl Player {
         match session.speed_regions(&regions, rate, &lanes) {
             Ok(()) => {
                 self.close_silence();
+                // Splitting each silence out and closing the room it no longer
+                // needs moves indexes exactly as the cut does: the selection
+                // goes with them.
+                self.selected = None;
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
@@ -2094,14 +2152,16 @@ impl Player {
     /// pointer exactly.
     fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let (duration, fps) = (self.drawn_duration(), self.fps);
-        let frac = frac_along(x, self.ruler.get());
+        let at = self
+            .view
+            .time_at(frac_along(x, self.ruler.get()), duration);
         let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
             return;
         };
         let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
             return;
         };
-        trim.to = frame_at(f64::from(frac) * duration, fps).clamp(lo, hi);
+        trim.to = frame_at(at, fps).clamp(lo, hi);
         cx.notify();
     }
 
@@ -2187,6 +2247,21 @@ impl Player {
         }
     }
 
+    /// Where the playhead is, as the panel draws it. The clock keeps running
+    /// after the last frame (wall time takes over at audio EOF) while the
+    /// picture is frozen, so what the UI shows is the clamped one, pinned to
+    /// the out-point once playback is done.
+    fn playhead(&self, duration: f64) -> f64 {
+        if self.done {
+            duration
+        } else {
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::now)
+                .clamp(0., duration)
+        }
+    }
+
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
     /// "add this source" does. The whole source goes in at the playhead as one
@@ -2266,26 +2341,107 @@ impl Player {
             .as_mut()
             .map(|session| session.remove_source(path, stream));
         let text = match removed {
-            Some(Ok(())) => {
+            Some(Ok(idx)) => {
                 // The picked row may be the one that just went, and the engine
                 // reseeks, so this owes the flag reset like every other edit.
                 if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
                     self.selected_asset = None;
                 }
+                // A copied clip names its source by *index*, and every index
+                // past the one that went has just moved down: without this the
+                // next paste puts some other file on the timeline.
+                self.clipboard = clipboard_after_remove(self.clipboard, idx);
                 self.reset_after_reseek();
-                // The undo stack goes with it (`Project::remove_source`): said
-                // here, because a `z` that does nothing afterwards would
-                // otherwise read as a bug.
-                format!(
-                    "REMOVED {} — there is nothing left to undo",
-                    file_name(path)
-                )
+                // The last row leaves a session naming no file: nothing to
+                // play, nothing to save and nothing to show, which is the empty
+                // window the editor launches as. The next import scaffolds a
+                // fresh timeline from whatever file it is, at that file's own
+                // rate -- which is why the session goes rather than lingering
+                // on with the gone file's parameters.
+                match self
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.sources().is_empty())
+                {
+                    true => {
+                        self.close_session();
+                        format!(
+                            "REMOVED {} — the library is empty; import a file to start again",
+                            file_name(path)
+                        )
+                    }
+                    // The undo stack goes with it (`Project::remove_source`):
+                    // said here, because a `z` that does nothing afterwards
+                    // would otherwise read as a bug.
+                    false => format!(
+                        "REMOVED {} — there is nothing left to undo",
+                        file_name(path)
+                    ),
+                }
             }
             Some(Err(e)) => format!("NOT REMOVED — {e}"),
             None => "NO TIMELINE — open a file first".to_string(),
         };
         self.notice = Some(text.into());
         cx.notify();
+    }
+
+    /// Back to the window the editor launches as: no timeline, no library, no
+    /// picture -- and the hint that says to open a file. What removing the last
+    /// library row leaves, since a session whose library is empty has nothing
+    /// left to be ([`Player::remove_source`]).
+    ///
+    /// Everything a *loaded project* resets goes here for its reasons (an index
+    /// into a timeline that is gone names nothing), plus the three per-file
+    /// caches: they are keyed by path, and the next file to arrive fills them
+    /// again.
+    fn close_session(&mut self) {
+        self.session = None;
+        // The picture goes with it, or the empty window would keep showing the
+        // last frame of a timeline that no longer exists.
+        //
+        // ponytail: its atlas tile is not released -- `window.drop_image` wants
+        // a `&mut Window` this door has no other reason to take. One tile per
+        // emptied library, against one per displayed frame in `pump`; the
+        // upgrade path is threading the window through `act_on_row`.
+        self.image = None;
+        self.clipboard = None;
+        self.selected = None;
+        self.selected_asset = None;
+        self.context_menu = None;
+        self.library_menu = None;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.close_silence();
+        self.waves.clear();
+        self.streams.clear();
+        self.sizes.clear();
+        // Scanned off a source that is not in the library any more.
+        self.silence_levels = None;
+        // Every gesture in flight, dropped for `reset_after_reseek`'s reason
+        // (it drops the trim below): a drag holds a bar, a clip or a band of a
+        // timeline that has just stopped existing.
+        self.scrubbing = false;
+        self.volume_dragging = false;
+        self.eq_dragging = false;
+        self.speed_dragging = false;
+        self.color_dragging = false;
+        self.displayed = 0;
+        self.dropped = 0;
+        self.started = None;
+        // The empty window's own: no name in the titlebar, nowhere chosen to
+        // export or save to yet, and a rate that only keeps the timecode
+        // reading in frames until a file brings its own (`main`).
+        self.name = NO_FILE.into();
+        self.export_path = PathBuf::new();
+        self.project_path = PathBuf::new();
+        self.fps = 30.;
+        // No decoder to wait for a frame from: the hint is what shows.
+        self.reset_after_reseek();
+        self.pending_seek = false;
+        self.eos = false;
+        self.done = false;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -2321,11 +2477,22 @@ impl Player {
         cx.notify();
     }
 
-    /// The rate and layout the whole timeline's audio is, taken from source 0's
-    /// own stream: what a library row has to match to be placeable. `None`
-    /// until that file has been probed, and then nothing is greyed for it.
+    /// The rate and layout the whole timeline's audio is, taken from the stream
+    /// of the first source that could have one: what a library row has to match
+    /// to be placeable. `None` until that file has been probed, and then nothing
+    /// is greyed for it.
+    ///
+    /// The first source that is *not a still*, which is the rule the engine
+    /// holds every import to (`playback::audio_source_of`) -- a picture at the
+    /// head of the list (a removal moves indexes) has no stream to describe
+    /// anything with.
     fn timeline_audio(&self) -> Option<(u32, u16)> {
-        let first = self.session.as_ref()?.sources().first()?;
+        let first = self
+            .session
+            .as_ref()?
+            .sources()
+            .iter()
+            .find(|s| !engine::is_image(&s.path))?;
         let info = self
             .streams
             .get(&first.path)?
@@ -2643,7 +2810,9 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
-        let t = f64::from(frac_along(x, self.ruler.get())) * session.timeline_duration();
+        let t = self
+            .view
+            .time_at(frac_along(x, self.ruler.get()), session.timeline_duration());
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
@@ -2913,17 +3082,12 @@ impl Render for Player {
         // timecode, the ruler and the clamp below all have to follow it -- and
         // so does the room a tail being dragged needs to grow into.
         let duration = self.drawn_duration();
-        // The clock keeps running after the last frame (wall time takes over at
-        // audio EOF) while the picture is frozen, so the timeline the UI shows is
-        // the clamped one, pinned to the out-point once playback is done.
-        let position = if self.done {
-            duration
-        } else {
-            self.session
-                .as_ref()
-                .map_or(0., PlaybackSession::now)
-                .clamp(0., duration)
-        };
+        let position = self.playhead(duration);
+        // Re-settled every frame against the duration this one is drawing: an
+        // edit that shortens the timeline moves the far end of the view, and a
+        // playhead that has run off the bed pulls the view after it -- which is
+        // what makes a zoomed-in timeline scroll while it plays.
+        self.view = self.view.following(position, duration, self.fps);
 
         div()
             .track_focus(&self.focus)
@@ -3630,11 +3794,11 @@ impl Player {
         playing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let filled = if duration > 0. {
-            (position / duration) as f32
-        } else {
-            0.
-        };
+        // Where the playhead is *on the bed*, which at the fit is where along
+        // the timeline it is and zoomed in is where along the visible slice.
+        // Clamped because it is drawn as a width as well as an offset, and the
+        // view follows the playhead anyway, so it is never off the bed.
+        let filled = self.view.frac_at(position, duration).clamp(0., 1.);
         // An export owns the hint slot and the ruler while it runs: the
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
@@ -3642,6 +3806,10 @@ impl Player {
         // Everything but Import and Keys needs a timeline to act on: with none
         // open they are dimmed rather than silently doing nothing.
         let live = self.session.is_some() && !exporting;
+        // The project's own picture size, for the button that cycles it: read
+        // per render like everything else here, so a cycle shows on the button
+        // that made it.
+        let resolution = self.session.as_ref().map(PlaybackSession::resolution);
         let key = |action| self.keymap.display(action);
         // The lanes the project has, or the pair a fresh one starts with so the
         // panel reads the same before a file is open as after.
@@ -3691,12 +3859,20 @@ impl Player {
             .bg(rgb(CHROME))
             // Transport | edit | file: three groups, so the eye can skip two of
             // them. Every button says what it does; the tooltip adds its key.
+            //
+            // The row scrolls rather than losing its tail: at the 640 px floor
+            // this window is sized for it is wider than the panel, and a button
+            // off the right edge is a button a pointer cannot press. A plain
+            // wheel moves it -- gpui puts a vertical delta on the x axis when
+            // that is the only one scrolling (div.rs:2424).
             .child(
                 div()
+                    .id("controls")
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .overflow_x_scroll()
                     .child(control(
                         "transport",
                         Some(transport_glyph(playing).into_any_element()),
@@ -3737,6 +3913,17 @@ impl Player {
                         },
                         live && self.selected.is_some(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                    ))
+                    // The way back from every one of them. It was a stroke and
+                    // nothing else, which made the whole edit group a one-way
+                    // door for anyone working with a pointer.
+                    .child(control(
+                        "undo",
+                        None,
+                        "Undo",
+                        format!("{} — takes the last edit back", key(ActionId::Undo)),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
                     ))
                     // With the edit group, beside the buttons that change the
                     // edit list: a track is a row of it, and adding one is an
@@ -3796,19 +3983,105 @@ impl Player {
                         cx,
                     ))
                     .child(separator())
+                    // The size every clip is composed onto, which is also the
+                    // size the export comes out at: the one project setting a
+                    // stroke used to be the only way to. Cycles exactly as the
+                    // key does, and says where it is now rather than opening a
+                    // list to close again.
+                    .child(control(
+                        "resolution",
+                        None,
+                        resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                        match resolution {
+                            Some((w, h)) => format!(
+                                "{} — the project is {w}x{h}; cycles source → 2160p → 1080p → 720p → 480p",
+                                key(ActionId::Resolution)
+                            ),
+                            None => format!("{} — open a file first", key(ActionId::Resolution)),
+                        },
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_resolution(cx)),
+                    ))
+                    // How much of the timeline the panel below is showing --
+                    // beside the resolution, since neither of them edits
+                    // anything: they are both what is being looked at. The
+                    // middle one reads as the state (1.0x is the whole
+                    // timeline) and is the way back to it.
+                    .child(control(
+                        "zoom-out",
+                        None,
+                        "−",
+                        format!(
+                            "{} — show more of the timeline; stops at the whole of it",
+                            key(ActionId::ZoomOut)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.zoom(1. / ZOOM_STEP, None, cx)
+                        }),
+                    ))
+                    .child(control(
+                        "zoom-fit",
+                        None,
+                        format!("{:.1}x", self.view.zoom),
+                        format!(
+                            "{} — fit the whole timeline; showing {} to {}",
+                            key(ActionId::ZoomFit),
+                            timecode(self.view.start, self.fps),
+                            timecode(
+                                (self.view.start + self.view.span(duration)).min(duration),
+                                self.fps
+                            )
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_fit(cx)),
+                    ))
+                    .child(control(
+                        "zoom-in",
+                        None,
+                        "+",
+                        format!(
+                            "{} — magnify around the playhead; ctrl+wheel on the bar zooms at the pointer",
+                            key(ActionId::ZoomIn)
+                        ),
+                        live,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
+                    ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
                     // which one is the real one.
+                    //
+                    // While one runs, this button is the way out of it: the
+                    // progress line promised esc and nothing else, which left a
+                    // pointer no way to stop an export it had started.
                     .child(control(
                         "export",
                         None,
-                        "Export",
-                        format!(
-                            "{} — quality and destination, then writes the timeline out",
-                            key(ActionId::Export)
-                        ),
-                        live && self.export.is_none(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_export(cx)),
+                        if exporting { "Cancel" } else { "Export" },
+                        if exporting {
+                            format!(
+                                "{} — stops the export; the part-written file goes",
+                                key(ActionId::CancelExport)
+                            )
+                        } else {
+                            format!(
+                                "{} — quality and destination, then writes the timeline out",
+                                key(ActionId::Export)
+                            )
+                        },
+                        if exporting {
+                            true
+                        } else {
+                            live && self.export.is_none()
+                        },
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if this.exporting().is_some() {
+                                this.cancel_export();
+                                cx.notify();
+                            } else {
+                                this.open_export(cx);
+                            }
+                        }),
                     ))
                     .child(control(
                         "save",
@@ -3886,7 +4159,32 @@ impl Player {
                             .hover(|s| s.bg(rgb(HOVER_DIM)))
                             // The strip carries no text, so the tooltip is the only
                             // place it can say what it is.
-                            .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tip("Seek — click or drag; ctrl+wheel zooms".into()))
+                                    .into()
+                            })
+                            // Ctrl+wheel is what every timeline zooms with, and
+                            // the point held still is the one under the pointer
+                            // rather than the playhead. Only with ctrl: a bare
+                            // wheel here is the window's to scroll, and the
+                            // controls row above scrolls on exactly that.
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    if !event.modifiers.control {
+                                        return;
+                                    }
+                                    let dy = match event.delta {
+                                        ScrollDelta::Lines(d) => d.y,
+                                        ScrollDelta::Pixels(d) => f32::from(d.y),
+                                    };
+                                    if dy == 0. {
+                                        return;
+                                    }
+                                    let anchor = frac_along(event.position.x, this.ruler.get());
+                                    let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
+                                    this.zoom(factor, Some(anchor), cx);
+                                },
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -4958,7 +5256,45 @@ impl Player {
                         cx.notify();
                     }))
                     .child(div().text_color(rgb(INK_DIM)).child(label))
-                    .child(value)
+                    // The value and the two steps that move it. Every other
+                    // card has something to drag or press; this one had the
+                    // arrow keys and nothing else, so a row was a setting a
+                    // pointer could pick but never change. One press each, the
+                    // same call the arrows make -- the hold-to-run is the
+                    // keyboard's own and is not a thing a button has.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(value)
+                            .children([-1, 1].map(|steps: i32| {
+                                div()
+                                    .id(("silence-step", n * 2 + usize::from(steps > 0)))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h(px(KEYS_ROW_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(CHROME))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        // Picked as well as moved: the row a
+                                        // press lands on is the row the arrows
+                                        // carry on from.
+                                        this.silence_field = n;
+                                        this.nudge_silence(steps);
+                                        cx.notify();
+                                    }))
+                                    .child(match steps > 0 {
+                                        true => "+",
+                                        false => "−",
+                                    })
+                            })),
+                    )
             })
             .collect();
         // The two buttons the ask names, side by side: a mode toggle would hide
@@ -5016,7 +5352,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "↑↓ picks a setting, ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
                                 ),
                         )
                         .children(rows)
@@ -5297,7 +5633,7 @@ impl Player {
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
-                let label = if action == ActionId::ToggleMute {
+                let label = if matches!(action, ActionId::ToggleMute | ActionId::Paste) {
                     format!("{} (global)", action.label())
                 } else {
                     action.label().to_string()
@@ -5344,7 +5680,10 @@ impl Player {
         let (x, y) = menu_at(
             menu.at,
             viewport,
-            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
+            // The cap once the list is longer than it: past that the list
+            // scrolls and the card stops growing, exactly as the keybindings and
+            // export lists do.
+            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
         );
         let full: SharedString = source.path.display().to_string().into();
         Some(
@@ -5399,7 +5738,18 @@ impl Player {
                         .when(menu.details, |d| {
                             d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
                         })
-                        .children(rows),
+                        // The list scrolls where the card would otherwise grow
+                        // past the window's floor -- an item hanging off the
+                        // bottom edge is an item nobody can click.
+                        .child(
+                            div()
+                                .id("menu-rows")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(MENU_ROWS_H))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -5426,6 +5776,9 @@ impl Player {
         // one probe answers for both. Zero before the first paint, which only
         // costs the labels one frame.
         let bed_w = f32::from(self.ruler.get().size.width);
+        // The slice being shown, copied out once: every box in the row is
+        // placed through it, so all of them move together when it does.
+        let view = self.view;
         let clips = self
             .session
             .as_ref()
@@ -5563,7 +5916,7 @@ impl Player {
                                 .and_then(|s| sources.iter().position(|o| o.path == s.path))
                                 .unwrap_or(clip.source),
                         );
-                        let width = width_frac(len, duration);
+                        let width = view.width_frac(len, duration);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
@@ -5587,7 +5940,11 @@ impl Player {
                             .absolute()
                             .top_0()
                             .h_full()
-                            .left(relative(start_frac(start, duration)))
+                            // Negative once the clip's head has been scrolled
+                            // off the left edge: the bed clips what hangs out
+                            // of it, so a half-visible clip is drawn as the
+                            // half of itself that is on screen.
+                            .left(relative(view.frac_at(start, duration)))
                             .w(relative(width))
                             .overflow_hidden()
                             .rounded(px(3.))
@@ -5736,8 +6093,12 @@ impl Player {
                                     .absolute()
                                     .top_0()
                                     .h_full()
-                                    .left(relative(start_frac(f64::from(at) / self.fps, duration)))
-                                    .w(relative(width_frac(f64::from(len) / self.fps, duration)))
+                                    .left(relative(
+                                        view.frac_at(f64::from(at) / self.fps, duration),
+                                    ))
+                                    .w(relative(
+                                        view.width_frac(f64::from(len) / self.fps, duration),
+                                    ))
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
@@ -6045,6 +6406,28 @@ fn menu_at(at: Point<Pixels>, viewport: Size<Pixels>, height: f32) -> (f32, f32)
 /// and takes no click, like every other one here.
 fn can_add(picked: Option<&(PathBuf, usize)>, timeline: bool, exporting: bool) -> bool {
     picked.is_some() && timeline && !exporting
+}
+
+/// What is left on the clipboard after the library row at `removed` was taken
+/// out. A copied clip names its file by *index* into the source list
+/// (`engine::Clip::source`) and a removal renumbers that list
+/// (`engine::Project::remove_source`), so a clipboard kept as it was would paste
+/// **a different file** -- the next one along -- over the range it was copied
+/// from.
+///
+/// The clip's own file gone means there is nothing to paste: `None`, and the
+/// next paste says the clipboard is empty rather than putting some other take
+/// down. Every index past it moves down by one, exactly as the lanes' clips do.
+fn clipboard_after_remove(clip: Option<Clip>, removed: usize) -> Option<Clip> {
+    let mut clip = clip?;
+    match clip.source.cmp(&removed) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => {
+            clip.source -= 1;
+            Some(clip)
+        }
+        std::cmp::Ordering::Less => Some(clip),
+    }
 }
 
 /// One library row: a file and one of its audio streams. Plain data, planned
@@ -6567,7 +6950,18 @@ enum Repeat {
 fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> bool {
     match scope {
         Repeat::Card => matches!(key, "up" | "down" | "left" | "right"),
-        Repeat::Keymap => matches!(action, Some(ActionId::VolumeUp | ActionId::VolumeDown)),
+        Repeat::Keymap => matches!(
+            action,
+            Some(
+                ActionId::VolumeUp
+                    | ActionId::VolumeDown
+                    // A zoom is a value being moved as much as a level is:
+                    // held, it runs from the whole timeline down to a handful
+                    // of frames and stops there. The fit is one press.
+                    | ActionId::ZoomIn
+                    | ActionId::ZoomOut
+            )
+        ),
         Repeat::Nothing => false,
     }
 }
@@ -6665,14 +7059,127 @@ fn width_frac(len: f64, total: f64) -> f32 {
     if total > 0. { (len / total) as f32 } else { 1. }
 }
 
-/// Where along the lane a clip starts, 0..1. Unlike [`width_frac`] a timeline
-/// with no length pins this to the left edge -- a full-width offset would push
-/// the box out of the lane it belongs to.
-fn start_frac(start: f64, total: f64) -> f32 {
-    if total > 0. {
-        (start / total).clamp(0., 1.) as f32
-    } else {
-        0.
+/// One press of a zoom key, or one notch of ctrl+wheel.
+const ZOOM_STEP: f32 = 1.25;
+
+/// How few frames the bed may be narrowed down to. Past this there is nothing
+/// left to aim at -- a single frame across a whole window is a wall of colour,
+/// not an edit surface.
+const ZOOM_MIN_FRAMES: f64 = 8.;
+
+/// Which slice of the timeline the ruler and the lanes are showing: `zoom` is
+/// how many times the whole of it the bed is now worth, and `start` the moment
+/// at the bed's left edge. The one place frames become pixels -- every box, the
+/// playhead, a seek and a trim all go through it, so none of them can drift
+/// away from the others when the view moves.
+///
+/// [`View::default`] is the whole timeline across the bed, which is what the
+/// panel drew before there was a zoom at all: at zoom 1 `start` is pinned to 0
+/// and every fraction here is the one [`width_frac`] and `start_frac` gave.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    zoom: f32,
+    start: f64,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        View {
+            zoom: 1.,
+            start: 0.,
+        }
+    }
+}
+
+impl View {
+    /// How much of the timeline is on the bed, in seconds.
+    fn span(self, duration: f64) -> f64 {
+        duration / f64::from(self.zoom)
+    }
+
+    /// The tightest this timeline may be zoomed: [`ZOOM_MIN_FRAMES`] across the
+    /// bed. Never under 1 -- a timeline shorter than that is already at its
+    /// floor, and a zoom that cannot fit the whole of it is not a zoom.
+    fn max_zoom(duration: f64, fps: f64) -> f32 {
+        let frames = duration * fps;
+        if frames > ZOOM_MIN_FRAMES {
+            (frames / ZOOM_MIN_FRAMES) as f32
+        } else {
+            1.
+        }
+    }
+
+    /// Where a moment sits along the bed, 0 at its left edge and 1 at its
+    /// right. Outside that range for a moment scrolled off the view, which is
+    /// exactly the negative offset a half-visible clip is drawn at.
+    fn frac_at(self, at: f64, duration: f64) -> f32 {
+        let span = self.span(duration);
+        if span > 0. {
+            ((at - self.start) / span) as f32
+        } else {
+            0.
+        }
+    }
+
+    /// How wide a stretch of `len` seconds is on the bed. More than the whole
+    /// bed once zoomed in, which is the point of zooming in.
+    fn width_frac(self, len: f64, duration: f64) -> f32 {
+        width_frac(len, self.span(duration))
+    }
+
+    /// The moment a pointer at `frac` along the bed is pointing at: the inverse
+    /// of [`View::frac_at`], and what every seek and every trim reads.
+    fn time_at(self, frac: f32, duration: f64) -> f64 {
+        (self.start + f64::from(frac) * self.span(duration)).clamp(0., duration)
+    }
+
+    /// Zoomed by `factor` about `anchor` (0..1 along the bed): whatever moment
+    /// was under that point stays under it, so a zoom magnifies what was being
+    /// looked at rather than throwing it off the edge.
+    fn zoomed(self, factor: f32, anchor: f32, duration: f64, fps: f64) -> Self {
+        let at = self.start + f64::from(anchor) * self.span(duration);
+        // Clamped *before* the offset is worked out, not after: a press that
+        // runs into either stop must still leave the anchor where it is, and a
+        // start measured against a zoom the stop then took away would slide it.
+        let zoom = (self.zoom * factor).clamp(1., Self::max_zoom(duration, fps));
+        let start = at - f64::from(anchor) * View { zoom, start: 0. }.span(duration);
+        View { zoom, start }.settled(duration, fps)
+    }
+
+    /// Clamped to the timeline it draws: never wider than the whole of it (the
+    /// zoom-out floor is the fit), never tighter than [`View::max_zoom`], and
+    /// never scrolled past either end.
+    fn settled(self, duration: f64, fps: f64) -> Self {
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.clamp(1., Self::max_zoom(duration, fps))
+        } else {
+            1.
+        };
+        let span = View { zoom, start: 0. }.span(duration);
+        let start = if self.start.is_finite() {
+            self.start.clamp(0., (duration - span).max(0.))
+        } else {
+            0.
+        };
+        View { zoom, start }
+    }
+
+    /// The view a playhead at `at` needs: the same one while it is on the bed,
+    /// and one centred on it once it has run off -- which is how a zoomed-in
+    /// timeline scrolls, during playback and after a seek alike. At the fit
+    /// this can never fire, so an unzoomed panel is untouched by it.
+    fn following(self, at: f64, duration: f64, fps: f64) -> Self {
+        let view = self.settled(duration, fps);
+        let span = view.span(duration);
+        if at < view.start || at > view.start + span {
+            View {
+                start: at - span / 2.,
+                ..view
+            }
+            .settled(duration, fps)
+        } else {
+            view
+        }
     }
 }
 
@@ -7334,17 +7841,20 @@ mod tests {
         EQ_TICKS, EXPORT_ROWS_H, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS,
         HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H,
         LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS,
-        MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
-        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
-        VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, can_add,
-        cancels_export, color_snap, envelope, eq_spectrum, eq_x, eq_y, export_path,
-        export_settings, format_key, format_line, format_refusal, frac_along, frac_down, frame_at,
-        histogram, is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at, normalise,
-        nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due, show_label,
-        silence_rate, source_tint, span_partner, speed_at, start_frac, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H,
+        SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source,
+        Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label,
+        can_add, cancels_export, clipboard_after_remove, color_snap, envelope, eq_spectrum, eq_x,
+        eq_y, export_path, export_settings, format_key, format_line, format_refusal, frac_along,
+        frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
+        menu_at, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
+        scrub_due, show_label, silence_rate, source_tint, span_partner, speed_at, timecode,
+        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
-    use super::{LaneKind, Repeat, file_name, file_uri, library_rows, repeats, unscannable};
+    use super::{
+        LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
+        repeats, unscannable,
+    };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
     /// the ones the bus would otherwise read as something else.
@@ -7693,6 +8203,93 @@ mod tests {
             assert!(ActionId::ALL.contains(&action), "{action:?} is not listed");
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
         }
+        // ...and the whole card still fits the 640x360 floor, however many items
+        // it grows to: the list is what scrolls past the cap, never the card.
+        let items = MENU_ITEMS.len() + 1; // Properties
+        assert!(MENU_PAD * 2. + MENU_ROWS_H <= 360., "menu too tall");
+        assert!(
+            MENU_ROWS_H / MENU_ROW_H >= 12.,
+            "too few items visible to scan"
+        );
+        assert_eq!(
+            menu_at(point(px(0.), px(0.)), size(px(640.), px(360.)), {
+                MENU_PAD * 2. + (items as f32 * MENU_ROW_H).min(MENU_ROWS_H)
+            }),
+            (0., 0.)
+        );
+    }
+
+    /// The other half of the keys menu's guarantee, and the audit this batch was
+    /// asked for kept as a test: no action may be a stroke and nothing else.
+    /// Either the clip menu offers it, or a control in the panel does -- named
+    /// here by the id [`control`] is handed, read out of this file's own source
+    /// like `no_stroke_is_missing_from_the_keys_menu` reads the key handler.
+    #[test]
+    fn every_action_is_reachable_without_the_keyboard() {
+        use keymap::ActionId;
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let element = |id: &str| source.contains(&format!("\"{id}\""));
+        for action in ActionId::ALL {
+            let by_pointer = MENU_ITEMS.contains(&action)
+                || match action {
+                    ActionId::Play => element("transport"),
+                    // One slot, two states: it starts an export and stops the
+                    // one it started.
+                    ActionId::Export | ActionId::CancelExport => element("export"),
+                    ActionId::Save => element("save"),
+                    ActionId::Undo => element("undo"),
+                    ActionId::Resolution => element("resolution"),
+                    // Three buttons beside it, and the ctrl+wheel on the bar.
+                    ActionId::ZoomIn => element("zoom-in"),
+                    ActionId::ZoomOut => element("zoom-out"),
+                    ActionId::ZoomFit => element("zoom-fit"),
+                    ActionId::AddVideoLane => element("add-video-lane"),
+                    ActionId::AddAudioLane => element("add-audio-lane"),
+                    // The × in a lane's own header, which takes any track and
+                    // not only the last one.
+                    ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
+                        source.contains("this.remove_lane(lane, cx)")
+                    }
+                    ActionId::ToggleMute => element("volume"),
+                    ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
+                    // The ruler seeks anywhere the pointer points; the frame and
+                    // the second are the keyboard's finer grain of that move.
+                    ActionId::StepBack
+                    | ActionId::StepForward
+                    | ActionId::JumpBack
+                    | ActionId::JumpForward
+                    | ActionId::GoStart
+                    | ActionId::GoEnd => element("ruler"),
+                    // A press on a clip is the selection, group and all.
+                    ActionId::Select | ActionId::SelectNext | ActionId::SelectPrev => {
+                        source.contains("this.select((lane, i), cx)")
+                    }
+                    _ => false,
+                };
+            assert!(by_pointer, "{action:?} is reachable by keyboard only");
+        }
+        // The card-local strokes have the same rule, and each of them is a thing
+        // on its card: the graph and its two buttons, the colour bars and their
+        // reset, the speed bar and its presets, and the silence card's rows --
+        // whose steppers are the pointer's only way to a threshold.
+        for id in [
+            "eq-graph",
+            "eq-reset",
+            "eq-spectrum",
+            "color-bar",
+            "color-reset",
+            "speed-bar",
+            "speed-preset",
+            "silence-row",
+            "silence-step",
+            "silence-apply",
+            "export-confirm",
+        ] {
+            assert!(element(id), "{id} is not on any card");
+        }
     }
 
     /// What the Detach and Group items do to a real timeline: a music video's
@@ -7932,15 +8529,69 @@ mod tests {
             .expect("nothing plays av2 any more");
         assert_eq!(rows(&session), 1, "the row went with it");
         assert_eq!(session.sources().len(), 1);
-        // The one file left cannot go: a project that names none is not one
-        // that reopens.
+        // The one file left is held to the same rule and no other: its own take
+        // is still on the lanes, so it stays...
+        let first = session.sources()[0].path.clone();
         let refusal = session
-            .remove_source(&session.sources()[0].path.clone(), 0)
-            .expect_err("the last file stays")
+            .remove_source(&first, 0)
+            .expect_err("its take is still on the timeline")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
+        assert!(refusal.contains("still plays"), "{refusal}");
+        // ...and once nothing plays it, the *last* row goes too. What is left
+        // is the empty library `Player::close_session` turns back into the
+        // window the editor launches as -- the user-reported bug was that this
+        // very removal was refused, leaving a row that could never be taken
+        // out.
+        assert!(session.delete_clip(Lane::V1, 0));
+        session
+            .remove_source(&first, 0)
+            .expect("the only row goes like any other");
+        assert_eq!(rows(&session), 0, "an empty library");
+        assert!(session.sources().is_empty());
+        // And it is still a session: silent, empty, and asked for its length
+        // rather than panicking on a source list that is not there.
+        assert_eq!(session.timeline_duration(), 0.0);
+        assert!(
+            session.save_project(&asset("nothing.edith")).is_err(),
+            "a project naming no file could never be opened again, so it is not written"
+        );
         // A row this timeline never had is refused, not panicked on.
         assert!(session.remove_source(&second, 0).is_err());
+    }
+
+    /// The clipboard after a library removal. A copied clip names its file by
+    /// index and a removal renumbers the list, so this is the difference
+    /// between pasting the take that was copied and pasting **another file**
+    /// over the same range ([`clipboard_after_remove`], called by
+    /// [`Player::remove_source`]).
+    #[test]
+    fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
+        let clip = |source: usize| Clip {
+            start: 0,
+            in_frame: 0,
+            out_frame: 30,
+            source,
+            link: None,
+            eq: None,
+            color: None,
+            fit: Default::default(),
+            speed: Default::default(),
+        };
+        // Copied from source 2, source 0 removed: the same file is source 1 now.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(2)), 0).map(|c| c.source),
+            Some(1),
+            "the clipboard follows its file down the list"
+        );
+        // Copied from a source *before* the one that went: untouched.
+        assert_eq!(
+            clipboard_after_remove(Some(clip(0)), 2).map(|c| c.source),
+            Some(0)
+        );
+        // Copied from the row that was just removed: there is nothing left to
+        // paste, and pasting the next file along would be a lie.
+        assert!(clipboard_after_remove(Some(clip(1)), 1).is_none());
+        assert!(clipboard_after_remove(None, 0).is_none());
     }
 
     /// The trim-a-clip path through the doors the edge drag uses:
@@ -8366,6 +9017,161 @@ mod tests {
         }
         for fixed in &keymap::FIXED {
             assert!(keymap::Category::ALL.contains(&fixed.category));
+        }
+    }
+
+    /// The mapping the whole panel is drawn and clicked through: a moment goes
+    /// to a fraction of the bed and comes back the same moment, at every zoom.
+    /// The fit is the invariant that matters most -- it must be the arithmetic
+    /// the panel did before there was a zoom at all.
+    #[test]
+    fn a_moment_and_the_place_it_is_drawn_are_the_same_at_every_zoom() {
+        let duration = 20.;
+        // The fit: what `start_frac`/`width_frac` used to answer, exactly.
+        let fit = View::default();
+        for t in [0., 5., 12.5, 20.] {
+            assert_eq!(fit.frac_at(t, duration), (t / duration) as f32, "fit at {t}");
+        }
+        assert_eq!(fit.width_frac(5., duration), width_frac(5., duration));
+        for view in [
+            fit,
+            View {
+                zoom: 2.,
+                start: 4.,
+            },
+            View {
+                zoom: 8.,
+                start: 12.5,
+            },
+            View {
+                zoom: 37.5,
+                start: 19.,
+            },
+        ] {
+            let view = view.settled(duration, 30.);
+            for frac in [0., 0.25, 0.5, 1.] {
+                let at = view.time_at(frac, duration);
+                assert!(
+                    (f64::from(view.frac_at(at, duration)) - f64::from(frac)).abs() < 1e-6,
+                    "{view:?} round trip at {frac}"
+                );
+            }
+            // A stretch is as wide as the share of the visible slice it takes.
+            assert!(
+                (f64::from(view.width_frac(view.span(duration), duration)) - 1.).abs() < 1e-6,
+                "{view:?} spans the bed"
+            );
+        }
+    }
+
+    /// The rule that makes a zoom usable: whatever was under the anchor is
+    /// still under it afterwards -- the playhead for a key, the pointer for a
+    /// ctrl+wheel.
+    #[test]
+    fn a_zoom_leaves_the_anchor_where_it_was_on_screen() {
+        let (duration, fps) = (20., 30.);
+        let mut view = View::default();
+        for anchor in [0.5f32, 0.25, 0.9] {
+            // Well past the zoom-in stop: the anchor holds at the clamp too,
+            // which is where it used to slide (the clamp came after the offset).
+            for _ in 0..30 {
+                let at = view.time_at(anchor, duration);
+                let zoomed = view.zoomed(ZOOM_STEP, anchor, duration, fps);
+                // Only where the anchor is not pinned by an edge of the
+                // timeline: a view already against an end cannot slide further.
+                let pinned = zoomed.start <= 0. || zoomed.start + zoomed.span(duration) >= duration;
+                if !pinned {
+                    assert!(
+                        (f64::from(zoomed.frac_at(at, duration)) - f64::from(anchor)).abs() < 1e-6,
+                        "{at} moved: {view:?} -> {zoomed:?}"
+                    );
+                }
+                assert!(zoomed.zoom >= view.zoom, "and it did zoom in");
+                view = zoomed;
+            }
+        }
+    }
+
+    /// Both stops: out is the whole timeline (which is where the panel starts,
+    /// so nothing regressed for anyone who never zooms), in is a handful of
+    /// frames -- and neither can scroll off an end.
+    #[test]
+    fn zoom_stops_at_the_whole_timeline_and_at_a_handful_of_frames() {
+        let (duration, fps) = (20., 30.);
+        let mut view = View::default();
+        for _ in 0..200 {
+            view = view.zoomed(1. / ZOOM_STEP, 0.5, duration, fps);
+        }
+        assert_eq!(view, View::default(), "zoomed out is the fit");
+        for _ in 0..200 {
+            view = view.zoomed(ZOOM_STEP, 0.5, duration, fps);
+        }
+        assert_eq!(
+            (view.span(duration) * fps).round(),
+            ZOOM_MIN_FRAMES,
+            "tightest is a handful of frames"
+        );
+        // Against the far end, the slice still ends at the last frame.
+        let end = View {
+            zoom: view.zoom,
+            start: 1e6,
+        }
+        .settled(duration, fps);
+        assert!((end.start + end.span(duration) - duration).abs() < 1e-9);
+        assert!(
+            View {
+                zoom: view.zoom,
+                start: -5.
+            }
+            .settled(duration, fps)
+            .start
+                == 0.
+        );
+        // A timeline too short to zoom into, and one with no length at all,
+        // both stay at the fit rather than dividing by nothing.
+        assert_eq!(View::max_zoom(0.1, fps), 1.);
+        assert_eq!(View::default().settled(0., fps), View::default());
+        assert_eq!(View::default().frac_at(3., 0.), 0.);
+        assert_eq!(View::default().time_at(0.5, 0.), 0.);
+    }
+
+    /// What makes a zoomed timeline follow the playing head: off the bed at
+    /// either end pulls the view onto it, and on the bed it never moves -- a
+    /// view that jumped every frame would be unreadable.
+    #[test]
+    fn the_view_follows_a_playhead_that_runs_off_the_bed() {
+        let (duration, fps) = (20., 30.);
+        let view = View {
+            zoom: 4.,
+            start: 5.,
+        }
+        .settled(duration, fps);
+        assert_eq!(view.span(duration), 5.);
+        // Inside: untouched, whichever part of the slice it is in.
+        for at in [5., 7.5, 10.] {
+            assert_eq!(view.following(at, duration, fps), view, "{at} is on the bed");
+        }
+        // Past the right edge, as playback does it: the head comes back on the
+        // bed, and the zoom is not changed by the scroll.
+        let moved = view.following(12., duration, fps);
+        assert_eq!(moved.zoom, view.zoom);
+        assert!(moved.start > view.start, "scrolled forward");
+        assert!(
+            moved.frac_at(12., duration) > 0. && moved.frac_at(12., duration) < 1.,
+            "and the playhead is on screen"
+        );
+        // A seek back behind the slice does the same the other way.
+        let back = view.following(1., duration, fps);
+        assert!(back.start < view.start);
+        assert!(back.frac_at(1., duration) >= 0.);
+        // At the fit there is nothing to follow: the whole timeline is on the
+        // bed already, so no playhead can move it.
+        for at in [0., 10., 20.] {
+            assert_eq!(
+                View::default().following(at, duration, fps),
+                View::default(),
+                "the fit never scrolls"
+            );
         }
     }
 
@@ -8951,11 +9757,20 @@ mod tests {
         // value being moved.
         assert!(repeats(Repeat::Keymap, "up", Some(ActionId::VolumeUp)));
         assert!(repeats(Repeat::Keymap, "down", Some(ActionId::VolumeDown)));
+        // ...and the zoom pair, which runs the view the way they run the level.
+        assert!(repeats(Repeat::Keymap, "=", Some(ActionId::ZoomIn)));
+        assert!(!repeats(Repeat::Keymap, "0", Some(ActionId::ZoomFit)));
         for action in ActionId::ALL {
             let held = repeats(Repeat::Keymap, "k", Some(action));
             assert_eq!(
                 held,
-                matches!(action, ActionId::VolumeUp | ActionId::VolumeDown),
+                matches!(
+                    action,
+                    ActionId::VolumeUp
+                        | ActionId::VolumeDown
+                        | ActionId::ZoomIn
+                        | ActionId::ZoomOut
+                ),
                 "{action:?} on a hold"
             );
         }
@@ -8989,8 +9804,11 @@ mod tests {
                 <= 360.,
             "card too tall"
         );
-        // Its rows and buttons are clicked, so WCAG 2.5.8 binds them.
+        // Its rows, its steppers and its buttons are clicked, so WCAG 2.5.8
+        // binds them: a stepper is `HIT_MIN` square inside a row of that height.
         assert!(KEYS_ROW_H >= HIT_MIN);
+        // ...and the pair of them fits beside the widest value the card prints.
+        assert!(2. * HIT_MIN + 4. < COLOR_W / 2., "steppers crowd the value");
         // A "speed-up" is never a slow-down: the rate stops above real time at
         // one end and at what a clip can hold at the other, whatever the keys
         // ask for. A silence played *slower* would make the timeline longer,
@@ -9176,10 +9994,9 @@ mod tests {
         assert!(show_label(400.));
         assert!(!show_label(LABEL_MIN_W - 0.1));
         // A timeline with no length must not put a box outside its lane.
-        assert_eq!(start_frac(3., 0.), 0.);
-        assert_eq!(start_frac(1., 4.), 0.25);
-        // Past the end clamps rather than running off the bed.
-        assert_eq!(start_frac(8., 4.), 1.);
+        let fit = View::default();
+        assert_eq!(fit.frac_at(3., 0.), 0.);
+        assert_eq!(fit.frac_at(1., 4.), 0.25);
     }
 
     #[test]
@@ -9544,6 +10361,9 @@ fn main() {
                     eos: false,
                     done: false,
                     ruler: Rc::default(),
+                    // The whole timeline across the bed, which is where a
+                    // project opens: zooming is something the user asks for.
+                    view: View::default(),
                     selected: None,
                     context_menu: None,
                     library_menu: None,

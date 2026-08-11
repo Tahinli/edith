@@ -2,17 +2,24 @@
 resolver = "3"
 members = ["crates/engine", "crates/engine-hw", "crates/engine-audio", "crates/app"]
 # Vendored third-party (see [patch.crates-io]); not ours to build or test.
-exclude = ["vendor/cros-libva", "vendor/cros-codecs"]
+exclude = ["vendor/cros-libva", "vendor/cros-codecs", "vendor/rusty_aac"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-# Two upstream crates vendored verbatim except for one clearly marked fix each,
-# both blockers on this machine and both still unfixed upstream as of 0.0.6/0.0.13:
+# Three upstream crates vendored verbatim except for one clearly marked fix each,
+# all blockers on this machine and all still unfixed upstream as of 0.0.6/0.0.13/0.5.0:
 #   cros-libva  - fails to build against libva >= 1.23 headers
-#   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses
-# Drop `vendor/` entirely once released versions handle both.
+#   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses;
+#                 and creates every decode context as 8-bit 4:2:0, which no HEVC
+#                 Main 10 stream can decode into (its own TODO, its own answer)
+#   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
+#                 term (the fast path in the same file serves the encoder only),
+#                 which is 4x slower than real time for 5.1 and therefore not
+#                 playable at all; the patch caches the cosine matrix
+# Drop `vendor/` entirely once released versions handle all three.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
+rusty_aac = { path = "vendor/rusty_aac" }
