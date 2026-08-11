@@ -1640,6 +1640,7 @@ dependencies = [
  "hound",
  "image",
  "libloading",
+ "miniz_oxide",
  "mp4",
  "oxideav-ac3",
  "oxideav-ass",
