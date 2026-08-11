@@ -17,6 +17,7 @@ pub mod playback;
 pub mod project;
 pub mod scale;
 pub mod silence;
+pub mod subtitle;
 pub mod waveform;
 
 pub use audio::{
