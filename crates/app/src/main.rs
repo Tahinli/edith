@@ -938,6 +938,17 @@ struct Player {
     fps: f64,
     name: SharedString,
     image: Option<Arc<RenderImage>>,
+    /// The picture of the bitmap cue on screen, and which cue that is: the
+    /// track it is a row of and where it starts on the timeline. A PGS display
+    /// set is run-length and has to be walked into a canvas-sized buffer to be
+    /// drawn ([`engine::subtitle::CueImage::rgba`]), which is a thing to do
+    /// when the cue changes -- every few seconds -- and not at every repaint.
+    ///
+    /// The *track* is half the key because the four PGS tracks of a remux are
+    /// one film's subtitles in four languages: they start at the same
+    /// microsecond, and a picked row that only changed the language would go on
+    /// showing the one before it.
+    sub_image: Option<((usize, i64), Arc<RenderImage>)>,
     /// A frame that arrived before its time; shown on the tick it comes due.
     /// The pump's buffer, not transport state -- but a frame waiting here is
     /// what keeps a finished decoder from reading as [`Transport::Ended`] one
@@ -3514,6 +3525,8 @@ impl Player {
         // emptied library, against one per displayed frame in `pump`; the
         // upgrade path is threading the window through `act_on_row`.
         self.image = None;
+        // The drawn cue with it, and its tile for the same reason as above.
+        self.sub_image = None;
         self.clipboard = None;
         self.selected = None;
         self.selected_asset = None;
@@ -4912,7 +4925,7 @@ impl Render for Player {
                             )
                             // After the picture, so the plate is drawn over it
                             // rather than under: siblings paint in order.
-                            .children(self.subtitle_overlay(position)),
+                            .children(self.subtitle_overlay(position, window)),
                     ),
             )
             // Above the panel and only when there is one to show, so it costs
@@ -5333,28 +5346,63 @@ impl Player {
     /// not the track's own: on a cut timeline an embedded track's cues ride the
     /// pictures they belong to, and this is the same map the export writes the
     /// file with -- so what is read here is what the file says.
-    fn subtitle_overlay(&self, at: f64) -> Option<impl IntoElement + use<>> {
+    ///
+    /// A cue off a PGS track is a *picture* and not a line
+    /// ([`engine::subtitle::CueImage`]), and is drawn as one: the disc's whole
+    /// canvas laid over the whole picture region, which puts every cue where
+    /// the disc put it relative to its own frame, at the cost of the region and
+    /// that frame not being the same shape.
+    ///
+    /// ponytail: that cost is a stretch -- a 2.39:1 encode in a 16:9 region
+    /// leaves the cue a little wide and a little low, because this maps the
+    /// canvas onto the region and not onto the letterboxed picture inside it.
+    /// The upgrade path is the picture's own rect, which wants `VideoMeta`'s
+    /// aspect and the measured bounds rather than a `relative()`.
+    fn subtitle_overlay(
+        &mut self,
+        at: f64,
+        window: &mut Window,
+    ) -> Option<impl IntoElement + use<>> {
         if !self.subs_on {
             return None;
         }
         let mapped = self.session.as_ref()?.timeline_cues(self.sub_track);
         let cues = cues_at(&mapped, at);
         if cues.is_empty() {
+            self.drop_sub_image(window);
             return None;
         }
+        // The first picture cue up, decoded once and kept: two bitmap cues at
+        // one moment is a thing PGS composes into one display set, so there is
+        // never a second picture to stack under the first.
+        let picture = cues
+            .iter()
+            .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
+            .and_then(|(start_us, image)| self.sub_picture(start_us, image, window));
         Some(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                .bottom(px(SUB_BOTTOM))
+                // A picture is placed on its own canvas and a plate is placed on
+                // the region, so the picture takes the whole of it.
+                .when(picture.is_some(), |d| d.top_0().bottom_0())
+                .when(picture.is_none(), |d| d.bottom(px(SUB_BOTTOM)))
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(2.))
+                .children(picture.map(|image| {
+                    img(image)
+                        .size_full()
+                        // Stretched, not fitted: the canvas *is* the frame the
+                        // disc composed against, so its corners are the frame's
+                        // corners and fitting it would move every cue.
+                        .object_fit(gpui::ObjectFit::Fill)
+                }))
                 // The plate takes no click: the picture behind it is still the
                 // drop target the whole window is.
-                .children(cues.into_iter().map(|cue| {
+                .children(cues.into_iter().filter(|c| c.image.is_none()).map(|cue| {
                     div()
                         .max_w(relative(0.9))
                         .px(px(6.))
@@ -5374,6 +5422,48 @@ impl Player {
                         )
                 })),
         )
+    }
+
+    /// The cue starting at `start_us` as a drawable picture, decoded on the
+    /// first repaint it is up for and kept until another cue takes its place
+    /// ([`Player::sub_image`]). `None` for a display set the decoder refuses,
+    /// which draws nothing rather than failing the frame.
+    ///
+    /// Its atlas tile is released as the video's is: every [`RenderImage`] gets
+    /// a fresh id and its own tile, so a film's worth of cues would grow the
+    /// sprite atlas by the whole film.
+    fn sub_picture(
+        &mut self,
+        start_us: i64,
+        image: &engine::subtitle::CueImage,
+        window: &mut Window,
+    ) -> Option<Arc<RenderImage>> {
+        let key = (self.sub_track, start_us);
+        if let Some((up, ready)) = &self.sub_image
+            && *up == key
+        {
+            return Some(ready.clone());
+        }
+        let mut rgba = image.rgba()?;
+        // gpui's atlas is BGRA with straight alpha; PGS decodes to RGBA with
+        // straight alpha. The same swap the video frames get.
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let buf = image::RgbaImage::from_raw(image.width, image.height, rgba)?;
+        let next = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+        self.drop_sub_image(window);
+        self.sub_image = Some((key, next.clone()));
+        Some(next)
+    }
+
+    /// Lets go of the drawn cue and its atlas tile. Called where the cue stops
+    /// being on screen, which is every gap between two of them: an 8 MB tile
+    /// per cue is not a thing to leave behind a film.
+    fn drop_sub_image(&mut self, window: &mut Window) {
+        if let Some((_, old)) = self.sub_image.take() {
+            let _ = window.drop_image(old);
+        }
     }
 
     /// What is decoding the picture right now, for the transport line: the
@@ -9237,14 +9327,17 @@ fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Opt
     }
 }
 
-/// What a subtitle row says under its name: how many cues it holds, or -- for a
-/// track that could not be read -- the engine's own reason, verbatim. A refusal
-/// is what the row is *for*: a PGS track off a BluRay remux is pictures, and a
-/// list that dropped it would say the film has no subtitles at all.
+/// What a subtitle row says under its name: how many cues it holds and whether
+/// they are pictures ([`engine::subtitle::SubtitleTrack::is_bitmap`]) -- which
+/// is the difference between a track an export writes into the file and one it
+/// can only draw -- or, for a track that could not be read, the engine's own
+/// reason verbatim. A refusal is still what a row can be *for*: a VobSub track
+/// dropped from the list would say the film has no subtitles at all.
 fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
-    match &track.refused {
-        Some(why) => why.clone(),
-        None => format!("{} cues", track.cues.len()),
+    match (&track.refused, track.is_bitmap()) {
+        (Some(why), _) => why.clone(),
+        (None, true) => format!("{} cues — pictures", track.cues.len()),
+        (None, false) => format!("{} cues", track.cues.len()),
     }
 }
 
@@ -15274,6 +15367,7 @@ mod tests {
             start_us,
             end_us,
             text: text.to_string(),
+            image: None,
         };
         // Two cues that hand over exactly, and one that overlaps the second --
         // a sign over a line of dialogue, which is two plates at one moment.
@@ -16077,6 +16171,7 @@ fn main() {
                     fps: meta.map_or(30., |meta| meta.frame_rate),
                     name: name.clone(),
                     image: None,
+                    sub_image: None,
                     held: None,
                     ruler: Rc::default(),
                     // A second is [`PPS_DEFAULT`] pixels wide until someone
