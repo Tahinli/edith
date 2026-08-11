@@ -106,6 +106,55 @@ fn a_timeline_takes_the_other_codec_or_names_the_missing_decoder() {
     }
 }
 
+/// The refusal *at a span*, which is where it happens now: playback opens its
+/// files on the worker (`DecodeSession::open_worker_deferred`), so a clip no
+/// decoder here can take is refused there rather than on the caller's thread.
+/// What must survive that move is the behaviour a refused span always had --
+/// no pictures from that clip, and the session walks on to the end instead of
+/// stalling on it.
+///
+/// The clip is imported as H.264, because the *door* still refuses what it
+/// cannot open; the bytes under it become VP9 afterwards, which is the only way
+/// to put a span the worker must refuse on a timeline.
+#[test]
+fn a_refused_codec_at_a_span_advances_instead_of_stalling() {
+    let scratch = Scratch::file("video_editor_vp9_span", "mp4");
+    std::fs::copy(asset("test_av2.mp4"), &scratch).expect("copy the fixture");
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av.mp4");
+    session.set_gain(0.0);
+    let first = session.meta().frame_count;
+    session.import(&scratch).expect("an H.264 file joins this timeline");
+    let end = session.timeline_duration();
+    assert!(
+        session
+            .place_stream_at(end, &scratch, 0, None)
+            .expect("a file just imported is on this timeline")
+    );
+    std::fs::copy(asset("test_vp9.mp4"), &scratch).expect("swap in the VP9 bytes");
+
+    // The no-plugin machine, forced, so hardware cannot quietly take the span.
+    // SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut count, mut last) = (0u32, None);
+    while !session.is_eos() {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            count += 1;
+            last = Some(frame.index);
+        }
+        assert!(Instant::now() < deadline, "the refused span stalled playback");
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    unsafe { std::env::remove_var("VE_SW") };
+
+    assert_eq!(last, Some(first - 1), "the refused clip made pictures");
+    assert_eq!(count, first, "the first source still played whole");
+    let _ = std::fs::remove_file(&scratch);
+}
+
 /// The end-to-end user path: opening the file yields pictures, all of them,
 /// through the plugin.
 #[test]
