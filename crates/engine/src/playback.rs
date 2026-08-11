@@ -752,6 +752,14 @@ impl PlaybackSession {
         crate::export::planned_audio(&self.project, format)
     }
 
+    /// What an export would do about the subtitle track at `pick` --
+    /// [`crate::export::planned_subtitles`], asked of the project a front-end is
+    /// holding, and pure for the same reason. `pick` is a row of
+    /// [`subtitles`](Self::subtitles).
+    pub fn planned_subtitles(&self, format: crate::export::Format, pick: Option<usize>) -> String {
+        crate::export::planned_subtitles(&self.project, format, pick)
+    }
+
     /// Why the sound's rate is not a choice for this timeline in this format --
     /// [`crate::export::audio_rate_refusal`], asked of the project a front-end
     /// is holding, and pure for the same reason.
