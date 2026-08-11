@@ -57,6 +57,23 @@ fn the_demuxer_reports_an_av1_track_in_matroska() {
     assert_eq!(vp9.codec, Codec::Vp9);
 }
 
+/// The depth, which is what picks the surface pool the plugin decodes into: an
+/// `av1C` with `high_bitdepth` set reads as 10 and takes the P010 pool HEVC Main
+/// 10 already goes through, and the 8-bit fixture beside it still reads as 8.
+/// It used to be an outright refusal at open ("10-bit AV1 is not supported").
+#[test]
+fn a_ten_bit_av1_track_is_read_as_ten_bit() {
+    let (meta, ten) = Demuxer::open(&asset("test_av1_10.mkv")).expect("open test_av1_10.mkv");
+    assert_eq!(meta.codec, Codec::Av1);
+    assert_eq!((meta.width, meta.height), (1280, 720));
+    assert_eq!(meta.frame_count, FRAMES);
+    assert_eq!(ten.bit_depth(), 10, "what picks the P010 surface pool");
+
+    // The invariant: the 8-bit file is untouched by any of it.
+    let (_, eight) = Demuxer::open(&asset("test_av1.mkv")).expect("open test_av1.mkv");
+    assert_eq!(eight.bit_depth(), 8);
+}
+
 /// The delivered audio scope, as an assert: a Matroska file's AAC track is read
 /// like any other file's (`tests/hevc_mkv.rs` is where that lives), and its
 /// *picture* being AV1 changes nothing about it.
@@ -188,6 +205,37 @@ fn the_plugin_decodes_every_av1_frame() {
     assert!(
         first.chunks_exact(4).any(|px| px != &first[..4]),
         "frame 0 is a single colour -- no picture was decoded"
+    );
+}
+
+/// ...and the 10-bit file through the very call the window's open door makes: a
+/// user opens it and the timeline shows a picture, read back off the P010 pool
+/// to the same 8-bit BGRA every other frame arrives in. The whole point of the
+/// slice, and the half a container test cannot say anything about.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with 10-bit AV1 decode"]
+fn opening_a_ten_bit_av1_file_shows_frames() {
+    let mut session =
+        PlaybackSession::open(asset("test_av1_10.mkv")).expect("open the 10-bit file");
+    assert_eq!(session.meta().codec, Codec::Av1);
+    assert_eq!(session.meta().frame_count, FRAMES);
+
+    // The decoder is a thread behind the door, so a frame is waited for exactly
+    // as the window's own pump waits for one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let frame = loop {
+        if let Some(frame) = session.try_frame() {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "no frame in 60 s");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!((frame.width, frame.height), (1280, 720));
+    // A picture, not a flat surface: a P010 surface read back through the NV12
+    // path would come out as noise or as nothing at all.
+    assert!(
+        frame.bgra.chunks_exact(4).any(|px| px != &frame.bgra[..4]),
+        "the first frame is a single colour -- no picture was decoded"
     );
 }
 
