@@ -528,6 +528,9 @@ impl VideoFrame for GenericDmaVideoFrame {
         // TODO: Add more supported formats
         let rt_format = match self.decoded_format().unwrap() {
             DecodedFormat::I420 | DecodedFormat::NV12 => libva::VA_RT_FORMAT_YUV420,
+            // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): the 10-bit
+            // surface an HEVC Main 10 stream decodes into.
+            DecodedFormat::P010 => libva::VA_RT_FORMAT_YUV420_10,
             _ => return Err("Format unsupported for VA-API export".to_string()),
         };
 

@@ -301,25 +301,33 @@ fn a_wav_export_of_a_2x_timeline_matches_the_preview() {
     std::fs::remove_file(&out).ok();
 }
 
-/// The half that refuses: an mp4 *copies* AAC packets and a packet carries no
-/// rate, so a speeded clip **on the lane being copied** is refused by name --
-/// never written out at 1.00x under a re-timed picture. Only that lane: the
-/// picture honours a rate (below), and AV1 has no audio to copy at all.
+/// The other half of the same rule, and it used to be a refusal: an mp4 *copies*
+/// AAC packets and a packet carries no rate, so a speeded clip on the lane being
+/// copied could only have come out at 1.00x under a re-timed picture. It is
+/// decoded, resampled and encoded again now (`export::copy_audio` routes a
+/// speeded lane to `encode_audio`), so the file carries the sound that was
+/// heard -- measured the way the WAV above is, by where the beep lands.
 #[test]
-fn an_mp4_export_refuses_a_speeded_sound_clip_by_name() {
+fn an_mp4_export_resamples_a_speeded_sound_clip() {
     let (mut project, meta) = sync_project();
     project
         .set_speed(Lane::A1, 0, Speed::from_permille(2000))
         .expect("room enough");
-    let out = out_path("refuse", "mp4");
+    let heard = beep_at(&play(&project));
+    let out = out_path("speeded", "mp4");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
-    let text = wait(&handle, Duration::from_secs(120))
-        .expect_err("an mp4 export cannot carry a rate in a copied packet")
-        .to_string();
-    assert!(text.contains("2.00x"), "{text}");
-    assert!(text.contains("00:00"), "{text}");
-    assert!(text.contains("WAV or FLAC"), "{text}");
-    assert!(!out.exists(), "a refused export writes no file");
+    wait(&handle, Duration::from_secs(180)).expect("an mp4 of a speeded sound clip");
+    let (audio, chunks) = AudioSession::open(&out)
+        .expect("reopen the export")
+        .expect("it has an audio track");
+    assert_eq!(audio.sample_rate, RATE);
+    let samples: Vec<f32> = chunks.into_iter().flat_map(|c| c.samples).collect();
+    let in_file = beep_at(&samples);
+    assert!(
+        (in_file - heard).abs() <= 1.0 / FPS,
+        "the beep is at {in_file:.3}s in the file and was at {heard:.3}s in the preview"
+    );
+    std::fs::remove_file(&out).ok();
 }
 
 /// The half that honours, and the shape that catches a walk that only works at
@@ -393,8 +401,8 @@ fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
     std::fs::remove_file(&out).ok();
 }
 
-/// AV1 carries no audio at all, so nothing about a rate reaches a packet copy
-/// there: it honours a speeded picture with no detaching and no refusal.
+/// AV1 honours a speeded picture with no detaching and no refusal -- and its
+/// sound, which it now carries, is resampled exactly as the mp4's is.
 #[test]
 fn an_av1_export_honours_a_speeded_take_whole() {
     let (mut project, meta) = sync_project();
@@ -413,10 +421,7 @@ fn an_av1_export_honours_a_speeded_take_whole() {
         },
     );
     wait(&handle, Duration::from_secs(600)).expect("an AV1 export of a speeded take");
-    assert!(
-        out.exists(),
-        "AV1 never refuses a rate: it has no audio lane"
-    );
+    assert!(out.exists(), "AV1 never refuses a rate");
     assert!(
         std::fs::metadata(&out).expect("the export").len() > 0,
         "and it wrote something"
