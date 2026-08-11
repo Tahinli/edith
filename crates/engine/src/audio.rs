@@ -1000,12 +1000,26 @@ impl Track {
             if stream > 0 {
                 return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
             }
-            if let Ok(Some(track)) = MkvAc3Track::open(path) {
-                return Ok(Some(Self::Mkv(track)));
+            match MkvAc3Track::open(path) {
+                Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
+                Ok(None) => {}
+                // Named on the way past for the same reason symphonia's failure
+                // is, below: an AC-3 track that broke is a bug, not a codec we
+                // never had.
+                Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
             }
+            // Logged on the way past: "silent" here covers both a codec nothing
+            // decodes and a track that genuinely broke, and only the second is a
+            // bug -- with no trace at all it reaches the user as a lane that
+            // drew no waveform and nothing else to go on.
             return Ok(SymTrack::open(path)
+                .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
                 .ok()
-                .filter(|t| t.decoder().is_ok())
+                .filter(|t| {
+                    t.decoder()
+                        .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
+                        .is_ok()
+                })
                 .map(Self::Sym));
         }
         let audio_file = crate::is_audio(path);
