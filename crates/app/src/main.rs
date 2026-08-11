@@ -1100,6 +1100,14 @@ struct Player {
     /// first one chose.
     quality: Quality,
     custom_mbps: u32,
+    /// The custom row's number *while it is being typed*, or `None` when nobody
+    /// is typing one. A field with a caret in it and not a key capture: digits
+    /// used to change the bitrate from anywhere in the card, with no caret to
+    /// say where they were landing and nothing to look at before the number
+    /// took effect. Nothing in this card takes gpui focus (the root keeps the
+    /// keyboard), so the field is a modal state on the player exactly as a
+    /// waiting rebind row is, and the root's handler is what types into it.
+    mbps_edit: Option<NumberEdit>,
     /// What the *sound* is coded at, in kbps, for every format that encodes it
     /// -- the AAC inside a video export as much as an MP3. Kept across closes
     /// like the picture's quality, and starts at the figure this program wrote
@@ -2338,7 +2346,12 @@ impl Player {
     /// exactly the ones that answer differently from the keys menu and the
     /// export card.
     fn repeat_scope(&self) -> Repeat {
-        if self.rebinding.is_some()
+        // A number being typed is a value under the arrows, exactly as a card's
+        // slider is -- so a held arrow runs it. Asked before the export card
+        // below, which otherwise repeats nothing.
+        if self.mbps_edit.is_some() {
+            Repeat::Card
+        } else if self.rebinding.is_some()
             || self.keys_open
             || self.export_open
             || self.exporting().is_some()
@@ -4015,9 +4028,11 @@ impl Player {
         }
         self.export_open = true;
         // One card at a time, and a waiting row must not outlive the card it
-        // was waiting in.
+        // was waiting in. Nor may a half-typed number: the card opens on the
+        // bitrate it will write, never on digits left behind by a closed one.
         self.keys_open = false;
         self.rebinding = None;
+        self.mbps_edit = None;
         cx.notify();
     }
 
@@ -4090,8 +4105,19 @@ impl Player {
     /// (the engine's own 1..20 Mbps), and picking the row is part of the step --
     /// a stepper that moves a number nobody is using would move nothing.
     fn nudge_mbps(&mut self, step: i32) {
-        self.custom_mbps = (self.custom_mbps as i32 + step).clamp(1, 20) as u32;
+        self.custom_mbps =
+            (self.custom_mbps as i32 + step).clamp(MBPS_MIN as i32, MBPS_MAX as i32) as u32;
         self.quality = Quality::Custom;
+    }
+
+    /// Opens the custom bitrate's field on the number the row is carrying, and
+    /// picks the row while it is at it: a field typed into is the row being
+    /// chosen, and a number nobody is using would be a number typed at nothing.
+    /// Nothing is committed here -- until enter, the card still exports at the
+    /// bitrate it had.
+    fn edit_mbps(&mut self) {
+        self.quality = Quality::Custom;
+        self.mbps_edit = Some(NumberEdit::new(self.custom_mbps));
     }
 
     /// The card's Destination row: the desktop's save dialog, on a background
@@ -4361,16 +4387,45 @@ impl Render for Player {
                 }
                 // The export card owns it the same way, and for the same
                 // reason. Escape closes it -- nothing has been written yet, so
-                // there is nothing here to cancel -- and a digit is the custom
-                // bitrate being typed: the card has no text field (nothing in
-                // it takes focus, ledger:182) so this listener is its input,
-                // exactly as it is a waiting row's.
+                // there is nothing here to cancel -- and the card's own letters
+                // are its input: it has no widget that takes focus (nothing in
+                // it does), so this listener is its keyboard, exactly as it is
+                // a waiting row's.
                 if this.export_open {
                     // A list open over the card is the innermost thing on
                     // screen, so it is what a stroke closes first -- the rule
                     // every menu here follows, said before the card's own keys
                     // so escape does not take the card out from under it.
                     if this.picker.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    // A number being typed is the next thing in: while the
+                    // field is open every stroke is text, which is what makes
+                    // it a field and not a capture -- the card's letters cannot
+                    // fire under it, and escape gives up the edit before it
+                    // touches the card.
+                    if let Some(edit) = &mut this.mbps_edit {
+                        if key == ESCAPE {
+                            this.mbps_edit = None;
+                        } else if key == "enter" {
+                            // Committed or refused in its own words; a refused
+                            // one stays open on what was typed, so the number
+                            // can be fixed rather than typed again.
+                            if let Some(mbps) = edit.commit() {
+                                this.custom_mbps = mbps;
+                                this.quality = Quality::Custom;
+                                this.mbps_edit = None;
+                            }
+                        } else if key == "backspace" {
+                            edit.backspace();
+                        } else if key == "up" {
+                            edit.step(1);
+                        } else if key == "down" {
+                            edit.step(-1);
+                        } else if let Ok(digit) = key.parse::<u32>() {
+                            edit.digit(digit);
+                        }
                         cx.notify();
                         return;
                     }
@@ -4404,19 +4459,13 @@ impl Render for Player {
                         this.export_grouped = !this.export_grouped;
                     } else if key == "r" {
                         this.export_refusals_inline = !this.export_refusals_inline;
-                    } else if let Ok(digit) = key.parse::<u32>() {
-                        let next = push_digit(this.custom_mbps, digit);
-                        // A refused third digit says so: it used to be dropped
-                        // in silence, which left the card showing a number the
-                        // user had already typed past.
-                        if next == this.custom_mbps && this.custom_mbps > 0 {
-                            this.notice = Some("1–20 Mbps — a third digit is refused".into());
-                        }
-                        this.custom_mbps = next;
-                        this.quality = Quality::Custom;
-                    } else if key == "backspace" {
-                        this.custom_mbps /= 10;
-                        this.quality = Quality::Custom;
+                    } else if key == "n" {
+                        // The custom row's field, by keyboard. The digits used
+                        // to do this from anywhere in the card, which meant a
+                        // stray keystroke changed the bitrate with nothing on
+                        // screen to say it had: now a digit outside the field
+                        // means nothing at all, and this is the way in.
+                        this.edit_mbps();
                     }
                     cx.notify();
                     return;
@@ -6110,7 +6159,7 @@ impl Player {
                         )
                         // The search box: no focus and no text field -- the
                         // card's key handler is the field, exactly as the
-                        // export card's digits are typed into it. Its own line
+                        // export card's bitrate is typed into it. Its own line
                         // above the list, so the rows below it are always the
                         // answer to what it says.
                         .child(
@@ -6147,7 +6196,8 @@ impl Player {
     /// two lines that state the file all of that adds up to. The same scrim and
     /// row shape as the keybindings overlay (two cards of different builds over
     /// one window read as two different programs) and the same plain divs, so
-    /// the root keeps the keyboard and a typed digit reaches the custom row.
+    /// the root keeps the keyboard and the custom row's field is typed into
+    /// through it ([`NumberEdit`]).
     ///
     /// Every row carries the key that picks it, so the card is drivable end to
     /// end without a pointer *and* without a legend to memorise -- and every
@@ -6342,22 +6392,31 @@ impl Player {
             ),
             None => {
                 for (i, quality) in Quality::ALL.into_iter().enumerate() {
+                    // The custom row is a field: `n` opens it, a click in it
+                    // opens it too, and while it is open the row shows what is
+                    // being typed with a caret in it rather than the number in
+                    // force. The other four are picked whole.
+                    let field = self.mbps_edit.as_ref().filter(|_| quality == Quality::Custom);
                     let mut r = entry(
                         ("quality", i),
                         match quality {
-                            // The one row a key does not step to but types
-                            // into, which is what its key column says.
-                            Quality::Custom => "0–9",
+                            Quality::Custom => "n",
                             _ => "q",
                         },
                         quality.label().into(),
-                        quality.detail(self.custom_mbps).into(),
+                        match field {
+                            Some(edit) => edit.detail().into(),
+                            None => quality.detail(self.custom_mbps).into(),
+                        },
                         self.quality == quality,
                         true,
                     )
                     .on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
-                            this.quality = quality;
+                            match quality {
+                                Quality::Custom => this.edit_mbps(),
+                                _ => this.quality = quality,
+                            }
                             cx.notify();
                         },
                     ));
@@ -6523,11 +6582,22 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
-                                .child(self.notice.clone().unwrap_or_else(|| {
-                                    "the keys are on the rows · enter exports · esc closes · \
-                                     g/r change the layout"
-                                        .into()
-                                })),
+                                .child(match (&self.mbps_edit, &self.notice) {
+                                    // A field being typed into says so here as
+                                    // well as in its row: this line is outside
+                                    // the scrolling list and on screen at every
+                                    // window size, and at 360 px the custom row
+                                    // itself can be below the fold -- a number
+                                    // typed where it cannot be seen is the
+                                    // blind capture this field replaced.
+                                    (Some(edit), _) => {
+                                        SharedString::from(format!("Custom bitrate {}", edit.detail()))
+                                    }
+                                    (None, Some(notice)) => notice.clone(),
+                                    (None, None) => "the keys are on the rows · enter exports · \
+                                                     esc closes · g/r change the layout"
+                                        .into(),
+                                }),
                         )
                         // Capped and scrolling like the keybindings list: the
                         // rows are more than a 360 px window has room for, and
@@ -9662,7 +9732,9 @@ impl Quality {
     fn detail(self, custom_mbps: u32) -> String {
         match self {
             Quality::Auto => "from the picture size and frame rate".to_string(),
-            Quality::Custom => format!("{custom_mbps} Mbps — type a number, 1–20"),
+            Quality::Custom => {
+                format!("{custom_mbps} Mbps — n types a number, {MBPS_MIN}–{MBPS_MAX}")
+            }
             other => format!(
                 "{} Mbps",
                 export_settings(other, 0, Format::Mp4, DEFAULT_AUDIO_KBPS)
@@ -9728,7 +9800,7 @@ const FORMATS: [(&[Format], &str, &str, &str); 8] = [
 /// `a` after an mp4 gives AV1 *in mp4*, because a box decided once is not a
 /// question again. A letter of the row's own name, spelled out in the table
 /// rather than taken from the initial (`MP4` and `MP3` share one). Never a
-/// digit -- those are the bitrate's. `None` for every other stroke, the rows
+/// digit -- those are the bitrate field's. `None` for every other stroke, the rows
 /// that cannot be picked included.
 fn format_key(key: &str, current: Format) -> Option<Format> {
     FORMATS
@@ -10129,13 +10201,118 @@ fn export_settings(
     }
 }
 
-/// A digit typed against the custom row, appended to what is already there.
-/// Refused rather than truncated past two digits: the engine's ceiling is
-/// 20 Mbps, so a third digit can only be a mistake, and a silently dropped one
-/// would leave the card showing a number nobody typed.
-fn push_digit(mbps: u32, digit: u32) -> u32 {
-    let next = mbps * 10 + digit;
-    if next <= 99 { next } else { mbps }
+/// What the engine will code an explicit bitrate at, in whole Mbps: outside
+/// this it clamps (`export.rs` `MIN_BITRATE`/`MAX_BITRATE`), so a number typed
+/// past either end would be written as a different one. The field refuses it
+/// instead of clamping quietly -- a card that changes the user's number without
+/// saying so is the one thing a field like this must never do.
+const MBPS_MIN: u32 = 1;
+const MBPS_MAX: u32 = 20;
+
+/// How many digits the field takes. Two reach the ceiling; the third is there so
+/// a number *past* it can be typed whole and refused in its own words, rather
+/// than being dropped keystroke by keystroke.
+const MBPS_DIGITS: usize = 3;
+
+/// A number being typed into a card row: the digits so far and, once a commit
+/// has been refused, why. Text-field semantics on a card that has no text field
+/// -- typing, backspace, arrows that step, enter that commits and escape that
+/// gives up -- held as state and driven by the root's key handler, since
+/// nothing in these cards takes gpui focus.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NumberEdit {
+    text: String,
+    refusal: Option<String>,
+}
+
+impl NumberEdit {
+    /// Starts on the number the row already carries, so backspace edits it
+    /// rather than the field opening empty over a value that is still in force.
+    /// Zero is no number at all -- it is what the card opens at, before anyone
+    /// has typed one.
+    fn new(value: u32) -> Self {
+        NumberEdit {
+            text: match value {
+                0 => String::new(),
+                v => v.to_string(),
+            },
+            refusal: None,
+        }
+    }
+
+    /// A digit against what is there. The one past [`MBPS_DIGITS`] is refused
+    /// *out loud*: a keystroke dropped in silence is how the old digit capture
+    /// left the card showing a number the user had already typed past.
+    fn digit(&mut self, digit: u32) {
+        if self.text.chars().count() >= MBPS_DIGITS {
+            self.refusal = Some(format!("{MBPS_DIGITS} digits is already past the ceiling"));
+            return;
+        }
+        match char::from_digit(digit, 10) {
+            Some(c) => {
+                self.text.push(c);
+                self.refusal = None;
+            }
+            None => self.refusal = Some("digits only".into()),
+        }
+    }
+
+    /// Erases the last digit, and the refusal with it: the number on screen has
+    /// changed, so the reason the old one was refused no longer describes it.
+    fn backspace(&mut self) {
+        self.text.pop();
+        self.refusal = None;
+    }
+
+    /// The arrows, which is how a number gets picked rather than typed. Steps
+    /// from what is in the field -- an empty one starts at the floor, so the
+    /// first press up is `MBPS_MIN` and not a jump to some remembered value --
+    /// and stays inside the range, because a step is a walk through the legal
+    /// numbers rather than a way out of them.
+    fn step(&mut self, by: i32) {
+        let at = self.text.parse::<i32>().unwrap_or(MBPS_MIN as i32 - by.signum());
+        self.text = (at + by)
+            .clamp(MBPS_MIN as i32, MBPS_MAX as i32)
+            .to_string();
+        self.refusal = None;
+    }
+
+    /// The number, or `None` with the reason recorded where the row will read
+    /// it. Never clamped: 45 committed as 20 is a number the user did not type.
+    fn commit(&mut self) -> Option<u32> {
+        match commit_mbps(&self.text) {
+            Ok(mbps) => Some(mbps),
+            Err(why) => {
+                self.refusal = Some(why);
+                None
+            }
+        }
+    }
+
+    /// What the row shows while it is being typed into: the digits, the caret
+    /// that says they are landing *here*, and either the refusal or the two
+    /// keys that end the edit.
+    fn detail(&self) -> String {
+        format!(
+            "{}▏ Mbps — {}",
+            self.text,
+            match &self.refusal {
+                Some(why) => why.as_str(),
+                None => "enter commits · esc cancels",
+            }
+        )
+    }
+}
+
+/// A typed bitrate as the card takes it, or the reason it is not one. The words
+/// are the row's: they are what the field shows in place of its hint.
+fn commit_mbps(text: &str) -> Result<u32, String> {
+    match text.parse::<u32>() {
+        Ok(mbps) if (MBPS_MIN..=MBPS_MAX).contains(&mbps) => Ok(mbps),
+        Ok(0) => Err(format!("0 is not a rate — {MBPS_MIN}–{MBPS_MAX} Mbps")),
+        Ok(mbps) => Err(format!("{mbps} is past the {MBPS_MAX} Mbps ceiling")),
+        Err(_) => Err(format!("type a number — {MBPS_MIN}–{MBPS_MAX} Mbps")),
+    }
 }
 
 /// Whether a stroke gets out of a running export. Escape does, whatever
@@ -11439,16 +11616,18 @@ mod tests {
         Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
         INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
         LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
-        MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MENU_ROWS_H, MENU_W, NO_FILE, NumberEdit, PANEL_H,
+        Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
         Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
-        bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, containers,
+        bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
+        containers,
         enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
         estimated_mb, export_path, export_settings, format_key,
         format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
         marked, menu_at, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
-        push_digit, retarget, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
+        retarget, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
         source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
         typed, unseen_paths, unseen_sources,
         whole_take, window_title,
@@ -14142,16 +14321,80 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_bitrate_stops_at_two_digits() {
-        assert_eq!(push_digit(0, 8), 8);
-        assert_eq!(push_digit(1, 2), 12);
-        // A third digit is refused whole: the ceiling is 20 Mbps, so it can
-        // only be a mistake, and dropping it silently would leave the card
-        // showing a number nobody typed.
-        assert_eq!(push_digit(12, 3), 12);
-        assert_eq!(push_digit(99, 9), 99);
-        // Never past what the clamp can take back to a real bitrate.
-        assert!(u64::from(push_digit(99, 9)) * 1_000_000 < u64::from(u32::MAX));
+    fn a_typed_bitrate_is_a_field_and_not_a_key_capture() {
+        // It opens on the number in force, so backspace edits that number
+        // rather than the field starting empty over a bitrate still being used.
+        let mut edit = NumberEdit::new(12);
+        assert_eq!(edit.text, "12");
+        edit.backspace();
+        edit.digit(8);
+        assert_eq!(edit.text, "18");
+        assert_eq!(edit.commit(), Some(18));
+        // A card nobody has typed a number into opens empty: zero is not a
+        // bitrate anyone chose.
+        assert_eq!(NumberEdit::new(0).text, "");
+
+        // Out of range is refused *in words* and the digits stay put: clamping
+        // 45 to 20 would write a bitrate the user never typed.
+        let mut edit = NumberEdit::new(0);
+        for digit in [4, 5] {
+            edit.digit(digit);
+        }
+        assert_eq!(edit.commit(), None);
+        assert_eq!(edit.text, "45", "a refusal keeps what was typed");
+        let refusal = edit.refusal.clone().expect("a refusal says why");
+        assert!(refusal.contains("20"), "{refusal}");
+        assert!(edit.detail().starts_with("45▏"), "{}", edit.detail());
+        assert!(edit.detail().contains(&refusal));
+        // And is fixable in place, which is the whole point of a field.
+        edit.backspace();
+        assert_eq!(edit.refusal, None, "the reason went with the digit");
+        assert_eq!(edit.commit(), Some(4));
+
+        // Empty, zero, and past the digit cap: each its own reason, none of
+        // them silent.
+        assert!(commit_mbps("").is_err());
+        assert!(commit_mbps("0").unwrap_err().contains("not a rate"));
+        assert_eq!(commit_mbps("1"), Ok(MBPS_MIN));
+        assert_eq!(commit_mbps("20"), Ok(MBPS_MAX));
+        assert!(commit_mbps("21").is_err());
+        let mut edit = NumberEdit::new(0);
+        for digit in [9, 9, 9, 9] {
+            edit.digit(digit);
+        }
+        assert_eq!(edit.text, "999", "the cap holds");
+        assert!(edit.refusal.is_some(), "and says it is holding");
+        // Never past what a u64 bitrate can be built from -- the committed
+        // number is the only one that reaches the engine, and it is bounded.
+        assert!(u64::from(MBPS_MAX) * 1_000_000 < u64::from(u32::MAX));
+        assert_eq!(MBPS_DIGITS, 3);
+
+        // The arrows step inside the range and stop at both ends: a walk
+        // through the legal numbers, never a way out of them.
+        let mut edit = NumberEdit::new(0);
+        edit.step(1);
+        assert_eq!(edit.text, MBPS_MIN.to_string(), "empty starts at the floor");
+        edit.step(-1);
+        assert_eq!(edit.text, MBPS_MIN.to_string());
+        let mut edit = NumberEdit::new(MBPS_MAX);
+        edit.step(1);
+        assert_eq!(edit.text, MBPS_MAX.to_string());
+        edit.step(-1);
+        assert_eq!(edit.text, (MBPS_MAX - 1).to_string());
+        // A step past a refused number clears the refusal with it.
+        let mut edit = NumberEdit::new(0);
+        edit.digit(4);
+        edit.digit(5);
+        assert_eq!(edit.commit(), None);
+        edit.step(-1);
+        assert_eq!(edit.refusal, None);
+        assert_eq!(edit.text, MBPS_MAX.to_string(), "back inside the range");
+
+        // The hint the field shows when there is nothing to refuse names both
+        // ways out of it.
+        let detail = NumberEdit::new(6).detail();
+        assert!(detail.contains("enter") && detail.contains("esc"), "{detail}");
+        assert!(detail.starts_with("6▏"), "{detail}");
     }
 
     #[test]
@@ -15596,6 +15839,7 @@ fn main() {
                     // bitrate the picture asks for.
                     quality: Quality::Auto,
                     custom_mbps: 0,
+                    mbps_edit: None,
                     // ...and the rate the sound has always been written at.
                     audio_kbps: DEFAULT_AUDIO_KBPS,
                     // Picture and sound, which is what an export was before
