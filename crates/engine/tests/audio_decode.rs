@@ -160,6 +160,103 @@ fn an_ac3_track_decodes_and_51_comes_down_to_stereo() {
     }
 }
 
+/// The same two ends of the AC-3 path, in **Matroska**: a stereo AC-3 track and
+/// a 5.1 E-AC-3 one -- the codec a remux carries and the one the "(AAC only)"
+/// refusal used to fire on -- both come out of the blocks, both arrive as the
+/// stereo the §7.8 downmix hands the timeline, and neither owes the session an
+/// excuse any more.
+#[test]
+fn matroska_ac3_and_eac3_decode_out_of_the_blocks() {
+    for (name, codec) in [("test_ac3.mkv", "ac-3"), ("test_eac3.mkv", "e-ac-3")] {
+        let path = asset(name);
+        let (meta, rx) = AudioSession::open(&path)
+            .expect("open")
+            .expect("Matroska AC-3 decodes now");
+        assert_eq!((meta.sample_rate, meta.channels), (48000, 2), "{name}");
+        let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+        let secs = (samples.len() / 2) as f64 / 48000.0;
+        assert!(
+            (1.9..2.1).contains(&secs),
+            "{name} is two seconds, decoded {secs:.3}s"
+        );
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(
+            (0.005..0.75).contains(&rms),
+            "{name}: RMS {rms:.6} is not a sine at a sane level"
+        );
+        assert!(
+            samples.iter().all(|s| s.abs() <= 1.0),
+            "{name}: the decode must not leave the device's range"
+        );
+        // The user-facing half: the session comes up with sound and no notice,
+        // and the file's one audio stream is offered by the name it is in.
+        let session = engine::PlaybackSession::open(&path).expect("open for playback");
+        assert_eq!(
+            session.audio_disabled_reason(),
+            None,
+            "{name}: a track that decodes owes no excuse"
+        );
+        let streams = AudioSession::probe_streams(&path).expect("streams");
+        assert_eq!(streams.len(), 1, "{name}: one audio track, one row");
+        assert_eq!(streams[0].codec, codec, "{name}");
+        assert!(streams[0].decodable, "{name}");
+        assert_eq!(
+            AudioSession::unsupported(&path).expect("unsupported"),
+            None,
+            "{name}: nothing to excuse when it plays"
+        );
+    }
+    // The invariant, stated as an assert: the AAC track of a Matroska file is
+    // still symphonia's, listed and decoded exactly as it was.
+    let streams = AudioSession::probe_streams(asset("test_av1.mkv")).expect("streams");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].codec, "aac", "AAC in an mkv is untouched by this");
+    assert!(
+        AudioSession::open(asset("test_av1.mkv"))
+            .expect("open")
+            .is_some(),
+        "AAC in an mkv still decodes"
+    );
+}
+
+/// A seek into a Matroska AC-3 track: Matroska indexes no samples, so the block
+/// a decode starts on is found by the blocks' own timestamps -- and getting that
+/// wrong is a tail that is the wrong length or lands in the wrong place. It is
+/// the same check `audio_seek` makes of the mp4 path, on the container that has
+/// no sample table.
+#[test]
+fn a_seek_into_a_matroska_ac3_track_is_the_tail_of_a_full_run() {
+    let path = asset("test_eac3.mkv");
+    let full: Vec<f32> = AudioSession::open(&path)
+        .expect("open")
+        .expect("audio")
+        .1
+        .into_iter()
+        .flat_map(|c| c.samples)
+        .collect();
+    let start = 48_000u64; // one second in, in frames per channel
+    let mut next = start;
+    let mut tail = Vec::new();
+    for chunk in AudioSession::open_at(&path, 1.0).expect("open").expect("audio").1 {
+        assert_eq!(chunk.start_sample, next, "a seeked run numbers from the seek");
+        next += (chunk.samples.len() / 2) as u64;
+        tail.extend(chunk.samples);
+    }
+    let want = &full[start as usize * 2..];
+    assert_eq!(tail.len(), want.len(), "the seeked run is a different length");
+    let diff = tail
+        .iter()
+        .zip(want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    // One syncframe of pre-roll is what the 256-sample overlap-add needs, so
+    // this is exact in practice; the tolerance is for a decoder that carries
+    // more state than the frame before, not for a wrong block.
+    assert!(diff < 1e-3, "max abs diff {diff} after the seek");
+}
+
 /// An AC-3 syncframe is not something an `mp4a` sample table holds, so the
 /// *copy* path names it and hands the export on to the re-encode (which decodes
 /// this very source: the downmix above is what it encodes). Named either way --
@@ -174,4 +271,41 @@ fn an_ac3_source_refuses_an_mp4_audio_copy() {
         err.contains("needs AAC in an mp4") && err.contains("AC-3"),
         "unhelpful refusal: {err}"
     );
+}
+
+/// The two things a Matroska file with no *readable* sound can be, told apart:
+/// a file with no audio track is the silent source it says it is, and a file
+/// whose audio will not open at all is an error. They used to be the same
+/// answer -- silence -- so a broken track played and exported as a hole with
+/// nothing but an `eprintln` to say why.
+#[test]
+fn a_matroska_with_no_track_is_silent_and_a_broken_one_is_an_error() {
+    // No audio track at all: a picture and two subtitle tracks. Silent, and the
+    // stream picker offers nothing rather than refusing the file.
+    let subs = asset("test_subs.mkv");
+    assert!(
+        AudioSession::probe(&subs, 0)
+            .expect("no audio is not an error")
+            .is_none(),
+        "an mkv with no audio track is a silent source"
+    );
+    assert!(AudioSession::probe_streams(&subs).expect("list").is_empty());
+    assert!(
+        AudioSession::open(&subs).expect("open").is_none(),
+        "no sound"
+    );
+
+    // ...and a file that will not parse at all, under the same extension: an
+    // `Err` a front-end can show, not a silent import.
+    let broken = std::env::temp_dir().join(format!("ve_broken_{}.mkv", std::process::id()));
+    std::fs::write(&broken, b"\x1a\x45\xdf\xa3not a matroska file at all").expect("write");
+    let err = AudioSession::probe(&broken, 0)
+        .expect_err("a broken file must not pass for a silent one")
+        .to_string();
+    assert!(!err.is_empty(), "the refusal says something");
+    assert!(
+        AudioSession::probe_streams(&broken).is_err(),
+        "and so does the listing"
+    );
+    std::fs::remove_file(&broken).unwrap();
 }
