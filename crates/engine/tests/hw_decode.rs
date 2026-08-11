@@ -16,13 +16,21 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine::DecodeSession;
+use engine::colorspace::ColorDescription;
 use engine::convert::i420_to_bgra;
+use engine::demux::Demuxer;
 use engine::hw::HwSession;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets")
         .join(name)
+}
+
+/// What the decode funnel converts this file's planes in, so a conversion done
+/// by hand here is the one `DecodeSession` would have done.
+fn color_of(path: &Path) -> ColorDescription {
+    Demuxer::open(path).expect("open for colour").0.color
 }
 
 fn open_hw(path: &Path) -> HwSession {
@@ -32,6 +40,7 @@ fn open_hw(path: &Path) -> HwSession {
 /// Decodes the whole file through the plugin, returning (frame count, frame 30 as BGRA).
 fn decode_all_hw(name: &str) -> (usize, Vec<u8>) {
     let path = asset(name);
+    let color = color_of(&path);
     let mut hw = open_hw(&path);
     let meta = hw.meta().expect("meta");
     assert_eq!(
@@ -46,7 +55,7 @@ fn decode_all_hw(name: &str) -> (usize, Vec<u8>) {
     while let Some((y, u, v, w, h)) = hw.next_frame().expect("hardware decode") {
         assert_eq!((w, h), (1280, 720), "{name} frame {count} dims");
         if count == 30 {
-            frame_30 = i420_to_bgra(y, u, v, w as usize, h as usize);
+            frame_30 = i420_to_bgra(&color, y, u, v, w as usize, h as usize);
         }
         count += 1;
     }
@@ -117,7 +126,7 @@ fn seek_matches_linear() {
         .expect("no frame after hardware seek");
     eprintln!("hardware seek to {TARGET} took {:?}", start.elapsed());
     assert_eq!(
-        i420_to_bgra(y, u, v, w as usize, h as usize),
+        i420_to_bgra(&color_of(&path), y, u, v, w as usize, h as usize),
         linear,
         "hardware seek != software linear"
     );
