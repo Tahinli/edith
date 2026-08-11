@@ -198,6 +198,26 @@ const SUB_CUE_MIN_W: f32 = 2.;
 /// How much of the subtitle list in the library column is on screen at once,
 /// past which it scrolls -- the media list above it is what keeps the height.
 const SUB_ROWS_H: f32 = 3. * ROW_H;
+/// The row naming the file a block of tracks came out of. Shorter than a track
+/// row because nothing on it is clicked -- `HIT_MIN` binds targets and a header
+/// is a label, not a way in -- and drawn at all only where the column has the
+/// height to show tracks under it ([`sub_headers_fit`]).
+const SUB_HEAD_H: f32 = 18.;
+/// How much of the subtitle list is on screen at the 640x360 floor: one row,
+/// measured -- the section's own heading and the Add button under it take the
+/// rest of the 84 px the column has there.
+const SUB_ROWS_AT_FLOOR: f32 = ROW_H;
+/// How much of a subtitle row's width the file's name in front of the label may
+/// take. Half: which file and which language are both worth reading, and a name
+/// given the whole row is a row where the language is what gets truncated.
+const SUB_STEM_SHARE: f32 = 0.5;
+/// Roughly how wide one character of an 11 px list row is. Generous on purpose:
+/// the element truncates for real, and a budget that overshoots would have the
+/// element cut the tail off after [`clip_middle`] had already kept it.
+const LIST_CHAR_W: f32 = 6.;
+/// The fewest characters a clipped name is cut to, however narrow the column
+/// gets: past this there is nothing on either side of the gap to read.
+const LIST_CLIP_MIN: usize = 5;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -4894,7 +4914,11 @@ impl Render for Player {
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
-                    .child(self.library(library_w(f32::from(window.viewport_size().width)), cx))
+                    .child(self.library(
+                        library_w(f32::from(window.viewport_size().width)),
+                        f32::from(window.viewport_size().height),
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -4970,7 +4994,7 @@ impl Player {
     /// the rest of this window: nothing in it takes focus, so the root keeps
     /// the keyboard and the play key still works after a row is clicked
     /// (ledger:182).
-    fn library(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn library(&self, width: f32, viewport_h: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let exporting = self.exporting().is_some();
         let sources = self
             .session
@@ -5142,7 +5166,15 @@ impl Player {
                         // Two lines rather than two columns: at the width
                         // this panel yields to, a name and a timecode side
                         // by side leave room for neither.
-                        .child(div().truncate().text_size(px(11.)).child(name))
+                        // Cut out of the middle, not the end: two episodes off
+                        // one release are the same words up to the number, and
+                        // the number is at the end.
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(11.))
+                                .child(clip_middle(&name, row_text_w(width))),
+                        )
                         .child(
                             div()
                                 .truncate()
@@ -5210,7 +5242,7 @@ impl Player {
             // Under the media it belongs to: a subtitle track is not a source --
             // it goes on no lane and is dragged nowhere -- but it is a thing the
             // timeline holds, and this is the list of those.
-            .children(self.subtitle_section(cx))
+            .children(self.subtitle_section(width, viewport_h, cx))
             .child(control(
                 "add-asset",
                 None,
@@ -5244,65 +5276,188 @@ impl Player {
     /// as a media row the timeline cannot take is: PGS subtitles are pictures,
     /// and a film carrying four of them says so instead of listing nothing.
     ///
+    /// Every row names the file it came out of itself, in words and in the tint
+    /// that file's clips wear on the lanes -- but only where there is more than
+    /// one file to tell apart, the way [`row_name`] numbers audio streams only
+    /// where a file gave several. Where the window is tall enough for it
+    /// ([`sub_headers_fit`]) each file's block is headed by its name as well: a
+    /// label and nothing more, no click and nothing to fold, so the rows under
+    /// it are the only things anybody has to aim at. At the 640x360 floor the
+    /// headers are gone and the rows still say whose they are.
+    ///
     /// `None` when there are none -- an empty heading is a section about
     /// nothing.
-    fn subtitle_section(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn subtitle_section(
+        &self,
+        width: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
         let tracks = self.session.as_ref()?.subtitles();
         if tracks.is_empty() {
             return None;
         }
-        let rows: Vec<_> = tracks
-            .iter()
-            .enumerate()
-            .map(|(i, track)| {
-                let picked = i == self.sub_track;
-                let usable = track.refused.is_none();
-                let under = subtitle_detail(track);
-                let tip: SharedString = match &track.refused {
-                    Some(why) => format!("{} — {why}", track.path.display()),
-                    None => format!(
-                        "{} — click to show this track over the picture",
-                        track.path.display()
-                    ),
-                }
-                .into();
+        let groups = subtitle_rows(tracks);
+        // One file's tracks need no prefix saying which file: it is the only
+        // one, and every row would carry the same word.
+        let several_files = groups.len() > 1;
+        let headed = several_files && sub_headers_fit(viewport_h);
+        let text_w = row_text_w(width);
+        let rows: Vec<_> = groups
+            .into_iter()
+            .map(|SubGroup { name, path, rows }| {
+                // The file's own colour, the one its media rows and its clips
+                // wear -- and none at all for a standalone `.srt`, which came
+                // off no file on this timeline.
+                let tint = file_tint(self.sources(), &path);
+                let numbered = rows.len() > 1;
+                // The name twice over: all of it the header can hold, and the
+                // share of a row a prefix may take in front of the label.
+                let head = clip_middle(&name, text_w);
+                let prefix = clip_middle(&name, text_w * SUB_STEM_SHARE);
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let track = row.track;
+                        let picked = track == self.sub_track;
+                        let usable = row.refused.is_none();
+                        // Two tracks off one remux that both say "eng" are told
+                        // apart by their number and by nothing else -- the same
+                        // count [`sub_pick_name`] echoes.
+                        let title = match numbered {
+                            true => format!("{} {}", row.label, row.number),
+                            false => row.label,
+                        };
+                        // The whole path, never clipped: the row says which
+                        // file, and the tooltip says which one on disk.
+                        let tip: SharedString = match &row.refused {
+                            Some(why) => format!("{} — {why}", path.display()),
+                            None => format!(
+                                "{} — click to show this track over the picture",
+                                path.display()
+                            ),
+                        }
+                        .into();
+                        div()
+                            // The *flat* index into the session's add-order
+                            // list, which is what a pick is and what a save
+                            // writes: the grouping moved the row on screen and
+                            // never the track it stands for.
+                            .id(("subtitle-track", track))
+                            .flex_none()
+                            .h(px(ROW_H))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .pr(px(6.))
+                            .rounded(px(3.))
+                            .when(!usable, |d| d.text_color(rgb(INK_DIM)).opacity(0.55))
+                            .when(usable, |d| {
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.sub_track = track;
+                                        // Picking a track is asking to see it: a
+                                        // click that changed nothing on screen
+                                        // because the toggle was off would read
+                                        // as a dead row.
+                                        this.subs_on = true;
+                                        cx.notify();
+                                    }))
+                            })
+                            .when(picked, |d| d.bg(rgb(SELECTED)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                            // The media rows' bar, same width and hard against
+                            // the same edge: one association across the panel
+                            // and the lanes. Kept as room rather than dropped
+                            // where there is no tint, so a standalone `.srt`
+                            // still lines its words up with the rest.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(SWATCH_W))
+                                    .h_full()
+                                    .rounded(px(2.))
+                                    .when_some(tint, |d, tint| d.bg(rgb(tint))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .text_size(px(11.))
+                                            // In front, because the column
+                                            // truncates from the right: an
+                                            // ownership word at the end is a
+                                            // word the floor never shows.
+                                            .when(several_files, |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex_none()
+                                                        // Said twice where a
+                                                        // header says it above:
+                                                        // still there, out of
+                                                        // the way.
+                                                        .when(headed, |d| {
+                                                            d.text_color(rgb(INK_DIM))
+                                                        })
+                                                        .child(format!("{prefix} · ")),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(INK_DIM))
+                                            .child(row.detail),
+                                    ),
+                            )
+                    })
+                    .collect();
                 div()
-                    .id(("subtitle-track", i))
                     .flex_none()
-                    .h(px(ROW_H))
                     .flex()
                     .flex_col()
-                    .justify_center()
-                    .px(px(6.))
-                    .rounded(px(3.))
-                    .when(!usable, |d| d.text_color(rgb(INK_DIM)).opacity(0.55))
-                    .when(usable, |d| {
-                        d.cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.sub_track = i;
-                                // Picking a track is asking to see it: a click
-                                // that changed nothing on screen because the
-                                // toggle was off would read as a dead row.
-                                this.subs_on = true;
-                                cx.notify();
-                            }))
+                    .gap(px(2.))
+                    // The header: which film these came out of, in words and not
+                    // in colour alone. No id, no click, nothing to fold -- a
+                    // label, which is why it is allowed under `HIT_MIN`.
+                    .when(headed, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .h(px(SUB_HEAD_H))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(10.))
+                                .text_color(rgb(INK_DIM))
+                                .when_some(tint, |d, tint| {
+                                    d.child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(SWATCH_W))
+                                            .h_full()
+                                            .rounded(px(2.))
+                                            .bg(rgb(tint)),
+                                    )
+                                })
+                                .child(div().flex_1().min_w(px(0.)).truncate().child(head)),
+                        )
                     })
-                    .when(picked, |d| d.bg(rgb(SELECTED)))
-                    .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(11.))
-                            .child(track.label.clone()),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(10.))
-                            .text_color(rgb(INK_DIM))
-                            .child(under),
-                    )
+                    .children(rows)
             })
             .collect();
         Some(
@@ -9373,12 +9528,10 @@ fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
 /// before anything is drawn -- the grouping is the branchy part and it is the
 /// same answer whatever a styling puts around it.
 ///
-/// ponytail: only [`sub_pick_name`] reads these -- [`Player::subtitle_section`]
-/// still *lists* the flat rows, so the grouping shows in what the headers say
-/// and not yet in how the list is laid out. The upgrade is that section
-/// rendering groups instead.
+/// [`Player::subtitle_section`] draws one block per group of these, and
+/// [`sub_pick_name`] names the pick out of the same answer -- so what a heading
+/// says and what a row a person clicked says cannot disagree.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 struct SubGroup {
     /// What the group is called: the file without its extension, which is what
     /// a person named the film even when the subtitles came out of a remux.
@@ -9392,7 +9545,6 @@ struct SubGroup {
 
 /// One subtitle track, as a row shows it.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 struct SubRow {
     /// Which track of the session's list this row is: the *flat* index into the
     /// add-order Vec `PlaybackSession::subtitles` hands back, which is what a
@@ -9418,7 +9570,6 @@ struct SubRow {
 /// distinct path, in the order the files first appear, and each file's tracks
 /// in the order they were added. Two remuxes' tracks arriving interleaved --
 /// which is what importing a second film does -- still read as two films.
-#[allow(dead_code)]
 fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<SubGroup> {
     let mut groups: Vec<SubGroup> = Vec::new();
     for (track, sub) in tracks.iter().enumerate() {
@@ -10031,6 +10182,55 @@ fn library_w(window_w: f32) -> f32 {
     (window_w * LIBRARY_FRAC)
         .clamp(LIBRARY_MIN_W, LIBRARY_MAX_W)
         .min(window_w / 3.)
+}
+
+/// What is left of a library column this wide for a row's *words*: the panel's
+/// padding on both sides, the tint bar, the gap after it and the row's own right
+/// inset. Every row in the column -- media and subtitle -- is built to this
+/// shape, so one number answers for both.
+fn row_text_w(width: f32) -> f32 {
+    // 8 px of panel padding each side, then the bar, the gap after it and the
+    // row's own right inset -- the numbers the rows are built with.
+    width - 16. - SWATCH_W - 6. - 6.
+}
+
+/// A name cut to what a column this wide can hold, out of the *middle*. Two
+/// files off one release differ in their last characters and nowhere else --
+/// "…Episode 01" against "…02" -- so a name cut from the right is the same
+/// name twice and the list stops naming anything. The width decides how much
+/// survives, not a number of characters somebody guessed: a wider window spells
+/// more of the file out, and the floor still keeps both ends.
+///
+/// The element truncates for real; this only decides where what is lost comes
+/// out of.
+fn clip_middle(name: &str, width: f32) -> String {
+    let budget = ((width / LIST_CHAR_W) as usize).max(LIST_CLIP_MIN);
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= budget {
+        return name.to_string();
+    }
+    // The gap costs a character, and what is left of the odd one goes to the
+    // tail: the tail is the half that tells two of them apart.
+    let head = (budget - 1) / 2;
+    let tail = budget - 1 - head;
+    format!(
+        "{}…{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+/// Whether the subtitle list has the height to name each file over its tracks.
+/// A header is worth its own height only where there are still tracks under it
+/// to read: at the 640x360 floor the list is one row tall, and a header there
+/// would name a film and show none of it -- so at the floor there are no
+/// headers and the rows say which file they came from themselves.
+///
+/// The window's height answers it on its own: the row above the picture and the
+/// panel under it are fixed, so every pixel the window gains past the floor is a
+/// pixel this column gains.
+fn sub_headers_fit(viewport_h: f32) -> bool {
+    SUB_ROWS_AT_FLOOR + (viewport_h - 360.).max(0.) >= SUB_HEAD_H + 2. * ROW_H
 }
 
 /// What the window is called: the program, and what is open in it. The name is
@@ -12087,8 +12287,10 @@ mod tests {
         visible_slice,
     };
     use super::{
-        SUB_BOTTOM, SUB_CUE_MIN_W, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H, SUB_TEXT, cue_box,
-        cues_at, file_tint, is_matroska, is_subtitle, lang_human, subtitle_detail, subtitle_notice,
+        SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H,
+        SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box,
+        cues_at, file_tint, is_matroska, is_subtitle, lang_human, row_text_w, sub_headers_fit,
+        subtitle_detail, subtitle_notice,
         sub_pick_name, subtitle_rows, subtitle_strip_h,
     };
 
@@ -15610,6 +15812,61 @@ mod tests {
         // taking the media list's room.
         assert_eq!(SUB_ROWS_H / ROW_H, 3.);
         assert!(ROW_H >= HIT_MIN, "a subtitle row is clicked to pick it");
+        // At the floor there are no group headers at all: the list is one row
+        // tall there, and a header would name a film and then show none of it.
+        // The rows go on naming their own file, so nothing is lost by it.
+        assert!(!sub_headers_fit(360.), "a header at the floor eats the track");
+        // At the size the window opens on there is room for a header and the
+        // tracks under it, which is the only condition it is drawn on.
+        assert!(sub_headers_fit(720.));
+        // ...and where it is drawn it fits inside the same capped list, header
+        // and two rows under it, without the tracks losing their budget.
+        assert!(SUB_HEAD_H + 2. * ROW_H <= SUB_ROWS_H);
+        // A header takes no click -- there is nothing to fold and nothing to
+        // aim at -- which is the only reason it may be under `HIT_MIN`.
+        assert!(SUB_HEAD_H < HIT_MIN && SUB_HEAD_H > 0.);
+    }
+
+    /// What the rows of both lists do with a name too long for the column: two
+    /// episodes off one release differ in their last two characters, and a name
+    /// cut from the right is the same row twice.
+    #[test]
+    fn a_long_name_is_cut_out_of_its_middle_so_two_episodes_stay_two_rows() {
+        let (a, b) = (
+            "A Long Release Name Of A Series 01",
+            "A Long Release Name Of A Series 02",
+        );
+        // The two call sites at the narrowest the column ever is: a media row's
+        // name gets the row's whole width, a subtitle row's file prefix gets a
+        // share of it because the language has to fit beside it.
+        let media = row_text_w(LIBRARY_MIN_W);
+        let prefix = media * SUB_STEM_SHARE;
+        for width in [media, prefix] {
+            assert!(width > 0., "the floor leaves a row no words at all");
+            assert_ne!(
+                clip_middle(a, width),
+                clip_middle(b, width),
+                "{width}px: two episodes read as one row"
+            );
+            // Both ends survive: the release's name at the front, the number
+            // that tells them apart at the back.
+            assert!(clip_middle(a, width).starts_with('F'));
+            assert!(clip_middle(a, width).ends_with("01"));
+            assert!(clip_middle(a, width).contains('…'));
+            // Never wider than the column can hold, gap included.
+            assert!(clip_middle(a, width).chars().count() <= (width / 6.) as usize + 1);
+        }
+        // A name the width holds is left exactly as it is -- no gap, nothing
+        // dropped -- and so is a name at any width once the column is wide.
+        assert_eq!(clip_middle("eng.srt", 400.), "eng.srt");
+        assert_eq!(clip_middle(a, 4000.), a);
+        // Nothing panics at a width no column ever has, and something of both
+        // ends is still there.
+        assert_eq!(clip_middle(a, 0.).chars().count(), 5);
+        assert!(clip_middle(a, 0.).ends_with('1'));
+        // Counted in characters and not bytes: a name in another script is cut
+        // between its letters, not through one.
+        assert_eq!(clip_middle("ααααααααααααααα", 24.), "αα…αα");
     }
 
     /// The two doors subtitles arrive through, end to end on the fixtures: a
@@ -16300,6 +16557,52 @@ mod tests {
         assert!(refused.bitmap);
         // ...and it was counted: the row after it in add order is still 2.
         assert_eq!(groups[0].rows[1].track, 2);
+    }
+
+    /// The same claim from the click's end, on the order imports actually
+    /// arrive in: two films opened one after the other and an `.srt` dropped
+    /// last interleave in the flat list, and the display reorders them. What a
+    /// click sets is the row's own `track`, so the *n*th row on screen has to
+    /// pick the track it shows and the echoes have to name that same file.
+    #[test]
+    fn a_click_on_a_regrouped_row_picks_the_track_that_row_shows() {
+        let tracks = [
+            sub("/films/a.mkv", Some(1), "eng"),
+            sub("/films/b.mkv", Some(1), "eng"),
+            sub("/films/a.mkv", Some(2), "fre"),
+            sub("/subs/late.srt", None, "late.srt"),
+            sub("/films/b.mkv", Some(3), "ger"),
+        ];
+        let rows: Vec<_> = subtitle_rows(&tracks)
+            .into_iter()
+            .flat_map(|group| {
+                group
+                    .rows
+                    .into_iter()
+                    .map(move |row| (group.path.clone(), row))
+            })
+            .collect();
+        // Read top to bottom, the rows are no longer in add order...
+        assert_eq!(
+            rows.iter().map(|(_, row)| row.track).collect::<Vec<_>>(),
+            [0, 2, 1, 4, 3]
+        );
+        for (path, row) in &rows {
+            // ...and what the click writes into `sub_track` -- and a save into
+            // the `.edith` -- still lands on the track the row is showing.
+            let picked = &tracks[row.track];
+            assert_eq!(&picked.path, path, "row {} picks another file", row.track);
+            assert_eq!(lang_human(&picked.label), row.label);
+            // And the heading, the strip and the notice name that same file
+            // back, so a click cannot leave the echoes pointing elsewhere.
+            let echo = sub_pick_name(&tracks, row.track).expect("the row's own track");
+            let stem = path.file_stem().expect("a fixture path").to_string_lossy();
+            assert!(
+                echo.contains(&*stem),
+                "picked {}, echoed {echo}",
+                path.display()
+            );
+        }
     }
 
     /// "und" is what a muxer writes when nobody said what the language is. A
