@@ -64,6 +64,7 @@ use flacenc::error::Verify;
 use oxideav_core::Muxer as _;
 
 use crate::audio::{AudioMeta, AudioSession};
+use crate::colorspace::ColorDescription;
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams};
@@ -953,13 +954,17 @@ fn run(
 
     // One header parse per source, before any of them is decoded: what rate
     // each file was shot at against the timeline's ([`Rate`]), which is how the
-    // clip's timeline frames below become frames of the file. Real time for a
-    // still, a song and a single-rate project, where every conversion below is
-    // the identity.
-    let rates: Vec<Rate> = sources
+    // clip's timeline frames below become frames of the file, and what its
+    // samples *mean* ([`ColorDescription`]), which is what decides whether they
+    // are remapped on the way in. Real time for a still, a song and a
+    // single-rate project, where every conversion below is the identity.
+    let rates: Vec<(Rate, ColorDescription)> = sources
         .iter()
         .map(|source| source_rate(&source.path, meta.frame_rate))
         .collect();
+    // ...and the one space they are all written in, the same rule a reader with
+    // no tags to read would apply to this file's height.
+    let out_color = ColorDescription::output(meta.height);
 
     let mut encoder = Enc::open(meta, settings)?;
     // What this file is really being written by, for a progress line to name.
@@ -985,19 +990,34 @@ fn run(
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
-        let (mut pictures, rate, in_frame) = match span.from {
+        let (mut pictures, rate, in_frame, color) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
-                let rate = rates[source];
+                let (rate, color) = rates[source];
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
                 let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
-                (Some(pictures), rate, in_frame)
+                (Some(pictures), rate, in_frame, Some(color))
             }
-            None => (None, Rate::REAL_TIME, 0),
+            // A gap's black is 16/128/128, which is black in every matrix here:
+            // nothing to remap, which is what `None` says.
+            None => (None, Rate::REAL_TIME, 0, None),
         };
+        // Mixed spaces on one timeline: a clip coded against another matrix than
+        // the one this file declares is rewritten into it, before the grade,
+        // whose numbers the user set against what the canvas showed. Same-space
+        // clips -- the whole of an ordinary project -- take `None` and not a
+        // byte is touched.
+        //
+        // ponytail: an HDR source is composited with the matrix treatment alone
+        // and still looks washed out; the tonemap lands here, ahead of this, and
+        // is a sibling task's.
+        let remap = color
+            .map(|c| c.matrix)
+            .filter(|&m| m != out_color.matrix)
+            .map(|m| (m, out_color.matrix));
         // What this span is graded by -- the same answer playback's decoder
         // carries, so the export is the picture that was watched. `None` for a
         // gap and for an ungraded clip, and that is the path where not a byte
@@ -1069,8 +1089,10 @@ fn run(
             // hands the same slice as both u and v), so a grade cannot be
             // applied in place: it goes onto a copy, which the encoder then
             // reads instead.
-            let (y, u, v) = match grade.filter(|p| !p.is_identity()) {
-                Some(params) => {
+            let params = grade.filter(|p| !p.is_identity());
+            let (y, u, v) = match (params, remap) {
+                (None, None) => (y, u, v),
+                (params, remap) => {
                     let (gy, gu, gv) = &mut graded;
                     gy.clear();
                     gy.extend_from_slice(y);
@@ -1078,10 +1100,14 @@ fn run(
                     gu.extend_from_slice(u);
                     gv.clear();
                     gv.extend_from_slice(v);
-                    crate::color::apply_yuv(&params, gy, gu, gv);
+                    if let Some((from, to)) = remap {
+                        crate::colorspace::remap(from, to, gy, gu, gv, width as usize);
+                    }
+                    if let Some(params) = params {
+                        crate::color::apply_yuv(&params, gy, gu, gv);
+                    }
                     (&gy[..], &gu[..], &gv[..])
                 }
-                None => (y, u, v),
             };
             // Grade first, place second: the grade is the clip's own pixels
             // and the bars around them are not the clip (see `scale::Composer`).
@@ -1153,16 +1179,24 @@ fn run(
 /// -- a still, a song -- and for one that will not open here: the decoder is
 /// opened a few lines later and fails the export by name, which is a better
 /// error than this one could raise.
-fn source_rate(path: &Path, timeline_fps: f64) -> Rate {
+fn source_rate(path: &Path, timeline_fps: f64) -> (Rate, ColorDescription) {
     if crate::is_image(path) || crate::is_audio(path) {
-        return Rate::REAL_TIME;
+        // A still is BT.601 by construction whatever it was authored as:
+        // `decode::rgb_to_i420` is the one matrix that turns its pixels into
+        // planes. A song has no picture and the answer is never read.
+        return (Rate::REAL_TIME, ColorDescription::default());
     }
     match Demuxer::open(path) {
         // ...and one whose rate cannot be named against the timeline's, which
         // `matches_timeline` refuses at import, so nothing on a timeline is on
         // this arm either.
-        Ok((meta, _)) => Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
-        Err(_) => Rate::REAL_TIME,
+        Ok((meta, _)) => (
+            Rate::from_fps(meta.frame_rate, timeline_fps).unwrap_or(Rate::REAL_TIME),
+            meta.color,
+        ),
+        // Unreadable here means unreadable below too, where the span dies with a
+        // real message; the file's own space is the least of that.
+        Err(_) => (Rate::REAL_TIME, ColorDescription::default()),
     }
 }
 
