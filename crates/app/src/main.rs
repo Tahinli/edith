@@ -687,6 +687,11 @@ struct Player {
     /// runs off the render thread and only while the export card is up. The
     /// inner `None` is "asked, not answered yet".
     export_seat: Option<(ExportSettings, (u32, u32), Option<&'static str>)>,
+    /// What this machine's GPU decodes and encodes, as the plugin answered it:
+    /// asked once, off the render thread like `export_seat` and for the same
+    /// reason (a VA-API init), and kept for the life of the process because the
+    /// answer cannot change while we run. `None` is "not asked yet".
+    hw_caps: Option<SharedString>,
     /// The copied clip. Frame ranges only, so it survives the clip it was taken
     /// from being deleted -- and it outlives the selection.
     clipboard: Option<Clip>,
@@ -2257,6 +2262,31 @@ impl Player {
         .detach();
     }
 
+    /// Asks the plugin what this machine's GPU can do, once, the first time the
+    /// export card is up to show it. Off the render thread for `cache_export_seat`'s
+    /// reason: the plugin initialises VA-API to answer, and a driver that is
+    /// slow to load must not be a frame the user waits for.
+    fn cache_hw_caps(&mut self, cx: &mut Context<Self>) {
+        if !self.export_open || self.hw_caps.is_some() {
+            return;
+        }
+        // Written before the spawn, exactly as the probes above are, so the
+        // repaints during it start no second one.
+        self.hw_caps = Some("asking the driver…".into());
+        let asked = cx
+            .background_executor()
+            .spawn(async move { engine::caps::hardware() });
+        cx.spawn(async move |this, cx| {
+            let line = asked.await;
+            this.update(cx, |this, cx| {
+                this.hw_caps = Some(line.into());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The group id of the clicked clip, which is what marks the other half.
     fn selected_link(&self) -> Option<u32> {
         let (lane, idx) = self.selected?;
@@ -3399,6 +3429,7 @@ impl Render for Player {
         // is the one place that has to notice a new one.
         self.cache_media(cx);
         self.cache_export_seat(cx);
+        self.cache_hw_caps(cx);
         // What the compositor calls this window. Pushed only when it changes:
         // it is a protocol round trip and this runs at vsync.
         let title = window_title(&self.name);
@@ -5135,6 +5166,30 @@ impl Player {
                     .into_any_element(),
             );
         }
+        // What is doing the work, on this machine and in this build: the GPU
+        // half is asked of the driver through the plugin (a different answer on
+        // every machine, and "none" where there is no plugin at all), the build
+        // half is the crates that were compiled in. Last in the list, because it
+        // is what a user checks rather than what they pick -- and a listing
+        // rather than rows, since none of it can be clicked.
+        if self.export_grouped {
+            list.push(header("THIS MACHINE"));
+        }
+        let note = |text: String| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .py(px(2.))
+                .text_size(px(11.))
+                .text_color(rgb(INK_DIM))
+                .child(text)
+                .into_any_element()
+        };
+        list.push(note(format!(
+            "GPU: {}",
+            self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
+        )));
+        list.push(note(format!("Built in: {}", engine::caps::software())));
         // What the rows add up to, which is the one thing that has to be right:
         // codec, box, size, rate, sound, where it goes and about how big. Two
         // lines, outside the scrolling list, so it is on screen whatever the
@@ -11720,6 +11775,7 @@ fn main() {
                     sizes: HashMap::new(),
                     decoders: HashMap::new(),
                     export_seat: None,
+                    hw_caps: None,
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
