@@ -22,10 +22,10 @@ use crate::ao::AoSession;
 use crate::audio::{AudioChunk, AudioSession};
 use crate::clock::{ClockSource, PlaybackClock};
 use crate::color::ColorParams;
-use crate::decode::{DecodeSession, Frame, Worker};
+use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Edge, Lane, LaneKind, Project, Source, Span, Speed};
+use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed};
 use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -40,10 +40,11 @@ const RING_FULL_WAIT: Duration = Duration::from_millis(10);
 /// honest; both are what a video imported onto such a timeline is held to
 /// ([`matches_timeline`]).
 ///
-/// ponytail: a 25 fps video refused by an audio-only timeline it could have
-/// defined is the ceiling here. Upgrade path is adopting the first *picture's*
-/// rate and codec on import, which means retiming every audio clip already
-/// placed in frames.
+/// ponytail: a 25 fps video imported onto an audio-only timeline it could have
+/// defined plays at 25 fps, correctly, but on a 30 fps timeline -- it is read
+/// through [`Rate`] like any other file shot at another rate rather than
+/// defining one. Upgrade path is adopting the first *picture's* rate and codec
+/// on import, which means retiming every audio clip already placed in frames.
 const AUDIO_ONLY_CANVAS: (u32, u32, f64) = (1920, 1080, 30.0);
 
 /// The frame rate a timeline scaffolded from a still image runs at, for
@@ -90,7 +91,17 @@ struct Audio {
     /// Bumped by every seek. A feeder only owns the device while this still
     /// matches the value it started with; see [`feed`].
     epoch: Arc<AtomicU64>,
+    /// The last [`TAP_SAMPLES`] mono samples handed to the device, oldest
+    /// first: what a meter or an analyser draws. Written by the feeder, which
+    /// is not the device's own callback -- the plugin's RT thread never sees
+    /// this lock, and the feeder holds it for one memcpy per write.
+    tap: Arc<Mutex<Vec<f32>>>,
 }
+
+/// How much of the played signal the tap keeps. A power of two, because what
+/// reads it transforms it, and long enough that the lowest band the editor
+/// draws (20 Hz) has a whole cycle in the window at any rate we open.
+const TAP_SAMPLES: usize = 2048;
 
 impl Audio {
     /// Whether the device has played everything there will ever be, i.e. the
@@ -98,6 +109,21 @@ impl Audio {
     fn played_out(&self, position: i64) -> bool {
         self.fed_all.load(Ordering::Acquire)
             && position as u64 * self.channels >= self.fed.load(Ordering::Relaxed)
+    }
+
+    /// Keeps the newest [`TAP_SAMPLES`] of what was just queued, downmixed to
+    /// mono. Called from the feeder only, once per accepted write.
+    fn note_tap(&self, accepted: &[f32]) {
+        let channels = self.channels.max(1) as usize;
+        let mut tap = self.tap.lock().unwrap();
+        // Only the tail can survive anyway: a big write replaces the window
+        // outright rather than being summed into it and then thrown away.
+        let from = accepted.len().saturating_sub(TAP_SAMPLES * channels);
+        for frame in accepted[from..].chunks_exact(channels) {
+            tap.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+        let over = tap.len().saturating_sub(TAP_SAMPLES);
+        tap.drain(..over);
     }
 
     /// Starts a feeder for the current epoch, draining `rx` into the device.
@@ -135,6 +161,11 @@ pub struct PlaybackSession {
     frames: Receiver<Frame>,
     /// The current decode worker.
     worker: Worker,
+    /// What that worker opened -- hardware, software, a still, a gap -- written
+    /// by the worker itself and read by [`decode_backend`](Self::decode_backend).
+    /// Replaced with the stream at every seek, so it always describes the
+    /// pictures currently arriving and never the clip before them.
+    backend: BackendCell,
     /// Workers cancelled by a seek or a clip change, waiting to be reaped.
     /// Joining one inline costs whatever VA-API init it is still inside (98 ms
     /// measured worst case), which is a visible hitch on the caller's thread;
@@ -168,6 +199,20 @@ pub struct PlaybackSession {
     /// not -- with the single exception `sources` itself has,
     /// [`Self::remove_source`], which takes the same entry out of both.
     counts: Vec<u32>,
+    /// What each source's own frame rate is against this timeline's, indexed
+    /// and grown exactly as [`Self::counts`] is (and shortened with it by
+    /// [`Self::remove_source`]). [`Rate::REAL_TIME`] for a file shot at the
+    /// timeline's rate -- and for a still and a song, which have no rate of
+    /// their own -- so a single-rate project converts nothing anywhere.
+    ///
+    /// A clip counts *timeline* frames ([`Rate`]); this is the one thing that
+    /// knows which frames of the file those are, and only
+    /// [`start_span`](Self::start_span) and [`try_frame`](Self::try_frame) ask.
+    rates: Vec<Rate>,
+    /// The rate of the source the current worker is decoding, kept beside
+    /// [`Self::span`] because the frames coming back are numbered in *its*
+    /// file's frames and nothing else can put them back on the timeline.
+    span_rate: Rate,
     /// What the current video worker was opened for: where it sits on the
     /// timeline, how long it runs, and which source frame it started at --
     /// together they rewrite a source frame index into a timeline one. Not a
@@ -234,12 +279,16 @@ impl PlaybackSession {
             native: (meta.width, meta.height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(source),
             audio,
             audio_disabled,
             project,
             counts: vec![meta.frame_count],
+            // Source 0 *is* the timeline's rate: it defined it.
+            rates: vec![Rate::REAL_TIME],
+            span_rate: Rate::REAL_TIME,
             span,
             eos: false,
         })
@@ -328,6 +377,7 @@ impl PlaybackSession {
             native: (width, height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             // The song keeps the clock, as a video's own sound does -- and wall
             // time keeps it on a machine with no device, where the picture
@@ -340,6 +390,9 @@ impl PlaybackSession {
             audio_disabled,
             project,
             counts: vec![meta.frame_count],
+            // Source 0 *is* the timeline's rate: it defined it.
+            rates: vec![Rate::REAL_TIME],
+            span_rate: Rate::REAL_TIME,
             span,
             eos: false,
         })
@@ -400,12 +453,16 @@ impl PlaybackSession {
             native: (meta.width, meta.height),
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(ClockSource::Wall),
             audio: None,
             audio_disabled: None,
             project,
             counts: vec![meta.frame_count],
+            // Source 0 *is* the timeline's rate: it defined it.
+            rates: vec![Rate::REAL_TIME],
+            span_rate: Rate::REAL_TIME,
             span,
             eos: false,
         })
@@ -417,10 +474,12 @@ impl PlaybackSession {
     ///
     /// A *new* session rather than a reload of this one, so a load that fails
     /// leaves the caller's current session untouched -- atomic by
-    /// construction. Every named file is opened and checked here: source 0
-    /// defines the timeline exactly as `open` does, every other source has to
-    /// match it the way [`import`](Self::import) demands, and every clip has to
-    /// still be inside the file it plays from. A source that vanished or
+    /// construction. Every named file is opened and checked here: the
+    /// *scaffolding* source -- the first that is not a still, since a picture
+    /// carries no rate -- defines the timeline exactly as `open` does, every
+    /// other source has to match it the way [`import`](Self::import) demands
+    /// (a save renumbers, so which index that is says nothing), and every clip
+    /// has to still be inside the file it plays from. A source that vanished or
     /// shrank since the save is a refusal naming it, not a silently shorter
     /// timeline -- the disappearing-file tolerance elsewhere in this type
     /// applies only *after* a project has loaded.
@@ -428,15 +487,38 @@ impl PlaybackSession {
     /// The undo history is not saved: `undo` is `false` on a fresh load.
     pub fn open_project(path: &Path) -> crate::Result<Self> {
         let doc = crate::edith::load(path)?;
+        // *Which* source scaffolds it: the first that is not a still, and index
+        // 0 only when there is no other. A still defines no frame rate -- it is
+        // given [`IMAGE_ONLY_RATE`] -- so scaffolding a timeline of 24 fps
+        // footage off a PNG that a save happened to renumber to index 0
+        // (`Project::without_orphan_sources` numbers by first use, and a
+        // library removal moves indexes too) reads the timeline as 30 fps and
+        // then refuses every file on it for not matching. The rule this and
+        // [`audio_source_of`] share: nothing may assume what source 0 *is*.
+        //
+        // A v9 file says what rate it was cut at, and that answer beats the
+        // scaffold's *where the scaffold has none to give*: a still and a song
+        // are both given a made-up rate (`IMAGE_ONLY_RATE`,
+        // `AUDIO_ONLY_CANVAS`), so a timeline of nothing but those used to come
+        // back at 30 fps however it was cut. A scaffold with a picture keeps
+        // defining the timeline as it always did -- it is the file every clip
+        // on the lane was conformed to, and the two agree by construction.
+        let saved_fps = doc.fps.filter(|f| f.is_finite() && *f > 0.0);
+        let scaffold = doc
+            .sources
+            .iter()
+            .position(|s| !crate::is_image(&s.path))
+            .unwrap_or(0);
         // Owned: the sources move into the `Project` below, and the device is
         // opened after that (see the comment there).
         let first = doc
             .sources
-            .first()
+            .get(scaffold)
             .cloned()
             .ok_or("the project names no sources")?;
-        // Source 0 both scaffolds the session and defines the timeline, so it
-        // is opened for playback rather than merely probed.
+        // The scaffolding source both defines the timeline and is what the
+        // playhead's first picture comes from, so it is opened for playback
+        // rather than merely probed.
         // One value, not two locals: everything below this line can refuse, and
         // locals drop in reverse declaration order -- a bare worker would join
         // its decode thread while the receiver next to it was still holding
@@ -451,7 +533,8 @@ impl PlaybackSession {
         // like every other worker opened here.
         let (mut meta, stream) = match crate::is_audio(&first.path) {
             true => {
-                let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
+                let (width, height, canvas_fps) = AUDIO_ONLY_CANVAS;
+                let frame_rate = saved_fps.unwrap_or(canvas_fps);
                 let meta = VideoMeta {
                     width,
                     height,
@@ -468,11 +551,12 @@ impl PlaybackSession {
             false if crate::is_image(&first.path) => {
                 let still = crate::decode::Still::open(&first.path)
                     .map_err(|e| format!("source {}: {e}", first.path.display()))?;
+                let frame_rate = saved_fps.unwrap_or(IMAGE_ONLY_RATE);
                 let meta = VideoMeta {
                     width: still.width,
                     height: still.height,
-                    frame_rate: IMAGE_ONLY_RATE,
-                    frame_count: image_frames(IMAGE_ONLY_RATE),
+                    frame_rate,
+                    frame_count: image_frames(frame_rate),
                     codec: Codec::H264,
                 };
                 let stream = DecodeSession::open_still(
@@ -503,8 +587,22 @@ impl PlaybackSession {
         }
         let first_audio = first_audio_of(&doc.sources)?;
 
-        let mut counts = vec![meta.frame_count];
-        for source in &doc.sources[1..] {
+        // In source order, with the scaffold's own count in its own slot: the
+        // clip check below indexes this list by source, so it must line up with
+        // `doc.sources` whichever entry the scaffolding came from.
+        let mut counts = Vec::with_capacity(doc.sources.len());
+        // Beside it, one entry per source, grown at every `push` below: the
+        // scaffold defines the rate, so it is read frame for frame; every other
+        // one is however long it is *in this timeline's frames*, which is the
+        // length `import` noted for it and the wall the clip check below holds
+        // it to.
+        let mut rates = Vec::with_capacity(doc.sources.len());
+        for (i, source) in doc.sources.iter().enumerate() {
+            if i == scaffold {
+                counts.push(meta.frame_count);
+                rates.push(Rate::REAL_TIME);
+                continue;
+            }
             // A still has neither a rate to match nor a track to match with:
             // its length is the one it is held to, recomputed exactly as the
             // import that first noted it did ([`image_frames`]), which is what
@@ -513,6 +611,7 @@ impl PlaybackSession {
                 crate::decode::image_size(&source.path)
                     .map_err(|e| format!("source {}: {e}", source.path.display()))?;
                 counts.push(image_frames(meta.frame_rate));
+                rates.push(Rate::REAL_TIME);
                 continue;
             }
             // A source with no picture is checked on what it does have, and
@@ -522,13 +621,15 @@ impl PlaybackSession {
                 audio_matches(source, &first_audio)
                     .map_err(|e| format!("source {}: {e}", source.path.display()))?;
                 counts.push(audio_frames(&source.path, meta.frame_rate)?);
+                rates.push(Rate::REAL_TIME);
                 continue;
             }
             let (other, _) = Demuxer::open(&source.path)
                 .map_err(|e| format!("source {}: {e}", source.path.display()))?;
-            matches_timeline(source, &other, &meta, &first_audio)
+            let rate = matches_timeline(source, &other, &meta, &first_audio)
                 .map_err(|e| format!("source {}: {e}", source.path.display()))?;
-            counts.push(other.frame_count);
+            counts.push(rate.timeline_at(other.frame_count));
+            rates.push(rate);
         }
         // The video lane can only play files that have pictures. Hand-written
         // (or hand-edited) project files are the one door this can come in
@@ -572,19 +673,29 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
-        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?;
+        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
+            .with_mix(&doc.gains, doc.limiter);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
         // only a session's `drop` retires it, so a refusal above this line would
         // leave a PipeWire stream and a thread behind for a project that never
         // opened. Nothing before it needs the device.
-        let (audio, audio_disabled) = open_audio(&first.path, first.audio_stream);
+        //
+        // On the source the timeline's *sound* is defined by, which is the
+        // scaffold unless that one is a still ([`audio_source_of`]): opening a
+        // PNG as the device is a session with no audio at all, however many
+        // clips with sound are on its lanes.
+        let (audio, audio_disabled) = match audio_source_of(project.sources()) {
+            Some(source) => open_audio(&source.path, source.audio_stream),
+            None => (None, None),
+        };
         let mut session = Self {
             meta,
             native,
             frames: stream.frames,
             worker: stream.worker,
+            backend: stream.backend,
             retired: Vec::new(),
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
@@ -594,6 +705,8 @@ impl PlaybackSession {
             audio_disabled,
             project,
             counts,
+            rates,
+            span_rate: Rate::REAL_TIME,
             span,
             eos: false,
         };
@@ -608,6 +721,24 @@ impl PlaybackSession {
 
     pub fn meta(&self) -> &VideoMeta {
         &self.meta
+    }
+
+    /// What the pictures now arriving are being decoded by: the clip under the
+    /// playhead, since one video worker feeds the composite at a time. An
+    /// atomic load -- a front-end may ask it every repaint -- and it is what
+    /// *opened*, so a clip whose hardware session fell back to software reads
+    /// [`Backend::Software`] from the frame that fallback happened.
+    pub fn decode_backend(&self) -> Backend {
+        self.backend.get()
+    }
+
+    /// What an export of this timeline would encode the *sound* with, before
+    /// one is started: the copy an mp4 normally makes, or the software encoder
+    /// the format (or an equalized lane) forces. Pure -- no probe, no file
+    /// opened -- so a card may ask it per repaint; the picture's half costs a
+    /// plugin open and lives in [`crate::export::planned_video`].
+    pub fn planned_audio(&self, format: crate::export::Format) -> &'static str {
+        crate::export::planned_audio(&self.project, format)
     }
 
     /// Why this session plays silent although the file has sound -- an audio
@@ -627,7 +758,16 @@ impl PlaybackSession {
     /// Writes the timeline to `path` as a `.edith`, atomically (see
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
+    ///
+    /// Refused, writing nothing, for a session whose library is empty (every
+    /// row removed, [`Project::remove_source`]): a file naming no source has no
+    /// timeline in it and [`open_project`](Self::open_project) could only
+    /// refuse it, so the refusal belongs here, where nothing has been
+    /// overwritten yet.
     pub fn save_project(&self, path: &Path) -> crate::Result<()> {
+        if self.project.sources().is_empty() {
+            return Err("this project names no file: there is nothing to save".into());
+        }
         let (sources, lanes, eq, color) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
@@ -635,9 +775,19 @@ impl PlaybackSession {
             path,
             &sources,
             &lanes,
+            // The lane volumes and the limiter with them: a mix that vanished
+            // on a reload would be a mix nobody could keep, and both are the
+            // project's, not this machine's (the monitoring volume is not
+            // written and never will be).
+            &self.project.lane_gains(),
             &eq,
             &color,
             (self.meta.width, self.meta.height),
+            // ...and the rate it was cut at, which nothing else in the file
+            // says: a timeline of stills and songs used to come back at
+            // whatever its scaffold implied (`open_project`).
+            Some(self.meta.frame_rate),
+            self.project.limiter(),
             playhead,
         )
     }
@@ -662,9 +812,15 @@ impl PlaybackSession {
                     // (`speed_maps_both_ways`). An empty timeline has no span,
                     // and its one black frame is frame 0. Real time is the
                     // arithmetic this always did, frame for frame.
-                    frame.index = self
-                        .span
-                        .map_or(frame.index, |s| s.timeline_at(frame.index));
+                    // ...through the file's own rate first, which is the ceil
+                    // half of *that* pair: the picture at source frame `i` is
+                    // due at the first timeline-rate frame that shows it, and a
+                    // slower file's picture is therefore held for the frames in
+                    // between. Real time for a gap and for a single-rate
+                    // project, where this is the identity.
+                    frame.index = self.span.map_or(frame.index, |s| {
+                        s.timeline_at(self.span_rate.timeline_at(frame.index))
+                    });
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -734,6 +890,14 @@ impl PlaybackSession {
     /// timeline still moves, there are simply no more pictures, and the
     /// disconnected receiver carries the session on to the next span.
     fn start_span(&mut self, span: Option<Span>) {
+        // Which file's frames the worker about to be opened will number its
+        // pictures in: the span's own source, and real time for a gap, whose
+        // black worker counts timeline frames already. Set before the open,
+        // because the open is the first thing that converts with it.
+        self.span_rate = match span.and_then(|s| s.from) {
+            Some((source, _)) => self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME),
+            None => Rate::REAL_TIME,
+        };
         let opened = match span {
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
@@ -770,10 +934,17 @@ impl PlaybackSession {
                 ..
             }) => DecodeSession::open_worker(
                 &self.project.sources()[source].path,
-                in_frame,
+                // The file's own frames, which is the only place they exist:
+                // a clip counts the timeline's ([`Rate`]).
+                self.span_rate.source_at(in_frame),
                 // Source frames, which a speed makes more (or fewer) than the
-                // timeline frames the span covers.
-                in_frame + span.expect("matched above").source_len(),
+                // timeline frames the span covers -- and which a file shot at
+                // another rate makes fewer (or more) again. One past the last
+                // frame this span shows, not one past its length: at another
+                // rate those are two different frames.
+                self.span_rate.source_at(
+                    in_frame + span.expect("matched above").source_len().saturating_sub(1),
+                ) + 1,
                 self.project
                     .composite_color_at(start)
                     .copied()
@@ -804,6 +975,7 @@ impl PlaybackSession {
             // then can it return and be reaped by a later sweep. Nothing here
             // joins, so this ordering costs the seek nothing.
             self.frames = stream.frames;
+            self.backend = stream.backend;
             self.retire(stream.worker);
         }
         self.span = span;
@@ -876,6 +1048,13 @@ impl PlaybackSession {
         self.project.add_lane(kind)
     }
 
+    /// Drops that empty lane again, in [`Project::remove_lane`]'s words when it
+    /// refuses. One undo step, and no reseek for the same reason the add needs
+    /// none: an empty lane was playing nothing.
+    pub fn remove_lane(&mut self, lane: Lane) -> crate::Result<()> {
+        self.project.remove_lane(lane)
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
@@ -931,6 +1110,31 @@ impl PlaybackSession {
         self.edit(|p| p.set_eq(lane, idx, params))
     }
 
+    /// How loud that lane plays, in dB -- everything on it, every frequency of
+    /// it. See [`Project::lane_gain_db`] for what it is *not*.
+    pub fn lane_gain_db(&self, lane: Lane) -> f32 {
+        self.project.lane_gain_db(lane)
+    }
+
+    /// Sets it. One undo step and a reseek, the equalizer's rule for the
+    /// equalizer's reason: the mixer is rebuilt from the new volumes right
+    /// where the playhead is, so a track turned down during playback is heard
+    /// turned down from the next chunk on.
+    pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
+        self.edit(|p| p.set_lane_gain_db(lane, db))
+    }
+
+    /// The master limiter the whole mix is summed through.
+    pub fn limiter(&self) -> crate::limiter::Limiter {
+        self.project.limiter()
+    }
+
+    /// Sets it, live like a lane volume and for the same reason -- the ceiling
+    /// a person is dragging has to be the ceiling they are hearing.
+    pub fn set_limiter(&mut self, limiter: crate::limiter::Limiter) -> bool {
+        self.edit(|p| p.set_limiter(limiter))
+    }
+
     /// Lifts one lane's clip out, leaving a gap: black frames on the video lane,
     /// silence on the audio one, and nothing else moves. Reseeks, because what
     /// the playhead sits on has changed. `false` for a bad index -- the lift of
@@ -940,14 +1144,20 @@ impl PlaybackSession {
         self.edit(|p| p.lift(lane, idx))
     }
 
-    /// Moves that clip onto another lane of the same kind, keeping the frames it
-    /// covers -- the drag between tracks. One undo step, and it reseeks like
-    /// every other edit: which lane a clip sits on is what the compositor's
-    /// topmost-lane-wins rule reads, so the frame on screen is recomposed at
-    /// once. `false` for a bad index, for a move across kinds and for one that
-    /// would land on another clip; nothing changes.
-    pub fn move_clip_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
-        self.edit(|p| p.move_to_lane(from, idx, to))
+    /// Moves that clip onto lane `to` with its head at timeline frame `start` --
+    /// the drag that carries a take along its track or onto another one, and its
+    /// whole group with it. See [`Project::move_clip`] for the walls `start` is
+    /// clamped to and the ways a drop is refused. One undo step, and it reseeks
+    /// like every other edit: which lane a clip sits on is what the compositor's
+    /// topmost-lane-wins rule reads, and where it starts is what the playhead
+    /// reads, so the frame on screen is recomposed at once.
+    ///
+    /// A *frame*, where the rest of this type takes seconds, for
+    /// [`trim_clip`](Self::trim_clip)'s reason: the drag has already put the
+    /// pointer on a frame, and converting it back through seconds would be a
+    /// rounding step between the box let go of and the box committed.
+    pub fn move_clip_to(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        self.edit(|p| p.move_clip(from, idx, to, start))
     }
 
     /// Drags one end of that clip to timeline frame `to`, changing how much of
@@ -1042,13 +1252,36 @@ impl PlaybackSession {
         self.project.trim_room(lane, idx, edge, &self.counts)
     }
 
-    /// Records how long a source is, for a source index that may be one
-    /// `Project::import` just made or one it handed back. See [`Self::counts`].
-    fn note_frames(&mut self, source: usize, frames: u32) {
+    /// Records how long a source is and what rate it was shot at, for a source
+    /// index that may be one `Project::import` just made or one it handed back.
+    /// See [`Self::counts`] and [`Self::rates`], which are one table in two
+    /// vectors and grow together.
+    fn note_frames(&mut self, source: usize, frames: u32, rate: Rate) {
         if source == self.counts.len() {
             self.counts.push(frames);
+            self.rates.push(rate);
         }
         debug_assert_eq!(self.counts.len(), self.project.sources().len());
+        debug_assert_eq!(self.rates.len(), self.counts.len());
+    }
+
+    /// The rate noted for whichever source plays `path`, by
+    /// [`file_frames`](Self::file_frames)'s rule: one file is one rate however
+    /// many audio tracks it carries. [`Rate::REAL_TIME`] for a file this session
+    /// has never taken in.
+    fn file_rate(&self, path: &Path) -> Rate {
+        self.source_of(path)
+            .map_or(Rate::REAL_TIME, |i| self.rates[i])
+    }
+
+    /// Which source `path` is, canonicalising only if it has to: a source's own
+    /// path is canonical ([`Source::new`]), so a caller handing one back from
+    /// [`sources`](Self::sources) -- which is every library row -- hits on the
+    /// first walk and never pays for the `canonicalize` syscall the second one
+    /// makes. One rule, so a path that names a length names a rate too.
+    fn source_of(&self, path: &Path) -> Option<usize> {
+        let at = |wanted: &Path| self.project.sources().iter().position(|s| s.path == wanted);
+        at(path).or_else(|| at(&Source::new(path, 0).path))
     }
 
     /// How long the whole of `path` is, in timeline frames: the length noted
@@ -1060,14 +1293,20 @@ impl PlaybackSession {
     /// audio tracks it carries -- the picture's frame count for an mp4, the
     /// playing time for a song.
     pub fn file_frames(&self, path: &Path) -> u32 {
-        let at = |wanted: &Path| self.project.sources().iter().position(|s| s.path == wanted);
-        // A source's own path is canonical ([`Source::new`]), so a caller
-        // handing one back from [`sources`](Self::sources) -- which is every
-        // library row -- hits on the first walk and never pays for the
-        // `canonicalize` syscall the second one makes.
-        at(path)
-            .or_else(|| at(&Source::new(path, 0).path))
-            .map_or(0, |i| self.counts[i])
+        self.source_of(path).map_or(0, |i| self.counts[i])
+    }
+
+    /// What rate the file at `path` was *shot* at, in frames per second -- which
+    /// is the timeline's own rate for every source that shares it, and is not
+    /// for one placed at another ([`Rate`]). By path like
+    /// [`file_frames`](Self::file_frames), and the timeline's rate for a file
+    /// this session has never taken in (and for a still and a song, which were
+    /// shot at no rate at all).
+    ///
+    /// What a library row names the file with: the timeline's rate there would
+    /// be a lie about a 23.976 fps file the moment one can join.
+    pub fn file_fps(&self, path: &Path) -> f64 {
+        self.file_rate(path).as_f64() * self.meta.frame_rate
     }
 
     /// The clip the picture is coming from at `timeline_secs`: the lane it sits
@@ -1186,7 +1425,7 @@ impl PlaybackSession {
     /// [`import`](Self::import) refuses a file with. One output device and one
     /// copied AAC track mean one set of audio parameters for the whole
     /// timeline, so a 22 kHz mono track cannot join a 44.1 kHz stereo one --
-    /// there is no resampler here, and no AAC encoder to write the join with.
+    /// there is no resampler here to make one rate of two.
     /// A front-end greys such a row out; this is the backstop that keeps a
     /// stale one from making the whole timeline silent.
     ///
@@ -1226,8 +1465,9 @@ impl PlaybackSession {
             let first = self.first_audio()?;
             audio_matches(&wanted, &first)?;
         }
+        let rate = self.file_rate(&wanted.path);
         let source = self.project.import(path, stream);
-        self.note_frames(source, frames);
+        self.note_frames(source, frames, rate);
         let clip = Clip {
             start: 0,
             in_frame: 0,
@@ -1286,7 +1526,14 @@ impl PlaybackSession {
     /// Reseeks like an edit even though nothing playable changed: the clip
     /// indexes into the source list have just moved, and the running workers
     /// were opened against the old numbering.
-    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<()> {
+    ///
+    /// The index that went, because everything past it moved down: a caller
+    /// holding a source index of its own (a clipboard) has to fix it up or drop
+    /// it, or it names a different file afterwards. The **last** row goes like
+    /// any other and leaves a session with an empty library -- silent, empty of
+    /// clips, and unsaveable ([`save_project`](Self::save_project)); a
+    /// front-end showing one is showing an empty window.
+    pub fn remove_source(&mut self, path: &Path, stream: usize) -> crate::Result<usize> {
         let wanted = Source::new(path, stream);
         let idx = self
             .project
@@ -1302,14 +1549,16 @@ impl PlaybackSession {
         // count one index late.
         if idx < self.counts.len() {
             self.counts.remove(idx);
+            self.rates.remove(idx);
         }
         let now = self.now();
         self.seek(now);
-        Ok(())
+        Ok(idx)
     }
 
-    /// What the timeline's audio *is*: source 0's chosen stream, probed. Every
-    /// other source is held to it.
+    /// What the timeline's audio *is*: the chosen stream of the first source
+    /// that could have any ([`audio_source_of`]), probed. Every other source is
+    /// held to it.
     fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
         first_audio_of(self.project.sources())
     }
@@ -1355,11 +1604,14 @@ impl PlaybackSession {
     /// nothing playable, so there is nothing for [`undo`](Self::undo) to take
     /// back, and nothing reseeks.
     ///
-    /// Refused unless it can join the timeline -- same codec, same frame rate,
-    /// same audio parameters or both silent; the `Err` names the property that
-    /// disagrees, for a caller to show. Nothing is changed by a refusal. A
-    /// *resolution* of its own is not a refusal: the clip is placed on the
-    /// project canvas by its fit policy ([`PlaybackSession::set_fit`]).
+    /// Refused unless it can join the timeline -- same codec, same audio
+    /// parameters or both silent; the `Err` names the property that disagrees,
+    /// for a caller to show. Nothing is changed by a refusal. A *resolution* of
+    /// its own is not a refusal: the clip is placed on the project canvas by its
+    /// fit policy ([`PlaybackSession::set_fit`]) -- and neither is a *frame
+    /// rate* of its own: the file is placed for the seconds it lasts and read at
+    /// [`Rate`] against the timeline's rate, so it plays at the speed it was
+    /// shot at.
     pub fn import(&mut self, path: &Path) -> crate::Result<usize> {
         if crate::is_audio(path) {
             return self.import_audio(path);
@@ -1372,9 +1624,15 @@ impl PlaybackSession {
         // Stream 0: an import brings a file in on its first audio track, and
         // [`place_stream_at`](Self::place_stream_at) is how any other one of
         // its streams reaches the timeline afterwards.
-        matches_timeline(&Source::new(path, 0), &meta, &self.meta, &first)?;
+        // ...and the rate it will be read at comes back from the check that
+        // accepted it, so the number the refusal was decided on is the number
+        // the file is played by.
+        let rate = matches_timeline(&Source::new(path, 0), &meta, &self.meta, &first)?;
         let source = self.project.import(path, 0);
-        self.note_frames(source, meta.frame_count);
+        // Its length *on this timeline*: a file shot slower than the timeline
+        // runs covers more frames than it holds, which is the whole of what
+        // placing it at another rate means ([`Rate`]).
+        self.note_frames(source, rate.timeline_at(meta.frame_count), rate);
         Ok(source)
     }
 
@@ -1394,7 +1652,7 @@ impl PlaybackSession {
         audio_matches(&Source::new(path, 0), &first)?;
         let frames = audio_frames(path, self.meta.frame_rate)?;
         let source = self.project.import(path, 0);
-        self.note_frames(source, frames);
+        self.note_frames(source, frames, Rate::REAL_TIME);
         Ok(source)
     }
 
@@ -1418,7 +1676,7 @@ impl PlaybackSession {
             .into());
         }
         let source = self.project.import(path, 0);
-        self.note_frames(source, image_frames(self.meta.frame_rate));
+        self.note_frames(source, image_frames(self.meta.frame_rate), Rate::REAL_TIME);
         Ok(source)
     }
 
@@ -1493,6 +1751,21 @@ impl PlaybackSession {
         }
     }
 
+    /// A copy of the most recent mono samples the device was handed, and the
+    /// rate they play at: the signal *after* every clip's equalizer, speed and
+    /// the mix, which is what an analyser drawn behind an EQ curve has to show.
+    /// `None` with no audio output at all, and empty until the feeder has
+    /// written once (right after a seek, for instance).
+    ///
+    /// Never blocks anything that matters: the feeder holds this lock for one
+    /// memcpy and the device's own callback lives in the plugin, on the far
+    /// side of a ring buffer, where it cannot see this at all.
+    pub fn audio_tap(&self) -> Option<(Vec<f32>, u32)> {
+        let audio = self.audio.as_ref()?;
+        let tap = audio.tap.lock().unwrap().clone();
+        Some((tap, audio.sample_rate))
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
@@ -1515,6 +1788,9 @@ impl PlaybackSession {
             // carrying can no longer reach the ring after this point.
             audio.epoch.fetch_add(1, Ordering::Release);
             ao.flush();
+            // The flushed samples are not being played any more, so nothing may
+            // still be drawn from them.
+            audio.tap.lock().unwrap().clear();
         }
 
         // Cancel first, drop second: the old worker may be parked in `send` on
@@ -1562,11 +1838,18 @@ impl PlaybackSession {
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
-            audio_running =
-                match AudioSession::open_mixed_streams_speed(&sources, &segs, &eqs, &speeds) {
-                    Ok(Some((_, rx))) => audio.spawn_feeder(rx),
-                    _ => false,
-                };
+            // ...and the mix settings over the lot: each lane's own volume on
+            // its way into the sum and the master limiter over the sum, both
+            // rebuilt here like the curves above, which is what makes a lane
+            // fader and a ceiling audible while the timeline runs.
+            let gains = self.project.audio_gains();
+            let limiter = self.project.limiter();
+            audio_running = match AudioSession::open_mixed_streams_master(
+                &sources, &segs, &eqs, &speeds, &gains, limiter,
+            ) {
+                Ok(Some((_, rx))) => audio.spawn_feeder(rx),
+                _ => false,
+            };
             if !audio_running {
                 // Nothing will ever be fed again; let `tick` fall to wall time
                 // instead of waiting on a device that has no more work coming.
@@ -1662,15 +1945,16 @@ impl Drop for PlaybackSession {
 
 /// Whether `path`, already demuxed to `meta`, may join a timeline whose
 /// parameters are `timeline` and whose audio probes as `first`: same codec,
-/// same frame rate, same audio parameters or both silent.
+/// same audio parameters or both silent, and a frame rate that can be named
+/// against the timeline's. The [`Rate`] it will be read at comes back with the
+/// answer, so the number the check was decided on is the number it plays by.
 ///
 /// *Not* the same size any more. A project has its own resolution
 /// ([`PlaybackSession::set_resolution`]) and every clip is placed on it by its
 /// own fit policy, so a 640x360 file joining a 1920x1080 timeline is a
-/// letterboxed clip rather than a refusal. The frame rate stays refused on
-/// purpose: mixing rates means resampling the *timeline*, which is a different
-/// problem from resampling a picture, and a refusal is the honest answer until
-/// it is solved.
+/// letterboxed clip rather than a refusal, and so is a frame rate of its own:
+/// the timeline keeps its own rate and the file is read at [`Rate`] against it
+/// ([`PlaybackSession::import`] notes how long it is *here*).
 ///
 /// The `Err` names the property that disagrees, and those strings are what a
 /// front-end shows verbatim; [`PlaybackSession::import`] and
@@ -1681,7 +1965,7 @@ fn matches_timeline(
     meta: &VideoMeta,
     timeline: &VideoMeta,
     first: &Option<crate::AudioProbe>,
-) -> crate::Result<()> {
+) -> crate::Result<Rate> {
     // Codec first: one timeline is one kind of source. Mixing them would decode
     // (every clip opens its own decoder) but on a machine without the VA-API
     // plugin the VP9 half would be black frames with the refusal only on
@@ -1694,15 +1978,20 @@ fn matches_timeline(
         )
         .into());
     }
-    // Container frame rates are computed from timescales, so never `==`.
-    if (meta.frame_rate - timeline.frame_rate).abs() > 0.01 {
-        return Err(format!(
-            "{:.3} fps does not match the timeline's {:.3} fps",
-            meta.frame_rate, timeline.frame_rate
-        )
-        .into());
-    }
-    audio_matches(source, first)
+    // The frame rate is *not* a refusal any more: a file shot at another rate is
+    // placed for the seconds it lasts and read through [`Rate`] at the
+    // decoder's door, so it plays at the speed it was shot at on a timeline
+    // that counts frames faster or slower.
+    //
+    // A rate that cannot be *named* still is, and this is the one place it is
+    // caught: `Rate::from_fps` builds itself out of the muxer's own timescales,
+    // and a file whose rate has none of those (a container that says nothing and
+    // holds one block, so the demuxer measures 0 fps) would otherwise be read
+    // 1:1 in silence -- the old rate gate refused those too, by arithmetic
+    // accident. The `Err` is `mux::frame_timing`'s own words.
+    let rate = Rate::from_fps(meta.frame_rate, timeline.frame_rate)?;
+    audio_matches(source, first)?;
+    Ok(rate)
 }
 
 /// Whether a candidate's audio may join a timeline whose first source probes as
@@ -1729,10 +2018,24 @@ fn matches_timeline(
 /// source 0 has always given. This function widens which source is asked, not
 /// what the answer means.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
-    match sources.iter().find(|s| !crate::is_image(&s.path)) {
+    match audio_source_of(sources) {
         Some(first) => AudioSession::probe(&first.path, first.audio_stream),
         None => Ok(None),
     }
+}
+
+/// *Which* source that is: the first one that is not a still. The single answer
+/// to "what does this timeline's sound come from", so that probing it
+/// ([`first_audio_of`]) and opening the device on it
+/// ([`PlaybackSession::open_project`]) can never disagree -- source 0 is only
+/// the scaffolding file until a save renumbers it or a library removal takes it
+/// away ([`crate::Project::remove_source`]), and a PNG at index 0 opened as the
+/// device is a timeline that plays silent although every clip on it has sound.
+///
+/// `None` for a library of nothing but stills, and for one with no file at all:
+/// both are silent timelines.
+fn audio_source_of(sources: &[Source]) -> Option<&Source> {
+    sources.iter().find(|s| !crate::is_image(&s.path))
 }
 
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
@@ -1832,6 +2135,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         fed_all: Arc::new(AtomicBool::new(false)),
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
+        tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
 }
@@ -1866,6 +2170,7 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             }
         };
         audio.fed.fetch_add(accepted as u64, Ordering::Relaxed);
+        audio.note_tap(&pending[..accepted]);
         pending.drain(..accepted);
         if !pending.is_empty() {
             // Ring full: nothing to do but let the device drain it.
@@ -1885,13 +2190,34 @@ fn secs_to_frame(secs: f64, fps: f64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Lane, PlaybackSession, secs_to_frame};
+    use super::{Edge, Lane, PlaybackSession, Source, audio_source_of, secs_to_frame};
     use std::path::PathBuf;
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// Which source the timeline's sound is opened on -- the one rule
+    /// [`open_project`](PlaybackSession::open_project), the probe every import
+    /// is held to and the audio worker all read through. A still at index 0 is
+    /// a picture, not a silent timeline: opening the device on it is a project
+    /// that plays silent although every clip on it has sound.
+    #[test]
+    fn the_audio_reference_is_never_a_still() {
+        let (video, still) = (asset("test_av.mp4"), asset("test_still.png"));
+        let sources = [Source::new(&still, 0), Source::new(&video, 3)];
+        assert_eq!(
+            audio_source_of(&sources).map(|s| (&s.path, s.audio_stream)),
+            Some((&sources[1].path, 3)),
+            "the first source that could have a track, with its own stream"
+        );
+        assert!(
+            audio_source_of(&sources[..1]).is_none(),
+            "nothing but stills"
+        );
+        assert!(audio_source_of(&[]).is_none(), "and no file at all");
     }
 
     /// The seam between the two lists a source index reaches: dropping a file
