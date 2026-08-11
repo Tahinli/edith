@@ -289,6 +289,11 @@ impl Rate {
         // fps is scale/ticks, so the ratio is (src_scale/src_ticks) / (tl_scale/tl_ticks).
         let num = u64::from(src_scale) * u64::from(tl_ticks);
         let den = u64::from(src_ticks) * u64::from(tl_scale);
+        Ok(Self::reduced(num, den))
+    }
+
+    /// `num` frames of a file per `den` frames of a timeline, in lowest terms.
+    fn reduced(num: u64, den: u64) -> Self {
         let g = gcd(num, den);
         let (mut num, mut den) = (num / g, den / g);
         // A ratio no pair of real frame rates produces, but the fields are `u32`
@@ -296,10 +301,22 @@ impl Rate {
         while num > u64::from(u32::MAX) || den > u64::from(u32::MAX) {
             (num, den) = (num.div_ceil(2), den.div_ceil(2));
         }
-        Ok(Self {
+        Self {
             source: num.max(1) as u32,
             timeline: den.max(1) as u32,
-        })
+        }
+    }
+
+    /// The same file against a timeline that has itself been retimed: `self` is
+    /// its frames per frame of the old timeline and `k` is old frames per new
+    /// one, so this is its frames per frame of the *new* one -- exactly, without
+    /// going back through an `f64` fps that names neither rate
+    /// ([`crate::PlaybackSession::set_frame_rate`]).
+    pub fn then(self, k: Rate) -> Self {
+        Self::reduced(
+            u64::from(self.source) * u64::from(k.source),
+            u64::from(self.timeline) * u64::from(k.timeline),
+        )
     }
 
     pub fn is_real_time(self) -> bool {
@@ -1421,6 +1438,52 @@ impl Project {
         self.snapshot();
         self.lane_mut(lane).expect("checked above")[idx].fit = fit;
         true
+    }
+
+    /// Every frame number on every lane rewritten onto a timeline counted at
+    /// another rate: `k` is old timeline frames per new one, `counts` is how
+    /// long each source is on the *new* timeline (indexed as
+    /// [`Project::sources`] is), and the edit survives as the same seconds of
+    /// the same footage. What [`crate::PlaybackSession::set_frame_rate`] does to
+    /// the edit list, and the only thing that touches the frame numbers without
+    /// being an edit anyone made.
+    ///
+    /// Every position -- a clip's start and its end alike -- goes through the
+    /// one map [`Rate::timeline_at`], so two clips that met still meet, a gap
+    /// stays a gap, and a take's picture and its sound land on the same frame on
+    /// their two lanes: no lane can drift against another. A clip is then only
+    /// ever made to *fit* the room its own start and end mapped to, never to
+    /// outgrow it, which is what keeps the lane sorted and disjoint (the cursor
+    /// below is the backstop for the one case that could: a slow clip so short
+    /// that no source range fits its new room at all).
+    ///
+    /// ponytail: not exact both ways. Each rate change re-rounds every boundary
+    /// onto the new grid, so a rate picked, unpicked and picked again is within
+    /// a frame of where it started rather than back at it. Upgrade path is
+    /// keeping the edit list at one reference rate and conforming on the way
+    /// out, which every frame number in this module would then be measured in.
+    pub fn retime(&mut self, k: Rate, counts: &[u32]) {
+        for lane in &mut self.lanes {
+            let mut cursor = 0;
+            for clip in &mut lane.clips {
+                let start = k.timeline_at(clip.start).max(cursor);
+                // The room its own end mapped to -- never zero, since a clip is
+                // never empty even on a grid too coarse to hold it.
+                let room = k.timeline_at(clip.end()).saturating_sub(start).max(1);
+                let count = counts.get(clip.source).copied().unwrap_or(u32::MAX).max(1);
+                // Its footage, held inside the file's new length: a clip whose
+                // out-point was the last frame of its source must not come out
+                // of this naming a frame past the end -- that is a project that
+                // would not open again ([`crate::PlaybackSession::open_project`]
+                // refuses one by name).
+                let in_frame = k.timeline_at(clip.in_frame).min(count - 1);
+                let len = clip.speed.fit(room).unwrap_or(1).clamp(1, count - in_frame);
+                clip.start = start;
+                clip.in_frame = in_frame;
+                clip.out_frame = in_frame + len;
+                cursor = clip.end();
+            }
+        }
     }
 
     /// Length of the timeline in frames: where the *last* lane runs out. A lane
