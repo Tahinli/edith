@@ -2374,7 +2374,7 @@ impl PlaybackSession {
         out: &Path,
         settings: &crate::export::ExportSettings,
     ) -> crate::ExportHandle {
-        crate::export::start(self.project.clone(), self.meta, out, settings)
+        crate::export::start(self.project.export_snapshot(), self.meta, out, settings)
     }
 
     /// Moves the clock forward; the caller runs this once per rendered frame.
