@@ -618,6 +618,13 @@ pub type Parts = (
     Vec<ColorParams>,
 );
 
+/// How many undo steps a project keeps. One gesture is one step, so 100 is past
+/// any chain a person walks back by hand, and the oldest step is dropped rather
+/// than the history growing without end: a snapshot is the whole lane list, so
+/// on a 1394-clip jumpcut timeline this is a bounded ~10 MB instead of a leak
+/// that grows for as long as the session lasts.
+const HISTORY_CAP: usize = 100;
+
 /// The edit list plus its undo history.
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -631,7 +638,8 @@ pub struct Project {
     /// The same, for [`Clip::color`].
     color: Vec<ColorParams>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one. The
-    /// whole lane list, so adding a lane undoes as well.
+    /// whole lane list, so adding a lane undoes as well. Bounded by
+    /// [`HISTORY_CAP`]: at the cap the oldest step goes.
     history: Vec<Vec<LaneData>>,
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
@@ -2693,6 +2701,24 @@ impl Project {
         }
     }
 
+    /// The project an export renders from: everything a render reads, with the
+    /// undo history left behind. An export never walks the history back, and
+    /// cloning it costs a copy of every lane list in the session -- this is
+    /// taken on the UI thread, so it clones the lanes and the sources alone.
+    pub fn export_snapshot(&self) -> Self {
+        Self {
+            sources: self.sources.clone(),
+            lanes: self.lanes.clone(),
+            eq: self.eq.clone(),
+            color: self.color.clone(),
+            history: Vec::new(),
+            next_link: self.next_link,
+            subtitles: self.subtitles.clone(),
+            limiter: self.limiter,
+            tone: self.tone,
+        }
+    }
+
     /// Half-open `(source, start, end)` segments in *source* seconds, from
     /// `timeline_frame` to the end of the timeline -- the play list for the
     /// audio worker, read off **`A1`**. A `None` source is a gap: the
@@ -2861,6 +2887,9 @@ impl Project {
     /// Pushes the undo snapshot. Every mutating method calls this once, *after*
     /// it has decided it will succeed -- a refusal must not cost an undo step.
     fn snapshot(&mut self) {
+        if self.history.len() == HISTORY_CAP {
+            self.history.remove(0);
+        }
         self.history.push(self.lanes.clone());
     }
 
@@ -4213,6 +4242,24 @@ mod tests {
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 9, 0)]);
         assert!(!p.undo(), "empty history");
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 9, 0)]);
+    }
+
+    /// Past the cap the *oldest* step goes, so a long session undoes exactly
+    /// `HISTORY_CAP` gestures and then runs dry -- it does not grow for ever.
+    #[test]
+    fn history_stops_at_the_cap() {
+        let mut p = Project::single(FILE, 400);
+        for frame in 1..=150 {
+            assert!(p.split(frame), "split {frame} is an edit");
+        }
+        assert_eq!(p.history.len(), HISTORY_CAP, "and only the last 100 kept");
+        for step in 0..HISTORY_CAP {
+            assert!(p.undo(), "undo {step} is inside the cap");
+        }
+        assert!(!p.undo(), "and the 101st has nothing left to take");
+        // 100 undos off 150 splits is the timeline after the 50th: the older
+        // steps were dropped, not the newer ones.
+        assert_eq!(p.clips().len(), 51);
     }
 
     /// Undo/redo by hand across a split must never merge two takes into one
