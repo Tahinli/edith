@@ -512,10 +512,35 @@ impl MkvDemuxer {
 /// by symphonia, or by the Dolby decoder where it is AC-3 ([`MkvAudio`]), and
 /// this exists to say which codec neither of them took.
 pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
+    Ok(matroska_audio_tracks(path)?.into_iter().next().map(|t| t.codec))
+}
+
+/// One audio `TrackEntry` of a Matroska file, as the header describes it.
+pub struct MkvAudioTrack {
+    /// `TrackNumber`: what this track's blocks are stamped with ([`MkvAudio`]),
+    /// and the id symphonia keeps for the same track. *Not* a position -- a
+    /// file's first audio track is number 2 as often as not.
+    pub number: u64,
+    /// The Matroska codec id: `A_AAC`, `A_EAC3`, `A_DTS`, ...
+    pub codec: String,
+    /// `TrackLanguage`, `"und"` for an entry that declares none (the spec's own
+    /// default), which is what a muxer writes when nobody said.
+    pub language: String,
+    /// `TrackName` -- "Japanese 5.1", "Commentary" -- empty when there is none.
+    pub name: String,
+    /// What this track's blocks have to be put back through.
+    unpack: Unpack,
+}
+
+/// Every audio track of a Matroska file, in file order: the numbering
+/// [`crate::AudioSession::probe_streams`] hands out, and the one a dual-audio
+/// remux is picked from. Header only, like [`matroska_audio_codec`], and an
+/// empty list is a file with no sound at all rather than an error.
+pub fn matroska_audio_tracks(path: &Path) -> crate::Result<Vec<MkvAudioTrack>> {
     let mut file = File::open(path)?;
     let end = file.metadata()?.len();
     let segment = mkv_segment(&mut file, end)?;
-    Ok(mkv_tracks(&mut file, segment)?.1.map(|(_, codec, _)| codec))
+    Ok(mkv_tracks(&mut file, segment)?.1)
 }
 
 /// The AC-3 / E-AC-3 sound of a Matroska file: every block of its first audio
@@ -543,12 +568,36 @@ impl MkvAudio {
     /// is in a codec nothing here decodes -- that file is the silent source it
     /// has always been, and [`crate::audio::AudioSession::unsupported`] names
     /// the codec. An `Err` is a track that *is* AC-3 and could not be read.
+    ///
+    /// The file's *first* audio track, which is the one this has always read.
     pub fn open(path: &Path) -> crate::Result<Option<Self>> {
+        Self::open_inner(path, None)
+    }
+
+    /// The audio track stamped `number` ([`MkvAudioTrack::number`], not a
+    /// position), for a file carrying more than one -- a dual-audio remux, where
+    /// which track is heard is the user's pick and not the muxer's order.
+    /// `Ok(None)` for a number this file does not have, or one whose codec is
+    /// not AC-3, exactly as [`open`](Self::open) answers for the first track.
+    pub fn open_track(path: &Path, number: u64) -> crate::Result<Option<Self>> {
+        Self::open_inner(path, Some(number))
+    }
+
+    fn open_inner(path: &Path, number: Option<u64>) -> crate::Result<Option<Self>> {
         let mut file = File::open(path)?;
         let end = file.metadata()?.len();
         let segment = mkv_segment(&mut file, end)?;
         let (_, audio, _, timestamp_scale) = mkv_tracks(&mut file, segment)?;
-        let Some((number, codec, unpack)) = audio else {
+        let Some(MkvAudioTrack {
+            number,
+            codec,
+            unpack,
+            ..
+        }) = (match number {
+            Some(number) => audio.into_iter().find(|t| t.number == number),
+            None => audio.into_iter().next(),
+        })
+        else {
             return Ok(None);
         };
         let codec = match codec.as_str() {
@@ -752,6 +801,8 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+const TRACK_LANGUAGE: u32 = 0x22B59C;
+const TRACK_NAME: u32 = 0x536E;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
 const CONTENT_ENCODING: u32 = 0x6240;
 const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
@@ -778,25 +829,21 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
     Err("no Segment element: not a Matroska file".into())
 }
 
-/// The video track of `segment`, the number and codec id of its first audio
-/// track, the codec id of a video track this cannot read, and the segment's
-/// `TimestampScale` in nanoseconds. The audio pair is what [`MkvAudio`] reads a
-/// sound track from; it and the other codec id are what tell a user why a file
-/// plays silent ([`crate::audio::AudioSession::unsupported`]) or refuses to
-/// open at all.
+/// The video track of `segment`, **every** audio track in file order, the codec
+/// id of a video track this cannot read, and the segment's `TimestampScale` in
+/// nanoseconds. The audio list is what [`MkvAudio`] reads a sound track from and
+/// what [`matroska_audio_tracks`] hands a stream picker; it and the other codec
+/// id are what tell a user why a file plays silent
+/// ([`crate::audio::AudioSession::unsupported`]) or refuses to open at all.
 ///
 /// Header only: the walk stops at the first `Cluster`, so this costs a handful
 /// of seeks whatever the file weighs.
 fn mkv_tracks(
     file: &mut File,
     segment: (u64, u64),
-) -> crate::Result<(
-    Option<MkvVideo>,
-    Option<(u64, String, Unpack)>,
-    Option<String>,
-    u64,
-)> {
-    let (mut video, mut audio, mut other) = (None, None, None);
+) -> crate::Result<(Option<MkvVideo>, Vec<MkvAudioTrack>, Option<String>, u64)> {
+    let (mut video, mut other) = (None, None);
+    let mut audio = Vec::new();
     let mut timestamp_scale = 1_000_000;
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
@@ -818,9 +865,11 @@ fn mkv_tracks(
                         match mkv_track_entry(file, e.1, e.2, timestamp_scale)? {
                             MkvEntry::Video(track) if video.is_none() => video = Some(track),
                             MkvEntry::OtherVideo(codec) if other.is_none() => other = Some(codec),
-                            MkvEntry::Audio(number, codec, unpack) if audio.is_none() => {
-                                audio = Some((number, codec, unpack))
-                            }
+                            // Every one of them, in the order the `Tracks`
+                            // element lists them: that order *is* the stream
+                            // numbering everything above hands out, so a
+                            // careless filter here plays the wrong language.
+                            MkvEntry::Audio(track) => audio.push(track),
                             _ => {}
                         }
                     }
@@ -839,10 +888,7 @@ enum MkvEntry {
     Video(MkvVideo),
     /// A video track in a codec this does not read, by the name it gives itself.
     OtherVideo(String),
-    /// An audio track: its track number, which is what [`MkvAudio`] indexes the
-    /// blocks of, its codec id (`A_AAC`, `A_EAC3`, ...), and what its blocks
-    /// have to be put back through.
-    Audio(u64, String, Unpack),
+    Audio(MkvAudioTrack),
     /// Subtitles, buttons: nobody's here.
     Other,
 }
@@ -856,6 +902,7 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
+    let (mut language, mut name) = (String::new(), String::new());
     let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
@@ -863,6 +910,8 @@ fn mkv_track_entry(
             TRACK_NUMBER => number = ebml_uint(file, body, stop)?,
             CONTENT_ENCODINGS => unpack = mkv_content_encoding(file, body, stop)?,
             TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
+            TRACK_LANGUAGE => language = string_of(file, body, stop)?,
+            TRACK_NAME => name = string_of(file, body, stop)?,
             DEFAULT_DURATION => {
                 default_duration = Some(ebml_uint(file, body, stop)?).filter(|d| *d > 0)
             }
@@ -906,7 +955,21 @@ fn mkv_track_entry(
             (Codec::H264, nal_length, sets, 8)
         }
         (1, _) => return Ok(MkvEntry::OtherVideo(codec)),
-        (2, _) => return Ok(MkvEntry::Audio(number, codec, unpack)),
+        (2, _) => {
+            return Ok(MkvEntry::Audio(MkvAudioTrack {
+                number,
+                codec,
+                // What a `TrackEntry` without a `Language` element means, by
+                // spec -- the same default the subtitle walk applies.
+                language: if language.is_empty() {
+                    "und".into()
+                } else {
+                    language
+                },
+                name,
+                unpack,
+            }));
+        }
         _ => return Ok(MkvEntry::Other),
     };
     Ok(MkvEntry::Video(MkvVideo {
@@ -1667,8 +1730,6 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
 
 /// One `TrackEntry`, `Some` only for track type 0x11 -- the subtitles.
 fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Option<MkvSubtitle>> {
-    const TRACK_LANGUAGE: u32 = 0x22B59C;
-    const TRACK_NAME: u32 = 0x536E;
     const SUBTITLE: u64 = 0x11;
     let (mut number, mut kind, mut codec) = (0, 0, String::new());
     let (mut language, mut name, mut private) = (String::new(), String::new(), Vec::new());

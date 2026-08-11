@@ -712,40 +712,55 @@ impl AudioSession {
     /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
-        // A Matroska file has exactly one readable audio stream here -- the
-        // reader's default track ([`SymTrack::open`]), or the AC-3 / E-AC-3 one
-        // symphonia has no decoder for ([`MkvAc3Track`]) -- so it lists like a
-        // standalone audio file rather than like an mp4, and one with no
-        // readable track at all lists as the silent source it is.
+        // A Matroska file lists one row per `TrackEntry` of audio, in the order
+        // its `Tracks` element gives them -- a dual-audio remux has two, and the
+        // second one used to be invisible. A file whose header will not walk at
+        // all is an `Err` here, as it is in [`Track::open`]: a listing that
+        // quietly came back empty for a broken file is how a lane ends up silent
+        // with nothing to go on. No audio track at all is an empty list, which
+        // is the silent source it says it is.
         if crate::demux::is_matroska(path) {
-            // The AC-3 row describes what the decoder *emits*, which is the
-            // stereo the §7.8 downmix hands the timeline, not the 5.1 the file
-            // carries -- exactly as the mp4 AC-3 rows do.
-            if let Ok(Some(track)) = MkvAc3Track::open(path) {
-                return Ok(vec![StreamInfo {
-                    index: 0,
-                    codec: if track.mkv.codec == "eac3" { "e-ac-3" } else { "ac-3" }.into(),
-                    channels: track.channels,
-                    sample_rate: track.sample_rate,
-                    lang: None,
-                    decodable: matches!(track.channels, 1 | 2),
-                }]);
+            let mut streams = Vec::new();
+            for (index, entry) in crate::demux::matroska_audio_tracks(path)?
+                .iter()
+                .enumerate()
+            {
+                // The routing [`Track::open`] does, one row at a time, so a row
+                // describes the track that would really open: AC-3 and E-AC-3
+                // through the Dolby decoder's own reader, everything else
+                // through symphonia. The AC-3 row describes what the decoder
+                // *emits*, which is the stereo the §7.8 downmix hands the
+                // timeline, not the 5.1 the file carries -- exactly as the mp4
+                // AC-3 rows do.
+                let ac3 = matches!(entry.codec.as_str(), "A_AC3" | "A_EAC3")
+                    .then(|| MkvAc3Track::open_track(path, entry.number).ok().flatten())
+                    .flatten();
+                // A track symphonia cannot even describe is listed undecodable
+                // by the name the container gives it, rather than taking the
+                // whole listing down with it: the other language still plays.
+                let sym = match &ac3 {
+                    Some(_) => None,
+                    None => SymTrack::open_track(path, entry.number).ok().flatten(),
+                };
+                let channels = ac3.as_ref().map_or_else(
+                    || sym.as_ref().map_or(0, |t| t.channels),
+                    |t| t.channels,
+                );
+                streams.push(StreamInfo {
+                    index,
+                    codec: mkv_codec_name(&entry.codec),
+                    channels,
+                    sample_rate: ac3.as_ref().map_or_else(
+                        || sym.as_ref().map_or(0, |t| t.sample_rate),
+                        |t| t.sample_rate,
+                    ),
+                    lang: (entry.language != "und" && !entry.language.is_empty())
+                        .then(|| entry.language.clone()),
+                    decodable: matches!(channels, 1 | 2)
+                        && (ac3.is_some() || sym.is_some_and(|t| t.decoder().is_ok())),
+                });
             }
-            // No audio track lists as the silent source it is; a track that
-            // will not open at all is an `Err` here, as it is in
-            // [`Track::open`] -- a listing that quietly came back empty for a
-            // broken file is how a lane ends up silent with nothing to go on.
-            let Some(track) = SymTrack::open(path)? else {
-                return Ok(Vec::new());
-            };
-            return Ok(vec![StreamInfo {
-                index: 0,
-                codec: track.codec.into(),
-                channels: track.channels,
-                sample_rate: track.sample_rate,
-                lang: None,
-                decodable: matches!(track.channels, 1 | 2) && track.decoder().is_ok(),
-            }]);
+            return Ok(streams);
         }
         if crate::is_audio(path) {
             let track = SymTrack::open_required(path)?;
@@ -1123,10 +1138,26 @@ impl Track {
         // failing the import of a file whose picture is fine. A track that will
         // not open at all is *not* in that group: see below.
         if crate::demux::is_matroska(path) {
-            if stream > 0 {
-                return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
+            // File order, the one `probe_streams` lists and a project saves:
+            // the stream index picks a `TrackEntry`, that entry's *track
+            // number* is what both readers are then pointed at. Positions are
+            // never handed to a reader -- symphonia's own order is its business
+            // -- because a mapping that drifts plays the wrong language and
+            // saves it into the project.
+            let tracks = crate::demux::matroska_audio_tracks(path)?;
+            if tracks.is_empty() {
+                return Ok(None);
             }
-            match MkvAc3Track::open(path) {
+            let Some(entry) = tracks.get(stream) else {
+                return Err(format!(
+                    "{}: audio stream {stream} of {} stream{}",
+                    path.display(),
+                    tracks.len(),
+                    if tracks.len() == 1 { "" } else { "s" }
+                )
+                .into());
+            };
+            match MkvAc3Track::open_track(path, entry.number) {
                 Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
                 Ok(None) => {}
                 // Named on the way past rather than returned: symphonia gets the
@@ -1142,7 +1173,7 @@ impl Track {
             // same answer the mp4 arm gives: turned into silence it would play
             // and export as a hole with only an eprintln to say why, which is a
             // bug wearing a feature's clothes.
-            let Some(track) = SymTrack::open(path)? else {
+            let Some(track) = SymTrack::open_track(path, entry.number)? else {
                 return Ok(None);
             };
             if let Err(e) = track.decoder() {
@@ -1311,6 +1342,22 @@ impl SymTrack {
     /// difference matters because silence is played and exported without a word
     /// while an `Err` is shown ([`Track::open`]).
     fn open(path: &Path) -> crate::Result<Option<Self>> {
+        Self::open_inner(path, None)
+    }
+
+    /// [`open`](Self::open) pointed at one **named** track: a Matroska
+    /// `TrackNumber`, which symphonia keeps as the track's id
+    /// (`symphonia-format-mkv` `demuxer.rs:301`). That is what makes the second
+    /// language of a dual-audio file reachable, and it is matched by number
+    /// rather than by position so this reader and
+    /// [`crate::demux::matroska_audio_tracks`] cannot disagree about which
+    /// track a stream index meant. `Ok(None)` for a number the reader does not
+    /// carry.
+    fn open_track(path: &Path, number: u64) -> crate::Result<Option<Self>> {
+        Self::open_inner(path, Some(number))
+    }
+
+    fn open_inner(path: &Path, number: Option<u64>) -> crate::Result<Option<Self>> {
         let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
         // The extension is a hint, not a decision: the probe reads the magic and
         // is free to disagree, which is what makes a mislabelled file work.
@@ -1324,7 +1371,14 @@ impl SymTrack {
             FormatOptions::default(),
             MetadataOptions::default(),
         )?;
-        let Some(track) = reader.default_track(SymKind::Audio) else {
+        let track = match number {
+            Some(number) => reader
+                .tracks()
+                .iter()
+                .find(|t| u64::from(t.id) == number),
+            None => reader.default_track(SymKind::Audio),
+        };
+        let Some(track) = track else {
             return Ok(None);
         };
         // `track.delay` is deliberately not read: see the `priming` field.
@@ -1611,7 +1665,19 @@ impl MkvAc3Track {
     /// that is one and could not be read, which
     /// [`AudioSession::unsupported`] quotes back to the user.
     fn open(path: &Path) -> crate::Result<Option<Self>> {
-        let Some(mut mkv) = crate::demux::MkvAudio::open(path)? else {
+        Self::from_blocks(crate::demux::MkvAudio::open(path)?)
+    }
+
+    /// [`open`](Self::open) on one **named** track ([`MkvAudioTrack::number`]),
+    /// which is how the AC-3 half of a dual-audio file is reached.
+    ///
+    /// [`MkvAudioTrack::number`]: crate::demux::MkvAudioTrack::number
+    fn open_track(path: &Path, number: u64) -> crate::Result<Option<Self>> {
+        Self::from_blocks(crate::demux::MkvAudio::open_track(path, number)?)
+    }
+
+    fn from_blocks(mkv: Option<crate::demux::MkvAudio>) -> crate::Result<Option<Self>> {
+        let Some(mut mkv) = mkv else {
             return Ok(None);
         };
         let first = mkv
@@ -1887,6 +1953,22 @@ fn packet_run(err: &mut i64, ideal: i64, available: u32) -> u32 {
     let n = (want.round().max(0.0) as i64).min(i64::from(available)) as u32;
     *err += i64::from(n) * packet - ideal;
     n
+}
+
+/// The name a Matroska audio row wears: the container's own codec id, cut down
+/// to what a picker shows — `A_AAC` is `aac`, `A_EAC3` is `e-ac-3`.
+///
+/// The codec id rather than symphonia's short name, because the rows that most
+/// need naming are exactly the ones it has no decoder for: an Opus or DTS track
+/// is greyed out with the codec in the reason (`unusable` in the app reads this
+/// very string), where symphonia would call it "an unsupported format".
+fn mkv_codec_name(id: &str) -> String {
+    match id {
+        "A_AC3" => "ac-3".into(),
+        "A_EAC3" => "e-ac-3".into(),
+        "A_MPEG/L3" => "mp3".into(),
+        _ => id.strip_prefix("A_").unwrap_or(id).to_ascii_lowercase(),
+    }
 }
 
 /// This file's audio tracks in file order — the order a stream index counts in.
