@@ -1355,9 +1355,9 @@ impl PlaybackSession {
     /// nothing playable, so there is nothing for [`undo`](Self::undo) to take
     /// back, and nothing reseeks.
     ///
-    /// Refused unless it can join the timeline -- same codec, same frame rate,
-    /// same audio parameters or both silent; the `Err` names the property that
-    /// disagrees, for a caller to show. Nothing is changed by a refusal. A
+    /// Refused unless it can join the timeline -- same frame rate, a decoder
+    /// this machine can open, and audio parameters that agree or none at all;
+    /// the `Err` names the property that disagrees, for a caller to show. Nothing is changed by a refusal. A
     /// *resolution* of its own is not a refusal: the clip is placed on the
     /// project canvas by its fit policy ([`PlaybackSession::set_fit`]).
     pub fn import(&mut self, path: &Path) -> crate::Result<usize> {
@@ -1661,16 +1661,18 @@ impl Drop for PlaybackSession {
 }
 
 /// Whether `path`, already demuxed to `meta`, may join a timeline whose
-/// parameters are `timeline` and whose audio probes as `first`: same codec,
-/// same frame rate, same audio parameters or both silent.
+/// parameters are `timeline` and whose audio probes as `first`: same frame
+/// rate, a decoder this machine can open, and audio parameters that agree (or
+/// no audio at all).
 ///
-/// *Not* the same size any more. A project has its own resolution
-/// ([`PlaybackSession::set_resolution`]) and every clip is placed on it by its
-/// own fit policy, so a 640x360 file joining a 1920x1080 timeline is a
-/// letterboxed clip rather than a refusal. The frame rate stays refused on
-/// purpose: mixing rates means resampling the *timeline*, which is a different
-/// problem from resampling a picture, and a refusal is the honest answer until
-/// it is solved.
+/// *Not* the same size, and no longer the same codec either. A project has its
+/// own resolution ([`PlaybackSession::set_resolution`]) and every clip is
+/// placed on it by its own fit policy, so a 640x360 file joining a 1920x1080
+/// timeline is a letterboxed clip rather than a refusal; and every clip opens
+/// its own decoder, so a mixed-codec timeline is a decoder each rather than a
+/// refusal. The frame rate stays refused on purpose: mixing rates means
+/// resampling the *timeline*, which is a different problem from resampling a
+/// picture, and a refusal is the honest answer until it is solved.
 ///
 /// The `Err` names the property that disagrees, and those strings are what a
 /// front-end shows verbatim; [`PlaybackSession::import`] and
@@ -1682,18 +1684,6 @@ fn matches_timeline(
     timeline: &VideoMeta,
     first: &Option<crate::AudioProbe>,
 ) -> crate::Result<()> {
-    // Codec first: one timeline is one kind of source. Mixing them would decode
-    // (every clip opens its own decoder) but on a machine without the VA-API
-    // plugin the VP9 half would be black frames with the refusal only on
-    // stderr, which is exactly what a front-end cannot show.
-    if meta.codec != timeline.codec {
-        return Err(format!(
-            "{} does not match the timeline's {}",
-            meta.codec.name(),
-            timeline.codec.name()
-        )
-        .into());
-    }
     // Container frame rates are computed from timescales, so never `==`.
     if (meta.frame_rate - timeline.frame_rate).abs() > 0.01 {
         return Err(format!(
@@ -1702,12 +1692,29 @@ fn matches_timeline(
         )
         .into());
     }
+    // The codec itself is *not* held to the timeline's any more -- every clip
+    // opens its own decoder, so an H.264 take and an HEVC one play on one
+    // timeline. What the codec gate was really protecting against stays, in the
+    // one place that can actually answer it: on a machine without the VA-API
+    // plugin an HEVC or VP9 clip would be black frames with the refusal on
+    // stderr alone, so the file is asked for a decoder *here*, at the door,
+    // where the `Err` is still something a front-end can show. A zero-length
+    // range probes and starts no worker, and H.264 costs nothing at all --
+    // [`DecodeSession::open_worker`] only enters VA-API off that path.
+    DecodeSession::open_worker(
+        &source.path,
+        0,
+        0,
+        ColorParams::default(),
+        Composer::passthrough(),
+    )?;
     audio_matches(source, first)
 }
 
 /// Whether a candidate's audio may join a timeline whose first source probes as
-/// `first`: same rate, same layout, or both silent. One output device and one
-/// exported track is all there is, and no resampler.
+/// `first`: same rate, same layout -- or no audio of its own at all, which is
+/// silence over the clip's span and agrees with everything. One output device
+/// and one exported track is all there is, and no resampler.
 ///
 /// The audio half of [`matches_timeline`], which a stream placed on its own
 /// ([`PlaybackSession::place_stream_at`]) has to pass while the picture it
@@ -1725,9 +1732,9 @@ fn matches_timeline(
 /// `Ok(None)` for a timeline whose first such source is silent, and for one of
 /// nothing but stills. That is a silent timeline, and a file with sound is
 /// still refused by [`audio_matches`] in the words it always used ("the file
-/// has audio, the timeline is silent") -- the same answer a silent *video* as
-/// source 0 has always given. This function widens which source is asked, not
-/// what the answer means.
+/// has audio, the timeline is silent") -- the device was opened on source 0's
+/// track and there is none to open. This function widens which source is asked,
+/// not what the answer means.
 fn first_audio_of(sources: &[Source]) -> crate::Result<Option<crate::AudioProbe>> {
     match sources.iter().find(|s| !crate::is_image(&s.path)) {
         Some(first) => AudioSession::probe(&first.path, first.audio_stream),
@@ -1742,12 +1749,19 @@ fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::R
     if probe == *first {
         return Ok(());
     }
-    Err(match (probe, first) {
-        (None, _) => "the file is silent, the timeline has audio".to_string(),
-        (_, None) => "the file has audio, the timeline is silent".to_string(),
-        (Some(a), Some(b)) => format!(
+    // ...and a *silent* file joins whatever the timeline is: it contributes
+    // silence over its span, which is the very thing both audio paths already
+    // synthesise for a gap ([`AudioSession::open_multi_streams_speed`] plays
+    // it, `AudioSession::copy_multi_streams` writes it). There is no rate and
+    // no layout to disagree about, so there is nothing left to refuse.
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    Err(match first {
+        None => "the file has audio, the timeline is silent".to_string(),
+        Some(b) => format!(
             "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
-            a.sample_rate, a.channels, b.sample_rate, b.channels
+            probe.sample_rate, probe.channels, b.sample_rate, b.channels
         ),
     }
     .into())
