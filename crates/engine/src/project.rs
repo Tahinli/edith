@@ -68,6 +68,7 @@ use crate::color::ColorParams;
 use crate::eq::EqParams;
 use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
+use crate::subtitle::SubtitleTrack;
 
 /// How far down a lane's own volume goes ([`Project::set_lane_gain_db`]).
 /// -60 dB is a thousandth of the amplitude -- a track that is out of the mix
@@ -618,6 +619,12 @@ pub struct Project {
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
     next_link: u32,
+    /// The subtitle tracks this timeline shows, in the order they were added.
+    /// Not in the lane list and not in the history snapshots, for the reason
+    /// the limiter is not: which subtitles a project carries is a setting on
+    /// it, and it is saved as a *reference* to the file the cues came out of
+    /// ([`crate::subtitle`]).
+    subtitles: Vec<SubtitleTrack>,
     /// The master limiter every lane's sound is summed *through*
     /// ([`Project::limiter`]). Off by default, and not in the lane list, which
     /// is what the history snapshots hold: it is a setting on the mix, like the
@@ -652,6 +659,7 @@ impl Project {
             color: Vec::new(),
             history: Vec::new(),
             next_link: 1,
+            subtitles: Vec::new(),
             limiter: Limiter::default(),
         }
     }
@@ -760,6 +768,7 @@ impl Project {
             color,
             history: Vec::new(),
             next_link,
+            subtitles: Vec::new(),
             limiter: Limiter::default(),
         })
     }
@@ -1126,6 +1135,35 @@ impl Project {
         }
         self.limiter = limiter.with_ceiling(limiter.ceiling_db);
         self
+    }
+
+    /// The subtitle tracks a *load* puts back, in the order they were saved --
+    /// the same door [`with_mix`](Project::with_mix) is, and no undo step for
+    /// the same reason.
+    pub fn with_subtitles(mut self, tracks: Vec<SubtitleTrack>) -> Self {
+        self.subtitles = tracks;
+        self
+    }
+
+    /// What this timeline shows over the picture, in the order they were added:
+    /// what a front-end lists and what a save writes.
+    pub fn subtitles(&self) -> &[SubtitleTrack] {
+        &self.subtitles
+    }
+
+    /// Adds a track, unless the very same one -- same file, same track number
+    /// inside it -- is already on the list. `false` for that repeat: importing
+    /// the same `.srt` twice is one subtitle track, not two identical ones.
+    pub fn add_subtitles(&mut self, track: &SubtitleTrack) -> bool {
+        if self
+            .subtitles
+            .iter()
+            .any(|t| t.path == track.path && t.track == track.track)
+        {
+            return false;
+        }
+        self.subtitles.push(track.clone());
+        true
     }
 
     /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
