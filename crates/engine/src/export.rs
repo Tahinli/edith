@@ -1015,7 +1015,10 @@ fn run(
         //
         // ponytail: an HDR source is composited with the matrix treatment alone
         // and still looks washed out; the tonemap lands here, ahead of this, and
-        // is a sibling task's.
+        // is a sibling task's. Until it does, the sentence above holds for SDR
+        // only: playback now maps an HDR clip to SDR *before* grading it
+        // (`decode::Render::frame`), so an exported HDR grade is not the picture
+        // the canvas showed either.
         let remap = color
             .map(|c| c.matrix)
             .filter(|&m| m != out_color.matrix)

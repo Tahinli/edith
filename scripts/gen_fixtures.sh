@@ -250,6 +250,22 @@ ffmpeg -y -f lavfi -i testsrc2=size=640x480:rate=30:duration=1 \
     -c:v libsvtav1 -preset 8 -pix_fmt yuv420p \
     -svtav1-params color-primaries=1:transfer-characteristics=1:matrix-coefficients=1 \
     assets/test_vui_av1.mp4
+# The HDR fixture, and the one place in this set where the *picture* is the
+# point: four flat patches written straight into the planes by `geq`, so a test
+# can name the code it feeds the tone map (`engine::tonemap`) and the code it
+# expects back. Top left is BT.2408 diffuse white -- 203 cd/m^2 is PQ signal
+# 0.584, limited-range code 144 -- top right the 1000 cd/m^2 the grade is
+# mastered against (code 181), and the bottom half a saturated BT.2020 red,
+# which is what a grey-washed render loses. H.264 rather than HEVC so the
+# software decoder can read it on a machine with no VA-API plugin: the tone map
+# is fed by the tags, not by the codec. `-qp 1` on flat patches is exact to the
+# code, so the numbers a test names are the numbers that arrive; the tags go on
+# through `setparams` rather than through the encoder's own `-colorspace`,
+# because that one makes ffmpeg *convert* into BT.2020 and the patches would no
+# longer be the codes written above.
+ffmpeg -y -f lavfi -i "color=c=black:s=320x240:rate=25:duration=1,format=yuv420p,geq=lum='if(lt(Y,H/2),if(lt(X,W/2),144,181),100)':cb='if(lt(Y,H/2),128,90)':cr='if(lt(Y,H/2),128,200)',setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv" \
+    -c:v libx264 -profile:v high -qp 1 -pix_fmt yuv420p \
+    assets/test_pq.mp4
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.

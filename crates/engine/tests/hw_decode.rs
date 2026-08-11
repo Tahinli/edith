@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use engine::DecodeSession;
-use engine::colorspace::ColorDescription;
+use engine::colorspace::{ColorDescription, Matrix};
 use engine::convert::i420_to_bgra;
 use engine::demux::Demuxer;
 use engine::hw::HwSession;
+use engine::tonemap::{ToneMapper, Transfer};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -166,6 +167,101 @@ fn range_stops_at_end() {
     assert!(range_indices(&path, 60, 30).is_empty(), "inverted range");
     // Past the end is clamped to the frame count.
     assert_eq!(range_indices(&path, 148, 999).len(), 2, "clamped range");
+}
+
+/// The real thing: a 4K HDR10 film through the funnel, against the picture the
+/// same planes gave before the tone map was in it (BT.2020 matrix, HDR codes
+/// shown as if they were SDR -- flat and grey-washed, which is the complaint
+/// this whole path answers). Colour has to come *up*, not down, and the picture
+/// has to land somewhere a display can show rather than at either rail.
+///
+/// Gated on the film being here: it is a 20 GB download, not a fixture. HEVC
+/// Main 10, so this is a hardware-only test in every sense.
+#[test]
+#[ignore = "needs libengine_hw.so, a VA-API driver and the film"]
+fn the_hdr_film_renders_tone_mapped() {
+    // Two minutes in: past the studio logos, inside lit footage.
+    const TARGET: u32 = 3000;
+    let path = Path::new(
+        "/path/to/a-real-4k-hdr10-film.mkv",
+    );
+    if !path.exists() {
+        eprintln!("skipped: {} is not on this machine", path.display());
+        return;
+    }
+    // SAFETY: --test-threads=1. There is no software HEVC decoder, so a pinned
+    // VE_SW from another test in this binary would refuse the file outright.
+    unsafe { std::env::remove_var("VE_SW") };
+
+    // The old picture, by hand off the plugin's own planes: the funnel did
+    // exactly this before the tone map, and it is what the comparison needs.
+    let mut hw = HwSession::open_at(path, TARGET).expect("no plugin/driver available");
+    let (y, u, v, w, h) = hw
+        .next_frame()
+        .expect("hardware decode")
+        .expect("no frame at the seek");
+    let (w, h) = (w as usize, h as usize);
+    let (y, u, v) = (y.to_vec(), u.to_vec(), v.to_vec());
+    let untouched = i420_to_bgra(&color_of(path), &y, &u, &v, w, h);
+
+    // ...and the picture the engine shows now, through the funnel itself.
+    let (_, rx, _cancel) = DecodeSession::open_at(path, TARGET).expect("open the film");
+    let shown = rx.recv().expect("a frame off the funnel").bgra;
+    assert_eq!(shown.len(), untouched.len(), "frame size");
+
+    // Saturation, as the mean distance from grey per pixel...
+    let spread = |bgra: &[u8]| -> f64 {
+        let total: u64 = bgra
+            .chunks_exact(4)
+            .map(|px| u64::from(px[..3].iter().max().unwrap() - px[..3].iter().min().unwrap()))
+            .sum();
+        total as f64 / (bgra.len() / 4) as f64
+    };
+    // ...and mean luma, in the limited-range code the tone map's anchors are in.
+    let luma = |bgra: &[u8]| -> f64 {
+        let total: f64 = bgra
+            .chunks_exact(4)
+            .map(|px| {
+                0.2126 * f64::from(px[2]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[0])
+            })
+            .sum();
+        16.0 + 219.0 * (total / (bgra.len() / 4) as f64) / 255.0
+    };
+    let (was, now) = (spread(&untouched), spread(&shown));
+    eprintln!(
+        "frame {TARGET}: saturation {was:.1} -> {now:.1}, mean luma {:.1} -> {:.1}",
+        luma(&untouched),
+        luma(&shown)
+    );
+    assert!(
+        now > was,
+        "the tone-mapped frame is no more colourful: {now}"
+    );
+    let mean = luma(&shown);
+    assert!(
+        (24.0..=200.0).contains(&mean),
+        "the tone-mapped frame sits at one end of the scale: mean luma {mean}"
+    );
+
+    // The funnel's own budget at this size: the map plus the conversion, which
+    // is what an HDR frame costs on top of the decode. Fastest of five, for the
+    // reason `tonemap::perf_4k_and_1080p` documents.
+    let mapper = ToneMapper::new(Transfer::Pq);
+    let sdr = ColorDescription {
+        matrix: Matrix::Bt709,
+        transfer: engine::colorspace::Transfer::Sdr,
+        full_range: false,
+    };
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let (mut my, mut mu, mut mv) = (y.clone(), u.clone(), v.clone());
+        let t = Instant::now();
+        mapper.map(&mut my, &mut mu, &mut mv, w, h);
+        let _ = i420_to_bgra(&sdr, &my, &mu, &mv, w, h);
+        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("{w}x{h} tone map + convert: {best:.1} ms/frame");
+    assert!(best <= 39.0, "{best:.1} ms/frame over the 39 ms budget");
 }
 
 /// H.264 8-bit decode is bit-exact by conformance, so the two backends must
