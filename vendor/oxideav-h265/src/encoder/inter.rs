@@ -364,7 +364,9 @@ impl LowDelayPEncoder {
                     max_num_reorder_pics: 0,
                     min_cb_log2: if self.amp { 3 } else { 4 },
                     amp: self.amp,
-                    conf_win: (0, 0), // edith patch: no crop on the inter paths
+                    // edith patch: no crop and no VUI on the inter paths
+                    conf_win: (0, 0),
+                    signal: None,
                 },
                 &self.filters,
             )?;

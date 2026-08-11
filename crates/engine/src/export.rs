@@ -64,7 +64,7 @@ use flacenc::error::Verify;
 use oxideav_core::Muxer as _;
 
 use crate::audio::{AudioMeta, AudioSession};
-use crate::colorspace::ColorDescription;
+use crate::colorspace::{ColorDescription, Matrix};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
 use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams};
@@ -1006,10 +1006,12 @@ fn run(
             None => (None, Rate::REAL_TIME, 0, None),
         };
         // Mixed spaces on one timeline: a clip coded against another matrix than
-        // the one this file declares is rewritten into it, before the grade,
-        // whose numbers the user set against what the canvas showed. Same-space
-        // clips -- the whole of an ordinary project -- take `None` and not a
-        // byte is touched.
+        // the one this file declares is rewritten into it, *after* the grade --
+        // playback grades in the source's own space and converts for the screen
+        // ([`crate::decode`]), so a grade applied to remapped samples is a
+        // different picture than the one the canvas showed. Same-space clips --
+        // the whole of an ordinary project -- take `None` and not a byte is
+        // touched.
         //
         // ponytail: an HDR source is composited with the matrix treatment alone
         // and still looks washed out; the tonemap lands here, ahead of this, and
@@ -1100,11 +1102,14 @@ fn run(
                     gu.extend_from_slice(u);
                     gv.clear();
                     gv.extend_from_slice(v);
-                    if let Some((from, to)) = remap {
-                        crate::colorspace::remap(from, to, gy, gu, gv, width as usize);
-                    }
+                    // Grade in the source's space, then remap the graded
+                    // result: the order playback's `Decoded::frame` renders in,
+                    // and the only order in which preview and export agree.
                     if let Some(params) = params {
                         crate::color::apply_yuv(&params, gy, gu, gv);
+                    }
+                    if let Some((from, to)) = remap {
+                        crate::colorspace::remap(from, to, gy, gu, gv, width as usize);
                     }
                     (&gy[..], &gu[..], &gv[..])
                 }
@@ -1827,6 +1832,11 @@ struct HevcEnc {
     crop: (usize, usize),
     qp: i32,
     lanes: usize,
+    /// What the SPS says the samples mean. A decoder reads the bitstream before
+    /// it reads the container, so an HEVC stream without this renders BT.601 in
+    /// libavcodec however the file is tagged -- the container's `Colour` element
+    /// and `colr` box are not enough on their own.
+    signal: oxideav_h265::vui::VideoSignalType,
 }
 
 impl Enc {
@@ -1929,6 +1939,25 @@ impl Enc {
         // progress the whole way, which is what makes that bearable rather than
         // hidden.
         cfg.speed_settings = rav1e::prelude::SpeedSettings::from_preset(AV1_SPEED);
+        // What the sequence header says the samples mean, for the reason
+        // [`video_signal_type`] gives: a container tag is the second answer a
+        // decoder looks at, not the first. Written as rav1e's own enums rather
+        // than the H.273 numbers -- the crate has no `from` for the code points,
+        // and the output rule only ever picks one of these two spaces.
+        let out = ColorDescription::output(meta.height);
+        cfg.pixel_range = rav1e::prelude::PixelRange::Limited;
+        cfg.color_description = Some(match out.matrix {
+            Matrix::Bt709 => rav1e::prelude::ColorDescription {
+                color_primaries: rav1e::prelude::ColorPrimaries::BT709,
+                transfer_characteristics: rav1e::prelude::TransferCharacteristics::BT709,
+                matrix_coefficients: rav1e::prelude::MatrixCoefficients::BT709,
+            },
+            _ => rav1e::prelude::ColorDescription {
+                color_primaries: rav1e::prelude::ColorPrimaries::BT601,
+                transfer_characteristics: rav1e::prelude::TransferCharacteristics::BT601,
+                matrix_coefficients: rav1e::prelude::MatrixCoefficients::BT601,
+            },
+        });
         let config = rav1e::Config::new()
             .with_encoder_config(cfg)
             .with_threads(std::thread::available_parallelism().map_or(1, |n| n.get()));
@@ -1987,6 +2016,7 @@ impl Enc {
             crop: (width - meta.width as usize, height - meta.height as usize),
             qp: hevc_qp(meta, settings),
             lanes: lanes.min(HEVC_LANES),
+            signal: video_signal_type(meta.height),
         }))
     }
 
@@ -2122,6 +2152,7 @@ impl HevcEnc {
     /// as an error rather than unwinding the export thread.
     fn code_batch(&mut self) -> crate::Result<()> {
         let (width, height, qp, crop) = (self.width, self.height, self.qp, self.crop);
+        let signal = self.signal;
         let coded: Vec<crate::Result<Vec<u8>>> = std::thread::scope(|scope| {
             let lanes: Vec<_> = self
                 .pending
@@ -2129,7 +2160,15 @@ impl HevcEnc {
                 .map(|(y, cb, cr)| {
                     scope.spawn(move || {
                         oxideav_h265::encoder::intra::encode_idr_intra_au_cropped(
-                            y, cb, cr, width, height, qp, crop.0, crop.1,
+                            y,
+                            cb,
+                            cr,
+                            width,
+                            height,
+                            qp,
+                            crop.0,
+                            crop.1,
+                            Some(signal),
                         )
                         .map(|coded| coded.au)
                         .map_err(|e| crate::Error::from(format!("HEVC intra encode: {e:?}")))
@@ -2210,6 +2249,31 @@ fn hevc_qp(meta: &VideoMeta, settings: &ExportSettings) -> i32 {
     let target = bitrate_of(meta, settings) as f64 / pixels.max(1.0);
     let qp = 27.0 + 6.0 * (HEVC_BPP_AT_27 / target.max(f64::MIN_POSITIVE)).log2();
     (qp.round() as i32).clamp(HEVC_QP_MIN, HEVC_QP_MAX)
+}
+
+/// What the *bitstream* says the samples mean, in the words a sequence header
+/// spells them -- the same H.273 code points [`crate::mux`] writes into the
+/// container, from the same [`ColorDescription::output`] rule, so the two halves
+/// of a file cannot drift apart.
+///
+/// This exists because a container tag is not enough: libavcodec takes the
+/// bitstream's answer first, and a stream that says nothing is "unspecified",
+/// which renders BT.601 -- a visible shift on a 709 export that a player reads
+/// from the wrong matrix. Every export is limited range, which is what
+/// `video_full_range_flag = false` says here.
+fn video_signal_type(height: u32) -> oxideav_h265::vui::VideoSignalType {
+    let (primaries, transfer, matrix) = ColorDescription::output(height).codes();
+    oxideav_h265::vui::VideoSignalType {
+        // "Unspecified", which is what every encoder here writes: the field is
+        // the analogue system a picture came off, and none of these did.
+        video_format: 5,
+        video_full_range_flag: false,
+        colour_description: Some(oxideav_h265::vui::ColourDescription {
+            colour_primaries: primaries as u8,
+            transfer_characteristics: transfer as u8,
+            matrix_coeffs: matrix as u8,
+        }),
+    }
 }
 
 /// Every temporal unit `rav1e` has finished, moved into the queue in display
