@@ -855,6 +855,25 @@ impl PlaybackSession {
         crate::export::planned_subtitles(&self.project, format, pick)
     }
 
+    /// Where the cues of the track at `pick` land on *this* timeline --
+    /// [`crate::export::timeline_cues`], the very map an export writes the file
+    /// with, so a front-end that draws these draws what the file will say. On a
+    /// rippled or cut timeline that is the whole point: an embedded track rides
+    /// the spans that still play it, and a standalone `.srt` keeps the
+    /// timeline's own clock, clipped to its length.
+    ///
+    /// Empty for a row that is not there and for a track that could not be read.
+    /// Pure and file-free, so it may be asked per repaint; the cost is a walk of
+    /// the spans and of the cues.
+    pub fn timeline_cues(&self, pick: usize) -> Vec<crate::subtitle::Cue> {
+        self.project
+            .subtitles()
+            .get(pick)
+            .map_or_else(Vec::new, |t| {
+                crate::export::timeline_cues(&self.project, t, self.meta.frame_rate)
+            })
+    }
+
     /// Why the sound's rate is not a choice for this timeline in this format --
     /// [`crate::export::audio_rate_refusal`], asked of the project a front-end
     /// is holding, and pure for the same reason.
@@ -1002,8 +1021,20 @@ impl PlaybackSession {
         }
     }
 
-    /// Whether the timeline has been played out. Any seek clears it, so an edit
-    /// after the end (which reseeks) revives the session.
+    /// Whether the timeline has been played out: the picture worker ran to the
+    /// end and there was no next clip. It is exactly that and nothing more,
+    /// which is what decides who clears it -- **starting a picture does**
+    /// (`start_picture`), so a seek clears it and so does every edit that
+    /// rebuilds the picture (`Dirty::Picture`, `Dirty::Both` -- a paste or a
+    /// placement past the end revives the session, and it has a new picture to
+    /// show for it).
+    ///
+    /// A **sound-only** edit does not (`Dirty::Sound`: an equalizer, a fader):
+    /// it rebuilds the sound where the playhead stands and starts no picture
+    /// worker, so the last frame is still the last frame and this is still the
+    /// end. A front-end's `Ended` therefore survives an EQ tweak made after the
+    /// timeline ran out -- the parameters are on the project either way, and the
+    /// next press restarts from the top with them, which is what `Ended` means.
     pub fn is_eos(&self) -> bool {
         self.eos
     }
@@ -2239,6 +2270,10 @@ impl PlaybackSession {
     /// the picture does not blink -- and the clock, held still by
     /// [`resume`](Self::resume) until the new stream is audible, puts the sound
     /// back exactly where the picture already is.
+    ///
+    /// End of stream is deliberately left alone -- no picture worker is started
+    /// here, so a timeline that was played out still is; see
+    /// [`is_eos`](Self::is_eos).
     fn reseek_audio(&mut self) {
         let (t, target) = self.landing(self.now());
         let was_playing = self.clock.is_playing();
