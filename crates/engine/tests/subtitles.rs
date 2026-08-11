@@ -338,6 +338,95 @@ fn a_project_keeps_a_bitmap_track_as_a_reference_and_reads_its_pictures_back() {
     let image = track.cues[0].image.as_ref().expect("the picture is back");
     assert_eq!((image.width, image.height), (8, 4));
     assert_eq!(image.rgba().expect("it decodes").len(), 8 * 4 * 4);
+
+    // Each row is the track it was saved as, in the order it was saved in: what
+    // a click picks is a place in this list, so a load that reordered the rows
+    // would repoint the picked track without saying anything. A re-save writing
+    // the same bytes is that order proved from both ends.
+    assert_eq!(
+        back.subtitles().iter().map(|t| t.track).collect::<Vec<_>>(),
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    let again = dir.join("cut2.edith");
+    back.save_project(&again).expect("save again");
+    assert_eq!(
+        std::fs::read(&again).expect("read"),
+        std::fs::read(&project).expect("read"),
+        "a save, a load and a save again are the same file"
+    );
+}
+
+/// Bytes this process has asked the kernel for so far, which is what a walk of
+/// a Matroska file costs and a page cache cannot hide: `rchar` counts what
+/// `read` handed back, warm or cold.
+fn read_bytes() -> u64 {
+    let io = std::fs::read_to_string("/proc/self/io").expect("Linux, like the rest of this suite");
+    io.lines()
+        .find_map(|l| l.strip_prefix("rchar: "))
+        .expect("rchar")
+        .trim()
+        .parse()
+        .expect("a number")
+}
+
+/// A project naming four tracks of one file walks that file *once*, and hands
+/// the rows back in the order they were saved in.
+///
+/// The order is the invariant with teeth: a subtitle is picked by its place in
+/// this list, so a reader that grouped the rows by file and handed them back
+/// grouped would silently repoint what the user had picked. And the walk count
+/// is the reason the grouping exists at all -- a saved film with thirty-five
+/// tracks was thirty-five walks of a 25 GB file with the window stopped.
+#[test]
+fn a_project_naming_many_tracks_of_one_file_walks_it_once_and_keeps_its_order() {
+    let dir = scratch("one_walk");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    let remux = dir.join("remux.mkv");
+    std::fs::write(&remux, pgs_matroska(pgs_display_set())).expect("write the hand-made mkv");
+    let subs = dir.join("test_subs.srt");
+    std::fs::copy(data("test_subs.srt"), &subs).expect("copy the subtitle fixture");
+
+    // One walk, for the measurement below to be compared against.
+    let before = read_bytes();
+    let all = subtitle::of_matroska(&remux).expect("the walk");
+    let one_walk = read_bytes() - before;
+    assert_eq!(all.len(), 4);
+    assert!(one_walk > 0, "a walk reads something");
+
+    // The rows a `.edith` holds, deliberately out of file order and with the
+    // standalone file in the middle of them.
+    let rows: Vec<(PathBuf, Option<u64>)> = vec![
+        (remux.clone(), Some(3)),
+        (remux.clone(), Some(1)),
+        (subs.clone(), None),
+        (remux.clone(), Some(4)),
+        (remux.clone(), Some(2)),
+        (remux.clone(), Some(9)), // gone: refused by name, still a row
+    ];
+    let before = read_bytes();
+    let opened = subtitle::open_all(&rows);
+    let cost = read_bytes() - before;
+    assert_eq!(
+        opened.iter().map(|t| (&t.path, t.track)).collect::<Vec<_>>(),
+        rows.iter().map(|(p, n)| (p, *n)).collect::<Vec<_>>(),
+        "every row comes back where it was saved"
+    );
+    assert_eq!(opened[1].label, "eng", "and it is that file's track 1");
+    assert_eq!(opened[2].cues, expected(), "the standalone row is untouched");
+    assert!(
+        opened[5]
+            .refused
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no subtitle track 9"),
+        "{:?}",
+        opened[5].refused
+    );
+    assert!(
+        cost < one_walk * 2,
+        "four rows of one file is one walk of it: {cost} bytes read against {one_walk} for a walk"
+    );
 }
 
 /// A refusal a front-end shows at the moment of the import, rather than a row
