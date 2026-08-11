@@ -1509,9 +1509,12 @@ impl Player {
     /// playhead happens to sit between two cues would read as broken.
     fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
         self.subs_on = !self.subs_on;
+        // Named with its film here too: a notice saying "SUBTITLES ON — eng"
+        // over a timeline holding two films' eng tracks names neither.
         let label = self
-            .subtitle_track()
-            .map(|track| track.label.clone())
+            .session
+            .as_ref()
+            .and_then(|session| sub_pick_name(session.subtitles(), self.sub_track))
             .unwrap_or_else(|| "nothing imported".to_string());
         self.notice = Some(
             match self.subs_on {
@@ -5313,12 +5316,16 @@ impl Player {
                         .truncate()
                         .text_size(px(11.))
                         .text_color(rgb(INK_DIM))
-                        .child(match self.subs_on {
-                            true => "Subtitles",
+                        .child(match (self.subs_on, sub_pick_name(tracks, self.sub_track)) {
+                            // Which of them is on screen, named by its film:
+                            // the heading over a list of five is where the one
+                            // being shown is worth saying out loud.
+                            (true, Some(pick)) => format!("Subtitles — {pick}"),
+                            (true, None) => "Subtitles".to_string(),
                             // The toggle's state where the tracks are listed: a
                             // list of subtitles nothing on screen is showing has
                             // to say that it is showing none.
-                            false => "Subtitles — hidden",
+                            (false, _) => "Subtitles — hidden".to_string(),
                         }),
                 )
                 .child(
@@ -8481,17 +8488,31 @@ impl Player {
     fn subtitle_strip(&self, filled: f32) -> Option<impl IntoElement + use<>> {
         let track = self.subtitle_track()?;
         let scale = self.scale;
-        let label = track.label.clone();
+        // The pick with its film on it, not the raw tag: two films' "eng"
+        // tracks read alike otherwise, and a header saying "und" names a
+        // language nobody speaks.
+        let label = sub_pick_name(self.session.as_ref()?.subtitles(), self.sub_track)?;
+        // The colour the file's own rows and clips wear, so the strip says
+        // whose subtitles these are before the tooltip is asked. `None` for a
+        // standalone `.srt` -- nobody's stream, and the first film's colour
+        // would be a lie about where it came from.
+        let tint = file_tint(self.sources(), &track.path).unwrap_or(SURFACE);
         // The whole of what the row says in words, since a 40 px column can hold
-        // three characters of it: which track, how many cues, and -- for one
-        // that could not be read -- the engine's own reason, where the library
-        // row's grey already says the same thing.
+        // three characters of it: which track of which file, how many cues, the
+        // file itself in full -- one stem is two films when they are two cuts of
+        // it -- and, for a track that could not be read, the engine's own reason,
+        // where the library row's grey already says the same thing.
         let tip: SharedString = match track.refused.is_some() {
-            true => format!("Subtitles: {label} — {}", subtitle_detail(track)),
-            false => format!(
-                "Subtitles: {label} — {}, {} hides them",
+            true => format!(
+                "Subtitles: {label} — {} — {}",
                 subtitle_detail(track),
-                self.keymap.display(ActionId::ToggleSubtitles)
+                track.path.display()
+            ),
+            false => format!(
+                "Subtitles: {label} — {}, {} hides them — {}",
+                subtitle_detail(track),
+                self.keymap.display(ActionId::ToggleSubtitles),
+                track.path.display()
             ),
         }
         .into();
@@ -8528,7 +8549,7 @@ impl Player {
                         // a centred truncation eats both of its ends.
                         .px(px(2.))
                         .rounded(px(3.))
-                        .bg(rgb(SURFACE))
+                        .bg(rgb(tint))
                         .text_size(px(9.))
                         .text_color(rgb(INK_DIM))
                         .truncate()
@@ -9352,9 +9373,10 @@ fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
 /// before anything is drawn -- the grouping is the branchy part and it is the
 /// same answer whatever a styling puts around it.
 ///
-/// ponytail: nothing draws these yet -- [`Player::subtitle_section`] still
-/// lists the flat rows. Ceiling: the model is proven by its tests and by
-/// nothing on screen. The upgrade is that section rendering groups instead.
+/// ponytail: only [`sub_pick_name`] reads these -- [`Player::subtitle_section`]
+/// still *lists* the flat rows, so the grouping shows in what the headers say
+/// and not yet in how the list is laid out. The upgrade is that section
+/// rendering groups instead.
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 struct SubGroup {
@@ -9426,6 +9448,38 @@ fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<SubGroup> {
         });
     }
     groups
+}
+
+/// How the picked track is named wherever the pick is echoed -- the strip
+/// header, the section heading, the toggle's own notice. What the track is
+/// *and* which file it came out of: two remuxes each carrying an "eng" track
+/// give the same word twice, and the file is the only thing that tells them
+/// apart. A file that gave several of them numbers them within itself, the way
+/// [`row_name`] numbers audio streams, since "eng" twice off one remux is the
+/// same problem one file down.
+///
+/// Goes through [`subtitle_rows`], so the name a header says and the row a
+/// person clicked cannot disagree -- and the label is humanised there, so an
+/// "und" track is named in words here without being passed through
+/// [`lang_human`] twice.
+///
+/// `None` for an index no track answers to, which is the silence
+/// [`Player::subtitle_track`] gives at the same moment.
+fn sub_pick_name(tracks: &[engine::subtitle::SubtitleTrack], track: usize) -> Option<String> {
+    subtitle_rows(tracks).into_iter().find_map(|group| {
+        let row = group.rows.iter().find(|row| row.track == track)?;
+        let track = match group.rows.len() > 1 {
+            false => row.label.clone(),
+            true => format!("{} {}", row.label, row.number),
+        };
+        // A standalone `.srt` is already named after its own file: "sub.srt —
+        // sub" says the one thing twice, and the film is only worth naming
+        // where it is not in the label yet.
+        Some(match row.label.starts_with(&group.name) {
+            true => track,
+            false => format!("{track} — {}", group.name),
+        })
+    })
 }
 
 /// Where a cue is drawn on the bed: left edge and width in pixels, through the
@@ -10008,6 +10062,16 @@ fn file_tint(sources: &[Source], path: &Path) -> Option<u32> {
     sources
         .iter()
         .position(|s| s.path == path)
+        .or_else(|| {
+            // A source entry is stored symlink-resolved (`Source::new`) and a
+            // path from anywhere else -- a subtitle track, a file being
+            // dragged -- is stored as it was spelled. `edith assets/film.mkv`
+            // is one file under two spellings, and matching by spelling alone
+            // said the film had no colour. Only asked when the spellings
+            // differ, so the common paint costs no syscall.
+            let path = std::fs::canonicalize(path).ok()?;
+            sources.iter().position(|s| s.path == path)
+        })
         .map(source_tint)
 }
 
@@ -12025,7 +12089,7 @@ mod tests {
     use super::{
         SUB_BOTTOM, SUB_CUE_MIN_W, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H, SUB_TEXT, cue_box,
         cues_at, file_tint, is_matroska, is_subtitle, lang_human, subtitle_detail, subtitle_notice,
-        subtitle_rows, subtitle_strip_h,
+        sub_pick_name, subtitle_rows, subtitle_strip_h,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -16091,6 +16155,18 @@ mod tests {
         );
         assert_eq!(file_tint(&sources, Path::new("/subs/a.eng.srt")), None);
         assert_eq!(file_tint(&[], Path::new("/films/a.mkv")), None);
+        // The same file under two spellings is one file and one colour: a
+        // source is stored symlink-resolved, everything else as it was typed.
+        let here = std::fs::canonicalize(".").expect("the crate directory");
+        let sources = [Source {
+            path: here.join("Cargo.toml"),
+            audio_stream: 0,
+        }];
+        assert_eq!(
+            file_tint(&sources, Path::new("Cargo.toml")),
+            Some(source_tint(0)),
+            "a relative spelling of the source file wears the source's colour"
+        );
     }
 
     fn sub(path: &str, track: Option<u64>, label: &str) -> engine::subtitle::SubtitleTrack {
@@ -16152,6 +16228,39 @@ mod tests {
             "the group carries the path the tint is asked by"
         );
         assert_eq!(file_tint(&sources, &groups[2].path), None);
+    }
+
+    /// What the strip header, the section heading and the toggle's notice all
+    /// say. Two films each carrying an "eng" track are one word apart until the
+    /// film is in the name; a film carrying two is one word apart from itself.
+    #[test]
+    fn the_picked_subtitle_is_named_with_the_film_it_came_out_of() {
+        let tracks = [
+            sub("/films/a.mkv", Some(1), "eng"),
+            sub("/films/b.mkv", Some(1), "eng"),
+            sub("/films/a.mkv", Some(2), "eng"),
+            sub("/films/b.mkv", Some(2), "und"),
+            sub("/subs/late.srt", None, "late.srt"),
+        ];
+        let name = |track| sub_pick_name(&tracks, track).expect("a track that is there");
+        // The two "eng"s of two films: one file gave several so its tracks are
+        // numbered, the other gave one so it is not.
+        assert_eq!(name(0), "eng 1 — a");
+        assert_eq!(name(2), "eng 2 — a");
+        assert_eq!(name(1), "eng 1 — b");
+        assert_ne!(name(0), name(1), "two films' eng tracks read apart");
+        for picked in [name(0), name(1), name(2)] {
+            assert!(picked.contains(" — a") || picked.contains(" — b"));
+        }
+        // "und" is the tag for "nobody said", humanised once by
+        // `subtitle_rows` and not again here.
+        assert_eq!(name(3), "unknown language 2 — b");
+        // A standalone `.srt` is its own file and its label already says so:
+        // one track, so no number, and no stem after it saying it again.
+        assert_eq!(name(4), "late.srt");
+        // The silence `subtitle_track` gives at the same moment.
+        assert_eq!(sub_pick_name(&tracks, 5), None);
+        assert_eq!(sub_pick_name(&[], 0), None);
     }
 
     /// The one thing regrouping must not break: `sub_track` is a flat index
