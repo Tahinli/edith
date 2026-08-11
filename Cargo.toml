@@ -23,7 +23,10 @@ edition = "2024"
 #   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
 #                 term (the fast path in the same file serves the encoder only),
 #                 which is 4x slower than real time for 5.1 and therefore not
-#                 playable at all; the patch caches the cosine matrix
+#                 playable at all; the patch routes the IMDCT through the same
+#                 N/4-point FFT the encoder's MDCT already uses (`dsp::dct4`),
+#                 40x the matrix version it started as -- 2 hours of 5.1 for a
+#                 waveform in 2.4 minutes rather than an hour
 #   oxideav-h265 - its intra encoder writes `conformance_window_flag = 0` and
 #                 refuses any dimension that is not a multiple of the 16-sample
 #                 CTB, so 1920x1080 could not be written at all; the patch adds

@@ -35,20 +35,45 @@ pub fn imdct(spec: &[f32]) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    // LOCAL PATCH: the AAC block sizes take the cached cosine matrix below --
-    // the same numbers, looked up instead of called for.
-    if let Some(matrix) = imdct_matrix(n) {
-        let mut out = vec![0f32; n];
-        for (i, o) in out.iter_mut().enumerate() {
-            let row = &matrix[i * half..(i + 1) * half];
-            let mut acc = 0f32;
-            for (k, &s) in spec.iter().enumerate() {
-                acc += s * row[k];
+    // LOCAL PATCH: O(N log N) instead of the O(N^2) sum below. With `n0 = N/4 +
+    // 1/2` the kernel is exactly a DCT-IV of length L = N/2 read at `j = i +
+    // L/2` -- the same DCT-IV [`mdct_fast`] already runs as one N/4-point FFT --
+    // so the transform is that one call plus a sign-and-mirror walk (DCT-IV is
+    // even about `j = -1/2`, odd about `j = L - 1/2`, and negates every 2L).
+    if half >= 2 && half.is_power_of_two() {
+        let owned;
+        let tw = match mdct_twiddles(n) {
+            Some(t) => t,
+            None => {
+                owned = MdctTwiddles::build(n);
+                &owned
             }
-            *o = acc;
-        }
-        return out;
+        };
+        let d = dct4(half, |k| spec[k] as f64, tw);
+        let scale = 2.0 / n as f64;
+        let (l, l2) = (half, half / 2);
+        return (0..n)
+            .map(|i| {
+                let j = i + l2;
+                let v = if j < l {
+                    d[j]
+                } else if j < 2 * l {
+                    -d[2 * l - 1 - j]
+                } else {
+                    -d[j - 2 * l]
+                };
+                (scale * v) as f32
+            })
+            .collect();
     }
+    imdct_direct(spec)
+}
+
+/// The direct O(N^2) transform [`imdct`] is defined as, kept as the oracle its
+/// test measures against and as the path for sizes the fast one does not take.
+fn imdct_direct(spec: &[f32]) -> Vec<f32> {
+    let half = spec.len();
+    let n = half * 2;
     let n0 = (n / 2 + 1) as f64 / 2.0; // N/4 + 1/2
     let scale = 2.0 / n as f64;
     let w = 2.0 * PI / n as f64;
@@ -62,36 +87,6 @@ pub fn imdct(spec: &[f32]) -> Vec<f32> {
         *o = (scale * acc) as f32;
     }
     out
-}
-
-/// LOCAL PATCH: `(2/N)·cos((2π/N)(i+n0)(k+½))` for every `(i, k)` of one block
-/// size, built once. The direct transform above spends its whole time in `cos`
-/// -- ~63 ms for one 1024-coefficient channel, three times slower than real
-/// time, which is what made a 5.1 stream unplayable. The matrix is 8 MB for the
-/// long block and 128 kB for the short one, and each output sample becomes a
-/// dot product a compiler can vectorise.
-fn imdct_matrix(n: usize) -> Option<&'static [f32]> {
-    static LONG: OnceLock<Vec<f32>> = OnceLock::new();
-    static SHORT: OnceLock<Vec<f32>> = OnceLock::new();
-    fn build(n: usize) -> Vec<f32> {
-        let half = n / 2;
-        let n0 = (n / 2 + 1) as f64 / 2.0;
-        let scale = 2.0 / n as f64;
-        let w = 2.0 * PI / n as f64;
-        let mut m = vec![0f32; n * half];
-        for i in 0..n {
-            let a = w * (i as f64 + n0);
-            for k in 0..half {
-                m[i * half + k] = (scale * (a * (k as f64 + 0.5)).cos()) as f32;
-            }
-        }
-        m
-    }
-    match n {
-        2048 => Some(LONG.get_or_init(|| build(2048))),
-        256 => Some(SHORT.get_or_init(|| build(256))),
-        _ => None,
-    }
 }
 
 /// Forward MDCT — the analysis transform paired with [`imdct`]. Used to validate
@@ -236,7 +231,7 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
     if n < 4 {
         return mdct(x); // tiny sizes: fall back to the direct oracle
     }
-    let (l, m) = (n / 2, n / 4);
+    let l = n / 2;
     let owned;
     let tw = match mdct_twiddles(n) {
         Some(t) => t,
@@ -254,20 +249,32 @@ pub fn mdct_fast(x: &[f32]) -> Vec<f32> {
             (x[mm - l2] as f64) - (x[l32 - 1 - mm] as f64)
         }
     };
-    // Pack + pre-rotate into M complex: v[p] = (y[2p] + i·y[L-1-2p])·e^{-iπ(4p+1)/4L}.
+    // Output scaled ×2: that factor is [`mdct`]'s, not the DCT-IV's.
+    dct4(l, fold, tw).iter().map(|&v| (2.0 * v) as f32).collect()
+}
+
+/// DCT-IV of length `l`: `out[k] = Σ_j y(j)·cos((π/L)(j+½)(k+½))`, as one
+/// `L/2`-point complex FFT — pack + pre-rotate `v[p] = (y[2p] + i·y[L-1-2p])
+/// ·e^{-iπ(4p+1)/4L}`, transform, post-rotate `W = V·e^{-iπp/L}`, and read
+/// `out[2p] = Re(W)`, `out[L-1-2p] = -Im(W)`.
+///
+/// `y` is a closure because the forward MDCT folds its input on the fly and the
+/// inverse reads a spectrum straight out; `tw` is the block-size table both
+/// directions share ([`MdctTwiddles`], built for `N = 2L`).
+fn dct4(l: usize, y: impl Fn(usize) -> f64, tw: &MdctTwiddles) -> Vec<f64> {
+    let m = l / 2;
     let (mut re, mut im) = (vec![0f64; m], vec![0f64; m]);
     for p in 0..m {
-        let (yr, yi) = (fold(2 * p), fold(l - 1 - 2 * p));
+        let (yr, yi) = (y(2 * p), y(l - 1 - 2 * p));
         re[p] = yr * tw.pre_c[p] + yi * tw.pre_s[p];
         im[p] = yi * tw.pre_c[p] - yr * tw.pre_s[p];
     }
     fft(&mut re, &mut im, &tw.fft_c, &tw.fft_s);
-    // Post-rotate W = V·e^{-iπp/L}; X[2p]=Re(W), X[L-1-2p]=-Im(W); output scaled ×2.
-    let mut out = vec![0f32; l];
+    let mut out = vec![0f64; l];
     for p in 0..m {
         let (vr, vi) = (re[p], im[p]);
-        out[2 * p] = (2.0 * (vr * tw.post_c[p] + vi * tw.post_s[p])) as f32;
-        out[l - 1 - 2 * p] = (2.0 * (vr * tw.post_s[p] - vi * tw.post_c[p])) as f32;
+        out[2 * p] = vr * tw.post_c[p] + vi * tw.post_s[p];
+        out[l - 1 - 2 * p] = vr * tw.post_s[p] - vi * tw.post_c[p];
     }
     out
 }
@@ -340,6 +347,37 @@ mod tests {
                         "n={n} scale={scale} k={k}: {} vs {}",
                         a[k],
                         b[k]
+                    );
+                }
+            }
+        }
+    }
+
+    /// LOCAL PATCH: the fast IMDCT against the direct sum it replaced, at both
+    /// AAC block sizes plus one the twiddle cache does not hold (512, built on
+    /// the spot) and one the fast path declines (a 3-coefficient spectrum), on
+    /// raw and decoder-scale (×32768) input. Every output sample, because the
+    /// index remap is where a DCT-IV-based inverse goes wrong: a sign or a
+    /// mirror off by one is silent in the first half and audible in the second.
+    #[test]
+    fn imdct_matches_direct() {
+        for &half in &[3usize, 128, 256, 1024] {
+            for &scale in &[1.0f32, 32768.0] {
+                let spec: Vec<f32> = (0..half)
+                    .map(|k| {
+                        scale
+                            * (0.4 * (k as f64 * 0.037).sin() + 0.25 * (k as f64 * 0.011).cos())
+                                as f32
+                    })
+                    .collect();
+                let (a, b) = (imdct_direct(&spec), imdct(&spec));
+                let tol = 2e-4 * scale.max(1.0);
+                for i in 0..half * 2 {
+                    assert!(
+                        (a[i] - b[i]).abs() < tol,
+                        "half={half} scale={scale} i={i}: {} vs {}",
+                        a[i],
+                        b[i]
                     );
                 }
             }

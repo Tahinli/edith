@@ -260,6 +260,10 @@ enum Wave {
     Loading,
     /// The file has no audio track. An answer, not a miss.
     Silent,
+    /// The decode failed. Drawn as its own mark rather than as [`Self::Silent`]:
+    /// "this file's sound could not be read" and "this file has no sound" look
+    /// the same on a lane, and the first is a bug report waiting to happen.
+    Failed,
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 
@@ -2178,9 +2182,8 @@ impl Player {
                 let (path, stream) = key.clone();
                 async move {
                     engine::waveform::peaks(&path, stream, WAVE_BPS)
-                        .ok()
-                        .flatten()
-                        .map(|peaks| Arc::new(normalise(peaks)))
+                        .map(|peaks| peaks.map(|peaks| Arc::new(normalise(peaks))))
+                        .inspect_err(|e| eprintln!("waveform: {}: {e}", path.display()))
                 }
             });
             cx.spawn(async move |this, cx| {
@@ -2189,11 +2192,14 @@ impl Player {
                     this.waves.insert(
                         key,
                         match decoded {
-                            Some(peaks) => Wave::Peaks(peaks),
-                            // Either no audio track or a file we could not read
-                            // it from; both mean the lane has nothing to draw,
-                            // and neither is worth asking about again.
-                            None => Wave::Silent,
+                            Ok(Some(peaks)) => Wave::Peaks(peaks),
+                            // No audio track: an answer, and not worth asking
+                            // about again.
+                            Ok(None) => Wave::Silent,
+                            // A file whose sound we could not read is not a
+                            // silent one, and a lane that drew it as silent is
+                            // how a broken decode passes for a design choice.
+                            Err(_) => Wave::Failed,
                         },
                     );
                     cx.notify();
@@ -6915,6 +6921,20 @@ impl Player {
                                         .into_any_element(),
                                     // No audio track: nothing, never a fake.
                                     Wave::Silent => return None,
+                                    // Could not be read: a band that says so in
+                                    // words, because the empty band a silent
+                                    // file draws would claim this file has no
+                                    // sound. The reason itself went to the log.
+                                    Wave::Failed => div()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .truncate()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(INK_DIM))
+                                        .child("audio unreadable")
+                                        .into_any_element(),
                                 };
                                 Some(
                                     div()
