@@ -79,6 +79,7 @@ pub enum ActionId {
     Silence,
     Mix,
     ToggleSnap,
+    ToggleSubtitles,
     CancelExport,
     /// Opens the actions card -- the list every other action is on. A door of
     /// its own, because a card reachable only by a button in the panel is one a
@@ -89,7 +90,7 @@ pub enum ActionId {
 impl ActionId {
     /// Display order everywhere -- the editor lists them in it and
     /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 41] = [
+    pub const ALL: [ActionId; 42] = [
         ActionId::Play,
         ActionId::StepBack,
         ActionId::StepForward,
@@ -129,6 +130,7 @@ impl ActionId {
         ActionId::Silence,
         ActionId::Mix,
         ActionId::ToggleSnap,
+        ActionId::ToggleSubtitles,
         ActionId::CancelExport,
         ActionId::ShowActions,
     ];
@@ -175,6 +177,7 @@ impl ActionId {
             ActionId::Silence => "Silences: cut or speed up…",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
+            ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
         }
@@ -223,6 +226,7 @@ impl ActionId {
             ActionId::Silence => "silence",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
+            ActionId::ToggleSubtitles => "toggle-subtitles",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
         }
@@ -265,9 +269,13 @@ impl ActionId {
             // a file operation either: it is what the viewer is looking at.
             // Neither is how much of the timeline the panel shows: a zoom edits
             // nothing, it magnifies.
-            ActionId::Resolution | ActionId::ZoomIn | ActionId::ZoomOut | ActionId::ZoomFit => {
-                Category::View
-            }
+            // ...and whether the cues are drawn over that picture: a subtitle
+            // edits nothing either, it is part of what is being watched.
+            ActionId::Resolution
+            | ActionId::ZoomIn
+            | ActionId::ZoomOut
+            | ActionId::ZoomFit
+            | ActionId::ToggleSubtitles => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -697,6 +705,10 @@ impl Keymap {
                 // The snap takes "n", which is what every other editor toggles
                 // it with: free here, and nowhere near the two keys that delete.
                 b(ActionId::ToggleSnap, "n", false),
+                // The subtitles take "t", for the word: free, one press like
+                // the rest of the things one *looks* at, and nowhere near the
+                // two keys that delete.
+                b(ActionId::ToggleSubtitles, "t", false),
                 b(ActionId::CancelExport, "escape", false),
                 // The help key, where every program's list of what it can do
                 // has always been. Free -- gpui names it "f1"
@@ -964,7 +976,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 43);
+        assert_eq!(k.entries().len(), 44);
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
@@ -1203,9 +1215,10 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 41);
+        assert_eq!(ActionId::ALL.len(), 42);
         assert_eq!(k.display(ActionId::ToggleSnap), "n");
         assert_eq!(k.display(ActionId::ShowActions), "f1");
+        assert_eq!(k.display(ActionId::ToggleSubtitles), "t");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
 
