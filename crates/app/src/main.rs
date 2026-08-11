@@ -618,6 +618,48 @@ const HIST_H: f32 = 96.;
 /// counts, lightened enough to read on the dark box.
 const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
 
+/// Where the transport is. The one answer the button's glyph, its label, its
+/// enablement, the play key and the repaint loop all read -- there is no play
+/// flag anywhere else, because a second one is a second answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    /// No timeline open. Nothing to play and the transport is dimmed.
+    Stopped,
+    Playing,
+    Paused,
+    /// Played out: the last frame is on screen, the decoder is finished, and the
+    /// clock is still running past it -- which is exactly why "is the clock
+    /// going" is not the same question as "is this playing".
+    Ended,
+}
+
+impl Transport {
+    /// The timeline is in motion: two bars on the button, and a repaint owed
+    /// every vsync.
+    fn is_playing(self) -> bool {
+        matches!(self, Transport::Playing)
+    }
+
+    /// The play key and the transport button start over from the top rather
+    /// than toggling -- the end of a timeline is where every NLE does this, and
+    /// the button does it because the key already did.
+    fn restarts(self) -> bool {
+        matches!(self, Transport::Ended)
+    }
+}
+
+/// What a session's own two answers mean: the clock, unless the timeline has
+/// been played out -- `played_out` is the engine's end of stream with no frame
+/// still waiting on the pump, and it wins, because past the end a running clock
+/// is measuring wall time and not a picture.
+fn transport(playing: bool, played_out: bool) -> Transport {
+    match (played_out, playing) {
+        (true, _) => Transport::Ended,
+        (_, true) => Transport::Playing,
+        (_, false) => Transport::Paused,
+    }
+}
+
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
@@ -629,11 +671,10 @@ struct Player {
     name: SharedString,
     image: Option<Arc<RenderImage>>,
     /// A frame that arrived before its time; shown on the tick it comes due.
+    /// The pump's buffer, not transport state -- but a frame waiting here is
+    /// what keeps a finished decoder from reading as [`Transport::Ended`] one
+    /// tick early. See [`Player::transport`].
     held: Option<Frame>,
-    /// The decoder's channel closed. Frames may still be waiting in `held`.
-    eos: bool,
-    /// Last frame shown; nothing left to animate.
-    done: bool,
     /// A seek is waiting for its frame. Keeps the repaint loop alive while
     /// paused, which is the only way the new still ever reaches the screen.
     pending_seek: bool,
@@ -889,6 +930,9 @@ impl Player {
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`.
     fn pump(&mut self, window: &mut Window) {
+        // Where the transport was before this drain, so the crossing into
+        // `Ended` can be recognised as the one transition it is.
+        let was = self.transport();
         // No timeline, nothing to catch up to: the window is showing its empty
         // state and there is no decoder to drain.
         let Some(session) = &mut self.session else {
@@ -904,10 +948,7 @@ impl Player {
                 // them apart -- `frame.index` is already a timeline index.
                 None => match session.try_frame() {
                     Some(frame) => frame,
-                    None => {
-                        self.eos = session.is_eos();
-                        break;
-                    }
+                    None => break,
                 },
             };
             if f64::from(frame.index) <= target {
@@ -942,29 +983,56 @@ impl Player {
             }
         }
 
-        if self.eos && self.held.is_none() && !self.done {
-            self.done = true;
+        if self.transport() == Transport::Ended {
             // A seek whose worker never produced a frame (vanished file) would
-            // otherwise repaint at vsync forever.
+            // otherwise repaint at vsync forever. Held true for as long as the
+            // state does, not just on the crossing: nothing else is coming.
             self.pending_seek = false;
-            let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
-            eprintln!(
-                "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
-                self.displayed,
-                self.dropped,
-                session.now()
-            );
+            if was != Transport::Ended {
+                // Ended is a *stopped* transport, so the clock stops with it,
+                // on the out point the timecode and the playhead have been
+                // showing all along. Nothing else ever stopped it: past the
+                // last frame wall time takes over and `now()` walks off the end
+                // of the timeline for as long as the window is left open -- and
+                // the playhead is what a cut, a paste, an insert and the
+                // analyser all act at, so every one of them was aiming into
+                // empty space (measured: a 5 s timeline recognised its end at
+                // clock 17.5 s under a slow renderer). End of stream is left
+                // set, so this is still `Ended` and the next press restarts.
+                if let Some(session) = &mut self.session {
+                    session.halt_at_end();
+                }
+                let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                eprintln!(
+                    "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
+                    self.displayed,
+                    self.dropped,
+                    self.session.as_ref().map_or(0., PlaybackSession::now)
+                );
+            }
         }
     }
 
-    /// Every end-of-stream flag is app state and the engine knows nothing about
-    /// it, so clearing them after a reseek is what stops the picture from
-    /// staying frozen on the old last frame. Edits reseek inside the engine and
-    /// still owe this.
+    /// Where the transport is, asked of the session rather than remembered:
+    /// end of stream is the engine's own flag (any seek clears it, which is why
+    /// an edit past the end revives the picture) and so is the clock. A held
+    /// frame is one still owed to the screen, so the end is not the end yet.
+    fn transport(&self) -> Transport {
+        let Some(session) = &self.session else {
+            return Transport::Stopped;
+        };
+        transport(
+            session.is_playing(),
+            session.is_eos() && self.held.is_none(),
+        )
+    }
+
+    /// A frame owed to the screen after a reseek, and the buffered one dropped:
+    /// what stops the picture from staying frozen on the old last frame. The
+    /// end-of-stream flag itself is the engine's and its own seek clears it --
+    /// edits reseek inside the engine and still owe this.
     fn reset_after_reseek(&mut self) {
         self.held = None;
-        self.eos = false;
-        self.done = false;
         self.pending_seek = true;
         // An edit moves the indices a drag in flight is holding -- a stroke
         // during one is exactly that -- and an edge committed against a moved
@@ -1933,16 +2001,17 @@ impl Player {
     /// door a ruler click uses -- so a step while playing keeps playing, exactly
     /// as a click does. It starts from the frame the transport is showing, which
     /// past the end is the last one, and that is what lets a step back off EOS
-    /// revive the picture ([`Player::reset_after_reseek`] clears `done`). Both
+    /// revive the picture (the engine's seek leaves [`Transport::Ended`]). Both
     /// ends clamp, so the two go-to actions are this same step asked for more
     /// frames than the timeline has. Selection is untouched: a seek is not an
     /// edit, and nothing it does moves a clip index.
     fn step(&mut self, frames: i64, cx: &mut Context<Self>) {
+        let ended = self.transport() == Transport::Ended;
         let Some(session) = &self.session else {
             return;
         };
         let last = ((session.timeline_duration() * self.fps).round() as i64 - 1).max(0);
-        let now = match self.done {
+        let now = match ended {
             true => last,
             false => i64::from(frame_at(session.now(), self.fps)),
         };
@@ -2554,12 +2623,11 @@ impl Player {
         }
     }
 
-    /// Where the playhead is, as the panel draws it. The clock keeps running
-    /// after the last frame (wall time takes over at audio EOF) while the
-    /// picture is frozen, so what the UI shows is the clamped one, pinned to
-    /// the out-point once playback is done.
+    /// Where the playhead is, as the panel draws it: pinned to the out point
+    /// once playback is done, and clamped to the drawn duration otherwise -- a
+    /// tail being dragged draws past the timeline it is about to become.
     fn playhead(&self, duration: f64) -> f64 {
-        if self.done {
+        if self.transport() == Transport::Ended {
             duration
         } else {
             self.session
@@ -2754,11 +2822,11 @@ impl Player {
         self.export_path = PathBuf::new();
         self.project_path = PathBuf::new();
         self.fps = 30.;
-        // No decoder to wait for a frame from: the hint is what shows.
+        // No decoder to wait for a frame from: the hint is what shows. The
+        // transport reads `Stopped` from the session being gone, so there is no
+        // end-of-stream state left to clear here.
         self.reset_after_reseek();
         self.pending_seek = false;
-        self.eos = false;
-        self.done = false;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -3174,11 +3242,11 @@ impl Player {
             return;
         }
         // Nothing to play is a message, not a transport state. An empty
-        // timeline is `done` from its one black frame onward, so the restart
-        // below would start a clock against a zero-length timeline -- and it is
-        // `done` again by the next repaint, so no later press could ever stop
-        // it: the button would read "Pause" and never pause. A delete can empty
-        // the timeline mid-play, and that press must still stop it.
+        // timeline is [`Transport::Ended`] from its one black frame onward, so
+        // the restart below would start a clock against a zero-length timeline
+        // -- and it is Ended again by the next repaint, so no later press could
+        // ever stop it: the button would read "Pause" and never pause. A delete
+        // can empty the timeline mid-play, and that press must still stop it.
         if nothing_to_play(self.session.as_ref()) {
             match self.session.as_mut().filter(|s| s.is_playing()) {
                 Some(session) => session.pause(),
@@ -3187,15 +3255,25 @@ impl Player {
             cx.notify();
             return;
         }
-        if self.done {
-            self.seek(0., cx);
-            if let Some(session) = &mut self.session {
-                session.play();
+        match self.transport() {
+            // Nothing open: the button is dimmed and the key says nothing.
+            Transport::Stopped => {}
+            // Back to the top and away, for the key and the button alike --
+            // whichever asked, the transport was showing Play.
+            state if state.restarts() => {
+                self.seek(0., cx);
+                if let Some(session) = &mut self.session {
+                    session.play();
+                }
             }
-        } else if let Some(session) = &mut self.session {
-            session.toggle();
-            // Past EOF nothing else asks for a repaint.
-            cx.notify();
+            _ => {
+                if let Some(session) = &mut self.session {
+                    session.toggle();
+                    // A paused timeline animates nothing; this is the repaint
+                    // that puts the new glyph up.
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -3412,11 +3490,9 @@ impl Render for Player {
             window.set_window_title(&title);
             self.titled = title;
         }
-        // No shadow flag: the clock is the only truth about play state.
-        let playing = self
-            .session
-            .as_ref()
-            .is_some_and(PlaybackSession::is_playing);
+        // No shadow flag: the session is the only truth about play state, and
+        // [`Player::transport`] is the one place it is read.
+        let state = self.transport();
         // A paused timeline has nothing to animate; the toggle handlers notify,
         // which is what starts the loop again. A paused seek keeps the loop
         // running by itself until `pump` has the frame it asked for. An export
@@ -3424,7 +3500,7 @@ impl Render for Player {
         // the screen on a repaint. A notice does not: it waits to be dismissed
         // rather than for a clock, so keeping the loop alive for it would spin
         // the GPU until someone answered it.
-        if (playing && !self.done) || self.pending_seek || self.export.is_some() {
+        if state.is_playing() || self.pending_seek || self.export.is_some() {
             window.request_animation_frame();
         }
 
@@ -3889,7 +3965,7 @@ impl Render for Player {
             // Above the panel and only when there is one to show, so it costs
             // the picture nothing the rest of the time.
             .children(self.notice_bar(cx))
-            .child(self.panel(position, duration, playing, cx))
+            .child(self.panel(position, duration, state, cx))
             // Over the panel it was opened on, and under the cards: it is only
             // ever up while neither of them is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
@@ -4210,7 +4286,7 @@ impl Player {
         &self,
         position: f64,
         duration: f64,
-        playing: bool,
+        state: Transport,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Where the playhead is *on the bed*, which at the fit is where along
@@ -4224,7 +4300,7 @@ impl Player {
         let exporting = self.exporting().is_some();
         // Everything but Import and Keys needs a timeline to act on: with none
         // open they are dimmed rather than silently doing nothing.
-        let live = self.session.is_some() && !exporting;
+        let live = state != Transport::Stopped && !exporting;
         // The project's own picture size, for the button that cycles it: read
         // per render like everything else here, so a cycle shows on the button
         // that made it.
@@ -4270,7 +4346,7 @@ impl Player {
             // of this line is what a narrow window truncates.
             (
                 join_detail(
-                    &self.live_decode(position, playing),
+                    &self.live_decode(position, state.is_playing()),
                     &format!(
                         "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
                          import",
@@ -4309,9 +4385,9 @@ impl Player {
                     .overflow_x_scroll()
                     .child(control(
                         "transport",
-                        Some(transport_glyph(playing).into_any_element()),
-                        if playing { "Pause" } else { "Play" },
-                        if nothing_to_play(self.session.as_ref()) && !playing {
+                        Some(transport_glyph(state).into_any_element()),
+                        if state.is_playing() { "Pause" } else { "Play" },
+                        if nothing_to_play(self.session.as_ref()) && !state.is_playing() {
                             format!("{} — put a clip on a lane first", key(ActionId::Play))
                         } else {
                             key(ActionId::Play)
@@ -4321,7 +4397,7 @@ impl Player {
                         // against nothing (the key press answers with the
                         // notice). Still live while it *is* playing: a delete
                         // can empty the timeline mid-play and that has to stop.
-                        live && (playing || !nothing_to_play(self.session.as_ref())),
+                        live && (state.is_playing() || !nothing_to_play(self.session.as_ref())),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
                     .child(separator())
@@ -8814,9 +8890,12 @@ fn empty_hint() -> impl IntoElement {
         )
 }
 
-/// Two bars while playing, a triangle while paused. Drawn, so there is no icon
-/// font and no glyph coverage to depend on.
-fn transport_glyph(playing: bool) -> impl IntoElement {
+/// Two bars while playing, a triangle in every other state -- paused, nothing
+/// open, and played out, where the button's next act is to start over rather
+/// than to stop something. Drawn, so there is no icon font and no glyph
+/// coverage to depend on.
+fn transport_glyph(state: Transport) -> impl IntoElement {
+    let playing = state.is_playing();
     div()
         .flex()
         .items_center()
@@ -8872,15 +8951,15 @@ mod tests {
         KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
         LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
         PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS,
-        WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
+        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Transport, VOLUME_W, Volume,
+        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
         clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
         estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
         fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
         keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
         project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
+        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{
         LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
@@ -8909,7 +8988,7 @@ mod tests {
     use gpui::{Bounds, Pixels, point, px, size};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn asset(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -10762,6 +10841,95 @@ mod tests {
         assert_eq!(volume.gain(), 0.75);
     }
 
+    /// The whole transport in one place: the clock keeps running past the last
+    /// frame (wall time takes over at audio EOF), so "the clock is going" is
+    /// not "this is playing" -- and a button that read the clock showed Pause
+    /// on a timeline that had stopped moving. Ended is its own state, it draws
+    /// Play, and the next press starts over from the top.
+    #[test]
+    fn a_played_out_timeline_is_not_playing_and_the_next_press_starts_it_over() {
+        assert_eq!(transport(true, false), Transport::Playing);
+        assert_eq!(transport(false, false), Transport::Paused);
+        // The transition the bug was about: the clock is still running and the
+        // decoder is finished. Played out wins, however the clock reads.
+        assert_eq!(transport(true, true), Transport::Ended);
+        assert_eq!(transport(false, true), Transport::Ended);
+
+        // What the button draws, in each state. Two bars only while it moves.
+        assert!(Transport::Playing.is_playing());
+        for state in [Transport::Paused, Transport::Ended, Transport::Stopped] {
+            assert!(!state.is_playing(), "{state:?} must draw the Play triangle");
+        }
+
+        // And what a press does: start over at the end, plain toggle before it,
+        // nothing with no timeline. Same answer for the key and the button --
+        // both come through `Player::toggle_or_restart`.
+        assert!(Transport::Ended.restarts());
+        for state in [Transport::Playing, Transport::Paused, Transport::Stopped] {
+            assert!(!state.restarts(), "{state:?} must toggle, not reseek");
+        }
+    }
+
+    /// The half of `Ended` the eye cannot see: the clock. Wall time takes over
+    /// at the last frame and nothing used to stop it, so the playhead walked off
+    /// the end of the timeline in real time -- and the playhead is what a cut, a
+    /// paste, an insert and the analyser all act at. `pump` pauses on the
+    /// crossing; this is the engine contract that rests on, driven exactly as
+    /// the pump drives it.
+    #[test]
+    fn the_clock_stops_where_the_timeline_does_and_the_end_still_restarts() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Start a breath short of the end: the tail is what this is about, and
+        // playing the whole five seconds would say nothing more.
+        session.seek(4.8);
+        session.play();
+
+        // The pump's own loop -- tick, drain, ask where the transport is --
+        // with a deadline so a fixture that will not decode fails as a failure
+        // rather than as a hang.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut state = transport(session.is_playing(), session.is_eos());
+        while state != Transport::Ended {
+            assert!(Instant::now() < deadline, "never reached the end of a 5s file");
+            session.tick();
+            while session.try_frame().is_some() {}
+            state = transport(session.is_playing(), session.is_eos());
+        }
+
+        // What `pump` does on the crossing, and the whole point of it: the
+        // position holds still afterwards instead of counting on past the end,
+        // and it holds still *on the out point* -- where the timecode and the
+        // playhead have been showing it. The clock at the moment the end is
+        // recognised is not that: a slow renderer reaches EOF with the clock
+        // seconds past the timeline, which is why this repositions rather than
+        // only freezing.
+        session.halt_at_end();
+        let stopped_at = session.now();
+        assert_eq!(stopped_at, session.timeline_duration());
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(session.now(), stopped_at, "the clock kept running past EOF");
+        // And it is still the end: pausing must not spend the state the glyph
+        // and the restart both read.
+        assert!(session.is_eos());
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Ended
+        );
+
+        // The restart path off that frozen end, which is what the button and
+        // the play key do from `Ended`: back to the top, and running.
+        session.seek(0.);
+        session.play();
+        assert!(!session.is_eos(), "a seek revives the session");
+        assert!(session.now() < 1.0);
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Playing
+        );
+        session.pause();
+    }
+
     /// Both ends hold under a key held down: the ABI only accepts `0.0..=1.0`,
     /// and a wrapped step count would hand it something else.
     #[test]
@@ -11725,8 +11893,6 @@ fn main() {
                     name: name.clone(),
                     image: None,
                     held: None,
-                    eos: false,
-                    done: false,
                     ruler: Rc::default(),
                     // The whole timeline across the bed, which is where a
                     // project opens: zooming is something the user asks for.
