@@ -11,6 +11,7 @@ pub mod edith;
 pub mod eq;
 pub mod export;
 pub mod hw;
+pub mod limiter;
 pub mod mux;
 pub mod playback;
 pub mod project;
@@ -27,7 +28,7 @@ pub use demux::{Codec, VideoMeta};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
 pub use playback::PlaybackSession;
-pub use project::{Clip, Project, Speed};
+pub use project::{Clip, Project, Rate, Speed};
 
 /// Whether a path names a standalone audio file -- a source with no picture,
 /// which belongs on the audio lane and nowhere else. Extension only, lowercased:
