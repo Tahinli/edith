@@ -5328,11 +5328,17 @@ impl Player {
     /// `None` -- no element at all -- while the toggle is off, with no track
     /// picked, and between cues: the picture is what this window is for, and a
     /// permanent empty band across it would be in the way of exactly that.
+    ///
+    /// The cues are the *timeline's* ([`PlaybackSession::timeline_cues`]) and
+    /// not the track's own: on a cut timeline an embedded track's cues ride the
+    /// pictures they belong to, and this is the same map the export writes the
+    /// file with -- so what is read here is what the file says.
     fn subtitle_overlay(&self, at: f64) -> Option<impl IntoElement + use<>> {
         if !self.subs_on {
             return None;
         }
-        let cues = cues_at(&self.subtitle_track()?.cues, at);
+        let mapped = self.session.as_ref()?.timeline_cues(self.sub_track);
+        let cues = cues_at(&mapped, at);
         if cues.is_empty() {
             return None;
         }
@@ -8392,7 +8398,17 @@ impl Player {
             ),
         }
         .into();
-        let cues: Vec<(f32, f32)> = track.cues.iter().map(|cue| cue_box(scale, cue)).collect();
+        // Where the cues are on *this* timeline and not in the file they came
+        // from ([`PlaybackSession::timeline_cues`]) -- the same map the plate
+        // over the picture and the export both go through, which is what keeps
+        // a mark under the take it is spoken over after a cut.
+        let cues: Vec<(f32, f32)> = self
+            .session
+            .as_ref()?
+            .timeline_cues(self.sub_track)
+            .iter()
+            .map(|cue| cue_box(scale, cue))
+            .collect();
         Some(
             div()
                 .flex_none()
@@ -15317,6 +15333,45 @@ mod tests {
         };
         assert!(subtitle_detail(&refused).contains("pictures"));
         assert!(cues_at(&refused.cues, 1.).is_empty());
+
+        // ...and what the plate and the strip draw after a *cut*: the timeline's
+        // own clock, asked of the engine through the very map an export writes
+        // the file with (`PlaybackSession::timeline_cues`), so the preview and
+        // the file cannot drift apart. The numbers are the export's own
+        // (`export::a_subtitle_file_beside_the_media_keeps_the_timelines_own_
+        // clock`): 0.5s..2.5s rippled out of a five-second timeline leaves
+        // three seconds, which clips the second cue and takes the third away
+        // altogether -- while the track itself still holds all three, which is
+        // exactly why the drawing may not read them straight.
+        let lanes = session.lanes();
+        session
+            .cut_regions(&[(15, 60)], &lanes)
+            .expect("cut 0.5s..2.5s out");
+        assert_eq!(session.timeline_duration(), 3.0);
+        assert_eq!(session.subtitles()[0].cues.len(), 3, "the track is untouched");
+        let mapped = session.timeline_cues(0);
+        assert_eq!(
+            mapped
+                .iter()
+                .map(|c| (c.start_us, c.end_us))
+                .collect::<Vec<_>>(),
+            vec![(500_000, 1_500_000), (2_000_000, 3_000_000)]
+        );
+        // The overlay's own two lines, at the same moments as above.
+        let drawn = |t: f64| -> Vec<String> {
+            cues_at(&mapped, t)
+                .into_iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        assert_eq!(drawn(0.7), ["first line"]);
+        assert_eq!(drawn(2.5), ["second line\nwith a break"]);
+        assert!(
+            drawn(4.2).is_empty(),
+            "a cue past the cut end is drawn where the file writes none"
+        );
+        // ...and the strip's: the second cue is one second wide now, not 1.25.
+        assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
     }
 
     #[test]
