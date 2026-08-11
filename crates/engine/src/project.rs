@@ -3063,7 +3063,7 @@ fn open_room(clips: &mut Vec<Clip>, at: u32, len: u32) {
 /// Absolute, symlink-resolved when the file is reachable; the path as given
 /// when it is not -- an unreadable path still deserves an index, it simply
 /// dedups by spelling.
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
