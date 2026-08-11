@@ -114,7 +114,7 @@ fn a_file_beside_the_media_and_a_track_inside_it_read_the_same() {
 fn a_pgs_track_is_read_as_pictures_and_the_erase_after_one_ends_it() {
     let dir = scratch("pgs");
     let file = dir.join("remux.mkv");
-    std::fs::write(&file, pgs_matroska()).expect("write the hand-made mkv");
+    std::fs::write(&file, pgs_matroska(pgs_display_set())).expect("write the hand-made mkv");
 
     let tracks = subtitle::of_matroska(&file).expect("the walk does not fail over them");
     assert_eq!(tracks.len(), 4, "every PGS track is listed");
@@ -126,11 +126,13 @@ fn a_pgs_track_is_read_as_pictures_and_the_erase_after_one_ends_it() {
     // track that names none is.
     assert_eq!(tracks[0].label, "eng");
     assert_eq!(tracks[3].label, "und");
-    // The three tracks with no blocks are tracks with no cues -- and a track
-    // with no cues is not a bitmap track as far as anything downstream knows.
+    // The three tracks with no blocks are tracks with no cues -- and still
+    // tracks of pictures, because that is the codec and not a count: one whose
+    // every display set is an erase would otherwise pass for text, and an
+    // export would promise to write words it has none of.
     for track in &tracks[1..] {
         assert_eq!(track.cues, Vec::new());
-        assert!(!track.is_bitmap());
+        assert!(track.is_bitmap(), "a PGS track with no cue is still PGS");
     }
 
     // Two blocks, one cue: the second composes no object, which is the disc
@@ -162,6 +164,29 @@ fn a_pgs_track_is_read_as_pictures_and_the_erase_after_one_ends_it() {
         rgba.chunks_exact(4).filter(|p| p[3] > 0).count(),
         4,
         "four painted pixels and no more"
+    );
+}
+
+/// The muxer that packs a display set and the erase after it into one block:
+/// the cue is still the picture. The sup handed to the decoder stops at the end
+/// of the first set that composes something, and without that cut the erase is
+/// the last word and the cue decodes to a canvas with nothing on it.
+#[test]
+fn a_block_holding_the_erase_after_the_picture_still_draws_the_picture() {
+    let dir = scratch("pgs_packed");
+    let file = dir.join("packed.mkv");
+    let packed = [pgs_display_set(), pgs_erase()].concat();
+    std::fs::write(&file, pgs_matroska(packed)).expect("write the hand-made mkv");
+
+    let tracks = subtitle::of_matroska(&file).expect("the walk");
+    let cue = &tracks[0].cues[0];
+    let image = cue.image.as_ref().expect("the packed block is still a picture");
+    assert_eq!((image.width, image.height), (8, 4));
+    let rgba = image.rgba().expect("it decodes");
+    assert_eq!(
+        rgba.chunks_exact(4).filter(|p| p[3] > 0).count(),
+        4,
+        "the picture, not the erase written after it"
     );
 }
 
@@ -279,7 +304,7 @@ fn a_project_keeps_a_bitmap_track_as_a_reference_and_reads_its_pictures_back() {
     let media = dir.join("test_av.mp4");
     std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
     let remux = dir.join("remux.mkv");
-    std::fs::write(&remux, pgs_matroska()).expect("write the hand-made mkv");
+    std::fs::write(&remux, pgs_matroska(pgs_display_set())).expect("write the hand-made mkv");
 
     let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
     session.set_gain(0.0);
@@ -349,9 +374,9 @@ fn element(id: &[u8], body: &[u8]) -> Vec<u8> {
 }
 
 /// A Matroska file carrying four PGS subtitle tracks, the first of them with
-/// one display set and the erase that ends it. No `Info`, so the timestamp
-/// scale is the spec's default of a millisecond a tick.
-fn pgs_matroska() -> Vec<u8> {
+/// `first` in a block at 500 ms and the erase that ends it at 2 s. No `Info`,
+/// so the timestamp scale is the spec's default of a millisecond a tick.
+fn pgs_matroska(first: Vec<u8>) -> Vec<u8> {
     let mut tracks = Vec::new();
     for (number, language) in [(1u8, "eng"), (2, "fra"), (3, "spa"), (4, "")] {
         let mut entry = Vec::new();
@@ -371,7 +396,7 @@ fn pgs_matroska() -> Vec<u8> {
         element(&[0xA3], &body)
     };
     let mut cluster = element(&[0xE7], &[0x00]); // Timestamp: 0
-    cluster.extend(block(500, pgs_display_set()));
+    cluster.extend(block(500, first));
     cluster.extend(block(2000, pgs_erase()));
 
     let mut segment = element(&[0x16, 0x54, 0xAE, 0x6B], &tracks); // Tracks

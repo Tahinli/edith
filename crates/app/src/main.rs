@@ -5349,24 +5349,27 @@ impl Player {
     ///
     /// A cue off a PGS track is a *picture* and not a line
     /// ([`engine::subtitle::CueImage`]), and is drawn as one: the disc's whole
-    /// canvas laid over the whole picture region, which puts every cue where
-    /// the disc put it relative to its own frame, at the cost of the region and
-    /// that frame not being the same shape.
+    /// canvas fitted over the picture region exactly as the picture itself is,
+    /// which puts every cue where the disc put it relative to its own frame.
     ///
-    /// ponytail: that cost is a stretch -- a 2.39:1 encode in a 16:9 region
-    /// leaves the cue a little wide and a little low, because this maps the
-    /// canvas onto the region and not onto the letterboxed picture inside it.
-    /// The upgrade path is the picture's own rect, which wants `VideoMeta`'s
-    /// aspect and the measured bounds rather than a `relative()`.
+    /// ponytail: exact only while the canvas and the encode are the same shape
+    /// -- a 16:9 canvas over a 2.39:1 encode fits to the region's height and
+    /// the film to its width, so a cue sits a little low on a scope film. The
+    /// upgrade path is the picture's own rect, which wants `VideoMeta`'s aspect
+    /// and the measured bounds rather than the shared `Contain`.
     fn subtitle_overlay(
         &mut self,
         at: f64,
         window: &mut Window,
     ) -> Option<impl IntoElement + use<>> {
-        if !self.subs_on {
-            return None;
-        }
-        let mapped = self.session.as_ref()?.timeline_cues(self.sub_track);
+        // One way out, and it lets the drawn picture go on the way: the toggle
+        // going off, the file closing and the gap between two cues are the same
+        // "nothing on screen", and an 8 MB atlas tile may not survive any of
+        // them (an early return above this leaked one per toggle-off).
+        let mapped = match self.session.as_ref().filter(|_| self.subs_on) {
+            Some(session) => session.timeline_cues(self.sub_track),
+            None => Vec::new(),
+        };
         let cues = cues_at(&mapped, at);
         if cues.is_empty() {
             self.drop_sub_image(window);
@@ -5379,27 +5382,30 @@ impl Player {
             .iter()
             .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
             .and_then(|(start_us, image)| self.sub_picture(start_us, image, window));
+        // A picture is fitted onto the whole region and a plate hangs off the
+        // bottom of it, and a track is one or the other -- so they are two
+        // shapes and not one with the parts switched off.
+        if let Some(image) = picture {
+            // A *flex* box with the canvas as its one growing item: a percentage
+            // size (`size_full`) inside an absolutely placed box has nothing to
+            // be a percentage of and lays the picture out to nothing, while a
+            // flex item is sized by the box itself. Fitted the way the picture
+            // above it is -- `Contain` over the same box -- so a canvas of the
+            // picture's own shape lands exactly on it.
+            return Some(div().absolute().inset_0().flex().child(
+                img(image).flex_1().h_full().object_fit(gpui::ObjectFit::Contain),
+            ));
+        }
         Some(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                // A picture is placed on its own canvas and a plate is placed on
-                // the region, so the picture takes the whole of it.
-                .when(picture.is_some(), |d| d.top_0().bottom_0())
-                .when(picture.is_none(), |d| d.bottom(px(SUB_BOTTOM)))
+                .bottom(px(SUB_BOTTOM))
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(2.))
-                .children(picture.map(|image| {
-                    img(image)
-                        .size_full()
-                        // Stretched, not fitted: the canvas *is* the frame the
-                        // disc composed against, so its corners are the frame's
-                        // corners and fitting it would move every cue.
-                        .object_fit(gpui::ObjectFit::Fill)
-                }))
                 // The plate takes no click: the picture behind it is still the
                 // drop target the whole window is.
                 .children(cues.into_iter().filter(|c| c.image.is_none()).map(|cue| {
@@ -15513,6 +15519,7 @@ mod tests {
             track: Some(1),
             label: "eng".into(),
             cues: Vec::new(),
+            bitmap: false,
             refused: Some("S_HDMV/PGS subtitles are pictures, not text".into()),
         };
         assert!(subtitle_detail(&refused).contains("pictures"));
