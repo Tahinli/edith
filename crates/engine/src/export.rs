@@ -1,6 +1,13 @@
-//! Export: the edit list rendered back out as one mp4 (H.264 or AV1) or one
-//! AV1-in-Matroska — or, picture left behind, as one WAV, FLAC or MP3 of the
-//! timeline's audio alone.
+//! Export: the edit list rendered back out as one mp4 (H.264, AV1 or HEVC) or
+//! one Matroska file (AV1 or HEVC) — or, picture left behind, as one WAV, FLAC
+//! or MP3 of the timeline's audio alone.
+//!
+//! The HEVC pair is **intra-only**, and says so wherever it is offered: every
+//! frame is a self-contained IDR from the vendored `oxideav-h265`, which is the
+//! only shape of a pure-Rust HEVC encode fast enough to wait for (its inter
+//! modes code 1080p at 0.81 fps across 12 cores against the intra path's 4.30).
+//! That makes it an intraframe master in the family of ProRes and DNxHD — large
+//! files, every frame a cut point — and not a delivery codec.
 //!
 //! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
 //! is impossible — while audio is copied packet for packet wherever a copy can
@@ -55,7 +62,7 @@ use flacenc::error::Verify;
 use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
-use crate::mux::{AudioParams, Av1Params, MkvMuxer, Mp4Muxer, VideoParams};
+use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, VideoParams};
 use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
 
@@ -73,15 +80,30 @@ const MAX_BITRATE: u64 = 20_000_000;
 /// on a build with no assembly, which is what this one is.
 const AV1_SPEED: u8 = 10;
 
-/// What an export writes. H.264-in-mp4 and AV1 -- in Matroska or in mp4, the
-/// user's pick of container -- are the only *video* pairs with both an encoder
-/// and a decoder under this project's no-install rule, and WAV, FLAC and MP3 are
-/// the standalone audio formats with a pure-Rust encoder: `hound`, `flacenc` and
-/// `rusty_mp3`. Vorbis and Opus have none. (AAC does -- `rusty_aac`, which is
-/// what a re-encoded video track's sound leaves through -- but AAC is a
-/// container's own audio, never a file of its own here.) HEVC and VP9 have no
-/// encoder here at all (`hevc`/`vp9` import through the plugin and stop there).
-/// A front-end says so rather than hiding the rows.
+/// The HEVC coding tree block this encoder is fixed at: the coded picture is a
+/// whole number of them, which is what the conformance window crops back.
+const CTB: usize = 16;
+/// How many frames the intra HEVC encoder codes at once. Twelve is where the
+/// 2026-08-11 bench stopped scaling on this box (4.30 fps at 1080p); more lanes
+/// only holds more decoded frames in memory.
+const HEVC_LANES: usize = 12;
+/// Bits per pixel the intra encoder spends at QP 27, measured on the same bench:
+/// 0.607 at 720p and 0.586 at 1080p. What [`hevc_qp`] maps a bitrate row through.
+const HEVC_BPP_AT_27: f64 = 0.6;
+/// The band [`hevc_qp`] is clamped into, for the reason stated there.
+const HEVC_QP_MIN: i32 = 22;
+const HEVC_QP_MAX: i32 = 40;
+
+/// What an export writes. H.264-in-mp4, AV1 and HEVC -- each of the last two in
+/// Matroska or in mp4, the user's pick of container -- are the *video* pairs
+/// with both an encoder and a decoder under this project's no-install rule, and
+/// WAV, FLAC and MP3 are the standalone audio formats with a pure-Rust encoder:
+/// `hound`, `flacenc` and `rusty_mp3`. Vorbis and Opus have none. (AAC does --
+/// `rusty_aac`, which is what a re-encoded video track's sound leaves through --
+/// but AAC is a container's own audio, never a file of its own here.) VP9 is the
+/// one codec left that comes in through the plugin and stops there, HEVC having
+/// gained an encoder (an intra-only one, which the rows say). A front-end says
+/// so rather than hiding the row.
 ///
 /// **Every video format carries sound.** Which way it carries it is the only
 /// difference: copied packet for packet where a copy can say what the timeline
@@ -103,6 +125,14 @@ pub enum Format {
     /// ([`crate::mux::Mp4Muxer::create_av1`]); the sound is the mp4 path's own,
     /// unchanged.
     Av1Mp4,
+    /// HEVC in Matroska, **intra-only**: every frame is a self-contained IDR
+    /// picture ([`Enc::open_hevc`]), which is what makes a pure-Rust HEVC
+    /// encoder fast enough to be an export at all. An intraframe master, like
+    /// ProRes or DNxHD -- large files, and every frame a cut point.
+    Hevc,
+    /// The same HEVC stream in an mp4 (`hvc1`), for everything that plays mp4
+    /// and not Matroska -- the AV1 pair's split, for the same reason.
+    HevcMp4,
     /// The audio lanes alone, 16-bit PCM.
     Wav,
     /// The audio lanes alone, losslessly compressed.
@@ -116,8 +146,8 @@ impl Format {
     /// the destination path from it, so the name never disagrees with the bytes.
     pub fn ext(self) -> &'static str {
         match self {
-            Self::Mp4 | Self::Av1Mp4 => "mp4",
-            Self::Av1 => "mkv",
+            Self::Mp4 | Self::Av1Mp4 | Self::HevcMp4 => "mp4",
+            Self::Av1 | Self::Hevc => "mkv",
             Self::Wav => "wav",
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
@@ -127,7 +157,10 @@ impl Format {
     /// Whether this format carries the picture. The bitrate settings are video
     /// settings and mean nothing to the audio-only ones.
     pub fn has_video(self) -> bool {
-        matches!(self, Self::Mp4 | Self::Av1 | Self::Av1Mp4)
+        matches!(
+            self,
+            Self::Mp4 | Self::Av1 | Self::Av1Mp4 | Self::Hevc | Self::HevcMp4
+        )
     }
 
     /// Whether the picture in it is AV1 rather than H.264 -- which encoder runs
@@ -137,12 +170,20 @@ impl Format {
         matches!(self, Self::Av1 | Self::Av1Mp4)
     }
 
+    /// The same question for HEVC, and the same answer for both its containers:
+    /// one encoder, two boxes to put its stream in.
+    fn is_hevc(self) -> bool {
+        matches!(self, Self::Hevc | Self::HevcMp4)
+    }
+
     /// What the format is called where a refusal names it.
     pub fn name(self) -> &'static str {
         match self {
             Self::Mp4 => "an mp4",
             Self::Av1 => "an AV1 Matroska",
             Self::Av1Mp4 => "an AV1 mp4",
+            Self::Hevc => "an HEVC Matroska",
+            Self::HevcMp4 => "an HEVC mp4",
             Self::Wav => "a WAV",
             Self::Flac => "a FLAC",
             Self::Mp3 => "an MP3",
@@ -339,6 +380,11 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
     let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate).ok()?;
     let bitrate = bitrate_of(meta, settings);
     match settings.format {
+        // The HEVC pair is software only, and not for want of a GPU: the plugin
+        // has no HEVC *encode* entry point at all (`hw::HwEncoder` opens H.264
+        // and AV1), so there is no seat to probe. Said here rather than left to
+        // a failed open, which would read as a driver refusal.
+        format if format.is_hevc() => None,
         // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
         // AV1 formats sit on it: the container is not the encoder's business.
         format if format.is_av1() && !forced("VE_HW_AV1") => None,
@@ -355,10 +401,11 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
 /// place, so what a card says before an export and what its progress line says
 /// during one cannot drift apart.
 fn video_label(format: Format, hw: bool) -> &'static str {
-    match (format.is_av1(), hw) {
+    match (format, hw) {
         (_, true) => "HW encode (VA-API)",
-        (true, false) => "SW encode (rav1e)",
-        (false, false) => "SW encode (rusty_h264)",
+        (Format::Hevc | Format::HevcMp4, false) => "SW encode (oxideav-h265 intra)",
+        (Format::Av1 | Format::Av1Mp4, false) => "SW encode (rav1e)",
+        (_, false) => "SW encode (rusty_h264)",
     }
 }
 
@@ -936,9 +983,7 @@ fn run_audio(
         Format::Wav => write_wav(out, &samples, &audio)?,
         Format::Flac => write_flac(out, &samples, &audio)?,
         Format::Mp3 => write_mp3(out, &samples, &audio)?,
-        Format::Mp4 | Format::Av1 | Format::Av1Mp4 => {
-            unreachable!("the picture formats are `run`")
-        }
+        _ => unreachable!("the picture formats are `run`"),
     }
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
@@ -1105,6 +1150,60 @@ fn write_video(
     au: &[u8],
     key: bool,
 ) -> crate::Result<()> {
+    if settings.format.is_hevc() {
+        // The parameter sets are in the access unit -- every intra AU carries
+        // VPS, SPS and PPS -- and the record built from them is what *both*
+        // containers declare the track with: an mp4's `hvcC` box and a
+        // Matroska `CodecPrivate` are the same bytes, so the two files are one
+        // stream written twice rather than two.
+        let sample =
+            crate::mux::annex_b_to_hvcc(au).ok_or("a coded HEVC unit with no slice in it")?;
+        if settings.format == Format::Hevc {
+            let muxer = match muxer {
+                Some(Muxer::Mkv(mkv)) => mkv,
+                Some(Muxer::Mp4(_)) => unreachable!("the format picks the muxer once"),
+                none => {
+                    let hvcc = hevc_params(au)?;
+                    let sound = audio.zip(packets.take());
+                    let Muxer::Mkv(mkv) = none.insert(Muxer::Mkv(MkvMuxer::create_hevc(
+                        out,
+                        &HevcParams {
+                            width: meta.width,
+                            height: meta.height,
+                            frame_rate: meta.frame_rate,
+                            hvcc: &hvcc,
+                        },
+                        sound,
+                    )?)) else {
+                        unreachable!("just inserted a Matroska muxer")
+                    };
+                    mkv
+                }
+            };
+            return muxer.write_frame(&sample, key);
+        }
+        let muxer = match muxer {
+            Some(Muxer::Mp4(mp4)) => mp4,
+            Some(Muxer::Mkv(_)) => unreachable!("the format picks the muxer once"),
+            none => {
+                let hvcc = hevc_params(au)?;
+                let Muxer::Mp4(mp4) = none.insert(Muxer::Mp4(Mp4Muxer::create_hevc(
+                    out,
+                    &HevcParams {
+                        width: meta.width,
+                        height: meta.height,
+                        frame_rate: meta.frame_rate,
+                        hvcc: &hvcc,
+                    },
+                    audio,
+                )?)) else {
+                    unreachable!("just inserted an mp4 muxer")
+                };
+                mp4
+            }
+        };
+        return muxer.write_coded_sample(&sample, key);
+    }
     if settings.format.is_av1() {
         // Every AV1 stream opens on a keyframe, and a keyframe carries the
         // sequence header the track has to declare: an encoder that handed back
@@ -1153,7 +1252,7 @@ fn write_video(
                 mp4
             }
         };
-        return muxer.write_av1_frame(au, key);
+        return muxer.write_coded_sample(au, key);
     }
     if !crate::mux::has_coded_slice(au) {
         return Ok(());
@@ -1181,6 +1280,13 @@ fn write_video(
         }
     };
     muxer.write_video_au(au)
+}
+
+/// The `hvcC` record of the first coded unit, or the refusal by name. Split out
+/// because both HEVC containers ask it in the same words.
+fn hevc_params(au: &[u8]) -> crate::Result<Vec<u8>> {
+    crate::mux::hvcc_record(au)
+        .ok_or_else(|| crate::Error::from("the first coded picture carries no HEVC VPS/SPS/PPS"))
 }
 
 fn bitrate_for(meta: &VideoMeta) -> u64 {
@@ -1219,6 +1325,38 @@ enum Enc {
         au: Vec<u8>,
         flushed: bool,
     },
+    /// HEVC, intra-only and software only: `encode_idr_intra_au_cropped` is a
+    /// *stateless* function of one picture, so a batch of frames is coded on as
+    /// many cores as there are lanes and collected back in order.
+    Hevc(HevcEnc),
+}
+
+/// The intra HEVC seat. Frames arrive one at a time (the export walk is one
+/// picture per timeline frame) and are held until there are [`lanes`] of them,
+/// then coded in parallel and queued in **display order** -- fanning out is the
+/// only thing that makes a pure-Rust HEVC export bearable (4.30 fps at 1080p on
+/// 12 lanes against 0.55 fps on one, measured 2026-08-11), and an export whose
+/// frames came back shuffled would be no export at all.
+///
+/// ponytail: a batch of padded planes sits in memory (~3 MB a frame at 1080p,
+/// so ~37 MB at 12 lanes) and the tail of a timeline is coded on fewer lanes
+/// than the middle. Upgrade path is a pipeline that keeps every lane fed from a
+/// decoder running ahead of the encoder rather than a batch barrier.
+struct HevcEnc {
+    /// Padded I420 planes waiting for a lane, in display order.
+    pending: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    /// Coded access units not yet collected, in the same order.
+    ready: std::collections::VecDeque<Vec<u8>>,
+    /// The unit currently lent out, for the reason `Sw` owns one.
+    au: Vec<u8>,
+    /// The *coded* size: the picture's, rounded up to the 16-sample CTB grid.
+    width: usize,
+    height: usize,
+    /// Luma samples the conformance window crops off the right and the bottom,
+    /// so a decoder outputs the picture's own size ([`pad_to_ctb`]).
+    crop: (usize, usize),
+    qp: i32,
+    lanes: usize,
 }
 
 impl Enc {
@@ -1231,14 +1369,18 @@ impl Enc {
             Self::Sw { .. } => video_label(Format::Mp4, false),
             Self::Av1Hw(_) => video_label(Format::Av1, true),
             Self::Av1Sw { .. } => video_label(Format::Av1, false),
+            Self::Hevc(_) => video_label(Format::Hevc, false),
         }
     }
 
     fn open(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
         // Which *codec* the picture is, not which container it goes in: both AV1
-        // formats run the same encoder.
+        // formats run the same encoder, and so do both HEVC ones.
         if settings.format.is_av1() {
             return Self::open_av1(meta, settings);
+        }
+        if settings.format.is_hevc() {
+            return Self::open_hevc(meta, settings);
         }
         // A caller's number goes through the same clamp as the computed one: a
         // zero bitrate switches the software encoder's lookahead on, which would
@@ -1331,6 +1473,53 @@ impl Enc {
         })
     }
 
+    /// The intra HEVC seat, software and frame-parallel. There is no hardware
+    /// half: the plugin encodes H.264 and AV1 and nothing else, which
+    /// [`hw_seat`] says by refusing to probe one.
+    ///
+    /// **Intra-only, deliberately.** The vendored encoder's inter modes code
+    /// 1080p at 0.81 fps across 12 cores (measured 2026-08-11) -- a minute of
+    /// timeline in half an hour, which is not an export anybody waits for --
+    /// while the intra path does 4.30 fps on the same picture and the same
+    /// cores. So every frame is an IDR, the file is an intraframe master in the
+    /// shape of ProRes or DNxHD, and the card says so where a user picks it.
+    ///
+    /// The picture is coded **padded** to the 16-sample CTB grid and the SPS
+    /// crops it back ([`pad_to_ctb`], the vendored conformance-window patch), so
+    /// 1920x1080 is a legal export rather than a refusal.
+    fn open_hevc(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
+        // The muxers time by it and the mp4 one wants an exact rational: asked
+        // here so an impossible rate fails before a frame is coded.
+        crate::mux::frame_timing(meta.frame_rate)?;
+        // 4:2:0 addresses its conformance window in *chroma* samples, so an odd
+        // picture cannot be cropped back to itself -- and an odd dimension has
+        // no chroma plane of its own to begin with. Named rather than padded to
+        // something a decoder would then show a column of.
+        if meta.width % 2 != 0 || meta.height % 2 != 0 {
+            return Err(format!(
+                "{}x{} cannot be written as HEVC: 4:2:0 needs even dimensions",
+                meta.width, meta.height
+            )
+            .into());
+        }
+        let (width, height) = (
+            (meta.width as usize).next_multiple_of(CTB),
+            (meta.height as usize).next_multiple_of(CTB),
+        );
+        let lanes = std::thread::available_parallelism().map_or(1, |n| n.get());
+        eprintln!("export encoder: software HEVC intra (oxideav-h265)");
+        Ok(Self::Hevc(HevcEnc {
+            pending: Vec::new(),
+            ready: std::collections::VecDeque::new(),
+            au: Vec::new(),
+            width,
+            height,
+            crop: (width - meta.width as usize, height - meta.height as usize),
+            qp: hevc_qp(meta, settings),
+            lanes: lanes.min(HEVC_LANES),
+        }))
+    }
+
     /// One picture in, at most one access unit out, and whether that unit is one
     /// a decoder may be started from -- which only the Matroska muxer asks, the
     /// mp4 one reading its own sync flag off the IDR slice.
@@ -1373,6 +1562,23 @@ impl Enc {
                 collect_av1(context, ready)?;
                 Ok(pop_av1(ready, au))
             }
+            Self::Hevc(hevc) => {
+                hevc.pending.push(pad_to_ctb(
+                    y,
+                    u,
+                    v,
+                    width as usize,
+                    height as usize,
+                    hevc.width,
+                    hevc.height,
+                ));
+                if hevc.pending.len() >= hevc.lanes {
+                    hevc.code_batch()?;
+                }
+                // Every intra AU is an IDR, so every one of them is a key
+                // frame -- which is what an intraframe master means.
+                Ok(pop_hevc(hevc))
+            }
             Self::Hw(hw) => Ok(hw
                 .encode(y, u, v, width, height, false)?
                 .map(|au| (au, false))),
@@ -1412,6 +1618,14 @@ impl Enc {
                 }
                 Ok(pop_av1(ready, au))
             }
+            Self::Hevc(hevc) => {
+                // The tail batch: fewer frames than lanes, coded on as many
+                // cores as there are frames left.
+                if !hevc.pending.is_empty() {
+                    hevc.code_batch()?;
+                }
+                Ok(pop_hevc(hevc))
+            }
             Self::Hw(hw) => Ok(hw.drain()?.map(|au| (au, false))),
             Self::Sw {
                 encoder,
@@ -1429,6 +1643,103 @@ impl Enc {
             }
         }
     }
+}
+
+impl HevcEnc {
+    /// The whole pending batch, one frame per lane, collected back in the order
+    /// it went out -- `std::thread::scope`, because the encode borrows the
+    /// planes rather than copying them again. A panic inside a lane comes back
+    /// as an error rather than unwinding the export thread.
+    fn code_batch(&mut self) -> crate::Result<()> {
+        let (width, height, qp, crop) = (self.width, self.height, self.qp, self.crop);
+        let coded: Vec<crate::Result<Vec<u8>>> = std::thread::scope(|scope| {
+            let lanes: Vec<_> = self
+                .pending
+                .iter()
+                .map(|(y, cb, cr)| {
+                    scope.spawn(move || {
+                        oxideav_h265::encoder::intra::encode_idr_intra_au_cropped(
+                            y, cb, cr, width, height, qp, crop.0, crop.1,
+                        )
+                        .map(|coded| coded.au)
+                        .map_err(|e| crate::Error::from(format!("HEVC intra encode: {e:?}")))
+                    })
+                })
+                .collect();
+            lanes
+                .into_iter()
+                .map(|lane| {
+                    lane.join()
+                        .unwrap_or_else(|_| Err("an HEVC encode lane panicked".into()))
+                })
+                .collect()
+        });
+        for au in coded {
+            self.ready.push_back(au?);
+        }
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+/// The oldest coded intra AU, lent out under the same "valid until the next
+/// call" contract [`pop_av1`] has. Every one of them is an IDR, so the key flag
+/// is not a guess.
+fn pop_hevc(hevc: &mut HevcEnc) -> Option<(&[u8], bool)> {
+    hevc.au = hevc.ready.pop_front()?;
+    Some((&hevc.au[..], true))
+}
+
+/// One I420 picture copied onto the padded plane sizes the CTB grid needs, the
+/// added rows and columns filled by **replicating the edge** rather than with
+/// black: the padding is coded and then cropped away, and a black border would
+/// bleed into the last real column through the intra prediction and the
+/// transform that straddles it.
+fn pad_to_ctb(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: usize,
+    height: usize,
+    padded_w: usize,
+    padded_h: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let plane = |src: &[u8], w: usize, h: usize, pw: usize, ph: usize| {
+        let mut out = vec![0u8; pw * ph];
+        for row in 0..ph {
+            let src_row = &src[row.min(h - 1) * w..][..w];
+            let dst = &mut out[row * pw..][..pw];
+            dst[..w].copy_from_slice(src_row);
+            dst[w..].fill(src_row[w - 1]);
+        }
+        out
+    };
+    (
+        plane(y, width, height, padded_w, padded_h),
+        plane(u, width / 2, height / 2, padded_w / 2, padded_h / 2),
+        plane(v, width / 2, height / 2, padded_w / 2, padded_h / 2),
+    )
+}
+
+/// The quantiser an intra HEVC export codes at, mapped from the *bitrate* row a
+/// user picked -- the card has no QP control and this codec has no rate control,
+/// so the two are joined by measurement rather than promised to each other.
+///
+/// The encoder codes ~0.6 bits per pixel at QP 27 ([`HEVC_BPP_AT_27`], measured
+/// on the 720p and 1080p benches to within 4% of each other), and a step of 6 QP
+/// is a factor of two in rate, which is the classic HEVC relation. So the QP
+/// that would land on a target is `27 + 6 * log2(0.6 / target)` -- and it is
+/// clamped, because this is a *quality* dial and not a rate controller: below QP
+/// 22 the file grows without a picture to show for it, and past QP 40 an
+/// intra-only frame goes blocky in a way no bitrate row asked for. A 1080p30
+/// timeline at the automatic 6.2 Mbps therefore codes at QP 40 and comes out
+/// bigger than that, which is what "intra-only, large files" on the format row
+/// means: the row buys quality, not a size.
+fn hevc_qp(meta: &VideoMeta, settings: &ExportSettings) -> i32 {
+    let pixels = f64::from(meta.width) * f64::from(meta.height) * meta.frame_rate;
+    let target = bitrate_of(meta, settings) as f64 / pixels.max(1.0);
+    let qp = 27.0 + 6.0 * (HEVC_BPP_AT_27 / target.max(f64::MIN_POSITIVE)).log2();
+    (qp.round() as i32).clamp(HEVC_QP_MIN, HEVC_QP_MAX)
 }
 
 /// Every temporal unit `rav1e` has finished, moved into the queue in display
@@ -1586,5 +1897,101 @@ mod tests {
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
         assert_eq!(bitrate_for(&meta(320, 240, 30.0)), MIN_BITRATE, "tiny");
         assert_eq!(bitrate_for(&meta(3840, 2160, 60.0)), MAX_BITRATE, "huge");
+    }
+
+    fn meta(width: u32, height: u32) -> VideoMeta {
+        VideoMeta {
+            width,
+            height,
+            frame_rate: 30.0,
+            frame_count: 1,
+            codec: crate::demux::Codec::H264,
+        }
+    }
+
+    /// The bitrate row a user picked, read as the quality tier it is: a higher
+    /// row is a lower QP, the band is honoured at both ends, and the same
+    /// picture at the same rate gets the same number whatever its size (the
+    /// mapping is bits per *pixel*, which is what makes 720p and 1080p one
+    /// table).
+    #[test]
+    fn the_quality_rows_map_onto_quantisers_that_only_go_one_way() {
+        let at = |width, height, mbps: Option<u64>| {
+            hevc_qp(
+                &meta(width, height),
+                &ExportSettings {
+                    bitrate: mbps.map(|m| m * 1_000_000),
+                    ..Default::default()
+                },
+            )
+        };
+        // 20 Mbps at 1080p30 is 0.32 bits a pixel against the 0.6 measured at
+        // QP 27, which is just over half: five QP up, and QP is not an
+        // arithmetic scale, so this is the number the formula gives.
+        assert_eq!(at(1920, 1080, Some(20)), 32);
+        // Every step down the card is a step up in QP, never sideways.
+        let rows: Vec<i32> = [20, 12, 8, 4, 2, 1]
+            .into_iter()
+            .map(|mbps| at(1920, 1080, Some(mbps)))
+            .collect();
+        assert!(
+            rows.windows(2).all(|w| w[0] <= w[1]),
+            "a lower bitrate row must never code at a lower QP: {rows:?}"
+        );
+        assert_eq!(*rows.last().unwrap(), HEVC_QP_MAX, "the floor is clamped");
+        // ...and the top of the range is the clamp, not an unbounded number: 20
+        // Mbps at 320x240 is 8.7 bits a pixel, which no picture needs.
+        assert_eq!(at(320, 240, Some(20)), HEVC_QP_MIN);
+        // The same bits per pixel is the same quantiser at any size: 1080p at
+        // 20 Mbps and 720p at 8.9 Mbps are one picture quality.
+        assert_eq!(at(1920, 1080, Some(20)), at(1280, 720, Some(9)));
+        // The automatic bitrate is 0.1 bpp at every size, so it is one QP
+        // everywhere -- the honest end of "intra-only, large files": the file
+        // will be bigger than the row says, and the row buys quality.
+        assert_eq!(at(1920, 1080, None), at(1280, 720, None));
+    }
+
+    /// The padding a non-%16 picture is coded with replicates the edge instead
+    /// of filling black: the coded rows past the picture carry its last row, so
+    /// nothing bleeds into the last real line through the intra prediction.
+    #[test]
+    fn the_ctb_padding_replicates_the_edge() {
+        // 6x2 luma, values 1..=12, padded to 8x4 (CTB is 16, so this checks the
+        // copy itself with numbers small enough to read).
+        let y: Vec<u8> = (1..=12).collect();
+        let u: Vec<u8> = vec![40, 41, 42];
+        let v: Vec<u8> = vec![50, 51, 52];
+        let (py, pu, pv) = pad_to_ctb(&y, &u, &v, 6, 2, 8, 4);
+        assert_eq!(
+            py,
+            vec![
+                1, 2, 3, 4, 5, 6, 6, 6, // the row, then its last sample twice
+                7, 8, 9, 10, 11, 12, 12, 12, //
+                7, 8, 9, 10, 11, 12, 12, 12, // the last row, replicated
+                7, 8, 9, 10, 11, 12, 12, 12,
+            ]
+        );
+        // Chroma is half of everything, padded the same way.
+        assert_eq!(pu, vec![40, 41, 42, 42, 40, 41, 42, 42]);
+        assert_eq!(pv, vec![50, 51, 52, 52, 50, 51, 52, 52]);
+    }
+
+    /// An odd picture cannot be cropped back to itself in 4:2:0 -- the
+    /// conformance window is stated in chroma samples -- so it is refused by
+    /// name rather than written a column wider than the timeline.
+    #[test]
+    fn an_odd_picture_is_refused_an_hevc_export_by_name() {
+        let settings = ExportSettings {
+            format: Format::Hevc,
+            ..Default::default()
+        };
+        let refused = Enc::open(&meta(1919, 1080), &settings)
+            .err()
+            .expect("an odd width has no chroma plane")
+            .to_string();
+        assert!(refused.contains("1919x1080"), "{refused}");
+        assert!(refused.contains("even"), "{refused}");
+        // ...and the even one it neighbours opens.
+        assert!(Enc::open(&meta(1920, 1080), &settings).is_ok());
     }
 }
