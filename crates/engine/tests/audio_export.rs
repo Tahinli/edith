@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::{LaneKind, Source, Speed};
+use engine::project::{Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::{AudioSession, Clip, ExportHandle, Project};
 
@@ -365,6 +365,126 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
 /// Cancel leaves nothing behind -- not the output, not the `.part`. The
 /// timeline is long enough (a minute of audio) that the escape lands mid-decode
 /// rather than after the file is already closed.
+/// What the two mix settings do to a *written file*, which is the only place
+/// the claim can be checked: a track's fader is that track's alone, and the
+/// master limiter holds the sum of them under its ceiling instead of letting it
+/// square off at full scale.
+///
+/// Four audio tracks of the same second, so the sum is four times one file and
+/// well past what a sample can hold. Measured as the peak of the WAV read back
+/// through the engine's own reader -- a level, not a shape, because that is
+/// exactly what a limiter promises.
+#[test]
+fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
+    let clip = Clip {
+        start: 0,
+        in_frame: 0,
+        out_frame: 30,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let four = || {
+        Project::from_parts(
+            vec![Source::new(asset("test_av.mp4"), 0)],
+            vec![
+                (LaneKind::Video, vec![clip]),
+                (LaneKind::Audio, vec![clip]),
+                (LaneKind::Audio, vec![clip]),
+                (LaneKind::Audio, vec![clip]),
+                (LaneKind::Audio, vec![clip]),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("one second on four audio tracks")
+    };
+    let write = |project: Project, name: &str| {
+        let out = out_path(name, "wav");
+        let handle = engine::export::start(
+            project,
+            meta(),
+            &out,
+            &ExportSettings {
+                format: Format::Wav,
+                ..Default::default()
+            },
+        );
+        wait(&handle, Duration::from_secs(60)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (audio, samples) = decode(&out);
+        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let level = rms(&samples, usize::from(audio.channels), 0.05, 0.95);
+        let _ = std::fs::remove_file(&out);
+        (peak, level)
+    };
+
+    // Four copies of one file, each fader all the way up: the sum is well past
+    // what a sample can hold, and with no limiter it is clamped at full scale
+    // by the mixer's own backstop -- which is the clipping this exists for.
+    let hot = || {
+        let mut project = four();
+        for ord in 0..4 {
+            assert!(project.set_lane_gain_db(
+                Lane::new(LaneKind::Audio, ord),
+                engine::project::MAX_GAIN_DB
+            ));
+        }
+        project
+    };
+    let (flat_peak, flat_level) = write(hot(), "mix_flat");
+    println!("flat: peak {flat_peak:.4} rms {flat_level:.4}");
+
+    // One track's fader, and one track's only: A2, A3 and A4 all the way down
+    // leaves a quarter of the sum, so the level drops by ~12 dB against the
+    // four of them at the same setting. A whole-band
+    // change -- there is no frequency in this claim, which is what makes it a
+    // different control from the equalizer.
+    let (unity_peak, unity_level) = write(four(), "mix_unity");
+    let mut down = four();
+    for ord in 1..4 {
+        assert!(down.set_lane_gain_db(
+            Lane::new(LaneKind::Audio, ord),
+            engine::project::MIN_GAIN_DB
+        ));
+    }
+    let (_, quiet_level) = write(down, "mix_fader");
+    let drop_db = 20.0 * (quiet_level / unity_level).log10();
+    println!("one track alone: rms {quiet_level:.4} ({drop_db:.1} dB)");
+    assert!(
+        (drop_db + 12.0).abs() < 1.5,
+        "three of four tracks down left {drop_db:.1} dB, not ~-12"
+    );
+
+    // The limiter over the same hot sum: the peak lands under the ceiling, and
+    // the sound is still there (a limiter that silenced the mix would pass a
+    // peak test and fail every ear).
+    let ceiling_db = -3.0;
+    let mut limited = hot();
+    assert!(limited.set_limiter(engine::limiter::Limiter {
+        ceiling_db,
+        on: true,
+    }));
+    let (peak, level) = write(limited, "mix_limited");
+    let ceiling = 10f32.powf(ceiling_db / 20.0);
+    println!("limited: peak {peak:.4} vs ceiling {ceiling:.4} rms {level:.4}");
+    assert!(
+        flat_peak > ceiling,
+        "the flat mix was not hot to begin with"
+    );
+    assert!(
+        peak <= ceiling + 1e-3,
+        "peak {peak:.4} passed the {ceiling:.4} ceiling"
+    );
+    assert!(level > unity_level, "the limiter took the mix out");
+    assert!(
+        unity_peak < 1.0,
+        "four at unity fit; the +12 dB four did not"
+    );
+}
+
 #[test]
 fn a_cancelled_audio_export_leaves_no_file() {
     let source = asset("test_av.mp4");
