@@ -52,8 +52,13 @@ fn out_path(name: &str, ext: &str) -> PathBuf {
 /// A hand-written v4 project: `V1` the whole of `test_av`, `V2` the middle
 /// third playing `test_av2` from its own frame 0, `A1` the whole of `test_av`.
 /// Exactly the file a user would write by hand, parsed by the real loader.
-fn three_lane_file() -> PathBuf {
-    let path = out_path("project", "edith");
+///
+/// `name` is the caller's own, because [`out_path`] is unique per *run* and not
+/// per test: two tests sharing one name run in parallel over one file, and the
+/// first to finish deletes it out from under the second -- which then fails on
+/// a file that is simply not there any more.
+fn three_lane_file(name: &str) -> PathBuf {
+    let path = out_path(name, "edith");
     // `source <audio stream> <path>`: the number is which audio track of the
     // file plays, not the source index -- both of these are on their first.
     let text = format!(
@@ -143,7 +148,7 @@ fn frame_of(session: &mut PlaybackSession, timeline: u32) -> Vec<u8> {
 #[test]
 fn playback_shows_the_topmost_video_lane() {
     pin_software();
-    let project = three_lane_file();
+    let project = three_lane_file("playback");
     let mut session = PlaybackSession::open_project(&project).expect("open the project");
     session.set_gain(0.0);
     assert_eq!(session.timeline_duration(), f64::from(TOTAL) / FPS);
@@ -164,7 +169,7 @@ fn playback_shows_the_topmost_video_lane() {
 #[test]
 fn export_writes_the_same_composite() {
     pin_software();
-    let file = three_lane_file();
+    let file = three_lane_file("export");
     let session = PlaybackSession::open_project(&file).expect("open the project");
     let out = out_path("composite", "mp4");
 

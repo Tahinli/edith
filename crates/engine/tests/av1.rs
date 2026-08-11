@@ -57,6 +57,23 @@ fn the_demuxer_reports_an_av1_track_in_matroska() {
     assert_eq!(vp9.codec, Codec::Vp9);
 }
 
+/// The depth, which is what picks the surface pool the plugin decodes into: an
+/// `av1C` with `high_bitdepth` set reads as 10 and takes the P010 pool HEVC Main
+/// 10 already goes through, and the 8-bit fixture beside it still reads as 8.
+/// It used to be an outright refusal at open ("10-bit AV1 is not supported").
+#[test]
+fn a_ten_bit_av1_track_is_read_as_ten_bit() {
+    let (meta, ten) = Demuxer::open(&asset("test_av1_10.mkv")).expect("open test_av1_10.mkv");
+    assert_eq!(meta.codec, Codec::Av1);
+    assert_eq!((meta.width, meta.height), (1280, 720));
+    assert_eq!(meta.frame_count, FRAMES);
+    assert_eq!(ten.bit_depth(), 10, "what picks the P010 surface pool");
+
+    // The invariant: the 8-bit file is untouched by any of it.
+    let (_, eight) = Demuxer::open(&asset("test_av1.mkv")).expect("open test_av1.mkv");
+    assert_eq!(eight.bit_depth(), 8);
+}
+
 /// The delivered audio scope, as an assert: a Matroska file's AAC track is read
 /// like any other file's (`tests/hevc_mkv.rs` is where that lives), and its
 /// *picture* being AV1 changes nothing about it.
@@ -138,17 +155,27 @@ fn the_software_path_refuses_av1_by_name() {
     assert!(refused.contains("plugin"), "{refused}");
 }
 
-/// A timeline is refused a source coded differently, in the same words a
-/// resolution mismatch is refused in: a front-end shows the string as it is.
+/// A timeline is *not* refused a source coded differently -- every clip opens
+/// its own decoder. What survives is the reason the codec gate existed: on a
+/// machine that cannot decode AV1 the file is refused at the door, by the
+/// decoder's own name, rather than becoming a clip of black frames.
 #[test]
-fn a_timeline_refuses_the_other_codec() {
+fn a_timeline_takes_the_other_codec_or_names_the_missing_decoder() {
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open test_av.mp4");
+    // The no-plugin machine, forced.
+    // SAFETY: the suite is documented to run with --test-threads=1.
+    unsafe { std::env::set_var("VE_SW", "1") };
     let refused = session
         .import(&asset("test_av1.mkv"))
-        .expect_err("AV1 must not join an H.264 timeline")
+        .expect_err("no AV1 decoder means no AV1 clip")
         .to_string();
-    assert!(refused.contains("AV1"), "{refused}");
-    assert!(refused.contains("H.264"), "{refused}");
+    unsafe { std::env::remove_var("VE_SW") };
+    assert_eq!(refused, Codec::Av1.needs_plugin());
+    assert!(
+        !refused.contains("H.264"),
+        "the timeline's own codec is no longer a reason: {refused}"
+    );
+    assert_eq!(session.sources().len(), 1, "a refusal left no row");
 }
 
 /// The end-to-end user path: opening the file yields pictures, all of them,
@@ -178,6 +205,37 @@ fn the_plugin_decodes_every_av1_frame() {
     assert!(
         first.chunks_exact(4).any(|px| px != &first[..4]),
         "frame 0 is a single colour -- no picture was decoded"
+    );
+}
+
+/// ...and the 10-bit file through the very call the window's open door makes: a
+/// user opens it and the timeline shows a picture, read back off the P010 pool
+/// to the same 8-bit BGRA every other frame arrives in. The whole point of the
+/// slice, and the half a container test cannot say anything about.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with 10-bit AV1 decode"]
+fn opening_a_ten_bit_av1_file_shows_frames() {
+    let mut session =
+        PlaybackSession::open(asset("test_av1_10.mkv")).expect("open the 10-bit file");
+    assert_eq!(session.meta().codec, Codec::Av1);
+    assert_eq!(session.meta().frame_count, FRAMES);
+
+    // The decoder is a thread behind the door, so a frame is waited for exactly
+    // as the window's own pump waits for one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let frame = loop {
+        if let Some(frame) = session.try_frame() {
+            break frame;
+        }
+        assert!(Instant::now() < deadline, "no frame in 60 s");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!((frame.width, frame.height), (1280, 720));
+    // A picture, not a flat surface: a P010 surface read back through the NV12
+    // path would come out as noise or as nothing at all.
+    assert!(
+        frame.bgra.chunks_exact(4).any(|px| px != &frame.bgra[..4]),
+        "the first frame is a single colour -- no picture was decoded"
     );
 }
 
