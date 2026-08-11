@@ -23,12 +23,31 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 mp4 = "0.14"
 rusty_h264 = { version = "0.8", default-features = false }
+# Both halves of AAC, and the only crate here that is asked for both. The
+# *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
+# otherwise processed) lane has to be decoded, and what is decoded has to be
+# encoded again. The *decoder*, because symphonia's own refuses anything wider
+# than stereo outright (`aac/mod.rs:93`, "aac: aac too complex") and a 5.1 film
+# soundtrack in an mkv is exactly that -- this one hands 5.1 back already
+# reordered into FL, FR, FC, LFE, BL, BR, which is the order the downmix in
+# `audio` folds. Pure Rust with no C or FFI, Apache-2.0, same family as
+# `rusty_h264` above. Nothing else in the ecosystem encodes AAC without linking
+# Fraunhofer's C library, which this project's no-install rule forbids. Built
+# from `vendor/rusty_aac` -- see the patch table in the workspace manifest.
+rusty_aac = "0.5"
+# The MP3 encoder, so that format is a row a user can pick rather than a licence
+# note: pure Rust, Apache-2.0, CBR and VBR. The decoder side of mp3 is
+# symphonia's below -- an mp3 has always been importable here, and until this it
+# was the one format the editor could read and never write.
+rusty_mp3 = "0.6"
 symphonia-core = "0.6"
 symphonia-codec-aac = "0.6"
 # The umbrella crate for the standalone audio files: one dependency instead of
 # seven, and its `default::get_probe`/`get_codecs` are the registries this would
 # otherwise hand-build. Explicit feature list rather than the default one -- no
-# mkv, no ape, no adpcm: what is listed here is exactly what `is_audio` admits.
+# ape, no adpcm: what is listed here is exactly what `is_audio` admits, plus
+# `mkv`, which is not an `is_audio` container at all -- it is how the *sound* of
+# a Matroska video file is read, the picture having its own demuxer here.
 # There is no opus/ac3/dts feature at any symphonia version, which is why those
 # are refused rather than promised.
 symphonia = { version = "0.6", default-features = false, features = [
@@ -38,6 +57,7 @@ symphonia = { version = "0.6", default-features = false, features = [
     "id3v1",
     "id3v2",
     "isomp4",
+    "mkv",
     "mp3",
     "ogg",
     "pcm",
@@ -54,6 +74,14 @@ oxideav-core = "0.1.34"
 # inside rav1e itself and is what keeps an export minutes rather than tens of
 # minutes; the cost of no assembly is measured in `export::Enc::open_av1`.
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
+# The software HEVC encoder, intra-only: OxideAV's pure-Rust H.265, MIT, no C
+# and no FFI like everything else here. Its *inter* modes run at 0.81 fps on
+# 1080p across 12 cores (measured 2026-08-11) and are therefore not an export
+# anyone would wait for; its intra AU is a stateless free function that fans out
+# across cores at 4.30 fps for the same picture, which is the export this
+# project offers -- an intraframe master, ProRes-shaped, large files and all.
+# Built from `vendor/oxideav-h265`; see the note in the workspace manifest.
+oxideav-h265 = { path = "../../vendor/oxideav-h265" }
 
 [dev-dependencies]
 # The still-image suite compares what the timeline shows against the file's own
