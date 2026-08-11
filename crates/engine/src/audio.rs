@@ -712,17 +712,20 @@ impl AudioSession {
     /// and an ALAC `.m4a` only half is.
     pub fn probe_streams(path: impl AsRef<Path>) -> crate::Result<Vec<StreamInfo>> {
         let path = path.as_ref();
-        // A Matroska file lists one row per `TrackEntry` of audio, in the order
-        // its `Tracks` element gives them -- a dual-audio remux has two, and the
-        // second one used to be invisible. A file whose header will not walk at
-        // all is an `Err` here, as it is in [`Track::open`]: a listing that
-        // quietly came back empty for a broken file is how a lane ends up silent
-        // with nothing to go on. No audio track at all is an empty list, which
-        // is the silent source it says it is.
+        // A Matroska file lists one row per `TrackEntry` of audio -- a
+        // dual-audio remux has two, and the second one used to be invisible --
+        // numbered by [`mkv_stream_order`]: the track that already plays first,
+        // then the rest in file order. A file whose header will not walk at all
+        // is an `Err` here, as it is in [`Track::open`]: a listing that quietly
+        // came back empty for a broken file is how a lane ends up silent with
+        // nothing to go on. No audio track at all is an empty list, which is
+        // the silent source it says it is.
         if crate::demux::is_matroska(path) {
+            let tracks = crate::demux::matroska_audio_tracks(path)?;
             let mut streams = Vec::new();
-            for (index, entry) in crate::demux::matroska_audio_tracks(path)?
-                .iter()
+            for (index, entry) in mkv_stream_order(path, &tracks)
+                .into_iter()
+                .map(|at| &tracks[at])
                 .enumerate()
             {
                 // The routing [`Track::open`] does, one row at a time, so a row
@@ -1138,17 +1141,19 @@ impl Track {
         // failing the import of a file whose picture is fine. A track that will
         // not open at all is *not* in that group: see below.
         if crate::demux::is_matroska(path) {
-            // File order, the one `probe_streams` lists and a project saves:
-            // the stream index picks a `TrackEntry`, that entry's *track
-            // number* is what both readers are then pointed at. Positions are
-            // never handed to a reader -- symphonia's own order is its business
-            // -- because a mapping that drifts plays the wrong language and
-            // saves it into the project.
+            // The numbering `probe_streams` lists and a project saves, from the
+            // one function that decides it ([`mkv_stream_order`]): the stream
+            // index picks a `TrackEntry`, that entry's *track number* is what
+            // both readers are then pointed at. Positions are never handed to a
+            // reader -- symphonia's own order is its business -- because a
+            // mapping that drifts plays the wrong language and saves it into
+            // the project.
             let tracks = crate::demux::matroska_audio_tracks(path)?;
             if tracks.is_empty() {
                 return Ok(None);
             }
-            let Some(entry) = tracks.get(stream) else {
+            let order = mkv_stream_order(path, &tracks);
+            let Some(entry) = order.get(stream).map(|at| &tracks[*at]) else {
                 return Err(format!(
                     "{}: audio stream {stream} of {} stream{}",
                     path.display(),
@@ -1953,6 +1958,54 @@ fn packet_run(err: &mut i64, ideal: i64, available: u32) -> u32 {
     let n = (want.round().max(0.0) as i64).min(i64::from(available)) as u32;
     *err += i64::from(n) * packet - ideal;
     n
+}
+
+/// The order a Matroska file's audio streams are numbered in, as positions into
+/// `tracks` (which is file order): **stream 0 is the track this project has
+/// always opened**, and the rest follow in file order behind it.
+///
+/// Not file order outright, and the difference is a saved project's sound. A
+/// remux flags the language it wants heard with `FlagDefault` on whichever
+/// track it likes -- mkvmerge writes it on the second one all the time -- and
+/// that flag is what every reader here used to pick with. Numbering by file
+/// position would have made stream 0 a *different* track on those files, so an
+/// `.edith` project saved before this would quietly start playing the other
+/// language. Nothing that already plays may change what it plays.
+///
+/// The old pick is not re-derived here, it is *run*: the AC-3 arm asks
+/// [`MkvAc3Track`] the same question [`Track::open`] asked it (and only of the
+/// file's first audio track, which is as far as [`crate::demux::MkvAudio`]
+/// ever looked), and everything else asks symphonia for its default track,
+/// which is `FlagDefault` where a muxer set one and the first readable track
+/// where nobody did.
+fn mkv_stream_order(path: &Path, tracks: &[crate::demux::MkvAudioTrack]) -> Vec<usize> {
+    // One track is its own order, and it is the common case: no second probe
+    // for the file that cannot have a second answer.
+    if tracks.len() < 2 {
+        return (0..tracks.len()).collect();
+    }
+    let head = match tracks.first() {
+        Some(first)
+            if matches!(first.codec.as_str(), "A_AC3" | "A_EAC3")
+                && matches!(MkvAc3Track::open_track(path, first.number), Ok(Some(_))) =>
+        {
+            0
+        }
+        // A file symphonia will not open at all keeps file order: the open
+        // itself is where that failure is reported, not the numbering.
+        _ => SymTrack::open(path)
+            .ok()
+            .flatten()
+            .and_then(|track| {
+                tracks
+                    .iter()
+                    .position(|entry| entry.number == u64::from(track.track_id))
+            })
+            .unwrap_or(0),
+    };
+    std::iter::once(head)
+        .chain((0..tracks.len()).filter(|i| *i != head))
+        .collect()
 }
 
 /// The name a Matroska audio row wears: the container's own codec id, cut down
