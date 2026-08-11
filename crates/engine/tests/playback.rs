@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
 use engine::project::Lane;
-use engine::{DecodeSession, Frame, PlaybackSession};
+use engine::{Codec, DecodeSession, Frame, PlaybackSession};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -788,30 +788,31 @@ fn the_first_import_opens_a_library_over_an_empty_timeline() {
     assert_eq!(session.sources().len(), 1, "the row survives the undo");
 }
 
-/// One timeline, one set of parameters: everything else is refused by name and
-/// changes nothing.
+/// One timeline, one frame rate and one set of audio parameters: what is left
+/// is refused by name and changes nothing.
 #[test]
 fn import_refuses_what_does_not_match() {
     let mut session = open(asset("test_av.mp4"));
 
-    // A different *codec* cannot join: one timeline is one kind of source.
-    let err = session
-        .import(&asset("test_vp9.mp4"))
-        .expect_err("VP9 must be refused")
-        .to_string();
-    assert!(err.contains("VP9"), "refusal must name the codec: {err}");
+    // A different *codec* is not among them any more -- every clip opens its
+    // own decoder. The only refusal left on that axis is a decoder this machine
+    // cannot open, and it is the plugin's own words, not the timeline's.
+    match session.import(&asset("test_vp9.mp4")) {
+        Ok(_) => assert_eq!(session.sources().len(), 2, "VP9 joined the H.264 timeline"),
+        Err(e) => assert_eq!(
+            e.to_string(),
+            Codec::Vp9.needs_plugin(),
+            "the only codec refusal left is the missing decoder"
+        ),
+    }
+    let rows = session.sources().len();
 
     // A different resolution is no longer among the refusals -- it is placed on
-    // the project canvas instead -- but this file is also silent, and that is.
-    let err = session
+    // the project canvas instead -- and neither is a file with no sound: it
+    // contributes silence over its span.
+    session
         .import(&asset("test_mismatch.mp4"))
-        .expect_err("a silent file must be refused")
-        .to_string();
-    assert!(err.contains("audio"), "refusal must name the audio: {err}");
-    assert!(
-        !err.contains("640x360"),
-        "a resolution of its own is not a refusal any more: {err}"
-    );
+        .expect("a silent 640x360 file joins a timeline with sound");
 
     // Same codec, same audio, 25 fps: the one property left, named with both
     // rates. Mixing rates would mean retiming the timeline itself, and there is
@@ -822,28 +823,51 @@ fn import_refuses_what_does_not_match() {
         .to_string();
     assert_eq!(err, "25.000 fps does not match the timeline's 30.000 fps");
 
-    // Same size and rate, no audio track: the timeline has one.
-    let err = session
-        .import(&asset("test_baseline.mp4"))
-        .expect_err("a silent file must be refused")
-        .to_string();
-    assert!(err.contains("audio"), "refusal must name the audio: {err}");
-
     assert!(
         session.import(&asset("no_such_file.mp4")).is_err(),
         "a missing file is an error, not a panic"
     );
-    assert_eq!(session.clip_spans().len(), 1, "a refusal changes nothing");
-    assert_eq!(session.sources().len(), 1, "a refusal left a library row");
+    assert_eq!(session.clip_spans().len(), 1, "an import places nothing");
+    assert_eq!(
+        session.sources().len(),
+        rows + 1,
+        "only the silent file was taken in"
+    );
     assert!((session.timeline_duration() - 5.0).abs() < 1e-9);
 
-    // The mirror: audio into a silent timeline is refused just as loudly.
+    // The mirror is still refused: the device was opened on source 0's track
+    // and a silent timeline has none to open, so a file with sound cannot be
+    // heard on one.
     let mut silent = open(asset("test_baseline.mp4"));
     let err = silent
         .import(&asset("test_av.mp4"))
         .expect_err("audio into a silent timeline")
         .to_string();
     assert!(err.contains("audio"), "refusal must name the audio: {err}");
+}
+
+/// The user path a silent take goes down: a file with no audio track lands on a
+/// timeline that has one, is placed as the grouped take every video file is,
+/// and plays -- pictures over its span, silence under them. The sound itself is
+/// asserted on the samples in `tests/audio_export.rs`; what is asserted here is
+/// that nothing about the *timeline* is refused or lost.
+#[test]
+fn a_silent_file_joins_a_timeline_with_sound_and_plays() {
+    let mut session = open(asset("test_av.mp4"));
+    import_and_place(&mut session, &asset("test_mismatch.mp4"));
+    // 150 frames of test_av, then 60 of the silent file, at 30 fps.
+    assert_eq!(session.clip_spans().len(), 2, "the silent take landed");
+    assert!((session.timeline_duration() - 7.0).abs() < 1e-9);
+    // Both lanes carry it: a silent file is a normal grouped take, and its
+    // audio clip is the span the worker fills with silence.
+    assert_eq!(session.lane_clips(Lane::V1).len(), 2);
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2);
+
+    // ...and it decodes: a picture from inside the silent clip's span, at the
+    // project's resolution like every other clip.
+    session.seek(6.0);
+    let frame = next_frame(&mut session, "the silent clip");
+    assert_eq!((frame.width, frame.height), session.resolution());
 }
 
 /// The user-facing point of a project resolution: media of two sizes on one
