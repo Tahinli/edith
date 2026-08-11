@@ -5,6 +5,7 @@ pub mod audio;
 pub mod caps;
 pub mod clock;
 pub mod color;
+pub mod colorspace;
 pub mod convert;
 pub mod decode;
 pub mod demux;

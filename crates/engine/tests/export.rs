@@ -217,6 +217,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         frame_rate: FPS,
         frame_count: 20,
         codec: engine::Codec::H264,
+        color: Default::default(),
     };
     let out = out_path("mixed");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());

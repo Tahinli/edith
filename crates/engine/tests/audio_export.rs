@@ -354,6 +354,7 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
         frame_rate: 30.0,
         frame_count: 60,
         codec: engine::Codec::H264,
+        color: Default::default(),
     };
     let out = out_path("still_song", "mp4");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
@@ -656,6 +657,7 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
         frame_rate: 30.0,
         frame_count: 60,
         codec: engine::Codec::H264,
+        color: Default::default(),
     };
     for want in [128u32, 320] {
         let out = out_path(&format!("mp4_aac_{want}"), "mp4");
