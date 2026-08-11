@@ -13,7 +13,7 @@ use engine::audio::StreamInfo;
 use engine::color::ColorParams;
 use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
-use engine::export::{ExportSettings, Format};
+use engine::export::{AUDIO_KBPS, DEFAULT_AUDIO_KBPS, ExportSettings, Format};
 use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
@@ -757,6 +757,12 @@ struct Player {
     /// first one chose.
     quality: Quality,
     custom_mbps: u32,
+    /// What the *sound* is coded at, in kbps, for every format that encodes it
+    /// -- the AAC inside a video export as much as an MP3. Kept across closes
+    /// like the picture's quality, and starts at the figure this program wrote
+    /// before the row existed ([`engine::export::DEFAULT_AUDIO_KBPS`]), so a
+    /// user who never touches the row gets the file they always got.
+    audio_kbps: u32,
     /// Which file the card will write. Kept across closes like the quality, and
     /// what [`Player::export_path`](Player) is named after.
     format: Format,
@@ -2214,7 +2220,8 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
-        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        let settings =
+            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
         if !self.export_open {
             return;
         }
@@ -3262,6 +3269,29 @@ impl Player {
         self.quality = Quality::ALL[(at + 1) % Quality::ALL.len()];
     }
 
+    /// The sound's rate by keyboard, wrapping through the offered ones -- the
+    /// picture's quality row for the other half of the file. Refused by name
+    /// where this timeline in this format has no rate to pick, exactly as
+    /// [`Player::cycle_quality`] is: a key that silently does nothing is the
+    /// card looking broken.
+    fn cycle_audio_kbps(&mut self) {
+        if let Some(why) = self.audio_rate_refusal() {
+            self.notice = Some(why.into());
+            return;
+        }
+        self.audio_kbps = next_audio_kbps(self.audio_kbps);
+    }
+
+    /// Why the sound row is not a choice right now, the engine answering about
+    /// the very project it would export. No session is the same answer as no
+    /// sound: there is nothing to write either way.
+    fn audio_rate_refusal(&self) -> Option<&'static str> {
+        match &self.session {
+            Some(session) => session.audio_rate_refusal(self.format),
+            None => Some("no sound to write"),
+        }
+    }
+
     /// The custom bitrate by pointer: the typed digits were the only control in
     /// this card a mouse could not reach. Clamped to the range the row states
     /// (the engine's own 1..20 Mbps), and picking the row is part of the step --
@@ -3316,7 +3346,8 @@ impl Player {
         if self.export.is_some() {
             return;
         }
-        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        let settings =
+            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
         let Some(session) = &mut self.session else {
             self.notice = Some("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
@@ -3521,6 +3552,10 @@ impl Render for Player {
                         this.cycle_container();
                     } else if key == "q" {
                         this.cycle_quality();
+                    } else if key == "b" {
+                        // The sound's rate, `q`'s pair for the other half of
+                        // the file. Not a digit: those are the picture's.
+                        this.cycle_audio_kbps();
                     } else if key == "d" {
                         // The save dialog, which was the one row here a
                         // keyboard could not open.
@@ -5103,6 +5138,36 @@ impl Player {
                 }
             }
         }
+        // The other half of the file, and the one this card used to write at a
+        // fixed rate without saying so: what the *sound* is coded at, for every
+        // format that codes it -- the AAC inside a video export as much as an
+        // MP3. One row that cycles, like the container's, rather than four more
+        // rows above the fold; dimmed with the reason where this timeline has
+        // no rate to pick, like the quality rows are.
+        let sound = self.audio_rate_refusal();
+        let mut r = entry(
+            ("sound", 0),
+            "b",
+            "Sound".into(),
+            match sound {
+                Some(why) => why.into(),
+                None => format!(
+                    "{} kbps — b for {}",
+                    self.audio_kbps,
+                    next_audio_kbps(self.audio_kbps)
+                )
+                .into(),
+            },
+            false,
+            sound.is_none(),
+        );
+        if sound.is_none() {
+            r = r.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.cycle_audio_kbps();
+                cx.notify();
+            }));
+        }
+        list.push(r.into_any_element());
         let destination = entry(
             ("destination", 0),
             "d",
@@ -5147,7 +5212,8 @@ impl Player {
             .session
             .as_ref()
             .map_or("", |s| s.planned_audio(self.format));
-        let settings = export_settings(self.quality, self.custom_mbps, self.format);
+        let settings =
+            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
         let mb = estimated_mb(
             settings.bitrate.filter(|_| self.format.has_video()),
             self.session
@@ -7552,7 +7618,7 @@ impl Quality {
             Quality::Custom => format!("{custom_mbps} Mbps — type a number, 1–20"),
             other => format!(
                 "{} Mbps",
-                export_settings(other, 0, Format::Mp4)
+                export_settings(other, 0, Format::Mp4, DEFAULT_AUDIO_KBPS)
                     .bitrate
                     .unwrap_or_default()
                     / 1_000_000
@@ -7606,12 +7672,7 @@ const FORMATS: [(&[Format], &str, &str, &str); 8] = [
     ),
     (&[Format::Wav], "w", "WAV", "16-bit PCM — audio only"),
     (&[Format::Flac], "f", "FLAC", "lossless — audio only"),
-    (
-        &[Format::Mp3],
-        "p",
-        "MP3",
-        "MPEG-1 Layer III, 256 kbps — audio only",
-    ),
+    (&[Format::Mp3], "p", "MP3", "MPEG-1 Layer III — audio only"),
     (&[], "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
     (&[], "", "VP9", "AV1 above replaces it"),
 ];
@@ -7660,6 +7721,14 @@ fn next_container(format: Format) -> Format {
         .unwrap_or(format)
 }
 
+/// The next rate the Sound row offers, wrapping -- what its key does, and what
+/// the row itself names so the stroke is never a guess. [`next_container`]'s
+/// shape, for the same reason: one place decides what "next" means.
+fn next_audio_kbps(kbps: u32) -> u32 {
+    let at = AUDIO_KBPS.iter().position(|&k| k == kbps).unwrap_or(0);
+    AUDIO_KBPS[(at + 1) % AUDIO_KBPS.len()]
+}
+
 /// Why the quality rows say nothing about this format, or `None` where they
 /// decide the picture. Only a picture encoder is given a bitrate here: the two
 /// lossless audio formats have none to give and MP3 is written at one fixed
@@ -7667,7 +7736,7 @@ fn next_container(format: Format) -> Format {
 fn bitrate_refusal(format: Format) -> Option<&'static str> {
     match format {
         Format::Wav | Format::Flac => Some("lossless audio — no bitrate to pick"),
-        Format::Mp3 => Some("MP3 is written at a fixed 256 kbps"),
+        Format::Mp3 => Some("sound only — its rate is the Sound row"),
         _ => None,
     }
 }
@@ -7871,7 +7940,7 @@ fn format_line(format: Format) -> &'static str {
         // only field on this line that says nothing.
         Format::Wav => "16-bit PCM · WAV",
         Format::Flac => "FLAC · lossless",
-        Format::Mp3 => "MP3 · 256 kbps",
+        Format::Mp3 => "MP3 · lossy",
     }
 }
 
@@ -7902,9 +7971,18 @@ fn retarget(path: &std::path::Path, format: Format) -> PathBuf {
 ///
 /// The bitrate travels even for an audio format, where the engine ignores it:
 /// one settings value, and a row the card has dimmed cannot have been changed.
-fn export_settings(quality: Quality, custom_mbps: u32, format: Format) -> ExportSettings {
+fn export_settings(
+    quality: Quality,
+    custom_mbps: u32,
+    format: Format,
+    audio_kbps: u32,
+) -> ExportSettings {
     ExportSettings {
         format,
+        // Always travels, exactly as the picture's bitrate does above: the
+        // engine ignores it where nothing encodes the sound, and a row the card
+        // has dimmed cannot have been changed.
+        audio_kbps: Some(audio_kbps),
         bitrate: match quality {
             Quality::Auto => None,
             Quality::Low => Some(2_000_000),
@@ -8845,22 +8923,23 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
-        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
-        EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, FORMATS, Format, HEADER_GAP,
-        HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
-        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
-        LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
-        PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS,
-        WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
-        clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
-        estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
-        fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
-        keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
-        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        ACCENT, AUDIO_KBPS, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip,
+        DEFAULT_AUDIO_KBPS, EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT,
+        EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB, EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H,
+        EXPORT_W, FORMATS, Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES,
+        HIT_MIN, INK, INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H,
+        LANES_MAX, LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+        MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
+        VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, applicable, band_label, bitrate_refusal,
+        can_add, cancels_export, clipboard_after_remove, color_snap, containers, envelope,
+        eq_spectrum, eq_x, eq_y, estimated_mb, export_path, export_settings, format_key,
+        format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
+        is_bare_modifier, is_project, keymap, lanes_h, marked, menu_at, next_audio_kbps,
+        next_container, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
+        scrub_due, show_label, silence_rate, snapped, source_tint, span_partner, speed_at,
+        summary_head, summary_tail, timecode, unseen_paths, unseen_sources, whole_take, width_frac,
+        window_title,
     };
     use super::{
         LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
@@ -10771,34 +10850,40 @@ mod tests {
         // Auto is the one row that says nothing: the exporter derives it, and
         // a number typed against the custom row must not leak into it.
         let mp4 = Format::Mp4;
-        assert_eq!(export_settings(Quality::Auto, 7, mp4).bitrate, None);
         assert_eq!(
-            export_settings(Quality::Low, 0, mp4).bitrate,
+            export_settings(Quality::Auto, 7, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+            None
+        );
+        assert_eq!(
+            export_settings(Quality::Low, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
             Some(2_000_000)
         );
         assert_eq!(
-            export_settings(Quality::Medium, 0, mp4).bitrate,
+            export_settings(Quality::Medium, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
             Some(6_000_000)
         );
         assert_eq!(
-            export_settings(Quality::High, 0, mp4).bitrate,
+            export_settings(Quality::High, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
             Some(12_000_000)
         );
         // Megabits as typed, and as the row says it back.
         assert_eq!(
-            export_settings(Quality::Custom, 7, mp4).bitrate,
+            export_settings(Quality::Custom, 7, mp4, DEFAULT_AUDIO_KBPS).bitrate,
             Some(7_000_000)
         );
         assert_eq!(Quality::Low.detail(0), "2 Mbps");
         // The picked format travels, or the card's rows would be a picture of a
         // choice the engine never hears about.
         for format in [Format::Mp4, Format::Wav, Format::Flac] {
-            assert_eq!(export_settings(Quality::Auto, 0, format).format, format);
+            assert_eq!(
+                export_settings(Quality::Auto, 0, format, DEFAULT_AUDIO_KBPS).format,
+                format
+            );
         }
         // Every fixed row sits inside the engine's clamp (export.rs:290), so no
         // row can promise a bitrate the exporter silently changes.
         for quality in Quality::ALL {
-            let settings = export_settings(quality, 7, mp4);
+            let settings = export_settings(quality, 7, mp4, DEFAULT_AUDIO_KBPS);
             if let Some(bitrate) = settings.bitrate {
                 assert!(
                     (1_000_000..=20_000_000).contains(&bitrate),
@@ -10808,6 +10893,40 @@ mod tests {
             // The software pin is the environment's to set, never a row's.
             assert!(!settings.force_sw);
         }
+    }
+
+    /// The Sound row: what it offers, and that the pick travels to the engine
+    /// for a *video* export as much as for an MP3 -- both files carry sound, so
+    /// a row that only reached the audio formats would be half a control.
+    #[test]
+    fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
+        // Sorted and unique, so a row that says "b for the next one" is stepping
+        // up and not shuffling.
+        assert!(AUDIO_KBPS.windows(2).all(|w| w[0] < w[1]));
+        // The untouched figure is one of the offered rows, or the first press of
+        // `b` would jump somewhere nobody chose.
+        assert!(AUDIO_KBPS.contains(&DEFAULT_AUDIO_KBPS));
+        // ...and it is what this program wrote before the row existed: the
+        // export of a user who never opens it must not change under them.
+        assert_eq!(DEFAULT_AUDIO_KBPS, 256);
+        for format in [Format::Mp4, Format::Av1, Format::Hevc, Format::Mp3] {
+            for kbps in AUDIO_KBPS {
+                assert_eq!(
+                    export_settings(Quality::Auto, 0, format, kbps).audio_kbps,
+                    Some(kbps),
+                    "{format:?} at {kbps} kbps"
+                );
+            }
+        }
+        // The wrap the row's key does, which is the row's own step function.
+        assert_eq!(
+            next_audio_kbps(AUDIO_KBPS[AUDIO_KBPS.len() - 1]),
+            AUDIO_KBPS[0]
+        );
+        assert_eq!(next_audio_kbps(DEFAULT_AUDIO_KBPS), 320);
+        // A rate no list holds (a stale one, say) lands back on the first row
+        // rather than nowhere.
+        assert_eq!(next_audio_kbps(7), AUDIO_KBPS[1]);
     }
 
     #[test]
@@ -11187,7 +11306,14 @@ mod tests {
             );
         }
         assert!(bitrate_refusal(Format::Wav).unwrap().contains("lossless"));
-        assert!(bitrate_refusal(Format::Mp3).unwrap().contains("256 kbps"));
+        // MP3 has a rate and it is the *Sound* row's: the quality rows are the
+        // picture's, and this refusal used to claim a fixed 256 kbps that the
+        // Sound row can now change under it.
+        assert!(bitrate_refusal(Format::Mp3).unwrap().contains("Sound row"));
+        assert!(
+            !format_line(Format::Mp3).contains("256"),
+            "the summary states a rate the Sound row can change under it"
+        );
         // The destination follows the format and keeps the stem, mp4 included.
         assert_eq!(
             retarget(std::path::Path::new("/a/take.export.mp4"), Format::Wav),
@@ -11773,6 +11899,8 @@ fn main() {
                     // bitrate the picture asks for.
                     quality: Quality::Auto,
                     custom_mbps: 0,
+                    // ...and the rate the sound has always been written at.
+                    audio_kbps: DEFAULT_AUDIO_KBPS,
                     // Picture and sound, which is what an export was before
                     // there was anything to pick.
                     format: Format::default(),
