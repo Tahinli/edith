@@ -14,12 +14,20 @@
 //! renderer is a later thing, and a cue nobody can draw yet is still a cue that
 //! has to be listed, timed and saved.
 //!
-//! What is *refused* is refused by name rather than by omission
-//! ([`SubtitleTrack::refused`]): the bitmap subtitle formats -- PGS off a
-//! BluRay remux, VobSub off a DVD -- are pictures, and a film carrying four of
-//! them opens with four rows that say so instead of opening with an empty list.
+//! A cue is not always words. `S_HDMV/PGS` off a BluRay remux is *pictures* --
+//! run-length bitmaps the disc composed against its own frame -- and one of
+//! those is a [`Cue`] with a [`CueImage`] on it and no text. The decoding is
+//! `oxideav-sub-image`, for the reason above. Everything downstream carries the
+//! picture the way it carries the string: [`crate::export::timeline_cues`] maps
+//! it onto the timeline, a front-end draws it over the film.
+//!
+//! What is still *refused* is refused by name rather than by omission
+//! ([`SubtitleTrack::refused`]): VobSub off a DVD is a picture format nothing
+//! here reads, and a file carrying one opens with a row that says so instead of
+//! opening with an empty list.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use oxideav_subtitle::ir::plain_text;
 
@@ -37,6 +45,84 @@ pub struct Cue {
     /// is to keep `oxideav_core::Segment` beside this string -- the parsers
     /// already hand it over -- and it belongs to whoever writes the renderer.
     pub text: String,
+    /// The picture this cue *is*, for a track that is pictures rather than
+    /// lines. `None` for every text cue -- an `.srt`, a `.vtt`, an `.ass`, an
+    /// `S_TEXT/*` track -- and `Some` for every cue of a PGS one, which then
+    /// has no [`text`](Self::text) at all.
+    ///
+    /// Shared rather than owned: [`crate::export::timeline_cues`] copies a whole
+    /// track's cues, per repaint, and a display set is tens of kilobytes.
+    pub image: Option<Arc<CueImage>>,
+}
+
+/// A cue that is a picture: one PGS display set, kept the way the Matroska
+/// block held it -- run-length and palettised, tens of kilobytes -- and turned
+/// into pixels only when something is about to draw it ([`Self::rgba`]).
+///
+/// Kept encoded because decoded is enormous: this film's canvas is 8 MB of
+/// RGBA and its four PGS tracks carry about eleven thousand display sets
+/// between them, so a track that decoded itself at import would cost gigabytes
+/// where it now costs the thirty megabytes the file already spends on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CueImage {
+    /// The canvas the disc composed against: 1920x1080 for a BluRay, whatever
+    /// the film's own frame was cropped to. The whole canvas is the picture --
+    /// transparent everywhere the cue does not paint -- so a caller lays it
+    /// over the film rather than placing it.
+    pub width: u32,
+    pub height: u32,
+    /// The display set: `type`, big-endian size, body, segment after segment,
+    /// which is the shape a Matroska block holds PGS in.
+    set: Vec<u8>,
+}
+
+impl CueImage {
+    /// The picture: straight (not premultiplied) RGBA, `width * height * 4`
+    /// bytes, transparent wherever the cue paints nothing. `None` for a display
+    /// set the decoder will not have, which is a corrupt block.
+    ///
+    /// Decoded on the spot: the run-length walk and one canvas-sized buffer,
+    /// which is a thing to do when the cue on screen changes and not sixty
+    /// times a second. A caller that draws these keeps the answer for as long
+    /// as the cue is up.
+    pub fn rgba(&self) -> Option<Vec<u8>> {
+        use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+        let params = CodecParameters::subtitle(CodecId::new(oxideav_sub_image::PGS_CODEC_ID));
+        let mut decoder = oxideav_sub_image::pgs::make_decoder(&params).ok()?;
+        // The decoder reads a `.sup`'s framing and a Matroska block is the same
+        // segments with the `PG` magic and the timestamps taken off, so they go
+        // back on. The times themselves are the block's and are already on the
+        // `Cue`, so they are written as nothing.
+        let mut sup = Vec::with_capacity(self.set.len() + 64);
+        for (kind, body) in segments(&self.set)? {
+            sup.extend_from_slice(b"PG");
+            sup.extend_from_slice(&[0; 8]);
+            sup.push(kind);
+            sup.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            sup.extend_from_slice(body);
+        }
+        decoder
+            .send_packet(&Packet::new(0, TimeBase::new(1, 90_000), sup))
+            .ok()?;
+        match decoder.receive_frame().ok()? {
+            Frame::Video(frame) => Some(frame.planes.into_iter().next()?.data),
+            _ => None,
+        }
+    }
+}
+
+/// The segments of a display set as a Matroska block holds them: a type byte, a
+/// big-endian size, that many bytes of body, and again until the block is out.
+/// `None` for bytes that do not walk -- a truncated or mislabelled block.
+fn segments(set: &[u8]) -> Option<Vec<(u8, &[u8])>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < set.len() {
+        let size = u16::from_be_bytes([*set.get(at + 1)?, *set.get(at + 2)?]) as usize;
+        out.push((set[at], set.get(at + 3..at + 3 + size)?));
+        at += 3 + size;
+    }
+    Some(out)
 }
 
 /// A subtitle track: where it came from and what it says.
@@ -72,6 +158,17 @@ impl SubtitleTrack {
             cues: Vec::new(),
             refused: Some(why),
         }
+    }
+
+    /// Whether this track's cues are pictures rather than lines -- a PGS track
+    /// off a remux. What it decides is where words are the only answer: an
+    /// export writes a *text* track and cannot carry these
+    /// ([`crate::export::planned_subtitles`] says so out loud).
+    ///
+    /// Read off the first cue rather than all of them, because a track is one
+    /// codec: PGS blocks are pictures to the last one.
+    pub fn is_bitmap(&self) -> bool {
+        self.cues.first().is_some_and(|c| c.image.is_some())
     }
 }
 
@@ -126,13 +223,13 @@ fn external(path: &Path) -> SubtitleTrack {
 pub fn of_matroska(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
     Ok(crate::demux::matroska_subtitles(path)?
         .into_iter()
-        .map(|t| {
+        .map(|mut t| {
             let label = match (t.name.is_empty(), t.language.as_str()) {
                 (true, lang) => lang.to_owned(),
                 (false, "und") => t.name.clone(),
                 (false, lang) => format!("{lang} — {}", t.name),
             };
-            match cues_of(&t) {
+            match cues_of(&mut t) {
                 Ok(cues) => SubtitleTrack {
                     path: path.to_path_buf(),
                     track: Some(t.number),
@@ -156,9 +253,13 @@ pub fn of_matroska(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
 /// reads -- rather than the markup being re-derived here -- which is also what
 /// makes an embedded track and the standalone file it was muxed from come back
 /// as the same cues.
-fn cues_of(track: &crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
+///
+/// A PGS track is neither: its blocks are pictures, and they are moved out of
+/// `track` rather than copied ([`pgs_cues`]) -- thirty megabytes a track is not
+/// a thing to hold twice.
+fn cues_of(track: &mut crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
     // A track compressed or encrypted with something the demuxer cannot undo is
-    // refused in those words, like a bitmap one: the row stays, and it says why.
+    // refused in those words: the row stays, and it says why.
     if let Some(why) = &track.unsupported {
         return Err(why.clone());
     }
@@ -170,9 +271,11 @@ fn cues_of(track: &crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
                 start_us: c.start_us,
                 end_us: end_of(track, c),
                 text: srt_body(&String::from_utf8_lossy(&c.payload)),
+                image: None,
             })
             .collect(),
         "S_TEXT/ASS" | "S_TEXT/SSA" => ass_cues(track)?,
+        crate::demux::PGS => pgs_cues(track),
         codec => {
             return Err(format!(
                 "{codec} subtitles are pictures, not text — this track is listed, not read"
@@ -182,13 +285,62 @@ fn cues_of(track: &crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
     Ok(cues)
 }
 
+/// The cues of an `S_HDMV/PGS` track: one display set per block, and a display
+/// set is a picture the disc composes onto its own canvas.
+///
+/// Only the blocks that compose *something* are cues. The other half of them
+/// are the disc's "take it off again" -- a composition with no object on it --
+/// and they are what says when the picture before them goes away, which is why
+/// they are walked and not skipped. A muxer writes `BlockDuration` zero for all
+/// of them, so [`end_of`] is what pairs the two.
+fn pgs_cues(track: &mut crate::demux::MkvSubtitle) -> Vec<Cue> {
+    // Before the blocks are emptied: `end_of` reads the ones after this one.
+    let ends: Vec<i64> = track.cues.iter().map(|c| end_of(track, c)).collect();
+    track
+        .cues
+        .iter_mut()
+        .zip(ends)
+        .filter_map(|(block, end_us)| {
+            let (width, height) = pgs_canvas(&block.payload)?;
+            Some(Cue {
+                start_us: block.start_us,
+                end_us,
+                text: String::new(),
+                image: Some(Arc::new(CueImage {
+                    width,
+                    height,
+                    set: std::mem::take(&mut block.payload),
+                })),
+            })
+        })
+        .collect()
+}
+
+/// The canvas of a display set that paints something -- its `PCS` says how big
+/// the disc's picture is, and how many objects are composed onto it.
+///
+/// `None` when nothing is composed, which is the disc clearing the screen, and
+/// `None` for bytes that are not a display set at all.
+fn pgs_canvas(set: &[u8]) -> Option<(u32, u32)> {
+    /// `PresentationCompositionSegment`, which every display set opens with.
+    const PCS: u8 = 0x16;
+    let (_, pcs) = segments(set)?.into_iter().find(|&(kind, _)| kind == PCS)?;
+    // Width and height, then the frame rate, the composition number and state,
+    // the palette-update flag and the palette id -- and then how many objects
+    // this composition puts on the canvas.
+    let width = u16::from_be_bytes([*pcs.first()?, *pcs.get(1)?]);
+    let height = u16::from_be_bytes([*pcs.get(2)?, *pcs.get(3)?]);
+    (*pcs.get(10)? > 0).then_some((u32::from(width), u32::from(height)))
+}
+
 /// When a cue goes away: its `BlockDuration`, or -- for the muxer that writes
-/// none -- when the next one arrives, and [`NO_DURATION_US`] for the last.
+/// none, and for the PGS block that writes a zero, which says the same thing --
+/// when the next one arrives, and [`NO_DURATION_US`] for the last.
 fn end_of(track: &crate::demux::MkvSubtitle, cue: &crate::demux::MkvCue) -> i64 {
     /// How long a cue with nothing to say about it stays up: two seconds, a
     /// read of one line.
     const NO_DURATION_US: i64 = 2_000_000;
-    match cue.duration_us {
+    match cue.duration_us.filter(|&d| d > 0) {
         Some(d) => cue.start_us + d,
         None => track
             .cues
@@ -264,6 +416,7 @@ fn ass_cues(track: &crate::demux::MkvSubtitle) -> Result<Vec<Cue>, String> {
                 c.end_us
             },
             text: plain_text(&c.segments),
+            image: None,
         })
         .collect())
 }
@@ -310,6 +463,7 @@ fn parse_file(path: &Path) -> crate::Result<Vec<Cue>> {
             start_us: c.start_us,
             end_us: c.end_us,
             text: plain_text(&c.segments),
+            image: None,
         })
         .collect())
 }
