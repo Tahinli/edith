@@ -22,6 +22,8 @@ use mp4::{
     Mp4Sample, Mp4Writer, SampleFreqIndex, TrackConfig, TrackType,
 };
 
+use crate::colorspace::ColorDescription;
+
 /// 90 kHz is the H.264 convention, and it divides exactly at every *integer*
 /// fps (3000 ticks at 30, 3600 at 25). The NTSC rates do not divide into it at
 /// all -- 24000/1001 wants 3753.75 -- so those get their own clock; see
@@ -71,9 +73,28 @@ pub struct Mp4Muxer {
     /// its payload (`av01`/`av1C`, `hvc1`/`hvcC`). `None` for H.264, which the
     /// crate spells itself. See [`create_av1`](Mp4Muxer::create_av1).
     entry: Option<([u8; 4], [u8; 4], Vec<u8>)>,
+    /// The `colr` box that entry gets either way -- what the samples in it mean
+    /// ([`colr_nclx`]). `mp4 0.14` writes no `colr` of its own, so this is
+    /// patched in at [`finish`](Mp4Muxer::finish) beside the entry rewrite,
+    /// which is why an H.264 file is patched at all now.
+    colr: [u8; 11],
     /// Where the file is, for that patch: the writer owns the handle it wrote
     /// through and the patch reopens the finished file.
     path: PathBuf,
+}
+
+/// A `ColourInformationBox` payload, ISO/IEC 14496-12 §12.1.5: the `nclx` tag
+/// and the same three H.273 code points Matroska's `Colour` carries, plus the
+/// range as the one-bit flag an mp4 says it with rather than Matroska's code.
+fn colr_nclx(colour: ColorDescription) -> [u8; 11] {
+    let (primaries, transfer, matrix) = colour.codes();
+    let mut out = [0u8; 11];
+    out[..4].copy_from_slice(b"nclx");
+    out[4..6].copy_from_slice(&primaries.to_be_bytes());
+    out[6..8].copy_from_slice(&transfer.to_be_bytes());
+    out[8..10].copy_from_slice(&matrix.to_be_bytes());
+    out[10] = u8::from(colour.full_range) << 7;
+    out
 }
 
 const VIDEO_TRACK: u32 = 1;
@@ -247,6 +268,7 @@ impl Mp4Muxer {
             frame_duration,
             has_audio: audio.is_some(),
             entry,
+            colr: colr_nclx(ColorDescription::output(video.height)),
             path: path.to_path_buf(),
         })
     }
@@ -318,6 +340,7 @@ impl Mp4Muxer {
         let Self {
             writer,
             entry,
+            colr,
             path,
             ..
         } = self;
@@ -325,17 +348,14 @@ impl Mp4Muxer {
         // patch below reads it back, and a `BufWriter` swallows the error of
         // flushing it on drop.
         writer.into_writer().flush()?;
-        match entry {
-            Some((kind, config_kind, config)) => patch_entry(&path, &kind, &config_kind, &config),
-            None => Ok(()),
-        }
+        patch_entry(&path, entry.as_ref(), &colr)
     }
 }
 
-/// Rewrites the finished file's one video sample entry from the `avc1` the crate
-/// wrote into the `av01` + `av1C` an AV1 track declares -- or the `hvc1` +
-/// `hvcC` an HEVC one does. Called once, on a complete file, and only for a file
-/// [`Mp4Muxer::create_av1`] or [`Mp4Muxer::create_hevc`] opened.
+/// Rewrites the finished file's one video sample entry: `colr` appended to it
+/// always (the crate writes none), and where `entry` says so the `avc1` header
+/// itself replaced by the `av01` + `av1C` an AV1 track declares -- or the `hvc1`
+/// + `hvcC` an HEVC one does. Called once, on a complete file.
 ///
 /// `moov` sits after `mdat` (the crate writes it at `write_end`), so this only
 /// ever rewrites the tail of the file: no sample moves and no chunk offset in
@@ -343,15 +363,13 @@ impl Mp4Muxer {
 /// is what keeps every ancestor's size right by construction.
 fn patch_entry(
     path: &Path,
-    kind: &[u8; 4],
-    config_kind: &[u8; 4],
-    config: &[u8],
+    entry: Option<&([u8; 4], [u8; 4], Vec<u8>)>,
+    colr: &[u8],
 ) -> crate::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let end = file.metadata()?.len();
     let (at, payload) = top_level(&mut file, end, b"moov")?.ok_or("no moov box to patch")?;
-    let patched = swap_entry(&payload, 0, kind, config_kind, config)
-        .ok_or("no avc1 sample entry to rewrite")?;
+    let patched = swap_entry(&payload, 0, entry, colr).ok_or("no avc1 sample entry to rewrite")?;
     let mut out = Vec::with_capacity(patched.len() + 8);
     push_box(&mut out, b"moov", &patched);
     file.seek(SeekFrom::Start(at))?;
@@ -393,38 +411,47 @@ fn top_level(file: &mut File, end: u64, want: &[u8; 4]) -> crate::Result<Option<
 /// `moov` down to the sample descriptions, which is where the entry lives.
 const STSD_PATH: [&[u8; 4]; 5] = [b"trak", b"mdia", b"minf", b"stbl", b"stsd"];
 
-/// The box at `depth` of [`STSD_PATH`], rebuilt with its `avc1` entry replaced.
-/// `None` where this branch holds no such entry -- an audio `trak` is walked
-/// into and comes back untouched, which is how the *video* track is found
-/// without being told which id it has.
+/// The box at `depth` of [`STSD_PATH`], rebuilt with its `avc1` entry given a
+/// `colr` box and, where `entry` says so, another four-character name and
+/// configuration box. `None` where this branch holds no such entry -- an audio
+/// `trak` is walked into and comes back untouched, which is how the *video*
+/// track is found without being told which id it has.
 fn swap_entry(
     payload: &[u8],
     depth: usize,
-    want: &[u8; 4],
-    config_kind: &[u8; 4],
-    config: &[u8],
+    entry: Option<&([u8; 4], [u8; 4], Vec<u8>)>,
+    colr: &[u8],
 ) -> Option<Vec<u8>> {
     if depth == STSD_PATH.len() {
         // stsd is a FullBox (4) plus entry_count (4), then the sample entries.
         let mut out = payload.get(..8)?.to_vec();
-        let (kind, entry) = crate::demux::boxes(payload.get(8..)?).next()?;
+        let (kind, sample_entry) = crate::demux::boxes(payload.get(8..)?).next()?;
         if kind != b"avc1" {
             return None;
         }
-        // A `VisualSampleEntry` is 78 bytes of fixed fields (dimensions and all)
-        // before its codec box, and `av01` and `hvc1` carry exactly the same
-        // ones -- so the header is kept and only the configuration box is
-        // swapped.
-        let mut swapped = entry.get(..78)?.to_vec();
-        push_box(&mut swapped, config_kind, config);
-        push_box(&mut out, want, &swapped);
+        let (name, mut swapped) = match entry {
+            // A `VisualSampleEntry` is 78 bytes of fixed fields (dimensions and
+            // all) before its codec box, and `av01` and `hvc1` carry exactly the
+            // same ones -- so the header is kept and only the configuration box
+            // is swapped.
+            Some((want, config_kind, config)) => {
+                let mut swapped = sample_entry.get(..78)?.to_vec();
+                push_box(&mut swapped, config_kind, config);
+                (want, swapped)
+            }
+            // H.264: the crate spelled the whole entry, `avcC` and all, and only
+            // the colour tag is missing from it.
+            None => (b"avc1", sample_entry.to_vec()),
+        };
+        push_box(&mut swapped, b"colr", colr);
+        push_box(&mut out, name, &swapped);
         return Some(out);
     }
     let mut out = Vec::with_capacity(payload.len());
     let mut done = false;
     for (kind, child) in crate::demux::boxes(payload) {
         let patched = match !done && kind == STSD_PATH[depth] {
-            true => swap_entry(child, depth + 1, want, config_kind, config),
+            true => swap_entry(child, depth + 1, entry, colr),
             false => None,
         };
         match patched {
@@ -475,6 +502,14 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+// `Colour` and the four children this writes, all inside `Video`. Byte-verified
+// against what `demux` reads back and what ffprobe reports: the spec tables that
+// list Range as 0x55B3 are describing ChromaSubsamplingHorz.
+const COLOUR: u32 = 0x55B0;
+const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const RANGE: u32 = 0x55B9;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const PRIMARIES: u32 = 0x55BB;
 const AUDIO: u32 = 0xE1;
 const SAMPLING_FREQUENCY: u32 = 0xB5;
 const CHANNELS: u32 = 0x9F;
@@ -733,6 +768,20 @@ impl MkvMuxer {
         let mut dims = Vec::new();
         uint(&mut dims, PIXEL_WIDTH, u64::from(width));
         uint(&mut dims, PIXEL_HEIGHT, u64::from(height));
+        // What the samples in those pixels mean. Written rather than left to a
+        // reader's own 720-line guess -- the guess is right for this file (the
+        // export remaps every clip into exactly that space) but a remuxer or a
+        // scaler downstream has no reason to make it, and an untagged file is
+        // how a 601 source ends up displayed as 709.
+        let colour = ColorDescription::output(height);
+        let (primaries, transfer, matrix) = colour.codes();
+        let mut tags = Vec::new();
+        uint(&mut tags, MATRIX_COEFFICIENTS, u64::from(matrix));
+        // Matroska says the range as a code, not a flag: 1 limited, 2 full.
+        uint(&mut tags, RANGE, 1 + u64::from(colour.full_range));
+        uint(&mut tags, TRANSFER_CHARACTERISTICS, u64::from(transfer));
+        uint(&mut tags, PRIMARIES, u64::from(primaries));
+        elem(&mut dims, COLOUR, &tags);
         elem(&mut entry, VIDEO, &dims);
         let mut tracks = Vec::new();
         elem(&mut tracks, TRACK_ENTRY, &entry);
