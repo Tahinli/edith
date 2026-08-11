@@ -109,6 +109,7 @@ rav1e = { version = "0.8.1", default-features = false, features = ["threading"] 
 # project offers -- an intraframe master, ProRes-shaped, large files and all.
 # Built from `vendor/oxideav-h265`; see the note in the workspace manifest.
 oxideav-h265 = { path = "../../vendor/oxideav-h265" }
+oxideav-sub-image = "0.0.7"
 
 [dev-dependencies]
 # The still-image suite compares what the timeline shows against the file's own
