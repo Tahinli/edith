@@ -12,7 +12,10 @@
 //!    reading the export by its own tags gives back the picture that went in --
 //!    a reconcile, not a second conversion; and
 //! 3. a graded clip comes out of the export the way the preview showed it,
-//!    which is what makes a grade a decision and not a guess.
+//!    which is what makes a grade a decision and not a guess; and
+//! 4. an HDR source is *tone-mapped* into that space rather than tagged into it
+//!    ([`engine::tonemap`]) -- once, before the grade, and never on top of a
+//!    matrix conversion of the same frame.
 //!
 //! ```text
 //! cargo test -p engine --release --test export_color
@@ -31,6 +34,7 @@ use engine::colorspace::{ColorDescription, Matrix, Transfer, remap};
 use engine::demux::Demuxer;
 use engine::export::{ExportSettings, Format};
 use engine::scratch::Scratch;
+use engine::tonemap::{self, ToneMapper};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -155,6 +159,40 @@ fn raw_yuv(path: &Path) -> Option<Vec<u8>> {
         .ok()?;
     assert!(ok.success(), "ffmpeg could not read {}", path.display());
     Some(std::fs::read(&*raw).expect("the raw frame"))
+}
+
+/// A one-second 720p fixture whose samples are ordinary 8-bit BT.709 pictures
+/// but whose *tags* say BT.2020 PQ -- which is all the colour path reads, so it
+/// exercises the tone map without an HDR encoder anywhere near the test. The
+/// codes therefore mean something far brighter than they were drawn as, which is
+/// the point: an HDR file handed to an SDR display is exactly that mistake.
+///
+/// The tags go in through `-x264-params`, not ffmpeg's own `-color_trc`: the
+/// latter writes the mp4's `colr` box alone here (measured: ffprobe reads the
+/// transfer back as "unknown"), and the bitstream is the answer any reader takes
+/// first. `None` where ffmpeg is not installed.
+fn pq_fixture() -> Option<Scratch> {
+    let path = out_path("pq_source", "mp4");
+    let made = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=1",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
+        ])
+        .arg(&*path)
+        .output()
+        .ok()?;
+    made.status.success().then_some(path)
 }
 
 fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
@@ -310,6 +348,185 @@ fn every_format_signals_its_space_in_the_bitstream() {
         assert_eq!(got, "bt709", "{name}: what a decoder makes of the frame");
         std::fs::remove_file(&out).unwrap();
     }
+}
+
+/// An HDR source comes out as an SDR file that *says* it is one, in the
+/// container and in the bitstream both. The tags are the half a player reads
+/// before it reads a pixel: a file of tone-mapped samples still labelled PQ is
+/// shown through a second, inverse curve and is worse than either honest answer.
+#[test]
+fn an_hdr_source_exports_as_a_tagged_sdr_file() {
+    let Some(source) = pq_fixture() else {
+        eprintln!("no ffmpeg: skipping the HDR export tags");
+        return;
+    };
+    let (meta, _) = Demuxer::open(&source).expect("open the PQ fixture");
+    assert_eq!(meta.color.transfer, Transfer::Pq, "the fixture's own curve");
+    assert_eq!(meta.color.matrix, Matrix::Bt2020Ncl, "...and its matrix");
+
+    let session = two_frames(&source);
+    let out = out_path("hdr_tags", "mp4");
+    export(&session, &out, Format::Mp4);
+
+    let (meta, _) = Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(
+        meta.color,
+        ColorDescription {
+            matrix: Matrix::Bt709,
+            transfer: Transfer::Sdr,
+            full_range: false,
+        },
+        "what the export says about itself"
+    );
+    match probed(&out) {
+        Some(tags) => {
+            eprintln!("PQ source -> mp4: ffprobe {tags:?}");
+            let want: Vec<String> = ["tv", "bt709", "bt709", "bt709"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(tags, want, "range, matrix, transfer, primaries");
+            assert_eq!(
+                probed_frame(&out).expect("ffprobe is installed"),
+                "bt709",
+                "what a decoder makes of the coded frame"
+            );
+        }
+        None => eprintln!("no ffprobe: skipping the external read"),
+    }
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The order, measured on the samples: tone-map first, grade the SDR picture
+/// that comes out. Playback renders in that order, so an export that graded the
+/// *HDR* codes and tone-mapped afterwards would be a different picture than the
+/// canvas showed -- and with a brightness lift on a curve this steep, a very
+/// different one, which is what the swapped-order control here measures.
+///
+/// It is also where "converted once" is checked: the reference below is the tone
+/// map and the grade and nothing else, no matrix step, so an export that also
+/// ran the BT.2020 matrix over those samples could not land on it.
+#[test]
+fn an_hdr_clip_is_tone_mapped_before_it_is_graded() {
+    let Some(source) = pq_fixture() else {
+        eprintln!("no ffmpeg: skipping the tone-map order check");
+        return;
+    };
+    let Some(src) = raw_yuv(&source) else {
+        eprintln!("no ffmpeg: skipping the tone-map order check");
+        return;
+    };
+    // A lift, because the curve it is composed with is steepest where the codes
+    // are: swap the two and the picture is visibly elsewhere.
+    let grade = engine::color::ColorParams {
+        brightness: 0.25,
+        ..Default::default()
+    };
+    let mut session = two_frames(&source);
+    assert!(
+        session.set_color(engine::project::Lane::V1, 0, Some(grade)),
+        "the grade went on the clip"
+    );
+    let out = out_path("hdr_order", "mp4");
+    export(&session, &out, Format::Mp4);
+    let got = raw_yuv(&out).expect("ffmpeg read the export");
+
+    let (width, height) = (1280usize, 720usize);
+    let mapper = ToneMapper::new(tonemap::Transfer::Pq);
+    // The same bytes twice, through the two orders. Whichever way MASTER_NITS is
+    // set, both sides move with it -- what is asserted is which of them the
+    // export sits on, not where either lands.
+    let both = [true, false].map(|tone_first| {
+        let mut planes = src.clone();
+        let (y, chroma) = planes.split_at_mut(width * height);
+        let (u, v) = chroma.split_at_mut(width * height / 4);
+        if tone_first {
+            mapper.map(y, u, v, width, height);
+            engine::color::apply_yuv(&grade, y, u, v);
+        } else {
+            engine::color::apply_yuv(&grade, y, u, v);
+            mapper.map(y, u, v, width, height);
+        }
+        planes
+    });
+    let [ordered, swapped] = both.map(|planes| mean_abs_diff(&got, &planes));
+    eprintln!(
+        "HDR export: {ordered:.2} off tone-map-then-grade, {swapped:.2} off the swapped order"
+    );
+    assert!(
+        ordered < 3.0,
+        "the export is {ordered:.2} codes from tone-map-then-grade"
+    );
+    assert!(
+        swapped > 3.0 * ordered,
+        "ordered {ordered:.2} vs swapped {swapped:.2}: the two orders are not far enough apart to have measured anything"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The real thing, where this machine has it: five seconds of a 4K HDR10 film,
+/// ten minutes in (the opening two are black and would measure nothing),
+/// decoded by the VA-API plugin -- 10-bit HEVC has no software decoder here --
+/// and exported. Skipped, loudly, on a machine without the film.
+///
+/// What is asserted is what the synthetic fixture cannot be: that the tone map
+/// survives a real grade of real HDR10 pixels. A picture that came out grey
+/// (chroma collapsed onto 128) or crushed to black is what a mistuned or
+/// double-applied conversion produces, and both are one mean away.
+#[test]
+fn a_real_hdr_film_exports_as_a_picture() {
+    let film = Path::new(
+        "/path/to/a-real-4k-hdr10-film.mkv",
+    );
+    if !film.exists() {
+        eprintln!("skipped: {} is not on this machine", film.display());
+        return;
+    }
+    let mut session = PlaybackSession::open(film).expect("open the film");
+    assert_eq!(session.meta().color.transfer, Transfer::Pq, "an HDR10 film");
+    // A five-second window out of the middle: cut both ends, drop them, and the
+    // delete closes the gap ahead of what is left, so the export is those five
+    // seconds and no leading black.
+    assert!(session.cut_at(605.0), "the tail cut");
+    assert!(session.cut_at(600.0), "the head cut");
+    assert!(session.delete_clip(engine::project::Lane::V1, 2), "the tail");
+    assert!(session.delete_clip(engine::project::Lane::V1, 0), "the head");
+    let out = out_path("hdr_film", "mp4");
+    export(&session, &out, Format::Mp4);
+
+    let (meta, _) = Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(
+        meta.color,
+        ColorDescription {
+            matrix: Matrix::Bt709,
+            transfer: Transfer::Sdr,
+            full_range: false,
+        },
+        "a 4K HDR film exported as tagged SDR"
+    );
+    let Some(frame) = raw_yuv(&out) else {
+        eprintln!("no ffmpeg: skipping the pixel half of the film check");
+        return;
+    };
+    let (width, height) = (meta.width as usize, meta.height as usize);
+    let (y, chroma) = frame.split_at(width * height);
+    let luma = y.iter().map(|s| f64::from(*s)).sum::<f64>() / y.len() as f64;
+    let colour = chroma
+        .iter()
+        .map(|s| f64::from(s.abs_diff(128)))
+        .sum::<f64>()
+        / chroma.len() as f64;
+    eprintln!("5 s of the film at 600 s: mean luma {luma:.1}, mean chroma distance {colour:.1}");
+    // Ranges, not anchors: the exposure the tone map is tuned to is a constant
+    // in that module and may move. What may not move is that the picture is
+    // still a picture -- neither crushed to black nor washed to white, and in
+    // colour.
+    assert!(
+        (25.0..200.0).contains(&luma),
+        "mean luma {luma:.1}: that is not a picture"
+    );
+    assert!(colour > 4.0, "mean chroma distance {colour:.1}: grey");
+    std::fs::remove_file(&out).unwrap();
 }
 
 /// Preview and export are the same picture, on the one path where they used to
