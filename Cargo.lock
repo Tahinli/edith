@@ -1637,8 +1637,11 @@ dependencies = [
  "mp4",
  "oxideav-ac3",
  "oxideav-core",
+ "oxideav-h265",
  "rav1e",
+ "rusty_aac",
  "rusty_h264",
+ "rusty_mp3",
  "symphonia",
  "symphonia-codec-aac",
  "symphonia-core",
@@ -3949,6 +3952,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxideav-h265"
+version = "0.0.9"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4881,6 +4891,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty_aac"
+version = "0.5.0"
+
+[[package]]
 name = "rusty_h264"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4918,6 +4932,12 @@ checksum = "f4fb69d8977d1d067d6d603df0614678c4a35ac1201fff38783c8847e429c879"
 dependencies = [
  "rusty_h264-common",
 ]
+
+[[package]]
+name = "rusty_mp3"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a99f339ec9a2d84eec8fc2a42baa92426966b25238c498e79d57b4e49b14fbad"
 
 [[package]]
 name = "rustybuzz"
@@ -5600,6 +5620,7 @@ dependencies = [
  "symphonia-codec-vorbis",
  "symphonia-core",
  "symphonia-format-isomp4",
+ "symphonia-format-mkv",
  "symphonia-format-ogg",
  "symphonia-format-riff",
  "symphonia-metadata",
@@ -5707,6 +5728,18 @@ dependencies = [
  "symphonia-common",
  "symphonia-core",
  "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-format-mkv"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb17713e134f5ad316c2690fa3104590ccc85842cdbcf82c3cd1a845cb08aa74"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-common",
+ "symphonia-core",
 ]
 
 [[package]]

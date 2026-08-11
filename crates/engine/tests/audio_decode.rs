@@ -208,12 +208,17 @@ fn matroska_ac3_and_eac3_decode_out_of_the_blocks() {
             "{name}: nothing to excuse when it plays"
         );
     }
-    // The invariant, stated as an assert: a Matroska file whose sound is in a
-    // codec this still cannot read is named, not silently silent.
-    let reason = AudioSession::unsupported(asset("test_av1.mkv"))
-        .expect("unsupported")
-        .expect("the AAC track of an mkv is still named");
-    assert!(reason.contains("A_AAC") && reason.contains("not wired"), "{reason}");
+    // The invariant, stated as an assert: the AAC track of a Matroska file is
+    // still symphonia's, listed and decoded exactly as it was.
+    let streams = AudioSession::probe_streams(asset("test_av1.mkv")).expect("streams");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].codec, "aac", "AAC in an mkv is untouched by this");
+    assert!(
+        AudioSession::open(asset("test_av1.mkv"))
+            .expect("open")
+            .is_some(),
+        "AAC in an mkv still decodes"
+    );
 }
 
 /// A seek into a Matroska AC-3 track: Matroska indexes no samples, so the block
@@ -252,8 +257,10 @@ fn a_seek_into_a_matroska_ac3_track_is_the_tail_of_a_full_run() {
     assert!(diff < 1e-3, "max abs diff {diff} after the seek");
 }
 
-/// An AC-3 source cannot be packet-copied into an mp4 -- there is no AAC
-/// encoder here -- and that refusal is named, never a silent silent export.
+/// An AC-3 syncframe is not something an `mp4a` sample table holds, so the
+/// *copy* path names it and hands the export on to the re-encode (which decodes
+/// this very source: the downmix above is what it encodes). Named either way --
+/// never a silent export.
 #[test]
 fn an_ac3_source_refuses_an_mp4_audio_copy() {
     let Err(err) = AudioSession::copy_segments(asset("test_ac3.mp4"), &[(0.0, 1.0)]) else {
@@ -261,7 +268,7 @@ fn an_ac3_source_refuses_an_mp4_audio_copy() {
     };
     let err = err.to_string();
     assert!(
-        err.contains("needs AAC audio") && err.contains("AC-3"),
+        err.contains("needs AAC in an mp4") && err.contains("AC-3"),
         "unhelpful refusal: {err}"
     );
 }

@@ -1,9 +1,11 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 8
+//! edith 9
 //! playhead 90
 //! resolution 1920 1080
+//! fps 30.0
+//! limiter -1.0 on
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
 //! eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk
@@ -12,7 +14,26 @@
 //! audio 1 0 0 120 0 0 0 - fit 1000
 //! video 2 120 0 120 1 - - - fill 2000
 //! audio 2
+//! gain audio 1 -3.0
 //! ```
+//!
+//! The `fps` line is the rate the timeline was cut at, printed so it reads back
+//! bit-exactly. A file without one (every dialect before v9) means "whatever
+//! the scaffolding source runs at", which is what such a project always was and
+//! is an answer only a project holding a video has
+//! ([`crate::PlaybackSession::open_project`]).
+//!
+//! The `limiter` line is the master limiter over the whole mix
+//! ([`crate::limiter`]): its ceiling in dBFS and whether it is in circuit,
+//! spelled `on` or `off`. Left out when it is the default, which is off.
+//!
+//! A `gain` line is `gain <kind> <lane> <dB>`: how loud that whole lane plays,
+//! everything on it and every frequency of it -- a different thing from a
+//! clip's `eq` line, which is one take and one band. It names its lane the way
+//! a clip line does and comes *after* the lanes, because a lane is declared by
+//! its clips and a gain declares nothing. Only a lane somebody has turned gets
+//! one; the rest are at 0 dB, which is where every lane of every dialect before
+//! v9 is.
 //!
 //! The `resolution` line is the **project's** picture size, which is a
 //! different thing from any source's: media of other sizes are placed on it.
@@ -58,7 +79,10 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 7** was this without the clip's speed field -- every clip of such
+//! **Version 8** was this without the `fps` and `limiter` lines and without
+//! the `gain` ones: such a project mixes every lane at unity, limits nothing,
+//! and comes back at the rate its scaffolding source runs at.
+//! **Version 7** was that without the clip's speed field -- every clip of such
 //! a project plays at real time, which is the only rate there was.
 //! **Version 6** was that without the `resolution` line and without the clip's
 //! fit field -- such a project is the size of its first source and letterboxes
@@ -72,9 +96,9 @@
 //! <in> <out> <source>`. All six still load -- a v1 file's clips are laid out
 //! cumulatively and copied onto both lanes as one group each, which is exactly
 //! what a v1 timeline meant, and an older file simply equalizes and grades
-//! nothing, and an older one plays everything at real time -- and saving any of
-//! them writes v8. An older reader refuses a newer
-//! file by name.
+//! nothing, and an older one plays everything at real time, and an older one
+//! mixes flat -- and saving any of them writes v9. An older reader refuses a
+//! newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -102,12 +126,14 @@ use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
 use crate::eq::{Band, BandKind, EqParams};
+use crate::limiter::Limiter;
 use crate::project::{Clip, Lane, LaneKind, Source, Speed};
 use crate::scale::FitPolicy;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 8";
+const MAGIC: &[u8] = b"edith 9";
+const MAGIC_V8: &[u8] = b"edith 8";
 const MAGIC_V7: &[u8] = b"edith 7";
 const MAGIC_V6: &[u8] = b"edith 6";
 const MAGIC_V5: &[u8] = b"edith 5";
@@ -136,18 +162,37 @@ pub struct Document {
     /// The project's own picture size. `None` for every dialect before v7 and
     /// for a v7 file that leaves it out, which both mean "source 0's picture".
     pub resolution: Option<(u32, u32)>,
+    /// Every lane's own volume in dB, in the order `lanes` is in and as long as
+    /// it; `0.0` for a lane nobody has turned, which is every lane of every
+    /// dialect before v9.
+    pub gains: Vec<f32>,
+    /// The master limiter. Off for every dialect before v9, and for a v9 file
+    /// that leaves the line out.
+    pub limiter: Limiter,
+    /// The timeline's frame rate. `None` for every dialect before v9 and for a
+    /// v9 file that leaves it out, which both mean "whatever the scaffolding
+    /// source runs at" -- the inference a project of nothing but stills and
+    /// songs has no answer for (see
+    /// [`crate::PlaybackSession::open_project`]).
+    pub fps: Option<f64>,
     pub playhead: u32,
 }
 
 /// Writes the project to `path`, atomically. `sources`, `eq` and `color` should
-/// already be orphan-free ([`crate::Project::without_orphan_sources`]).
+/// already be orphan-free ([`crate::Project::without_orphan_sources`]);
+/// `gains` is one dB per lane in the same order the lanes are in
+/// ([`crate::Project::lane_gains`]).
+#[allow(clippy::too_many_arguments)]
 pub fn save(
     path: &Path,
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
+    gains: &[f32],
     eq: &[EqParams],
     color: &[ColorParams],
     resolution: (u32, u32),
+    fps: Option<f64>,
+    limiter: Limiter,
     playhead: u32,
 ) -> crate::Result<()> {
     let dir = project_dir(path);
@@ -160,7 +205,9 @@ pub fn save(
     // the second one puts the name itself there.
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
-            f.write_all(&emit(&dir, sources, lanes, eq, color, resolution, playhead))?;
+            f.write_all(&emit(
+                &dir, sources, lanes, gains, eq, color, resolution, fps, limiter, playhead,
+            ))?;
             f.sync_all()
         })
         .and_then(|()| std::fs::rename(&part, path))
@@ -190,13 +237,17 @@ fn project_dir(path: &Path) -> PathBuf {
     dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit(
     dir: &Path,
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
+    gains: &[f32],
     eq: &[EqParams],
     color: &[ColorParams],
     resolution: (u32, u32),
+    fps: Option<f64>,
+    limiter: Limiter,
     playhead: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -204,6 +255,26 @@ fn emit(
     out.push(b'\n');
     out.extend_from_slice(format!("playhead {playhead}\n").as_bytes());
     out.extend_from_slice(format!("resolution {} {}\n", resolution.0, resolution.1).as_bytes());
+    // `{:?}`, the eq table's rule: the rate a timeline was cut at has to read
+    // back as the very number, or every clip on it lands on another frame.
+    if let Some(fps) = fps.filter(|f| f.is_finite() && *f > 0.0) {
+        out.extend_from_slice(format!("fps {fps:?}\n").as_bytes());
+    }
+    // Written only when it is not the default, so a project nobody has limited
+    // is the same bytes it was in v8 bar the version line.
+    if limiter != Limiter::default() {
+        out.extend_from_slice(
+            format!(
+                "limiter {:?} {}\n",
+                limiter.ceiling_db,
+                match limiter.on {
+                    true => "on",
+                    false => "off",
+                }
+            )
+            .as_bytes(),
+        );
+    }
     for s in sources {
         out.extend_from_slice(format!("source {} ", s.audio_stream).as_bytes());
         escape(s.path.strip_prefix(dir).unwrap_or(&s.path), &mut out);
@@ -276,6 +347,25 @@ fn emit(
             );
         }
     }
+    // After the lanes, not before them: a gain line names a lane that has to be
+    // there already, and a lane is declared by its own lines. Only the lanes
+    // somebody has turned get one.
+    let (mut video, mut audio) = (0, 0);
+    for ((kind, _), &db) in lanes.iter().zip(gains) {
+        let (keyword, ord) = match kind {
+            LaneKind::Video => {
+                video += 1;
+                ("video", video)
+            }
+            LaneKind::Audio => {
+                audio += 1;
+                ("audio", audio)
+            }
+        };
+        if db != 0.0 {
+            out.extend_from_slice(format!("gain {keyword} {ord} {db:?}\n").as_bytes());
+        }
+    }
     out
 }
 
@@ -289,8 +379,11 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries a per-clip speed...
-    let v8 = first == MAGIC;
+    // The one that carries the mix -- lane volumes, the master limiter and the
+    // rate the timeline was cut at...
+    let v9 = first == MAGIC;
+    // ...the ones that carry a per-clip speed...
+    let v8 = v9 || first == MAGIC_V8;
     // ...the ones that carry a project resolution and per-clip fit policies...
     let v7 = v8 || first == MAGIC_V7;
     // ...the ones that carry colour grades...
@@ -322,6 +415,11 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // Nothing before v7 has a resolution of its own: source 0's picture is
         // what those projects were, and `None` is how the loader is told so.
         resolution: None,
+        // ...and nothing before v9 carries a mix or a rate: every lane at unity,
+        // no limiter, and the rate inferred from the scaffold as it always was.
+        gains: Vec::new(),
+        limiter: Limiter::default(),
+        fps: None,
         playhead: 0,
     };
     let mut playhead_seen = false;
@@ -359,6 +457,76 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     return Err(format!("line {n}: {width}x{height} is not a picture").into());
                 }
                 doc.resolution = Some((width, height));
+            }
+            b"fps" if v9 => {
+                if doc.fps.is_some() || !doc.sources.is_empty() {
+                    return Err(format!("line {n}: fps belongs once, before the sources").into());
+                }
+                let f = fields(rest, 1, "fps", n)?;
+                let fps = std::str::from_utf8(f[0])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|f| f.is_finite() && *f > 0.0 && *f <= 1000.0)
+                    .ok_or_else(|| {
+                        format!(
+                            "line {n}: {:?} is not a frame rate",
+                            String::from_utf8_lossy(f[0])
+                        )
+                    })?;
+                doc.fps = Some(fps);
+            }
+            b"limiter" if v9 => {
+                if !doc.sources.is_empty() {
+                    return Err(
+                        format!("line {n}: limiter belongs once, before the sources").into(),
+                    );
+                }
+                let f = fields(rest, 2, "limiter", n)?;
+                let on = match f[1] {
+                    b"on" => true,
+                    b"off" => false,
+                    other => {
+                        return Err(format!(
+                            "line {n}: limiter is on or off, not {:?}",
+                            String::from_utf8_lossy(other)
+                        )
+                        .into());
+                    }
+                };
+                // Through the same clamp a nudge goes through: a hand-written
+                // ceiling above full scale is a ceiling that limits nothing.
+                doc.limiter = Limiter {
+                    on,
+                    ..Limiter::default()
+                }
+                .with_ceiling(float(f[0], n)?);
+            }
+            // After the lanes it names, which is where `emit` writes it: a lane
+            // is declared by its own lines, and a gain declares nothing.
+            b"gain" if v9 => {
+                let f = fields(rest, 3, "gain", n)?;
+                let kind = match f[0] {
+                    b"video" => LaneKind::Video,
+                    b"audio" => LaneKind::Audio,
+                    other => {
+                        return Err(format!(
+                            "line {n}: gain names {:?}, not a lane kind",
+                            String::from_utf8_lossy(other)
+                        )
+                        .into());
+                    }
+                };
+                let ord = number(f[1], n)?;
+                let at = doc
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (k, _))| *k == kind)
+                    .nth(ord.saturating_sub(1) as usize)
+                    .map(|(at, _)| at)
+                    .ok_or_else(|| format!("line {n}: gain names a lane that is not there"))?;
+                doc.gains.resize(doc.lanes.len(), 0.0);
+                doc.gains[at] = float(f[2], n)?;
             }
             b"source" => {
                 if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
@@ -518,6 +686,8 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
         }
     }
+    // One per lane whatever the file said, so a caller may zip the two.
+    doc.gains.resize(doc.lanes.len(), 0.0);
     // A file whose lanes are all empty *is* a project -- the emptied timeline,
     // saved. What it may not be is laneless; [`crate::Project::from_parts`]
     // refuses that one, by the name it has there.
@@ -773,6 +943,35 @@ fn unescape(field: &[u8], line: usize) -> crate::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// [`super::emit`] for a project whose mix is flat: every lane at unity, no
+    /// limiter, no rate written. Shadows the real one for the tests that were
+    /// written before there was a mix to write -- the dialect they are about is
+    /// the one this emits, and a v9 file with flat settings is a v8 file bar
+    /// its version line, which is exactly what they assert.
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        dir: &Path,
+        sources: &[Source],
+        lanes: &[(LaneKind, Vec<Clip>)],
+        eq: &[EqParams],
+        color: &[ColorParams],
+        resolution: (u32, u32),
+        playhead: u32,
+    ) -> Vec<u8> {
+        super::emit(
+            dir,
+            sources,
+            lanes,
+            &[],
+            eq,
+            color,
+            resolution,
+            None,
+            Limiter::default(),
+            playhead,
+        )
+    }
+
     fn clip(start: u32, in_frame: u32, out_frame: u32, source: usize, link: Option<u32>) -> Clip {
         Clip {
             start,
@@ -833,7 +1032,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -870,7 +1069,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -978,7 +1177,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1082,7 +1281,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1147,7 +1346,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 8\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1185,7 +1384,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -1214,7 +1413,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 8\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -1223,6 +1422,105 @@ mod tests {
             parse(bad, &dir).unwrap_err().to_string(),
             "line 3: speed 9000 is outside 250-4000 thousandths"
         );
+    }
+
+    /// The whole of the v9 bump, the speed test's twin: the mix a project was
+    /// left at -- every track's own volume and the master limiter -- plus the
+    /// rate it was cut at, all written, all read back as the very numbers, and
+    /// a v8 file (which has none of them) loading flat and unlimited.
+    #[test]
+    fn the_mix_and_the_rate_round_trip_and_a_v8_file_is_flat() {
+        let dir = PathBuf::from("/proj");
+        let sources = vec![Source::new("/proj/a.mp4", 0)];
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 30, 0, None)]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0, None)]),
+            // A second audio track, turned down: the gain lines are per lane,
+            // so the two must not run into one another.
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0, None)]),
+        ];
+        let limiter = Limiter {
+            ceiling_db: -1.5,
+            on: true,
+        };
+        let bytes = super::emit(
+            &dir,
+            &sources,
+            &lanes,
+            &[0.0, 3.0, -6.5],
+            &[],
+            &[],
+            (1280, 720),
+            Some(23.976023976023978),
+            limiter,
+            0,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "edith 9\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+             limiter -1.5 on\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
+             audio 2 0 0 30 0 - - - fit 1000\n\
+             gain audio 1 3.0\ngain audio 2 -6.5\n",
+            "the mix is lines of its own, the gains after the lanes they name"
+        );
+        let back = parse(&bytes, &dir).expect("parse");
+        assert_eq!(back.lanes, lanes);
+        assert_eq!(back.gains, vec![0.0, 3.0, -6.5], "one per lane, in order");
+        assert_eq!(back.limiter, limiter);
+        assert_eq!(back.fps, Some(23.976023976023978), "bit-exact, not 23.976");
+
+        // ...and the dialect before it, which carried none of the three: a v8
+        // file mixes flat, limits nothing, and says nothing about its rate.
+        let v8 = b"edith 8\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+                   video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n";
+        let old = parse(v8, &dir).expect("v8 parses");
+        assert_eq!(old.gains, vec![0.0, 0.0], "one per lane, all at unity");
+        assert_eq!(old.limiter, Limiter::default());
+        assert_eq!(old.fps, None);
+        // A v9 file may leave all three out too, and means the same thing.
+        assert_eq!(
+            String::from_utf8_lossy(&emit(
+                &dir,
+                &old.sources,
+                &old.lanes,
+                &old.eq,
+                &old.color,
+                (1280, 720),
+                old.playhead
+            )),
+            "edith 9\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+             video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
+        );
+
+        // Each of the three refuses by name, on its own line.
+        for (text, want) in [
+            (
+                "edith 9\nfps nope\nsource 0 a.mp4\n",
+                "line 2: \"nope\" is not a frame rate",
+            ),
+            (
+                "edith 9\nlimiter -1.0 maybe\nsource 0 a.mp4\n",
+                "line 2: limiter is on or off, not \"maybe\"",
+            ),
+            (
+                "edith 9\nsource 0 a.mp4\nvideo 1 0 0 30 0 - - - fit 1000\ngain audio 1 -3.0\n",
+                "line 4: gain names a lane that is not there",
+            ),
+            (
+                "edith 9\nsource 0 a.mp4\nvideo 1 0 0 30 0 - - - fit 1000\ngain lane 1 -3.0\n",
+                "line 4: gain names \"lane\", not a lane kind",
+            ),
+        ] {
+            assert_eq!(
+                parse(text.as_bytes(), &dir).unwrap_err().to_string(),
+                want,
+                "{text:?}"
+            );
+        }
+        // A hand-written ceiling nothing could limit at is clamped, not taken.
+        let loud = parse(b"edith 9\nlimiter 12.0 on\nsource 0 a.mp4\n", &dir).expect("parses");
+        assert_eq!(loud.limiter.ceiling_db, Limiter::MAX_DB);
     }
 
     /// The refusals the colour grammar adds, each naming its line.
@@ -1355,7 +1653,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -1408,7 +1706,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 8\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 9\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1440,7 +1738,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 8\n"));
+        assert!(v5.starts_with(b"edith 9\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1535,14 +1833,17 @@ mod tests {
             &two(one.to_vec(), one.to_vec()),
             &[],
             &[],
+            &[],
             (1280, 720),
+            None,
+            Limiter::default(),
             0,
         )
         .expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 8\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 9\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -1587,10 +1888,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 9\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 10\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 9");
+        assert_eq!(err, "line 1: unsupported version 10");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
