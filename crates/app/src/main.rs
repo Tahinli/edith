@@ -117,7 +117,7 @@ const KEYS_ROW_H: f32 = HIT_MIN;
 /// editor grows -- ten rows fit here, and the eleventh is a scroll away.
 const KEYS_ROWS_H: f32 = 10. * KEYS_ROW_H;
 /// The same for the export card, which carries a fixed-format line and a button
-/// under its list and so has less room: destination, nine formats and five
+/// under its list and so has less room: destination, ten formats and five
 /// qualities are fifteen rows, eight of them on screen.
 const EXPORT_ROWS_H: f32 = 8. * KEYS_ROW_H;
 /// The menu a right-click on a clip opens: wide enough for the longest label
@@ -4802,11 +4802,12 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "pick a format (m/a/v/w/f/p), then Export — esc closes".into()
+                                    "pick a format (m/a/v/h/x/w/f/p), then Export — esc closes"
+                                        .into()
                                 })),
                         )
                         // Capped and scrolling like the keybindings list: the
-                        // destination, nine formats and five qualities are more
+                        // destination, ten formats and five qualities are more
                         // rows than a 360 px window has room for, and it is the
                         // list that scrolls, never the card that grows.
                         .child(
@@ -6941,20 +6942,23 @@ impl Quality {
 /// as a claim that nothing else exists -- so the refusals are rows too, dimmed
 /// and unclickable.
 ///
-/// `None` is exactly that kind of row, and there are three left. MP3 stopped
+/// `None` is exactly that kind of row, and there are two left. MP3 stopped
 /// being one when `rusty_mp3` gave this project an Apache-2.0 encoder (the LGPL
 /// `shine-rs` was the licence question, and it is not the only encoder any
-/// more). HEVC and VP9 are the two this program *reads* and cannot write -- the
-/// plugin decodes both and there is no encoder for either here -- so they are
-/// rows for the same reason: a codec that opens but never comes back out is
-/// exactly the gap a user would otherwise go looking for. AAC is not a row at
-/// all: it is what both containers' sound *is*, never a file of its own.
+/// more), and HEVC stopped being one when OxideAV's pure-Rust H.265 gave it an
+/// encoder — an *intra-only* one, which the rows say rather than let a user
+/// find out from the size of the file. VP9 is the one this program still only
+/// *reads*: the plugin decodes it and there is no encoder for it here, so it is
+/// a row for the reason the refusals are rows at all — a codec that opens but
+/// never comes back out is exactly the gap a user would otherwise go looking
+/// for. AAC is not a row at all: it is what both containers' sound *is*, never a
+/// file of its own.
 ///
 /// AV1 is two rows because a codec and a container are two choices: the same
 /// picture and the same AAC track go into a Matroska file or into an mp4, and
 /// which one a user needs is about what has to play the file, not about the
-/// encode.
-const FORMATS: [(Option<Format>, &str, &str, &str); 9] = [
+/// encode. HEVC is two rows for the same reason.
+const FORMATS: [(Option<Format>, &str, &str, &str); 10] = [
     (Some(Format::Mp4), "m", "MP4", "H.264 picture + AAC sound"),
     (
         Some(Format::Av1),
@@ -6968,6 +6972,18 @@ const FORMATS: [(Option<Format>, &str, &str, &str); 9] = [
         "AV1 · MP4",
         "the same AV1 picture and sound in .mp4",
     ),
+    (
+        Some(Format::Hevc),
+        "h",
+        "HEVC · MKV",
+        "intra-only HEVC + AAC in .mkv — large files",
+    ),
+    (
+        Some(Format::HevcMp4),
+        "x",
+        "HEVC · MP4",
+        "the same intra-only HEVC and sound in .mp4",
+    ),
     (Some(Format::Wav), "w", "WAV", "16-bit PCM — audio only"),
     (Some(Format::Flac), "f", "FLAC", "lossless — audio only"),
     (
@@ -6977,12 +6993,6 @@ const FORMATS: [(Option<Format>, &str, &str, &str); 9] = [
         "MPEG-1 Layer III, 256 kbps — audio only",
     ),
     (None, "", "OGG", "no pure-Rust Vorbis or Opus encoder"),
-    (
-        None,
-        "",
-        "HEVC",
-        "no encoder in this stack, and patent-encumbered",
-    ),
     (None, "", "VP9", "superseded by AV1, which is the row above"),
 ];
 
@@ -7167,6 +7177,8 @@ fn format_line(format: Format) -> &'static str {
         Format::Mp4 => "H.264 · MP4 · moov at end",
         Format::Av1 => "AV1 · Matroska · picture and sound",
         Format::Av1Mp4 => "AV1 · MP4 · picture and sound",
+        Format::Hevc => "HEVC intra · Matroska · picture and sound",
+        Format::HevcMp4 => "HEVC intra · MP4 · picture and sound",
         Format::Wav => "16-bit PCM · WAV · timeline audio only",
         Format::Flac => "FLAC · lossless · timeline audio only",
         Format::Mp3 => "MP3 · 256 kbps · timeline audio only",
@@ -10254,6 +10266,8 @@ mod tests {
                 Format::Mp4,
                 Format::Av1,
                 Format::Av1Mp4,
+                Format::Hevc,
+                Format::HevcMp4,
                 Format::Wav,
                 Format::Flac,
                 Format::Mp3
@@ -10261,10 +10275,14 @@ mod tests {
         );
         assert_eq!(Format::Av1.ext(), "mkv");
         assert_eq!(Format::Av1Mp4.ext(), "mp4");
+        assert_eq!(Format::Hevc.ext(), "mkv");
+        assert_eq!(Format::HevcMp4.ext(), "mp4");
         for (format, _, label, _) in FORMATS {
             match format {
                 Some(Format::Av1) => assert_eq!(label, "AV1 · MKV"),
                 Some(Format::Av1Mp4) => assert_eq!(label, "AV1 · MP4"),
+                Some(Format::Hevc) => assert_eq!(label, "HEVC · MKV"),
+                Some(Format::HevcMp4) => assert_eq!(label, "HEVC · MP4"),
                 Some(format) => assert_eq!(format.ext(), label.to_lowercase()),
                 // A refused format is a row with a reason, never a hidden one:
                 // an empty detail column would read as an oversight.
@@ -10277,7 +10295,12 @@ mod tests {
             // dims them off exactly this.
             assert_eq!(
                 format.is_some_and(Format::has_video),
-                matches!(format, Some(Format::Mp4 | Format::Av1 | Format::Av1Mp4))
+                matches!(
+                    format,
+                    Some(
+                        Format::Mp4 | Format::Av1 | Format::Av1Mp4 | Format::Hevc | Format::HevcMp4
+                    )
+                )
             );
             // Every row that can be picked has a key of its own, and no two
             // share one: the card is drivable without a pointer.
@@ -10290,10 +10313,11 @@ mod tests {
                 );
             }
         }
-        // The two codecs this program reads and cannot write are rows of their
-        // own, refused by name rather than absent -- HEVC for want of an encoder
-        // (and for its patents), VP9 because AV1 is the row that replaced it.
-        for (label, word) in [("HEVC", "no encoder"), ("VP9", "superseded")] {
+        // The codec this program reads and cannot write is a row of its own,
+        // refused by name rather than absent: VP9, because AV1 is the row that
+        // replaced it. HEVC used to be one beside it and is now two rows that
+        // pick -- an intra-only encoder is still an encoder.
+        for (label, word) in [("VP9", "superseded")] {
             let (format, _, _, detail) = FORMATS
                 .into_iter()
                 .find(|(_, _, row, _)| *row == label)
@@ -10312,8 +10336,21 @@ mod tests {
             assert!(detail.contains("sound"), "{detail}");
             assert!(format_line(format).contains("picture and sound"));
         }
+        // ...and both HEVC rows say what they are before a user waits on one:
+        // intra-only, which is a file several times the size of the AV1 above
+        // it. A row that hid that would be found out by the disk.
+        for format in [Format::Hevc, Format::HevcMp4] {
+            let (_, _, _, detail) = FORMATS
+                .into_iter()
+                .find(|(f, ..)| *f == Some(format))
+                .expect("an HEVC row");
+            assert!(detail.contains("intra-only"), "{detail}");
+            assert!(format_line(format).contains("picture and sound"));
+        }
         assert_eq!(format_key("a"), Some(Format::Av1), "the Matroska one");
         assert_eq!(format_key("v"), Some(Format::Av1Mp4), "and the mp4 one");
+        assert_eq!(format_key("h"), Some(Format::Hevc), "HEVC's Matroska");
+        assert_eq!(format_key("x"), Some(Format::HevcMp4), "and its mp4");
         assert_eq!(format_key("p"), Some(Format::Mp3));
         assert_eq!(format_key("m"), Some(Format::Mp4), "not MP3, which is p");
         // The destination follows the format and keeps the stem, mp4 included.
