@@ -96,49 +96,70 @@ fn a_playing_session_reports_the_seat_the_probe_named() {
 /// picture's seat is probed by opening the very encoder the export opens, and
 /// the sound's is decided outright. A drift between them is a front-end lying
 /// about the machine, which is exactly what this whole surface is for.
+///
+/// Every picture format, because each one is a different pair of seats: H.264
+/// through `rusty_h264` or the plugin, and AV1 through `rav1e` in either
+/// container -- a container is not an encoder, and the card must not say it is.
 #[test]
 fn the_planned_encoders_are_the_ones_the_job_opens() {
-    let settings = ExportSettings {
-        format: Format::Mp4,
-        ..ExportSettings::default()
-    };
-    let session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
-    let planned = format!(
-        "{} · {}",
-        engine::export::planned_video(session.meta(), &settings).expect("an mp4 carries picture"),
-        session.planned_audio(Format::Mp4)
-    );
-    let out = out_path("planned", "mp4");
-    let handle = session.export_to_with(&out, &settings);
-    let started = Instant::now();
-    let opened = loop {
-        if let Some(line) = handle.encoders() {
-            break line;
-        }
-        assert!(
-            !handle.is_finished(),
-            "the export settled before it opened an encoder: {:?}",
-            handle.result().map(|r| r.err())
+    for (format, ext) in [
+        (Format::Mp4, "mp4"),
+        (Format::Av1, "mkv"),
+        (Format::Av1Mp4, "mp4"),
+    ] {
+        let settings = ExportSettings {
+            format,
+            ..ExportSettings::default()
+        };
+        let session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        let planned = format!(
+            "{} · {}",
+            engine::export::planned_video(session.meta(), &settings)
+                .expect("these formats carry picture"),
+            session.planned_audio(format)
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "no encoder was published"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    // Nothing here wants the file, only the seat it was going to be written
-    // with: cancelling deletes the `.part` the worker had started.
-    handle.cancel();
-    wind_down(&handle);
-    assert_eq!(opened, planned);
+        let out = out_path("planned", ext);
+        let handle = session.export_to_with(&out, &settings);
+        let started = Instant::now();
+        let opened = loop {
+            if let Some(line) = handle.encoders() {
+                break line;
+            }
+            assert!(
+                !handle.is_finished(),
+                "the export settled before it opened an encoder: {:?}",
+                handle.result().map(|r| r.err())
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no encoder was published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Nothing here wants the file, only the seat it was going to be written
+        // with: cancelling deletes the `.part` the worker had started.
+        handle.cancel();
+        wind_down(&handle);
+        assert_eq!(opened, planned, "{ext}");
+        // ...and the sound is named on both, AV1 included: an AV1 export
+        // carries the timeline's audio now, so a line that said nothing about
+        // it would be the old picture-only lie in a new place.
+        assert!(planned.contains("AAC"), "{ext}: {planned}");
+    }
 }
 
 /// A WAV job has no picture at all and still names what writes it, so an audio
 /// export is not a progress line with nothing to say.
 #[test]
 fn an_audio_only_job_names_its_encoder() {
+    for format in [Format::Wav, Format::Flac, Format::Mp3] {
+        audio_only_job_names_its_encoder(format);
+    }
+}
+
+fn audio_only_job_names_its_encoder(format: Format) {
     let settings = ExportSettings {
-        format: Format::Wav,
+        format,
         ..ExportSettings::default()
     };
     assert_eq!(
@@ -149,11 +170,11 @@ fn an_audio_only_job_names_its_encoder() {
             &settings
         ),
         None,
-        "a WAV has no video seat to name"
+        "an audio-only format has no video seat to name"
     );
     let session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
-    let planned = session.planned_audio(Format::Wav);
-    let out = out_path("wav", "wav");
+    let planned = session.planned_audio(format);
+    let out = out_path("audio", format.ext());
     let handle = session.export_to_with(&out, &settings);
     let started = Instant::now();
     let opened = loop {
@@ -169,7 +190,7 @@ fn an_audio_only_job_names_its_encoder() {
     handle.cancel();
     wind_down(&handle);
     let _ = std::fs::remove_file(&out);
-    assert_eq!(opened, planned);
+    assert_eq!(opened, planned, "{}", format.ext());
 }
 
 /// Waits for a cancelled job to settle, so its `.part` is gone before the test
