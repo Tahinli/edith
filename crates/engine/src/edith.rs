@@ -1,10 +1,11 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 10
+//! edith 11
 //! playhead 90
 //! resolution 1920 1080
 //! fps 30.0
+//! tonemap vivid
 //! limiter -1.0 on
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
@@ -36,6 +37,12 @@
 //! a project file stays an edit list. A subtitle file that has gone missing
 //! since the save comes back listed and refused by name rather than dropped,
 //! which is what keeps a re-save from losing it.
+//!
+//! The `tonemap` line is which HDR-to-SDR rendition the project is watched and
+//! exported in ([`crate::tonemap::Preset`]), spelled `reference`, `standard` or
+//! `vivid`. Left out when it is the default, which is `reference` -- so a
+//! project holding no HDR media, and one whose owner never picked, are the bytes
+//! they were.
 //!
 //! The `limiter` line is the master limiter over the whole mix
 //! ([`crate::limiter`]): its ceiling in dBFS and whether it is in circuit,
@@ -93,7 +100,9 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 9** was this without the `subtitle` lines: such a project shows no
+//! **Version 10** was this without the `tonemap` line: such a project is shown
+//! in the reference rendition, which is the only one there was.
+//! **Version 9** was that without the `subtitle` lines: such a project shows no
 //! subtitles, which is all any project could do.
 //! **Version 8** was that without the `fps` and `limiter` lines and without
 //! the `gain` ones: such a project mixes every lane at unity, limits nothing,
@@ -113,8 +122,9 @@
 //! cumulatively and copied onto both lanes as one group each, which is exactly
 //! what a v1 timeline meant, and an older file simply equalizes and grades
 //! nothing, and an older one plays everything at real time, and an older one
-//! mixes flat, and an older one shows no subtitles -- and saving any of them
-//! writes v10. An older reader refuses a newer file by name.
+//! mixes flat, and an older one shows no subtitles, and an older one is shown
+//! in the reference rendition -- and saving any of them writes v11. An older
+//! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
 //! *bytes* on this platform -- a JSON string would have to lossily decode one.
@@ -149,7 +159,8 @@ use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 10";
+const MAGIC: &[u8] = b"edith 11";
+const MAGIC_V10: &[u8] = b"edith 10";
 const MAGIC_V9: &[u8] = b"edith 9";
 const MAGIC_V8: &[u8] = b"edith 8";
 const MAGIC_V7: &[u8] = b"edith 7";
@@ -198,6 +209,11 @@ pub struct Document {
     /// songs has no answer for (see
     /// [`crate::PlaybackSession::open_project`]).
     pub fps: Option<f64>,
+    /// The HDR-to-SDR rendition every clip on an HDR curve is shown in.
+    /// [`crate::tonemap::Preset::Reference`] for every dialect before v11 and
+    /// for a v11 file that leaves the line out, which both mean the published
+    /// conversion -- the only one those projects had.
+    pub tone: crate::tonemap::Preset,
     pub playhead: u32,
 }
 
@@ -216,6 +232,7 @@ pub fn save(
     color: &[ColorParams],
     resolution: (u32, u32),
     fps: Option<f64>,
+    tone: crate::tonemap::Preset,
     limiter: Limiter,
     playhead: u32,
 ) -> crate::Result<()> {
@@ -230,8 +247,8 @@ pub fn save(
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
             f.write_all(&emit(
-                &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, limiter,
-                playhead,
+                &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, tone,
+                limiter, playhead,
             ))?;
             f.sync_all()
         })
@@ -273,6 +290,7 @@ fn emit(
     color: &[ColorParams],
     resolution: (u32, u32),
     fps: Option<f64>,
+    tone: crate::tonemap::Preset,
     limiter: Limiter,
     playhead: u32,
 ) -> Vec<u8> {
@@ -285,6 +303,12 @@ fn emit(
     // back as the very number, or every clip on it lands on another frame.
     if let Some(fps) = fps.filter(|f| f.is_finite() && *f > 0.0) {
         out.extend_from_slice(format!("fps {fps:?}\n").as_bytes());
+    }
+    // Beside the rate, and written only when it is not the default: a project
+    // holding no HDR media has nothing to say here, and saying nothing is what
+    // a v10 file already said.
+    if tone != crate::tonemap::Preset::default() {
+        out.extend_from_slice(format!("tonemap {}\n", tone.name()).as_bytes());
     }
     // Written only when it is not the default, so a project nobody has limited
     // is the same bytes it was in v8 bar the version line.
@@ -415,8 +439,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries subtitle tracks...
-    let v10 = first == MAGIC;
+    // The one that carries an HDR rendition...
+    let v11 = first == MAGIC;
+    // ...the ones that carry subtitle tracks...
+    let v10 = v11 || first == MAGIC_V10;
     // ...the ones that carry the mix -- lane volumes, the master limiter and
     // the rate the timeline was cut at...
     let v9 = v10 || first == MAGIC_V9;
@@ -456,9 +482,11 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // ...and nothing before v9 carries a mix or a rate: every lane at unity,
         // no limiter, and the rate inferred from the scaffold as it always was.
         gains: Vec::new(),
-        // Nothing before v10 shows a subtitle.
+        // Nothing before v10 shows a subtitle, and nothing before v11 was shown
+        // in any rendition but the published one.
         subtitles: Vec::new(),
         limiter: Limiter::default(),
+        tone: crate::tonemap::Preset::default(),
         fps: None,
         playhead: 0,
     };
@@ -514,6 +542,20 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         )
                     })?;
                 doc.fps = Some(fps);
+            }
+            b"tonemap" if v11 => {
+                if !doc.sources.is_empty() {
+                    return Err(
+                        format!("line {n}: tonemap belongs once, before the sources").into(),
+                    );
+                }
+                let f = fields(rest, 1, "tonemap", n)?;
+                doc.tone = crate::tonemap::Preset::from_name(f[0]).ok_or_else(|| {
+                    format!(
+                        "line {n}: {:?} is not a tone map",
+                        String::from_utf8_lossy(f[0])
+                    )
+                })?;
             }
             b"limiter" if v9 => {
                 if !doc.sources.is_empty() {
@@ -1033,6 +1075,7 @@ mod tests {
             color,
             resolution,
             None,
+            crate::tonemap::Preset::default(),
             Limiter::default(),
             playhead,
         )
@@ -1073,6 +1116,7 @@ mod tests {
             &[],
             (1280, 720),
             None,
+            crate::tonemap::Preset::default(),
             Limiter::default(),
             0,
         );
@@ -1101,7 +1145,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 10\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 11\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1113,6 +1157,59 @@ mod tests {
             assert!(
                 parse(file.as_bytes(), &dir).is_err(),
                 "{line:?} is not a subtitle line"
+            );
+        }
+    }
+
+    /// The v11 line: the HDR rendition, written by name, read back as the very
+    /// preset -- and the dialect before it, which had no way to say one and
+    /// meant the published conversion.
+    #[test]
+    fn the_tone_map_round_trips_by_name_and_a_v10_file_is_the_reference_one() {
+        let dir = PathBuf::from("/proj");
+        let (_, sources, lanes) = doc();
+        for preset in crate::tonemap::Preset::ALL {
+            let bytes = super::emit(
+                &dir,
+                &sources,
+                &lanes,
+                &[],
+                &[],
+                &[],
+                &[],
+                (1280, 720),
+                None,
+                preset,
+                Limiter::default(),
+                0,
+            );
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            assert_eq!(
+                text.contains(&format!("tonemap {}\n", preset.name())),
+                preset != crate::tonemap::Preset::default(),
+                "the default is the line left out: {text}"
+            );
+            assert_eq!(parse(&bytes, &dir).expect("v11 parses").tone, preset);
+        }
+
+        // A v10 file is a project shown the published way, and re-saving it
+        // writes v11 with nothing more in it.
+        let v10 = b"edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+                    video 1 0 0 30 0 - - - fit 1000\n";
+        let old = parse(v10, &dir).expect("v10 still loads");
+        assert_eq!(old.tone, crate::tonemap::Preset::Reference);
+        // ...and the line itself is not a v10 line: a dialect may not be mixed.
+        let mixed = parse(b"edith 10\nsource 0 a.mp4\ntonemap vivid\n", &dir)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mixed, "line 3: unknown keyword \"tonemap\"");
+        // A rendition nobody wrote is a corrupt line, by name -- not a silent
+        // fall back to another picture.
+        for line in ["tonemap\n", "tonemap bright\n", "tonemap Vivid\n"] {
+            let file = format!("edith 11\nsource 0 a.mp4\n{line}");
+            assert!(
+                parse(file.as_bytes(), &dir).is_err(),
+                "{line:?} is not a tonemap line"
             );
         }
     }
@@ -1177,7 +1274,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1214,7 +1311,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1322,7 +1419,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1426,7 +1523,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1491,7 +1588,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1529,7 +1626,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -1558,7 +1655,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -1598,12 +1695,13 @@ mod tests {
             &[],
             (1280, 720),
             Some(23.976023976023978),
+            crate::tonemap::Preset::default(),
             limiter,
             0,
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 11\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -1635,7 +1733,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 10\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -1799,7 +1897,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -1852,7 +1950,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 10\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 11\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1884,7 +1982,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 10\n"));
+        assert!(v5.starts_with(b"edith 11\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -1981,6 +2079,7 @@ mod tests {
             &[],
             (1280, 720),
             None,
+            crate::tonemap::Preset::default(),
             Limiter::default(),
             0,
         )
@@ -1988,7 +2087,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 10\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 11\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2033,10 +2132,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 11\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 12\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 11");
+        assert_eq!(err, "line 1: unsupported version 12");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),

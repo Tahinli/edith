@@ -17,6 +17,7 @@ use engine::export::{AUDIO_KBPS, DEFAULT_AUDIO_KBPS, ExportSettings, Format};
 use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
+use engine::tonemap::Preset;
 use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
@@ -458,6 +459,10 @@ enum Pick {
     /// What the export's *sound* is coded at. Opened from the card's Sound row,
     /// which is the only place it means anything.
     AudioRate,
+    /// Which HDR-to-SDR rendition the project is watched and exported in
+    /// ([`engine::tonemap::Preset`]). Opened from the panel, beside the two
+    /// other settings that are the project's rather than the media's.
+    Tone,
 }
 
 /// One value a list offers, carrying everything picking it needs -- so a click
@@ -472,6 +477,7 @@ enum Choice {
     Fps(f64),
     Fit(Lane, usize, FitPolicy),
     AudioRate(u32),
+    Tone(Preset),
 }
 
 /// One row of an open list: the value, its name, the small print beside it, and
@@ -1778,6 +1784,22 @@ impl Player {
         cx.notify();
     }
 
+    /// The project's HDR media shown another way: the list names a rendition and
+    /// this is where it happens, the way [`apply_resolution`](Self::apply_resolution)
+    /// is for a size. The engine remaps the frame under the playhead at once
+    /// ([`PlaybackSession::set_tone`]), so the picture on screen is the picked
+    /// one before the notice has faded -- and an SDR project is unmoved, which
+    /// is what the notice says rather than pretending something happened.
+    fn apply_tone(&mut self, preset: Preset, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session
+            && session.set_tone(preset)
+        {
+            self.notice = Some(format!("HDR: {} — affects HDR media", tone_label(preset)).into());
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
     /// Opens a choice list on a setting, where it was asked for. One floating
     /// thing at a time: the click that opens it is the click that closes
     /// whatever menu it was opened from.
@@ -1797,6 +1819,7 @@ impl Player {
             Choice::Size(w, h) => self.apply_resolution(w, h, cx),
             Choice::Fps(fps) => self.apply_frame_rate(fps, cx),
             Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
+            Choice::Tone(preset) => self.apply_tone(preset, cx),
             // The same field the row's key steps, set outright: a list picks a
             // value, it does not step to one.
             Choice::AudioRate(kbps) => {
@@ -1822,6 +1845,7 @@ impl Player {
                 fit_choices(lane, idx, session.fit_of(lane, idx), session.resolution())
             }
             Pick::AudioRate => audio_rate_choices(self.audio_kbps),
+            Pick::Tone => tone_choices(session.tone()),
         }
     }
 
@@ -5935,6 +5959,30 @@ impl Player {
                         live,
                         cx.listener(|this, event: &ClickEvent, _, cx| {
                             this.open_picker(Pick::Fps, event.position(), cx)
+                        }),
+                    ))
+                    // ...and which rendition its HDR media is watched in, the
+                    // third thing that is the project's rather than the media's.
+                    // Listed whatever is on the timeline, and the tooltip says
+                    // who it acts on: a control that came and went with the
+                    // media would be one nobody could find when they wanted it.
+                    .child(control(
+                        "tonemap",
+                        None,
+                        match &self.session {
+                            Some(session) => format!("HDR {}", tone_label(session.tone())),
+                            None => "HDR".to_string(),
+                        },
+                        match &self.session {
+                            Some(session) => format!(
+                                "click to pick the HDR rendition — the project is {}; SDR media is untouched",
+                                tone_label(session.tone())
+                            ),
+                            None => "the HDR rendition — open a file first".to_string(),
+                        },
+                        live,
+                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.open_picker(Pick::Tone, event.position(), cx)
                         }),
                     ))
                     // How much of the timeline the panel below is showing --
@@ -10704,6 +10752,40 @@ fn audio_rate_choices(current: u32) -> Vec<ChoiceRow> {
         .collect()
 }
 
+/// How a rendition is named where a person reads it: the panel button, the
+/// notice and the list row all say the same word ([`engine::tonemap::Preset`]).
+fn tone_label(preset: Preset) -> &'static str {
+    match preset {
+        Preset::Reference => "Reference",
+        Preset::Standard => "Standard",
+        Preset::Vivid => "Vivid",
+    }
+}
+
+/// The HDR list's rows: all three renditions, the one in force marked, and what
+/// each one *is* beside it -- in the fewest words that fit inside `MENU_W`, the
+/// truncation the three lists above already met. Always offered, whatever is on
+/// the timeline: a setting that appeared and vanished with the media would be a
+/// setting nobody could find, and the row says who it acts on instead.
+fn tone_choices(current: Preset) -> Vec<ChoiceRow> {
+    Preset::ALL
+        .into_iter()
+        .map(|preset| {
+            (
+                Choice::Tone(preset),
+                tone_label(preset).into(),
+                match preset {
+                    Preset::Reference => "BT.2446-A, as published",
+                    Preset::Standard => "brighter, player-like",
+                    Preset::Vivid => "brightest, richer colour",
+                }
+                .into(),
+                preset == current,
+            )
+        })
+        .collect()
+}
+
 /// The next project resolution after `current`, over [`RESOLUTIONS`] with the
 /// media's own size cycled in at its place by size -- so the trip round always
 /// comes back to the media, whatever odd shape it is, and a project already at a
@@ -12278,12 +12360,13 @@ mod tests {
         whole_take, window_title,
     };
     use super::{
-        Choice, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, RESOLUTIONS, Repeat,
+        Choice, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, Preset, RESOLUTIONS, Repeat,
         Scale, View,
         ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
-        repeats, resolution_choices, resolution_ladder, span_label, trimmed_clip, unscannable,
+        repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
+        trimmed_clip, unscannable,
         visible_slice,
     };
     use super::{
@@ -15304,6 +15387,20 @@ mod tests {
         for (.., detail, _) in &fps {
             assert!(detail.chars().count() < 26, "{detail} loses its tail");
         }
+
+        // The HDR list, the third project setting: all three renditions in the
+        // order they brighten, the one in force marked, and every row saying
+        // what it is in words that fit beside the label.
+        let tones = tone_choices(Preset::Standard);
+        assert_eq!(tones.len(), Preset::ALL.len());
+        assert_eq!(tones.iter().filter(|(.., picked)| *picked).count(), 1);
+        for (row, preset) in tones.iter().zip(Preset::ALL) {
+            assert_eq!(row.0, Choice::Tone(preset));
+            assert_eq!(row.1.as_ref(), tone_label(preset));
+            assert!(!row.2.is_empty(), "{preset:?} says nothing about itself");
+            assert!(row.2.chars().count() < 26, "{} loses its tail", row.2);
+        }
+        assert!(tones[1].3, "the rendition in force is not marked");
 
         // The open list fits the floor the menus are measured against: the
         // longest of them is the rate ladder with an odd rate cycled in, and it

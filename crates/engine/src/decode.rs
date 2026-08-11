@@ -236,6 +236,9 @@ impl DecodeSession {
             // No project, no canvas: the file-level API hands back the
             // pictures the file holds, at the size it holds them.
             Composer::passthrough(),
+            // ...and no project means no picked rendition either: an HDR file
+            // opened through this door is mapped the published way.
+            tonemap::Preset::default(),
         )?;
         // The public API hands out the flag alone, so the worker is detached and
         // the receiver goes to the caller: nothing here joins anything.
@@ -324,7 +327,16 @@ impl DecodeSession {
         // BT.601 limited, because that is what `rgb_to_i420` above wrote these
         // planes in: a still round-trips through the pair, not through the
         // colour of whatever file is on the timeline beside it.
-        let first = Render::new(color, ColorDescription::default(), canvas).frame(
+        // No preset argument, and none wanted: a still is decoded into BT.601
+        // SDR planes, so the tone map is not built at all whichever rendition
+        // the project is watching.
+        let first = Render::new(
+            color,
+            ColorDescription::default(),
+            canvas,
+            tonemap::Preset::default(),
+        )
+        .frame(
             start_frame,
             &still.y,
             &still.u,
@@ -375,12 +387,18 @@ impl DecodeSession {
     /// frames come out at *that* size, whatever the file's is. A
     /// [`Composer::passthrough`] (or one already the source's size) leaves every
     /// picture exactly as it was decoded.
+    ///
+    /// `tone` is the project's HDR rendition ([`tonemap::Preset`]), captured
+    /// here for the reason the grade is: it is constant across one span, and a
+    /// preset picked while this worker runs reaches the picture when the session
+    /// reseeks onto the new one. An SDR source ignores it entirely.
     pub(crate) fn open_worker(
         path: impl AsRef<Path>,
         start_frame: u32,
         end_frame: u32,
         color: ColorParams,
         canvas: Composer,
+        tone: tonemap::Preset,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
         let path = path.as_ref().to_path_buf();
         let (meta, demuxer) = Demuxer::open(&path)?;
@@ -430,7 +448,7 @@ impl DecodeSession {
                 if worker_cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut render = Render::new(color, source_color, canvas);
+                let mut render = Render::new(color, source_color, canvas, tone);
                 // The plugin has to be opened on the thread that uses it: its
                 // VA-API state is not `Send`-safe across a later hand-off.
                 if let Some(hw) = open_hw(&path, start_frame) {
@@ -518,7 +536,12 @@ const TONE_MAPPED: ColorDescription = ColorDescription {
 };
 
 impl Render {
-    fn new(color: ColorParams, desc: ColorDescription, canvas: Composer) -> Self {
+    fn new(
+        color: ColorParams,
+        desc: ColorDescription,
+        canvas: Composer,
+        preset: tonemap::Preset,
+    ) -> Self {
         Self {
             color,
             desc,
@@ -530,8 +553,8 @@ impl Render {
             // range argument to `ToneMapper::new`.
             tone: match desc.transfer {
                 Transfer::Sdr => None,
-                Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq)),
-                Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg)),
+                Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset)),
+                Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset)),
             },
             graded: (Vec::new(), Vec::new(), Vec::new()),
         }
@@ -800,6 +823,7 @@ mod tests {
             u32::MAX,
             ColorParams::default(),
             Composer::passthrough(),
+            tonemap::Preset::default(),
         )
         .expect("open");
         // Nothing is ever received: two frames fill the channel and the next

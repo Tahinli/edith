@@ -17,7 +17,8 @@
 //! 2. the transfer's EOTF -> display light in cd/m^2 (PQ per ST 2084, HLG per
 //!    BT.2100 including its OOTF, which is why HLG costs almost nothing extra:
 //!    it is one more EOTF feeding the same pipe),
-//! 3. normalise by [`MASTER_NITS`] and take the 1/2.4 root -- Method A does its
+//! 3. normalise by the assumed mastering peak ([`Preset`]) and take the 1/2.4
+//!    root -- Method A does its
 //!    work in a gamma-2.4 domain, not in linear light,
 //! 4. BT.2020 luma + colour differences in that domain,
 //! 5. the tone curve: a logarithmic lift keyed on the HDR peak, a three-piece
@@ -35,9 +36,12 @@
 //! Method A is conservative on mid-tones by construction: told the standard
 //! 1000 cd/m^2 mastering peak it puts 203-nit HDR diffuse white near SDR code
 //! 166 (about 40 cd/m^2), not at SDR white -- a picture a viewer reads as dark.
-//! [`MASTER_NITS`] is the exposure knob that answers it: a lower assumed peak
-//! lifts everything, and it is a constant here because this module is handed
-//! pixels, never the stream metadata that would carry the real one.
+//! The assumed peak is the exposure knob that answers it -- a lower one lifts
+//! everything -- and *which* answer a project wants is a matter of taste, not of
+//! correctness: a reference rendition and a vivid one are both honest pictures
+//! of the same film. So it is a [`Preset`] the viewer picks rather than a
+//! constant, and never the stream's own metadata, which this module is never
+//! handed (it is given pixels).
 //!
 //! # Why a 3D LUT
 //!
@@ -71,13 +75,6 @@
 //! pixels is mapped in the same visit, sharing the block's bilinear chroma
 //! weights, which is what keeps a 4K frame inside a frame's time budget.
 
-/// The mastering peak Method A is told to assume, cd/m^2. Not the 1000 an HDR10
-/// grade is mastered to and not BT.2446's own worked example: the goal here is
-/// what a *viewer* sees on an SDR screen next to mpv, and told 1000 the method
-/// lands 203-nit diffuse white on code 166, which reads as broadcast-dark.
-/// Told 400 it lands near 205 -- display-referred, the brightness a player
-/// shows -- which is what this constant buys. See the module note.
-const MASTER_NITS: f32 = 400.0;
 /// The SDR display peak Method A targets, cd/m^2.
 const SDR_NITS: f32 = 100.0;
 /// Method A's working gamma. Not a display curve here -- it is the domain the
@@ -98,6 +95,72 @@ const CHROMA_NODES: usize = 17;
 const CHROMA_STEP: u32 = 4;
 /// `1 << CHROMA_STEP`.
 const CHROMA_FRAC: u32 = 16;
+
+/// Which rendition of the same conversion a project is watching: two numbers,
+/// the assumed mastering peak and a chroma gain, and *only* those two -- every
+/// preset runs the very same BT.2446 Method A stages, so the hue relationships
+/// the method is chosen for hold whichever one is picked.
+///
+/// The peak is Method A's exposure knob (see the module note): told the 1000
+/// cd/m^2 an HDR10 grade is really mastered to, the published conversion lands
+/// 203-nit diffuse white on code 166 -- broadcast-faithful, and darker than a
+/// player looks; told a lower one it lifts the whole picture. The gain is
+/// applied *after* the map, on the SDR colour differences, so it enriches the
+/// picture a viewer is shown rather than bending a stage of the standard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    /// The published conversion, at the mastering peak the content really has.
+    /// The default: what the document says, and what a second reference can be
+    /// checked against.
+    #[default]
+    Reference,
+    /// Display-referred: the peak lowered to 400 so diffuse white lands near SDR
+    /// white and the picture reads as bright as a player shows it.
+    Standard,
+    /// Brighter again, and slightly richer -- the colour differences scaled up a
+    /// tenth after the map.
+    Vivid,
+}
+
+impl Preset {
+    /// Every preset, in the order a list offers them: reference first, brightest
+    /// last.
+    pub const ALL: [Preset; 3] = [Preset::Reference, Preset::Standard, Preset::Vivid];
+
+    /// The mastering peak Method A is told to assume, cd/m^2.
+    pub fn master_nits(self) -> f32 {
+        match self {
+            Preset::Reference => 1000.0,
+            Preset::Standard => 400.0,
+            Preset::Vivid => 250.0,
+        }
+    }
+
+    /// What the SDR colour differences are multiplied by after the map. `1.0`
+    /// leaves the method's own output untouched, byte for byte.
+    pub fn chroma_gain(self) -> f32 {
+        match self {
+            Preset::Reference | Preset::Standard => 1.0,
+            Preset::Vivid => 1.10,
+        }
+    }
+
+    /// The name a project file carries ([`crate::edith`]) -- lower case, one
+    /// word, and the inverse of [`from_name`](Preset::from_name).
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Reference => "reference",
+            Preset::Standard => "standard",
+            Preset::Vivid => "vivid",
+        }
+    }
+
+    /// Reads one back. `None` for anything else, which a project file refuses by
+    /// name rather than silently rendering another way.
+    pub fn from_name(name: &[u8]) -> Option<Self> {
+        Preset::ALL.into_iter().find(|p| p.name().as_bytes() == name)
+    }
+}
 
 /// Which HDR transfer the incoming codes carry. Both feed the same Method A
 /// pipeline; they differ only in how a code becomes display light.
@@ -126,7 +189,7 @@ pub struct ToneMapper {
 }
 
 impl ToneMapper {
-    pub fn new(transfer: Transfer) -> Self {
+    pub fn new(transfer: Transfer, preset: Preset) -> Self {
         let cells = LUMA_NODES * CHROMA_NODES * CHROMA_NODES;
         let (mut y_node, mut uv_node) = (vec![0u8; cells], vec![[0u8; 2]; cells]);
         for kv in 0..CHROMA_NODES {
@@ -138,6 +201,7 @@ impl ToneMapper {
                     // own.
                     let out = map_code(
                         transfer,
+                        preset,
                         (iy << LUMA_STEP) as f32,
                         (ju << CHROMA_STEP) as f32,
                         (kv << CHROMA_STEP) as f32,
@@ -282,7 +346,8 @@ fn byte(value: f32) -> u8 {
 /// The whole float pipeline, from one triple of input codes to one triple of
 /// BT.709 limited-range output codes. Runs at build time only; the module note
 /// walks the stages.
-fn map_code(transfer: Transfer, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
+fn map_code(transfer: Transfer, preset: Preset, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
+    let master_nits = preset.master_nits();
     // 1. limited-range BT.2020 Y'C'bC'r -> R'G'B' signal.
     let luma = (yc - 16.0) / 219.0;
     let cb = (uc - 128.0) / 224.0;
@@ -303,14 +368,15 @@ fn map_code(transfer: Transfer, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
     // Clamping instead walks a too-bright pixel toward white, which is what a
     // highlight past the display's reach should do.
     //
-    // ponytail: the ceiling is that MASTER_NITS is an exposure choice, not a
-    // measurement. Everything the content masters above it -- which at 400 is
-    // most of an HDR10 grade's highlight range -- walks to white here. The
-    // upgrade is the stream's own MaxCLL/mastering-display metadata reaching
-    // this module as a `new` argument, with 400 as the fallback: nothing else
-    // in the pipeline changes.
-    let lin = display_light(transfer, [r, g, b]);
-    let gam = lin.map(|c| (c / MASTER_NITS).clamp(0.0, 1.0).powf(1.0 / GAMMA));
+    // ponytail: the ceiling is that the assumed peak is an exposure *choice*
+    // (now the viewer's, [`Preset`]), not a measurement. Everything the content
+    // masters above it -- which at 400 is most of an HDR10 grade's highlight
+    // range -- walks to white here. The upgrade is the stream's own
+    // MaxCLL/mastering-display metadata reaching this module beside the preset,
+    // as the measured ceiling the picked one is read against: nothing else in
+    // the pipeline changes.
+    let lin = display_light(transfer, preset, [r, g, b]);
+    let gam = lin.map(|c| (c / master_nits).clamp(0.0, 1.0).powf(1.0 / GAMMA));
 
     // 4. BT.2020 luma and colour differences, in that domain.
     let y_hdr = 0.2627 * gam[0] + 0.6780 * gam[1] + 0.0593 * gam[2];
@@ -318,7 +384,7 @@ fn map_code(transfer: Transfer, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
     let cr_hdr = (gam[0] - y_hdr) / 1.4746;
 
     // 5/6. the curve, then colour-difference scaling and its luma payback.
-    let y_sdr = tone_curve(y_hdr);
+    let y_sdr = tone_curve(y_hdr, master_nits);
     let scale = if y_hdr > 1e-6 {
         y_sdr / (1.075 * y_hdr)
     } else {
@@ -342,29 +408,49 @@ fn map_code(transfer: Transfer, yc: f32, uc: f32, vc: f32) -> [f32; 3] {
     let b709 = (-0.0182 * r - 0.1006 * g + 1.1187 * b).clamp(0.0, 1.0);
     let [r, g, b] = [r709, g709, b709].map(|c| c.powf(1.0 / GAMMA));
 
-    // 8. BT.709 limited-range codes.
+    // 8. BT.709 limited-range codes, the preset's chroma gain on the two colour
+    // differences.
+    //
+    // A *scale* about 128 and never a shift, applied here and nowhere earlier:
+    // 128 is neutral, so a grey stays exactly grey at any gain (`128 - 128` is
+    // zero however it is multiplied) and only a pixel that already had colour
+    // gets more of it. Clamped to the legal 16..240 chroma range, which at gain
+    // 1.0 is a clamp the maths above cannot reach -- the untouched presets come
+    // out byte for byte what Method A produced.
     let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let gain = preset.chroma_gain();
     [
         16.0 + 219.0 * luma,
-        128.0 + 224.0 * (b - luma) / 1.8556,
-        128.0 + 224.0 * (r - luma) / 1.5748,
+        (128.0 + gain * 224.0 * (b - luma) / 1.8556).clamp(16.0, 240.0),
+        (128.0 + gain * 224.0 * (r - luma) / 1.5748).clamp(16.0, 240.0),
     ]
 }
 
 /// Signal -> display light in cd/m^2.
-fn display_light(transfer: Transfer, rgb: [f32; 3]) -> [f32; 3] {
+fn display_light(transfer: Transfer, preset: Preset, rgb: [f32; 3]) -> [f32; 3] {
     match transfer {
         Transfer::Pq => rgb.map(pq_eotf),
         Transfer::Hlg => {
             // BT.2100: inverse OETF to scene light, then the OOTF, whose system
             // gamma is 1.2 at a 1000 cd/m^2 display and follows the display
-            // peak from there by the standard's own log term -- so the peak
-            // [`MASTER_NITS`] names is the peak the OOTF is built for, rather
-            // than a number the constant silently invalidates.
+            // peak from there by the standard's own log term -- so the peak the
+            // preset names is the peak the OOTF is built for, rather than a
+            // number the choice silently invalidates.
+            let master_nits = preset.master_nits();
             let scene = rgb.map(hlg_scene);
             let ys = 0.2627 * scene[0] + 0.6780 * scene[1] + 0.0593 * scene[2];
-            let gamma = 1.2 + 0.42 * (MASTER_NITS / 1000.0).log10();
-            let gain = MASTER_NITS * ys.max(0.0).powf(gamma - 1.0);
+            let gamma = 1.2 + 0.42 * (master_nits / 1000.0).log10();
+            // Black is black, said outright rather than left to the arithmetic:
+            // below a 1000 cd/m^2 peak the system gamma is *under* 1, so the
+            // `ys^(gamma - 1)` term diverges as the scene goes black and the
+            // `0 * inf` that follows is a NaN -- which byte-casts to 0 and puts
+            // a hole where black belongs (measured: HLG black rendered code 0
+            // under the vivid preset before this line).
+            let ys = ys.max(0.0);
+            let gain = match ys > 0.0 {
+                true => master_nits * ys.powf(gamma - 1.0),
+                false => 0.0,
+            };
             scene.map(|c| gain * c)
         }
     }
@@ -401,8 +487,8 @@ fn hlg_scene(e: f32) -> f32 {
 /// BT.2446 Method A's tone curve, in the gamma-2.4 domain: 1 in is 1 out (HDR
 /// peak to SDR peak) and 0 in is 0 out, which is what pins the two `p` terms
 /// and the three-piece polynomial between them.
-fn tone_curve(y_hdr: f32) -> f32 {
-    let p_hdr = 1.0 + 32.0 * (MASTER_NITS / 10000.0).powf(1.0 / GAMMA);
+fn tone_curve(y_hdr: f32, master_nits: f32) -> f32 {
+    let p_hdr = 1.0 + 32.0 * (master_nits / 10000.0).powf(1.0 / GAMMA);
     let p_sdr = 1.0 + 32.0 * (SDR_NITS / 10000.0).powf(1.0 / GAMMA);
     let yp = (1.0 + (p_hdr - 1.0) * y_hdr.max(0.0)).ln() / p_hdr.ln();
     let yc = if yp <= 0.7399 {
@@ -445,32 +531,70 @@ mod tests {
     }
 
     /// The anchors, in cd/m^2, against the codes the stages in the module note
-    /// give for [`MASTER_NITS`]. Black is pinned by the curve (0 in, 0 out);
-    /// [`MASTER_NITS`] itself is the assumed peak and must reach SDR white;
-    /// 203 nits is BT.2408 diffuse white, and 205 is where a 400 cd/m^2 peak
-    /// puts it -- a picture as bright as a player shows, which is the whole
-    /// reason that constant is not 1000 (where the same maths gives 166). The
+    /// give for each preset's assumed peak. Black is pinned by the curve (0 in,
+    /// 0 out); the assumed peak itself must reach SDR white; 203 nits is BT.2408
+    /// diffuse white, and *where it lands is the whole difference between the
+    /// presets* -- 166 at the published 1000 cd/m^2 (broadcast-faithful, and the
+    /// reason the reference rendition reads dark), 205 at 400, 226 at 250. The
     /// day one of these moves, the transcription moved with it.
     ///
-    /// 1000 nits is the ceiling the `map_code` ponytail names, asserted rather
-    /// than described: everything above the assumed peak is white.
+    /// The last row of each is the ceiling the `map_code` ponytail names,
+    /// asserted rather than described: everything above the assumed peak is
+    /// white.
     #[test]
     fn pq_anchors_land_where_method_a_puts_them() {
-        let mapper = ToneMapper::new(Transfer::Pq);
-        for (nits, expected) in [
-            (0.0, 16u8),
-            (26.0, 108),
-            (203.0, 205),
-            (MASTER_NITS, 235),
-            (1000.0, 235),
+        for (preset, diffuse) in [
+            (Preset::Reference, 166u8),
+            (Preset::Standard, 205),
+            (Preset::Vivid, 226),
         ] {
-            let code = byte(pq_code(nits));
-            let (y, _, _) = mapped(&mapper, code, 128, 128);
-            assert!(
-                y.abs_diff(expected) <= 3,
-                "{nits} cd/m^2 (code {code}) -> {y}, expected {expected}"
-            );
+            let peak = preset.master_nits();
+            let mapper = ToneMapper::new(Transfer::Pq, preset);
+            for (nits, expected) in [(0.0, 16u8), (203.0, diffuse), (peak, 235), (10000.0, 235)] {
+                let code = byte(pq_code(nits));
+                let (y, _, _) = mapped(&mapper, code, 128, 128);
+                assert!(
+                    y.abs_diff(expected) <= 3,
+                    "{preset:?}: {nits} cd/m^2 (code {code}) -> {y}, expected {expected}"
+                );
+            }
         }
+    }
+
+    /// What the presets are *for*, on one code: brighter is brighter, and the
+    /// vivid one has more colour in it. A preset that renamed the same numbers
+    /// would pass every other test in this module and fail this one.
+    ///
+    /// The chroma reading is the distance from neutral, which is the thing the
+    /// gain scales; the grey beside it is the neutrality that must survive it,
+    /// so "richer" cannot have been bought with a tint.
+    #[test]
+    fn a_brighter_preset_is_brighter_and_a_vivid_one_is_richer() {
+        // BT.2408 diffuse white, and a saturated BT.2020 red beside it.
+        let (diffuse, red) = (byte(pq_code(203.0)), (100u8, 90u8, 200u8));
+        let luma = |preset| mapped(&ToneMapper::new(Transfer::Pq, preset), diffuse, 128, 128).0;
+        let (reference, standard, vivid) = (
+            luma(Preset::Reference),
+            luma(Preset::Standard),
+            luma(Preset::Vivid),
+        );
+        assert!(
+            reference < standard && standard < vivid,
+            "reference {reference}, standard {standard}, vivid {vivid}"
+        );
+        let colour = |preset| {
+            let (_, u, v) = mapped(&ToneMapper::new(Transfer::Pq, preset), red.0, red.1, red.2);
+            (u.abs_diff(128), v.abs_diff(128))
+        };
+        let (flat, rich) = (colour(Preset::Standard), colour(Preset::Vivid));
+        // Both differences read together, and neither of them allowed to shrink:
+        // this red is saturated enough that its V is already against the legal
+        // 240 rail under both presets, so the gain has nowhere to take *that*
+        // one -- which is the clamp doing its job, not the gain failing to.
+        assert!(
+            rich.0 + rich.1 > flat.0 + flat.1 && rich.0 >= flat.0 && rich.1 >= flat.1,
+            "vivid's red {rich:?} is no further from neutral than standard's {flat:?}"
+        );
     }
 
     /// On its nodes the grid is not an approximation at all: no interpolation
@@ -479,15 +603,17 @@ mod tests {
     /// covers every node of every axis for both transfers.
     #[test]
     fn the_grid_is_the_pipeline_on_its_nodes() {
-        for transfer in [Transfer::Pq, Transfer::Hlg] {
-            let mapper = ToneMapper::new(transfer);
-            for yc in (0..=248u8).step_by(1 << LUMA_STEP) {
-                for uc in (0..=240u8).step_by(1 << CHROMA_STEP) {
-                    for vc in (0..=240u8).step_by(1 << CHROMA_STEP) {
-                        let got = mapped(&mapper, yc, uc, vc);
-                        let want = map_code(transfer, yc.into(), uc.into(), vc.into());
-                        let want = (byte(want[0]), byte(want[1]), byte(want[2]));
-                        assert_eq!(got, want, "{transfer:?} node {yc}/{uc}/{vc}");
+        for preset in Preset::ALL {
+            for transfer in [Transfer::Pq, Transfer::Hlg] {
+                let mapper = ToneMapper::new(transfer, preset);
+                for yc in (0..=248u8).step_by(1 << LUMA_STEP) {
+                    for uc in (0..=240u8).step_by(1 << CHROMA_STEP) {
+                        for vc in (0..=240u8).step_by(1 << CHROMA_STEP) {
+                            let got = mapped(&mapper, yc, uc, vc);
+                            let want = map_code(transfer, preset, yc.into(), uc.into(), vc.into());
+                            let want = (byte(want[0]), byte(want[1]), byte(want[2]));
+                            assert_eq!(got, want, "{preset:?} {transfer:?} node {yc}/{uc}/{vc}");
+                        }
                     }
                 }
             }
@@ -507,8 +633,13 @@ mod tests {
     /// pipeline steps.
     #[test]
     fn between_nodes_the_grid_stays_inside_its_own_cell() {
-        for transfer in [Transfer::Pq, Transfer::Hlg] {
-            let mapper = ToneMapper::new(transfer);
+        // Every preset, since the vivid one's chroma gain is a stage the nodes
+        // carry and the interpolation between them must not exaggerate.
+        for (transfer, preset) in [Transfer::Pq, Transfer::Hlg]
+            .into_iter()
+            .flat_map(|t| Preset::ALL.map(|p| (t, p)))
+        {
+            let mapper = ToneMapper::new(transfer, preset);
             for yc in (3..=255u8).step_by(23) {
                 for uc in (5..=255u8).step_by(29) {
                     for vc in (7..=255u8).step_by(31) {
@@ -526,6 +657,7 @@ mod tests {
                                 for dv in [0.0, f32::from(1u8 << CHROMA_STEP)] {
                                     let out = map_code(
                                         transfer,
+                                        preset,
                                         node(yc, LUMA_STEP) + dy,
                                         node(uc, CHROMA_STEP) + du,
                                         node(vc, CHROMA_STEP) + dv,
@@ -542,7 +674,7 @@ mod tests {
                             // and the interpolation rounds once more.
                             assert!(
                                 got[i] + 1 >= lo[i] && got[i] <= hi[i] + 1,
-                                "{transfer:?} {name} at {yc}/{uc}/{vc}: {} outside {}..{}",
+                                "{preset:?} {transfer:?} {name} at {yc}/{uc}/{vc}: {} outside {}..{}",
                                 got[i],
                                 lo[i],
                                 hi[i]
@@ -559,14 +691,17 @@ mod tests {
     /// grid or a truncating interpolation produces.
     #[test]
     fn a_grey_ramp_never_inverts() {
-        for transfer in [Transfer::Pq, Transfer::Hlg] {
-            let mapper = ToneMapper::new(transfer);
+        for (transfer, preset) in [Transfer::Pq, Transfer::Hlg]
+            .into_iter()
+            .flat_map(|t| Preset::ALL.map(|p| (t, p)))
+        {
+            let mapper = ToneMapper::new(transfer, preset);
             let mut last = 0u8;
             for code in 0..=255u8 {
                 let (y, _, _) = mapped(&mapper, code, 128, 128);
                 assert!(
                     y >= last,
-                    "{transfer:?}: code {code} darkened to {y} < {last}"
+                    "{preset:?} {transfer:?}: code {code} darkened to {y} < {last}"
                 );
                 last = y;
             }
@@ -574,16 +709,21 @@ mod tests {
     }
 
     /// Grey in, grey out: any chroma the pipeline invents on a neutral is a
-    /// tint across the whole picture.
+    /// tint across the whole picture -- and a chroma *gain* that was written as
+    /// a shift, or applied anywhere but about 128, is exactly that tint, which
+    /// is why the vivid preset is in this loop.
     #[test]
     fn neutral_input_stays_neutral() {
-        for transfer in [Transfer::Pq, Transfer::Hlg] {
-            let mapper = ToneMapper::new(transfer);
+        for (transfer, preset) in [Transfer::Pq, Transfer::Hlg]
+            .into_iter()
+            .flat_map(|t| Preset::ALL.map(|p| (t, p)))
+        {
+            let mapper = ToneMapper::new(transfer, preset);
             for code in (16..=235u8).step_by(7) {
                 let (_, u, v) = mapped(&mapper, code, 128, 128);
                 assert!(
                     u.abs_diff(128) <= 2 && v.abs_diff(128) <= 2,
-                    "{transfer:?}: grey {code} tinted to U{u} V{v}"
+                    "{preset:?} {transfer:?}: grey {code} tinted to U{u} V{v}"
                 );
             }
         }
@@ -596,27 +736,37 @@ mod tests {
     ///
     /// BT.2408 HLG diffuse white is signal 0.75, and it does *not* land on the
     /// PQ side's 203-nit code: relative is the point of HLG, so 0.75 is 19% of
-    /// whatever peak the display has -- 76 cd/m^2 of [`MASTER_NITS`]'s 400,
-    /// against PQ's absolute 203 -- and it comes out darker, at 170. That is
-    /// the standard's own behaviour and the number to watch: if the OOTF's
-    /// system gamma stops following the assumed peak, this is what moves.
+    /// whatever peak the display has -- 76 cd/m^2 of the standard preset's 400,
+    /// against PQ's absolute 203 -- and it comes out darker. That is the
+    /// standard's own behaviour and the number to watch: if the OOTF's system
+    /// gamma stops following the assumed peak, this is what moves, and it moves
+    /// per preset because the peak is what a preset picks.
     #[test]
     fn hlg_anchors_are_sane() {
-        let mapper = ToneMapper::new(Transfer::Hlg);
-        let code = |signal: f32| byte(16.0 + 219.0 * signal);
-        let (black, _, _) = mapped(&mapper, code(0.0), 128, 128);
-        let (diffuse, _, _) = mapped(&mapper, code(0.75), 128, 128);
-        let (white, _, _) = mapped(&mapper, code(1.0), 128, 128);
-        assert!(black.abs_diff(16) <= 3, "HLG black -> {black}");
-        assert!(white.abs_diff(235) <= 3, "HLG peak -> {white}");
-        assert!(diffuse.abs_diff(170) <= 3, "HLG diffuse white -> {diffuse}");
+        for (preset, expected) in [
+            (Preset::Reference, 170u8),
+            (Preset::Standard, 170),
+            (Preset::Vivid, 170),
+        ] {
+            let mapper = ToneMapper::new(Transfer::Hlg, preset);
+            let code = |signal: f32| byte(16.0 + 219.0 * signal);
+            let (black, _, _) = mapped(&mapper, code(0.0), 128, 128);
+            let (diffuse, _, _) = mapped(&mapper, code(0.75), 128, 128);
+            let (white, _, _) = mapped(&mapper, code(1.0), 128, 128);
+            assert!(black.abs_diff(16) <= 3, "{preset:?} HLG black -> {black}");
+            assert!(white.abs_diff(235) <= 3, "{preset:?} HLG peak -> {white}");
+            assert!(
+                diffuse.abs_diff(expected) <= 3,
+                "{preset:?} HLG diffuse white -> {diffuse}, expected {expected}"
+            );
+        }
     }
 
     /// A short plane is left alone rather than half mapped, and a frame with no
     /// size at all returns instead of panicking on a zero-length band.
     #[test]
     fn a_frame_that_does_not_measure_up_is_untouched() {
-        let mapper = ToneMapper::new(Transfer::Pq);
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
         let mut y = vec![128u8; 8 * 8 - 1];
         let mut u = vec![128u8; 4 * 4];
         let mut v = vec![128u8; 4 * 4];
@@ -631,7 +781,7 @@ mod tests {
     /// off the end.
     #[test]
     fn odd_sizes_map_every_pixel() {
-        let mapper = ToneMapper::new(Transfer::Pq);
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
         let (w, h) = (7usize, 5usize);
         let mut y = vec![200u8; w * h];
         let mut u = vec![128u8; w.div_ceil(2) * h.div_ceil(2)];
@@ -653,7 +803,7 @@ mod tests {
     /// time", and the reason a plain mean here would be a coin flip.
     #[test]
     fn perf_4k_and_1080p() {
-        let mapper = ToneMapper::new(Transfer::Pq);
+        let mapper = ToneMapper::new(Transfer::Pq, Preset::default());
         for (w, h, budget) in [(3840usize, 1600usize, 25.0f64), (1920, 1080, 8.0)] {
             let mut y: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
             let mut u: Vec<u8> = (0..w / 2 * h / 2).map(|i| (i % 256) as u8).collect();

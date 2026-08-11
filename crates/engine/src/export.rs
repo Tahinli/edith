@@ -969,12 +969,18 @@ fn run(
     // span reopens its file, so building it here rather than in the loop below
     // is the difference between paying that once and paying it per cut. An SDR
     // source -- the whole of an ordinary project -- builds no table at all.
+    //
+    // Through the project's own preset ([`tonemap::Preset`]), which is the same
+    // one playback's decode funnel builds its tables with: preview and export
+    // are the same rendition of the same film because they are told the same
+    // thing, not because two numbers happen to agree.
+    let preset = project.tone();
     let tone: Vec<Option<ToneMapper>> = rates
         .iter()
         .map(|(_, color)| match color.transfer {
             Transfer::Sdr => None,
-            Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq)),
-            Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg)),
+            Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset)),
+            Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset)),
         })
         .collect();
     // ...and the one space they are all written in, the same rule a reader with
