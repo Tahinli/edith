@@ -66,10 +66,11 @@ pub struct Mp4Muxer {
     writer: Mp4Writer<BufWriter<File>>,
     frame_duration: u32,
     has_audio: bool,
-    /// The `av1C` record an AV1 file's sample entry is patched to carry at
-    /// [`finish`](Mp4Muxer::finish); `None` for H.264, which the crate spells
-    /// itself. See [`create_av1`](Mp4Muxer::create_av1).
-    av1c: Option<Vec<u8>>,
+    /// The sample entry an AV1 or HEVC file's is patched into at
+    /// [`finish`](Mp4Muxer::finish) -- entry type, configuration box type and
+    /// its payload (`av01`/`av1C`, `hvc1`/`hvcC`). `None` for H.264, which the
+    /// crate spells itself. See [`create_av1`](Mp4Muxer::create_av1).
+    entry: Option<([u8; 4], [u8; 4], Vec<u8>)>,
     /// Where the file is, for that patch: the writer owns the handle it wrote
     /// through and the patch reopens the finished file.
     path: PathBuf,
@@ -129,7 +130,37 @@ impl Mp4Muxer {
                 pps: &[0x68, 0xCE, 0x3C, 0x80],
             },
             audio,
-            Some(av1c),
+            Some((*b"av01", *b"av1C", av1c)),
+        )
+    }
+
+    /// ...and the same trick for HEVC, which `mp4 0.14` cannot spell either:
+    /// the file is written with an `avc1` entry and that entry is rewritten at
+    /// [`finish`](Mp4Muxer::finish) into the `hvc1` + `hvcC` pair ISO/IEC
+    /// 14496-15 §8.4.1 asks for -- the record being the very bytes the Matroska
+    /// file puts in `CodecPrivate`, so the two containers carry one stream.
+    /// `hvc1` rather than `hev1`: the samples this writes carry no parameter
+    /// sets (they are dropped into `hvcC`), which is exactly what the `hvc1`
+    /// name promises a reader.
+    pub fn create_hevc(
+        path: &Path,
+        video: &HevcParams,
+        audio: Option<&AudioParams>,
+    ) -> crate::Result<Self> {
+        if video.hvcc.is_empty() {
+            return Err("no hvcC record for the track's sample entry".into());
+        }
+        Self::open(
+            path,
+            &VideoParams {
+                width: video.width,
+                height: video.height,
+                frame_rate: video.frame_rate,
+                sps: &[0x67, 0x42, 0x00, 0x1E],
+                pps: &[0x68, 0xCE, 0x3C, 0x80],
+            },
+            audio,
+            Some((*b"hvc1", *b"hvcC", video.hvcc.to_vec())),
         )
     }
 
@@ -137,7 +168,7 @@ impl Mp4Muxer {
         path: &Path,
         video: &VideoParams,
         audio: Option<&AudioParams>,
-        av1c: Option<Vec<u8>>,
+        entry: Option<([u8; 4], [u8; 4], Vec<u8>)>,
     ) -> crate::Result<Self> {
         if !video.frame_rate.is_finite() || video.frame_rate <= 0.0 {
             return Err(format!("bad frame rate {}", video.frame_rate).into());
@@ -166,8 +197,8 @@ impl Mp4Muxer {
                 compatible_brands: vec![
                     FourCC::from(*b"isom"),
                     FourCC::from(*b"iso2"),
-                    FourCC::from(match av1c {
-                        Some(_) => *b"av01",
+                    FourCC::from(match &entry {
+                        Some((kind, ..)) => *kind,
                         None => *b"avc1",
                     }),
                     FourCC::from(*b"mp41"),
@@ -215,7 +246,7 @@ impl Mp4Muxer {
             writer,
             frame_duration,
             has_audio: audio.is_some(),
-            av1c,
+            entry,
             path: path.to_path_buf(),
         })
     }
@@ -237,14 +268,15 @@ impl Mp4Muxer {
         Ok(())
     }
 
-    /// One coded picture as an AV1 temporal unit, written verbatim: an mp4 AV1
-    /// sample is the low-overhead OBU stream the encoder handed over, exactly as
-    /// a Matroska block is, so there is nothing to reframe. `key` is the
+    /// One coded picture already framed the way its sample carries it: an AV1
+    /// temporal unit is the low-overhead OBU stream the encoder handed over
+    /// (nothing to reframe, exactly as a Matroska block holds it), and an HEVC
+    /// sample is the length-prefixed NALs [`annex_b_to_hvcc`] made. `key` is the
     /// encoder's own word for a unit a decoder may start on -- an mp4 says it in
     /// `stss` where Matroska says it in the block flags.
-    pub fn write_av1_frame(&mut self, obus: &[u8], key: bool) -> crate::Result<()> {
+    pub fn write_coded_sample(&mut self, obus: &[u8], key: bool) -> crate::Result<()> {
         if obus.is_empty() {
-            return Err("an empty AV1 temporal unit".into());
+            return Err("an empty coded picture".into());
         }
         self.writer.write_sample(
             VIDEO_TRACK,
@@ -284,32 +316,42 @@ impl Mp4Muxer {
     pub fn finish(mut self) -> crate::Result<()> {
         self.writer.write_end()?;
         let Self {
-            writer, av1c, path, ..
+            writer,
+            entry,
+            path,
+            ..
         } = self;
         // Not a `drop`: the buffered tail of `moov` has to be on disk before the
         // patch below reads it back, and a `BufWriter` swallows the error of
         // flushing it on drop.
         writer.into_writer().flush()?;
-        match av1c {
-            Some(av1c) => patch_av01(&path, &av1c),
+        match entry {
+            Some((kind, config_kind, config)) => patch_entry(&path, &kind, &config_kind, &config),
             None => Ok(()),
         }
     }
 }
 
 /// Rewrites the finished file's one video sample entry from the `avc1` the crate
-/// wrote into the `av01` + `av1C` an AV1 track declares. Called once, on a
-/// complete file, and only for a file [`Mp4Muxer::create_av1`] opened.
+/// wrote into the `av01` + `av1C` an AV1 track declares -- or the `hvc1` +
+/// `hvcC` an HEVC one does. Called once, on a complete file, and only for a file
+/// [`Mp4Muxer::create_av1`] or [`Mp4Muxer::create_hevc`] opened.
 ///
 /// `moov` sits after `mdat` (the crate writes it at `write_end`), so this only
 /// ever rewrites the tail of the file: no sample moves and no chunk offset in
 /// `co64` changes. The box tree is rebuilt rather than patched in place, which
 /// is what keeps every ancestor's size right by construction.
-fn patch_av01(path: &Path, av1c: &[u8]) -> crate::Result<()> {
+fn patch_entry(
+    path: &Path,
+    kind: &[u8; 4],
+    config_kind: &[u8; 4],
+    config: &[u8],
+) -> crate::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let end = file.metadata()?.len();
     let (at, payload) = top_level(&mut file, end, b"moov")?.ok_or("no moov box to patch")?;
-    let patched = swap_av01(&payload, 0, av1c).ok_or("no avc1 sample entry to rewrite as av01")?;
+    let patched = swap_entry(&payload, 0, kind, config_kind, config)
+        .ok_or("no avc1 sample entry to rewrite")?;
     let mut out = Vec::with_capacity(patched.len() + 8);
     push_box(&mut out, b"moov", &patched);
     file.seek(SeekFrom::Start(at))?;
@@ -355,7 +397,13 @@ const STSD_PATH: [&[u8; 4]; 5] = [b"trak", b"mdia", b"minf", b"stbl", b"stsd"];
 /// `None` where this branch holds no such entry -- an audio `trak` is walked
 /// into and comes back untouched, which is how the *video* track is found
 /// without being told which id it has.
-fn swap_av01(payload: &[u8], depth: usize, av1c: &[u8]) -> Option<Vec<u8>> {
+fn swap_entry(
+    payload: &[u8],
+    depth: usize,
+    want: &[u8; 4],
+    config_kind: &[u8; 4],
+    config: &[u8],
+) -> Option<Vec<u8>> {
     if depth == STSD_PATH.len() {
         // stsd is a FullBox (4) plus entry_count (4), then the sample entries.
         let mut out = payload.get(..8)?.to_vec();
@@ -364,18 +412,19 @@ fn swap_av01(payload: &[u8], depth: usize, av1c: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         // A `VisualSampleEntry` is 78 bytes of fixed fields (dimensions and all)
-        // before its codec box, and `av01` carries exactly the same ones -- so
-        // the header is kept and only the configuration box is swapped.
+        // before its codec box, and `av01` and `hvc1` carry exactly the same
+        // ones -- so the header is kept and only the configuration box is
+        // swapped.
         let mut swapped = entry.get(..78)?.to_vec();
-        push_box(&mut swapped, b"av1C", av1c);
-        push_box(&mut out, b"av01", &swapped);
+        push_box(&mut swapped, config_kind, config);
+        push_box(&mut out, want, &swapped);
         return Some(out);
     }
     let mut out = Vec::with_capacity(payload.len());
     let mut done = false;
     for (kind, child) in crate::demux::boxes(payload) {
         let patched = match !done && kind == STSD_PATH[depth] {
-            true => swap_av01(child, depth + 1, av1c),
+            true => swap_entry(child, depth + 1, want, config_kind, config),
             false => None,
         };
         match patched {
@@ -471,6 +520,18 @@ pub struct Av1Params<'a> {
     pub config: &'a [u8],
 }
 
+/// What an HEVC track declares in either container: the `hvcC` record
+/// [`hvcc_record`] built out of the encoder's own VPS/SPS/PPS. The dimensions
+/// are the *displayed* ones -- the coded picture is padded up to the 16-sample
+/// CTB grid and the SPS crops it back with a conformance window, which is the
+/// size a decoder outputs and therefore the size the container states.
+pub struct HevcParams<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    pub hvcc: &'a [u8],
+}
+
 /// Writes one AV1 video track as Matroska (`.mkv`), and the timeline's AAC
 /// beside it where there is any: an `A_AAC` track whose `CodecPrivate` is the
 /// two-byte `AudioSpecificConfig` an mp4's `esds` carries, which is what
@@ -528,18 +589,66 @@ impl MkvMuxer {
         video: &Av1Params,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
     ) -> crate::Result<Self> {
-        if !video.frame_rate.is_finite() || video.frame_rate <= 0.0 {
-            return Err(format!("bad frame rate {}", video.frame_rate).into());
-        }
-        if video.width == 0 || video.height == 0 {
-            return Err(format!("bad dimensions {}x{}", video.width, video.height).into());
-        }
-        let frame_ns = (1e9 / video.frame_rate).round() as u64;
-        if frame_ns == 0 {
-            return Err(format!("frame rate {} is too fast to time", video.frame_rate).into());
-        }
         if video.config.is_empty() {
             return Err("no AV1 sequence header for the track's CodecPrivate".into());
+        }
+        let mut av1c = AV1C_HEAD.to_vec();
+        av1c.extend_from_slice(video.config);
+        Self::open(
+            path,
+            video.width,
+            video.height,
+            video.frame_rate,
+            b"V_AV1",
+            &av1c,
+            audio,
+        )
+    }
+
+    /// The same file with an HEVC track in it: `V_MPEGH/ISO/HEVC`, whose
+    /// `CodecPrivate` is the very `hvcC` record an mp4 puts in its sample entry
+    /// ([`hvcc_record`]) -- and whose blocks are therefore length-prefixed NALs
+    /// like an mp4 sample's, not Annex B. That is what this engine's own reader
+    /// expects back (`demux`'s Matroska branch parses `CodecPrivate` as `hvcC`
+    /// and reframes the blocks by the length it states), and what every other
+    /// Matroska reader expects too.
+    pub fn create_hevc(
+        path: &Path,
+        video: &HevcParams,
+        audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+    ) -> crate::Result<Self> {
+        if video.hvcc.is_empty() {
+            return Err("no hvcC record for the track's CodecPrivate".into());
+        }
+        Self::open(
+            path,
+            video.width,
+            video.height,
+            video.frame_rate,
+            b"V_MPEGH/ISO/HEVC",
+            video.hvcc,
+            audio,
+        )
+    }
+
+    fn open(
+        path: &Path,
+        width: u32,
+        height: u32,
+        frame_rate: f64,
+        codec_id: &[u8],
+        codec_private: &[u8],
+        audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+    ) -> crate::Result<Self> {
+        if !frame_rate.is_finite() || frame_rate <= 0.0 {
+            return Err(format!("bad frame rate {frame_rate}").into());
+        }
+        if width == 0 || height == 0 {
+            return Err(format!("bad dimensions {width}x{height}").into());
+        }
+        let frame_ns = (1e9 / frame_rate).round() as u64;
+        if frame_ns == 0 {
+            return Err(format!("frame rate {frame_rate} is too fast to time").into());
         }
 
         let mut head = Vec::new();
@@ -576,14 +685,12 @@ impl MkvMuxer {
         uint(&mut entry, TRACK_UID, 1);
         uint(&mut entry, TRACK_TYPE, 1); // video
         uint(&mut entry, FLAG_LACING, 0);
-        elem(&mut entry, CODEC_ID, b"V_AV1");
-        let mut av1c = AV1C_HEAD.to_vec();
-        av1c.extend_from_slice(video.config);
-        elem(&mut entry, CODEC_PRIVATE, &av1c);
+        elem(&mut entry, CODEC_ID, codec_id);
+        elem(&mut entry, CODEC_PRIVATE, codec_private);
         uint(&mut entry, DEFAULT_DURATION, frame_ns);
         let mut dims = Vec::new();
-        uint(&mut dims, PIXEL_WIDTH, u64::from(video.width));
-        uint(&mut dims, PIXEL_HEIGHT, u64::from(video.height));
+        uint(&mut dims, PIXEL_WIDTH, u64::from(width));
+        uint(&mut dims, PIXEL_HEIGHT, u64::from(height));
         elem(&mut entry, VIDEO, &dims);
         let mut tracks = Vec::new();
         elem(&mut tracks, TRACK_ENTRY, &entry);
@@ -880,6 +987,91 @@ pub fn parameter_sets(annex_b: &[u8]) -> Option<(&[u8], &[u8])> {
     let sps = nals.iter().find(|n| nal_type(n) == NAL_SPS)?;
     let pps = nals.iter().find(|n| nal_type(n) == NAL_PPS)?;
     Some((sps, pps))
+}
+
+/// The `HEVCDecoderConfigurationRecord` an HEVC track declares, built out of the
+/// parameter sets the encoder put in its first access unit -- the exact record
+/// `demux::parse_hvcc` reads back, which is what makes an export of this
+/// project's own something it can re-open.
+///
+/// The 22 fixed bytes before the arrays: the 12-byte `profile_tier_level` is
+/// copied straight out of the SPS (its first 12 bytes after the two-byte NAL
+/// header and the four `sps_video_parameter_set_id`/`sps_max_sub_layers_minus1`
+/// /`sps_temporal_id_nesting_flag` bits -- §7.3.2.2 puts the PTL there and the
+/// hvcC header states the same fields in the same order), and the rest is what
+/// this encoder is: 4:2:0, 8-bit, one temporal layer, 4-byte NAL lengths. Only
+/// the *arrays* are read by anything here, but a record whose header lied about
+/// the profile would be a file `ffprobe` disagrees with.
+///
+/// `None` where the unit carries no VPS, SPS or PPS -- the first coded intra AU
+/// always carries all three.
+pub fn hvcc_record(annex_b: &[u8]) -> Option<Vec<u8>> {
+    let nals = split_annex_b(annex_b);
+    let of = |kind: u8| nals.iter().copied().find(|n| hevc_nal_type(n) == kind);
+    let (vps, sps, pps) = (of(HEVC_VPS)?, of(HEVC_SPS)?, of(HEVC_PPS)?);
+    // The SPS as a decoder reads it: the emulation-prevention bytes the encoder
+    // escaped it with are not part of the syntax, and a run of zeros in the
+    // constraint flags is exactly where one lands.
+    let rbsp = unescape(sps.get(2..)?);
+    let mut rec = vec![1u8]; // configurationVersion
+    rec.extend_from_slice(rbsp.get(1..13)?); // profile_tier_level, verbatim
+    rec.extend_from_slice(&[0xF0, 0x00]); // min_spatial_segmentation_idc = 0
+    rec.push(0xFC); // parallelismType = 0 (unknown)
+    rec.push(0xFC | 1); // chroma_format_idc = 1 (4:2:0)
+    rec.push(0xF8); // bit_depth_luma_minus8 = 0
+    rec.push(0xF8); // bit_depth_chroma_minus8 = 0
+    rec.extend_from_slice(&0u16.to_be_bytes()); // avgFrameRate: unstated
+    // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1,
+    // lengthSizeMinusOne 3 -- the same 4-byte prefix `annex_b_to_hvcc` writes.
+    rec.push(0b00_001_1_11);
+    rec.push(3); // numOfArrays
+    for (kind, nal) in [(HEVC_VPS, vps), (HEVC_SPS, sps), (HEVC_PPS, pps)] {
+        rec.push(0x80 | kind); // array_completeness = 1, NAL_unit_type
+        rec.extend_from_slice(&1u16.to_be_bytes()); // numNalus
+        rec.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        rec.extend_from_slice(nal);
+    }
+    Some(rec)
+}
+
+/// One HEVC access unit as a sample of both containers: 4-byte length prefixes,
+/// parameter sets dropped (they are in the `hvcC`, which is what `hvc1` and a
+/// Matroska `CodecPrivate` both promise). `None` where the unit holds no coded
+/// slice at all.
+pub(crate) fn annex_b_to_hvcc(annex_b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(annex_b.len());
+    for nal in split_annex_b(annex_b) {
+        // 32 VPS, 33 SPS, 34 PPS, 35 AUD -- and everything from 40 up is
+        // non-VCL padding no decoder needs to start.
+        if matches!(hevc_nal_type(nal), HEVC_VPS | HEVC_SPS | HEVC_PPS | 35) {
+            continue;
+        }
+        out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        out.extend_from_slice(nal);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// §7.3.1.2 `nal_unit_type`, the six bits after the forbidden_zero_bit.
+fn hevc_nal_type(nal: &[u8]) -> u8 {
+    nal.first().map_or(0xFF, |b| (b >> 1) & 0x3F)
+}
+
+const HEVC_VPS: u8 = 32;
+const HEVC_SPS: u8 = 33;
+const HEVC_PPS: u8 = 34;
+
+/// A coded NAL payload back to its RBSP: every `00 00 03` loses the `03`
+/// (§7.3.1.1). Only ever asked of an SPS, which is short.
+fn unescape(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    for (i, &byte) in nal.iter().enumerate() {
+        if byte == 3 && i >= 2 && nal[i - 1] == 0 && nal[i - 2] == 0 {
+            continue;
+        }
+        out.push(byte);
+    }
+    out
 }
 
 /// Whether the unit carries a coded picture (NAL types 1..=5). An encoder that
@@ -1322,9 +1514,9 @@ mod tests {
             }),
         )
         .unwrap();
-        muxer.write_av1_frame(&key, true).unwrap();
-        muxer.write_av1_frame(&inter, false).unwrap();
-        muxer.write_av1_frame(&inter, false).unwrap();
+        muxer.write_coded_sample(&key, true).unwrap();
+        muxer.write_coded_sample(&inter, false).unwrap();
+        muxer.write_coded_sample(&inter, false).unwrap();
         for packet in &packets {
             muxer.write_audio_packet(&packet.bytes).unwrap();
         }

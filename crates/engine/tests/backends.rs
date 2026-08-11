@@ -106,6 +106,11 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         (Format::Mp4, "mp4"),
         (Format::Av1, "mkv"),
         (Format::Av1Mp4, "mp4"),
+        // Both HEVC containers, whose seat is software whatever the box has:
+        // the plugin encodes H.264 and AV1 and no HEVC, so a card that offered
+        // a hardware seat here would be promising one that cannot exist.
+        (Format::Hevc, "mkv"),
+        (Format::HevcMp4, "mp4"),
     ] {
         let settings = ExportSettings {
             format,
@@ -145,6 +150,12 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         // carries the timeline's audio now, so a line that said nothing about
         // it would be the old picture-only lie in a new place.
         assert!(planned.contains("AAC"), "{ext}: {planned}");
+        if matches!(format, Format::Hevc | Format::HevcMp4) {
+            assert!(
+                planned.contains("oxideav-h265 intra"),
+                "{ext}: an HEVC job names the intra encoder that writes it: {planned}"
+            );
+        }
     }
 }
 
