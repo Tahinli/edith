@@ -250,8 +250,9 @@ struct AssetDrag(PathBuf, usize);
 
 /// A clip already on the timeline being dragged: the lane it is on and its index
 /// there, which is how every other edit names a clip. Unlike an [`AssetDrag`]
-/// nothing is inserted -- the same clip changes lane and keeps its frames -- so
-/// where along the bed it is let go says nothing here either.
+/// nothing is inserted -- the same clip changes lane and keeps the frames it
+/// plays -- but where along the bed it is let go is exactly where it lands, less
+/// the offset the hand grabbed it at ([`Player::grab`]).
 #[derive(Clone, Copy)]
 struct ClipDrag {
     lane: Lane,
@@ -282,6 +283,12 @@ struct Trim {
 /// Wide enough to hit, narrow enough that the middle of even a small box is
 /// still the body.
 const EDGE_W: f32 = 6.;
+
+/// How close to an edge a dragged clip has to be let go for it to land *on* it:
+/// the snap every timeline has, in pixels rather than frames so that it feels
+/// the same at every zoom. Narrower than [`EDGE_W`] -- a hand aiming between two
+/// takes must still be able to leave a gap of a few frames there.
+const SNAP_PX: f64 = 5.;
 
 /// An open clip menu: which clip it was opened on, where it hangs, and whether
 /// it has been turned over to show what that clip *is* instead of what can be
@@ -647,6 +654,13 @@ struct Player {
     /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
     /// [`Trim`].
     trim: Option<Trim>,
+    /// How far into the clip the last press on a box landed, in timeline
+    /// frames: what a drag lets go of is the *point that was grabbed*, so the
+    /// head lands that much in front of the pointer and the clip does not jump
+    /// under the hand. Recorded at the press because gpui hands the drop only
+    /// the value being dragged, and stale between drags, which costs nothing --
+    /// no drag starts without a press on the box it moves.
+    grab: u32,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -2050,19 +2064,29 @@ impl Player {
         cx.notify();
     }
 
-    /// A clip dragged off one lane and let go over another: it changes track and
-    /// keeps the frames it covers, as one undo step. Dropped back on its own
-    /// lane it is not an edit at all, so nothing is said about it. The engine
-    /// reseeks, so all this owes is the flag reset -- and the selection, whose
-    /// index was that lane's own and now names a different clip there.
-    fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, cx: &mut Context<Self>) {
-        if self.exporting().is_some() || from == to {
+    /// A clip let go at window `x` over lane `to`: it lands with its head where
+    /// the hand is carrying it ([`Player::drop_frame`]), on the track it was
+    /// dropped on, taking its whole take with it -- one undo step for the
+    /// gesture. Dropped back where it was picked up it is not an edit at all, so
+    /// nothing is said about it. The engine reseeks, so all this owes is the
+    /// flag reset -- and the selection, whose index was that lane's own and now
+    /// names a different clip there.
+    fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
             return;
         }
+        let (Some(start), Some(was)) = (
+            self.drop_frame(from, idx, to, x),
+            self.session
+                .as_ref()
+                .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.start)),
+        ) else {
+            return;
+        };
         let moved = self
             .session
             .as_mut()
-            .is_some_and(|session| session.move_clip_to_lane(from, idx, to));
+            .is_some_and(|session| session.move_clip_to(from, idx, to, start));
         let (kind, lanes) = match from.kind {
             LaneKind::Video => ("picture", "video"),
             LaneKind::Audio => ("sound", "audio"),
@@ -2072,9 +2096,10 @@ impl Player {
                 self.selected = None;
                 self.reset_after_reseek();
             }
-            // The two ways a drag is refused, told apart by the one thing the
-            // front-end already knows: a lane's kind. Everything else that
-            // could refuse (a clip that is not there) cannot be dragged.
+            // The three ways a drag is refused, told apart by what the
+            // front-end already knows: a lane's kind, and where the clip was.
+            // Everything else that could refuse (a clip that is not there)
+            // cannot be dragged.
             false if from.kind != to.kind => {
                 self.notice = Some(
                     format!(
@@ -2084,6 +2109,9 @@ impl Player {
                     .into(),
                 )
             }
+            // Picked up and put back down where it was: a click, and a click
+            // says nothing.
+            false if from == to && start == was => {}
             false => {
                 self.notice = Some(
                     format!(
@@ -2095,6 +2123,55 @@ impl Player {
             }
         }
         cx.notify();
+    }
+
+    /// Where a clip let go at window `x` over lane `to` wants its head: the
+    /// frame under the pointer, less however far into the box the hand grabbed
+    /// it (so the clip does not jump under the pointer), pulled onto a
+    /// neighbouring edge when it lands within [`SNAP_PX`] of one. `None` when
+    /// there is no such clip to move. The engine has the last word on where it
+    /// may actually go -- this is the ask, not the answer.
+    ///
+    /// ponytail: the bed ends where the timeline does, so a clip cannot be
+    /// dragged *past* the last frame -- the pointer has no pixel out there to
+    /// name and [`View::time_at`] clamps to the duration. Room to the right is
+    /// made by pulling a tail out first ([`Player::drawn_duration`] already
+    /// lengthens the bed for exactly that gesture). The upgrade is to draw the
+    /// bed past the end while a clip drag is in flight, the way a trim already
+    /// does: `drawn_duration` would take the dragged clip's length the same way
+    /// it takes a trim's reach.
+    fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
+        let session = self.session.as_ref()?;
+        let clip = session.lane_clips(from).get(idx).copied()?;
+        let raw = self.frame_under(x).saturating_sub(self.grab);
+        // The edges worth landing on: both ends of every clip already on the
+        // lane it is being let go over, the playhead, and the head of the
+        // timeline. Never the group's own boxes -- a clip does not snap to
+        // where it already is.
+        let mut marks: Vec<u32> = session
+            .lane_clips(to)
+            .iter()
+            .enumerate()
+            .filter(|&(i, c)| {
+                (to, i) != (from, idx) && !(clip.link.is_some() && c.link == clip.link)
+            })
+            .flat_map(|(_, c)| [c.start, c.end()])
+            .collect();
+        marks.push(frame_at(session.now(), self.fps));
+        marks.push(0);
+        Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the zoom the bed is drawn at: a snap is
+    /// a distance on screen, so zoomed right in it is worth less than a frame
+    /// (no snap at all, which is what a hand placing single frames wants) and
+    /// zoomed out to the whole timeline it is worth many.
+    fn snap_frames(&self) -> u32 {
+        let bed = f64::from(f32::from(self.ruler.get().size.width));
+        if bed <= 0. {
+            return 0;
+        }
+        (SNAP_PX / bed * self.view.span(self.drawn_duration()) * self.fps) as u32
     }
 
     /// Opens the clip menu on the box under the pointer, from the right button
@@ -2151,18 +2228,28 @@ impl Player {
     /// against the same duration the boxes are drawn to, so the edge tracks the
     /// pointer exactly.
     fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let (duration, fps) = (self.drawn_duration(), self.fps);
-        let at = self
-            .view
-            .time_at(frac_along(x, self.ruler.get()), duration);
+        let at = self.frame_under(x);
         let (Some(trim), Some(session)) = (&mut self.trim, &self.session) else {
             return;
         };
         let Some((lo, hi)) = session.trim_room(trim.lane, trim.idx, trim.edge) else {
             return;
         };
-        trim.to = frame_at(at, fps).clamp(lo, hi);
+        trim.to = at.clamp(lo, hi);
         cx.notify();
+    }
+
+    /// The timeline frame a pointer at window x is on: along the same bed the
+    /// ruler is measured on, through the same [`View`] every box is drawn
+    /// through, so a zoomed-in panel answers with the frame under the pointer
+    /// and not with the one that would have been there unzoomed. The one
+    /// question a trim, a grab and a drop all ask.
+    fn frame_under(&self, x: Pixels) -> u32 {
+        let duration = self.drawn_duration();
+        frame_at(
+            self.view.time_at(frac_along(x, self.ruler.get()), duration),
+            self.fps,
+        )
     }
 
     /// The release: the whole drag reaches the engine as one edit, so it is one
@@ -2264,16 +2351,18 @@ impl Player {
 
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
-    /// "add this source" does. The whole source goes in at the playhead as one
-    /// grouped take -- the same insert a paste makes, so everything after it
-    /// moves along rather than being painted over. Reseeks like every other
-    /// edit, and drops the timeline's selection with it: the insert has just
-    /// moved the indices it pointed at.
+    /// "add this source" does. The whole source goes in as one grouped take at
+    /// `at` -- the frame the pointer let it go on, or the playhead for the
+    /// button, which names no place. It is the same insert a paste makes, so
+    /// everything after it moves along rather than being painted over. Reseeks
+    /// like every other edit, and drops the timeline's selection with it: the
+    /// insert has just moved the indices it pointed at.
     fn insert_source(
         &mut self,
         path: &Path,
         stream: usize,
         onto: Option<Lane>,
+        at: Option<u32>,
         cx: &mut Context<Self>,
     ) {
         if self.exporting().is_some() {
@@ -2308,8 +2397,16 @@ impl Player {
         // in: a row that has never been on a lane is placeable at its full
         // length, which is the whole point of an import that only fills the
         // library.
+        let fps = self.fps;
         let placed = match &mut self.session {
-            Some(session) => session.place_stream_at(session.now(), path, stream, onto),
+            // Seconds, because that is what the engine's own door takes: the
+            // frame the pointer named goes back through the same rate every box
+            // on the bed is drawn at, so it lands on the frame it was let go on
+            // rather than a neighbouring one.
+            Some(session) => {
+                let at = at.map_or_else(|| session.now(), |frame| f64::from(frame) / fps);
+                session.place_stream_at(at, path, stream, onto)
+            }
             None => Ok(false),
         };
         match placed {
@@ -2459,7 +2556,7 @@ impl Player {
             }
             RowItem::Add => {
                 self.library_menu = None;
-                self.insert_source(&menu.path, menu.stream, None, cx);
+                self.insert_source(&menu.path, menu.stream, None, None, cx);
             }
             RowItem::Remove => {
                 self.library_menu = None;
@@ -3585,7 +3682,7 @@ impl Player {
                 // row that says where it came from has to say which rate that
                 // was.
                 (None, Some(meta)) => format!(
-                    "{} — {}x{} @ {:.2} fps · drag onto a lane, or Add at playhead",
+                    "{} — {}x{} @ {:.2} fps · drag it where you want it, or Add at playhead",
                     row.path.display(),
                     meta.width,
                     meta.height,
@@ -3769,7 +3866,7 @@ impl Player {
                 "Add at playhead",
                 match self.selected_asset {
                     Some(_) => "inserts the picked file at the playhead".to_string(),
-                    None => "click a file above first — or drag one onto a lane".to_string(),
+                    None => "click a file above first — or drag one where you want it".to_string(),
                 },
                 can_add(
                     self.selected_asset.as_ref(),
@@ -3780,7 +3877,7 @@ impl Player {
                     if let Some((path, stream)) = this.selected_asset.clone() {
                         // No lane: the button means "wherever this belongs",
                         // which for a file with no picture is the audio lane.
-                        this.insert_source(&path, stream, None, cx);
+                        this.insert_source(&path, stream, None, None, cx);
                     }
                 }),
             ))
@@ -5810,7 +5907,7 @@ impl Player {
         let (sel, sel_link) = (self.selected, self.selected_link());
         let audio = lane.kind == LaneKind::Audio;
         let tip: SharedString = format!(
-            "Select (or {} under the playhead, {}/{} along the lane) — drag an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
+            "Select (or {} under the playhead, {}/{} along the lane) — drag it to move it, an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
             self.keymap.display(ActionId::Select),
             self.keymap.display(ActionId::SelectPrev),
             self.keymap.display(ActionId::SelectNext),
@@ -5877,18 +5974,23 @@ impl Player {
                     .bg(rgb(LETTERBOX))
                     .overflow_hidden()
                     // A library row let go over a lane is the same insert the
-                    // Add button makes, through the same call -- at the
-                    // playhead, not at the pointer: clips here are placed end
-                    // to end, so where along the bed it landed says nothing.
-                    .on_drop(cx.listener(move |this, drag: &AssetDrag, _, cx| {
-                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), cx)
+                    // Add button makes, through the same call -- but where the
+                    // pointer let it go, not at the playhead: a hand that
+                    // carried a file to a place on the bed named that place.
+                    // gpui hands a drop no event, so the pointer is read off
+                    // the window, which took it from the release that fired
+                    // this (gpui window.rs:3602).
+                    .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+                        let at = this.frame_under(window.mouse_position().x);
+                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
                     .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
-                    // A clip let go over another lane changes track and keeps
-                    // the frames it covers -- the pointer's position along the
-                    // bed says nothing here either, for the reason above.
-                    .on_drop(cx.listener(move |this, drag: &ClipDrag, _, cx| {
-                        this.move_clip(drag.lane, drag.idx, lane, cx)
+                    // ...and a clip let go over a lane lands the same way: on
+                    // the track it was dropped on, at the frame it was carried
+                    // to -- its own included, which is the drag that moves a
+                    // take along its track.
+                    .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+                        this.move_clip(drag.lane, drag.idx, lane, window.mouse_position().x, cx)
                     }))
                     .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(HOVER_DIM)))
                     .children(clips.iter().enumerate().map(|(i, clip)| {
@@ -5933,6 +6035,10 @@ impl Player {
                         // says what is moving.
                         let ghost: SharedString =
                             label.clone().unwrap_or_else(|| lane.label()).into();
+                        // Its head in frames, for the press below: the `start`
+                        // above is the same moment in seconds, which is what
+                        // the box is *drawn* from.
+                        let head = clip.start;
                         div()
                             // Named per lane: two rows numbering their clips
                             // from zero would hand gpui the same id twice.
@@ -5960,16 +6066,23 @@ impl Player {
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT)))
                             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
-                            // Dragged onto another lane it *moves* there; the
-                            // click that starts the drag still selects, so
-                            // picking a clip up and putting it back down where
-                            // it was is exactly a click.
+                            // Dragged, it *moves*: to the frame it was let go on
+                            // and to the lane it was let go over. The click that
+                            // starts the drag still selects, so picking a clip
+                            // up and putting it back down where it was is
+                            // exactly a click.
                             .on_drag(ClipDrag { lane, idx: i }, move |_, _, _, cx| {
                                 cx.new(|_| Tip(ghost.clone()))
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    // Where in the box the hand took hold of it,
+                                    // for the drag this press may become: the
+                                    // clip has to move with the pointer rather
+                                    // than jump its head under it.
+                                    this.grab =
+                                        this.frame_under(event.position.x).saturating_sub(head);
                                     this.select((lane, i), cx);
                                 }),
                             )
@@ -7511,6 +7624,28 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
 }
 
+/// The frame a dropped clip's head lands on: `raw`, unless one of `marks` is
+/// within `tol` frames of where its head -- or its tail, `len` frames along --
+/// would come to rest, in which case that edge wins. The snap every timeline
+/// has: clips meet exactly instead of a frame apart, and the hand does not have
+/// to aim. The nearest mark wins, and a head landing on one beats a tail at the
+/// same distance -- what was dragged is the head.
+fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
+    let mut best: Option<(u32, u32)> = None;
+    for &mark in marks {
+        // Head on the mark, then tail on it -- a clip dragged up against the
+        // take in front of it snaps by whichever end reaches first.
+        for start in [Some(mark), mark.checked_sub(len)] {
+            let Some(start) = start else { continue };
+            let d = start.abs_diff(raw);
+            if d <= tol && best.is_none_or(|(near, _)| d < near) {
+                best = Some((d, start));
+            }
+        }
+    }
+    best.map_or(raw, |(_, start)| start)
+}
+
 /// Where down an element a pointer sits, 0..1 from the top: the vertical twin
 /// of [`frac_along`], for the equalizer, whose gain axis is the y one. An
 /// element that was never painted reads as its middle -- flat, the one answer
@@ -7848,8 +7983,8 @@ mod tests {
         eq_y, export_path, export_settings, format_key, format_line, format_refusal, frac_along,
         frac_down, frame_at, histogram, is_bare_modifier, is_project, keymap, lanes_h, marked,
         menu_at, normalise, nothing_to_play, panel_h, project_path, push_digit, retarget,
-        scrub_due, show_label, silence_rate, source_tint, span_partner, speed_at, timecode,
-        unseen_paths, unseen_sources, whole_take, width_frac, window_title,
+        scrub_due, show_label, silence_rate, snapped, source_tint, span_partner, speed_at,
+        timecode, unseen_paths, unseen_sources, whole_take, width_frac, window_title,
     };
     use super::{
         LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
@@ -8669,7 +8804,7 @@ mod tests {
         let v2 = session.add_lane(LaneKind::Video);
         assert_eq!(session.video_clip_at(0.0), Some((Lane::V1, 0)));
 
-        assert!(session.move_clip_to_lane(Lane::V1, 0, v2), "V1 -> V2");
+        assert!(session.move_clip_to(Lane::V1, 0, v2, 0), "V1 -> V2");
         assert!(session.lane_clips(Lane::V1).is_empty(), "it left V1");
         assert_eq!(session.lane_clips(v2).len(), 1, "and landed on V2");
         assert_eq!(
@@ -8682,11 +8817,11 @@ mod tests {
         // Dropped on a lane of the other kind it is refused and nothing moves --
         // the notice the front-end shows for it says which kind of lane to use.
         // (The other refusal, landing on another clip, is the engine's own test
-        // `move_to_lane_keeps_the_frames_and_refuses_the_rest`.)
-        assert!(!session.move_clip_to_lane(v2, 0, Lane::A1), "picture on A1");
+        // `move_clip_keeps_the_frames_and_refuses_the_rest`.)
+        assert!(!session.move_clip_to(v2, 0, Lane::A1, 0), "picture on A1");
         assert_eq!(session.lane_clips(v2).len(), 1, "and it stayed on V2");
         assert!(
-            session.move_clip_to_lane(v2, 0, Lane::V1),
+            session.move_clip_to(v2, 0, Lane::V1, 0),
             "dragged back down"
         );
 
@@ -8886,6 +9021,70 @@ mod tests {
         assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
     }
 
+    /// What a drop reads: the frame under the pointer, through the same view
+    /// the boxes are drawn through. Zoomed in, the same pixel is a different
+    /// frame -- which is the whole reason `Player::frame_under` goes through
+    /// [`View`] rather than through the duration alone.
+    #[test]
+    fn a_drop_reads_the_frame_under_the_pointer_at_every_zoom() {
+        // A 200 px bed inset by the panel's padding, 10 seconds at 30 fps.
+        let bed: Bounds<Pixels> = Bounds {
+            origin: point(px(12.), px(400.)),
+            size: size(px(200.), px(6.)),
+        };
+        let (duration, fps) = (10., 30.);
+        // The frame a pointer at window `x` names, exactly as `frame_under`
+        // composes it.
+        let under =
+            |view: View, x: f32| frame_at(view.time_at(frac_along(px(x), bed), duration), fps);
+
+        // The whole timeline across the bed: halfway along is frame 150.
+        let fit = View::default();
+        assert_eq!(under(fit, 12.), 0);
+        assert_eq!(under(fit, 112.), 150);
+        assert_eq!(under(fit, 212.), 300);
+
+        // Four times in, starting at second 5: the same middle pixel is now the
+        // frame in the middle of seconds 5..7.5, and the left edge is not 0.
+        let zoomed = View {
+            zoom: 4.,
+            start: 5.,
+        };
+        assert_eq!(under(zoomed, 12.), 150);
+        assert_eq!(under(zoomed, 112.), 187);
+        assert_eq!(under(zoomed, 212.), 225);
+        // ...and a drop past either end of the bed lands on the timeline, never
+        // outside it: `time_at` clamps.
+        assert_eq!(under(zoomed, 0.), 150);
+        assert_eq!(under(fit, 9999.), 300);
+    }
+
+    /// The snap: a clip let go a few frames off a neighbour's edge lands *on*
+    /// it, by whichever of its own ends is nearer, and a clip let go in open bed
+    /// stays exactly where the hand left it.
+    #[test]
+    fn a_dropped_clip_snaps_to_the_edges_worth_landing_on() {
+        // A neighbour covering [100, 160) and the playhead at 300.
+        let marks = [100, 160, 300, 0];
+        // Head a frame short of the neighbour's tail: laid end to end with it.
+        assert_eq!(snapped(158, 40, 4, &marks), 160);
+        // Tail a frame into its head: pulled back so the two meet exactly.
+        assert_eq!(snapped(62, 40, 4, &marks), 60);
+        // The playhead is an edge like any other.
+        assert_eq!(snapped(298, 40, 4, &marks), 300);
+        // Outside the tolerance nothing moves -- a gap the hand meant to leave
+        // is a gap.
+        assert_eq!(snapped(150, 40, 4, &marks), 150);
+        // No tolerance at all (zoomed right in, where a few pixels are worth
+        // less than a frame) is no snap: single frames are placed by hand.
+        assert_eq!(snapped(158, 40, 0, &marks), 158);
+        // The nearer edge wins when two are in reach.
+        assert_eq!(snapped(101, 40, 8, &marks), 100);
+        // ...and a mark closer to the head than `len` cannot pull the clip to a
+        // negative start.
+        assert_eq!(snapped(2, 40, 4, &marks), 0);
+    }
+
     #[test]
     fn timecode_counts_frames_inside_the_second() {
         assert_eq!(timecode(0., 30.), "00:00:00:00");
@@ -9030,7 +9229,11 @@ mod tests {
         // The fit: what `start_frac`/`width_frac` used to answer, exactly.
         let fit = View::default();
         for t in [0., 5., 12.5, 20.] {
-            assert_eq!(fit.frac_at(t, duration), (t / duration) as f32, "fit at {t}");
+            assert_eq!(
+                fit.frac_at(t, duration),
+                (t / duration) as f32,
+                "fit at {t}"
+            );
         }
         assert_eq!(fit.width_frac(5., duration), width_frac(5., duration));
         for view in [
@@ -9149,7 +9352,11 @@ mod tests {
         assert_eq!(view.span(duration), 5.);
         // Inside: untouched, whichever part of the slice it is in.
         for at in [5., 7.5, 10.] {
-            assert_eq!(view.following(at, duration, fps), view, "{at} is on the bed");
+            assert_eq!(
+                view.following(at, duration, fps),
+                view,
+                "{at} is on the bed"
+            );
         }
         // Past the right edge, as playback does it: the head comes back on the
         // bed, and the zoom is not changed by the scroll.
@@ -10153,7 +10360,10 @@ mod tests {
             while session.try_frame().is_some() {}
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(session.is_eos(), "an empty timeline is done before it starts");
+        assert!(
+            session.is_eos(),
+            "an empty timeline is done before it starts"
+        );
 
         // So the press is refused rather than sent down the restart branch --
         // and with no session at all it is the same refusal.
@@ -10374,6 +10584,7 @@ fn main() {
                     clipboard: None,
                     scrubbing: false,
                     trim: None,
+                    grab: 0,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,

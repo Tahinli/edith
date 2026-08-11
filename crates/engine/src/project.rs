@@ -1724,42 +1724,106 @@ impl Project {
         true
     }
 
-    /// Move the clip at `idx` of `from` onto `to`, keeping the timeline frames
-    /// it covers: the drag that rearranges takes across tracks. One snapshot, so
-    /// one [`Project::undo`] puts it back where it was.
+    /// Move the clip at `idx` of `from` onto `to` with its head at timeline
+    /// frame `start`: the drag that rearranges takes, along a track and across
+    /// them alike. One snapshot, so one [`Project::undo`] puts it back where it
+    /// was. `start` at the clip's own is the pure lane change.
     ///
-    /// Its group id travels with it, and that is not a desync: a link means
-    /// "these cover one span on however many lanes" and names no lane at all
-    /// (see [`links_are_consistent`]), so a picture moved from `V1` to `V2` is
-    /// still the same take as the sound under it. The span never changes here --
-    /// only which lane draws it.
+    /// The whole group travels the same distance, each half on the lane it
+    /// already sits on -- a link means "these cover one span on however many
+    /// lanes" ([`links_are_consistent`]), so a picture that slid away from its
+    /// sound would be a group no save could load. Only the dragged half changes
+    /// lane, and that is not a desync: a link names no lane at all.
     ///
-    /// Refused, changing nothing, for a lane that is not there, an index that is
-    /// not there, a move onto the lane it is already on, a move across *kinds*
-    /// (a picture cannot play on an audio lane, and the save it wrote would not
-    /// open again), and a landing that would touch another clip -- a move that
-    /// overwrote what it landed on would destroy a take the pointer never named,
-    /// which is what [`place`](Project::place) may do and a drag may not.
-    pub fn move_to_lane(&mut self, from: Lane, idx: usize, to: Lane) -> bool {
-        if from.kind != to.kind || from == to || self.index(to).is_none() {
-            return false;
-        }
-        let Some(clip) = self.lane(from).get(idx).copied() else {
+    /// `start` is **clamped**, never refused, to the room the group has: no
+    /// member crosses a neighbour on the lane it lands on, exactly as
+    /// [`trim`](Project::trim) stops an edge at the clip in front of it. A hand
+    /// dragging past a neighbour means "as far as it goes", and butting up
+    /// against the take next door is how clips are laid end to end. The
+    /// tightest member's wall wins, so a sound half boxed in between two others
+    /// holds its picture still.
+    ///
+    /// Refused, changing nothing and costing no undo step, for a lane that is
+    /// not there, an index that is not there, a move across *kinds* (a picture
+    /// cannot play on an audio lane, and the save it wrote would not open
+    /// again), a head let go *inside* another clip or into a gap too narrow to
+    /// hold this one -- a move that overwrote what it landed on would destroy a
+    /// take the pointer never named, which is what [`place`](Project::place)
+    /// may do and a drag may not -- a half let go onto the lane its own partner
+    /// is on, and a drop that changes neither lane nor frame, which is a clip
+    /// picked up and put back down, i.e. a click.
+    pub fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> bool {
+        let (Some(dest), Some(clip)) = (self.index(to), self.lane(from).get(idx).copied()) else {
             return false;
         };
-        if self
-            .lane(to)
-            .iter()
-            .any(|c| c.start < clip.end() && clip.start < c.end())
-        {
+        if from.kind != to.kind {
+            return false;
+        }
+        let members = self.group_of(from, idx).expect("the clip was found");
+        let held = self.index(from).expect("the clip was found on it");
+        // The two halves of one group would land on one span of one lane, which
+        // is the one thing a link may never mean. Refused rather than clamped:
+        // the partner moves the same distance, so there is no room for it
+        // anywhere on that lane.
+        if dest != held && members.iter().any(|&(l, _)| l == dest) {
+            return false;
+        }
+        let want = i64::from(start) - i64::from(clip.start);
+        // How far the group may travel, in timeline frames and signed: every
+        // member narrows it to the gap it is landing in, and what is left is
+        // what the pointer is clamped to.
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for &(l, i) in &members {
+            let c = self.lanes[l].clips[i];
+            let land = if (l, i) == (held, idx) { dest } else { l };
+            // Which gap this member's walls are read off: its own place on the
+            // lane it stays on, and the frame the pointer named on the lane it
+            // is let go over.
+            let at = if land == l { c.start } else { start };
+            let (mut wall_lo, mut wall_hi) = (0, u32::MAX);
+            for (j, other) in self.lanes[land].clips.iter().enumerate() {
+                if members.contains(&(land, j)) {
+                    continue;
+                }
+                if other.start <= at && at < other.end() {
+                    return false;
+                }
+                match other.end() <= at {
+                    true => wall_lo = wall_lo.max(other.end()),
+                    false => wall_hi = wall_hi.min(other.start),
+                }
+            }
+            if wall_hi - wall_lo < c.frames() {
+                return false;
+            }
+            lo = lo.max(i64::from(wall_lo) - i64::from(c.start));
+            hi = hi.min(i64::from(wall_hi - c.frames()) - i64::from(c.start));
+        }
+        if lo > hi {
+            return false;
+        }
+        let delta = want.clamp(lo, hi);
+        if delta == 0 && dest == held {
             return false;
         }
         self.snapshot();
-        self.lane_mut(from).expect("checked above").remove(idx);
-        let clips = self.lane_mut(to).expect("checked above");
-        let at = clips.partition_point(|c| c.start < clip.start);
-        clips.insert(at, clip);
-        debug_assert!(sorted_disjoint(clips));
+        for &(l, i) in &members {
+            let c = &mut self.lanes[l].clips[i];
+            // In range by the walls above, which are `u32` frames throughout.
+            c.start = (i64::from(c.start) + delta) as u32;
+        }
+        if dest != held {
+            let clip = self.lanes[held].clips.remove(idx);
+            let clips = &mut self.lanes[dest].clips;
+            let at = clips.partition_point(|c| c.start < clip.start);
+            clips.insert(at, clip);
+        }
+        debug_assert!(sorted_disjoint(&self.lanes[dest].clips));
+        debug_assert!(
+            members
+                .iter()
+                .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips))
+        );
         true
     }
 
@@ -2100,7 +2164,12 @@ impl Project {
         // Nothing reaches past `at`: there is nothing to cut and nothing to
         // slide back, and a delete that changes nothing must not cost an undo
         // step (see [`snapshot`](Project::snapshot)).
-        if !self.lanes.iter().flat_map(|l| &l.clips).any(|c| c.end() > at) {
+        if !self
+            .lanes
+            .iter()
+            .flat_map(|l| &l.clips)
+            .any(|c| c.end() > at)
+        {
             return false;
         }
         self.snapshot();
@@ -3452,7 +3521,11 @@ mod tests {
         // A gap on one lane leaves the other's clip selectable there.
         assert!(p.lift(Lane::A1, 0));
         assert_eq!(p.lane_clip_at(Lane::A1, 0), None, "the gap holds nothing");
-        assert_eq!(p.lane_clip_at(Lane::A1, 3), Some(0), "indices moved with it");
+        assert_eq!(
+            p.lane_clip_at(Lane::A1, 3),
+            Some(0),
+            "indices moved with it"
+        );
         assert_eq!(p.lane_clip_at(Lane::V1, 0), Some(0));
         // A lane that is not there is not a panic.
         assert_eq!(p.lane_clip_at(Lane::new(LaneKind::Video, 1), 0), None);
@@ -3499,16 +3572,17 @@ mod tests {
         assert!(!p.place(Lane::V1, 0, clip(0, 7, 7, 0)), "empty clip");
     }
 
-    /// The drag between tracks: the clip keeps its frames, one undo takes it
-    /// back, and every way it can be refused leaves the project untouched.
+    /// The drag between tracks: let go at the frames it already covers the clip
+    /// keeps them, one undo takes it back, and every way it can be refused
+    /// leaves the project untouched.
     #[test]
-    fn move_to_lane_keeps_the_frames_and_refuses_the_rest() {
+    fn move_clip_keeps_the_frames_and_refuses_the_rest() {
         let v2 = Lane::new(LaneKind::Video, 1);
         let mut p = three();
         assert_eq!(p.add_lane(LaneKind::Video), v2);
         let before = shape(&p);
 
-        assert!(p.move_to_lane(Lane::V1, 1, v2), "V1's middle clip moves up");
+        assert!(p.move_clip(Lane::V1, 1, v2, 3), "V1's middle clip moves up");
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(5, 5, 9, 0)]);
         assert_eq!(shape(&p)[2], vec![clip(3, 3, 5, 0)], "same frames on V2");
         assert_eq!(shape(&p)[1], before[1], "the audio lane is untouched");
@@ -3517,17 +3591,21 @@ mod tests {
         assert!(p.undo());
         assert_eq!(shape(&p), before);
 
-        // A lane that is not there, the lane it is already on, an index that is
-        // not there, and a move across kinds: all refused, nothing changed.
+        // A lane that is not there, the lane and frame it is already at, an
+        // index that is not there, and a move across kinds: all refused,
+        // nothing changed.
         let history = p.history.len();
-        for (from, idx, to) in [
-            (Lane::V1, 1, Lane::new(LaneKind::Video, 7)),
-            (Lane::V1, 1, Lane::V1),
-            (Lane::V1, 9, v2),
-            (Lane::V1, 1, Lane::A1),
-            (Lane::A1, 1, v2),
+        for (from, idx, to, start) in [
+            (Lane::V1, 1, Lane::new(LaneKind::Video, 7), 3),
+            (Lane::V1, 1, Lane::V1, 3),
+            (Lane::V1, 9, v2, 3),
+            (Lane::V1, 1, Lane::A1, 3),
+            (Lane::A1, 1, v2, 3),
         ] {
-            assert!(!p.move_to_lane(from, idx, to), "{from:?} {idx} -> {to:?}");
+            assert!(
+                !p.move_clip(from, idx, to, start),
+                "{from:?} {idx} -> {to:?} at {start}"
+            );
         }
         assert_eq!(shape(&p), before);
         assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
@@ -3535,10 +3613,85 @@ mod tests {
         // Landing on another clip is refused rather than overwriting it: the
         // pointer named the lane, never the take already sitting there.
         assert!(p.place(v2, 3, clip(0, 100, 101, 0)), "V2 holds [3,4)");
-        assert!(!p.move_to_lane(Lane::V1, 1, v2), "[3,5) would land on it");
-        assert!(p.move_to_lane(Lane::V1, 0, v2), "[0,3) merely abuts it");
+        assert!(!p.move_clip(Lane::V1, 1, v2, 3), "let go inside it");
+        assert!(p.move_clip(Lane::V1, 0, v2, 0), "[0,3) merely abuts it");
         assert_eq!(shape(&p)[0], vec![clip(3, 3, 5, 0), clip(5, 5, 9, 0)]);
         assert_eq!(shape(&p)[2], vec![clip(0, 0, 3, 0), clip(3, 100, 101, 0)]);
+    }
+
+    /// The drag *along* a track, which is the one every other editor has: the
+    /// clip lands on the frame the pointer let it go at, and stops dead against
+    /// the neighbour rather than overwriting it.
+    #[test]
+    fn a_clip_slides_along_its_own_lane_and_butts_against_its_neighbour() {
+        let sources = vec![Source::new(FILE, 0)];
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 3, 0), clip(10, 3, 6, 0)]),
+            (LaneKind::Audio, vec![clip(0, 0, 3, 0)]),
+        ];
+        let mut p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
+        let before = shape(&p);
+
+        // Into the gap, exactly where it was let go -- nothing else moves.
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 5));
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(5, 3, 6, 0)]);
+        assert_eq!(shape(&p)[1], before[1], "the audio lane is untouched");
+        // Dragged past the clip in front of it: clamped to its wall, laid end
+        // to end with it, never over it.
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 0));
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(3, 3, 6, 0)]);
+        // One undo per drag, and both of them together are the state it started
+        // in -- the frames each clip plays never changed.
+        assert!(p.undo() && p.undo());
+        assert_eq!(shape(&p), before);
+
+        // A drop that changes nothing is a click, not an edit.
+        let history = p.history.len();
+        assert!(!p.move_clip(Lane::V1, 1, Lane::V1, 10));
+        assert_eq!(p.history.len(), history, "a refusal snapshots nothing");
+    }
+
+    /// A drag carries the whole take: the sound half travels exactly as far as
+    /// the picture does, and the tighter of their two walls stops both.
+    #[test]
+    fn a_dragged_take_carries_its_sound_and_stops_at_the_tighter_wall() {
+        let mut p = three();
+        assert!(
+            p.lift(Lane::V1, 2) && p.lift(Lane::A1, 2),
+            "room to the right"
+        );
+        let link = p.lane(Lane::V1)[1].link.expect("a split hands out ids");
+        assert_eq!(p.lane(Lane::A1)[1].link, Some(link), "both halves grouped");
+        // Something in the sound's way, and nothing at all in the picture's.
+        assert!(p.place(Lane::A1, 10, clip(0, 0, 2, 0)), "A1 holds [10,12)");
+        let before = shape(&p);
+
+        assert!(p.move_clip(Lane::V1, 1, Lane::V1, 30), "dragged far right");
+        assert_eq!(p.lane(Lane::V1)[1].start, 8, "stopped where the sound did");
+        assert_eq!(p.lane(Lane::A1)[1].start, 8, "and the sound came with it");
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+        assert!(p.undo());
+        assert_eq!(shape(&p), before, "one undo for the whole take");
+    }
+
+    /// The drag that does both at once -- another lane *and* another frame --
+    /// which is what a pointer let go over a lane always names.
+    #[test]
+    fn a_clip_dragged_to_another_lane_lands_on_the_pointers_frame() {
+        let v2 = Lane::new(LaneKind::Video, 1);
+        let mut p = three();
+        assert_eq!(p.add_lane(LaneKind::Video), v2);
+
+        assert!(p.move_clip(Lane::V1, 2, v2, 20), "[5,9) -> V2 at 20");
+        assert_eq!(shape(&p)[0], vec![clip(0, 0, 3, 0), clip(3, 3, 5, 0)]);
+        assert_eq!(shape(&p)[2], vec![clip(20, 5, 9, 0)], "at the pointer");
+        assert_eq!(
+            p.lane(Lane::A1)[2].start,
+            20,
+            "its sound travelled the same distance"
+        );
+        links_are_consistent(&p.lanes).expect("one id per lane, one span");
+        assert_eq!(p.timeline_frames(), 24, "a move is not an insert");
     }
 
     /// How long `FILE` is, which is what a trim's tail is allowed to reach:
@@ -3563,8 +3716,15 @@ mod tests {
 
         // ...and back out, no further than the clip behind it.
         assert!(p.trim(Lane::V1, 1, Edge::End, 8, SRC));
-        assert_eq!(shape(&p)[0][1], clip(3, 3, 5, 0), "stopped at the neighbour");
-        assert!(!p.trim(Lane::V1, 1, Edge::End, 8, SRC), "already at the wall");
+        assert_eq!(
+            shape(&p)[0][1],
+            clip(3, 3, 5, 0),
+            "stopped at the neighbour"
+        );
+        assert!(
+            !p.trim(Lane::V1, 1, Edge::End, 8, SRC),
+            "already at the wall"
+        );
 
         // One frame of clip always survives, however far back the pointer went.
         assert!(p.trim(Lane::V1, 1, Edge::End, 0, SRC));
@@ -3588,7 +3748,11 @@ mod tests {
     fn trimming_the_head_moves_the_in_point() {
         let mut p = three();
         assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
-        assert_eq!(shape(&p)[0][0], clip(2, 2, 3, 0), "two frames off the front");
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(2, 2, 3, 0),
+            "two frames off the front"
+        );
         assert_eq!(p.map(Lane::V1, 2), Some((0, 2)), "frame 2 still plays 2");
         assert_eq!(p.map(Lane::V1, 1), None, "and the front is a gap");
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "back out again");
@@ -3625,7 +3789,11 @@ mod tests {
         );
         assert!(!p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "already there");
         assert!(p.trim(Lane::V1, 0, Edge::Start, 2, SRC));
-        assert_eq!(shape(&p)[0], vec![clip(2, 7, 9, 0)], "the in-point followed");
+        assert_eq!(
+            shape(&p)[0],
+            vec![clip(2, 7, 9, 0)],
+            "the in-point followed"
+        );
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, SRC), "and back out");
         assert_eq!(shape(&p)[0], vec![clip(0, 5, 9, 0)]);
     }
@@ -3665,7 +3833,11 @@ mod tests {
         );
         // Past the cap is clamped, exactly as the tail is -- not refused.
         assert!(p.trim(Lane::V1, 0, Edge::Start, 0, CAP));
-        assert_eq!(shape(&p)[0][0], clip(60, 0, 60, 0), "a cap's worth, no more");
+        assert_eq!(
+            shape(&p)[0][0],
+            clip(60, 0, 60, 0),
+            "a cap's worth, no more"
+        );
         // ...and the clip in front is the nearer wall of the two: no head trim
         // may open an overlap.
         assert!(p.trim(Lane::V1, 0, Edge::Start, 90, CAP));
@@ -3692,7 +3864,10 @@ mod tests {
         assert!(p.trim(Lane::V1, 2, Edge::Start, 7, SRC));
         assert_eq!(shape(&p)[0][2], clip(7, 7, 9, 0));
         assert_eq!(shape(&p)[1][2], clip(7, 7, 9, 0), "the sound followed");
-        assert!(p.trim(Lane::A1, 2, Edge::End, 8, SRC), "either half drags it");
+        assert!(
+            p.trim(Lane::A1, 2, Edge::End, 8, SRC),
+            "either half drags it"
+        );
         assert_eq!(shape(&p)[0][2], clip(7, 7, 8, 0), "and the picture follows");
         links_are_consistent(&p.lanes).expect("one id per lane, one span");
 
@@ -3727,13 +3902,13 @@ mod tests {
     /// A moved half stays in its group: a link names a span, not a lane, so the
     /// picture on `V2` is still the same take as the sound under it on `A1`.
     #[test]
-    fn move_to_lane_keeps_the_group() {
+    fn move_clip_keeps_the_group() {
         let v2 = Lane::new(LaneKind::Video, 1);
         let mut p = three();
         p.add_lane(LaneKind::Video);
         let link = p.lane(Lane::V1)[1].link.expect("a split hands out ids");
         assert_eq!(p.lane(Lane::A1)[1].link, Some(link), "both halves grouped");
-        assert!(p.move_to_lane(Lane::V1, 1, v2));
+        assert!(p.move_clip(Lane::V1, 1, v2, 3));
         assert_eq!(p.lane(v2)[0].link, Some(link), "the id travelled with it");
         links_are_consistent(&p.lanes).expect("one id per lane, one span");
         assert_eq!(
@@ -4878,7 +5053,12 @@ mod tests {
                 }
                 let lane = if next(2) == 0 { Lane::V1 } else { Lane::A1 };
                 let idx = next(4) as usize;
-                let _ = match next(15) {
+                let _ = match next(16) {
+                    // A clip dragged along its own lane to wherever the pointer
+                    // let it go: the op that moves a placement without changing
+                    // what it plays, so what it may not do is land on top of the
+                    // neighbour it was dragged at.
+                    15 => p.move_clip(lane, idx, lane, frame),
                     // ...and a second `place`, so a punch lands inside a clip
                     // far more often than one op in fourteen would put it there.
                     14 => p.place(lane, frame, copied),
@@ -5298,7 +5478,12 @@ mod tests {
                     .unwrap_or(&clip(0, 0, 5, 0));
                 let lane = lanes[next(3) as usize];
                 let idx = next(4) as usize;
-                let _ = match next(13) {
+                let _ = match next(14) {
+                    // The drag, in the mix: a clip dragged along its own lane
+                    // and onto another one, at a frame the pointer picked --
+                    // which is where the group rule and the sorted+disjoint one
+                    // meet, since every half travels the same distance.
+                    13 => p.move_clip(lane, idx, lanes[next(3) as usize], frame),
                     10 => p.set_eq(lane, idx, Some(band_at(next(4)))),
                     11 => p.set_eq(lane, idx, None),
                     // A rate, which on many lanes is the group rule as well:
