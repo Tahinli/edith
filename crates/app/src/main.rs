@@ -406,6 +406,47 @@ const MENU_ITEMS: [ActionId; 14] = [
     ActionId::ToggleMute,
 ];
 
+/// One row of the actions card, in the order it lists them: a heading, then
+/// every action the registry files under it, then the strokes the modal cards
+/// answer themselves.
+///
+/// A list rather than a loop inside the render, so the card and
+/// `every_action_is_on_the_actions_card` read the *same* order: an action that
+/// reaches no row fails a test instead of quietly becoming pointer-unreachable.
+enum KeyRow {
+    Head(keymap::Category),
+    /// Click its label to do it, click its stroke to change that stroke.
+    Act(ActionId),
+    /// An index into [`keymap::FIXED`]. Shown and never offered: nothing may
+    /// unbind the way out of a card.
+    Fixed(usize),
+}
+
+/// Every action, under its heading, and the card-local strokes beside them.
+/// Generated from the registry -- [`ActionId::ALL`] in its own order, under
+/// [`keymap::Category::ALL`] -- so an action added there is on the card the
+/// moment it exists and there is no second list here to forget.
+fn keys_rows() -> Vec<KeyRow> {
+    let mut rows = Vec::new();
+    for category in keymap::Category::ALL {
+        rows.push(KeyRow::Head(category));
+        rows.extend(
+            ActionId::ALL
+                .into_iter()
+                .filter(|a| a.category() == category)
+                .map(KeyRow::Act),
+        );
+        rows.extend(
+            keymap::FIXED
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.category == category)
+                .map(|(i, _)| KeyRow::Fixed(i)),
+        );
+    }
+    rows
+}
+
 /// The project resolutions [`Player::cycle_resolution`] offers, largest first.
 /// A short list of the sizes people name; the media's own is cycled in beside
 /// them, which is what makes the trip round come back to where it started.
@@ -618,6 +659,48 @@ const HIST_H: f32 = 96.;
 /// counts, lightened enough to read on the dark box.
 const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
 
+/// Where the transport is. The one answer the button's glyph, its label, its
+/// enablement, the play key and the repaint loop all read -- there is no play
+/// flag anywhere else, because a second one is a second answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    /// No timeline open. Nothing to play and the transport is dimmed.
+    Stopped,
+    Playing,
+    Paused,
+    /// Played out: the last frame is on screen, the decoder is finished, and the
+    /// clock is still running past it -- which is exactly why "is the clock
+    /// going" is not the same question as "is this playing".
+    Ended,
+}
+
+impl Transport {
+    /// The timeline is in motion: two bars on the button, and a repaint owed
+    /// every vsync.
+    fn is_playing(self) -> bool {
+        matches!(self, Transport::Playing)
+    }
+
+    /// The play key and the transport button start over from the top rather
+    /// than toggling -- the end of a timeline is where every NLE does this, and
+    /// the button does it because the key already did.
+    fn restarts(self) -> bool {
+        matches!(self, Transport::Ended)
+    }
+}
+
+/// What a session's own two answers mean: the clock, unless the timeline has
+/// been played out -- `played_out` is the engine's end of stream with no frame
+/// still waiting on the pump, and it wins, because past the end a running clock
+/// is measuring wall time and not a picture.
+fn transport(playing: bool, played_out: bool) -> Transport {
+    match (played_out, playing) {
+        (true, _) => Transport::Ended,
+        (_, true) => Transport::Playing,
+        (_, false) => Transport::Paused,
+    }
+}
+
 struct Player {
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
@@ -629,21 +712,20 @@ struct Player {
     name: SharedString,
     image: Option<Arc<RenderImage>>,
     /// A frame that arrived before its time; shown on the tick it comes due.
+    /// The pump's buffer, not transport state -- but a frame waiting here is
+    /// what keeps a finished decoder from reading as [`Transport::Ended`] one
+    /// tick early. See [`Player::transport`].
     held: Option<Frame>,
-    /// The decoder's channel closed. Frames may still be waiting in `held`.
-    eos: bool,
-    /// Last frame shown; nothing left to animate.
-    done: bool,
     /// A seek is waiting for its frame. Keeps the repaint loop alive while
     /// paused, which is the only way the new still ever reaches the screen.
     pending_seek: bool,
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
-    /// How much of the timeline the ruler and the lanes are showing. Held here
+    /// How wide a second of timeline is drawn, and from which moment. Held here
     /// and nowhere else: every frame-to-pixel answer in the panel comes out of
     /// it, so the boxes, the playhead and the pointer cannot disagree.
-    view: View,
+    scale: Scale,
     /// Which clip the edit keys act on: the lane it is in and its index there.
     /// The *clicked* half, not the group -- a group is what gets marked on
     /// screen, but Lift has to know which half it was aimed at. Indices move
@@ -889,6 +971,9 @@ impl Player {
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`.
     fn pump(&mut self, window: &mut Window) {
+        // Where the transport was before this drain, so the crossing into
+        // `Ended` can be recognised as the one transition it is.
+        let was = self.transport();
         // No timeline, nothing to catch up to: the window is showing its empty
         // state and there is no decoder to drain.
         let Some(session) = &mut self.session else {
@@ -904,10 +989,7 @@ impl Player {
                 // them apart -- `frame.index` is already a timeline index.
                 None => match session.try_frame() {
                     Some(frame) => frame,
-                    None => {
-                        self.eos = session.is_eos();
-                        break;
-                    }
+                    None => break,
                 },
             };
             if f64::from(frame.index) <= target {
@@ -942,29 +1024,56 @@ impl Player {
             }
         }
 
-        if self.eos && self.held.is_none() && !self.done {
-            self.done = true;
+        if self.transport() == Transport::Ended {
             // A seek whose worker never produced a frame (vanished file) would
-            // otherwise repaint at vsync forever.
+            // otherwise repaint at vsync forever. Held true for as long as the
+            // state does, not just on the crossing: nothing else is coming.
             self.pending_seek = false;
-            let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
-            eprintln!(
-                "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
-                self.displayed,
-                self.dropped,
-                session.now()
-            );
+            if was != Transport::Ended {
+                // Ended is a *stopped* transport, so the clock stops with it,
+                // on the out point the timecode and the playhead have been
+                // showing all along. Nothing else ever stopped it: past the
+                // last frame wall time takes over and `now()` walks off the end
+                // of the timeline for as long as the window is left open -- and
+                // the playhead is what a cut, a paste, an insert and the
+                // analyser all act at, so every one of them was aiming into
+                // empty space (measured: a 5 s timeline recognised its end at
+                // clock 17.5 s under a slow renderer). End of stream is left
+                // set, so this is still `Ended` and the next press restarts.
+                if let Some(session) = &mut self.session {
+                    session.halt_at_end();
+                }
+                let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                eprintln!(
+                    "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
+                    self.displayed,
+                    self.dropped,
+                    self.session.as_ref().map_or(0., PlaybackSession::now)
+                );
+            }
         }
     }
 
-    /// Every end-of-stream flag is app state and the engine knows nothing about
-    /// it, so clearing them after a reseek is what stops the picture from
-    /// staying frozen on the old last frame. Edits reseek inside the engine and
-    /// still owe this.
+    /// Where the transport is, asked of the session rather than remembered:
+    /// end of stream is the engine's own flag (any seek clears it, which is why
+    /// an edit past the end revives the picture) and so is the clock. A held
+    /// frame is one still owed to the screen, so the end is not the end yet.
+    fn transport(&self) -> Transport {
+        let Some(session) = &self.session else {
+            return Transport::Stopped;
+        };
+        transport(
+            session.is_playing(),
+            session.is_eos() && self.held.is_none(),
+        )
+    }
+
+    /// A frame owed to the screen after a reseek, and the buffered one dropped:
+    /// what stops the picture from staying frozen on the old last frame. The
+    /// end-of-stream flag itself is the engine's and its own seek clears it --
+    /// edits reseek inside the engine and still owe this.
     fn reset_after_reseek(&mut self) {
         self.held = None;
-        self.eos = false;
-        self.done = false;
         self.pending_seek = true;
         // An edit moves the indices a drag in flight is holding -- a stroke
         // during one is exactly that -- and an edge committed against a moved
@@ -1028,6 +1137,31 @@ impl Player {
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
         }
+    }
+
+    /// Whether the editor can be asked for `action` right now, and why not when
+    /// it cannot. `on` is the clip the question is about -- the one a clip menu
+    /// was opened on -- and `None` asks about the marked clip instead, which is
+    /// what a menu that hangs over no clip in particular means by "this one".
+    ///
+    /// The player's half of [`enable`]: it reads the state, the table decides.
+    fn enable(&self, action: ActionId, on: Option<(Lane, usize)>) -> Enable {
+        let Some(session) = &self.session else {
+            return enable(action, Ctx::default());
+        };
+        let clip = on
+            .or(self.selected)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
+        enable(
+            action,
+            Ctx {
+                clip,
+                playhead: frame_at(session.now(), self.fps),
+                timeline: true,
+                clipboard: self.clipboard.is_some(),
+                exporting: self.exporting().is_some(),
+            },
+        )
     }
 
     /// The one place a clip becomes *the* selected one: a click, a right-click
@@ -1133,23 +1267,37 @@ impl Player {
         cx.notify();
     }
 
-    /// Magnifies the timeline about a point that stays put: `anchor` is where
-    /// along the bed to hold still (a ctrl+wheel holds the pointer), and with
-    /// none it is the playhead -- so the frame being worked on is still the
+    /// The scale against the bed it is drawn on and the timeline it is drawn
+    /// from: every clamp, zoom and scroll is worked out through this, and the
+    /// bed is measured off the ruler's probe rather than remembered, so a
+    /// resized window is a resized view on the very next answer.
+    fn view(&self) -> View {
+        View {
+            scale: self.scale,
+            bed: f32::from(self.ruler.get().size.width),
+            duration: self.drawn_duration(),
+            fps: self.fps,
+        }
+    }
+
+    /// Magnifies the timeline about a point that stays put: `anchor` is how many
+    /// pixels along the bed to hold still (a ctrl+wheel holds the pointer), and
+    /// with none it is the playhead -- so the frame being worked on is still the
     /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
-    /// stops at the whole timeline, in at a handful of frames.
+    /// stops at [`ZOOM_MAX_SECONDS`] on the bed, in at a handful of frames.
     fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
-        let duration = self.drawn_duration();
-        let at = self.playhead(duration);
-        let anchor = anchor.unwrap_or_else(|| self.view.frac_at(at, duration).clamp(0., 1.));
-        self.view = self.view.zoomed(factor, anchor, duration, self.fps);
+        let view = self.view();
+        let at = self.playhead(view.duration);
+        let anchor = anchor.unwrap_or_else(|| self.scale.px_at(at).clamp(0., view.bed));
+        self.scale = view.zoomed(factor, anchor);
         cx.notify();
     }
 
-    /// All the way back out: the whole timeline across the bed, which is what
-    /// the panel shows before anyone has zoomed at all.
+    /// All the way back out: the whole timeline across the bed, and the one
+    /// thing that reads the timeline's own length to decide how wide a second
+    /// is drawn.
     fn zoom_fit(&mut self, cx: &mut Context<Self>) {
-        self.view = View::default();
+        self.scale = self.view().fit();
         cx.notify();
     }
 
@@ -1933,16 +2081,17 @@ impl Player {
     /// door a ruler click uses -- so a step while playing keeps playing, exactly
     /// as a click does. It starts from the frame the transport is showing, which
     /// past the end is the last one, and that is what lets a step back off EOS
-    /// revive the picture ([`Player::reset_after_reseek`] clears `done`). Both
+    /// revive the picture (the engine's seek leaves [`Transport::Ended`]). Both
     /// ends clamp, so the two go-to actions are this same step asked for more
     /// frames than the timeline has. Selection is untouched: a seek is not an
     /// edit, and nothing it does moves a clip index.
     fn step(&mut self, frames: i64, cx: &mut Context<Self>) {
+        let ended = self.transport() == Transport::Ended;
         let Some(session) = &self.session else {
             return;
         };
         let last = ((session.timeline_duration() * self.fps).round() as i64 - 1).max(0);
-        let now = match self.done {
+        let now = match ended {
             true => last,
             false => i64::from(frame_at(session.now(), self.fps)),
         };
@@ -2352,14 +2501,12 @@ impl Player {
     /// there is no such clip to move. The engine has the last word on where it
     /// may actually go -- this is the ask, not the answer.
     ///
-    /// ponytail: the bed ends where the timeline does, so a clip cannot be
-    /// dragged *past* the last frame -- the pointer has no pixel out there to
-    /// name and [`View::time_at`] clamps to the duration. Room to the right is
-    /// made by pulling a tail out first ([`Player::drawn_duration`] already
-    /// lengthens the bed for exactly that gesture). The upgrade is to draw the
-    /// bed past the end while a clip drag is in flight, the way a trim already
-    /// does: `drawn_duration` would take the dragged clip's length the same way
-    /// it takes a trim's reach.
+    /// ponytail: the bed now runs past the last frame whenever the timeline is
+    /// shorter than the view ([`Scale::time_at`] clamps at the head only), so a
+    /// clip *can* be dragged out there. Zoomed in against the far end it cannot:
+    /// the scroll clamp pins the bed's right edge to the duration, and the
+    /// pointer has no pixel past it. The upgrade is to let the scroll clamp
+    /// leave a screen of empty bed after the end, the way every NLE does.
     fn drop_frame(&self, from: Lane, idx: usize, to: Lane, x: Pixels) -> Option<u32> {
         let session = self.session.as_ref()?;
         let clip = session.lane_clips(from).get(idx).copied()?;
@@ -2382,16 +2529,11 @@ impl Player {
         Some(snapped(raw, clip.frames(), self.snap_frames(), &marks))
     }
 
-    /// [`SNAP_PX`] in timeline frames at the zoom the bed is drawn at: a snap is
-    /// a distance on screen, so zoomed right in it is worth less than a frame
-    /// (no snap at all, which is what a hand placing single frames wants) and
-    /// zoomed out to the whole timeline it is worth many.
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
+    /// own width drops out of it, since a pixel is now worth the same stretch of
+    /// timeline wherever the view sits.
     fn snap_frames(&self) -> u32 {
-        let bed = f64::from(f32::from(self.ruler.get().size.width));
-        if bed <= 0. {
-            return 0;
-        }
-        (SNAP_PX / bed * self.view.span(self.drawn_duration()) * self.fps) as u32
+        self.scale.snap_frames(self.fps)
     }
 
     /// Opens the clip menu on the box under the pointer, from the right button
@@ -2460,14 +2602,13 @@ impl Player {
     }
 
     /// The timeline frame a pointer at window x is on: along the same bed the
-    /// ruler is measured on, through the same [`View`] every box is drawn
+    /// ruler is measured on, through the same [`Scale`] every box is drawn
     /// through, so a zoomed-in panel answers with the frame under the pointer
     /// and not with the one that would have been there unzoomed. The one
     /// question a trim, a grab and a drop all ask.
     fn frame_under(&self, x: Pixels) -> u32 {
-        let duration = self.drawn_duration();
         frame_at(
-            self.view.time_at(frac_along(x, self.ruler.get()), duration),
+            self.scale.time_at(px_along(x, self.ruler.get())),
             self.fps,
         )
     }
@@ -2554,12 +2695,11 @@ impl Player {
         }
     }
 
-    /// Where the playhead is, as the panel draws it. The clock keeps running
-    /// after the last frame (wall time takes over at audio EOF) while the
-    /// picture is frozen, so what the UI shows is the clamped one, pinned to
-    /// the out-point once playback is done.
+    /// Where the playhead is, as the panel draws it: pinned to the out point
+    /// once playback is done, and clamped to the drawn duration otherwise -- a
+    /// tail being dragged draws past the timeline it is about to become.
     fn playhead(&self, duration: f64) -> f64 {
-        if self.done {
+        if self.transport() == Transport::Ended {
             duration
         } else {
             self.session
@@ -2754,11 +2894,11 @@ impl Player {
         self.export_path = PathBuf::new();
         self.project_path = PathBuf::new();
         self.fps = 30.;
-        // No decoder to wait for a frame from: the hint is what shows.
+        // No decoder to wait for a frame from: the hint is what shows. The
+        // transport reads `Stopped` from the session being gone, so there is no
+        // end-of-stream state left to clear here.
         self.reset_after_reseek();
         self.pending_seek = false;
-        self.eos = false;
-        self.done = false;
     }
 
     /// One item of a library row's menu, done. Every one of them closes the
@@ -3127,9 +3267,12 @@ impl Player {
         let Some(session) = &self.session else {
             return;
         };
+        // Clamped to the timeline here rather than in the mapping: there is bed
+        // past the last frame now, and a seek out there is a seek to the end.
         let t = self
-            .view
-            .time_at(frac_along(x, self.ruler.get()), session.timeline_duration());
+            .scale
+            .time_at(px_along(x, self.ruler.get()))
+            .clamp(0., session.timeline_duration());
         let target = (t * self.fps) as u32;
         if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
             self.last_target = target;
@@ -3174,11 +3317,11 @@ impl Player {
             return;
         }
         // Nothing to play is a message, not a transport state. An empty
-        // timeline is `done` from its one black frame onward, so the restart
-        // below would start a clock against a zero-length timeline -- and it is
-        // `done` again by the next repaint, so no later press could ever stop
-        // it: the button would read "Pause" and never pause. A delete can empty
-        // the timeline mid-play, and that press must still stop it.
+        // timeline is [`Transport::Ended`] from its one black frame onward, so
+        // the restart below would start a clock against a zero-length timeline
+        // -- and it is Ended again by the next repaint, so no later press could
+        // ever stop it: the button would read "Pause" and never pause. A delete
+        // can empty the timeline mid-play, and that press must still stop it.
         if nothing_to_play(self.session.as_ref()) {
             match self.session.as_mut().filter(|s| s.is_playing()) {
                 Some(session) => session.pause(),
@@ -3187,15 +3330,25 @@ impl Player {
             cx.notify();
             return;
         }
-        if self.done {
-            self.seek(0., cx);
-            if let Some(session) = &mut self.session {
-                session.play();
+        match self.transport() {
+            // Nothing open: the button is dimmed and the key says nothing.
+            Transport::Stopped => {}
+            // Back to the top and away, for the key and the button alike --
+            // whichever asked, the transport was showing Play.
+            state if state.restarts() => {
+                self.seek(0., cx);
+                if let Some(session) = &mut self.session {
+                    session.play();
+                }
             }
-        } else if let Some(session) = &mut self.session {
-            session.toggle();
-            // Past EOF nothing else asks for a repaint.
-            cx.notify();
+            _ => {
+                if let Some(session) = &mut self.session {
+                    session.toggle();
+                    // A paused timeline animates nothing; this is the repaint
+                    // that puts the new glyph up.
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -3412,11 +3565,9 @@ impl Render for Player {
             window.set_window_title(&title);
             self.titled = title;
         }
-        // No shadow flag: the clock is the only truth about play state.
-        let playing = self
-            .session
-            .as_ref()
-            .is_some_and(PlaybackSession::is_playing);
+        // No shadow flag: the session is the only truth about play state, and
+        // [`Player::transport`] is the one place it is read.
+        let state = self.transport();
         // A paused timeline has nothing to animate; the toggle handlers notify,
         // which is what starts the loop again. A paused seek keeps the loop
         // running by itself until `pump` has the frame it asked for. An export
@@ -3424,7 +3575,7 @@ impl Render for Player {
         // the screen on a repaint. A notice does not: it waits to be dismissed
         // rather than for a clock, so keeping the loop alive for it would spin
         // the GPU until someone answered it.
-        if (playing && !self.done) || self.pending_seek || self.export.is_some() {
+        if state.is_playing() || self.pending_seek || self.export.is_some() {
             window.request_animation_frame();
         }
 
@@ -3437,7 +3588,7 @@ impl Render for Player {
         // edit that shortens the timeline moves the far end of the view, and a
         // playhead that has run off the bed pulls the view after it -- which is
         // what makes a zoomed-in timeline scroll while it plays.
-        self.view = self.view.following(position, duration, self.fps);
+        self.scale = self.view().following(position);
 
         div()
             .track_focus(&self.focus)
@@ -3889,7 +4040,7 @@ impl Render for Player {
             // Above the panel and only when there is one to show, so it costs
             // the picture nothing the rest of the time.
             .children(self.notice_bar(cx))
-            .child(self.panel(position, duration, playing, cx))
+            .child(self.panel(position, duration, state, cx))
             // Over the panel it was opened on, and under the cards: it is only
             // ever up while neither of them is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
@@ -4210,21 +4361,22 @@ impl Player {
         &self,
         position: f64,
         duration: f64,
-        playing: bool,
+        state: Transport,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Where the playhead is *on the bed*, which at the fit is where along
-        // the timeline it is and zoomed in is where along the visible slice.
-        // Clamped because it is drawn as a width as well as an offset, and the
-        // view follows the playhead anyway, so it is never off the bed.
-        let filled = self.view.frac_at(position, duration).clamp(0., 1.);
+        // Where the playhead is *on the bed*, in pixels from its left edge.
+        // Clamped to the bed because it is drawn as a width as well as an
+        // offset, and the view follows the playhead anyway, so it is never off
+        // the bed for long.
+        let bed_w = f32::from(self.ruler.get().size.width);
+        let filled = self.scale.px_at(position).clamp(0., bed_w);
         // An export owns the hint slot and the ruler while it runs: the
         // percentage and the accent bar are the same number, so the playhead
         // fill doubles as the progress bar for free.
         let exporting = self.exporting().is_some();
         // Everything but Import and Keys needs a timeline to act on: with none
         // open they are dimmed rather than silently doing nothing.
-        let live = self.session.is_some() && !exporting;
+        let live = state != Transport::Stopped && !exporting;
         // The project's own picture size, for the button that cycles it: read
         // per render like everything else here, so a cycle shows on the button
         // that made it.
@@ -4240,7 +4392,7 @@ impl Player {
         // closure would hold it for as long as the iterator lives.
         let mut rows = Vec::new();
         for &lane in &lanes {
-            rows.push(self.lane_row(lane, duration, filled, cx));
+            rows.push(self.lane_row(lane, filled, cx));
         }
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
@@ -4270,7 +4422,7 @@ impl Player {
             // of this line is what a narrow window truncates.
             (
                 join_detail(
-                    &self.live_decode(position, playing),
+                    &self.live_decode(position, state.is_playing()),
                     &format!(
                         "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
                          import",
@@ -4309,9 +4461,9 @@ impl Player {
                     .overflow_x_scroll()
                     .child(control(
                         "transport",
-                        Some(transport_glyph(playing).into_any_element()),
-                        if playing { "Pause" } else { "Play" },
-                        if nothing_to_play(self.session.as_ref()) && !playing {
+                        Some(transport_glyph(state).into_any_element()),
+                        if state.is_playing() { "Pause" } else { "Play" },
+                        if nothing_to_play(self.session.as_ref()) && !state.is_playing() {
                             format!("{} — put a clip on a lane first", key(ActionId::Play))
                         } else {
                             key(ActionId::Play)
@@ -4321,7 +4473,7 @@ impl Player {
                         // against nothing (the key press answers with the
                         // notice). Still live while it *is* playing: a delete
                         // can empty the timeline mid-play and that has to stop.
-                        live && (playing || !nothing_to_play(self.session.as_ref())),
+                        live && (state.is_playing() || !nothing_to_play(self.session.as_ref())),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
                     ))
                     .child(separator())
@@ -4439,14 +4591,14 @@ impl Player {
                     // How much of the timeline the panel below is showing --
                     // beside the resolution, since neither of them edits
                     // anything: they are both what is being looked at. The
-                    // middle one reads as the state (1.0x is the whole
-                    // timeline) and is the way back to it.
+                    // middle one says how much of it is on the bed, and is the
+                    // way back to the whole of it.
                     .child(control(
                         "zoom-out",
                         None,
                         "−",
                         format!(
-                            "{} — show more of the timeline; stops at the whole of it",
+                            "{} — show more of the timeline; stops at four hours on the bed",
                             key(ActionId::ZoomOut)
                         ),
                         live,
@@ -4457,13 +4609,17 @@ impl Player {
                     .child(control(
                         "zoom-fit",
                         None,
-                        format!("{:.1}x", self.view.zoom),
+                        // How much timeline is on the bed, not a multiple of
+                        // "the whole of it": the scale no longer knows what the
+                        // whole of it is, and a number that changed on every
+                        // import was a number that lied.
+                        span_label(self.view().span()),
                         format!(
                             "{} — fit the whole timeline; showing {} to {}",
                             key(ActionId::ZoomFit),
-                            timecode(self.view.start, self.fps),
+                            timecode(self.scale.start, self.fps),
                             timecode(
-                                (self.view.start + self.view.span(duration)).min(duration),
+                                (self.scale.start + self.view().span()).min(duration),
                                 self.fps
                             )
                         ),
@@ -4531,8 +4687,10 @@ impl Player {
                     .child(control(
                         "keys",
                         None,
-                        "Keys",
-                        "show and change the keybindings".to_string(),
+                        "Actions",
+                        // The pointer's way to every action there is, including
+                        // the ones no button here has room for.
+                        "do any action, or change the key that does it".to_string(),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.keys_open = !this.keys_open;
@@ -4614,7 +4772,7 @@ impl Player {
                                     if dy == 0. {
                                         return;
                                     }
-                                    let anchor = frac_along(event.position.x, this.ruler.get());
+                                    let anchor = px_along(event.position.x, this.ruler.get());
                                     let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
                                     this.zoom(factor, Some(anchor), cx);
                                 },
@@ -4636,7 +4794,7 @@ impl Player {
                                     .child(
                                         div()
                                             .h_full()
-                                            .w(relative(filled))
+                                            .w(px(filled))
                                             .rounded(px(3.))
                                             .bg(rgb(ACCENT)),
                                     ),
@@ -4742,83 +4900,115 @@ impl Player {
             ctrl: false,
         }
         .pretty();
-        // Every stroke that works, under its heading, and both halves of the
-        // list come from the registry: one row per action -- an action with two
-        // strokes reads as one line ("x or delete") and a rebind replaces that
-        // whole set -- then the strokes the modal cards answer to, which are
-        // shown but not offered, because nothing may unbind the way out.
+        // Every action there is, under its heading, and the strokes the modal
+        // cards answer to beside them -- `keys_rows` is the whole of the order
+        // and every word in it comes off the registry.
+        //
+        // A row is two targets, not one: its label *does* the action, which is
+        // the pointer's way to the ones no button carries, and its stroke
+        // changes that stroke. An action with two strokes reads as one line
+        // ("x or delete") and a rebind replaces that whole set.
         let mut rows: Vec<AnyElement> = Vec::new();
-        for category in keymap::Category::ALL {
-            let actions = ActionId::ALL
-                .into_iter()
-                .enumerate()
-                .filter(|(_, a)| a.category() == category);
-            let fixed = keymap::FIXED.iter().filter(|f| f.category == category);
-            let mut headed = false;
-            let mut head = |rows: &mut Vec<AnyElement>| {
-                if !std::mem::replace(&mut headed, true) {
-                    rows.push(
-                        div()
-                            .flex_none()
-                            .px(px(6.))
-                            .pt(px(4.))
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(category.label())
-                            .into_any_element(),
-                    );
-                }
-            };
-            for (i, action) in actions {
-                head(&mut rows);
-                let capturing = self.rebinding == Some(action);
-                let out = out.clone();
-                rows.push(
-                    div()
-                        .id(("bind", i))
-                        .flex()
-                        // The floor, not the height: a row that needed two lines
-                        // would otherwise paint over the one under it.
-                        .min_h(px(KEYS_ROW_H))
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .px(px(6.))
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(HOVER)))
+        let row = || {
+            div()
+                .flex()
+                // The floor, not the height: a row that needed two lines
+                // would otherwise paint over the one under it.
+                .min_h(px(KEYS_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+        };
+        for (i, key_row) in keys_rows().into_iter().enumerate() {
+            rows.push(match key_row {
+                KeyRow::Head(category) => div()
+                    .flex_none()
+                    .px(px(6.))
+                    .pt(px(4.))
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_DIM))
+                    .child(category.label())
+                    .into_any_element(),
+                KeyRow::Act(action) => {
+                    let capturing = self.rebinding == Some(action);
+                    // Why the label half will not answer, if it will not: the
+                    // registry's one answer, the same the clip menu dims by.
+                    let refusal = self.enable(action, None);
+                    let out = out.clone();
+                    row()
                         .when(capturing, |d| d.bg(rgb(SELECTED)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.rebinding = Some(action);
-                            cx.notify();
-                        }))
-                        .child(action.label())
-                        .child(if capturing {
+                        .child(
                             div()
-                                .text_color(rgb(INK_DIM))
-                                .child(format!("press a key — {out} cancels"))
-                        } else {
-                            div().child(self.keymap.display(action))
-                        })
-                        .into_any_element(),
-                );
-            }
-            for f in fixed {
-                head(&mut rows);
-                rows.push(
-                    div()
-                        .flex()
-                        .min_h(px(KEYS_ROW_H))
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .px(px(6.))
+                                .id(("do", i))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .min_h(px(KEYS_ROW_H))
+                                .items_center()
+                                .child(action.label())
+                                // The reason rides on the label rather than in
+                                // the stroke column, which the rebind half
+                                // needs whatever the editor's state is: an
+                                // action nobody can ask for right now is still
+                                // one whose key may be changed.
+                                .when_some(refusal.why(), |d, why| {
+                                    let why: SharedString = why.into();
+                                    d.tooltip(move |_, cx| cx.new(|_| Tip(why.clone())).into())
+                                })
+                                .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
+                                .when(refusal.yes(), |d| {
+                                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))).on_click(
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            // The card goes first: several of
+                                            // these open a card of their own,
+                                            // and every edit moves the indices
+                                            // the menus are holding.
+                                            this.keys_open = false;
+                                            this.rebinding = None;
+                                            this.act(action, cx);
+                                            cx.notify();
+                                        }),
+                                    )
+                                }),
+                        )
+                        .child(
+                            // ponytail: the column is as wide as the stroke it
+                            // prints, so a one-character chord gives this half a
+                            // hit area under the 24px WCAG 2.5.8 floor -- tall
+                            // enough, narrow. Upgrade: a min_w of HIT_MIN here.
+                            div()
+                                .id(("bind", i))
+                                .flex_none()
+                                .flex()
+                                .min_h(px(KEYS_ROW_H))
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.rebinding = Some(action);
+                                    cx.notify();
+                                }))
+                                .child(if capturing {
+                                    div()
+                                        .text_color(rgb(INK_DIM))
+                                        .child(format!("press a key — {out} cancels"))
+                                } else {
+                                    div().child(self.keymap.display(action))
+                                }),
+                        )
+                        .into_any_element()
+                }
+                KeyRow::Fixed(f) => {
+                    let f = &keymap::FIXED[f];
+                    row()
                         .child(f.label)
                         // Dim, and no hover: this one is not a row you can click.
                         .child(div().text_color(rgb(INK_DIM)).child(f.chord))
-                        .into_any_element(),
-                );
-            }
+                        .into_any_element()
+                }
+            });
         }
         Some(
             div()
@@ -4845,7 +5035,7 @@ impl Player {
                         // Title and instruction are two children, never one
                         // wrapping line: a fixed-height slot whose text wrapped
                         // painted its second line over the first row.
-                        .child(div().flex_none().px(px(6.)).child("Keybindings"))
+                        .child(div().flex_none().px(px(6.)).child("Actions & keys"))
                         // One status line, under the title where the eye starts.
                         // A refusal takes it over -- it is the more urgent of the
                         // two, and the notice bar it would otherwise appear in is
@@ -4863,7 +5053,10 @@ impl Player {
                                 .child(
                                     self.notice
                                         .clone()
-                                        .unwrap_or_else(|| "click a row, then press a key".into()),
+                                        .unwrap_or_else(|| {
+                                            "click an action to do it · click its key to change it"
+                                                .into()
+                                        }),
                                 ),
                         )
                         // Capped and scrolling rather than as tall as the action
@@ -6402,7 +6595,6 @@ impl Player {
         let menu = self.context_menu?;
         let session = self.session.as_ref()?;
         let clip = *session.lane_clips(menu.lane).get(menu.idx)?;
-        let playhead = frame_at(session.now(), self.fps);
         let source = session.sources().get(clip.source).cloned()?;
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
         let row = |n: usize| {
@@ -6456,7 +6648,11 @@ impl Player {
             }
         } else {
             for action in MENU_ITEMS {
-                let enabled = applicable(&clip, menu.lane, action, playhead);
+                // The registry's own answer, the same one the actions card
+                // dims a row with -- and a row that takes no click says *why*
+                // rather than printing a stroke that would do nothing.
+                let refusal = self.enable(action, Some((menu.lane, menu.idx)));
+                let enabled = refusal.yes();
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
@@ -6468,11 +6664,20 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(
-                            div()
+                        .child(match refusal.why() {
+                            // One truncated line, like the details side: a
+                            // reason that wrapped would make the card taller
+                            // than the height `menu_at` placed it by.
+                            Some(why) => div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(why),
+                            None => div()
                                 .text_color(rgb(INK_DIM))
                                 .child(self.keymap.display(action)),
-                        )
+                        })
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
@@ -6591,21 +6796,18 @@ impl Player {
     fn lane_row(
         &self,
         lane: Lane,
-        duration: f64,
+        // Where the playhead is on the bed, in pixels: worked out once by the
+        // panel so the ruler's line and every lane's draw the same one.
         filled: f32,
         cx: &mut Context<Self>,
         // Borrows nothing it was given (`use<>`): the rows are built one after
         // another into a list, and a row still holding `cx` would be the only
         // one that could be built.
     ) -> impl IntoElement + use<> {
-        // The bed's own width, measured last repaint off the ruler's bar: the
-        // two are laid out identically (same header offset, same `flex_1`), so
-        // one probe answers for both. Zero before the first paint, which only
-        // costs the labels one frame.
-        let bed_w = f32::from(self.ruler.get().size.width);
-        // The slice being shown, copied out once: every box in the row is
-        // placed through it, so all of them move together when it does.
-        let view = self.view;
+        // The mapping, copied out once: every box in the row is placed through
+        // it, so all of them move together when it does. No bed width is needed
+        // to place them any more -- a second is so many pixels wherever it is.
+        let scale = self.scale;
         let clips = self
             .session
             .as_ref()
@@ -6789,7 +6991,7 @@ impl Player {
                                 .and_then(|s| sources.iter().position(|o| o.path == s.path))
                                 .unwrap_or(clip.source),
                         );
-                        let width = view.width_frac(len, duration);
+                        let width = scale.width_px(len);
                         let label = sources.get(clip.source).map(|s| file_name(&s.path));
                         let wave = sources
                             .get(clip.source)
@@ -6821,8 +7023,8 @@ impl Player {
                             // off the left edge: the bed clips what hangs out
                             // of it, so a half-visible clip is drawn as the
                             // half of itself that is on screen.
-                            .left(relative(view.frac_at(start, duration)))
-                            .w(relative(width))
+                            .left(px(scale.px_at(start)))
+                            .w(px(width))
                             .overflow_hidden()
                             .rounded(px(3.))
                             .border_1()
@@ -6965,7 +7167,7 @@ impl Player {
                                         .child(format!("{}", clip.speed)),
                                 )
                             })
-                            .when_some(label.filter(|_| show_label(bed_w * width)), |d, label| {
+                            .when_some(label.filter(|_| show_label(width)), |d, label| {
                                 d.child(
                                     div()
                                         .relative()
@@ -6991,12 +7193,8 @@ impl Player {
                                     .absolute()
                                     .top_0()
                                     .h_full()
-                                    .left(relative(
-                                        view.frac_at(f64::from(at) / self.fps, duration),
-                                    ))
-                                    .w(relative(
-                                        view.width_frac(f64::from(len) / self.fps, duration),
-                                    ))
+                                    .left(px(scale.px_at(f64::from(at) / self.fps)))
+                                    .w(px(scale.width_px(f64::from(len) / self.fps)))
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
@@ -7007,7 +7205,7 @@ impl Player {
                             .absolute()
                             .top_0()
                             .h_full()
-                            .left(relative(filled))
+                            .left(px(filled))
                             .w(px(1.))
                             .bg(rgb(ACCENT)),
                     ),
@@ -7248,42 +7446,132 @@ fn band_label(band: &Band) -> String {
     }
 }
 
-/// Whether the clip menu offers `action` on the clip it was opened on. Two of
-/// the items act on the *playhead* rather than on the clip, so a menu opened
-/// away from it dims them instead of looking broken when they are clicked, and
-/// one acts on sound, which only an audio lane's clip has.
-fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool {
-    match action {
-        // The equalizer filters samples, and a video clip has none of its own
-        // here: the sound is the audio lane's, clip for clip.
-        ActionId::Equalizer => lane.kind == LaneKind::Audio,
-        // A grade is a picture setting and an audio clip has no picture: the
-        // item is there on every clip, and dimmed where it would mean nothing.
-        // A fit policy is a picture setting for the same reason.
-        ActionId::Color | ActionId::Fit => lane.kind == LaneKind::Video,
-        // Splits this clip only from inside it: at either edge there is nothing
-        // to split off -- and, on a speeded clip, only at a frame its own rate
-        // can address, which is the same question `splittable` asks.
-        ActionId::Cut => {
-            clip.start < playhead
-                && playhead < clip.end()
-                && clip
-                    .speed
-                    .split_at(clip.len(), playhead - clip.start)
-                    .is_some()
+/// Whether an action can be asked for, and what to say when it cannot. Two
+/// kinds of no: `Hidden` is about the *kind* of thing the action was aimed at
+/// -- an audio clip has no picture, so a grade is not a thing that exists for
+/// it, whatever the editor does next -- and `No` is about the state of this
+/// moment, which the next click of the playhead can change. Both dim their row
+/// today; a menu that wants to leave the class refusals out and keep the state
+/// ones has only to match on which of the two it got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Enable {
+    Yes,
+    No(&'static str),
+    Hidden(&'static str),
+}
+
+impl Enable {
+    /// Whether the row takes a click.
+    fn yes(self) -> bool {
+        self == Enable::Yes
+    }
+
+    /// What the row says instead of its stroke, if it says anything.
+    fn why(self) -> Option<&'static str> {
+        match self {
+            Enable::Yes => None,
+            Enable::No(why) | Enable::Hidden(why) => Some(why),
         }
-        // A rate applies to a clip of either kind and to its whole group, so
-        // there is no lane it means nothing on -- `_ => true` below is its
-        // answer, and the engine words the one refusal there is (no room).
+    }
+}
+
+/// What an enablement question is asked *about*: the clip in question, if there
+/// is one, and the little of the editor's state the answers need. Handed in
+/// rather than read off the player, so [`enable`] is a pure function a test can
+/// ask about a clip without building a window.
+#[derive(Clone, Copy, Default)]
+struct Ctx {
+    /// The clip the question is about -- the one a menu was opened on, or the
+    /// marked one. `None` means the question is about the editor as a whole,
+    /// and the clip-relative answers stand aside: those actions find their own
+    /// clip under the playhead and word their own refusal.
+    clip: Option<(Clip, Lane)>,
+    playhead: u32,
+    /// A timeline is open.
+    timeline: bool,
+    /// Something has been copied.
+    clipboard: bool,
+    exporting: bool,
+}
+
+/// Whether `action` can be asked for, on `ctx`. One arm per action and nothing
+/// else in the editor asks the question: the clip menu dims a row with this,
+/// the actions card dims a row with this, and the two can never come to
+/// disagree about what an action needs -- exactly the reason [`Player::act`] is
+/// one table too.
+fn enable(action: ActionId, ctx: Ctx) -> Enable {
+    if !ctx.timeline {
+        return Enable::No("no timeline open");
+    }
+    // An export is reading the edit list every other action would change, which
+    // is the rule the key handler already follows.
+    if ctx.exporting {
+        return match action {
+            ActionId::CancelExport => Enable::Yes,
+            _ => Enable::No("an export is running"),
+        };
+    }
+    match action {
+        // -- class: what kind of thing the action is about. The equalizer
+        // filters samples, and a video clip has none of its own here: the sound
+        // is the audio lane's, clip for clip.
+        ActionId::Equalizer => match ctx.clip {
+            Some((_, lane)) if lane.kind != LaneKind::Audio => Enable::Hidden("this clip is picture"),
+            _ => Enable::Yes,
+        },
+        // A grade is a picture setting and an audio clip has no picture. A fit
+        // policy is a picture setting for the same reason.
+        ActionId::Color | ActionId::Fit => match ctx.clip {
+            Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
+            _ => Enable::Yes,
+        },
+        // -- state: true of this clip now, and the next playhead click or the
+        // next selection changes the answer. Splits this clip only from inside
+        // it: at either edge there is nothing to split off -- and, on a speeded
+        // clip, only at a frame its own rate can address, which is the same
+        // question `splittable` asks.
+        ActionId::Cut => match ctx.clip {
+            Some((clip, _))
+                if !(clip.start < ctx.playhead
+                    && ctx.playhead < clip.end()
+                    && clip
+                        .speed
+                        .split_at(clip.len(), ctx.playhead - clip.start)
+                        .is_some()) =>
+            {
+                Enable::No("only from inside a clip")
+            }
+            _ => Enable::Yes,
+        },
         // Rejoins whatever meets at the playhead, so it can mean something only
         // at an edge of this clip. Whether those two halves were ever one take
         // is the engine's question, and it words that refusal itself.
-        ActionId::Regroup => playhead == clip.start || playhead == clip.end(),
+        ActionId::Regroup => match ctx.clip {
+            Some((clip, _)) if ctx.playhead != clip.start && ctx.playhead != clip.end() => {
+                Enable::No("only where two clips meet")
+            }
+            _ => Enable::Yes,
+        },
         // Nothing to take apart in a clip that names no group at all. Whether
         // the group it names still has another half is the engine's question,
-        // like the regroup above, and it words that refusal itself.
-        ActionId::Detach => clip.link.is_some(),
-        _ => true,
+        // like the regroup above.
+        ActionId::Detach => match ctx.clip {
+            Some((clip, _)) if clip.link.is_none() => Enable::No("this clip is not grouped"),
+            _ => Enable::Yes,
+        },
+        // The three that act on the marked clip and on nothing else: with none
+        // marked they would silently do nothing, which is what the Delete
+        // button's own dimming has always said.
+        ActionId::Copy | ActionId::Delete | ActionId::Lift if ctx.clip.is_none() => {
+            Enable::No("click a clip first")
+        }
+        ActionId::Paste if !ctx.clipboard => Enable::No("nothing copied yet"),
+        ActionId::CancelExport => Enable::No("nothing is exporting"),
+        // A rate applies to a clip of either kind and to its whole group, so
+        // there is no lane it means nothing on, and the engine words the one
+        // refusal there is (no room). Everything else is the editor's own and
+        // needs nothing but a timeline.
+        _ => Enable::Yes,
     }
 }
 
@@ -8062,10 +8350,6 @@ fn panel_h(lanes: usize) -> f32 {
     PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
 }
 
-fn width_frac(len: f64, total: f64) -> f32 {
-    if total > 0. { (len / total) as f32 } else { 1. }
-}
-
 /// One press of a zoom key, or one notch of ctrl+wheel.
 const ZOOM_STEP: f32 = 1.25;
 
@@ -8074,118 +8358,222 @@ const ZOOM_STEP: f32 = 1.25;
 /// not an edit surface.
 const ZOOM_MIN_FRAMES: f64 = 8.;
 
-/// Which slice of the timeline the ruler and the lanes are showing: `zoom` is
-/// how many times the whole of it the bed is now worth, and `start` the moment
-/// at the bed's left edge. The one place frames become pixels -- every box, the
-/// playhead, a seek and a trim all go through it, so none of them can drift
-/// away from the others when the view moves.
+/// How much timeline the bed may be widened out to hold. The far stop, and the
+/// counterpart of [`ZOOM_MIN_FRAMES`]: both are measured against the bed, never
+/// against what is on the timeline, so neither moves when a clip is added.
+const ZOOM_MAX_SECONDS: f64 = 4. * 3600.;
+
+/// How wide a second of timeline is drawn before anyone zooms: a five second
+/// import is 200 px of a bed several times that, so a short clip reads as
+/// short -- the thing a bed scaled to the content's own length cannot say.
+/// [`View::fit`] is the one way back to "the whole timeline across the bed".
+const PPS_DEFAULT: f64 = 40.;
+
+/// What the zoom button says it is showing: how much timeline fits on the bed,
+/// in the coarsest unit that still tells two zooms apart.
+fn span_label(span: f64) -> String {
+    match span {
+        s if !s.is_finite() || s <= 0. => "—".to_string(),
+        s if s >= 600. => format!("{:.0}m", s / 60.),
+        s if s >= 60. => format!("{:.1}m", s / 60.),
+        s if s >= 10. => format!("{s:.0}s"),
+        s => format!("{s:.1}s"),
+    }
+}
+
+/// The mapping the whole panel is drawn and clicked through: `pps` pixels to a
+/// second of timeline, `start` the moment at the bed's left edge. Absolute --
+/// how wide a clip is drawn depends on how long the clip is and on nothing
+/// else, so adding a second clip does not redraw the first one narrower and
+/// zooming out always makes every box smaller.
 ///
-/// [`View::default`] is the whole timeline across the bed, which is what the
-/// panel drew before there was a zoom at all: at zoom 1 `start` is pinned to 0
-/// and every fraction here is the one [`width_frac`] and `start_frac` gave.
+/// The one place seconds become pixels: every box, the playhead, a seek and a
+/// trim all go through it, so none of them can drift away from the others when
+/// the view moves. What clamps it -- the stops, the scroll, the fit -- needs the
+/// bed it is drawn on and lives on [`View`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct View {
-    zoom: f32,
+struct Scale {
+    pps: f64,
     start: f64,
 }
 
-impl Default for View {
+impl Default for Scale {
     fn default() -> Self {
-        View {
-            zoom: 1.,
+        Scale {
+            pps: PPS_DEFAULT,
             start: 0.,
         }
     }
 }
 
+impl Scale {
+    /// Where a moment sits on the bed, in pixels from its left edge. Negative
+    /// for a moment scrolled off to the left, which is exactly the offset a
+    /// half-visible clip is drawn at.
+    fn px_at(self, at: f64) -> f32 {
+        ((at - self.start) * self.pps) as f32
+    }
+
+    /// How wide a stretch of `len` seconds is drawn. Wider than the bed once
+    /// zoomed in, which is the point of zooming in; never negative, which gpui
+    /// has no meaning for.
+    fn width_px(self, len: f64) -> f32 {
+        (len * self.pps).max(0.) as f32
+    }
+
+    /// The moment `x` pixels along the bed is pointing at: the inverse of
+    /// [`Scale::px_at`], and what every seek and every trim reads. Clamped at
+    /// the head of the timeline only -- there is bed past the last frame now,
+    /// and a tail dragged into it is a longer clip, not an error.
+    fn time_at(self, x: f32) -> f64 {
+        if self.pps > 0. {
+            (self.start + f64::from(x) / self.pps).max(0.)
+        } else {
+            self.start
+        }
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: a snap
+    /// is a distance on screen, so zoomed right in it is worth less than a frame
+    /// (no snap at all, which is what a hand placing single frames wants) and
+    /// zoomed out it is worth many.
+    fn snap_frames(self, fps: f64) -> u32 {
+        if self.pps > 0. {
+            (SNAP_PX / self.pps * fps) as u32
+        } else {
+            0
+        }
+    }
+}
+
+/// A [`Scale`] against the bed it is drawn on and the timeline it is drawn
+/// from. The bed's width is what turns a scale into "how much is on screen",
+/// and that is all the stops, the scroll clamp and the fit are made of.
+///
+/// Built per use out of [`Player::view`] and thrown away again -- the state is
+/// the `Scale`, and this is what a bed of `bed` px showing `duration` seconds
+/// at `fps` may do to it. So no call site can measure a moment against a bed or
+/// a duration that another one did not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct View {
+    scale: Scale,
+    bed: f32,
+    duration: f64,
+    fps: f64,
+}
+
 impl View {
     /// How much of the timeline is on the bed, in seconds.
-    fn span(self, duration: f64) -> f64 {
-        duration / f64::from(self.zoom)
-    }
-
-    /// The tightest this timeline may be zoomed: [`ZOOM_MIN_FRAMES`] across the
-    /// bed. Never under 1 -- a timeline shorter than that is already at its
-    /// floor, and a zoom that cannot fit the whole of it is not a zoom.
-    fn max_zoom(duration: f64, fps: f64) -> f32 {
-        let frames = duration * fps;
-        if frames > ZOOM_MIN_FRAMES {
-            (frames / ZOOM_MIN_FRAMES) as f32
-        } else {
-            1.
-        }
-    }
-
-    /// Where a moment sits along the bed, 0 at its left edge and 1 at its
-    /// right. Outside that range for a moment scrolled off the view, which is
-    /// exactly the negative offset a half-visible clip is drawn at.
-    fn frac_at(self, at: f64, duration: f64) -> f32 {
-        let span = self.span(duration);
-        if span > 0. {
-            ((at - self.start) / span) as f32
+    fn span(self) -> f64 {
+        if self.scale.pps > 0. {
+            f64::from(self.bed) / self.scale.pps
         } else {
             0.
         }
     }
 
-    /// How wide a stretch of `len` seconds is on the bed. More than the whole
-    /// bed once zoomed in, which is the point of zooming in.
-    fn width_frac(self, len: f64, duration: f64) -> f32 {
-        width_frac(len, self.span(duration))
+    /// The two stops, in pixels per second: [`ZOOM_MIN_FRAMES`] across the bed
+    /// is as tight as it goes, [`ZOOM_MAX_SECONDS`] across it as wide. `None`
+    /// on a bed that was never painted -- there is nothing to measure them
+    /// against yet, and a stop guessed off a zero width would throw away a zoom
+    /// the user asked for.
+    fn stops(self) -> Option<(f64, f64)> {
+        (self.bed > 0.).then(|| {
+            let bed = f64::from(self.bed);
+            let min = bed / ZOOM_MAX_SECONDS;
+            (min, (bed * self.fps / ZOOM_MIN_FRAMES).max(min))
+        })
     }
 
-    /// The moment a pointer at `frac` along the bed is pointing at: the inverse
-    /// of [`View::frac_at`], and what every seek and every trim reads.
-    fn time_at(self, frac: f32, duration: f64) -> f64 {
-        (self.start + f64::from(frac) * self.span(duration)).clamp(0., duration)
+    /// Clamped to the bed it draws on: between the two stops, and never
+    /// scrolled past either end of the timeline. Unlike the fractional view
+    /// this replaced, the *floor* is not the content -- a five second timeline
+    /// zooms out as far as an hour long one does.
+    fn settled(self) -> Scale {
+        let pps = match self.scale.pps.is_finite() && self.scale.pps > 0. {
+            true => self.scale.pps,
+            false => PPS_DEFAULT,
+        };
+        let start = match self.scale.start.is_finite() {
+            true => self.scale.start,
+            false => 0.,
+        };
+        let Some((min, max)) = self.stops() else {
+            return Scale {
+                pps,
+                start: start.max(0.),
+            };
+        };
+        let pps = pps.clamp(min, max);
+        let span = f64::from(self.bed) / pps;
+        Scale {
+            pps,
+            start: start.clamp(0., (self.duration - span).max(0.)),
+        }
     }
 
-    /// Zoomed by `factor` about `anchor` (0..1 along the bed): whatever moment
+    /// Zoomed by `factor` about `anchor` (pixels along the bed): whatever moment
     /// was under that point stays under it, so a zoom magnifies what was being
     /// looked at rather than throwing it off the edge.
-    fn zoomed(self, factor: f32, anchor: f32, duration: f64, fps: f64) -> Self {
-        let at = self.start + f64::from(anchor) * self.span(duration);
+    fn zoomed(self, factor: f32, anchor: f32) -> Scale {
+        let at = self.scale.time_at(anchor);
         // Clamped *before* the offset is worked out, not after: a press that
         // runs into either stop must still leave the anchor where it is, and a
-        // start measured against a zoom the stop then took away would slide it.
-        let zoom = (self.zoom * factor).clamp(1., Self::max_zoom(duration, fps));
-        let start = at - f64::from(anchor) * View { zoom, start: 0. }.span(duration);
-        View { zoom, start }.settled(duration, fps)
+        // start measured against a scale the stop then took away would slide it.
+        let raw = self.scale.pps * f64::from(factor);
+        let pps = match self.stops() {
+            Some((min, max)) => raw.clamp(min, max),
+            None => raw,
+        };
+        View {
+            scale: Scale {
+                pps,
+                start: at - f64::from(anchor) / pps,
+            },
+            ..self
+        }
+        .settled()
     }
 
-    /// Clamped to the timeline it draws: never wider than the whole of it (the
-    /// zoom-out floor is the fit), never tighter than [`View::max_zoom`], and
-    /// never scrolled past either end.
-    fn settled(self, duration: f64, fps: f64) -> Self {
-        let zoom = if self.zoom.is_finite() {
-            self.zoom.clamp(1., Self::max_zoom(duration, fps))
-        } else {
-            1.
+    /// The whole timeline across the bed. The one place the content's own
+    /// length sets the scale, and the only one -- everywhere else a second is a
+    /// second -- because this is a user pressing a key that asks for exactly
+    /// that.
+    fn fit(self) -> Scale {
+        let pps = match self.duration > 0. && self.bed > 0. {
+            true => f64::from(self.bed) / self.duration,
+            false => PPS_DEFAULT,
         };
-        let span = View { zoom, start: 0. }.span(duration);
-        let start = if self.start.is_finite() {
-            self.start.clamp(0., (duration - span).max(0.))
-        } else {
-            0.
-        };
-        View { zoom, start }
+        View {
+            scale: Scale { pps, start: 0. },
+            ..self
+        }
+        .settled()
     }
 
-    /// The view a playhead at `at` needs: the same one while it is on the bed,
+    /// The scale a playhead at `at` needs: the same one while it is on the bed,
     /// and one centred on it once it has run off -- which is how a zoomed-in
-    /// timeline scrolls, during playback and after a seek alike. At the fit
-    /// this can never fire, so an unzoomed panel is untouched by it.
-    fn following(self, at: f64, duration: f64, fps: f64) -> Self {
-        let view = self.settled(duration, fps);
-        let span = view.span(duration);
-        if at < view.start || at > view.start + span {
+    /// timeline scrolls, during playback and after a seek alike. With the whole
+    /// timeline on the bed this can never fire, so a panel showing all of it is
+    /// untouched by it.
+    fn following(self, at: f64) -> Scale {
+        // Nothing is drawn yet, so nothing has run off anything.
+        if self.bed <= 0. {
+            return self.scale;
+        }
+        let scale = self.settled();
+        let span = f64::from(self.bed) / scale.pps;
+        if at < scale.start || at > scale.start + span {
             View {
-                start: at - span / 2.,
-                ..view
+                scale: Scale {
+                    start: at - span / 2.,
+                    ..scale
+                },
+                ..self
             }
-            .settled(duration, fps)
+            .settled()
         } else {
-            view
+            scale
         }
     }
 }
@@ -8518,6 +8906,15 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     ((x - bounds.left()) / bounds.size.width).clamp(0., 1.)
 }
 
+/// Where along an element a click landed, in pixels from its own left edge:
+/// [`frac_along`] in the units the timeline is drawn in, since a [`Scale`]
+/// measures in pixels and not in shares of a bed. Clamped to the element -- a
+/// drag that slid off the end names its end -- and an element that was never
+/// painted reads as its start.
+fn px_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    f32::from(x - bounds.left()).clamp(0., f32::from(bounds.size.width).max(0.))
+}
+
 /// The frame a dropped clip's head lands on: `raw`, unless one of `marks` is
 /// within `tol` frames of where its head -- or its tail, `len` frames along --
 /// would come to rest, in which case that edge wins. The snap every timeline
@@ -8814,9 +9211,12 @@ fn empty_hint() -> impl IntoElement {
         )
 }
 
-/// Two bars while playing, a triangle while paused. Drawn, so there is no icon
-/// font and no glyph coverage to depend on.
-fn transport_glyph(playing: bool) -> impl IntoElement {
+/// Two bars while playing, a triangle in every other state -- paused, nothing
+/// open, and played out, where the button's next act is to start over rather
+/// than to stop something. Drawn, so there is no icon font and no glyph
+/// coverage to depend on.
+fn transport_glyph(state: Transport) -> impl IntoElement {
+    let playing = state.is_playing();
     div()
         .flex()
         .items_center()
@@ -8865,26 +9265,26 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
-        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
-        EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, FORMATS, Format, HEADER_GAP,
-        HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
-        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
-        LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
-        PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, VOLUME_W, Volume, WAVE_BPS,
-        WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
-        clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
-        estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
-        fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
-        keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
-        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, unseen_paths,
-        unseen_sources, whole_take, width_frac, window_title,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, Ctx,
+        EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE,
+        EQ_SPECTRUM_DB, EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, FORMATS,
+        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
+        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
+        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+        MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
+        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, band_label, bitrate_refusal,
+        can_add, cancels_export, clipboard_after_remove, color_snap, containers, enable, envelope,
+        eq_spectrum, eq_x, eq_y, estimated_mb, export_path, export_settings, format_key,
+        format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
+        is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at, next_container,
+        normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
+        show_label, silence_rate, snapped, source_tint, span_partner, speed_at, summary_head,
+        summary_tail, timecode, transport, unseen_paths, unseen_sources, whole_take, window_title,
     };
     use super::{
-        LaneKind, Repeat, View, ZOOM_MIN_FRAMES, ZOOM_STEP, file_name, file_uri, library_rows,
-        repeats, unscannable,
+        LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
+        file_name, file_uri, library_rows, px_along, repeats, span_label, unscannable,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -8909,7 +9309,7 @@ mod tests {
     use gpui::{Bounds, Pixels, point, px, size};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn asset(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -9196,43 +9596,126 @@ mod tests {
             speed: Speed::NORMAL,
         };
         assert_eq!(clip.end(), 90);
-        // Cut splits from inside only: neither edge has anything to split off.
         let a1 = Lane::A1;
         let v1 = Lane::V1;
-        assert!(applicable(&clip, v1, ActionId::Cut, 31));
-        assert!(applicable(&clip, v1, ActionId::Cut, 89));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 30));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 90));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 200));
+        // The question the clip menu asks: a timeline is open and the menu was
+        // opened on this clip, at this playhead.
+        let on = |clip: &Clip, lane, action, playhead| {
+            enable(
+                action,
+                Ctx {
+                    clip: Some((*clip, lane)),
+                    playhead,
+                    timeline: true,
+                    ..Ctx::default()
+                },
+            )
+        };
+        let offered = |clip: &Clip, lane, action, playhead| on(clip, lane, action, playhead).yes();
+        // Cut splits from inside only: neither edge has anything to split off.
+        assert!(offered(&clip, v1, ActionId::Cut, 31));
+        assert!(offered(&clip, v1, ActionId::Cut, 89));
+        assert!(!offered(&clip, v1, ActionId::Cut, 30));
+        assert!(!offered(&clip, v1, ActionId::Cut, 90));
+        assert!(!offered(&clip, v1, ActionId::Cut, 200));
         // Regroup is the other way round: only where this clip meets another.
-        assert!(applicable(&clip, v1, ActionId::Regroup, 30));
-        assert!(applicable(&clip, v1, ActionId::Regroup, 90));
-        assert!(!applicable(&clip, v1, ActionId::Regroup, 60));
+        assert!(offered(&clip, v1, ActionId::Regroup, 30));
+        assert!(offered(&clip, v1, ActionId::Regroup, 90));
+        assert!(!offered(&clip, v1, ActionId::Regroup, 60));
         // Detach is the clip's own business: nothing to take apart in one that
         // names no group, and whether the group still has another half is the
         // engine's question. Group is offered on every clip, for that reason.
-        assert!(!applicable(&clip, v1, ActionId::Detach, 0));
+        assert!(!offered(&clip, v1, ActionId::Detach, 0));
         let grouped = Clip {
             link: Some(3),
             ..clip
         };
-        assert!(applicable(&grouped, v1, ActionId::Detach, 60));
-        assert!(applicable(&clip, a1, ActionId::Group, 0));
+        assert!(offered(&grouped, v1, ActionId::Detach, 60));
+        assert!(offered(&clip, a1, ActionId::Group, 0));
         // The equalizer is the one item the *lane* decides: it filters samples,
         // and a video clip has none of its own. Never the playhead's business.
-        assert!(applicable(&clip, a1, ActionId::Equalizer, 0));
-        assert!(applicable(&clip, a1, ActionId::Equalizer, 60));
-        assert!(!applicable(&clip, v1, ActionId::Equalizer, 60));
+        assert!(offered(&clip, a1, ActionId::Equalizer, 0));
+        assert!(offered(&clip, a1, ActionId::Equalizer, 60));
+        assert!(!offered(&clip, v1, ActionId::Equalizer, 60));
         // The rest act on the clip that was clicked, so they always mean
         // something -- the engine words its own refusals.
         for action in [ActionId::Delete, ActionId::Lift, ActionId::ToggleMute] {
-            assert!(applicable(&clip, v1, action, 0));
-            assert!(applicable(&clip, a1, action, 60));
+            assert!(offered(&clip, v1, action, 0));
+            assert!(offered(&clip, a1, action, 60));
         }
         // Except the grade, which is a picture setting: offered on a video
         // clip wherever the playhead is, dimmed on a waveform.
-        assert!(applicable(&clip, v1, ActionId::Color, 0));
-        assert!(!applicable(&clip, a1, ActionId::Color, 60));
+        assert!(offered(&clip, v1, ActionId::Color, 0));
+        assert!(!offered(&clip, a1, ActionId::Color, 60));
+        // The two kinds of no, which is what the row can be told apart by: a
+        // grade on a waveform is a *class* answer -- an audio clip has no
+        // picture and never will, so a menu may leave the item out -- where a
+        // cut at the clip's edge is this moment's answer and the next click of
+        // the playhead changes it, so that one is dimmed and stays.
+        assert!(matches!(
+            on(&clip, a1, ActionId::Color, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(
+            on(&clip, a1, ActionId::Fit, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(
+            on(&clip, v1, ActionId::Equalizer, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(on(&clip, v1, ActionId::Cut, 30), Enable::No(_)));
+        assert!(matches!(on(&clip, v1, ActionId::Regroup, 60), Enable::No(_)));
+        assert!(matches!(on(&clip, v1, ActionId::Detach, 0), Enable::No(_)));
+        // Every refusal says something, and says it short enough to sit in the
+        // menu's right-hand column beside a label.
+        for action in MENU_ITEMS {
+            for lane in [v1, a1] {
+                for playhead in [0, 30, 60, 90] {
+                    if let Some(why) = on(&clip, lane, action, playhead).why() {
+                        assert!(!why.is_empty() && why.len() <= 30, "{action:?}: {why:?}");
+                    }
+                }
+            }
+        }
+        // The editor as a whole, which is how the actions card asks: with no
+        // timeline nothing is offered, an export leaves only its own cancel,
+        // and the three that act on the marked clip say so when none is.
+        let whole = |action, ctx| enable(action, ctx);
+        assert_eq!(
+            whole(ActionId::Play, Ctx::default()),
+            Enable::No("no timeline open")
+        );
+        let live = Ctx {
+            timeline: true,
+            ..Ctx::default()
+        };
+        assert!(whole(ActionId::Play, live).yes());
+        assert!(!whole(ActionId::Delete, live).yes());
+        assert!(!whole(ActionId::Paste, live).yes());
+        assert!(
+            whole(
+                ActionId::Paste,
+                Ctx {
+                    clipboard: true,
+                    ..live
+                }
+            )
+            .yes()
+        );
+        assert!(!whole(ActionId::CancelExport, live).yes());
+        let busy = Ctx {
+            exporting: true,
+            ..live
+        };
+        assert!(whole(ActionId::CancelExport, busy).yes());
+        for action in ActionId::ALL {
+            assert_eq!(
+                whole(action, busy).yes(),
+                action == ActionId::CancelExport,
+                "{action:?} while an export reads the edit list"
+            );
+        }
         // The playhead frame is the engine's own rule, boundary included.
         assert_eq!(frame_at(1.0, 30.), 30);
         assert_eq!(frame_at(0.0, 30.), 0);
@@ -9275,9 +9758,9 @@ mod tests {
 
     /// The other half of the keys menu's guarantee, and the audit this batch was
     /// asked for kept as a test: no action may be a stroke and nothing else.
-    /// Either the clip menu offers it, or a control in the panel does -- named
-    /// here by the id [`control`] is handed, read out of this file's own source
-    /// like `no_stroke_is_missing_from_the_keys_menu` reads the key handler.
+    /// The actions card answers it for all of them at once -- its rows come off
+    /// [`ActionId::ALL`], so a fortieth action is on it the moment it exists and
+    /// there is no hand-written list here to fall behind.
     #[test]
     fn every_action_is_reachable_without_the_keyboard() {
         use keymap::ActionId;
@@ -9286,48 +9769,22 @@ mod tests {
             .next()
             .unwrap();
         let element = |id: &str| source.contains(&format!("\"{id}\""));
+        let listed: Vec<ActionId> = keys_rows()
+            .iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
         for action in ActionId::ALL {
-            let by_pointer = MENU_ITEMS.contains(&action)
-                || match action {
-                    ActionId::Play => element("transport"),
-                    // One slot, two states: it starts an export and stops the
-                    // one it started.
-                    ActionId::Export | ActionId::CancelExport => element("export"),
-                    ActionId::Save => element("save"),
-                    ActionId::Undo => element("undo"),
-                    ActionId::Resolution => element("resolution"),
-                    // Three buttons beside it, and the ctrl+wheel on the bar.
-                    ActionId::ZoomIn => element("zoom-in"),
-                    ActionId::ZoomOut => element("zoom-out"),
-                    ActionId::ZoomFit => element("zoom-fit"),
-                    ActionId::AddVideoLane => element("add-video-lane"),
-                    ActionId::AddAudioLane => element("add-audio-lane"),
-                    // The × in a lane's own header, which takes any track and
-                    // not only the last one.
-                    ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
-                        source.contains("this.remove_lane(lane, cx)")
-                    }
-                    ActionId::ToggleMute => element("volume"),
-                    // The fader on every audio track's own header, which is
-                    // also what opens the card the limiter is on.
-                    ActionId::Mix => element("mix-lane"),
-                    ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
-                    // The ruler seeks anywhere the pointer points; the frame and
-                    // the second are the keyboard's finer grain of that move.
-                    ActionId::StepBack
-                    | ActionId::StepForward
-                    | ActionId::JumpBack
-                    | ActionId::JumpForward
-                    | ActionId::GoStart
-                    | ActionId::GoEnd => element("ruler"),
-                    // A press on a clip is the selection, group and all.
-                    ActionId::Select | ActionId::SelectNext | ActionId::SelectPrev => {
-                        source.contains("this.select((lane, i), cx)")
-                    }
-                    _ => false,
-                };
-            assert!(by_pointer, "{action:?} is reachable by keyboard only");
+            assert_eq!(
+                listed.iter().filter(|a| **a == action).count(),
+                1,
+                "{action:?} is reachable by keyboard only"
+            );
         }
+        // And the card is a door the pointer can open: the panel's own button.
+        assert!(element("keys"), "no way to open the actions card");
         // The card-local strokes have the same rule, and each of them is a thing
         // on its card: the graph and its two buttons, the colour bars and their
         // reset, the speed bar and its presets, and the silence card's rows --
@@ -9942,10 +10399,10 @@ mod tests {
         assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
     }
 
-    /// What a drop reads: the frame under the pointer, through the same view
+    /// What a drop reads: the frame under the pointer, through the same scale
     /// the boxes are drawn through. Zoomed in, the same pixel is a different
     /// frame -- which is the whole reason `Player::frame_under` goes through
-    /// [`View`] rather than through the duration alone.
+    /// [`Scale`] rather than through the duration alone.
     #[test]
     fn a_drop_reads_the_frame_under_the_pointer_at_every_zoom() {
         // A 200 px bed inset by the panel's padding, 10 seconds at 30 fps.
@@ -9953,29 +10410,32 @@ mod tests {
             origin: point(px(12.), px(400.)),
             size: size(px(200.), px(6.)),
         };
-        let (duration, fps) = (10., 30.);
+        let fps = 30.;
         // The frame a pointer at window `x` names, exactly as `frame_under`
         // composes it.
-        let under =
-            |view: View, x: f32| frame_at(view.time_at(frac_along(px(x), bed), duration), fps);
+        let under = |scale: Scale, x: f32| frame_at(scale.time_at(px_along(px(x), bed)), fps);
 
-        // The whole timeline across the bed: halfway along is frame 150.
-        let fit = View::default();
+        // The whole 10 s timeline across the 200 px bed: 20 px to the second,
+        // so halfway along is frame 150.
+        let fit = Scale {
+            pps: 20.,
+            start: 0.,
+        };
         assert_eq!(under(fit, 12.), 0);
         assert_eq!(under(fit, 112.), 150);
         assert_eq!(under(fit, 212.), 300);
 
         // Four times in, starting at second 5: the same middle pixel is now the
         // frame in the middle of seconds 5..7.5, and the left edge is not 0.
-        let zoomed = View {
-            zoom: 4.,
+        let zoomed = Scale {
+            pps: 80.,
             start: 5.,
         };
         assert_eq!(under(zoomed, 12.), 150);
         assert_eq!(under(zoomed, 112.), 187);
         assert_eq!(under(zoomed, 212.), 225);
-        // ...and a drop past either end of the bed lands on the timeline, never
-        // outside it: `time_at` clamps.
+        // ...and a pointer that slid off either end of the bed names an end of
+        // the bed, never a pixel outside it.
         assert_eq!(under(zoomed, 0.), 150);
         assert_eq!(under(fit, 9999.), 300);
     }
@@ -10140,50 +10600,63 @@ mod tests {
         }
     }
 
+    /// The bed the view tests are drawn on: 200 px at 30 fps, as the drop test
+    /// above uses.
+    const TEST_BED: f32 = 200.;
+
+    /// A scale against that bed and a timeline `duration` seconds long.
+    fn test_view(scale: Scale, duration: f64) -> View {
+        View {
+            scale,
+            bed: TEST_BED,
+            duration,
+            fps: 30.,
+        }
+    }
+
     /// The mapping the whole panel is drawn and clicked through: a moment goes
-    /// to a fraction of the bed and comes back the same moment, at every zoom.
-    /// The fit is the invariant that matters most -- it must be the arithmetic
-    /// the panel did before there was a zoom at all.
+    /// to a pixel on the bed and comes back the same moment, at every zoom.
     #[test]
     fn a_moment_and_the_place_it_is_drawn_are_the_same_at_every_zoom() {
         let duration = 20.;
-        // The fit: what `start_frac`/`width_frac` used to answer, exactly.
-        let fit = View::default();
+        // The fit, which is the only scale the content's own length picks: 20 s
+        // across a 200 px bed is 10 px to the second, and a 5 s clip is a
+        // quarter of the bed -- the answer the fractional view gave for it.
+        let fit = test_view(Scale::default(), duration).fit();
+        assert_eq!(fit.pps, 10.);
+        assert_eq!(fit.width_px(5.), TEST_BED * 0.25);
         for t in [0., 5., 12.5, 20.] {
-            assert_eq!(
-                fit.frac_at(t, duration),
-                (t / duration) as f32,
-                "fit at {t}"
-            );
+            assert_eq!(fit.px_at(t), (t / duration) as f32 * TEST_BED, "fit at {t}");
         }
-        assert_eq!(fit.width_frac(5., duration), width_frac(5., duration));
-        for view in [
+        for scale in [
             fit,
-            View {
-                zoom: 2.,
+            Scale {
+                pps: 20.,
                 start: 4.,
             },
-            View {
-                zoom: 8.,
+            Scale {
+                pps: 80.,
                 start: 12.5,
             },
-            View {
-                zoom: 37.5,
+            Scale {
+                pps: 375.,
                 start: 19.,
             },
         ] {
-            let view = view.settled(duration, 30.);
-            for frac in [0., 0.25, 0.5, 1.] {
-                let at = view.time_at(frac, duration);
+            let scale = test_view(scale, duration).settled();
+            for x in [0., 50., 100., TEST_BED] {
+                let at = scale.time_at(x);
                 assert!(
-                    (f64::from(view.frac_at(at, duration)) - f64::from(frac)).abs() < 1e-6,
-                    "{view:?} round trip at {frac}"
+                    (f64::from(scale.px_at(at)) - f64::from(x)).abs() < 1e-3,
+                    "{scale:?} round trip at {x}"
                 );
             }
-            // A stretch is as wide as the share of the visible slice it takes.
+            // A stretch as long as what is on the bed is as wide as the bed.
             assert!(
-                (f64::from(view.width_frac(view.span(duration), duration)) - 1.).abs() < 1e-6,
-                "{view:?} spans the bed"
+                (f64::from(scale.width_px(test_view(scale, duration).span())) - f64::from(TEST_BED))
+                    .abs()
+                    < 1e-3,
+                "{scale:?} spans the bed"
             );
         }
     }
@@ -10193,70 +10666,98 @@ mod tests {
     /// ctrl+wheel.
     #[test]
     fn a_zoom_leaves_the_anchor_where_it_was_on_screen() {
-        let (duration, fps) = (20., 30.);
-        let mut view = View::default();
-        for anchor in [0.5f32, 0.25, 0.9] {
+        let duration = 20.;
+        let mut scale = test_view(Scale::default(), duration).settled();
+        // The same three points along the bed the fractional view held: a half,
+        // a quarter and nine tenths of 200 px.
+        for anchor in [100f32, 50., 180.] {
             // Well past the zoom-in stop: the anchor holds at the clamp too,
             // which is where it used to slide (the clamp came after the offset).
             for _ in 0..30 {
-                let at = view.time_at(anchor, duration);
-                let zoomed = view.zoomed(ZOOM_STEP, anchor, duration, fps);
+                let at = scale.time_at(anchor);
+                let view = test_view(scale, duration);
+                let zoomed = view.zoomed(ZOOM_STEP, anchor);
                 // Only where the anchor is not pinned by an edge of the
                 // timeline: a view already against an end cannot slide further.
-                let pinned = zoomed.start <= 0. || zoomed.start + zoomed.span(duration) >= duration;
+                let span = test_view(zoomed, duration).span();
+                let pinned = zoomed.start <= 0. || zoomed.start + span >= duration;
                 if !pinned {
                     assert!(
-                        (f64::from(zoomed.frac_at(at, duration)) - f64::from(anchor)).abs() < 1e-6,
-                        "{at} moved: {view:?} -> {zoomed:?}"
+                        (f64::from(zoomed.px_at(at)) - f64::from(anchor)).abs() < 1e-3,
+                        "{at} moved: {scale:?} -> {zoomed:?}"
                     );
                 }
-                assert!(zoomed.zoom >= view.zoom, "and it did zoom in");
-                view = zoomed;
+                assert!(zoomed.pps >= scale.pps, "and it did zoom in");
+                scale = zoomed;
             }
         }
     }
 
-    /// Both stops: out is the whole timeline (which is where the panel starts,
-    /// so nothing regressed for anyone who never zooms), in is a handful of
-    /// frames -- and neither can scroll off an end.
+    /// Both stops, and the point of the whole mapping: neither is the content's
+    /// own length any more. Out is [`ZOOM_MAX_SECONDS`] across the bed, in is
+    /// [`ZOOM_MIN_FRAMES`] across it -- so a short import can be zoomed out of
+    /// and a long one zoomed into, and neither can scroll off an end.
     #[test]
-    fn zoom_stops_at_the_whole_timeline_and_at_a_handful_of_frames() {
+    fn zoom_stops_at_a_bedful_of_time_and_at_a_handful_of_frames() {
         let (duration, fps) = (20., 30.);
-        let mut view = View::default();
+        let mut scale = Scale::default();
         for _ in 0..200 {
-            view = view.zoomed(1. / ZOOM_STEP, 0.5, duration, fps);
+            scale = test_view(scale, duration).zoomed(1. / ZOOM_STEP, 100.);
         }
-        assert_eq!(view, View::default(), "zoomed out is the fit");
+        assert!(
+            (test_view(scale, duration).span() - ZOOM_MAX_SECONDS).abs() < 1e-6,
+            "widest is a bedful of hours, not the 20 s that happen to be on it"
+        );
         for _ in 0..200 {
-            view = view.zoomed(ZOOM_STEP, 0.5, duration, fps);
+            scale = test_view(scale, duration).zoomed(ZOOM_STEP, 100.);
         }
         assert_eq!(
-            (view.span(duration) * fps).round(),
+            (test_view(scale, duration).span() * fps).round(),
             ZOOM_MIN_FRAMES,
             "tightest is a handful of frames"
         );
         // Against the far end, the slice still ends at the last frame.
-        let end = View {
-            zoom: view.zoom,
-            start: 1e6,
-        }
-        .settled(duration, fps);
-        assert!((end.start + end.span(duration) - duration).abs() < 1e-9);
-        assert!(
-            View {
-                zoom: view.zoom,
-                start: -5.
-            }
-            .settled(duration, fps)
-            .start
-                == 0.
+        let end = test_view(
+            Scale {
+                start: 1e6,
+                ..scale
+            },
+            duration,
         );
-        // A timeline too short to zoom into, and one with no length at all,
-        // both stay at the fit rather than dividing by nothing.
-        assert_eq!(View::max_zoom(0.1, fps), 1.);
-        assert_eq!(View::default().settled(0., fps), View::default());
-        assert_eq!(View::default().frac_at(3., 0.), 0.);
-        assert_eq!(View::default().time_at(0.5, 0.), 0.);
+        let end = (end.settled(), end.span());
+        assert!((end.0.start + end.1 - duration).abs() < 1e-9);
+        assert_eq!(
+            test_view(
+                Scale {
+                    start: -5.,
+                    ..scale
+                },
+                duration
+            )
+            .settled()
+            .start,
+            0.
+        );
+        // The dead zone the fractional view had: a timeline of a handful of
+        // frames could not be zoomed at all, because its own length was the
+        // floor *and* the ceiling. Both keys work on it now.
+        let tiny = test_view(Scale::default(), 0.1);
+        assert!(tiny.zoomed(ZOOM_STEP, 100.).pps > PPS_DEFAULT);
+        assert!(tiny.zoomed(1. / ZOOM_STEP, 100.).pps < PPS_DEFAULT);
+        // A timeline with no length at all divides by nothing and scrolls
+        // nowhere; the fit of one keeps the scale it had.
+        let empty = test_view(Scale::default(), 0.);
+        assert_eq!(empty.settled(), Scale::default());
+        assert_eq!(empty.fit(), Scale::default());
+        assert_eq!(Scale::default().px_at(0.), 0.);
+        // A bed that was never painted clamps nothing -- there is nothing to
+        // clamp against, and a zoom must survive the frame before the probe.
+        let unpainted = View {
+            bed: 0.,
+            ..test_view(Scale { pps: 4e6, start: 3. }, duration)
+        };
+        assert_eq!(unpainted.settled().pps, 4e6);
+        assert_eq!(unpainted.following(19.), unpainted.scale);
     }
 
     /// What makes a zoomed timeline follow the playing head: off the bed at
@@ -10264,53 +10765,96 @@ mod tests {
     /// view that jumped every frame would be unreadable.
     #[test]
     fn the_view_follows_a_playhead_that_runs_off_the_bed() {
-        let (duration, fps) = (20., 30.);
-        let view = View {
-            zoom: 4.,
-            start: 5.,
-        }
-        .settled(duration, fps);
-        assert_eq!(view.span(duration), 5.);
+        let duration = 20.;
+        // 5 s on a 200 px bed: 40 px to the second, starting at second 5.
+        let view = test_view(
+            Scale {
+                pps: 40.,
+                start: 5.,
+            },
+            duration,
+        );
+        let scale = view.settled();
+        assert_eq!(view.span(), 5.);
         // Inside: untouched, whichever part of the slice it is in.
         for at in [5., 7.5, 10.] {
-            assert_eq!(
-                view.following(at, duration, fps),
-                view,
-                "{at} is on the bed"
-            );
+            assert_eq!(view.following(at), scale, "{at} is on the bed");
         }
         // Past the right edge, as playback does it: the head comes back on the
-        // bed, and the zoom is not changed by the scroll.
-        let moved = view.following(12., duration, fps);
-        assert_eq!(moved.zoom, view.zoom);
-        assert!(moved.start > view.start, "scrolled forward");
+        // bed, and the scale is not changed by the scroll.
+        let moved = view.following(12.);
+        assert_eq!(moved.pps, scale.pps);
+        assert!(moved.start > scale.start, "scrolled forward");
         assert!(
-            moved.frac_at(12., duration) > 0. && moved.frac_at(12., duration) < 1.,
+            moved.px_at(12.) > 0. && moved.px_at(12.) < TEST_BED,
             "and the playhead is on screen"
         );
         // A seek back behind the slice does the same the other way.
-        let back = view.following(1., duration, fps);
-        assert!(back.start < view.start);
-        assert!(back.frac_at(1., duration) >= 0.);
-        // At the fit there is nothing to follow: the whole timeline is on the
-        // bed already, so no playhead can move it.
+        let back = view.following(1.);
+        assert!(back.start < scale.start);
+        assert!(back.px_at(1.) >= 0.);
+        // With the whole timeline on the bed there is nothing to follow.
+        let whole = test_view(Scale::default(), duration);
+        let fit = whole.fit();
         for at in [0., 10., 20.] {
             assert_eq!(
-                View::default().following(at, duration, fps),
-                View::default(),
+                test_view(fit, duration).following(at),
+                fit,
                 "the fit never scrolls"
             );
         }
     }
 
+    /// The bug this mapping exists for: the first import used to fill the whole
+    /// track whatever it was, because the bed *was* the timeline -- so a 5 s
+    /// clip was 100% of the lane, zooming out did nothing, and adding a second
+    /// clip silently halved the first one's box.
     #[test]
-    fn clip_boxes_split_the_lane_by_duration() {
-        // 1 s + 3 s of a 4 s timeline: a quarter and three quarters.
-        assert_eq!(width_frac(1., 4.), 0.25);
-        assert_eq!(width_frac(3., 4.), 0.75);
-        assert_eq!(width_frac(4., 4.), 1.);
-        // A timeline with no length must not hand gpui a NaN width.
-        assert_eq!(width_frac(0., 0.), 1.);
+    fn a_clip_is_drawn_the_same_width_whatever_else_is_on_the_timeline() {
+        let bed = 900.;
+        let of = |duration: f64| View {
+            scale: Scale::default(),
+            bed,
+            duration,
+            fps: 30.,
+        };
+        // One 5 s import, then a second clip after it: 20 s of timeline where
+        // there were 5, and the first box has not moved or narrowed.
+        let (alone, joined) = (of(5.).settled(), of(20.).settled());
+        assert_eq!(alone, joined);
+        assert_eq!(alone.width_px(5.), joined.width_px(5.));
+        assert_eq!(joined.px_at(5.), alone.width_px(5.));
+        // And it does not fill the track: a short clip reads as short.
+        assert!(
+            alone.width_px(5.) < bed / 2.,
+            "5 s at {} px/s is {} px of a {bed} px bed",
+            alone.pps,
+            alone.width_px(5.)
+        );
+        // Zooming out visibly shrinks it, however short the timeline is -- the
+        // press that used to be a no-op.
+        let out = of(5.).zoomed(1. / ZOOM_STEP, 0.);
+        assert!(
+            out.width_px(5.) < alone.width_px(5.),
+            "{} px is not smaller than {} px",
+            out.width_px(5.),
+            alone.width_px(5.)
+        );
+        // The way back to "the whole timeline across the bed" is still one key.
+        assert_eq!(of(5.).fit().width_px(5.), bed);
+    }
+
+    /// What the zoom button says: how much timeline is on the bed, in a unit
+    /// that tells two zooms apart.
+    #[test]
+    fn the_zoom_button_says_how_much_is_on_the_bed() {
+        assert_eq!(span_label(4.5), "4.5s");
+        assert_eq!(span_label(22.5), "22s");
+        assert_eq!(span_label(90.), "1.5m");
+        assert_eq!(span_label(3600.), "60m");
+        // Before the first paint there is no bed and so no answer to give.
+        assert_eq!(span_label(0.), "—");
+        assert_eq!(span_label(f64::NAN), "—");
     }
 
     #[test]
@@ -10344,6 +10888,65 @@ mod tests {
         for key in ["c", "x", "space", "escape", "delete", "f1", "z"] {
             assert!(!is_bare_modifier(key), "{key}");
         }
+    }
+
+    /// The whole point of the card: there is no action a pointer cannot reach.
+    /// It renders [`keys_rows`] and nothing else, so this reads the same list
+    /// the card does -- add an `ActionId` and forget to surface it and this
+    /// fails, which is the only way that stays true as the editor grows.
+    #[test]
+    fn every_action_is_on_the_actions_card() {
+        use keymap::{ActionId, Category, Keymap};
+        let rows = keys_rows();
+        let listed: Vec<ActionId> = rows
+            .iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        for action in ActionId::ALL {
+            assert_eq!(
+                listed.iter().filter(|a| **a == action).count(),
+                1,
+                "{action:?} is not on the card exactly once"
+            );
+        }
+        assert_eq!(listed.len(), ActionId::ALL.len());
+        // Under its own heading, in the registry's order: every row after a
+        // heading belongs to that heading until the next one.
+        let mut heading = None;
+        let mut heads = 0;
+        for row in &rows {
+            match row {
+                KeyRow::Head(category) => {
+                    heading = Some(*category);
+                    heads += 1;
+                }
+                KeyRow::Act(action) => assert_eq!(Some(action.category()), heading, "{action:?}"),
+                KeyRow::Fixed(i) => assert_eq!(Some(keymap::FIXED[*i].category), heading),
+            }
+        }
+        assert_eq!(heads, Category::ALL.len(), "a heading per category");
+        // The card-local strokes are still all there beside them.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, KeyRow::Fixed(_)))
+                .count(),
+            keymap::FIXED.len()
+        );
+        // Both columns say something: the label does the action, the stroke
+        // beside it changes that stroke, and neither may read blank.
+        let keymap = Keymap::defaults();
+        for action in ActionId::ALL {
+            assert!(!action.label().is_empty(), "{action:?}");
+            assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
+        // The list scrolls inside a card the smallest window holds, so a
+        // thirty-fourth action costs no height at all.
+        assert!(rows.len() as f32 * KEYS_ROW_H > KEYS_ROWS_H, "no cap needed?");
+        // Both halves of a row are click targets, so WCAG 2.5.8 binds them.
+        assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
     #[test]
@@ -10761,6 +11364,95 @@ mod tests {
         // Unmute returns to the level, including the step taken while silent.
         volume.muted = false;
         assert_eq!(volume.gain(), 0.75);
+    }
+
+    /// The whole transport in one place: the clock keeps running past the last
+    /// frame (wall time takes over at audio EOF), so "the clock is going" is
+    /// not "this is playing" -- and a button that read the clock showed Pause
+    /// on a timeline that had stopped moving. Ended is its own state, it draws
+    /// Play, and the next press starts over from the top.
+    #[test]
+    fn a_played_out_timeline_is_not_playing_and_the_next_press_starts_it_over() {
+        assert_eq!(transport(true, false), Transport::Playing);
+        assert_eq!(transport(false, false), Transport::Paused);
+        // The transition the bug was about: the clock is still running and the
+        // decoder is finished. Played out wins, however the clock reads.
+        assert_eq!(transport(true, true), Transport::Ended);
+        assert_eq!(transport(false, true), Transport::Ended);
+
+        // What the button draws, in each state. Two bars only while it moves.
+        assert!(Transport::Playing.is_playing());
+        for state in [Transport::Paused, Transport::Ended, Transport::Stopped] {
+            assert!(!state.is_playing(), "{state:?} must draw the Play triangle");
+        }
+
+        // And what a press does: start over at the end, plain toggle before it,
+        // nothing with no timeline. Same answer for the key and the button --
+        // both come through `Player::toggle_or_restart`.
+        assert!(Transport::Ended.restarts());
+        for state in [Transport::Playing, Transport::Paused, Transport::Stopped] {
+            assert!(!state.restarts(), "{state:?} must toggle, not reseek");
+        }
+    }
+
+    /// The half of `Ended` the eye cannot see: the clock. Wall time takes over
+    /// at the last frame and nothing used to stop it, so the playhead walked off
+    /// the end of the timeline in real time -- and the playhead is what a cut, a
+    /// paste, an insert and the analyser all act at. `pump` pauses on the
+    /// crossing; this is the engine contract that rests on, driven exactly as
+    /// the pump drives it.
+    #[test]
+    fn the_clock_stops_where_the_timeline_does_and_the_end_still_restarts() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Start a breath short of the end: the tail is what this is about, and
+        // playing the whole five seconds would say nothing more.
+        session.seek(4.8);
+        session.play();
+
+        // The pump's own loop -- tick, drain, ask where the transport is --
+        // with a deadline so a fixture that will not decode fails as a failure
+        // rather than as a hang.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut state = transport(session.is_playing(), session.is_eos());
+        while state != Transport::Ended {
+            assert!(Instant::now() < deadline, "never reached the end of a 5s file");
+            session.tick();
+            while session.try_frame().is_some() {}
+            state = transport(session.is_playing(), session.is_eos());
+        }
+
+        // What `pump` does on the crossing, and the whole point of it: the
+        // position holds still afterwards instead of counting on past the end,
+        // and it holds still *on the out point* -- where the timecode and the
+        // playhead have been showing it. The clock at the moment the end is
+        // recognised is not that: a slow renderer reaches EOF with the clock
+        // seconds past the timeline, which is why this repositions rather than
+        // only freezing.
+        session.halt_at_end();
+        let stopped_at = session.now();
+        assert_eq!(stopped_at, session.timeline_duration());
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(session.now(), stopped_at, "the clock kept running past EOF");
+        // And it is still the end: pausing must not spend the state the glyph
+        // and the restart both read.
+        assert!(session.is_eos());
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Ended
+        );
+
+        // The restart path off that frozen end, which is what the button and
+        // the play key do from `Ended`: back to the top, and running.
+        session.seek(0.);
+        session.play();
+        assert!(!session.is_eos(), "a seek revives the session");
+        assert!(session.now() < 1.0);
+        assert_eq!(
+            transport(session.is_playing(), session.is_eos()),
+            Transport::Playing
+        );
+        session.pause();
     }
 
     /// Both ends hold under a key held down: the ABI only accepts `0.0..=1.0`,
@@ -11358,10 +12050,11 @@ mod tests {
         assert!(show_label(LABEL_MIN_W));
         assert!(show_label(400.));
         assert!(!show_label(LABEL_MIN_W - 0.1));
-        // A timeline with no length must not put a box outside its lane.
-        let fit = View::default();
-        assert_eq!(fit.frac_at(3., 0.), 0.);
-        assert_eq!(fit.frac_at(1., 4.), 0.25);
+        // The label test is the box's own width in pixels now, which is what
+        // the scale hands it -- no bed width, and so nothing to be zero.
+        let scale = Scale::default();
+        assert!(show_label(scale.width_px(LABEL_MIN_W as f64 / PPS_DEFAULT)));
+        assert!(!show_label(scale.width_px(0.)));
     }
 
     #[test]
@@ -11726,12 +12419,11 @@ fn main() {
                     name: name.clone(),
                     image: None,
                     held: None,
-                    eos: false,
-                    done: false,
                     ruler: Rc::default(),
-                    // The whole timeline across the bed, which is where a
-                    // project opens: zooming is something the user asks for.
-                    view: View::default(),
+                    // A second is [`PPS_DEFAULT`] pixels wide until someone
+                    // zooms or asks for the fit: a project opens at a scale, not
+                    // at whatever its first import happens to be long.
+                    scale: Scale::default(),
                     selected: None,
                     context_menu: None,
                     library_menu: None,

@@ -103,16 +103,26 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
 # at all, so AV1 is read out of an mkv (`demux::MkvDemuxer`). Same A/V shape as
 # the others so the tests measure the codec and nothing else -- but `-g 30` is
 # not a preference: it puts a second keyframe at frame 30, which is what the
-# sync index and the seek test are checked against. 8-bit Main profile, because
-# the plugin's NV12 read-back cannot carry 10-bit. Its AAC track is deliberate
-# too: Matroska audio is not wired to the decoder yet, and the notice that says
-# so needs a track to name.
+# sync index and the seek test are checked against. 8-bit Main profile here; the
+# 10-bit twin is below. Its AAC track is deliberate too: it is the AAC a Matroska
+# file's sound is read out of through symphonia, beside the AC-3 fixtures further
+# down that no symphonia version decodes.
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -f lavfi -i "sine=frequency=880:duration=2" \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# ...and the same file 10-bit, which is what an `av1C` with `high_bitdepth` set
+# reads as and what the P010 surface pool is picked by -- the AV1 seat of the
+# pair test_hevc.mkv/test_hevc10.mkv already make for HEVC. libaom rather than
+# SVT-AV1 because it is the encoder that writes a 10-bit `av1C` here.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libaom-av1 -cpu-used 8 -row-mt 1 -g 30 -pix_fmt yuv420p10le \
+    -c:a aac -b:a 128k assets/test_av1_10.mkv
 # H.264 in Matroska: the same stream the mp4 fixtures carry, in the container
 # that used to refuse it. Baseline profile so `rusty_h264` reads it with nothing
 # installed, `-g 30` for the second keyframe the sync index is checked against,
@@ -167,6 +177,24 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a][3:a][4:a][5:a][6:a]join=inputs=6:channel_layout=5.1[a]" \
     -map 0:v -map "[a]" -c:v libx265 -x265-params log-level=error -g 30 -pix_fmt yuv420p10le \
     -c:a aac -b:a 384k assets/test_hevc10.mkv
+# Matroska sound: the two Dolby codecs that arrive in one and are read straight
+# out of its blocks (`demux::MkvAudio`). Stereo AC-3 for the plain syntax and
+# **5.1 E-AC-3** for Annex E -- the shape a remux has, and the one that must
+# come down to stereo through the same A/52 7.8 downmix the mp4 path uses.
+# 48 kHz both, which is the only rate E-AC-3 is written at in practice. Small
+# H.264 picture on purpose: these two are about the sound, and the software
+# decoder reads that one, so an audio test needs no VA-API plugin to open a
+# session on them.
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=2:sample_rate=48000" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
+    -c:a ac3 -b:a 192k assets/test_ac3.mkv
+ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
+    -ac 6 -c:a eac3 -b:a 384k assets/test_eac3.mkv
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.

@@ -1788,6 +1788,25 @@ impl PlaybackSession {
         }
     }
 
+    /// Stops the transport where the timeline stops: the clock is paused and put
+    /// on the out point.
+    ///
+    /// Playing past the last frame is wall time counting on past the end of the
+    /// media -- there is no picture left to pace it -- so a session left at EOF
+    /// reports a `now()` that walks off the end of the timeline in real time,
+    /// and a caller that reads the playhead (a cut, a paste, an insert) then
+    /// acts at a position no clip is at. How far off depends only on how long
+    /// the window was left open, so no clamp in a caller is worth writing.
+    ///
+    /// End of stream is deliberately left set: the picture is still the last
+    /// frame and this is still the end. That is what makes it safe to call on
+    /// the crossing into it -- the state the transport shows does not change,
+    /// only the running clock stops.
+    pub fn halt_at_end(&mut self) {
+        self.pause();
+        self.clock.seek_to(self.timeline_duration());
+    }
+
     /// Sets the monitoring gain, 0.0 (silent) to 1.0. Mute is a gain of 0.0:
     /// one knob, because muting and turning it down are the same thing to the
     /// device, and *which* the user meant is a question only the UI can answer
