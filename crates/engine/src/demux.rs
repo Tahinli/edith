@@ -1138,6 +1138,216 @@ fn tkhd_track_id(payload: &[u8]) -> Option<u32> {
     ))
 }
 
+/// One subtitle track of a Matroska file, exactly as its `TrackEntry` declares
+/// it. What the cues *mean* is [`crate::subtitle`]'s business; this is the
+/// walk, and it reads every track type 0x11 the file has -- including the ones
+/// nothing here can render, which is how a caller names what it is leaving out
+/// instead of quietly opening a film with no subtitles in the list.
+#[derive(Debug)]
+pub struct MkvSubtitle {
+    pub number: u64,
+    /// The Matroska codec id: `S_TEXT/UTF8`, `S_TEXT/ASS`, `S_HDMV/PGS`, ...
+    pub codec: String,
+    /// `Language`, ISO-639-2, `und` when the file says nothing.
+    pub language: String,
+    /// `Name`, the human label a muxer wrote, often empty.
+    pub name: String,
+    /// `CodecPrivate`: the ASS script header (`[Script Info]` through the
+    /// `[Events]` `Format:` line) for `S_TEXT/ASS`, empty for `S_TEXT/UTF8`.
+    pub private: Vec<u8>,
+    /// Every cue block, in storage order -- but only for the `S_TEXT/*` codecs.
+    /// A bitmap track (PGS, VobSub) comes back declared and empty: its blocks
+    /// are megabytes of pictures, and nothing here can draw one.
+    pub cues: Vec<MkvCue>,
+}
+
+/// One subtitle block: when it shows and the bytes it shows.
+#[derive(Debug)]
+pub struct MkvCue {
+    /// Microseconds from the start of the file -- the block timestamp scaled by
+    /// the segment's `TimestampScale`, which is the unit
+    /// [`crate::subtitle::Cue`] keeps.
+    pub start_us: i64,
+    /// `BlockDuration`, microseconds. `None` for a block that declares none,
+    /// which leaves how long the cue stays up to the caller.
+    pub duration_us: Option<i64>,
+    /// The block's own bytes: the text for `S_TEXT/UTF8`, the comma-separated
+    /// `Dialogue` fields (`ReadOrder` first, no timing) for `S_TEXT/ASS`.
+    pub payload: Vec<u8>,
+}
+
+/// The subtitle tracks of a Matroska file, in file order. An mp4's are not read
+/// (its `tx3g` is a different beast, and no file this project opens carries
+/// one); anything that is not a Matroska file at all is an error, as it is for
+/// [`matroska_audio_codec`].
+///
+/// Two passes at most: the header walk stops at the first `Cluster`, and the
+/// cue pass runs only when there is a text track to fill.
+pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
+    let mut file = File::open(path)?;
+    let end = file.metadata()?.len();
+    let segment = mkv_segment(&mut file, end)?;
+    let mut tracks: Vec<MkvSubtitle> = Vec::new();
+    let mut timestamp_scale = 1_000_000;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(&mut file, at, segment.1)? {
+        match id {
+            CLUSTER => break,
+            INFO => {
+                let mut at = body;
+                while let Some(e) = ebml_element(&mut file, at, stop)? {
+                    if e.0 == TIMESTAMP_SCALE {
+                        timestamp_scale = ebml_uint(&mut file, e.1, e.2)?.max(1);
+                    }
+                    at = e.2;
+                }
+            }
+            TRACKS => {
+                let mut at = body;
+                while let Some(e) = ebml_element(&mut file, at, stop)? {
+                    if e.0 == TRACK_ENTRY {
+                        tracks.extend(mkv_subtitle_entry(&mut file, e.1, e.2)?);
+                    }
+                    at = e.2;
+                }
+            }
+            _ => {}
+        }
+        at = stop;
+    }
+    // The text tracks only: see `MkvSubtitle::cues`.
+    let wanted: Vec<u64> = tracks
+        .iter()
+        .filter(|t| t.codec.starts_with("S_TEXT"))
+        .map(|t| t.number)
+        .collect();
+    if !wanted.is_empty() {
+        mkv_subtitle_blocks(&mut file, segment, timestamp_scale, &wanted, &mut tracks)?;
+    }
+    Ok(tracks)
+}
+
+/// One `TrackEntry`, `Some` only for track type 0x11 -- the subtitles.
+fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Option<MkvSubtitle>> {
+    const TRACK_LANGUAGE: u32 = 0x22B59C;
+    const TRACK_NAME: u32 = 0x536E;
+    const SUBTITLE: u64 = 0x11;
+    let (mut number, mut kind, mut codec) = (0, 0, String::new());
+    let (mut language, mut name, mut private) = (String::new(), String::new(), Vec::new());
+    let mut at = body;
+    while let Some((id, body, stop)) = ebml_element(file, at, end)? {
+        match id {
+            TRACK_NUMBER => number = ebml_uint(file, body, stop)?,
+            TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
+            CODEC_ID => codec = string_of(file, body, stop)?,
+            CODEC_PRIVATE => private = ebml_bytes(file, body, stop)?,
+            TRACK_LANGUAGE => language = string_of(file, body, stop)?,
+            TRACK_NAME => name = string_of(file, body, stop)?,
+            _ => {}
+        }
+        at = stop;
+    }
+    Ok((kind == SUBTITLE).then(|| MkvSubtitle {
+        number,
+        codec,
+        // What a `TrackEntry` without a `Language` element means, by spec.
+        language: if language.is_empty() {
+            "und".into()
+        } else {
+            language
+        },
+        name,
+        private,
+        cues: Vec::new(),
+    }))
+}
+
+/// Every block of the `wanted` tracks, appended to their entries in `tracks`.
+///
+/// A second cluster walk rather than a widening of [`mkv_blocks`]: that one
+/// indexes *one* video track and reads no payloads, and a subtitle needs every
+/// track at once, the bytes, and the `BlockDuration` beside them.
+fn mkv_subtitle_blocks(
+    file: &mut File,
+    segment: (u64, u64),
+    timestamp_scale: u64,
+    wanted: &[u64],
+    tracks: &mut [MkvSubtitle],
+) -> crate::Result<()> {
+    const BLOCK_DURATION: u32 = 0x9B;
+    // Ticks to microseconds, the unit `MkvCue` keeps. `TimestampScale` is
+    // nanoseconds per tick and is a millisecond in every file anything writes.
+    let us = |ticks: i64| ticks * timestamp_scale as i64 / 1_000;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        at = stop;
+        if id != CLUSTER {
+            continue;
+        }
+        let mut cluster_ts = 0i64;
+        let mut child = body;
+        while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
+            child = stop;
+            let (block, duration) = match id {
+                CLUSTER_TIMESTAMP => {
+                    cluster_ts = ebml_uint(file, body, stop)? as i64;
+                    continue;
+                }
+                SIMPLE_BLOCK => (mkv_block(file, body, stop)?, None),
+                BLOCK_GROUP => {
+                    let (mut found, mut duration) = (None, None);
+                    let mut child = body;
+                    while let Some(e) = ebml_element(file, child, stop)? {
+                        match e.0 {
+                            BLOCK => found = Some(mkv_block(file, e.1, e.2)?),
+                            BLOCK_DURATION => duration = Some(ebml_uint(file, e.1, e.2)? as i64),
+                            _ => {}
+                        }
+                        child = e.2;
+                    }
+                    match found {
+                        Some(block) => (block, duration),
+                        None => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !wanted.contains(&block.number) {
+                continue;
+            }
+            // As for a video block: guessing at the boundaries inside a laced
+            // one is not something to do silently. No muxer laces subtitles.
+            if block.flags & 0x06 != 0 {
+                return Err("laced subtitle blocks are not supported".into());
+            }
+            // A megabyte of *text* in one cue is a corrupt file, not a subtitle,
+            // and a crafted length may not reach an allocation through here.
+            if block.len > 1 << 20 {
+                return Err("a Matroska subtitle block larger than a megabyte".into());
+            }
+            let mut payload = vec![0u8; block.len];
+            read_exact_at(file, block.at, &mut payload)?;
+            let Some(track) = tracks.iter_mut().find(|t| t.number == block.number) else {
+                continue;
+            };
+            track.cues.push(MkvCue {
+                start_us: us(cluster_ts + i64::from(block.rel)),
+                duration_us: duration.map(us),
+                payload,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A string element, without the trailing NULs a `Name` may be padded with.
+fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
+    let bytes = ebml_bytes(file, body, stop)?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\0')
+        .to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
