@@ -66,9 +66,10 @@ use oxideav_core::Muxer as _;
 use crate::audio::{AudioMeta, AudioSession};
 use crate::demux::{Demuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
-use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, VideoParams};
+use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams};
 use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
+use crate::subtitle::{Cue, SubtitleTrack};
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -241,6 +242,16 @@ pub struct ExportSettings {
     /// it used to. Means nothing to WAV and FLAC, which code no rate, and
     /// nothing to a *copied* AAC track, which carries its source's.
     pub audio_kbps: Option<u32>,
+    /// Which of the project's subtitle tracks travels with the file: an index
+    /// into [`Project::subtitles`], which is the same list a front-end picks a
+    /// row of. `None` writes none -- what every caller wrote before there was a
+    /// choice, so an export of a timeline without subtitles is the file it
+    /// always was, byte for byte.
+    ///
+    /// Only a Matroska container carries it: an mp4's `tx3g` is a different
+    /// beast and nothing here writes one, so an mp4 export says so
+    /// ([`planned_subtitles`]) rather than dropping the track in silence.
+    pub subtitles: Option<usize>,
 }
 
 struct Shared {
@@ -546,6 +557,139 @@ pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static 
     }
 }
 
+/// The track a Matroska export carries, or `None`: no pick, a pick nothing
+/// answers, a track that could not be read, one with no cue left on the
+/// exported timeline -- and every mp4, whose refusal [`planned_subtitles`] says
+/// out loud before the button is pressed.
+fn export_subtitles(
+    project: &Project,
+    meta: &VideoMeta,
+    settings: &ExportSettings,
+) -> Option<SubParams> {
+    if !matches!(settings.format, Format::Av1 | Format::Hevc) {
+        return None;
+    }
+    let track = project.subtitles().get(settings.subtitles?)?;
+    if track.refused.is_some() {
+        return None;
+    }
+    let cues = timeline_cues(project, track, meta.frame_rate);
+    (!cues.is_empty()).then(|| SubParams {
+        label: track.label.clone(),
+        cues,
+    })
+}
+
+/// The track's cues where the *exported* timeline puts them, which is the only
+/// clock the file has: the export writes timeline frame 0 onwards and nothing
+/// else, exactly as the sound is mixed from frame 0 and resized to the
+/// timeline's own length ([`encode_audio`]).
+///
+/// Which clock the cues arrive in is what the track itself says:
+///
+/// * a track out of a *file* (`SubtitleTrack::track`) is timed against that
+///   file, so each cue is carried through the spans that play it -- a cue over
+///   a stretch that was cut out is gone, one straddling a cut keeps the half
+///   that is still there, and one after a rippled delete moves back with the
+///   picture it belongs to. The *edges* a cut clips to are frames -- that is
+///   what a cut is -- but a cue nothing clipped keeps its own microseconds, so
+///   an untouched timeline exports the times the source states.
+/// * a *standalone* file (`subs.srt`) is timed against nothing else -- there is
+///   no clip to hang it on and no offset in the project to shift it by -- so it
+///   is the timeline's own clock, which is where it was drawn while editing
+///   (`Player::subtitle_overlay`). Clipped to the exported length and no more.
+///
+/// This is also what the *preview* draws: the plate over the picture and the
+/// timeline strip both ask it through
+/// [`PlaybackSession::timeline_cues`](crate::PlaybackSession::timeline_cues), so
+/// what a rippled timeline shows and what its export writes are one answer by
+/// construction rather than two maps kept in step by hand.
+///
+/// Pure and cheap enough to ask per repaint (a walk of the spans and of the
+/// cues, no file opened), which is how a front-end asks it.
+pub fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<Cue> {
+    let frames = project.timeline_frames();
+    let us = |frame: u32| (f64::from(frame) / fps * 1e6).round() as i64;
+    let end = us(frames);
+    // The file the cues are timed against, when there is one on this timeline.
+    // A track whose media has since been dropped from the project has no span
+    // to be carried through and falls back to the timeline's clock, which is
+    // what it was drawn on.
+    //
+    // Through the same `canonical` a source is indexed by, or the two spellings
+    // of one file (an argv `../assets/film.mkv`, a symlinked folder) would read
+    // as two files and the cues would quietly fall back to the timeline's clock.
+    let source = track.track.and_then(|_| {
+        let path = crate::project::canonical(&track.path);
+        project.sources().iter().position(|s| s.path == path)
+    });
+    let Some(source) = source else {
+        return track
+            .cues
+            .iter()
+            .filter_map(|cue| {
+                let (start_us, end_us) = (cue.start_us.max(0), cue.end_us.min(end));
+                (end_us > start_us).then(|| Cue {
+                    start_us,
+                    end_us,
+                    text: cue.text.clone(),
+                })
+            })
+            .collect();
+    };
+    let mut out = Vec::new();
+    for span in project.composite_spans_from(0) {
+        let Some((_, in_frame)) = span.from.filter(|&(from, _)| from == source) else {
+            continue;
+        };
+        // What of the file this span plays, as *time in the file*: a clip counts
+        // the timeline's frames whatever its file was shot at ([`Rate`]), which
+        // is what makes those frames the same seconds a cue is timed in.
+        let (first, last) = (us(in_frame), us(in_frame + span.source_len()));
+        // Where that lands, and how fast: a cue is carried by the same factor
+        // the pictures under it are, so a slowed clip stretches its subtitles
+        // with it instead of leaving them behind.
+        let start = us(span.start);
+        let onto = |t: i64| start + ((t - first) as f64 / span.speed.as_f64()).round() as i64;
+        for cue in &track.cues {
+            let (a, b) = (cue.start_us.max(first), cue.end_us.min(last));
+            if b <= a {
+                continue; // wholly outside what this span kept
+            }
+            out.push(Cue {
+                start_us: onto(a),
+                end_us: onto(b).min(end),
+                text: cue.text.clone(),
+            });
+        }
+    }
+    // The spans come in timeline order but a cue's *own* order across them does
+    // not: a Matroska muxer writes blocks as they come up.
+    out.sort_by_key(|cue| cue.start_us);
+    out
+}
+
+/// What [`start`] would do about the subtitles, in the words a card shows.
+/// Pure, like [`planned_audio`]: no file is opened, so it may be asked per
+/// repaint.
+pub fn planned_subtitles(project: &Project, format: Format, pick: Option<usize>) -> String {
+    let Some(track) = pick.and_then(|i| project.subtitles().get(i)) else {
+        return "none".into();
+    };
+    if let Some(why) = &track.refused {
+        return format!("{} — {why}", track.label);
+    }
+    match format {
+        _ if track.cues.is_empty() => "none".into(),
+        Format::Av1 | Format::Hevc => format!("{} → embedded", track.label),
+        // Said before the export rather than after it: an mp4 carries text in
+        // `tx3g` and nothing here writes one, so the honest answer is the
+        // container that does.
+        format if format.has_video() => "mkv only — an mp4 carries none".into(),
+        _ => "none — this format is the sound alone".into(),
+    }
+}
+
 /// What [`start`] would encode the picture with, probed the way the export
 /// probes it -- the very encoder is opened and closed again -- so this is a
 /// measurement and not a promise. `None` for a format that carries no picture.
@@ -791,6 +935,10 @@ fn run(
     // Taken by the Matroska muxer at creation; the mp4 one writes its track
     // after the picture, so for that path this is still `Some` at the end.
     let mut packets = audio.map(|track| track.packets);
+    // ...and the cues with them, for the same reason: the subtitle track is
+    // declared in the header and its blocks are interleaved into the clusters,
+    // so the muxer needs the lot before the first picture is written.
+    let mut subs = export_subtitles(project, meta, settings);
 
     // One header parse per source, before any of them is decoded: what rate
     // each file was shot at against the timeline's ([`Rate`]), which is how the
@@ -939,6 +1087,7 @@ fn run(
                         settings,
                         audio_params.as_ref(),
                         &mut packets,
+                        &mut subs,
                         au,
                         key,
                     )?;
@@ -959,6 +1108,7 @@ fn run(
             settings,
             audio_params.as_ref(),
             &mut packets,
+            &mut subs,
             au,
             key,
         )?;
@@ -1419,6 +1569,7 @@ fn write_video(
     settings: &ExportSettings,
     audio: Option<&AudioParams>,
     packets: &mut Option<Vec<crate::AacPacket>>,
+    subs: &mut Option<SubParams>,
     au: &[u8],
     key: bool,
 ) -> crate::Result<()> {
@@ -1446,6 +1597,7 @@ fn write_video(
                             hvcc: &hvcc,
                         },
                         sound,
+                        subs.take(),
                     )?)) else {
                         unreachable!("just inserted a Matroska muxer")
                     };
@@ -1502,6 +1654,7 @@ fn write_video(
                         out,
                         &params(meta, au)?,
                         sound,
+                        subs.take(),
                     )?)) else {
                         unreachable!("just inserted a Matroska muxer")
                     };
@@ -2155,6 +2308,102 @@ impl SwDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A track of three cues, in whichever clock `track` says: `Some(n)` is a
+    /// track of the media file, `None` a `.srt` beside it.
+    fn subtitles(path: &str, track: Option<u64>) -> SubtitleTrack {
+        SubtitleTrack {
+            path: path.into(),
+            track,
+            label: "eng".into(),
+            cues: vec![
+                Cue {
+                    start_us: 500_000,
+                    end_us: 1_500_000,
+                    text: "first".into(),
+                },
+                Cue {
+                    start_us: 2_000_000,
+                    end_us: 3_250_000,
+                    text: "second".into(),
+                },
+                Cue {
+                    start_us: 4_000_000,
+                    end_us: 4_750_000,
+                    text: "third".into(),
+                },
+            ],
+            refused: None,
+        }
+    }
+
+    /// A standalone subtitle file is timed against the timeline itself -- there
+    /// is no clip to hang it on -- so a cut moves the pictures and not it. What
+    /// it does get is the exported length: a cue past the end of the file would
+    /// otherwise be a block after the last picture.
+    ///
+    /// The pair of this, the embedded clock, is measured against a real exported
+    /// file in `tests/export_subs.rs`; both live in one function and this is the
+    /// half that needs no encoder.
+    #[test]
+    fn a_subtitle_file_beside_the_media_keeps_the_timelines_own_clock() {
+        // 5 seconds at 30, with `[0.5s, 2.5s)` cut out of it: 3 seconds left.
+        let mut project = Project::single("/nonexistent/film.mp4", 150);
+        let track = subtitles("/nonexistent/film.srt", None);
+        assert!(project.ripple_delete(15, 60));
+        assert_eq!(project.timeline_frames(), 90);
+        let cues = timeline_cues(&project, &track, 30.0);
+        assert_eq!(
+            cues,
+            vec![
+                Cue {
+                    start_us: 500_000,
+                    end_us: 1_500_000,
+                    text: "first".into()
+                },
+                // Clipped to the three seconds the export writes...
+                Cue {
+                    start_us: 2_000_000,
+                    end_us: 3_000_000,
+                    text: "second".into()
+                },
+                // ...and the one wholly past the end is not written at all.
+            ]
+        );
+        // A track *of a file* the project no longer plays has no span to be
+        // carried through either, so it falls back to the same clock rather
+        // than exporting nothing.
+        let orphan = subtitles("/nonexistent/other.mkv", Some(2));
+        assert_eq!(timeline_cues(&project, &orphan, 30.0).len(), 2);
+    }
+
+    /// The embedded clock, without an encoder in it: the cut moves the cues with
+    /// the pictures, and a cue nothing clipped keeps its own microseconds.
+    #[test]
+    fn a_track_of_the_media_is_carried_through_the_cut() {
+        let mut project = Project::single("/nonexistent/film.mkv", 150);
+        let track = subtitles("/nonexistent/film.mkv", Some(2));
+        assert!(project.ripple_delete(15, 60), "cut 0.5s..2.5s out");
+        let cues = timeline_cues(&project, &track, 30.0);
+        assert_eq!(
+            cues,
+            vec![
+                // The first cue was wholly inside the cut. The second straddled
+                // its far edge and kept the 0.75s that is still there...
+                Cue {
+                    start_us: 500_000,
+                    end_us: 1_250_000,
+                    text: "second".into()
+                },
+                // ...and the third simply moves back the two seconds that went.
+                Cue {
+                    start_us: 2_000_000,
+                    end_us: 2_750_000,
+                    text: "third".into()
+                },
+            ]
+        );
+    }
 
     #[test]
     fn bitrate_clamps_at_both_ends() {

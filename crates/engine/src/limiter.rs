@@ -106,6 +106,11 @@ pub struct LimiterState {
     /// delay line, which is how the latency is paid back (module docs).
     warm: usize,
     gain: f32,
+    /// Switched out while the mix runs ([`LimiterState::retune`]): the line
+    /// still delays and still emits a frame per frame, only nothing is held
+    /// down. Dropping the state instead would drop the frames still inside the
+    /// line, and those frames are what the master clock counts.
+    bypass: bool,
     ceiling: f32,
     /// Where the knee starts, as an amplitude: under this the fast path runs
     /// and no logarithm is taken.
@@ -125,12 +130,41 @@ impl LimiterState {
             at: 0,
             warm: frames - 1,
             gain: 1.0,
+            bypass: !params.on,
             ceiling: db_to_linear(ceiling_db),
             knee_floor: db_to_linear(ceiling_db - KNEE_DB / 2.0),
             // One time constant per sample: the gain covers 63% of the way back
             // in `RELEASE_MS`.
             release: 1.0 - (-1000.0 / (RELEASE_MS * sample_rate as f32)).exp(),
         }
+    }
+
+    /// One switched in **while the mix is already running**: the same limiter,
+    /// except that it swallows nothing to fill its delay line -- what comes out
+    /// first is the line's own [`LOOKAHEAD_MS`] of silence and the mix behind
+    /// it, where a fresh state would have eaten that much of the mix instead.
+    ///
+    /// Which matters because the count *is* the clock: a mixer that emitted
+    /// fewer samples than the timeline asked for would slide the picture off
+    /// the sound by the lookahead, once per switch-on. A hair of silence at the
+    /// moment somebody engages a limiter is the honest price.
+    pub fn engaged(params: &Limiter, sample_rate: u32, channels: usize) -> Self {
+        Self {
+            warm: 0,
+            ..Self::new(params, sample_rate, channels)
+        }
+    }
+
+    /// Points a running limiter at another setting -- a ceiling dragged, the
+    /// switch flipped -- without touching the delay line, the peak window or
+    /// the gain it is holding. That is what makes the ceiling a live control:
+    /// rebuilding the state would restart the window (a pump) and lose the
+    /// frames inside the line (a slip against the picture).
+    pub fn retune(&mut self, params: &Limiter) {
+        let ceiling_db = params.with_ceiling(params.ceiling_db).ceiling_db;
+        self.bypass = !params.on;
+        self.ceiling = db_to_linear(ceiling_db);
+        self.knee_floor = db_to_linear(ceiling_db - KNEE_DB / 2.0);
     }
 
     /// Rewrites `buf` -- interleaved frames -- as the limited mix. Shorter than
@@ -163,8 +197,14 @@ impl LimiterState {
                 self.warm -= 1;
                 continue;
             }
+            // Bypassed, the line is a delay and nothing else: the frames come
+            // out as they went in, one for one.
+            let gain = match self.bypass {
+                true => 1.0,
+                false => self.gain,
+            };
             for c in 0..channels {
-                out.push(self.line[self.at * channels + c] * self.gain);
+                out.push(self.line[self.at * channels + c] * gain);
             }
         }
         *buf = out;
@@ -238,6 +278,56 @@ mod tests {
         // The delay line is paid back, not carried: the output is shorter by
         // exactly the lookahead and nothing else.
         assert_eq!(buf.len(), rate as usize * 2 - (state.peaks.len() - 1) * 2);
+    }
+
+    /// A ceiling dragged while the mix runs: the new one is honoured from the
+    /// next block, the delay line keeps running -- so the block is as long as
+    /// it would have been, which is what the master clock counts -- and
+    /// switching the limiter out leaves the samples alone rather than dropping
+    /// the ones still inside the line.
+    #[test]
+    fn a_retune_moves_the_ceiling_and_costs_no_samples() {
+        let rate = 48_000;
+        let mut state = LimiterState::engaged(
+            &Limiter {
+                ceiling_db: -3.0,
+                on: true,
+            },
+            rate,
+            2,
+        );
+        let block: Vec<f32> = (0..2_000).map(|i| 2.0 * ((i % 7) as f32 - 3.0)).collect();
+
+        // Engaged mid-stream: nothing is swallowed, so the count is the count.
+        let mut buf = block.clone();
+        state.process(&mut buf);
+        assert_eq!(buf.len(), block.len(), "an engaged limiter ate samples");
+        let hot = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(hot <= db_to_linear(-3.0) + 1e-6, "peak {hot} passed -3 dB");
+
+        // Down to -12: the same length again, and quieter.
+        state.retune(&Limiter {
+            ceiling_db: -12.0,
+            on: true,
+        });
+        let mut buf = block.clone();
+        state.process(&mut buf);
+        assert_eq!(buf.len(), block.len(), "a retune ate samples");
+        let quiet = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(quiet <= db_to_linear(-12.0) + 1e-6, "peak {quiet} passed -12 dB");
+        assert!(quiet < hot, "the ceiling did not move: {hot} -> {quiet}");
+
+        // Switched out: the line still delays, so the count still holds, and
+        // what comes out is the mix as it was written.
+        state.retune(&Limiter {
+            ceiling_db: -12.0,
+            on: false,
+        });
+        let mut buf = block.clone();
+        state.process(&mut buf);
+        assert_eq!(buf.len(), block.len(), "a bypass ate samples");
+        let raw = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(raw > 1.0, "bypassed, the mix is untouched: peak {raw}");
     }
 
     /// Flat settings are a passthrough, which is what the export invariant
