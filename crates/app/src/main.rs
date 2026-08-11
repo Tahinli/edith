@@ -406,6 +406,47 @@ const MENU_ITEMS: [ActionId; 14] = [
     ActionId::ToggleMute,
 ];
 
+/// One row of the actions card, in the order it lists them: a heading, then
+/// every action the registry files under it, then the strokes the modal cards
+/// answer themselves.
+///
+/// A list rather than a loop inside the render, so the card and
+/// `every_action_is_on_the_actions_card` read the *same* order: an action that
+/// reaches no row fails a test instead of quietly becoming pointer-unreachable.
+enum KeyRow {
+    Head(keymap::Category),
+    /// Click its label to do it, click its stroke to change that stroke.
+    Act(ActionId),
+    /// An index into [`keymap::FIXED`]. Shown and never offered: nothing may
+    /// unbind the way out of a card.
+    Fixed(usize),
+}
+
+/// Every action, under its heading, and the card-local strokes beside them.
+/// Generated from the registry -- [`ActionId::ALL`] in its own order, under
+/// [`keymap::Category::ALL`] -- so an action added there is on the card the
+/// moment it exists and there is no second list here to forget.
+fn keys_rows() -> Vec<KeyRow> {
+    let mut rows = Vec::new();
+    for category in keymap::Category::ALL {
+        rows.push(KeyRow::Head(category));
+        rows.extend(
+            ActionId::ALL
+                .into_iter()
+                .filter(|a| a.category() == category)
+                .map(KeyRow::Act),
+        );
+        rows.extend(
+            keymap::FIXED
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.category == category)
+                .map(|(i, _)| KeyRow::Fixed(i)),
+        );
+    }
+    rows
+}
+
 /// The project resolutions [`Player::cycle_resolution`] offers, largest first.
 /// A short list of the sizes people name; the media's own is cycled in beside
 /// them, which is what makes the trip round come back to where it started.
@@ -1096,6 +1137,31 @@ impl Player {
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
         }
+    }
+
+    /// Whether the editor can be asked for `action` right now, and why not when
+    /// it cannot. `on` is the clip the question is about -- the one a clip menu
+    /// was opened on -- and `None` asks about the marked clip instead, which is
+    /// what a menu that hangs over no clip in particular means by "this one".
+    ///
+    /// The player's half of [`enable`]: it reads the state, the table decides.
+    fn enable(&self, action: ActionId, on: Option<(Lane, usize)>) -> Enable {
+        let Some(session) = &self.session else {
+            return enable(action, Ctx::default());
+        };
+        let clip = on
+            .or(self.selected)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
+        enable(
+            action,
+            Ctx {
+                clip,
+                playhead: frame_at(session.now(), self.fps),
+                timeline: true,
+                clipboard: self.clipboard.is_some(),
+                exporting: self.exporting().is_some(),
+            },
+        )
     }
 
     /// The one place a clip becomes *the* selected one: a click, a right-click
@@ -4621,8 +4687,10 @@ impl Player {
                     .child(control(
                         "keys",
                         None,
-                        "Keys",
-                        "show and change the keybindings".to_string(),
+                        "Actions",
+                        // The pointer's way to every action there is, including
+                        // the ones no button here has room for.
+                        "do any action, or change the key that does it".to_string(),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.keys_open = !this.keys_open;
@@ -4832,83 +4900,115 @@ impl Player {
             ctrl: false,
         }
         .pretty();
-        // Every stroke that works, under its heading, and both halves of the
-        // list come from the registry: one row per action -- an action with two
-        // strokes reads as one line ("x or delete") and a rebind replaces that
-        // whole set -- then the strokes the modal cards answer to, which are
-        // shown but not offered, because nothing may unbind the way out.
+        // Every action there is, under its heading, and the strokes the modal
+        // cards answer to beside them -- `keys_rows` is the whole of the order
+        // and every word in it comes off the registry.
+        //
+        // A row is two targets, not one: its label *does* the action, which is
+        // the pointer's way to the ones no button carries, and its stroke
+        // changes that stroke. An action with two strokes reads as one line
+        // ("x or delete") and a rebind replaces that whole set.
         let mut rows: Vec<AnyElement> = Vec::new();
-        for category in keymap::Category::ALL {
-            let actions = ActionId::ALL
-                .into_iter()
-                .enumerate()
-                .filter(|(_, a)| a.category() == category);
-            let fixed = keymap::FIXED.iter().filter(|f| f.category == category);
-            let mut headed = false;
-            let mut head = |rows: &mut Vec<AnyElement>| {
-                if !std::mem::replace(&mut headed, true) {
-                    rows.push(
-                        div()
-                            .flex_none()
-                            .px(px(6.))
-                            .pt(px(4.))
-                            .text_size(px(11.))
-                            .text_color(rgb(INK_DIM))
-                            .child(category.label())
-                            .into_any_element(),
-                    );
-                }
-            };
-            for (i, action) in actions {
-                head(&mut rows);
-                let capturing = self.rebinding == Some(action);
-                let out = out.clone();
-                rows.push(
-                    div()
-                        .id(("bind", i))
-                        .flex()
-                        // The floor, not the height: a row that needed two lines
-                        // would otherwise paint over the one under it.
-                        .min_h(px(KEYS_ROW_H))
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .px(px(6.))
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(HOVER)))
+        let row = || {
+            div()
+                .flex()
+                // The floor, not the height: a row that needed two lines
+                // would otherwise paint over the one under it.
+                .min_h(px(KEYS_ROW_H))
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .px(px(6.))
+                .rounded(px(3.))
+        };
+        for (i, key_row) in keys_rows().into_iter().enumerate() {
+            rows.push(match key_row {
+                KeyRow::Head(category) => div()
+                    .flex_none()
+                    .px(px(6.))
+                    .pt(px(4.))
+                    .text_size(px(11.))
+                    .text_color(rgb(INK_DIM))
+                    .child(category.label())
+                    .into_any_element(),
+                KeyRow::Act(action) => {
+                    let capturing = self.rebinding == Some(action);
+                    // Why the label half will not answer, if it will not: the
+                    // registry's one answer, the same the clip menu dims by.
+                    let refusal = self.enable(action, None);
+                    let out = out.clone();
+                    row()
                         .when(capturing, |d| d.bg(rgb(SELECTED)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.rebinding = Some(action);
-                            cx.notify();
-                        }))
-                        .child(action.label())
-                        .child(if capturing {
+                        .child(
                             div()
-                                .text_color(rgb(INK_DIM))
-                                .child(format!("press a key — {out} cancels"))
-                        } else {
-                            div().child(self.keymap.display(action))
-                        })
-                        .into_any_element(),
-                );
-            }
-            for f in fixed {
-                head(&mut rows);
-                rows.push(
-                    div()
-                        .flex()
-                        .min_h(px(KEYS_ROW_H))
-                        .items_center()
-                        .justify_between()
-                        .gap(px(12.))
-                        .px(px(6.))
+                                .id(("do", i))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .min_h(px(KEYS_ROW_H))
+                                .items_center()
+                                .child(action.label())
+                                // The reason rides on the label rather than in
+                                // the stroke column, which the rebind half
+                                // needs whatever the editor's state is: an
+                                // action nobody can ask for right now is still
+                                // one whose key may be changed.
+                                .when_some(refusal.why(), |d, why| {
+                                    let why: SharedString = why.into();
+                                    d.tooltip(move |_, cx| cx.new(|_| Tip(why.clone())).into())
+                                })
+                                .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
+                                .when(refusal.yes(), |d| {
+                                    d.cursor_pointer().hover(|s| s.bg(rgb(HOVER))).on_click(
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            // The card goes first: several of
+                                            // these open a card of their own,
+                                            // and every edit moves the indices
+                                            // the menus are holding.
+                                            this.keys_open = false;
+                                            this.rebinding = None;
+                                            this.act(action, cx);
+                                            cx.notify();
+                                        }),
+                                    )
+                                }),
+                        )
+                        .child(
+                            // ponytail: the column is as wide as the stroke it
+                            // prints, so a one-character chord gives this half a
+                            // hit area under the 24px WCAG 2.5.8 floor -- tall
+                            // enough, narrow. Upgrade: a min_w of HIT_MIN here.
+                            div()
+                                .id(("bind", i))
+                                .flex_none()
+                                .flex()
+                                .min_h(px(KEYS_ROW_H))
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.rebinding = Some(action);
+                                    cx.notify();
+                                }))
+                                .child(if capturing {
+                                    div()
+                                        .text_color(rgb(INK_DIM))
+                                        .child(format!("press a key — {out} cancels"))
+                                } else {
+                                    div().child(self.keymap.display(action))
+                                }),
+                        )
+                        .into_any_element()
+                }
+                KeyRow::Fixed(f) => {
+                    let f = &keymap::FIXED[f];
+                    row()
                         .child(f.label)
                         // Dim, and no hover: this one is not a row you can click.
                         .child(div().text_color(rgb(INK_DIM)).child(f.chord))
-                        .into_any_element(),
-                );
-            }
+                        .into_any_element()
+                }
+            });
         }
         Some(
             div()
@@ -4935,7 +5035,7 @@ impl Player {
                         // Title and instruction are two children, never one
                         // wrapping line: a fixed-height slot whose text wrapped
                         // painted its second line over the first row.
-                        .child(div().flex_none().px(px(6.)).child("Keybindings"))
+                        .child(div().flex_none().px(px(6.)).child("Actions & keys"))
                         // One status line, under the title where the eye starts.
                         // A refusal takes it over -- it is the more urgent of the
                         // two, and the notice bar it would otherwise appear in is
@@ -4953,7 +5053,10 @@ impl Player {
                                 .child(
                                     self.notice
                                         .clone()
-                                        .unwrap_or_else(|| "click a row, then press a key".into()),
+                                        .unwrap_or_else(|| {
+                                            "click an action to do it · click its key to change it"
+                                                .into()
+                                        }),
                                 ),
                         )
                         // Capped and scrolling rather than as tall as the action
@@ -6492,7 +6595,6 @@ impl Player {
         let menu = self.context_menu?;
         let session = self.session.as_ref()?;
         let clip = *session.lane_clips(menu.lane).get(menu.idx)?;
-        let playhead = frame_at(session.now(), self.fps);
         let source = session.sources().get(clip.source).cloned()?;
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
         let row = |n: usize| {
@@ -6546,7 +6648,11 @@ impl Player {
             }
         } else {
             for action in MENU_ITEMS {
-                let enabled = applicable(&clip, menu.lane, action, playhead);
+                // The registry's own answer, the same one the actions card
+                // dims a row with -- and a row that takes no click says *why*
+                // rather than printing a stroke that would do nothing.
+                let refusal = self.enable(action, Some((menu.lane, menu.idx)));
+                let enabled = refusal.yes();
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
                 // but its row in the keys menu is not sitting on a clip.
@@ -6558,11 +6664,20 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(
-                            div()
+                        .child(match refusal.why() {
+                            // One truncated line, like the details side: a
+                            // reason that wrapped would make the card taller
+                            // than the height `menu_at` placed it by.
+                            Some(why) => div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(rgb(INK_DIM))
+                                .child(why),
+                            None => div()
                                 .text_color(rgb(INK_DIM))
                                 .child(self.keymap.display(action)),
-                        )
+                        })
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
@@ -7331,42 +7446,132 @@ fn band_label(band: &Band) -> String {
     }
 }
 
-/// Whether the clip menu offers `action` on the clip it was opened on. Two of
-/// the items act on the *playhead* rather than on the clip, so a menu opened
-/// away from it dims them instead of looking broken when they are clicked, and
-/// one acts on sound, which only an audio lane's clip has.
-fn applicable(clip: &Clip, lane: Lane, action: ActionId, playhead: u32) -> bool {
-    match action {
-        // The equalizer filters samples, and a video clip has none of its own
-        // here: the sound is the audio lane's, clip for clip.
-        ActionId::Equalizer => lane.kind == LaneKind::Audio,
-        // A grade is a picture setting and an audio clip has no picture: the
-        // item is there on every clip, and dimmed where it would mean nothing.
-        // A fit policy is a picture setting for the same reason.
-        ActionId::Color | ActionId::Fit => lane.kind == LaneKind::Video,
-        // Splits this clip only from inside it: at either edge there is nothing
-        // to split off -- and, on a speeded clip, only at a frame its own rate
-        // can address, which is the same question `splittable` asks.
-        ActionId::Cut => {
-            clip.start < playhead
-                && playhead < clip.end()
-                && clip
-                    .speed
-                    .split_at(clip.len(), playhead - clip.start)
-                    .is_some()
+/// Whether an action can be asked for, and what to say when it cannot. Two
+/// kinds of no: `Hidden` is about the *kind* of thing the action was aimed at
+/// -- an audio clip has no picture, so a grade is not a thing that exists for
+/// it, whatever the editor does next -- and `No` is about the state of this
+/// moment, which the next click of the playhead can change. Both dim their row
+/// today; a menu that wants to leave the class refusals out and keep the state
+/// ones has only to match on which of the two it got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Enable {
+    Yes,
+    No(&'static str),
+    Hidden(&'static str),
+}
+
+impl Enable {
+    /// Whether the row takes a click.
+    fn yes(self) -> bool {
+        self == Enable::Yes
+    }
+
+    /// What the row says instead of its stroke, if it says anything.
+    fn why(self) -> Option<&'static str> {
+        match self {
+            Enable::Yes => None,
+            Enable::No(why) | Enable::Hidden(why) => Some(why),
         }
-        // A rate applies to a clip of either kind and to its whole group, so
-        // there is no lane it means nothing on -- `_ => true` below is its
-        // answer, and the engine words the one refusal there is (no room).
+    }
+}
+
+/// What an enablement question is asked *about*: the clip in question, if there
+/// is one, and the little of the editor's state the answers need. Handed in
+/// rather than read off the player, so [`enable`] is a pure function a test can
+/// ask about a clip without building a window.
+#[derive(Clone, Copy, Default)]
+struct Ctx {
+    /// The clip the question is about -- the one a menu was opened on, or the
+    /// marked one. `None` means the question is about the editor as a whole,
+    /// and the clip-relative answers stand aside: those actions find their own
+    /// clip under the playhead and word their own refusal.
+    clip: Option<(Clip, Lane)>,
+    playhead: u32,
+    /// A timeline is open.
+    timeline: bool,
+    /// Something has been copied.
+    clipboard: bool,
+    exporting: bool,
+}
+
+/// Whether `action` can be asked for, on `ctx`. One arm per action and nothing
+/// else in the editor asks the question: the clip menu dims a row with this,
+/// the actions card dims a row with this, and the two can never come to
+/// disagree about what an action needs -- exactly the reason [`Player::act`] is
+/// one table too.
+fn enable(action: ActionId, ctx: Ctx) -> Enable {
+    if !ctx.timeline {
+        return Enable::No("no timeline open");
+    }
+    // An export is reading the edit list every other action would change, which
+    // is the rule the key handler already follows.
+    if ctx.exporting {
+        return match action {
+            ActionId::CancelExport => Enable::Yes,
+            _ => Enable::No("an export is running"),
+        };
+    }
+    match action {
+        // -- class: what kind of thing the action is about. The equalizer
+        // filters samples, and a video clip has none of its own here: the sound
+        // is the audio lane's, clip for clip.
+        ActionId::Equalizer => match ctx.clip {
+            Some((_, lane)) if lane.kind != LaneKind::Audio => Enable::Hidden("this clip is picture"),
+            _ => Enable::Yes,
+        },
+        // A grade is a picture setting and an audio clip has no picture. A fit
+        // policy is a picture setting for the same reason.
+        ActionId::Color | ActionId::Fit => match ctx.clip {
+            Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
+            _ => Enable::Yes,
+        },
+        // -- state: true of this clip now, and the next playhead click or the
+        // next selection changes the answer. Splits this clip only from inside
+        // it: at either edge there is nothing to split off -- and, on a speeded
+        // clip, only at a frame its own rate can address, which is the same
+        // question `splittable` asks.
+        ActionId::Cut => match ctx.clip {
+            Some((clip, _))
+                if !(clip.start < ctx.playhead
+                    && ctx.playhead < clip.end()
+                    && clip
+                        .speed
+                        .split_at(clip.len(), ctx.playhead - clip.start)
+                        .is_some()) =>
+            {
+                Enable::No("only from inside a clip")
+            }
+            _ => Enable::Yes,
+        },
         // Rejoins whatever meets at the playhead, so it can mean something only
         // at an edge of this clip. Whether those two halves were ever one take
         // is the engine's question, and it words that refusal itself.
-        ActionId::Regroup => playhead == clip.start || playhead == clip.end(),
+        ActionId::Regroup => match ctx.clip {
+            Some((clip, _)) if ctx.playhead != clip.start && ctx.playhead != clip.end() => {
+                Enable::No("only where two clips meet")
+            }
+            _ => Enable::Yes,
+        },
         // Nothing to take apart in a clip that names no group at all. Whether
         // the group it names still has another half is the engine's question,
-        // like the regroup above, and it words that refusal itself.
-        ActionId::Detach => clip.link.is_some(),
-        _ => true,
+        // like the regroup above.
+        ActionId::Detach => match ctx.clip {
+            Some((clip, _)) if clip.link.is_none() => Enable::No("this clip is not grouped"),
+            _ => Enable::Yes,
+        },
+        // The three that act on the marked clip and on nothing else: with none
+        // marked they would silently do nothing, which is what the Delete
+        // button's own dimming has always said.
+        ActionId::Copy | ActionId::Delete | ActionId::Lift if ctx.clip.is_none() => {
+            Enable::No("click a clip first")
+        }
+        ActionId::Paste if !ctx.clipboard => Enable::No("nothing copied yet"),
+        ActionId::CancelExport => Enable::No("nothing is exporting"),
+        // A rate applies to a clip of either kind and to its whole group, so
+        // there is no lane it means nothing on, and the engine words the one
+        // refusal there is (no room). Everything else is the editor's own and
+        // needs nothing but a timeline.
+        _ => Enable::Yes,
     }
 }
 
@@ -9060,22 +9265,22 @@ fn timecode(t: f64, fps: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, EQ_CURVE_STEPS,
-        EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE, EQ_SPECTRUM_DB,
-        EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, FORMATS, Format, HEADER_GAP,
-        HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK, INK_DIM, KEYS_ROW_H,
-        KEYS_ROWS_H, KEYS_W, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX, LETTERBOX, LIBRARY_MAX_W,
-        LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H, MENU_ROWS_H, MENU_W, NO_FILE,
-        PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS, SOURCE_TINTS, SPEED_PRESETS,
-        SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo, Transport, VOLUME_W, Volume,
-        WAVE_BPS, WAVE_COL, Wave, applicable, band_label, bitrate_refusal, can_add, cancels_export,
-        clipboard_after_remove, color_snap, containers, envelope, eq_spectrum, eq_x, eq_y,
-        estimated_mb, export_path, export_settings, format_key, format_line, format_refusal,
-        fps_label, frac_along, frac_down, frame_at, histogram, is_bare_modifier, is_project,
-        keymap, lanes_h, marked, menu_at, next_container, normalise, nothing_to_play, panel_h,
-        project_path, push_digit, retarget, scrub_due, show_label, silence_rate, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
-        unseen_paths, unseen_sources, whole_take, window_title,
+        ACCENT, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, Ctx,
+        EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_GAIN_LIMIT, EQ_GRAPH_H, EQ_HANDLE,
+        EQ_SPECTRUM_DB, EQ_TICKS, ESCAPE, EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, FORMATS,
+        Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
+        INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
+        LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+        MENU_ROWS_H, MENU_W, NO_FILE, PANEL_H, Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
+        SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
+        Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, Wave, band_label, bitrate_refusal,
+        can_add, cancels_export, clipboard_after_remove, color_snap, containers, enable, envelope,
+        eq_spectrum, eq_x, eq_y, estimated_mb, export_path, export_settings, format_key,
+        format_line, format_refusal, fps_label, frac_along, frac_down, frame_at, histogram,
+        is_bare_modifier, is_project, keymap, keys_rows, lanes_h, marked, menu_at, next_container,
+        normalise, nothing_to_play, panel_h, project_path, push_digit, retarget, scrub_due,
+        show_label, silence_rate, snapped, source_tint, span_partner, speed_at, summary_head,
+        summary_tail, timecode, transport, unseen_paths, unseen_sources, whole_take, window_title,
     };
     use super::{
         LaneKind, PPS_DEFAULT, Repeat, Scale, View, ZOOM_MAX_SECONDS, ZOOM_MIN_FRAMES, ZOOM_STEP,
@@ -9391,43 +9596,126 @@ mod tests {
             speed: Speed::NORMAL,
         };
         assert_eq!(clip.end(), 90);
-        // Cut splits from inside only: neither edge has anything to split off.
         let a1 = Lane::A1;
         let v1 = Lane::V1;
-        assert!(applicable(&clip, v1, ActionId::Cut, 31));
-        assert!(applicable(&clip, v1, ActionId::Cut, 89));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 30));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 90));
-        assert!(!applicable(&clip, v1, ActionId::Cut, 200));
+        // The question the clip menu asks: a timeline is open and the menu was
+        // opened on this clip, at this playhead.
+        let on = |clip: &Clip, lane, action, playhead| {
+            enable(
+                action,
+                Ctx {
+                    clip: Some((*clip, lane)),
+                    playhead,
+                    timeline: true,
+                    ..Ctx::default()
+                },
+            )
+        };
+        let offered = |clip: &Clip, lane, action, playhead| on(clip, lane, action, playhead).yes();
+        // Cut splits from inside only: neither edge has anything to split off.
+        assert!(offered(&clip, v1, ActionId::Cut, 31));
+        assert!(offered(&clip, v1, ActionId::Cut, 89));
+        assert!(!offered(&clip, v1, ActionId::Cut, 30));
+        assert!(!offered(&clip, v1, ActionId::Cut, 90));
+        assert!(!offered(&clip, v1, ActionId::Cut, 200));
         // Regroup is the other way round: only where this clip meets another.
-        assert!(applicable(&clip, v1, ActionId::Regroup, 30));
-        assert!(applicable(&clip, v1, ActionId::Regroup, 90));
-        assert!(!applicable(&clip, v1, ActionId::Regroup, 60));
+        assert!(offered(&clip, v1, ActionId::Regroup, 30));
+        assert!(offered(&clip, v1, ActionId::Regroup, 90));
+        assert!(!offered(&clip, v1, ActionId::Regroup, 60));
         // Detach is the clip's own business: nothing to take apart in one that
         // names no group, and whether the group still has another half is the
         // engine's question. Group is offered on every clip, for that reason.
-        assert!(!applicable(&clip, v1, ActionId::Detach, 0));
+        assert!(!offered(&clip, v1, ActionId::Detach, 0));
         let grouped = Clip {
             link: Some(3),
             ..clip
         };
-        assert!(applicable(&grouped, v1, ActionId::Detach, 60));
-        assert!(applicable(&clip, a1, ActionId::Group, 0));
+        assert!(offered(&grouped, v1, ActionId::Detach, 60));
+        assert!(offered(&clip, a1, ActionId::Group, 0));
         // The equalizer is the one item the *lane* decides: it filters samples,
         // and a video clip has none of its own. Never the playhead's business.
-        assert!(applicable(&clip, a1, ActionId::Equalizer, 0));
-        assert!(applicable(&clip, a1, ActionId::Equalizer, 60));
-        assert!(!applicable(&clip, v1, ActionId::Equalizer, 60));
+        assert!(offered(&clip, a1, ActionId::Equalizer, 0));
+        assert!(offered(&clip, a1, ActionId::Equalizer, 60));
+        assert!(!offered(&clip, v1, ActionId::Equalizer, 60));
         // The rest act on the clip that was clicked, so they always mean
         // something -- the engine words its own refusals.
         for action in [ActionId::Delete, ActionId::Lift, ActionId::ToggleMute] {
-            assert!(applicable(&clip, v1, action, 0));
-            assert!(applicable(&clip, a1, action, 60));
+            assert!(offered(&clip, v1, action, 0));
+            assert!(offered(&clip, a1, action, 60));
         }
         // Except the grade, which is a picture setting: offered on a video
         // clip wherever the playhead is, dimmed on a waveform.
-        assert!(applicable(&clip, v1, ActionId::Color, 0));
-        assert!(!applicable(&clip, a1, ActionId::Color, 60));
+        assert!(offered(&clip, v1, ActionId::Color, 0));
+        assert!(!offered(&clip, a1, ActionId::Color, 60));
+        // The two kinds of no, which is what the row can be told apart by: a
+        // grade on a waveform is a *class* answer -- an audio clip has no
+        // picture and never will, so a menu may leave the item out -- where a
+        // cut at the clip's edge is this moment's answer and the next click of
+        // the playhead changes it, so that one is dimmed and stays.
+        assert!(matches!(
+            on(&clip, a1, ActionId::Color, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(
+            on(&clip, a1, ActionId::Fit, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(
+            on(&clip, v1, ActionId::Equalizer, 60),
+            Enable::Hidden(_)
+        ));
+        assert!(matches!(on(&clip, v1, ActionId::Cut, 30), Enable::No(_)));
+        assert!(matches!(on(&clip, v1, ActionId::Regroup, 60), Enable::No(_)));
+        assert!(matches!(on(&clip, v1, ActionId::Detach, 0), Enable::No(_)));
+        // Every refusal says something, and says it short enough to sit in the
+        // menu's right-hand column beside a label.
+        for action in MENU_ITEMS {
+            for lane in [v1, a1] {
+                for playhead in [0, 30, 60, 90] {
+                    if let Some(why) = on(&clip, lane, action, playhead).why() {
+                        assert!(!why.is_empty() && why.len() <= 30, "{action:?}: {why:?}");
+                    }
+                }
+            }
+        }
+        // The editor as a whole, which is how the actions card asks: with no
+        // timeline nothing is offered, an export leaves only its own cancel,
+        // and the three that act on the marked clip say so when none is.
+        let whole = |action, ctx| enable(action, ctx);
+        assert_eq!(
+            whole(ActionId::Play, Ctx::default()),
+            Enable::No("no timeline open")
+        );
+        let live = Ctx {
+            timeline: true,
+            ..Ctx::default()
+        };
+        assert!(whole(ActionId::Play, live).yes());
+        assert!(!whole(ActionId::Delete, live).yes());
+        assert!(!whole(ActionId::Paste, live).yes());
+        assert!(
+            whole(
+                ActionId::Paste,
+                Ctx {
+                    clipboard: true,
+                    ..live
+                }
+            )
+            .yes()
+        );
+        assert!(!whole(ActionId::CancelExport, live).yes());
+        let busy = Ctx {
+            exporting: true,
+            ..live
+        };
+        assert!(whole(ActionId::CancelExport, busy).yes());
+        for action in ActionId::ALL {
+            assert_eq!(
+                whole(action, busy).yes(),
+                action == ActionId::CancelExport,
+                "{action:?} while an export reads the edit list"
+            );
+        }
         // The playhead frame is the engine's own rule, boundary included.
         assert_eq!(frame_at(1.0, 30.), 30);
         assert_eq!(frame_at(0.0, 30.), 0);
@@ -9470,9 +9758,9 @@ mod tests {
 
     /// The other half of the keys menu's guarantee, and the audit this batch was
     /// asked for kept as a test: no action may be a stroke and nothing else.
-    /// Either the clip menu offers it, or a control in the panel does -- named
-    /// here by the id [`control`] is handed, read out of this file's own source
-    /// like `no_stroke_is_missing_from_the_keys_menu` reads the key handler.
+    /// The actions card answers it for all of them at once -- its rows come off
+    /// [`ActionId::ALL`], so a fortieth action is on it the moment it exists and
+    /// there is no hand-written list here to fall behind.
     #[test]
     fn every_action_is_reachable_without_the_keyboard() {
         use keymap::ActionId;
@@ -9481,48 +9769,22 @@ mod tests {
             .next()
             .unwrap();
         let element = |id: &str| source.contains(&format!("\"{id}\""));
+        let listed: Vec<ActionId> = keys_rows()
+            .iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
         for action in ActionId::ALL {
-            let by_pointer = MENU_ITEMS.contains(&action)
-                || match action {
-                    ActionId::Play => element("transport"),
-                    // One slot, two states: it starts an export and stops the
-                    // one it started.
-                    ActionId::Export | ActionId::CancelExport => element("export"),
-                    ActionId::Save => element("save"),
-                    ActionId::Undo => element("undo"),
-                    ActionId::Resolution => element("resolution"),
-                    // Three buttons beside it, and the ctrl+wheel on the bar.
-                    ActionId::ZoomIn => element("zoom-in"),
-                    ActionId::ZoomOut => element("zoom-out"),
-                    ActionId::ZoomFit => element("zoom-fit"),
-                    ActionId::AddVideoLane => element("add-video-lane"),
-                    ActionId::AddAudioLane => element("add-audio-lane"),
-                    // The × in a lane's own header, which takes any track and
-                    // not only the last one.
-                    ActionId::RemoveVideoLane | ActionId::RemoveAudioLane => {
-                        source.contains("this.remove_lane(lane, cx)")
-                    }
-                    ActionId::ToggleMute => element("volume"),
-                    // The fader on every audio track's own header, which is
-                    // also what opens the card the limiter is on.
-                    ActionId::Mix => element("mix-lane"),
-                    ActionId::VolumeUp | ActionId::VolumeDown => element("volume-bar"),
-                    // The ruler seeks anywhere the pointer points; the frame and
-                    // the second are the keyboard's finer grain of that move.
-                    ActionId::StepBack
-                    | ActionId::StepForward
-                    | ActionId::JumpBack
-                    | ActionId::JumpForward
-                    | ActionId::GoStart
-                    | ActionId::GoEnd => element("ruler"),
-                    // A press on a clip is the selection, group and all.
-                    ActionId::Select | ActionId::SelectNext | ActionId::SelectPrev => {
-                        source.contains("this.select((lane, i), cx)")
-                    }
-                    _ => false,
-                };
-            assert!(by_pointer, "{action:?} is reachable by keyboard only");
+            assert_eq!(
+                listed.iter().filter(|a| **a == action).count(),
+                1,
+                "{action:?} is reachable by keyboard only"
+            );
         }
+        // And the card is a door the pointer can open: the panel's own button.
+        assert!(element("keys"), "no way to open the actions card");
         // The card-local strokes have the same rule, and each of them is a thing
         // on its card: the graph and its two buttons, the colour bars and their
         // reset, the speed bar and its presets, and the silence card's rows --
@@ -10625,6 +10887,65 @@ mod tests {
         for key in ["c", "x", "space", "escape", "delete", "f1", "z"] {
             assert!(!is_bare_modifier(key), "{key}");
         }
+    }
+
+    /// The whole point of the card: there is no action a pointer cannot reach.
+    /// It renders [`keys_rows`] and nothing else, so this reads the same list
+    /// the card does -- add an `ActionId` and forget to surface it and this
+    /// fails, which is the only way that stays true as the editor grows.
+    #[test]
+    fn every_action_is_on_the_actions_card() {
+        use keymap::{ActionId, Category, Keymap};
+        let rows = keys_rows();
+        let listed: Vec<ActionId> = rows
+            .iter()
+            .filter_map(|r| match r {
+                KeyRow::Act(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        for action in ActionId::ALL {
+            assert_eq!(
+                listed.iter().filter(|a| **a == action).count(),
+                1,
+                "{action:?} is not on the card exactly once"
+            );
+        }
+        assert_eq!(listed.len(), ActionId::ALL.len());
+        // Under its own heading, in the registry's order: every row after a
+        // heading belongs to that heading until the next one.
+        let mut heading = None;
+        let mut heads = 0;
+        for row in &rows {
+            match row {
+                KeyRow::Head(category) => {
+                    heading = Some(*category);
+                    heads += 1;
+                }
+                KeyRow::Act(action) => assert_eq!(Some(action.category()), heading, "{action:?}"),
+                KeyRow::Fixed(i) => assert_eq!(Some(keymap::FIXED[*i].category), heading),
+            }
+        }
+        assert_eq!(heads, Category::ALL.len(), "a heading per category");
+        // The card-local strokes are still all there beside them.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, KeyRow::Fixed(_)))
+                .count(),
+            keymap::FIXED.len()
+        );
+        // Both columns say something: the label does the action, the stroke
+        // beside it changes that stroke, and neither may read blank.
+        let keymap = Keymap::defaults();
+        for action in ActionId::ALL {
+            assert!(!action.label().is_empty(), "{action:?}");
+            assert_ne!(keymap.display(action), "unbound", "{action:?}");
+        }
+        // The list scrolls inside a card the smallest window holds, so a
+        // thirty-fourth action costs no height at all.
+        assert!(rows.len() as f32 * KEYS_ROW_H > KEYS_ROWS_H, "no cap needed?");
+        // Both halves of a row are click targets, so WCAG 2.5.8 binds them.
+        assert!(KEYS_ROW_H >= HIT_MIN);
     }
 
     #[test]
