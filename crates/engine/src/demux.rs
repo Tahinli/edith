@@ -374,6 +374,9 @@ pub struct MkvDemuxer {
     /// landing place of its own.
     scratch: Vec<u8>,
     next: usize,
+    /// What the track's `ContentEncodings` asks of every block; [`Unpack::None`]
+    /// for a file that declares none, which is most of them.
+    unpack: Unpack,
 }
 
 impl MkvDemuxer {
@@ -396,6 +399,11 @@ impl MkvDemuxer {
                 .into());
             }
         };
+        // A picture nothing here can put back together is a refusal at the door,
+        // by the name of what the muxer did to it -- not a decode of garbage.
+        if let Unpack::Refused(why) = &video.unpack {
+            return Err(why.clone().into());
+        }
         let (blocks, span) = mkv_blocks(&mut file, segment, video.number)?;
         if blocks.is_empty() {
             return Err(format!(
@@ -445,6 +453,7 @@ impl MkvDemuxer {
                 bit_depth: video.bit_depth,
                 scratch: Vec::new(),
                 next: 0,
+                unpack: video.unpack,
             },
         ))
     }
@@ -458,16 +467,25 @@ impl MkvDemuxer {
         };
         self.next += 1;
         let head = if block.key { self.config.len() } else { 0 };
-        if self.codec == Codec::Av1 {
-            let mut au = vec![0u8; head + block.len];
-            au[..head].copy_from_slice(&self.config[..head]);
-            read_exact_at(&mut self.file, block.at, &mut au[head..])?;
-            return Ok(Some(au));
-        }
-        let Self { file, scratch, .. } = self;
+        let Self {
+            file,
+            scratch,
+            unpack,
+            ..
+        } = self;
         scratch.resize(block.len, 0);
         read_exact_at(file, block.at, scratch)?;
-        let mut au = Vec::with_capacity(head + block.len + 16);
+        // What the muxer stripped or compressed, put back before anything reads
+        // the bytes as a codec's: a stripped block is not a NAL and an inflated
+        // one is not where it was read from.
+        unpack.frame(scratch)?;
+        if self.codec == Codec::Av1 {
+            let mut au = Vec::with_capacity(head + self.scratch.len());
+            au.extend_from_slice(&self.config[..head]);
+            au.extend_from_slice(&self.scratch);
+            return Ok(Some(au));
+        }
+        let mut au = Vec::with_capacity(head + self.scratch.len() + 16);
         au.extend_from_slice(&self.config[..head]);
         append_annex_b(&self.scratch, self.nal_length, &mut au)?;
         Ok(Some(au))
@@ -497,7 +515,7 @@ pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
     let mut file = File::open(path)?;
     let end = file.metadata()?.len();
     let segment = mkv_segment(&mut file, end)?;
-    Ok(mkv_tracks(&mut file, segment)?.1.map(|(_, codec)| codec))
+    Ok(mkv_tracks(&mut file, segment)?.1.map(|(_, codec, _)| codec))
 }
 
 /// The AC-3 / E-AC-3 sound of a Matroska file: every block of its first audio
@@ -516,6 +534,8 @@ pub struct MkvAudio {
     pub codec: &'static str,
     /// Seconds one `TimestampScale` tick is worth, resolved once at open.
     secs_per_tick: f64,
+    /// As [`MkvDemuxer::unpack`], on the sound track.
+    unpack: Unpack,
 }
 
 impl MkvAudio {
@@ -528,7 +548,7 @@ impl MkvAudio {
         let end = file.metadata()?.len();
         let segment = mkv_segment(&mut file, end)?;
         let (_, audio, _, timestamp_scale) = mkv_tracks(&mut file, segment)?;
-        let Some((number, codec)) = audio else {
+        let Some((number, codec, unpack)) = audio else {
             return Ok(None);
         };
         let codec = match codec.as_str() {
@@ -536,6 +556,12 @@ impl MkvAudio {
             "A_EAC3" => "eac3",
             _ => return Ok(None),
         };
+        // Named here rather than at the walk: a sound track this cannot put back
+        // together is an error for the *audio* session, and the picture of the
+        // same file still opens.
+        if let Unpack::Refused(why) = &unpack {
+            return Err(why.clone().into());
+        }
         let (blocks, _) = mkv_blocks(&mut file, segment, number)?;
         if blocks.is_empty() {
             return Err("the AC-3 track in this Matroska file has no blocks".into());
@@ -545,11 +571,12 @@ impl MkvAudio {
             blocks,
             codec,
             secs_per_tick: timestamp_scale as f64 / 1e9,
+            unpack,
         }))
     }
 
-    /// How many blocks the track has; one syncframe each, lacing being refused
-    /// in [`mkv_blocks`].
+    /// How many blocks the track has; one syncframe each, a laced block having
+    /// been split into one per frame by [`mkv_blocks`].
     pub fn blocks(&self) -> usize {
         self.blocks.len()
     }
@@ -562,6 +589,7 @@ impl MkvAudio {
         };
         let mut bytes = vec![0u8; block.len];
         read_exact_at(&mut self.file, block.at, &mut bytes)?;
+        self.unpack.frame(&mut bytes)?;
         Ok(Some(bytes))
     }
 
@@ -596,6 +624,117 @@ struct MkvVideo {
     config: Vec<u8>,
     nal_length: usize,
     bit_depth: u8,
+    unpack: Unpack,
+}
+
+/// What a track's `ContentEncodings` element did to every one of its frames,
+/// undone here on the way back out. [`Unpack::None`] is every file this project
+/// writes and most of what it reads; the rest is what a remuxer does on the way
+/// to shaving bytes off a disc rip.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum Unpack {
+    #[default]
+    None,
+    /// Header stripping (`ContentCompAlgo` 3): bytes every frame of the track
+    /// begins with, cut off by the muxer and written once into
+    /// `ContentCompSettings`. A decoder handed the rest sees garbage -- one
+    /// stripped zero byte is the whole difference between a film that plays and
+    /// a film that does not.
+    Prepend(Vec<u8>),
+    /// zlib (`ContentCompAlgo` 0), which mkvmerge compressed subtitle tracks
+    /// with by default for years.
+    Zlib,
+    /// A scheme this cannot undo, in the words a caller refuses with. Carried
+    /// rather than raised where the tracks are walked, so one unreadable *audio*
+    /// track does not refuse a file whose picture is fine.
+    Refused(String),
+}
+
+impl Unpack {
+    /// One frame put back the way the encoder wrote it, in place: a block is a
+    /// megabyte of keyframe often enough that it is not worth copying whole for
+    /// the sake of a byte at the front.
+    fn frame(&self, buf: &mut Vec<u8>) -> crate::Result<()> {
+        match self {
+            Self::None => {}
+            Self::Prepend(head) => drop(buf.splice(..0, head.iter().copied())),
+            Self::Zlib => {
+                // With a ceiling on the way out: a frame is a megabyte of
+                // keyframe at worst, and a crafted block must not be able to
+                // inflate into all the memory there is.
+                const LIMIT: usize = 64 << 20;
+                *buf = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(buf, LIMIT)
+                    .map_err(|e| format!("a zlib Matroska block did not inflate: {e}"))?;
+            }
+            Self::Refused(why) => return Err(why.clone().into()),
+        }
+        Ok(())
+    }
+}
+
+/// The `ContentEncodings` of one `TrackEntry`. Anything this cannot undo comes
+/// back as [`Unpack::Refused`] with the sentence naming the feature it wanted: a
+/// compressed track read as if it were plain decodes into garbage, and that is
+/// the one thing this must not do quietly.
+fn mkv_content_encoding(file: &mut File, body: u64, end: u64) -> crate::Result<Unpack> {
+    let mut found: Option<Unpack> = None;
+    let mut at = body;
+    while let Some((id, body, stop)) = ebml_element(file, at, end)? {
+        at = stop;
+        if id != CONTENT_ENCODING {
+            continue;
+        }
+        // Scope 1 -- every frame of the track -- is the default and the only one
+        // written in practice; the others encode the `CodecPrivate` or the next
+        // track, and a `CodecPrivate` this cannot read is a track it cannot open
+        // either way.
+        let (mut scope, mut kind, mut algo, mut settings) = (1, 0, None, Vec::new());
+        let mut child = body;
+        while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
+            match id {
+                CONTENT_ENCODING_SCOPE => scope = ebml_uint(file, body, stop)?,
+                CONTENT_ENCODING_TYPE => kind = ebml_uint(file, body, stop)?,
+                CONTENT_COMPRESSION => {
+                    let mut child = body;
+                    while let Some(e) = ebml_element(file, child, stop)? {
+                        match e.0 {
+                            CONTENT_COMP_ALGO => algo = Some(ebml_uint(file, e.1, e.2)?),
+                            CONTENT_COMP_SETTINGS => settings = ebml_bytes(file, e.1, e.2)?,
+                            _ => {}
+                        }
+                        child = e.2;
+                    }
+                }
+                _ => {}
+            }
+            child = stop;
+        }
+        let refuse = |what: &str| {
+            Unpack::Refused(format!(
+                "{what} in a Matroska file are not supported — this track cannot be read back"
+            ))
+        };
+        let unpack = match (kind, scope, algo.unwrap_or(0)) {
+            (1, _, _) => refuse("encrypted tracks"),
+            (_, s, _) if s & 1 == 0 => refuse("tracks whose headers are the compressed part"),
+            // 3 is header stripping and 0 is zlib; 1 (bzlib) and 2 (lzo1x) are
+            // named rather than guessed at -- there is no decompressor for
+            // either here, and nothing has written one in twenty years.
+            (_, _, 3) => Unpack::Prepend(settings),
+            (_, _, 0) => Unpack::Zlib,
+            (_, _, 1) => refuse("bzlib-compressed tracks"),
+            (_, _, 2) => refuse("lzo1x-compressed tracks"),
+            (_, _, algo) => refuse(&format!("tracks compressed with algorithm {algo}")),
+        };
+        found = Some(match found {
+            // Chained encodings -- compressed *and* encrypted, say -- are legal
+            // and written by nothing. Undoing one of the two is worse than
+            // saying so.
+            Some(_) => refuse("chained content encodings"),
+            None => unpack,
+        });
+    }
+    Ok(found.unwrap_or_default())
 }
 
 // Matroska element IDs, written with the leading length marker they carry in
@@ -613,6 +752,13 @@ const DEFAULT_DURATION: u32 = 0x23E383;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+const CONTENT_ENCODINGS: u32 = 0x6D80;
+const CONTENT_ENCODING: u32 = 0x6240;
+const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
+const CONTENT_ENCODING_TYPE: u32 = 0x5033;
+const CONTENT_COMPRESSION: u32 = 0x5034;
+const CONTENT_COMP_ALGO: u32 = 0x4254;
+const CONTENT_COMP_SETTINGS: u32 = 0x4255;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -644,7 +790,12 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
 fn mkv_tracks(
     file: &mut File,
     segment: (u64, u64),
-) -> crate::Result<(Option<MkvVideo>, Option<(u64, String)>, Option<String>, u64)> {
+) -> crate::Result<(
+    Option<MkvVideo>,
+    Option<(u64, String, Unpack)>,
+    Option<String>,
+    u64,
+)> {
     let (mut video, mut audio, mut other) = (None, None, None);
     let mut timestamp_scale = 1_000_000;
     let mut at = segment.0;
@@ -667,8 +818,8 @@ fn mkv_tracks(
                         match mkv_track_entry(file, e.1, e.2, timestamp_scale)? {
                             MkvEntry::Video(track) if video.is_none() => video = Some(track),
                             MkvEntry::OtherVideo(codec) if other.is_none() => other = Some(codec),
-                            MkvEntry::Audio(number, codec) if audio.is_none() => {
-                                audio = Some((number, codec))
+                            MkvEntry::Audio(number, codec, unpack) if audio.is_none() => {
+                                audio = Some((number, codec, unpack))
                             }
                             _ => {}
                         }
@@ -689,8 +840,9 @@ enum MkvEntry {
     /// A video track in a codec this does not read, by the name it gives itself.
     OtherVideo(String),
     /// An audio track: its track number, which is what [`MkvAudio`] indexes the
-    /// blocks of, and its codec id (`A_AAC`, `A_EAC3`, ...).
-    Audio(u64, String),
+    /// blocks of, its codec id (`A_AAC`, `A_EAC3`, ...), and what its blocks
+    /// have to be put back through.
+    Audio(u64, String, Unpack),
     /// Subtitles, buttons: nobody's here.
     Other,
 }
@@ -704,10 +856,12 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
+    let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
         match id {
             TRACK_NUMBER => number = ebml_uint(file, body, stop)?,
+            CONTENT_ENCODINGS => unpack = mkv_content_encoding(file, body, stop)?,
             TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
             DEFAULT_DURATION => {
                 default_duration = Some(ebml_uint(file, body, stop)?).filter(|d| *d > 0)
@@ -752,7 +906,7 @@ fn mkv_track_entry(
             (Codec::H264, nal_length, sets, 8)
         }
         (1, _) => return Ok(MkvEntry::OtherVideo(codec)),
-        (2, _) => return Ok(MkvEntry::Audio(number, codec)),
+        (2, _) => return Ok(MkvEntry::Audio(number, codec, unpack)),
         _ => return Ok(MkvEntry::Other),
     };
     Ok(MkvEntry::Video(MkvVideo {
@@ -765,6 +919,7 @@ fn mkv_track_entry(
         config,
         nal_length,
         bit_depth,
+        unpack,
     }))
 }
 
@@ -856,7 +1011,9 @@ fn mkv_blocks(
     number: u64,
 ) -> crate::Result<(Vec<Block>, Option<(i64, i64)>)> {
     let mut blocks = Vec::new();
-    let mut span: Option<(i64, i64)> = None;
+    // Where each laced block's frames landed, so their timestamps can be spread
+    // once the block after is known -- see the fixup below.
+    let mut laced: Vec<(usize, usize)> = Vec::new();
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
         at = stop;
@@ -901,32 +1058,135 @@ fn mkv_blocks(
             if block.number != number {
                 continue;
             }
-            // Lacing packs several frames into one block, behind a header of
-            // frame sizes this does not read. Video muxers write none; an audio
-            // muxer may, and guessing at frame boundaries inside a laced block
-            // is not something to do silently.
-            //
-            // ponytail: a laced audio track is refused by name rather than
-            // played. The upgrade path is the three lace headers of the spec
-            // (Xiph, fixed, EBML) read here into one `Block` per frame; ffmpeg,
-            // which writes the fixtures and most remuxes, laces nothing.
-            if block.flags & 0x06 != 0 {
-                return Err("laced Matroska blocks are not supported".into());
-            }
             let ts = cluster_ts + i64::from(block.rel);
-            span = Some(match span {
-                Some((first, last)) => (first.min(ts), last.max(ts)),
-                None => (ts, ts),
-            });
-            blocks.push(Block {
-                at: block.at,
-                len: block.len,
-                key,
-                ts,
-            });
+            if block.flags & 0x06 == 0 {
+                blocks.push(Block {
+                    at: block.at,
+                    len: block.len,
+                    key,
+                    ts,
+                });
+                continue;
+            }
+            // A laced block is several frames behind a header of sizes: one
+            // `Block` each, and only the first of them is a point a decoder can
+            // be started from -- the rest are inside the same lace.
+            let start = blocks.len();
+            for (i, (at, len)) in mkv_lace(file, &block)?.into_iter().enumerate() {
+                blocks.push(Block {
+                    at,
+                    len,
+                    key: key && i == 0,
+                    ts,
+                });
+            }
+            laced.push((start, blocks.len() - start));
         }
     }
+    // The lace fixup: a laced block writes one timestamp for all its frames, and
+    // stacking six E-AC-3 frames on one instant is a sound track that drifts a
+    // fifth of a second away from the picture inside a cluster. The gap to the
+    // next block of the same track is what the lace really spans, so the frames
+    // are spread across it; the last lace of a file has no block after it and
+    // keeps the step the one before it measured.
+    let mut step = 0.0;
+    for (start, count) in laced {
+        let first = blocks[start].ts;
+        if let Some(next) = blocks
+            .get(start + count)
+            .map(|b| b.ts)
+            .filter(|&next| next > first)
+        {
+            step = (next - first) as f64 / count as f64;
+        }
+        for i in 1..count {
+            blocks[start + i].ts = first + (i as f64 * step).round() as i64;
+        }
+    }
+    let span = blocks
+        .iter()
+        .map(|b| b.ts)
+        .min()
+        .zip(blocks.iter().map(|b| b.ts).max());
     Ok((blocks, span))
+}
+
+/// The frames inside a laced block: one `(offset, length)` each, in order.
+///
+/// Lacing packs several frames -- always whole ones, and only ones nothing else
+/// references -- into a single block behind a header of sizes, in one of the
+/// three shapes the spec defines. Video muxers write none, but a streaming
+/// service's audio is laced by the thousand: every E-AC-3 block of a WEB remux
+/// is fixed-laced, and a reader that refuses those is a film that plays silent.
+fn mkv_lace(file: &mut File, block: &BlockHeader) -> crate::Result<Vec<(u64, usize)>> {
+    // The frame count is one byte and there are at most 256 frames, each size
+    // at most 8 bytes of vint (or a run of 0xFF bytes in Xiph, which is bounded
+    // by the block itself): the header cannot be longer than this.
+    let head_len = (1 + 256 * 9).min(block.len);
+    let mut head = vec![0u8; head_len];
+    read_exact_at(file, block.at, &mut head)?;
+    let count = usize::from(*head.first().ok_or("a laced Matroska block with no frames")?) + 1;
+    let short = || crate::Error::from("a Matroska lace header past the end of its block");
+    // The cursor into the lace header, which is where the frames start once the
+    // sizes have been read.
+    let mut at = 1usize;
+    let mut sizes = Vec::with_capacity(count);
+    match (block.flags >> 1) & 0x03 {
+        // Xiph: every size but the last as a run of 255s and a remainder.
+        1 => {
+            for _ in 1..count {
+                let mut size = 0usize;
+                loop {
+                    let &b = head.get(at).ok_or_else(short)?;
+                    at += 1;
+                    size += usize::from(b);
+                    if b != 255 {
+                        break;
+                    }
+                }
+                sizes.push(size);
+            }
+        }
+        // Fixed: no sizes written at all, the frames divide the rest evenly.
+        2 => {
+            let rest = block.len - at;
+            if rest % count != 0 {
+                return Err("a fixed-lace Matroska block that does not divide evenly".into());
+            }
+            sizes = vec![rest / count; count - 1];
+        }
+        // EBML: the first size outright, the rest as differences from the one
+        // before -- signed vints, which is the same encoding with the middle of
+        // its range taken as zero.
+        3 => {
+            let mut size = 0i64;
+            for i in 1..count {
+                let (raw, len) = ebml_vint(head.get(at..).ok_or_else(short)?, true)?;
+                at += len;
+                size = match i {
+                    1 => raw as i64,
+                    _ => size + raw as i64 - ((1i64 << (7 * len - 1)) - 1),
+                };
+                sizes.push(usize::try_from(size).map_err(|_| "a negative Matroska lace size")?);
+            }
+        }
+        // The caller reads the same two bits and only comes here for a lace.
+        _ => unreachable!("an unlaced block does not reach the lace reader"),
+    }
+    let end = block.at + block.len as u64;
+    let mut frames = Vec::with_capacity(count);
+    let mut off = block.at + at as u64;
+    for size in sizes {
+        let stop = off.checked_add(size as u64).filter(|&s| s <= end).ok_or(
+            "a Matroska lace whose frame sizes run past the end of its block",
+        )?;
+        frames.push((off, size));
+        off = stop;
+    }
+    // The last frame is whatever is left, which is the only length the fixed and
+    // Xiph headers write down for it.
+    frames.push((off, (end - off) as usize));
+    Ok(frames)
 }
 
 /// A `SimpleBlock`/`Block` header: track number, timestamp relative to the
@@ -1324,6 +1584,12 @@ pub struct MkvSubtitle {
     /// A bitmap track (PGS, VobSub) comes back declared and empty: its blocks
     /// are megabytes of pictures, and nothing here can draw one.
     pub cues: Vec<MkvCue>,
+    /// Why this track's blocks were not read at all: a `ContentEncodings` this
+    /// cannot undo. Listed like a bitmap track rather than raised, so a film
+    /// with one encrypted subtitle track still opens with the others.
+    pub unsupported: Option<String>,
+    /// What every block of this track goes back through; see [`Unpack`].
+    unpack: Unpack,
 }
 
 /// One subtitle block: when it shows and the bytes it shows.
@@ -1383,7 +1649,7 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
     // The text tracks only: see `MkvSubtitle::cues`.
     let wanted: Vec<u64> = tracks
         .iter()
-        .filter(|t| t.codec.starts_with("S_TEXT"))
+        .filter(|t| t.codec.starts_with("S_TEXT") && t.unsupported.is_none())
         .map(|t| t.number)
         .collect();
     if !wanted.is_empty() {
@@ -1399,10 +1665,12 @@ fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Opt
     const SUBTITLE: u64 = 0x11;
     let (mut number, mut kind, mut codec) = (0, 0, String::new());
     let (mut language, mut name, mut private) = (String::new(), String::new(), Vec::new());
+    let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
         match id {
             TRACK_NUMBER => number = ebml_uint(file, body, stop)?,
+            CONTENT_ENCODINGS => unpack = mkv_content_encoding(file, body, stop)?,
             TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
             CODEC_ID => codec = string_of(file, body, stop)?,
             CODEC_PRIVATE => private = ebml_bytes(file, body, stop)?,
@@ -1424,6 +1692,11 @@ fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Opt
         name,
         private,
         cues: Vec::new(),
+        unsupported: match &unpack {
+            Unpack::Refused(why) => Some(why.clone()),
+            _ => None,
+        },
+        unpack,
     }))
 }
 
@@ -1480,26 +1753,32 @@ fn mkv_subtitle_blocks(
             if !wanted.contains(&block.number) {
                 continue;
             }
-            // As for a video block: guessing at the boundaries inside a laced
-            // one is not something to do silently. No muxer laces subtitles.
-            if block.flags & 0x06 != 0 {
-                return Err("laced subtitle blocks are not supported".into());
-            }
-            // A megabyte of *text* in one cue is a corrupt file, not a subtitle,
-            // and a crafted length may not reach an allocation through here.
-            if block.len > 1 << 20 {
-                return Err("a Matroska subtitle block larger than a megabyte".into());
-            }
-            let mut payload = vec![0u8; block.len];
-            read_exact_at(file, block.at, &mut payload)?;
             let Some(track) = tracks.iter_mut().find(|t| t.number == block.number) else {
                 continue;
             };
-            track.cues.push(MkvCue {
-                start_us: us(cluster_ts + i64::from(block.rel)),
-                duration_us: duration.map(us),
-                payload,
-            });
+            // A laced subtitle block is several cues written at one instant. No
+            // muxer writes one, but the header is the same one the sound track's
+            // blocks carry ([`mkv_lace`]), so reading it costs nothing here.
+            let frames = match block.flags & 0x06 {
+                0 => vec![(block.at, block.len)],
+                _ => mkv_lace(file, &block)?,
+            };
+            for (at, len) in frames {
+                // A megabyte of *text* in one cue is a corrupt file, not a
+                // subtitle, and a crafted length may not reach an allocation
+                // through here.
+                if len > 1 << 20 {
+                    return Err("a Matroska subtitle block larger than a megabyte".into());
+                }
+                let mut payload = vec![0u8; len];
+                read_exact_at(file, at, &mut payload)?;
+                track.unpack.frame(&mut payload)?;
+                track.cues.push(MkvCue {
+                    start_us: us(cluster_ts + i64::from(block.rel)),
+                    duration_us: duration.map(us),
+                    payload,
+                });
+            }
         }
     }
     Ok(())
