@@ -673,8 +673,19 @@ impl PlaybackSession {
         }
 
         let playhead = doc.playhead;
+        // The subtitle files are read here rather than in the parser: a
+        // `.edith` names them and holds no cues. One that has gone missing, or
+        // whose track is a codec of pictures, comes back listed and refused by
+        // name ([`crate::subtitle::open`]) -- a project does not stop opening
+        // over a subtitle, and a re-save does not lose the row.
+        let subtitles = doc
+            .subtitles
+            .iter()
+            .map(|(path, track)| crate::subtitle::open(path, *track))
+            .collect();
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
-            .with_mix(&doc.gains, doc.limiter);
+            .with_mix(&doc.gains, doc.limiter)
+            .with_subtitles(subtitles);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -755,6 +766,47 @@ impl PlaybackSession {
         self.project.sources()
     }
 
+    /// The subtitle tracks on this timeline, in the order they were added: what
+    /// a front-end lists and what [`save_project`](Self::save_project) writes.
+    /// A track that could not be read is *in* this list, saying why
+    /// ([`crate::subtitle::SubtitleTrack::refused`]) -- listed and skipped, not
+    /// dropped.
+    pub fn subtitles(&self) -> &[crate::subtitle::SubtitleTrack] {
+        self.project.subtitles()
+    }
+
+    /// Adds subtitles from `path`: every subtitle track of a Matroska file, or
+    /// the one track a standalone `.srt`/`.vtt`/`.ass` is. Hands back how many
+    /// were added -- 0 for a file whose tracks are all on the timeline already,
+    /// since importing the same file twice is the same subtitles.
+    ///
+    /// An error only when the file cannot be read *at all*; a track this cannot
+    /// parse is added refused by name, for the reason
+    /// [`crate::subtitle::open`] gives. Nothing else about the timeline moves:
+    /// subtitles are not clips and land on no lane.
+    pub fn import_subtitles(&mut self, path: &Path) -> crate::Result<usize> {
+        let tracks = match path.extension().is_some_and(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            e == "mkv" || e == "webm"
+        }) {
+            true => crate::subtitle::of_matroska(path)?,
+            false => vec![crate::subtitle::open(path, None)],
+        };
+        // A standalone file that could not be parsed is a refusal here rather
+        // than a row nobody asked for: the import is the moment to say so, and
+        // the load is the moment to keep it.
+        if let [one] = &tracks[..]
+            && one.track.is_none()
+            && let Some(why) = &one.refused
+        {
+            return Err(why.clone().into());
+        }
+        Ok(tracks
+            .into_iter()
+            .filter(|t| self.project.add_subtitles(t))
+            .count())
+    }
+
     /// Writes the timeline to `path` as a `.edith`, atomically (see
     /// [`crate::edith`]). Sources no clip plays from are left out, and the
     /// playhead is saved with it so a reopened project resumes where it stood.
@@ -780,6 +832,9 @@ impl PlaybackSession {
             // project's, not this machine's (the monitoring volume is not
             // written and never will be).
             &self.project.lane_gains(),
+            // The subtitle tracks with them, by reference: which file the cues
+            // are in, never the cues (see [`crate::edith`]).
+            self.project.subtitles(),
             &eq,
             &color,
             (self.meta.width, self.meta.height),
