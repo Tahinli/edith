@@ -134,7 +134,7 @@ pub trait VideoFrame: Send + Sync + Sized + Debug + 'static {
             | DecodedFormat::I212
             | DecodedFormat::I410
             | DecodedFormat::I412 => 3,
-            DecodedFormat::NV12 | DecodedFormat::MM21 => 2,
+            DecodedFormat::NV12 | DecodedFormat::P010 | DecodedFormat::MM21 => 2,
         }
     }
 
@@ -152,6 +152,7 @@ pub trait VideoFrame: Send + Sync + Sized + Debug + 'static {
                     | DecodedFormat::I012
                     | DecodedFormat::I210
                     | DecodedFormat::I212
+                    | DecodedFormat::P010
                     | DecodedFormat::MM21 => {
                         if plane_idx == 0 {
                             1
@@ -177,6 +178,7 @@ pub trait VideoFrame: Send + Sync + Sized + Debug + 'static {
                     | DecodedFormat::NV12
                     | DecodedFormat::I010
                     | DecodedFormat::I012
+                    | DecodedFormat::P010
                     | DecodedFormat::MM21 => {
                         if plane_idx == 0 {
                             1
@@ -215,6 +217,15 @@ pub trait VideoFrame: Send + Sync + Sized + Debug + 'static {
                             1
                         } else {
                             2
+                        }
+                    }
+                    // LOCAL PATCH: P010 is NV12 with 16-bit samples, so its
+                    // chroma element -- one UV pair -- is four bytes wide.
+                    DecodedFormat::P010 => {
+                        if plane_idx == 0 {
+                            2
+                        } else {
+                            4
                         }
                     }
                 })

@@ -277,72 +277,114 @@ fn a_lane_is_equalized_before_the_mix_and_never_after_it() {
 }
 
 /// The export half of the same claim, through `export::start`: what is written
-/// is what is heard, so the WAV carries the boost at the same ratio the feeder
-/// path measured.
+/// is what is heard, so both audio-only formats carry the boost at the same
+/// ratio the feeder path measured. Both, because both are lossless and both are
+/// one `run_audio` -- a FLAC that disagreed with the WAV beside it would be the
+/// writer, and this is where that would show.
 #[test]
-fn a_wav_export_carries_the_same_boost_playback_does() {
+fn the_audio_only_exports_carry_the_same_boost_playback_does() {
     let flat = project(vec![clip(0, 0, 30)]);
     let mut eqd = flat.clone();
     assert!(eqd.set_eq(Lane::A1, 0, Some(boost())));
 
+    for format in [Format::Wav, Format::Flac] {
+        let mut written = Vec::new();
+        for (name, project) in [("flat", &flat), ("eqd", &eqd)] {
+            let out = out_path(name, format.ext());
+            let handle = engine::export::start(
+                project.clone(),
+                meta(),
+                &out,
+                &ExportSettings {
+                    format,
+                    ..Default::default()
+                },
+            );
+            wait(&handle, Duration::from_secs(60)).expect("an audio-only export");
+            written.push(decode(&out));
+            std::fs::remove_file(&out).unwrap();
+        }
+        let [plain, boosted] = &written[..] else {
+            unreachable!("two exports")
+        };
+        assert_boosted(
+            rms(boosted, 0.05, 0.95) / rms(plain, 0.05, 0.95),
+            format.name(),
+        );
+        // ...and the same number to the ear: the export is not a second, kinder
+        // filter run at a different point in the chain.
+        let played = rms(&play(&eqd), 0.05, 0.95) / rms(&play(&flat), 0.05, 0.95);
+        let exported = rms(boosted, 0.05, 0.95) / rms(plain, 0.05, 0.95);
+        assert!(
+            (played - exported).abs() < 0.05,
+            "playback boosted by {played:.3} and {} by {exported:.3}",
+            format.name()
+        );
+    }
+}
+
+/// An mp4 export *copies* AAC packets and no filter can reach a copy, so an
+/// equalized lane is decoded, mixed and encoded again instead
+/// (`export::encode_audio`). The claim is the same one the WAV makes: the boost
+/// is in the file, on the clip that was given it and on no other -- and the
+/// track still starts where the picture does, which is what the encoder's own
+/// priming packet is for.
+#[test]
+fn an_mp4_export_carries_the_boost_a_packet_copy_could_not() {
+    let flat = project(vec![clip(0, 0, 30), clip(30, 0, 30)]);
+    let mut eqd = flat.clone();
+    assert!(eqd.set_eq(Lane::A1, 1, Some(boost())));
+
     let mut written = Vec::new();
     for (name, project) in [("flat", &flat), ("eqd", &eqd)] {
-        let out = out_path(name, "wav");
-        let handle = engine::export::start(
-            project.clone(),
-            meta(),
-            &out,
-            &ExportSettings {
-                format: Format::Wav,
-                ..Default::default()
-            },
-        );
-        wait(&handle, Duration::from_secs(60)).expect("wav export");
+        let out = out_path(name, "mp4");
+        let settings = ExportSettings::default();
+        let handle = engine::export::start(project.clone(), meta(), &out, &settings);
+        wait(&handle, Duration::from_secs(180)).expect("an equalized timeline exports as mp4");
         written.push(decode(&out));
         std::fs::remove_file(&out).unwrap();
     }
     let [plain, boosted] = &written[..] else {
         unreachable!("two exports")
     };
-    assert_boosted(
-        rms(boosted, 0.05, 0.95) / rms(plain, 0.05, 0.95),
-        "wav export",
+
+    // Two seconds of timeline, to within the one 1024-frame packet the length
+    // rounds up to: an encoder delay left uncompensated would show up here as a
+    // whole packet of shift, and in the windows below as a smeared cut.
+    let secs = |s: &[f32]| s.len() as f64 / 2.0 / f64::from(RATE);
+    println!(
+        "mp4 lengths: flat {:.3}s, eqd {:.3}s",
+        secs(plain),
+        secs(boosted)
     );
-    // ...and the same number to the ear: the export is not a second, kinder
-    // filter run at a different point in the chain.
-    let played = rms(&play(&eqd), 0.05, 0.95) / rms(&play(&flat), 0.05, 0.95);
-    let exported = rms(boosted, 0.05, 0.95) / rms(plain, 0.05, 0.95);
+    for samples in [plain, boosted] {
+        assert!(
+            (secs(samples) - 2.0).abs() < 1024.0 / f64::from(RATE),
+            "the exported track is {:.3}s of a 2.000s timeline",
+            secs(samples)
+        );
+    }
+
+    // The boost itself. Not to `assert_boosted`'s fifth of a dB: this file is
+    // AAC at 128 kbps measured against a *copied* one, so a fraction of a dB is
+    // the codec, not the filter. A dB either way is far tighter than the 12 the
+    // band asks for and far wider than any coding noise.
+    let db = 20.0 * (rms(boosted, 1.05, 1.95) / rms(plain, 1.05, 1.95)).log10();
+    println!("mp4 equalized clip: {db:+.2} dB");
     assert!(
-        (played - exported).abs() < 0.05,
-        "playback boosted by {played:.3} and the export by {exported:.3}"
+        (db - f64::from(BOOST_DB)).abs() < 1.0,
+        "the equalized clip in the mp4 measured {db:+.2} dB, the band asks for {BOOST_DB:+.1}"
     );
-}
+    // The clip before it is the same sound: not to the bit -- this file is a
+    // re-encode and that one is a copy -- but to a fraction of a dB, which is
+    // what says the filter stopped at the cut rather than lifting the lot.
+    let leak = 20.0 * (rms(boosted, 0.05, 0.95) / rms(plain, 0.05, 0.95)).log10();
+    println!("mp4 flat clip moved {leak:+.2} dB");
+    assert!(leak.abs() < 0.5, "the flat clip moved {leak:+.2} dB");
 
-/// An mp4 export *copies* AAC packets, and no filter can reach a packet copy.
-/// Refused by name, with the clip's own position in it -- silently writing the
-/// clip flat is the one failure nobody would notice.
-#[test]
-fn an_mp4_export_refuses_an_equalized_clip_and_names_where_it_is() {
-    let mut p = project(vec![clip(0, 0, 30), clip(30, 0, 30)]);
-    assert!(p.set_eq(Lane::A1, 1, Some(boost())));
-
-    let out = out_path("refused", "mp4");
-    let handle = engine::export::start(p.clone(), meta(), &out, &ExportSettings::default());
-    let err = wait(&handle, Duration::from_secs(60))
-        .expect_err("an equalized clip cannot leave through the copy path")
-        .to_string();
-    println!("mp4 refusal: {err}");
-    assert!(err.contains("00:01"), "the refusal names the clip: {err}");
-    assert!(err.contains("equalizer"), "{err}");
-    assert!(err.contains("WAV or FLAC"), "and the way out: {err}");
-    assert!(!out.exists(), "a refused export leaves no file");
-
-    // Taking the curve off is all it takes -- the refusal is about the setting,
-    // never about the clip having once had one.
-    assert!(p.set_eq(Lane::A1, 1, None));
-    let handle = engine::export::start(p, meta(), &out, &ExportSettings::default());
-    wait(&handle, Duration::from_secs(120)).expect("a flat timeline exports as mp4");
-    std::fs::remove_file(&out).unwrap();
+    // ...and a timeline nobody equalized never reaches the encoder at all: its
+    // audio track is still the source's own packets, which
+    // `export::exported_packets_are_the_copied_stream` holds to the byte.
 }
 
 /// A band moved while the timeline is playing: `PlaybackSession::set_eq` writes

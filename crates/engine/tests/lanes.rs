@@ -363,14 +363,48 @@ fn two_audio_lanes_are_summed() {
         out_two / out_one
     );
 
-    // The mp4 path *copies* AAC packets and cannot mix: it refuses by name
-    // rather than writing a file missing half its sound.
+    // ...and the mp4 of the same timeline carries that very mix. It used to be
+    // a refusal by name -- the mp4 path *copies* AAC packets and a mix is not a
+    // copy -- and a refusal is what a file missing half its sound deserves;
+    // this decodes both lanes and encodes the sum instead (`export::copy_audio`
+    // routes to `encode_audio`), which is the same mix the WAV above measured.
     let out = out_path("mixed", "mp4");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
-    let err = wait(&handle, Duration::from_secs(120)).expect_err("mp4 cannot mix");
-    println!("mp4 refusal: {err}");
-    assert!(err.to_string().contains("2 audio lanes"), "{err}");
-    assert!(!out.exists(), "a refused export leaves no file");
+    wait(&handle, Duration::from_secs(180)).expect("an mp4 of two audio lanes");
+    let (audio, chunks) = engine::AudioSession::open(&out)
+        .expect("reopen the export")
+        .expect("it has an audio track");
+    let coded: Vec<f64> = chunks
+        .into_iter()
+        .flat_map(|c| c.samples)
+        .map(|s| f64::from(s) * f64::from(i16::MAX))
+        .collect();
+    let per = f64::from(audio.sample_rate) / FPS * f64::from(audio.channels);
+    let window = |from: u32, to: u32| {
+        let (a, b) = (
+            (f64::from(from) * per) as usize,
+            (f64::from(to) * per) as usize,
+        );
+        let w = &coded[a.min(coded.len())..b.min(coded.len())];
+        (w.iter().map(|s| s * s).sum::<f64>() / w.len().max(1) as f64).sqrt()
+    };
+    let (coded_over, coded_out) = (
+        window(TOP_IN + 5, TOP_OUT - 5),
+        window(TOP_OUT + 5, TOTAL - 5),
+    );
+    println!("mp4 rms: under A2 {coded_over:.1}, past it {coded_out:.1}");
+    // Against the WAV of the same timeline, not against a figure: one lossy
+    // generation moves the level by a fraction of a dB and nothing here is
+    // measuring the encoder.
+    assert!(
+        (coded_over / over_two - 1.0).abs() < 0.1,
+        "the mp4's overlap is {coded_over:.1} against the mix's {over_two:.1}"
+    );
+    assert!(
+        (coded_out / out_two - 1.0).abs() < 0.1,
+        "past A2 the mp4 is {coded_out:.1} against the mix's {out_two:.1}"
+    );
+    std::fs::remove_file(&out).unwrap();
 }
 
 /// A project with one lane of each kind is what it always was: the composite of
