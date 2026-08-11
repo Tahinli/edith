@@ -208,6 +208,25 @@ fn a_still_trims_out_to_its_cap_and_no_further() {
     // ...and back in, which is the half a five-second title card actually uses.
     assert!(session.trim_clip(Lane::V1, 0, Edge::End, clip.start + 60));
     assert_eq!(session.lane_clips(Lane::V1)[0].len(), 60);
+
+    // The *head* is the same story from the other side: a still has no first
+    // frame to walk an in-point back to, so its left edge stretches out to the
+    // same cap. Pulled in first, since a clip at frame 0 has nowhere to go.
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 20));
+    let clip = session.lane_clips(Lane::V1)[0];
+    assert_eq!((clip.start, clip.len()), (20, 40));
+    assert_eq!(
+        session.trim_room(Lane::V1, 0, Edge::Start),
+        Some((0, clip.end() - 1)),
+        "out to frame 0: the cap is further off than the timeline reaches"
+    );
+    assert!(session.trim_clip(Lane::V1, 0, Edge::Start, 0), "dragged out");
+    let clip = session.lane_clips(Lane::V1)[0];
+    assert_eq!(
+        (clip.start, clip.in_frame, clip.len()),
+        (0, 0, 60),
+        "longer by what the head took, and still read from the first frame"
+    );
 }
 
 /// The *clipboard* door, which is the second way a clip picks its lanes and
@@ -338,6 +357,95 @@ fn a_still_survives_the_project_round_trip() {
             "the refusal says what it is: {refused}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The save renumbers sources by first use, so a still at the head of `V1`
+/// comes back as **source 0** however the session was scaffolded -- and source
+/// 0 is what everything used to read the timeline off. A picture defines no
+/// frame rate and has no sound, so the reload used to read this project as 30
+/// fps (refusing the 25 fps footage still on `A1` by name) and open the output
+/// device on a PNG (a timeline that plays silent although its clips have
+/// sound). Nothing may assume what source 0 *is*: the rate comes from the first
+/// source that has one, and the sound from the first that could have any.
+#[test]
+fn a_still_at_saved_source_zero_keeps_the_rate_and_the_sound() {
+    pin_software();
+    let dir = std::env::temp_dir().join(format!("ve_still_first_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let media = dir.join("test_25fps.mp4");
+    let still = dir.join("test_still.png");
+    std::fs::copy(asset("test_25fps.mp4"), &media).expect("copy the video");
+    std::fs::copy(asset("test_still.png"), &still).expect("copy the still");
+
+    // 25 fps, which no still is ever given: the rate alone says which source
+    // the reload scaffolded from.
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    assert!((session.meta().frame_rate - 25.0).abs() < 0.01);
+    session.import(&still).expect("a picture");
+    // Over the head of V1, where it takes the whole take's picture: the sound
+    // stays on A1, so the still is the first clip in save order and the video
+    // is a source only the audio lane names.
+    assert!(
+        session
+            .place_stream_at(0.0, &still, 0, Some(Lane::V1))
+            .expect("a still joins any timeline")
+    );
+    assert!(session.lane_clips(Lane::V1).len() == 1 && session.lane_clips(Lane::A1).len() == 1);
+
+    let project = dir.join("still_first.edith");
+    session.save_project(&project).expect("save");
+    let text = std::fs::read_to_string(&project).expect("read the project");
+    let source_0 = text
+        .lines()
+        .find(|l| l.starts_with("source "))
+        .expect("a source line");
+    assert!(
+        source_0.contains("test_still.png"),
+        "the premise: the save put the still at index 0 -- {source_0}"
+    );
+
+    let reopened = PlaybackSession::open_project(&project).expect("a saved project always reopens");
+    assert!(
+        (reopened.meta().frame_rate - 25.0).abs() < 0.01,
+        "the footage's rate, not the still's 30: {}",
+        reopened.meta().frame_rate
+    );
+    // The same sound, at the same place, playing the same file -- by a *new*
+    // index, which is the renumbering this whole test is about.
+    let (sound, was) = (
+        reopened.lane_clips(Lane::A1)[0],
+        session.lane_clips(Lane::A1)[0],
+    );
+    assert_eq!(
+        (sound.start, sound.in_frame, sound.out_frame),
+        (was.start, was.in_frame, was.out_frame)
+    );
+    assert!(
+        reopened.sources()[sound.source]
+            .path
+            .ends_with("test_25fps.mp4"),
+        "the take's sound still names the video"
+    );
+    assert!(
+        reopened.audio_disabled_reason().is_none(),
+        "a still is not a reason a timeline is silent: {:?}",
+        reopened.audio_disabled_reason()
+    );
+    // And the sound itself, through the very opener a seek builds its worker
+    // with: source 0 is the PNG here, and one opened unconditionally is an
+    // error that takes every lane's audio down with it.
+    let sources: Vec<_> = reopened
+        .sources()
+        .iter()
+        .map(|s| (s.path.clone(), s.audio_stream))
+        .collect();
+    let (meta, _rx) = engine::AudioSession::open_multi_streams(&sources, &[(Some(1), 0.0, 1.0)])
+        .expect("the worker opens over a still at index 0")
+        .expect("the take on A1 has sound");
+    assert_eq!(meta.sample_rate, 44_100, "the take's own rate");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

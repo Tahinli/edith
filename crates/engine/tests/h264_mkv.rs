@@ -131,13 +131,19 @@ fn opening_an_h264_matroska_file_shows_frames() {
     );
 }
 
-/// The delivered scope, unchanged by this arm: a Matroska file's *sound* is
-/// still not read, and the notice names the track rather than half-playing it.
+/// The sound comes with it: a Matroska file's audio is read whatever its picture
+/// is coded with, so nothing is left for the "cannot be decoded" notice to name.
 #[test]
-fn matroska_audio_is_still_not_wired_and_says_so() {
-    let reason = AudioSession::unsupported(&asset("test_h264.mkv"))
-        .expect("unsupported")
-        .expect("the fixture has an AAC track to name");
-    assert!(reason.contains("A_AAC"), "{reason}");
-    assert!(reason.contains("not wired"), "{reason}");
+fn the_matroska_audio_path_takes_this_file_too() {
+    let stereo = AudioSession::probe(asset("test_h264.mkv"), 0)
+        .expect("probe")
+        .expect("the fixture has an AAC track");
+    assert_eq!((stereo.sample_rate, stereo.channels), (44_100, 2));
+    // ...and it really opens, which is what says the sound plays rather than
+    // merely being described.
+    assert!(
+        AudioSession::open(asset("test_h264.mkv"))
+            .expect("open")
+            .is_some()
+    );
 }
