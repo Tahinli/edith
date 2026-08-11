@@ -131,6 +131,148 @@ impl ColorDescription {
     }
 }
 
+/// How bright a stream's pictures actually get, in cd/m^2 ("nits"), as the grade
+/// declared them. Absent from everything but HDR, which is why every field is an
+/// [`Option`] and why [`Default`] is all-[`None`]: an SDR file says nothing here
+/// and a tone map handed nothing must fall back to its assumed constant rather
+/// than to a zero.
+///
+/// Two different claims, which is why there are four numbers. `max_cll`/
+/// `max_fall` measure the *content* -- the brightest pixel anywhere in the
+/// stream, and the brightest frame average -- while the mastering pair describes
+/// the *display the grade was approved on*, which is a ceiling the film may
+/// never come near.
+///
+/// Parsed at open by both demuxers ([`crate::demux::Demuxer::light`]); nothing
+/// reads it yet. [`crate::tonemap`] is where it belongs, and wiring it there is
+/// its own change.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ContentLight {
+    /// MaxCLL: the brightest single pixel in the whole stream.
+    pub max_cll: Option<f32>,
+    /// MaxFALL: the brightest frame-average light level in the whole stream.
+    pub max_fall: Option<f32>,
+    /// The mastering display's peak white.
+    pub mastering_max: Option<f32>,
+    /// The mastering display's black, which is a hundredth of a nit or less on
+    /// the displays these grades are approved on.
+    pub mastering_min: Option<f32>,
+}
+
+impl ContentLight {
+    /// The peak a tone map should roll off from, or [`None`] for a file that
+    /// declared neither and has to be assumed at.
+    ///
+    /// MaxCLL first, and the order matters: it is the brightest pixel *in this
+    /// film*, measured over the finished encode. The mastering display's peak is
+    /// only the brightest thing the colourist *could* have used -- a film graded
+    /// on a 4000 nit display whose own brightest pixel is 600 comes out crushed
+    /// if that ceiling is believed instead of the measurement.
+    pub fn peak(self) -> Option<f32> {
+        self.max_cll.or(self.mastering_max)
+    }
+
+    /// Field-wise fallback, as [`Tags::over`] is for the colour tags: `self` is
+    /// the container's word and `under` the bitstream's. Per field rather than
+    /// per file because a remuxer that rewrote MaxCLL and dropped the mastering
+    /// block is a file that exists.
+    pub fn over(self, under: Self) -> Self {
+        Self {
+            max_cll: self.max_cll.or(under.max_cll),
+            max_fall: self.max_fall.or(under.max_fall),
+            mastering_max: self.mastering_max.or(under.mastering_max),
+            mastering_min: self.mastering_min.or(under.mastering_min),
+        }
+    }
+}
+
+/// A `MasteringDisplayColourVolume` payload: eight 16-bit chromaticities (green,
+/// blue, red -- that order -- then the white point) and the two luminances, in
+/// ten-thousandths of a nit. An mp4 `mdcv` box and an HEVC
+/// `mastering_display_colour_volume` SEI are these same 24 bytes, so one reader
+/// serves both; Matroska writes the same numbers as EBML floats instead and is
+/// read where it is walked.
+///
+/// The chromaticities are read past: what a tone map wants is the luminance
+/// pair, and the display's gamut is not something this engine can act on.
+/// A zero luminance is "not stated", which is what ffmpeg writes when it has
+/// nothing -- believing it would tell a tone map the film peaks at black.
+pub(crate) fn mdcv(payload: &[u8]) -> ContentLight {
+    let luminance = |at: usize| -> Option<f32> {
+        let raw = u32::from_be_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        Some(raw as f32 * 1e-4).filter(|v| *v > 0.0)
+    };
+    ContentLight {
+        mastering_max: luminance(16),
+        mastering_min: luminance(20),
+        ..ContentLight::default()
+    }
+}
+
+/// A `ContentLightLevel` payload: MaxCLL then MaxFALL, whole nits, 16 bits each.
+/// An mp4 `clli` box and an HEVC `content_light_level_info` SEI, again the same
+/// four bytes. Zero is "not stated" here too.
+pub(crate) fn clli(payload: &[u8]) -> ContentLight {
+    let level = |at: usize| -> Option<f32> {
+        let raw = u16::from_be_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+        Some(f32::from(raw)).filter(|v| *v > 0.0)
+    };
+    ContentLight {
+        max_cll: level(0),
+        max_fall: level(2),
+        ..ContentLight::default()
+    }
+}
+
+/// The two HDR SEI messages of one Annex-B access unit. The tier below the
+/// container, and for a web rip the *only* tier: the encoder writes these ahead
+/// of every keyframe, and a muxer that never carried them into `Colour`/`mdcv`
+/// leaves them as the one place the film's real peak still exists (which is
+/// exactly what the 2160p HEVC rips this was read against do).
+pub fn hevc_sei_light(annex_b: &[u8]) -> ContentLight {
+    let mut light = ContentLight::default();
+    for nal in nal_units(annex_b) {
+        // 39 prefix SEI, 40 suffix SEI, and the HEVC NAL header is two bytes.
+        if nal.len() <= 2 || !matches!((nal[0] >> 1) & 0x3f, 39 | 40) {
+            continue;
+        }
+        let sei = rbsp(&nal[2..]);
+        let mut at = 0;
+        // sei_message() (H.265 §7.3.5): payload type and size are each a run of
+        // 0xff bytes plus a final smaller one. The trailing 0x80 of the RBSP
+        // reads as a type with no size behind it, which ends the walk.
+        while let (Some(kind), Some(size)) = (sei_value(&sei, &mut at), sei_value(&sei, &mut at)) {
+            let Some(payload) = sei.get(at..at + size) else {
+                break;
+            };
+            at += size;
+            match kind {
+                137 => light = light.over(mdcv(payload)),
+                144 => light = light.over(clli(payload)),
+                _ => {}
+            }
+        }
+    }
+    light
+}
+
+/// One `ff`-extended SEI count, advancing `at` past it. [`None`] at the end of
+/// the message and for a run long enough to be garbage rather than a value.
+fn sei_value(sei: &[u8], at: &mut usize) -> Option<usize> {
+    let mut value = 0usize;
+    loop {
+        let &byte = sei.get(*at)?;
+        *at += 1;
+        value += usize::from(byte);
+        if byte != 0xff {
+            return Some(value);
+        }
+        if value > 1 << 16 {
+            return None;
+        }
+    }
+}
+
 /// Rewrites planar 4:2:0 samples coded against `from` as the same picture coded
 /// against `to`, in place. Both spaces here are limited range with the same
 /// primaries, so this is the matrix and nothing else: no gamut mapping, no range
@@ -1266,5 +1408,194 @@ mod tests {
         assert!(worst(&y, &ry) <= 2, "luma drifted by {}", worst(&y, &ry));
         assert!(worst(&u, &ru) <= 2, "cb drifted by {}", worst(&u, &ru));
         assert!(worst(&v, &rv) <= 2, "cr drifted by {}", worst(&v, &rv));
+    }
+
+    /// The grade `scripts/gen_fixtures.sh` writes into all three HDR fixtures:
+    /// MaxCLL 1000, MaxFALL 400, a 1000 nit mastering display down to 0.005.
+    const GRADE: ContentLight = ContentLight {
+        max_cll: Some(1000.0),
+        max_fall: Some(400.0),
+        mastering_max: Some(1000.0),
+        mastering_min: Some(0.005),
+    };
+
+    /// Nits, compared the way three different encodings of them allow: Matroska
+    /// writes 0.005 as a double and both mp4 and the SEI write 50 ten-thousandths
+    /// of a nit, and those do not land on the same `f32`.
+    #[track_caller]
+    fn same_light(got: ContentLight, want: ContentLight) {
+        let close = |a: Option<f32>, b: Option<f32>| match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() <= b.abs() * 1e-4,
+            (a, b) => a == b,
+        };
+        assert!(
+            close(got.max_cll, want.max_cll)
+                && close(got.max_fall, want.max_fall)
+                && close(got.mastering_max, want.mastering_max)
+                && close(got.mastering_min, want.mastering_min),
+            "{got:?} is not {want:?}"
+        );
+    }
+
+    fn light_of(name: &str) -> ContentLight {
+        let (_, demuxer) =
+            Demuxer::open(&asset(name)).unwrap_or_else(|e| panic!("open {name}: {e}"));
+        demuxer.light()
+    }
+
+    /// The container tier, both containers: Matroska's `MaxCLL`/`MaxFALL` beside
+    /// its `MasteringMetadata` floats, and an mp4's `clli`/`mdcv` beside its
+    /// `colr`. Same grade in, same four numbers out.
+    #[test]
+    fn the_containers_carry_the_grades_brightness() {
+        same_light(light_of("test_hdr_meta.mkv"), GRADE);
+        same_light(light_of("test_hdr_meta.mp4"), GRADE);
+        assert_eq!(light_of("test_hdr_meta.mkv").peak(), Some(1000.0));
+    }
+
+    /// The bitstream tier, which is the only one a web rip has: test_hdr_sei.mkv
+    /// is the x265 encode before the transcode that gave the other two their
+    /// container elements -- its `Colour` element stops at the code points, and
+    /// every one of these numbers comes out of the first access unit's SEI.
+    #[test]
+    fn an_sei_answers_for_a_container_that_says_nothing() {
+        same_light(light_of("test_hdr_sei.mkv"), GRADE);
+    }
+
+    /// ...and a file that carries neither tier says so, rather than reporting a
+    /// zero peak that would tell a tone map the picture never leaves black.
+    #[test]
+    fn an_sdr_file_declares_no_brightness_at_all() {
+        assert_eq!(light_of("test_av.mp4"), ContentLight::default());
+        assert_eq!(light_of("test_av1.mkv"), ContentLight::default());
+        assert_eq!(ContentLight::default().peak(), None);
+    }
+
+    /// The number a tone map will ask for. MaxCLL is the film's own measured
+    /// peak and wins; the mastering display is the fallback, and a grade that
+    /// stated only the display is still worth more than an assumed constant.
+    #[test]
+    fn the_peak_is_the_measured_light_before_the_display_it_was_graded_on() {
+        assert_eq!(GRADE.peak(), Some(1000.0));
+        let display_only = ContentLight {
+            max_cll: None,
+            ..GRADE
+        };
+        assert_eq!(display_only.peak(), Some(1000.0), "the mastering display");
+        let measured = ContentLight {
+            max_cll: Some(600.0),
+            mastering_max: Some(4000.0),
+            ..ContentLight::default()
+        };
+        assert_eq!(
+            measured.peak(),
+            Some(600.0),
+            "600 nits of content, not 4000"
+        );
+        // The tier fallback: field by field, container over bitstream.
+        let container = ContentLight {
+            max_cll: Some(1200.0),
+            ..ContentLight::default()
+        };
+        assert_eq!(
+            container.over(measured),
+            ContentLight {
+                max_cll: Some(1200.0),
+                mastering_max: Some(4000.0),
+                ..ContentLight::default()
+            }
+        );
+    }
+
+    /// The SEI walk on bytes rather than on a file: a `mastering_display_colour_volume`
+    /// (137) and a `content_light_level_info` (144) in one prefix SEI NAL, with
+    /// an emulation-prevention byte inside the mastering payload -- which is not
+    /// hypothetical, a 0.005 nit minimum *is* `00 00 00 32` before escaping.
+    #[test]
+    fn the_sei_walk_reads_past_an_emulation_prevention_byte() {
+        let mut mastering = Vec::new();
+        for coordinate in [8500u16, 39850, 6550, 2300, 35400, 14600, 15635, 16450] {
+            mastering.extend_from_slice(&coordinate.to_be_bytes());
+        }
+        mastering.extend_from_slice(&10_000_000u32.to_be_bytes()); // 1000 nits
+        mastering.extend_from_slice(&50u32.to_be_bytes()); // 0.005 nits
+        let mut nal = vec![39 << 1, 1]; // prefix SEI, temporal id 1
+        nal.extend_from_slice(&[137, 24]);
+        // 00 00 00 32 is escaped into 00 00 03 00 32 by any encoder that writes
+        // it, and the reader has to undo that or the luminances land a byte out.
+        let mut escaped = Vec::new();
+        let mut zeros = 0;
+        for &byte in &mastering {
+            if zeros == 2 && byte <= 3 {
+                escaped.push(3);
+                zeros = 0;
+            }
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+            escaped.push(byte);
+        }
+        assert!(
+            escaped.len() > mastering.len(),
+            "the payload needed escaping"
+        );
+        nal.extend_from_slice(&escaped);
+        nal.extend_from_slice(&[144, 4, 0x03, 0xe8, 0x01, 0x90]); // 1000 / 400
+        nal.push(0x80); // rbsp_trailing_bits
+        let mut annex_b = vec![0, 0, 0, 1];
+        annex_b.extend_from_slice(&nal);
+        same_light(hevc_sei_light(&annex_b), GRADE);
+
+        // Nothing to find is not a failure: a keyframe with no SEI at all, and a
+        // truncated message, both come back empty rather than reading garbage.
+        assert_eq!(
+            hevc_sei_light(&[0, 0, 0, 1, 0x26, 0x01, 0xAA]),
+            ContentLight::default()
+        );
+        assert_eq!(
+            hevc_sei_light(&[0, 0, 0, 1, 39 << 1, 1, 144, 4, 0x03]),
+            ContentLight::default()
+        );
+    }
+
+    /// Zero is what a muxer writes for "I was not told", in every one of the
+    /// three encodings -- and it must not read back as a film that peaks at
+    /// black.
+    #[test]
+    fn an_unstated_brightness_is_absent_and_not_a_zero() {
+        assert_eq!(clli(&[0, 0, 0, 0]), ContentLight::default());
+        assert_eq!(mdcv(&[0u8; 24]), ContentLight::default());
+        // ...and a box shorter than its own syntax is absent too.
+        assert_eq!(clli(&[0x03]), ContentLight::default());
+        assert_eq!(mdcv(&[0u8; 16]), ContentLight::default());
+    }
+
+    /// The real thing: a 4K HDR10 web rip, whose grade lives *only* in the
+    /// bitstream -- its `Colour` element is four code points and stops. The
+    /// numbers are what ffprobe reports for the same file (`Content light level
+    /// metadata` 1759/202, `Mastering display metadata` 10000000/10000 down to
+    /// 50/10000). Skipped, loudly, on a machine without the film.
+    #[test]
+    fn a_real_hdr_film_reports_the_peak_ffprobe_reports() {
+        let film = Path::new(
+            "/path/to/a-real-4k-hdr10-film.mkv",
+        );
+        if !film.exists() {
+            eprintln!("skipped: {} is not on this machine", film.display());
+            return;
+        }
+        let (_, demuxer) = Demuxer::open(film).expect("open the film");
+        same_light(
+            demuxer.light(),
+            ContentLight {
+                max_cll: Some(1759.0),
+                max_fall: Some(202.0),
+                mastering_max: Some(1000.0),
+                mastering_min: Some(0.005),
+            },
+        );
+        assert_eq!(
+            demuxer.light().peak(),
+            Some(1759.0),
+            "the film's own peak, not the 1000 nit display it was graded on"
+        );
     }
 }

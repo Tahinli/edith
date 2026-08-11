@@ -19,7 +19,7 @@ use std::path::Path;
 use mp4::{MediaType, Mp4Reader, Mp4Track, TrackType};
 
 use crate::audio::{edit_media_time, packet_at, stts_pairs};
-use crate::colorspace::{ColorDescription, Tags, bitstream_tags};
+use crate::colorspace::{ColorDescription, ContentLight, Tags, bitstream_tags};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
@@ -80,12 +80,58 @@ pub enum Demuxer {
 
 impl Demuxer {
     pub fn open(path: &Path) -> crate::Result<(VideoMeta, Self)> {
-        if is_matroska(path) {
+        let (meta, mut demuxer) = if is_matroska(path) {
             let (meta, mkv) = MkvDemuxer::open(path)?;
-            return Ok((meta, Self::Mkv(mkv)));
+            (meta, Self::Mkv(mkv))
+        } else {
+            let (meta, mp4) = Mp4Demuxer::open(path)?;
+            (meta, Self::Mp4(mp4))
+        };
+        demuxer.fill_sei_light();
+        Ok((meta, demuxer))
+    }
+
+    /// What the file says about how bright its pictures get, [`ContentLight`],
+    /// read at open out of the container and -- for an HEVC stream whose
+    /// container said nothing -- out of the first access unit's SEI.
+    ///
+    /// Not part of [`VideoMeta`] for the reason [`Self::bit_depth`] is not:
+    /// nothing above reads it yet. [`crate::tonemap`] is where it goes, and that
+    /// is a change of its own.
+    pub fn light(&self) -> ContentLight {
+        match self {
+            Self::Mp4(d) => d.light,
+            Self::Mkv(d) => d.light,
         }
-        let (meta, mp4) = Mp4Demuxer::open(path)?;
-        Ok((meta, Self::Mp4(mp4)))
+    }
+
+    /// The bitstream tier of [`Self::light`]: an HEVC encoder writes the film's
+    /// peak into an SEI ahead of every keyframe, and a container that carried
+    /// none of it -- a web rip's Matroska, which tags the curve and stops there
+    /// -- leaves that SEI as the only place the grade still exists.
+    ///
+    /// One access unit is read for it and the cursor put back where it opened,
+    /// and only when the container said nothing at all: a file that spoke is
+    /// believed whole rather than half-read, which is what keeps this off the
+    /// cost of every open.
+    fn fill_sei_light(&mut self) {
+        let (codec, light) = match self {
+            Self::Mp4(d) => (d.codec, d.light),
+            Self::Mkv(d) => (d.codec, d.light),
+        };
+        if codec != Codec::Hevc || light != ContentLight::default() {
+            return;
+        }
+        let first = self.next_access_unit();
+        self.seek_to_sync_at_or_before(0);
+        let Ok(Some(au)) = first else {
+            return;
+        };
+        let found = light.over(crate::colorspace::hevc_sei_light(&au));
+        match self {
+            Self::Mp4(d) => d.light = found,
+            Self::Mkv(d) => d.light = found,
+        }
     }
 
     /// Next access unit in decode order, `None` at end of track.
@@ -153,6 +199,8 @@ pub struct Mp4Demuxer {
     next_sample: u32,
     /// Bits per luma sample; see [`Demuxer::bit_depth`].
     bit_depth: u8,
+    /// How bright the track says it gets; see [`Demuxer::light`].
+    light: ContentLight,
 }
 
 impl Mp4Demuxer {
@@ -287,6 +335,7 @@ impl Mp4Demuxer {
                 sync_samples,
                 next_sample,
                 bit_depth,
+                light: mp4_light(path, track_id),
             },
         ))
     }
@@ -382,6 +431,8 @@ pub struct MkvDemuxer {
     nal_length: usize,
     /// Bits per luma sample; see [`Demuxer::bit_depth`].
     bit_depth: u8,
+    /// How bright the track says it gets; see [`Demuxer::light`].
+    light: ContentLight,
     /// One block's bytes, reused across access units: a 4K HEVC keyframe is a
     /// megabyte and it is reframed, not handed over, so the read needs a
     /// landing place of its own.
@@ -472,6 +523,7 @@ impl MkvDemuxer {
                 config: video.config,
                 nal_length: video.nal_length,
                 bit_depth: video.bit_depth,
+                light: video.light,
                 scratch: Vec::new(),
                 next: 0,
                 unpack: video.unpack,
@@ -533,7 +585,10 @@ impl MkvDemuxer {
 /// by symphonia, or by the Dolby decoder where it is AC-3 ([`MkvAudio`]), and
 /// this exists to say which codec neither of them took.
 pub fn matroska_audio_codec(path: &Path) -> crate::Result<Option<String>> {
-    Ok(matroska_audio_tracks(path)?.into_iter().next().map(|t| t.codec))
+    Ok(matroska_audio_tracks(path)?
+        .into_iter()
+        .next()
+        .map(|t| t.codec))
 }
 
 /// One audio `TrackEntry` of a Matroska file, as the header describes it.
@@ -690,6 +745,9 @@ struct MkvVideo {
     height: u32,
     /// What the track's `Colour` element declared, empty when it has none.
     tags: Tags,
+    /// What that same element said about brightness (MaxCLL and the mastering
+    /// display), likewise empty when it said nothing.
+    light: ContentLight,
     default_duration: Option<u64>,
     timestamp_scale: u64,
     codec: Codec,
@@ -831,6 +889,15 @@ const COLOUR: u32 = 0x55B0;
 const MATRIX_COEFFICIENTS: u32 = 0x55B1;
 const RANGE: u32 = 0x55B9;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+// ...and how bright it says its pictures get: two whole-nit integers beside the
+// code points, and a `MasteringMetadata` container whose ten children are EBML
+// *floats* -- eight chromaticities nothing here reads and the two luminances it
+// does. Byte-verified the same way, against an ffmpeg-written HDR fixture.
+const MAX_CLL: u32 = 0x55BC;
+const MAX_FALL: u32 = 0x55BD;
+const MASTERING_METADATA: u32 = 0x55D0;
+const LUMINANCE_MAX: u32 = 0x55D9;
+const LUMINANCE_MIN: u32 = 0x55DA;
 const TRACK_LANGUAGE: u32 = 0x22B59C;
 const TRACK_NAME: u32 = 0x536E;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
@@ -934,6 +1001,7 @@ fn mkv_track_entry(
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
     let (mut language, mut name) = (String::new(), String::new());
     let mut tags = Tags::default();
+    let mut light = ContentLight::default();
     let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
@@ -971,6 +1039,33 @@ fn mkv_track_entry(
                                         transfer = ebml_uint(file, c.1, c.2)?
                                     }
                                     RANGE => range = ebml_uint(file, c.1, c.2)?,
+                                    MAX_CLL => {
+                                        light.max_cll = nits(ebml_uint(file, c.1, c.2)? as f64)
+                                    }
+                                    MAX_FALL => {
+                                        light.max_fall = nits(ebml_uint(file, c.1, c.2)? as f64)
+                                    }
+                                    MASTERING_METADATA => {
+                                        let mut at = c.1;
+                                        while let Some(m) = ebml_element(file, at, c.2)? {
+                                            match m.0 {
+                                                LUMINANCE_MAX => {
+                                                    light.mastering_max =
+                                                        nits(ebml_float(file, m.1, m.2)?)
+                                                }
+                                                LUMINANCE_MIN => {
+                                                    light.mastering_min =
+                                                        nits(ebml_float(file, m.1, m.2)?)
+                                                }
+                                                // The eight chromaticities: the
+                                                // display's gamut, which this
+                                                // engine cannot act on. Walked
+                                                // past, never refused.
+                                                _ => {}
+                                            }
+                                            at = m.2;
+                                        }
+                                    }
                                     _ => {}
                                 }
                                 at = c.2;
@@ -1029,6 +1124,7 @@ fn mkv_track_entry(
         width,
         height,
         tags,
+        light,
         default_duration,
         timestamp_scale,
         codec,
@@ -1241,7 +1337,11 @@ fn mkv_lace(file: &mut File, block: &BlockHeader) -> crate::Result<Vec<(u64, usi
     let head_len = (1 + 256 * 9).min(block.len);
     let mut head = vec![0u8; head_len];
     read_exact_at(file, block.at, &mut head)?;
-    let count = usize::from(*head.first().ok_or("a laced Matroska block with no frames")?) + 1;
+    let count = usize::from(
+        *head
+            .first()
+            .ok_or("a laced Matroska block with no frames")?,
+    ) + 1;
     let short = || crate::Error::from("a Matroska lace header past the end of its block");
     // The cursor into the lace header, which is where the frames start once the
     // sizes have been read.
@@ -1293,9 +1393,10 @@ fn mkv_lace(file: &mut File, block: &BlockHeader) -> crate::Result<Vec<(u64, usi
     let mut frames = Vec::with_capacity(count);
     let mut off = block.at + at as u64;
     for size in sizes {
-        let stop = off.checked_add(size as u64).filter(|&s| s <= end).ok_or(
-            "a Matroska lace whose frame sizes run past the end of its block",
-        )?;
+        let stop = off
+            .checked_add(size as u64)
+            .filter(|&s| s <= end)
+            .ok_or("a Matroska lace whose frame sizes run past the end of its block")?;
         frames.push((off, size));
         off = stop;
     }
@@ -1390,6 +1491,25 @@ fn ebml_uint(file: &mut File, body: u64, stop: u64) -> crate::Result<u64> {
     Ok(ebml_bytes(file, body, stop)?
         .iter()
         .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+}
+
+/// An EBML float element: IEEE big-endian, 4 or 8 bytes wide (a Matroska muxer
+/// writes the luminances as doubles). Zero for any other width, which is what an
+/// absent one is by spec and what [`nits`] then reads as "not stated".
+fn ebml_float(file: &mut File, body: u64, stop: u64) -> crate::Result<f64> {
+    let bytes = ebml_bytes(file, body, stop)?;
+    Ok(match bytes.len() {
+        4 => f64::from(f32::from_be_bytes(bytes[..4].try_into().unwrap())),
+        8 => f64::from_be_bytes(bytes[..8].try_into().unwrap()),
+        _ => 0.0,
+    })
+}
+
+/// A brightness a container stated, or [`None`] when it stated zero -- which is
+/// what a muxer writes for "unknown" and what a tone map must not read as a film
+/// that peaks at black.
+fn nits(value: f64) -> Option<f32> {
+    (value > 0.0).then_some(value as f32)
 }
 
 /// The payload of an element, which is only ever a header field here -- 8 bytes
@@ -1556,6 +1676,27 @@ fn colr_tags(path: &Path, track_id: u32) -> Option<Tags> {
         _ => 0,
     };
     Some(Tags::from_codes(code(8)?, code(6)?, range))
+}
+
+/// The `clli` and `mdcv` boxes of `track_id`'s sample entry: what an mp4 says
+/// about how bright its pictures get, beside the `colr` that says what their
+/// numbers mean. Neither is a FullBox -- their payloads are the HEVC SEI
+/// messages of the same names, byte for byte, and are read by the same pair of
+/// readers ([`crate::colorspace::clli`], [`crate::colorspace::mdcv`]).
+///
+/// Empty rather than an error for the files that carry neither, which is every
+/// SDR mp4 there is.
+fn mp4_light(path: &Path, track_id: u32) -> ContentLight {
+    let Ok((_, entry)) = sample_entry(path, track_id) else {
+        return ContentLight::default();
+    };
+    // Behind the same fixed 78-byte VisualSampleEntry header `colr` sits behind.
+    let entry = entry.get(78..).unwrap_or_default();
+    let levels = child(entry, b"clli").map(crate::colorspace::clli);
+    let mastering = child(entry, b"mdcv").map(crate::colorspace::mdcv);
+    levels
+        .unwrap_or_default()
+        .over(mastering.unwrap_or_default())
 }
 
 /// The four-character code of `track_id`'s first `stsd` sample entry and that
@@ -1800,9 +1941,7 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
     // The tracks something reads: see `MkvSubtitle::cues`.
     let wanted: Vec<u64> = tracks
         .iter()
-        .filter(|t| {
-            (t.codec.starts_with("S_TEXT") || t.codec == PGS) && t.unsupported.is_none()
-        })
+        .filter(|t| (t.codec.starts_with("S_TEXT") || t.codec == PGS) && t.unsupported.is_none())
         .map(|t| t.number)
         .collect();
     if !wanted.is_empty() {
