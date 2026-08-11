@@ -422,46 +422,57 @@ fn an_hdr_clip_is_tone_mapped_before_it_is_graded() {
         brightness: 0.25,
         ..Default::default()
     };
-    let mut session = two_frames(&source);
-    assert!(
-        session.set_color(engine::project::Lane::V1, 0, Some(grade)),
-        "the grade went on the clip"
-    );
-    let out = out_path("hdr_order", "mp4");
-    export(&session, &out, Format::Mp4);
-    let got = raw_yuv(&out).expect("ffmpeg read the export");
+    // Under both the default rendition and a picked one: an export that built
+    // its tables from anything but the project's own preset would sit on the
+    // wrong reference for the second pass, which is the whole preview-equals-
+    // export claim ([`tonemap::Preset`]).
+    for preset in [tonemap::Preset::default(), tonemap::Preset::Vivid] {
+        let mut session = two_frames(&source);
+        assert!(
+            session.set_color(engine::project::Lane::V1, 0, Some(grade)),
+            "the grade went on the clip"
+        );
+        assert_eq!(
+            session.set_tone(preset),
+            preset != tonemap::Preset::default(),
+            "picking {preset:?}"
+        );
+        let out = out_path("hdr_order", "mp4");
+        export(&session, &out, Format::Mp4);
+        let got = raw_yuv(&out).expect("ffmpeg read the export");
 
-    let (width, height) = (1280usize, 720usize);
-    let mapper = ToneMapper::new(tonemap::Transfer::Pq);
-    // The same bytes twice, through the two orders. Whichever way MASTER_NITS is
-    // set, both sides move with it -- what is asserted is which of them the
-    // export sits on, not where either lands.
-    let both = [true, false].map(|tone_first| {
-        let mut planes = src.clone();
-        let (y, chroma) = planes.split_at_mut(width * height);
-        let (u, v) = chroma.split_at_mut(width * height / 4);
-        if tone_first {
-            mapper.map(y, u, v, width, height);
-            engine::color::apply_yuv(&grade, y, u, v);
-        } else {
-            engine::color::apply_yuv(&grade, y, u, v);
-            mapper.map(y, u, v, width, height);
-        }
-        planes
-    });
-    let [ordered, swapped] = both.map(|planes| mean_abs_diff(&got, &planes));
-    eprintln!(
-        "HDR export: {ordered:.2} off tone-map-then-grade, {swapped:.2} off the swapped order"
-    );
-    assert!(
-        ordered < 3.0,
-        "the export is {ordered:.2} codes from tone-map-then-grade"
-    );
-    assert!(
-        swapped > 3.0 * ordered,
-        "ordered {ordered:.2} vs swapped {swapped:.2}: the two orders are not far enough apart to have measured anything"
-    );
-    std::fs::remove_file(&out).unwrap();
+        let (width, height) = (1280usize, 720usize);
+        let mapper = ToneMapper::new(tonemap::Transfer::Pq, preset);
+        // The same bytes twice, through the two orders. Whichever preset is in
+        // force, both sides move with it -- what is asserted is which of them
+        // the export sits on, not where either lands.
+        let both = [true, false].map(|tone_first| {
+            let mut planes = src.clone();
+            let (y, chroma) = planes.split_at_mut(width * height);
+            let (u, v) = chroma.split_at_mut(width * height / 4);
+            if tone_first {
+                mapper.map(y, u, v, width, height);
+                engine::color::apply_yuv(&grade, y, u, v);
+            } else {
+                engine::color::apply_yuv(&grade, y, u, v);
+                mapper.map(y, u, v, width, height);
+            }
+            planes
+        });
+        let [ordered, swapped] = both.map(|planes| mean_abs_diff(&got, &planes));
+        eprintln!(
+            "HDR export ({preset:?}): {ordered:.2} off tone-map-then-grade, {swapped:.2} off the swapped order"
+        );
+        assert!(
+            ordered < 3.0,
+            "{preset:?}: the export is {ordered:.2} codes from tone-map-then-grade"
+        );
+        assert!(
+            swapped > 3.0 * ordered,
+            "{preset:?}: ordered {ordered:.2} vs swapped {swapped:.2}: the two orders are not far enough apart to have measured anything"
+        );
+        std::fs::remove_file(&out).unwrap();
+    }
 }
 
 /// The real thing, where this machine has it: five seconds of a 4K HDR10 film,

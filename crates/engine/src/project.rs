@@ -648,6 +648,10 @@ pub struct Project {
     /// project's resolution is a setting on the picture, and neither is an undo
     /// step.
     limiter: Limiter,
+    /// Which HDR-to-SDR rendition every clip on an HDR curve is shown and
+    /// exported in ([`crate::tonemap::Preset`]). A setting on the picture, like
+    /// the resolution, and not in the lane snapshots for the same reason.
+    tone: crate::tonemap::Preset,
 }
 
 impl Project {
@@ -678,6 +682,7 @@ impl Project {
             next_link: 1,
             subtitles: Vec::new(),
             limiter: Limiter::default(),
+            tone: crate::tonemap::Preset::default(),
         }
     }
 
@@ -787,6 +792,7 @@ impl Project {
             next_link,
             subtitles: Vec::new(),
             limiter: Limiter::default(),
+            tone: crate::tonemap::Preset::default(),
         })
     }
 
@@ -1152,6 +1158,35 @@ impl Project {
         }
         self.limiter = limiter.with_ceiling(limiter.ceiling_db);
         self
+    }
+
+    /// The HDR rendition a *load* puts back -- the same door
+    /// [`with_mix`](Project::with_mix) is, and no undo step for the same reason.
+    pub fn with_tone(mut self, preset: crate::tonemap::Preset) -> Self {
+        self.tone = preset;
+        self
+    }
+
+    /// Which HDR-to-SDR rendition this project is watched and exported in. A
+    /// project setting, not a clip's: one picture, one look
+    /// ([`crate::tonemap::Preset`]).
+    pub fn tone(&self) -> crate::tonemap::Preset {
+        self.tone
+    }
+
+    /// Sets it. `false` for the one already in force, which is what keeps a
+    /// re-pick of the current rendition from costing a reseek.
+    ///
+    /// ponytail: not an undo step, for the reason the limiter and the project
+    /// resolution are not -- it is not in the lane list the history snapshots.
+    /// Upgrade path is the same one: a history entry holding the project's own
+    /// settings beside the lanes.
+    pub fn set_tone(&mut self, preset: crate::tonemap::Preset) -> bool {
+        if self.tone == preset {
+            return false;
+        }
+        self.tone = preset;
+        true
     }
 
     /// The subtitle tracks a *load* puts back, in the order they were saved --

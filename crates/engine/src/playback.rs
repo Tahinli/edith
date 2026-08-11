@@ -320,6 +320,9 @@ impl PlaybackSession {
             u32::MAX,
             ColorParams::default(),
             Composer::passthrough(),
+            // The default rendition: a file just opened is a project nobody has
+            // picked one for, exactly as it is a project nobody has graded.
+            crate::tonemap::Preset::default(),
         )?;
         // A file is opened on its first audio stream, like `Project::single`
         // names it: nothing has picked one yet.
@@ -647,6 +650,10 @@ impl PlaybackSession {
                 u32::MAX,
                 ColorParams::default(),
                 Composer::passthrough(),
+                // The saved rendition, from the document rather than from the
+                // project (which is built below): this placeholder is what the
+                // window shows until the `seek` at the end reopens the span.
+                doc.tone,
             )
             .map_err(|e| format!("source {}: {e}", first.path.display()))?,
         };
@@ -784,6 +791,7 @@ impl PlaybackSession {
             .collect();
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
             .with_mix(&doc.gains, doc.limiter)
+            .with_tone(doc.tone)
             .with_subtitles(subtitles);
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
@@ -978,6 +986,10 @@ impl PlaybackSession {
             // says: a timeline of stills and songs used to come back at
             // whatever its scaffold implied (`open_project`).
             Some(self.meta.frame_rate),
+            // ...and which rendition its HDR media is watched in, for the same
+            // reason: a picked look that vanished on a reload is a look nobody
+            // could keep.
+            self.project.tone(),
             self.project.limiter(),
             playhead,
         )
@@ -1160,6 +1172,10 @@ impl PlaybackSession {
                     self.meta.height,
                     self.project.composite_fit_at(start),
                 ),
+                // ...and the rendition an HDR source among them is mapped to,
+                // the project's own and constant across the span for that reason
+                // too.
+                self.project.tone(),
             )
             .map(|(_, stream)| stream)
             .inspect_err(|e| eprintln!("timeline frame {start}: video open failed: {e}")),
@@ -1644,6 +1660,33 @@ impl PlaybackSession {
         }
         self.meta.width = width;
         self.meta.height = height;
+        self.invalidate(Dirty::Picture);
+        true
+    }
+
+    /// Which HDR-to-SDR rendition this project is watched and exported in
+    /// ([`crate::tonemap::Preset`]) -- the reference one until somebody picks
+    /// another, and a setting on the project rather than on any clip.
+    pub fn tone(&self) -> crate::tonemap::Preset {
+        self.project.tone()
+    }
+
+    /// Picks one. Rebuilds the **picture** where the playhead is, exactly as
+    /// [`set_resolution`](Self::set_resolution) does -- the frame on screen is
+    /// remapped at once, paused or playing, and the sound is not touched: a
+    /// rendition is not something a sample can carry. `false` for the rendition
+    /// already in force.
+    ///
+    /// An SDR project is unmoved by this by construction: no clip of it builds a
+    /// tone map at all ([`crate::tonemap`]), so the reseek recomposes the very
+    /// same bytes.
+    ///
+    /// ponytail: not an undo step, for the reason the resolution is not
+    /// ([`Project::set_tone`]).
+    pub fn set_tone(&mut self, preset: crate::tonemap::Preset) -> bool {
+        if !self.project.set_tone(preset) {
+            return false;
+        }
         self.invalidate(Dirty::Picture);
         true
     }
@@ -2447,6 +2490,9 @@ fn matches_timeline(
         0,
         ColorParams::default(),
         Composer::passthrough(),
+        // A zero-length range decodes nothing, so no table is built and the
+        // rendition cannot matter here.
+        crate::tonemap::Preset::default(),
     )?;
     // The frame rate is *not* a refusal any more: a file shot at another rate is
     // placed for the seconds it lasts and read through [`Rate`] at the

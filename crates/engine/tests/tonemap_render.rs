@@ -22,7 +22,7 @@ use engine::color::{ColorParams, apply_yuv};
 use engine::colorspace::{ColorDescription, Matrix, Transfer};
 use engine::convert::i420_to_bgra;
 use engine::project::Lane;
-use engine::tonemap::{ToneMapper, Transfer as Hdr};
+use engine::tonemap::{Preset, ToneMapper, Transfer as Hdr};
 
 /// The fixture's patches: the source codes, and where the centre of each one
 /// sits in the 320x240 picture.
@@ -99,7 +99,7 @@ fn spread(px: [u8; 3]) -> u8 {
 /// to render it: tone-mapped first, then graded, then converted as BT.709 SDR.
 /// `grade` is applied in whichever domain `before` says -- which is the point of
 /// [`the_grade_lands_after_the_tone_map`].
-fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool) -> [u8; 3] {
+fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool, preset: Preset) -> [u8; 3] {
     let (w, h) = (8usize, 8usize);
     let mut y = vec![codes[0]; w * h];
     let mut u = vec![codes[1]; w / 2 * h / 2];
@@ -107,7 +107,7 @@ fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool) -> [u8; 3] {
     if before {
         apply_yuv(grade, &mut y, &mut u, &mut v);
     }
-    ToneMapper::new(Hdr::Pq).map(&mut y, &mut u, &mut v, w, h);
+    ToneMapper::new(Hdr::Pq, preset).map(&mut y, &mut u, &mut v, w, h);
     if !before {
         apply_yuv(grade, &mut y, &mut u, &mut v);
     }
@@ -116,10 +116,12 @@ fn by_hand(codes: [u8; 3], grade: &ColorParams, before: bool) -> [u8; 3] {
 }
 
 /// The claim itself: a PQ stream is shown as an SDR display can show it.
-/// Diffuse white lands where a viewer expects white-ish paper (~205, not the
-/// 144 an untouched code would convert to and not clipped white), the 1000
-/// cd/m^2 highlight stays a highlight, and the saturated red is still red --
-/// a grey wash is exactly what the missing map looked like.
+/// Diffuse white lands where BT.2446 Method A puts it at the mastering peak the
+/// content really has (~166, not the 144 an untouched code would convert to and
+/// not clipped white -- the reference rendition, which is what a project nobody
+/// has picked for is shown in), the 1000 cd/m^2 highlight stays a highlight, and
+/// the saturated red is still red -- a grey wash is exactly what the missing map
+/// looked like.
 #[test]
 fn a_pq_stream_is_tone_mapped_on_its_way_to_the_window() {
     let mut session = open("test_pq.mp4");
@@ -135,8 +137,8 @@ fn a_pq_stream_is_tone_mapped_on_its_way_to_the_window() {
 
     let diffuse = luma_code(pixel(&frame, DIFFUSE.1));
     assert!(
-        (200..=210).contains(&diffuse),
-        "diffuse white (code {}) rendered at {diffuse}, wanted 200..=210",
+        (161..=171).contains(&diffuse),
+        "diffuse white (code {}) rendered at {diffuse}, wanted 161..=171",
         DIFFUSE.0[0]
     );
     let highlight = luma_code(pixel(&frame, HIGHLIGHT.1));
@@ -149,6 +151,56 @@ fn a_pq_stream_is_tone_mapped_on_its_way_to_the_window() {
         spread(red) > 60 && red[2] > red[0] && red[2] > red[1],
         "the saturated red washed out to {red:?}"
     );
+}
+
+/// The preset is a thing a viewer *sees*: picked on the running session, the
+/// very next frame out of the funnel is the new rendition, and the three are in
+/// the order their names promise -- reference darkest, vivid brightest and
+/// richest. Measured on the rendered BGRA the window gets, so it covers the
+/// whole chain (project setting -> reseek -> decode worker -> LUT), not the
+/// table alone.
+#[test]
+fn picking_a_preset_changes_the_picture_the_window_shows() {
+    let mut session = open("test_pq.mp4");
+    assert_eq!(session.tone(), Preset::Reference, "nobody has picked yet");
+    let mut shown = Vec::new();
+    for preset in Preset::ALL {
+        if preset != Preset::Reference {
+            assert!(session.set_tone(preset), "pick {preset:?}");
+            assert!(!session.set_tone(preset), "picking it again changes nothing");
+        }
+        let frame = next_frame(&mut session, "a preset");
+        // Still a picture, not a wash: the fixture's saturated red has to stay
+        // red under every rendition, which is what a mistuned preset breaks
+        // first.
+        assert!(spread(pixel(&frame, RED.1)) > 60, "{preset:?} washed the red out");
+        shown.push(luma_code(pixel(&frame, DIFFUSE.1)));
+    }
+    let [reference, standard, vivid] = [shown[0], shown[1], shown[2]];
+    assert!(
+        reference < standard && standard < vivid,
+        "diffuse white by preset: reference {reference}, standard {standard}, vivid {vivid}"
+    );
+    // The vivid preset's *chroma* gain is asserted on the codes rather than
+    // here: this fixture's red is saturated enough that it clips to 255 in BGRA
+    // under both presets, so a rendered patch cannot measure it
+    // (`tonemap::tests::a_brighter_preset_is_brighter_and_a_vivid_one_is_richer`).
+}
+
+/// ...and an SDR stream is not any of this: no clip of it builds a tone map at
+/// all, so all three presets are the same bytes. The hash is the passthrough
+/// branch's own, from the test below -- if a preset ever reached an SDR picture,
+/// this is where it would show.
+#[test]
+fn an_sdr_stream_is_the_same_bytes_under_every_preset() {
+    let mut session = open("test_h264.mkv");
+    for preset in Preset::ALL {
+        if preset != Preset::Reference {
+            assert!(session.set_tone(preset), "pick {preset:?}");
+        }
+        let frame = next_frame(&mut session, "a preset");
+        assert_eq!(fnv(&frame.bgra), SDR_PASSTHROUGH, "{preset:?} moved an SDR picture");
+    }
 }
 
 /// The other half: an SDR stream may not move by one byte for any of this.
@@ -204,8 +256,8 @@ fn the_grade_lands_after_the_tone_map() {
 
     for (name, patch) in [("diffuse white", DIFFUSE), ("red", RED)] {
         let shown = pixel(&frame, patch.1);
-        let after = by_hand(patch.0, &grade, false);
-        let before = by_hand(patch.0, &grade, true);
+        let after = by_hand(patch.0, &grade, false, Preset::default());
+        let before = by_hand(patch.0, &grade, true, Preset::default());
         for (i, channel) in ["B", "G", "R"].iter().enumerate() {
             assert!(
                 shown[i].abs_diff(after[i]) <= 2,
