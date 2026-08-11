@@ -221,9 +221,8 @@ impl std::fmt::Display for Speed {
     }
 }
 
-/// What a file's own frame rate is against the timeline's, as an exact rational
-/// in thousandths of a frame per second: how many frames of the *file* one frame
-/// of the timeline is worth.
+/// What a file's own frame rate is against the timeline's, as an exact
+/// rational: how many frames of the *file* one frame of the timeline is worth.
 ///
 /// Every frame number in this module counts **timeline** frames -- a clip's
 /// `in_frame` and `out_frame` included -- so a 23.976 fps file placed on a 30 fps
@@ -238,18 +237,18 @@ impl std::fmt::Display for Speed {
 /// there. Composed *after* a speed rather than folded into it, so a 2x 24 fps
 /// clip on a 30 fps timeline is exactly both (`rate_composes_with_speed`).
 ///
-/// ponytail: the rate is rounded to milli-fps, so 24000/1001 is carried as
-/// 23.976 -- about a frame per 40000, or a frame off after seven hours of one
-/// clip. Upgrade path is carrying the container's own timescale rational in
-/// [`crate::VideoMeta`] and building this from it.
+/// Rational and not an `f64`, exactly: 24000/1001 over 30 is `800/1001` and
+/// stays `800/1001` however far the timeline runs, where a rate rounded to
+/// (say) milli-fps would leave a fraction of a frame per clip to pile up into a
+/// visible drift over an hour (`a_23_976_rate_is_exact_and_never_drifts`).
 ///
 /// [`PlaybackSession`]: crate::PlaybackSession
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rate {
-    /// Milli-fps of the file...
-    source: u64,
-    /// ...and of the timeline it plays on.
-    timeline: u64,
+    /// Frames of the file...
+    source: u32,
+    /// ...per this many frames of the timeline it plays on. Never zero.
+    timeline: u32,
 }
 
 impl Rate {
@@ -260,22 +259,36 @@ impl Rate {
         timeline: 1,
     };
 
-    /// The rate of a file at `source_fps` on a timeline at `timeline_fps`.
-    /// Rounded to milli-fps, and [`REAL_TIME`](Self::REAL_TIME) for the rates
-    /// that agree there -- container rates are computed from timescales, so
-    /// "the same rate" is never `==` either.
-    pub fn new(source_fps: f64, timeline_fps: f64) -> Self {
-        let milli = |fps: f64| match fps.is_finite() && fps > 0. {
-            true => (fps * 1000.).round().clamp(1., 1e9) as u64,
-            // Not a rate at all: read the file frame for frame rather than
-            // dividing the timeline by a zero.
-            false => 0,
-        };
-        match (milli(source_fps), milli(timeline_fps)) {
-            (0, _) | (_, 0) => Self::REAL_TIME,
-            (source, timeline) if source == timeline => Self::REAL_TIME,
-            (source, timeline) => Self { source, timeline },
+    /// The rate of a file at `source_fps` on a timeline at `timeline_fps`,
+    /// exactly.
+    ///
+    /// Both rates come out of a container as a division, so neither is ever the
+    /// number it means (`23.976023976...`); [`crate::mux::frame_timing`] is what
+    /// already knows how to name one exactly -- it is the same pair the muxer
+    /// counts an export's frames in -- and this is that pair divided by that
+    /// pair, reduced. A rate no timescale can name is an `Err` in that
+    /// function's own words rather than a silent 1:1 -- `matches_timeline` is
+    /// where a file carrying one is refused by name, beside the codec.
+    ///
+    /// Exactly [`REAL_TIME`](Self::REAL_TIME) when the two agree, which is every
+    /// timeline that had ever opened in this editor before mixed rates.
+    pub fn from_fps(source_fps: f64, timeline_fps: f64) -> crate::Result<Self> {
+        let (src_scale, src_ticks) = crate::mux::frame_timing(source_fps)?;
+        let (tl_scale, tl_ticks) = crate::mux::frame_timing(timeline_fps)?;
+        // fps is scale/ticks, so the ratio is (src_scale/src_ticks) / (tl_scale/tl_ticks).
+        let num = u64::from(src_scale) * u64::from(tl_ticks);
+        let den = u64::from(src_ticks) * u64::from(tl_scale);
+        let g = gcd(num, den);
+        let (mut num, mut den) = (num / g, den / g);
+        // A ratio no pair of real frame rates produces, but the fields are `u32`
+        // so that every multiplication below fits a `u64` at any frame count.
+        while num > u64::from(u32::MAX) || den > u64::from(u32::MAX) {
+            (num, den) = (num.div_ceil(2), den.div_ceil(2));
         }
+        Ok(Self {
+            source: num.max(1) as u32,
+            timeline: den.max(1) as u32,
+        })
     }
 
     pub fn is_real_time(self) -> bool {
@@ -285,13 +298,14 @@ impl Rate {
     /// As a multiplier of the timeline's rate: what a *file's* own frame rate
     /// is, given the timeline's, for a library row that names it.
     pub fn as_f64(self) -> f64 {
-        self.source as f64 / self.timeline as f64
+        f64::from(self.source) / f64::from(self.timeline)
     }
 
     /// Which frame of the file the `frame`th timeline-rate frame of it is:
     /// floored, [`Speed::source_at`]'s half of the pair.
     pub fn source_at(self, frame: u32) -> u32 {
-        (u64::from(frame) * self.source / self.timeline).min(u64::from(u32::MAX)) as u32
+        (u64::from(frame) * u64::from(self.source) / u64::from(self.timeline))
+            .min(u64::from(u32::MAX)) as u32
     }
 
     /// Its inverse, ceiled ([`Speed::timeline_at`]'s half): the first
@@ -299,9 +313,18 @@ impl Rate {
     /// the stamp playback puts on a decoded picture, and, applied to a file's
     /// frame *count*, how long that file is in timeline frames.
     pub fn timeline_at(self, source_frame: u32) -> u32 {
-        (u64::from(source_frame) * self.timeline)
-            .div_ceil(self.source)
+        (u64::from(source_frame) * u64::from(self.timeline))
+            .div_ceil(u64::from(self.source))
             .min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Greatest common divisor, for reducing a [`Rate`] to the numbers that fit its
+/// fields. `a` for `gcd(a, 0)`, and never zero: something divides by it.
+fn gcd(a: u64, b: u64) -> u64 {
+    match b {
+        0 => a.max(1),
+        b => gcd(b, a % b),
     }
 }
 
@@ -897,10 +920,20 @@ impl Project {
     ///
     /// Refused, changing nothing, while any clip still plays from it: the
     /// refusal names the lanes and how many clips each holds, so a caller can
-    /// say what has to be deleted first. Refused too for the last entry left,
-    /// because a project that names no file cannot be reopened
-    /// (`PlaybackSession::open_project`) and the timeline's audio parameters
-    /// are read off source 0.
+    /// say what has to be deleted first. The *last* entry goes like any other
+    /// -- a project may name no file at all, which is an empty library over an
+    /// empty timeline (nothing can play, since a clip would have refused the
+    /// removal). What a front-end does with that is its own decision: `edith`'s
+    /// window goes back to the empty state it launches in, and
+    /// [`PlaybackSession::save_project`](crate::PlaybackSession::save_project)
+    /// refuses to write a project that names nothing, because no such file
+    /// could be opened again.
+    ///
+    /// Every index past `idx` moves down by one, so a caller holding a *raw*
+    /// source index of its own -- a clipboard, which is the one thing outside
+    /// this type that does -- has to fix it up or drop it, or a paste plays a
+    /// different file. [`PlaybackSession::remove_source`] hands back the index
+    /// that went for exactly that.
     ///
     /// ponytail: this retires the undo stack. `history` holds lanes alone, so a
     /// snapshot older than the removal can name the very source being removed
@@ -915,12 +948,6 @@ impl Project {
             return Err(format!("there is no source {idx} to remove").into());
         };
         let name = source.path.display().to_string();
-        // Asked before the clips are counted: with one file left the answer is
-        // the same whatever plays, and "the only file" is the more useful half
-        // of it.
-        if self.sources.len() == 1 {
-            return Err(format!("{name} is the only file this project names").into());
-        }
         let used: Vec<String> = handles(&self.lanes)
             .into_iter()
             .zip(&self.lanes)
@@ -964,9 +991,16 @@ impl Project {
     /// only the ones a clip names.
     ///
     /// One exception, and it is the emptied timeline's: a project no clip plays
-    /// from still keeps source 0. It is the file a session is scaffolded from --
-    /// its frame rate is the timeline's and is written nowhere else -- so a save
-    /// that pruned it would write a project that cannot be loaded back at all.
+    /// from still keeps its first source, if it has one. A file is what a
+    /// reopened project scaffolds itself from -- the frame rate is written
+    /// nowhere else -- so a save that pruned the last of them would write a
+    /// project that cannot be loaded back at all.
+    ///
+    /// What comes out is *not* ordered by anything a reader may assume: first
+    /// use, lane by lane, means the entry at index 0 can be a still or a song
+    /// whatever the session was scaffolded from. `PlaybackSession::open_project`
+    /// picks its rate and its audio reference by what a source *is*, never by
+    /// where it sits.
     pub fn without_orphan_sources(&self) -> Parts {
         let mut moved = vec![None; self.sources.len()];
         let mut sources = Vec::new();
@@ -4019,10 +4053,10 @@ mod tests {
     }
 
     /// The two edges of a removal: it retires the undo stack (the ponytail on
-    /// [`Project::remove_source`]), and the last entry standing cannot go --
-    /// source 0 is where a reopened project reads its frame rate.
+    /// [`Project::remove_source`]), and the last entry goes like any other
+    /// once nothing plays it -- a project may name no file at all.
     #[test]
-    fn remove_source_retires_undo_and_keeps_the_last_file() {
+    fn remove_source_retires_undo_and_empties_the_library() {
         let mut p = two_sources();
         assert!(p.delete_in(Lane::V1, 3), "FILE2's take goes first");
         assert!(!p.history.is_empty(), "there is something to undo");
@@ -4033,18 +4067,25 @@ mod tests {
         );
         assert!(!p.undo(), "and so there is nothing left to undo");
 
-        // The last file standing stays, whatever plays from it:
-        // `PlaybackSession::open_project` refuses a project that names no
-        // sources at all, and the timeline's frame rate lives in source 0.
+        // The last file standing is held to the one rule every row is -- what
+        // plays cannot go -- and to no other.
         assert_eq!(p.sources().len(), 1);
         let refusal = p
             .remove_source(0)
-            .expect_err("the only source must stay")
+            .expect_err("its clips are still on the lanes")
             .to_string();
-        assert!(refusal.contains("only file"), "{refusal}");
-        assert_eq!(p.sources().len(), 1);
+        assert!(refusal.contains("still plays"), "{refusal}");
+        assert_eq!(p.sources().len(), 1, "a refusal changes nothing");
+        while p.delete_in(Lane::V1, 0) {}
+        p.remove_source(0)
+            .expect("the last row goes like any other");
         assert!(
-            p.remove_source(1).is_err(),
+            p.sources().is_empty(),
+            "a project may name no file at all: an empty library over an empty timeline"
+        );
+        assert_eq!(p.timeline_frames(), 0);
+        assert!(
+            p.remove_source(0).is_err(),
             "and an index that is not there is refused, not panicked on"
         );
     }
@@ -4643,7 +4684,7 @@ mod tests {
             (25., 30.),
             (30., 30.),
         ] {
-            let rate = Rate::new(source_fps, timeline_fps);
+            let rate = Rate::from_fps(source_fps, timeline_fps).expect("a nameable rate");
             for n in 0..2000u32 {
                 let source = rate.source_at(n);
                 // The stamp is the *first* timeline-rate frame that shows it, so
@@ -4663,13 +4704,12 @@ mod tests {
                     "{source_fps} on {timeline_fps}: {count} frames reads past the file"
                 );
             }
-            // No drift: the mapping is one exact division, not an accumulation,
-            // so an hour in is as true as the first second. (`Rate` rounds the
-            // rate itself to milli-fps -- 23.976 for 24000/1001 -- which is the
-            // 3e-8 the tolerance below allows for.)
-            let milli = |fps: f64| (fps * 1000.).round();
+            // No drift: the mapping is one exact division of the *rate itself*,
+            // not an accumulation and not a rounded rate, so an hour in is as
+            // true as the first second. (Held to the real ratio of the two rates
+            // the caller asked for -- `as_f64` would be true of a wrong rate.)
             for n in [1u32, 100, 10_000, 500_000, 3_000_000] {
-                let want = f64::from(n) * milli(source_fps) / milli(timeline_fps);
+                let want = f64::from(n) * source_fps / timeline_fps;
                 assert!(
                     (f64::from(rate.source_at(n)) - want).abs() < 1.,
                     "{source_fps} on {timeline_fps}: frame {n} drifted"
@@ -4677,9 +4717,18 @@ mod tests {
             }
         }
         // The timeline's own rate is the identity, whichever way it is written.
-        assert!(Rate::new(30., 30.).is_real_time());
-        assert!(Rate::new(30.0004, 30.).is_real_time(), "milli-fps rounding");
-        assert!(Rate::new(0., 30.).is_real_time(), "not a rate at all");
+        assert!(Rate::from_fps(30., 30.).expect("30 over 30").is_real_time());
+        assert!(
+            Rate::from_fps(30.0004, 30.)
+                .expect("30.0004 over 30")
+                .is_real_time(),
+            "a rate is named by the muxer's timescales, and 30.0004 is 30030/1001"
+        );
+        // ...and a rate no timescale can name is an `Err`, not a silent 1:1: the
+        // one thing `matches_timeline` refuses a file for now that the rate gate
+        // is gone.
+        assert!(Rate::from_fps(0., 30.).is_err(), "not a rate at all");
+        assert!(Rate::from_fps(30., f64::NAN).is_err());
         for n in 0..1000 {
             assert_eq!(Rate::REAL_TIME.source_at(n), n);
             assert_eq!(Rate::REAL_TIME.timeline_at(n), n);
@@ -4687,13 +4736,14 @@ mod tests {
         // ...and the composition, in the order the decoder's door applies it:
         // the speed picks the clip's (timeline-rate) frame, the rate picks the
         // file's. A 2x clip of a 23.976 fps file on a 30 fps timeline reads two
-        // timeline frames per frame shown, each of them 0.799 of a file frame.
-        let rate = Rate::new(24000. / 1001., 30.);
+        // timeline frames per frame shown, each of them exactly 800/1001 of a
+        // file frame.
+        let rate = Rate::from_fps(24000. / 1001., 30.).expect("23.976 over 30");
         let speed = Speed::from_permille(2000);
         for d in 0..100u32 {
             assert_eq!(
                 rate.source_at(speed.source_at(d)),
-                (u64::from(d) * 2 * 23976 / 30000) as u32,
+                (u64::from(d) * 2 * 800 / 1001) as u32,
                 "2x of a 23.976 fps file at timeline frame {d}"
             );
         }
