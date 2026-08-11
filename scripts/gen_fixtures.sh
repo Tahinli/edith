@@ -113,6 +113,16 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# H.264 in Matroska: the same stream the mp4 fixtures carry, in the container
+# that used to refuse it. Baseline profile so `rusty_h264` reads it with nothing
+# installed, `-g 30` for the second keyframe the sync index is checked against,
+# and the AAC track again so the "not wired" audio notice has one to name.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -f lavfi -i "sine=frequency=880:duration=2" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libx264 -profile:v baseline -g 30 -pix_fmt yuv420p \
+    -c:a aac -b:a 128k assets/test_h264.mkv
 # Sync fixture: one flash and one beep, at the same instant. Black picture with
 # a white frame from t=1.0 to t=1.1, silence with a 1 kHz tone over exactly that
 # stretch — so a test can find each of them and say how far apart they came out.
