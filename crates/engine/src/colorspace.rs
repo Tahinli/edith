@@ -96,7 +96,8 @@ impl ColorDescription {
     /// [`resolve`](Self::resolve)'s heuristic reads, so a file written here is
     /// read back as the space it was written in even by a reader that drops the
     /// tags. Limited range because both encoders here are configured for it, and
-    /// SDR because nothing on this path tone-maps yet.
+    /// SDR always: an HDR source is *tone-mapped* into this on the way out
+    /// ([`crate::tonemap`]), never carried through and re-tagged.
     pub fn output(height: u32) -> Self {
         Self {
             matrix: if height >= 720 {
