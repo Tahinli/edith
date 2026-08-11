@@ -203,10 +203,14 @@ impl AudioSession {
     /// pause — the master clock counts what the device has been fed, so a hole
     /// that fed nothing would stall the whole timeline on it.
     ///
+    /// A segment naming a source that has **no track** is the same silence: a
+    /// clip of a silent file is a hole with a picture over it, and the timeline
+    /// let it in on exactly that footing ([`crate::PlaybackSession::import`]).
+    ///
     /// Only the sources some segment names are opened. `Ok(None)` when `sources`
-    /// is empty or its first entry has no AAC track; a later source that is
-    /// missing audio or disagrees on rate/layout is an `Err` — import refuses
-    /// those up front (one timeline, one output device), this is the backstop.
+    /// is empty or its first entry has no AAC track; a later source that
+    /// disagrees on rate/layout is an `Err` — import refuses those up front (one
+    /// timeline, one output device), this is the backstop.
     pub fn open_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -294,11 +298,18 @@ impl AudioSession {
         first.check_decoder()?;
 
         let mut tracks: Vec<Option<Track>> = sources.iter().map(|_| None).collect();
+        // ...and which of them turned out to have no track at all, so a silent
+        // source is opened once like any other rather than once per segment
+        // naming it.
+        let mut silent: Vec<bool> = sources.iter().map(|_| false).collect();
         tracks[at] = Some(first);
         for &(source, ..) in segs {
             let Some(source) = source else {
                 continue; // a gap opens no file
             };
+            if silent.get(source) == Some(&true) {
+                continue;
+            }
             let slot = tracks
                 .get_mut(source)
                 .ok_or_else(|| format!("segment names source {source} of {}", sources.len()))?;
@@ -306,8 +317,14 @@ impl AudioSession {
                 continue; // already opened, and the checks below already ran
             }
             let (path, stream) = &sources[source];
-            let track = Track::open(path, *stream)?
-                .ok_or_else(|| format!("source {source} has no audio track"))?;
+            // A source with no audio track at all is not a failure: its
+            // segments are silence, exactly as a gap's are, and the slot stays
+            // empty to say so. That is what a silent clip on an audio lane
+            // means -- a picture over a hole.
+            let Some(track) = Track::open(path, *stream)? else {
+                silent[source] = true;
+                continue;
+            };
             if (track.sample_rate(), track.channels()?) != (meta.sample_rate, meta.channels) {
                 return Err(format!(
                     "source {source} is {} Hz {} ch, the timeline is {} Hz {} ch",
@@ -324,14 +341,15 @@ impl AudioSession {
 
         let segments: Vec<Segment> = segs
             .iter()
-            .map(|&(source, start_secs, end_secs)| match source {
-                Some(source) => tracks[source]
-                    .as_ref()
-                    .expect("opened above")
-                    .segment(source, start_secs, end_secs),
-                None => Segment::silence(
-                    ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
-                ),
+            // A gap, and a source with no track to decode, are the same stretch
+            // of nothing: as many frames of silence as the window is long.
+            .map(|&(source, start_secs, end_secs)| {
+                match source.and_then(|source| Some((source, tracks[source].as_ref()?))) {
+                    Some((source, track)) => track.segment(source, start_secs, end_secs),
+                    None => Segment::silence(
+                        ((end_secs - start_secs).max(0.0) * f64::from(meta.sample_rate)) as u64,
+                    ),
+                }
             })
             .collect();
         // Chunk numbering is continuous across every join, counted from the first
@@ -622,7 +640,11 @@ impl AudioSession {
                     decodable: matches!(track.channels, 1 | 2),
                 }]);
             }
-            let Ok(track) = SymTrack::open(path) else {
+            // No audio track lists as the silent source it is; a track that
+            // will not open at all is an `Err` here, as it is in
+            // [`Track::open`] -- a listing that quietly came back empty for a
+            // broken file is how a lane ends up silent with nothing to go on.
+            let Some(track) = SymTrack::open(path)? else {
                 return Ok(Vec::new());
             };
             return Ok(vec![StreamInfo {
@@ -635,7 +657,7 @@ impl AudioSession {
             }]);
         }
         if crate::is_audio(path) {
-            let track = SymTrack::open(path)?;
+            let track = SymTrack::open_required(path)?;
             return Ok(vec![StreamInfo {
                 index: 0,
                 codec: track.codec.into(),
@@ -762,15 +784,18 @@ impl AudioSession {
     /// half a packet over the whole list however many files it spans, and the
     /// extra priming packet is still the very first segment's alone.
     ///
-    /// Every source must declare the same [`AacTrackParams`]: the copy becomes
-    /// one output track with one esds. Import refuses a mismatch up front; the
-    /// check here is the backstop, as is the missing-track `Err`.
+    /// Every source that *has* a track must declare the same
+    /// [`AacTrackParams`]: the copy becomes one output track with one esds.
+    /// Import refuses a mismatch up front; the check here is the backstop.
     ///
     /// A segment naming **no** source is a gap, and is copied as that many
     /// packets of [`silent_packet`] silence — the rounding debt carried through
     /// it like any other, so the hole occupies its exact duration and the audio
     /// after it stays in sync with the picture. A gap the track *opens* on gets
-    /// one silent packet more, which is the priming a reader drops.
+    /// one silent packet more, which is the priming a reader drops. A segment
+    /// naming a *silent* source is written the same way: a clip whose file has
+    /// no audio track is a hole with a picture over it, and the timeline it
+    /// joined already said so ([`crate::PlaybackSession::import`]).
     pub fn copy_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -789,24 +814,34 @@ impl AudioSession {
         sources: &[(PathBuf, usize)],
         segs: &[(Option<usize>, f64, f64)],
     ) -> crate::Result<Option<(AacTrackParams, Vec<AacPacket>)>> {
-        let Some(&(Some(first), ..)) = segs.iter().find(|s| s.0.is_some()) else {
+        // The output track is declared from the first source that has one --
+        // not simply the first one named, which may be a silent clip. Such a
+        // clip defines no rate and no layout; it is written as silence below
+        // and the track goes on being the audible sources' track.
+        let mut tracks: Vec<Option<Option<AacTrack>>> = sources.iter().map(|_| None).collect();
+        let mut first = None;
+        for &(source, ..) in segs {
+            let Some(source) = source else { continue };
+            if let Some(track) = source_at(&mut tracks, sources, source)? {
+                first = Some(track.track_params());
+                break;
+            }
+        }
+        let Some(params) = first else {
             return Ok(None); // no segments, or nothing but silence
         };
-        let (path, stream) = sources
-            .get(first)
-            .ok_or_else(|| format!("segment names source {first} of {}", sources.len()))?;
-        let Some(track) = copy_track(path, *stream)? else {
-            return Ok(None); // silent source, silent export
-        };
-        let params = track.track_params();
-        let mut tracks: Vec<Option<AacTrack>> = sources.iter().map(|_| None).collect();
-        tracks[first] = Some(track);
 
         let sample_rate = params.sample_rate;
         let mut err = 0i64;
         let mut packets: Vec<AacPacket> = Vec::new();
         for &(source, start_secs, end_secs) in segs {
-            let Some(source) = source else {
+            // A gap, and a clip whose source carries no track, are the same hole
+            // to write: silence for as long as the window is.
+            let named = match source {
+                Some(source) => source_at(&mut tracks, sources, source)?.map(|t| (source, t)),
+                None => None,
+            };
+            let Some((source, track)) = named else {
                 let ideal = ((end_secs - start_secs).max(0.0) * f64::from(sample_rate)) as i64;
                 let bytes = silent_packet(params.chan_conf)?;
                 // A reader drops the first packet of an AAC track as the
@@ -824,7 +859,6 @@ impl AudioSession {
                 }
                 continue;
             };
-            let track = source_at(&mut tracks, sources, source)?;
             if track.track_params() != params {
                 return Err(format!(
                     "source {source} audio is {:?}, the timeline's is {params:?}",
@@ -885,24 +919,25 @@ fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
     }
 }
 
-/// The source at `index`, on the stream it names, opened on first use. Sources
-/// a segment list never names are never touched: a project's list only grows.
+/// The source at `index`, on the stream it names, opened on first use -- and
+/// `None` for a source that has no track at all, which the caller writes as
+/// silence exactly as it writes a gap. The outer `Option` is "has it been
+/// opened", the inner one "was there anything in it", so a silent source is
+/// opened once like any other. Sources a segment list never names are never
+/// touched: a project's list only grows.
 fn source_at<'a>(
-    tracks: &'a mut [Option<AacTrack>],
+    tracks: &'a mut [Option<Option<AacTrack>>],
     sources: &[(PathBuf, usize)],
     index: usize,
-) -> crate::Result<&'a mut AacTrack> {
+) -> crate::Result<Option<&'a mut AacTrack>> {
     let slot = tracks
         .get_mut(index)
         .ok_or_else(|| format!("segment names source {index} of {}", sources.len()))?;
     if slot.is_none() {
         let (path, stream) = &sources[index];
-        *slot = Some(
-            copy_track(path, *stream)?
-                .ok_or_else(|| format!("source {index} has no audio track"))?,
-        );
+        *slot = Some(copy_track(path, *stream)?);
     }
-    Ok(slot.as_mut().expect("just opened"))
+    Ok(slot.as_mut().expect("just opened").as_mut())
 }
 
 /// A source's track for the *copy* path, which needs raw AAC access units.
@@ -994,8 +1029,8 @@ impl Track {
         // decoder straight out of the blocks ([`MkvAc3Track`]). Sound neither
         // one can decode (Opus, DTS) leaves the source the silent one it always
         // was, which `AudioSession::unsupported` puts into words, rather than
-        // failing the import of a file whose picture is fine -- and so does an
-        // AC-3 track that will not open, a laced block say.
+        // failing the import of a file whose picture is fine. A track that will
+        // not open at all is *not* in that group: see below.
         if crate::demux::is_matroska(path) {
             if stream > 0 {
                 return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
@@ -1003,24 +1038,27 @@ impl Track {
             match MkvAc3Track::open(path) {
                 Ok(Some(track)) => return Ok(Some(Self::Mkv(track))),
                 Ok(None) => {}
-                // Named on the way past for the same reason symphonia's failure
-                // is, below: an AC-3 track that broke is a bug, not a codec we
-                // never had.
+                // Named on the way past rather than returned: symphonia gets the
+                // same file next and may read the track perfectly well (a laced
+                // block is [`MkvAc3Track`]'s limitation, not the file's), and
+                // if it cannot either, *its* `Err` is the one that comes back.
                 Err(e) => eprintln!("matroska audio: {}: {e}", path.display()),
             }
-            // Logged on the way past: "silent" here covers both a codec nothing
-            // decodes and a track that genuinely broke, and only the second is a
-            // bug -- with no trace at all it reaches the user as a lane that
-            // drew no waveform and nothing else to go on.
-            return Ok(SymTrack::open(path)
-                .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
-                .ok()
-                .filter(|t| {
-                    t.decoder()
-                        .inspect_err(|e| eprintln!("matroska audio: {}: {e}", path.display()))
-                        .is_ok()
-                })
-                .map(Self::Sym));
+            // Two things are silent here and no more: a file with no audio
+            // track at all, and a track whose codec nothing in this project
+            // decodes (Opus, DTS -- [`AudioSession::unsupported`] is what puts
+            // that into words). A track that will not *open* is an `Err`, the
+            // same answer the mp4 arm gives: turned into silence it would play
+            // and export as a hole with only an eprintln to say why, which is a
+            // bug wearing a feature's clothes.
+            let Some(track) = SymTrack::open(path)? else {
+                return Ok(None);
+            };
+            if let Err(e) = track.decoder() {
+                eprintln!("matroska audio: {}: {e}", path.display());
+                return Ok(None);
+            }
+            return Ok(Some(Self::Sym(track)));
         }
         let audio_file = crate::is_audio(path);
         // Ahead of the AAC reader, because that one answers "not AAC" for a
@@ -1041,7 +1079,7 @@ impl Track {
         if stream > 0 {
             return Err(format!("{}: audio stream {stream} of 1 stream", path.display()).into());
         }
-        SymTrack::open(path).map(|track| Some(Self::Sym(track)))
+        SymTrack::open_required(path).map(|track| Some(Self::Sym(track)))
     }
 
     fn sample_rate(&self) -> u32 {
@@ -1166,7 +1204,13 @@ struct SymTrack {
 }
 
 impl SymTrack {
-    fn open(path: &Path) -> crate::Result<Self> {
+    /// `Ok(None)` for a container that opened and holds no audio track at all --
+    /// a silent source, which is a thing a file is allowed to be. Everything
+    /// else that goes wrong here is an `Err`: a file that will not open, will
+    /// not parse, or carries a track it cannot describe is *broken*, and the
+    /// difference matters because silence is played and exported without a word
+    /// while an `Err` is shown ([`Track::open`]).
+    fn open(path: &Path) -> crate::Result<Option<Self>> {
         let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
         // The extension is a hint, not a decision: the probe reads the magic and
         // is free to disagree, which is what makes a mislabelled file work.
@@ -1180,9 +1224,9 @@ impl SymTrack {
             FormatOptions::default(),
             MetadataOptions::default(),
         )?;
-        let track = reader
-            .default_track(SymKind::Audio)
-            .ok_or_else(|| format!("{} has no audio track", path.display()))?;
+        let Some(track) = reader.default_track(SymKind::Audio) else {
+            return Ok(None);
+        };
         let (track_id, num_frames, delay) = (track.id, track.num_frames, track.delay);
         let time_base = track
             .time_base
@@ -1203,7 +1247,7 @@ impl SymTrack {
         let codec = symphonia::default::get_codecs()
             .get_audio_decoder(params.codec)
             .map_or("an unsupported format", |d| d.codec.info.short_name);
-        Ok(Self {
+        Ok(Some(Self {
             reader,
             track_id,
             sample_rate,
@@ -1217,7 +1261,14 @@ impl SymTrack {
             time_base,
             params,
             codec,
-        })
+        }))
+    }
+
+    /// [`open`](Self::open) where having no audio track is itself the error:
+    /// what a standalone audio file is held to, since a song with no sound in
+    /// it is a broken file and not a silent source.
+    fn open_required(path: &Path) -> crate::Result<Self> {
+        Self::open(path)?.ok_or_else(|| format!("{} has no audio track", path.display()).into())
     }
 
     /// A fresh decoder: seeking mid-stream leaves state that belongs to the
