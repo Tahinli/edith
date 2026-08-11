@@ -103,9 +103,10 @@ impl Demuxer {
     }
 
     /// Bits per luma sample the stream is coded at: 8 for everything but an
-    /// HEVC Main 10 track, which decodes into a P010 surface rather than an
-    /// NV12 one. Not part of [`VideoMeta`] because nothing above the plugin has
-    /// a use for it -- what comes out of the read-back is 8-bit either way.
+    /// HEVC Main 10 or a 10-bit AV1 track, which decode into a P010 surface
+    /// rather than an NV12 one. Not part of [`VideoMeta`] because nothing above
+    /// the plugin has a use for it -- what comes out of the read-back is 8-bit
+    /// either way.
     pub fn bit_depth(&self) -> u8 {
         match self {
             Self::Mp4(d) => d.bit_depth,
@@ -234,7 +235,9 @@ impl Mp4Demuxer {
                 let (_, entry) = sample_entry(path, track_id)?;
                 let av1c = child(entry.get(78..).unwrap_or_default(), b"av1C")
                     .ok_or("no av1C box in the AV1 sample entry")?;
-                parameter_sets = parse_av1c(av1c)?;
+                let (sets, depth) = parse_av1c(av1c)?;
+                parameter_sets = sets;
+                bit_depth = depth;
             }
             // No parameter sets: a VP9 sample is self-contained.
             Codec::Vp9 => {}
@@ -639,7 +642,10 @@ fn mkv_track_entry(
     // `av1C` for AV1 and an `hvcC` for HEVC, byte for byte the one an mp4
     // sample entry carries, so it parses with the very same reader.
     let (codec, nal_length, config, bit_depth) = match (kind, codec.as_str()) {
-        (1, "V_AV1") => (Codec::Av1, 4, parse_av1c(&config)?, 8),
+        (1, "V_AV1") => {
+            let (sets, bit_depth) = parse_av1c(&config)?;
+            (Codec::Av1, 4, sets, bit_depth)
+        }
         (1, "V_MPEGH/ISO/HEVC") => {
             let (nal_length, sets, bit_depth) = parse_hvcc(&config)?;
             (Codec::Hevc, nal_length, sets, bit_depth)
@@ -714,25 +720,33 @@ fn parse_avcc(rec: &[u8]) -> crate::Result<(usize, Vec<u8>)> {
 /// §2.3.3): four fixed bytes, then the sequence header OBU in the same
 /// low-overhead format the blocks are in, so it needs no reframing.
 ///
+/// Also the bits per luma sample, out of `high_bitdepth`/`twelve_bit` in byte 2:
+/// 10-bit decodes through the P010 pool HEVC Main 10 already goes through
+/// ([`crate::hw`]), 12-bit is refused by name because that pool is the only
+/// deeper one there is.
+///
 /// An empty record is not an error -- an encoder that repeats its sequence
-/// header in-band needs none -- but a 10- or 12-bit one is refused by name, for
-/// the same reason HEVC Main 10 is: the plugin's NV12 pool and its `vaGetImage`
-/// read-back are 8-bit, and the upgrade path is a P010 pool.
-fn parse_av1c(rec: &[u8]) -> crate::Result<Vec<u8>> {
+/// header in-band needs none -- and is taken as 8-bit, which is what the depth
+/// defaults to everywhere else here.
+fn parse_av1c(rec: &[u8]) -> crate::Result<(Vec<u8>, u8)> {
     if rec.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 8));
     }
     let &flags = rec
         .get(2)
         .ok_or("av1C record shorter than its fixed header")?;
-    if flags & 0x40 != 0 {
-        return Err(format!(
-            "{}-bit AV1 is not supported yet — this file is not 8-bit",
-            if flags & 0x20 != 0 { 12 } else { 10 }
-        )
-        .into());
-    }
-    Ok(rec.get(4..).unwrap_or_default().to_vec())
+    // `twelve_bit` only says anything when `high_bitdepth` is set (AV1 §5.5.1),
+    // so it is read where the record means it and nowhere else.
+    let bit_depth = match (flags & 0x40 != 0, flags & 0x20 != 0) {
+        (true, true) => {
+            return Err(
+                "12-bit AV1 is not supported — 8- and 10-bit are what the decoder carries".into(),
+            );
+        }
+        (true, false) => 10,
+        _ => 8,
+    };
+    Ok((rec.get(4..).unwrap_or_default().to_vec(), bit_depth))
 }
 
 /// Every block of track `number`, in storage order, with the presentation span
@@ -1517,8 +1531,9 @@ mod tests {
     }
 
     /// The `av1C` record: four fixed bytes and then the sequence header OBU,
-    /// which is handed to the decoder as it stands. 10-bit is refused by name
-    /// exactly as HEVC Main 10 is, and for the same 8-bit read-back reason.
+    /// which is handed to the decoder as it stands, and the depth beside it --
+    /// 10-bit reads as 10 (the P010 pool, exactly as HEVC Main 10), 12-bit is
+    /// refused by name.
     #[test]
     fn reads_the_sequence_header_out_of_an_av1c_record() {
         // marker/version, profile 0 + level 5, 8-bit 4:2:0, no delay; then a
@@ -1527,14 +1542,16 @@ mod tests {
         rec.extend_from_slice(&[
             0x0A, 0x0B, 0x00, 0x00, 0x00, 0x2D, 0x4C, 0xFF, 0xB3, 0xC0, 0x2F, 0x80, 0x00,
         ]);
-        let config = parse_av1c(&rec).unwrap();
+        let (config, depth) = parse_av1c(&rec).unwrap();
         assert_eq!(config, rec[4..], "the fixed header is not part of the OBUs");
         assert_eq!((config[0] >> 3) & 0xF, 1, "OBU type 1 is a sequence header");
+        assert_eq!(depth, 8);
 
         let mut ten = rec.clone();
         ten[2] |= 0x40; // high_bitdepth
-        let refused = parse_av1c(&ten).unwrap_err().to_string();
-        assert!(refused.contains("10-bit"), "{refused}");
+        let (ten_config, ten_depth) = parse_av1c(&ten).unwrap();
+        assert_eq!(ten_depth, 10, "what picks the P010 surface pool");
+        assert_eq!(ten_config, config, "the OBUs are read the same either way");
         let mut twelve = ten.clone();
         twelve[2] |= 0x20; // twelve_bit
         assert!(
@@ -1543,10 +1560,15 @@ mod tests {
                 .to_string()
                 .contains("12-bit")
         );
+        // `twelve_bit` without `high_bitdepth` says nothing, and an 8-bit
+        // record reads as one whatever that bit holds.
+        let mut stray = rec.clone();
+        stray[2] |= 0x20;
+        assert_eq!(parse_av1c(&stray).unwrap().1, 8);
 
         // An encoder that repeats its sequence header in-band writes no record
         // at all, which is not an error; a truncated one is.
-        assert!(parse_av1c(&[]).unwrap().is_empty());
+        assert!(parse_av1c(&[]).unwrap().0.is_empty());
         assert!(parse_av1c(&[0x81, 0x05]).is_err());
     }
 
