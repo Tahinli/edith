@@ -170,6 +170,32 @@ const MENU_PAD: f32 = 6.;
 /// the bottom edge, where nobody can click them.
 const MENU_ROWS_H: f32 = 12. * MENU_ROW_H;
 
+/// The subtitle over the picture: white on a black plate, because a cue is read
+/// against whatever the film happens to be showing under it and the chrome's own
+/// greys are not a contrast the picture agrees to. 21:1 against the plate, which
+/// is the only pair here that is not a chrome-on-chrome one.
+const SUB_INK: u32 = 0xffffff;
+const SUB_SHADE: u32 = 0x000000cc;
+/// A cue's text, and the line it sits on. Fixed rather than a share of the
+/// picture: the video region is 108 px tall at the 640x360 floor and a
+/// proportional size there would be unreadable at exactly the size where it has
+/// to be read.
+const SUB_TEXT: f32 = 14.;
+const SUB_LINE_H: f32 = 18.;
+/// How far off the bottom of the picture the plate sits.
+const SUB_BOTTOM: f32 = 8.;
+/// The subtitle strip under the lanes: thin, because it is a picture of where
+/// the cues are and nothing on it can be dragged -- `HIT_MIN` binds targets, and
+/// this row has none.
+const SUB_LANE_H: f32 = 16.;
+/// A cue narrower than this is still drawn this wide: a one-frame cue on a
+/// zoomed-out bed is worth a fraction of a pixel, and a mark nobody can see says
+/// the track is empty.
+const SUB_CUE_MIN_W: f32 = 2.;
+/// How much of the subtitle list in the library column is on screen at once,
+/// past which it scrolls -- the media list above it is what keeps the height.
+const SUB_ROWS_H: f32 = 3. * ROW_H;
+
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
 /// while the keymap itself is what is being changed -- so neither can go
@@ -983,6 +1009,18 @@ struct Player {
     /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
     /// no magnet may take away.
     snap: bool,
+    /// Whether the cue under the playhead is drawn over the picture. On by
+    /// default -- a subtitle imported and then invisible is an import nobody can
+    /// tell happened -- and off by one stroke
+    /// ([`ActionId::ToggleSubtitles`](keymap::ActionId::ToggleSubtitles)) for
+    /// anyone watching the picture rather than reading it. The player's, not the
+    /// project's: it changes nothing that is saved and nothing that is exported.
+    subs_on: bool,
+    /// Which subtitle track is the one on screen: an index into
+    /// [`PlaybackSession::subtitles`], since a file may carry several and only
+    /// one can be read at a time. Cleared with the timeline like every other
+    /// index here -- track 2 of one project is not track 2 of the next.
+    sub_track: usize,
     /// The frame the live gesture is about to land on, or `None` while it is
     /// over open bed: the line every lane draws so the snap is seen before it
     /// happens rather than discovered after the release. Stale between gestures,
@@ -1363,6 +1401,7 @@ impl Player {
             ActionId::Silence => self.open_silence(cx),
             ActionId::Mix => self.open_mix(None, cx),
             ActionId::ToggleSnap => self.toggle_snap(cx),
+            ActionId::ToggleSubtitles => self.toggle_subtitles(cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -1415,6 +1454,32 @@ impl Player {
         self.keys_scroll.set_offset(point(px(0.), px(at)));
     }
 
+    /// The cues over the picture, off and on. Says which it is now *and* what is
+    /// on screen while they are on: a toggle whose answer is invisible when the
+    /// playhead happens to sit between two cues would read as broken.
+    fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
+        self.subs_on = !self.subs_on;
+        let label = self
+            .subtitle_track()
+            .map(|track| track.label.clone())
+            .unwrap_or_else(|| "nothing imported".to_string());
+        self.notice = Some(
+            match self.subs_on {
+                true => format!("SUBTITLES ON — {label}"),
+                false => format!("SUBTITLES OFF — {label} is still on the timeline"),
+            }
+            .into(),
+        );
+        cx.notify();
+    }
+
+    /// The subtitle track the overlay and the strip are showing: the one a
+    /// library row picked, or the first there is. `None` with no timeline and
+    /// for an index left over from one that is gone.
+    fn subtitle_track(&self) -> Option<&engine::subtitle::SubtitleTrack> {
+        self.session.as_ref()?.subtitles().get(self.sub_track)
+    }
+
     /// Whether the editor can be asked for `action` right now, and why not when
     /// it cannot. `on` is the clip the question is about -- the one a clip menu
     /// was opened on -- and `None` asks about the marked clip instead, which is
@@ -1441,6 +1506,7 @@ impl Player {
                 playhead: frame_at(session.now(), self.fps),
                 timeline: true,
                 clipboard: self.clipboard.is_some(),
+                subtitles: !session.subtitles().is_empty(),
                 exporting: self.exporting().is_some(),
             },
         )
@@ -3394,6 +3460,8 @@ impl Player {
         self.clipboard = None;
         self.selected = None;
         self.selected_asset = None;
+        // The subtitle rows go with the timeline they were on.
+        self.sub_track = 0;
         self.context_menu = None;
         self.library_menu = None;
         self.eq_open = None;
@@ -3501,11 +3569,47 @@ impl Player {
         // whether or not a session was already up. A file *named at launch* is
         // the other fork -- that one is an open, and it does become the
         // timeline (`main`).
+        // A subtitle file is not a source and lands on no lane: it joins the
+        // timeline's own list of them, which is what the library's subtitle
+        // section shows and what the overlay draws. With no timeline open there
+        // is nothing for the cues to be timed against, and it says so.
+        if is_subtitle(path) {
+            let text = match self
+                .session
+                .as_mut()
+                .map(|session| session.import_subtitles(path))
+            {
+                Some(Ok(0)) => format!("{} is already on the timeline", file_name(path)),
+                Some(Ok(_)) => format!(
+                    "SUBTITLES {} — showing over the picture, {} hides them",
+                    file_name(path),
+                    self.keymap.display(ActionId::ToggleSubtitles)
+                ),
+                Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
+                None => {
+                    "NO SUBTITLES ADDED — open a file for them to run against first".to_string()
+                }
+            };
+            eprintln!("{text}");
+            self.notice = Some(text.into());
+            cx.notify();
+            return;
+        }
         let text = match self.session.as_mut().map(|session| session.import(path)) {
-            Some(Ok(_)) => format!(
-                "IMPORTED {} to the library — drag it onto a lane to place it",
-                file_name(path)
-            ),
+            Some(Ok(_)) => {
+                // The file's own subtitle tracks with it, exactly as an open
+                // takes them: an import is the other door the same file arrives
+                // through.
+                let subs = self
+                    .session
+                    .as_mut()
+                    .and_then(|session| subtitle_notice(session, path))
+                    .unwrap_or_default();
+                format!(
+                    "IMPORTED {} to the library — drag it onto a lane to place it{subs}",
+                    file_name(path)
+                )
+            }
             Some(Err(e)) => format!("IMPORT FAILED: {e}"),
             None => self.open_media(path, false),
         };
@@ -3529,11 +3633,17 @@ impl Player {
             false => PlaybackSession::open_library(path),
         };
         match opened {
-            Ok(session) => {
+            Ok(mut session) => {
                 self.fps = session.meta().frame_rate;
                 // Read before the session moves: a file that plays silent says
                 // so here or nowhere.
                 let silent = audio_notice(&session);
+                // ...and the subtitle tracks the file carries inside it, taken
+                // now: nothing else ever opens this container again.
+                let subs = subtitle_notice(&mut session, path).unwrap_or_default();
+                // A file replaces the one that was open, and track 3 of that one
+                // is not track 3 of this.
+                self.sub_track = 0;
                 self.session = Some(session);
                 // A fresh session comes up at full volume; the player's own
                 // setting outlives the file, so it is pushed at every new one.
@@ -3553,7 +3663,7 @@ impl Player {
                         format!("IMPORTED {name} to the library — drag it onto a lane to place it")
                     }
                 };
-                format!("{what}{}", silent.unwrap_or_default())
+                format!("{what}{}{subs}", silent.unwrap_or_default())
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         }
@@ -3621,8 +3731,10 @@ impl Player {
                 // Marks are timeline frames of the timeline that was.
                 self.close_silence();
                 // A different set of sources: the row that was picked is not
-                // the file that index names any more.
+                // the file that index names any more -- and neither is the
+                // subtitle track that was showing.
                 self.selected_asset = None;
+                self.sub_track = 0;
                 // The counters describe one timeline; the eof line must not
                 // report the old one's frames against the new one.
                 self.displayed = 0;
@@ -4673,6 +4785,10 @@ impl Render for Player {
                             .flex_1()
                             .min_w(px(0.))
                             .overflow_hidden()
+                            // The bed the cue plate is placed against: it hangs
+                            // off the bottom of the picture region, which is the
+                            // one box that is the picture and nothing else.
+                            .relative()
                             .flex()
                             .justify_center()
                             .items_center()
@@ -4695,7 +4811,10 @@ impl Render for Player {
                                             .is_none()
                                             .then(|| empty_hint().into_any_element())
                                     }),
-                            ),
+                            )
+                            // After the picture, so the plate is drawn over it
+                            // rather than under: siblings paint in order.
+                            .children(self.subtitle_overlay(position)),
                     ),
             )
             // Above the panel and only when there is one to show, so it costs
@@ -4973,6 +5092,10 @@ impl Player {
                     })
                     .children(rows),
             )
+            // Under the media it belongs to: a subtitle track is not a source --
+            // it goes on no lane and is dragged nowhere -- but it is a thing the
+            // timeline holds, and this is the list of those.
+            .children(self.subtitle_section(cx))
             .child(control(
                 "add-asset",
                 None,
@@ -4994,6 +5117,159 @@ impl Player {
                     }
                 }),
             ))
+    }
+
+    /// The subtitle tracks this timeline holds, under the media list: one row
+    /// each, the picked one marked, and a click makes another one the picked one
+    /// -- which is the whole of choosing between the two tracks of a film. A row
+    /// per track and no cycle: three of them is an ordinary number for a remux,
+    /// and a key that steps through three is a key nobody can aim.
+    ///
+    /// A track that could not be read is *here*, greyed and saying why, exactly
+    /// as a media row the timeline cannot take is: PGS subtitles are pictures,
+    /// and a film carrying four of them says so instead of listing nothing.
+    ///
+    /// `None` when there are none -- an empty heading is a section about
+    /// nothing.
+    fn subtitle_section(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let tracks = self.session.as_ref()?.subtitles();
+        if tracks.is_empty() {
+            return None;
+        }
+        let rows: Vec<_> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, track)| {
+                let picked = i == self.sub_track;
+                let usable = track.refused.is_none();
+                let under = subtitle_detail(track);
+                let tip: SharedString = match &track.refused {
+                    Some(why) => format!("{} — {why}", track.path.display()),
+                    None => format!(
+                        "{} — click to show this track over the picture",
+                        track.path.display()
+                    ),
+                }
+                .into();
+                div()
+                    .id(("subtitle-track", i))
+                    .flex_none()
+                    .h(px(ROW_H))
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .when(!usable, |d| d.text_color(rgb(INK_DIM)).opacity(0.55))
+                    .when(usable, |d| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.sub_track = i;
+                                // Picking a track is asking to see it: a click
+                                // that changed nothing on screen because the
+                                // toggle was off would read as a dead row.
+                                this.subs_on = true;
+                                cx.notify();
+                            }))
+                    })
+                    .when(picked, |d| d.bg(rgb(SELECTED)))
+                    .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(11.))
+                            .child(track.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(rgb(INK_DIM))
+                            .child(under),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(rgb(INK_DIM))
+                        .child(match self.subs_on {
+                            true => "Subtitles",
+                            // The toggle's state where the tracks are listed: a
+                            // list of subtitles nothing on screen is showing has
+                            // to say that it is showing none.
+                            false => "Subtitles — hidden",
+                        }),
+                )
+                .child(
+                    div()
+                        .id("subtitle-rows")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .max_h(px(SUB_ROWS_H))
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+        )
+    }
+
+    /// The cues of the picked track that are on screen at `at`, over the picture
+    /// and nothing else: bottom-centred where every player puts them, white on a
+    /// plate so the film underneath cannot swallow them, and each cue its own
+    /// plate so two at one moment stack rather than run together.
+    ///
+    /// `None` -- no element at all -- while the toggle is off, with no track
+    /// picked, and between cues: the picture is what this window is for, and a
+    /// permanent empty band across it would be in the way of exactly that.
+    fn subtitle_overlay(&self, at: f64) -> Option<impl IntoElement + use<>> {
+        if !self.subs_on {
+            return None;
+        }
+        let cues = cues_at(&self.subtitle_track()?.cues, at);
+        if cues.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(SUB_BOTTOM))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(2.))
+                // The plate takes no click: the picture behind it is still the
+                // drop target the whole window is.
+                .children(cues.into_iter().map(|cue| {
+                    div()
+                        .max_w(relative(0.9))
+                        .px(px(6.))
+                        .rounded(px(3.))
+                        .bg(rgba(SUB_SHADE))
+                        .text_size(px(SUB_TEXT))
+                        .text_color(rgb(SUB_INK))
+                        .text_align(TextAlign::Center)
+                        // A line of the cue is a line on screen: the break the
+                        // parser kept is not whitespace to be re-flowed. What a
+                        // *long* line does is wrap inside its own div, which is
+                        // what the width cap above is for.
+                        .children(
+                            cue.text
+                                .split('\n')
+                                .map(|line| div().min_h(px(SUB_LINE_H)).child(line.to_string())),
+                        )
+                })),
+        )
     }
 
     /// What is decoding the picture right now, for the transport line: the
@@ -5058,6 +5334,11 @@ impl Player {
         for &lane in &lanes {
             rows.push(self.lane_row(lane, filled, cx));
         }
+        // Built from the same playhead pixel the lanes are, and before the
+        // export takes `filled` over below: the strip is a picture of the
+        // timeline, not of an export's progress.
+        let strip = self.subtitle_strip(filled);
+        let strip_h = subtitle_strip_h(strip.is_some());
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
             let elapsed = self
@@ -5114,7 +5395,7 @@ impl Player {
         };
         div()
             .flex_none()
-            .h(px(panel_h(lanes.len())))
+            .h(px(panel_h(lanes.len()) + strip_h))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -5337,6 +5618,36 @@ impl Player {
                         live,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
                     ))
+                    // The cues over the picture, off and on -- beside the zoom
+                    // and the snap, since like both of them it changes what is
+                    // being looked at and nothing about the edit. The label is
+                    // the state, as the snap's is, and it says what there is to
+                    // toggle when there is nothing.
+                    .child(control(
+                        "subs",
+                        None,
+                        match (self.subtitle_track().is_some(), self.subs_on) {
+                            (false, _) => "No subs",
+                            (true, true) => "Subs",
+                            (true, false) => "Subs off",
+                        },
+                        match self.enable(ActionId::ToggleSubtitles, None).why() {
+                            Some(why) => format!(
+                                "{} — {why}; drop a .srt on the window, or open an mkv that carries them",
+                                key(ActionId::ToggleSubtitles)
+                            ),
+                            None => format!(
+                                "{} — {}",
+                                key(ActionId::ToggleSubtitles),
+                                match self.subs_on {
+                                    true => "the cue under the playhead is drawn over the picture",
+                                    false => "the cues are on the timeline and off the picture",
+                                }
+                            ),
+                        },
+                        live && self.enable(ActionId::ToggleSubtitles, None).yes(),
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_subtitles(cx)),
+                    ))
                     // Import is not here: it belongs to the media list it adds
                     // to, and two doors into one action is a question about
                     // which one is the real one.
@@ -5531,6 +5842,11 @@ impl Player {
                     .overflow_y_scroll()
                     .children(rows),
             )
+            // Under the tracks and outside their scrolling column: a subtitle is
+            // not a track -- nothing can be dropped on it and nothing dragged
+            // along it -- and a strip that scrolled away with the sixth lane
+            // would be a strip nobody could see while editing.
+            .children(strip)
     }
 
     /// A notice holds its own bar, full width, until it is answered: any key
@@ -7884,6 +8200,99 @@ impl Player {
     /// is by its tint, and the tooltip is where every box says what clicking it
     /// does. Never focusable, so the root keeps focus and the play binding still
     /// works after a click (ledger:182).
+    /// The subtitle strip: where the picked track's cues are along the very same
+    /// bed the lanes are drawn on, through the very same [`Scale`], so a cue
+    /// lines up with the take it belongs to at every zoom.
+    ///
+    /// Display only -- no drag, no trim, no drop. What it is *for* is the
+    /// question "is there a subtitle here", which a timeline could not answer at
+    /// all before: the cues are the project's and are edited in the file they
+    /// came from.
+    ///
+    /// `None` with no track picked, so a timeline without subtitles is the panel
+    /// it has always been.
+    fn subtitle_strip(&self, filled: f32) -> Option<impl IntoElement + use<>> {
+        let track = self.subtitle_track()?;
+        let scale = self.scale;
+        let label = track.label.clone();
+        // The whole of what the row says in words, since a 40 px column can hold
+        // three characters of it: which track, how many cues, and -- for one
+        // that could not be read -- the engine's own reason, where the library
+        // row's grey already says the same thing.
+        let tip: SharedString = match track.refused.is_some() {
+            true => format!("Subtitles: {label} — {}", subtitle_detail(track)),
+            false => format!(
+                "Subtitles: {label} — {}, {} hides them",
+                subtitle_detail(track),
+                self.keymap.display(ActionId::ToggleSubtitles)
+            ),
+        }
+        .into();
+        let cues: Vec<(f32, f32)> = track.cues.iter().map(|cue| cue_box(scale, cue)).collect();
+        Some(
+            div()
+                .flex_none()
+                .h(px(SUB_LANE_H))
+                .flex()
+                .gap(px(HEADER_GAP))
+                .child(
+                    // Identified for the tooltip's sake and for nothing else:
+                    // the whole of what a 40 px column can say is three
+                    // characters, and the rest of it hangs off the hover.
+                    div()
+                        .id("subtitle-lane")
+                        .flex_none()
+                        .w(px(HEADER_W))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        // From the left rather than centred, unlike a lane's
+                        // `V1`: a track label is a language or a file name, and
+                        // a centred truncation eats both of its ends.
+                        .px(px(2.))
+                        .rounded(px(3.))
+                        .bg(rgb(SURFACE))
+                        .text_size(px(9.))
+                        .text_color(rgb(INK_DIM))
+                        .truncate()
+                        .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .rounded(px(3.))
+                        .bg(rgb(LETTERBOX))
+                        .overflow_hidden()
+                        .children(cues.into_iter().map(|(left, width)| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(left))
+                                .w(px(width))
+                                .rounded(px(2.))
+                                .bg(rgb(SELECTED))
+                        }))
+                        // The playhead again, last and in the lanes' own colour:
+                        // the strip is only worth anything beside them if it
+                        // reads as the same moment.
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(filled))
+                                .w(px(1.))
+                                .bg(rgb(ACCENT)),
+                        ),
+                ),
+        )
+    }
+
     fn lane_row(
         &self,
         lane: Lane,
@@ -8603,6 +9012,90 @@ fn audio_notice(session: &PlaybackSession) -> Option<String> {
         .map(|reason| format!(" — NO AUDIO: {reason}"))
 }
 
+/// Whether a dropped or named path is a subtitle file rather than media: the
+/// formats `engine::subtitle` parses, lowercased, for [`engine::is_audio`]'s
+/// reason -- the import door has to know which of the engine's two doors a file
+/// goes through before anything is opened.
+fn is_subtitle(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "srt" | "vtt" | "webvtt" | "ass" | "ssa"
+        )
+    })
+}
+
+/// Whether a media path is a container that can carry subtitle tracks *inside*
+/// it -- the two Matroska extensions, which is what
+/// [`PlaybackSession::import_subtitles`] walks for them.
+fn is_matroska(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
+}
+
+/// The subtitle tracks a media file carries, taken into the session as it is
+/// opened, and the tail the notice grows for them: an mkv with subtitles in it
+/// arrives with its subtitles, because a track nobody imported is a track nobody
+/// knows is there. Every other container answers `None` without being read.
+///
+/// A refusal is a tail too, never a failure of the open: the picture and the
+/// sound of a film whose subtitle tracks cannot be walked are still the film.
+///
+/// ponytail: the walk reads the whole file for its cues
+/// (`engine::subtitle::of_matroska`), so a long film pauses at the open it is
+/// part of. Ceiling: a two-hour remux. The upgrade is the background executor
+/// the waveforms already use, with the rows arriving when it lands.
+fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Option<String> {
+    if !is_matroska(path) {
+        return None;
+    }
+    match session.import_subtitles(path) {
+        Ok(0) => None,
+        Ok(n) => Some(format!(" — {n} subtitle track(s) in the file")),
+        Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
+    }
+}
+
+/// What a subtitle row says under its name: how many cues it holds, or -- for a
+/// track that could not be read -- the engine's own reason, verbatim. A refusal
+/// is what the row is *for*: a PGS track off a BluRay remux is pictures, and a
+/// list that dropped it would say the film has no subtitles at all.
+fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
+    match &track.refused {
+        Some(why) => why.clone(),
+        None => format!("{} cues", track.cues.len()),
+    }
+}
+
+/// Where a cue is drawn on the bed: left edge and width in pixels, through the
+/// same [`Scale`] every clip box goes through -- so a cue and the take it is
+/// spoken over line up at every zoom, which is the only reason the strip is
+/// worth drawing. Microseconds are the cue's unit and seconds are the scale's,
+/// and this is the one place they meet.
+///
+/// Never narrower than [`SUB_CUE_MIN_W`]: zoomed out, a one-second cue is a
+/// fraction of a pixel, and a mark that rounds away reads as a track with
+/// nothing in it.
+fn cue_box(scale: Scale, cue: &engine::subtitle::Cue) -> (f32, f32) {
+    let (start, end) = (cue.start_us as f64 / 1e6, cue.end_us as f64 / 1e6);
+    (
+        scale.px_at(start),
+        scale.width_px(end - start).max(SUB_CUE_MIN_W),
+    )
+}
+
+/// Which cues of a track are on screen at `at` seconds. Half-open, as the cue
+/// itself is: one that ends exactly where the next begins hands over rather than
+/// overlapping it for a frame, and several that genuinely overlap all come back
+/// -- a sign and a line of dialogue are two cues at one moment.
+fn cues_at(cues: &[engine::subtitle::Cue], at: f64) -> Vec<&engine::subtitle::Cue> {
+    let us = (at * 1e6) as i64;
+    cues.iter()
+        .filter(|cue| cue.start_us <= us && us < cue.end_us)
+        .collect()
+}
+
 /// The sources a repaint has not asked about yet. A key that is already there
 /// means "asked", whatever state it is in, which is what stops a decode already
 /// running from being started again by the next of sixty repaints a second.
@@ -8771,6 +9264,9 @@ struct Ctx {
     timeline: bool,
     /// Something has been copied.
     clipboard: bool,
+    /// This timeline has at least one subtitle track: a toggle with nothing to
+    /// show is a switch that does nothing, and it says so rather than flipping.
+    subtitles: bool,
     exporting: bool,
 }
 
@@ -8862,6 +9358,10 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
             Enable::No("click a clip first")
         }
         ActionId::Paste if !ctx.clipboard => Enable::No("nothing copied yet"),
+        // Nothing to draw over the picture, so nothing to switch off: the
+        // library says how subtitles arrive, and this row would flip a state
+        // with no visible half either way.
+        ActionId::ToggleSubtitles if !ctx.subtitles => Enable::No("no subtitles yet"),
         ActionId::CancelExport => Enable::No("nothing is exporting"),
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
@@ -9741,6 +10241,16 @@ fn lanes_h(lanes: usize) -> f32 {
     match lanes {
         0 => 0.,
         n => n as f32 * LANE_H + (n - 1) as f32 * 8.,
+    }
+}
+
+/// What the subtitle strip adds to the panel: its own row and the panel's gap
+/// above it, and nothing at all for a timeline with no subtitles on it -- the
+/// picture does not pay for a strip that is not drawn.
+fn subtitle_strip_h(shown: bool) -> f32 {
+    match shown {
+        true => SUB_LANE_H + 8.,
+        false => 0.,
     }
 }
 
@@ -10950,6 +11460,10 @@ mod tests {
         note_progress, px_along,
         repeats, resolution_choices, resolution_ladder, span_label, trimmed_clip, unscannable,
         visible_slice,
+    };
+    use super::{
+        SUB_BOTTOM, SUB_CUE_MIN_W, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H, SUB_TEXT, cue_box,
+        cues_at, is_matroska, is_subtitle, subtitle_detail, subtitle_notice, subtitle_strip_h,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -14230,6 +14744,166 @@ mod tests {
         assert_eq!(estimated_mb(Some(0), 60.), None);
     }
 
+    /// Which cue is on screen when: the whole of what the overlay decides, and
+    /// the one piece of it that is arithmetic rather than layout.
+    #[test]
+    fn a_cue_is_on_screen_from_its_start_until_the_moment_it_ends() {
+        use engine::subtitle::Cue;
+        let cue = |start_us, end_us, text: &str| Cue {
+            start_us,
+            end_us,
+            text: text.to_string(),
+        };
+        // Two cues that hand over exactly, and one that overlaps the second --
+        // a sign over a line of dialogue, which is two plates at one moment.
+        let cues = [
+            cue(500_000, 1_500_000, "first line"),
+            cue(1_500_000, 2_500_000, "second line"),
+            cue(2_000_000, 2_200_000, "a sign"),
+        ];
+        let at = |t: f64| -> Vec<&str> {
+            cues_at(&cues, t)
+                .into_iter()
+                .map(|c| c.text.as_str())
+                .collect()
+        };
+        // Before the first, between none of them: nothing, which is what makes
+        // the overlay disappear rather than sit there empty.
+        assert!(at(0.).is_empty());
+        assert!(at(0.4).is_empty());
+        assert!(at(3.).is_empty());
+        assert_eq!(at(0.5), ["first line"], "on at its own start");
+        assert_eq!(at(1.4), ["first line"]);
+        // Half-open: the frame the first ends on is the second's, never both.
+        assert_eq!(at(1.5), ["second line"]);
+        assert_eq!(at(2.1), ["second line", "a sign"], "two at once stack");
+        assert_eq!(at(2.2), ["second line"], "the sign is over");
+        // ...and the end of the last one is the end of it.
+        assert!(at(2.5).is_empty());
+        // A negative time is before everything rather than a panic: the
+        // playhead is clamped, but nothing here depends on that.
+        assert!(at(-1.).is_empty());
+    }
+
+    /// The two places a subtitle is drawn -- the plate over the picture and the
+    /// strip under the lanes -- inside the 640x360 floor the rest of this window
+    /// is sized for, and the plate readable on whatever the film is showing.
+    #[test]
+    fn the_subtitle_plate_and_strip_fit_the_smallest_window() {
+        // The strip costs the panel its own row and the panel's gap, and costs
+        // nothing at all when there is no track to draw.
+        assert_eq!(subtitle_strip_h(false), 0.);
+        assert_eq!(subtitle_strip_h(true), SUB_LANE_H + 8.);
+        // What is left for the picture at the floor, with the panel a project
+        // starts with and the strip under it.
+        let picture = 360. - HEADER_H - panel_h(2) - subtitle_strip_h(true);
+        assert!(picture > 0., "the strip pushed the picture off the window");
+        // A two-line cue and the gap under it fit inside that, which is the
+        // whole claim: the plate sits *over* the picture and must not need more
+        // of it than there is.
+        assert!(
+            SUB_BOTTOM + 2. * SUB_LINE_H <= picture,
+            "a two-line cue does not fit the smallest picture"
+        );
+        // The text sits on its line rather than being clipped by it.
+        assert!(SUB_LINE_H >= SUB_TEXT);
+        // White on the plate, not chrome on chrome: a cue is read against the
+        // film, and this is the one pair here that has to survive any picture.
+        assert!(contrast(SUB_INK, 0x000000) >= 7.);
+        // The strip is a picture and not a target -- nothing on it takes a
+        // click -- which is the only reason it may be under `HIT_MIN`.
+        assert!(SUB_LANE_H < HIT_MIN && SUB_LANE_H > 0.);
+        // The library's own list of tracks scrolls past three rather than
+        // taking the media list's room.
+        assert_eq!(SUB_ROWS_H / ROW_H, 3.);
+        assert!(ROW_H >= HIT_MIN, "a subtitle row is clicked to pick it");
+    }
+
+    /// The two doors subtitles arrive through, end to end on the fixtures: a
+    /// file beside the media and the tracks inside an mkv, what the overlay then
+    /// says at a given moment, and where the strip draws it.
+    #[test]
+    fn subtitles_arrive_beside_the_media_and_inside_it() {
+        // Which door a path goes through is decided before anything is opened.
+        for name in ["subs.srt", "SUBS.SRT", "a.vtt", "a.ass", "a.ssa"] {
+            assert!(is_subtitle(Path::new(name)), "{name}");
+        }
+        for name in ["a.mp4", "a.mkv", "notes.txt", "a"] {
+            assert!(!is_subtitle(Path::new(name)), "{name}");
+        }
+        assert!(is_matroska(Path::new("film.MKV")) && is_matroska(Path::new("clip.webm")));
+        assert!(!is_matroska(Path::new("clip.mp4")));
+
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        // Beside the media: the drop door's own call, and the row it makes.
+        let srt = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../engine/tests/data/test_subs.srt")
+            .canonicalize()
+            .expect("the subtitle fixture");
+        assert_eq!(session.import_subtitles(&srt).expect("the .srt imports"), 1);
+        let track = &session.subtitles()[0];
+        assert_eq!(track.label, "test_subs.srt");
+        assert_eq!(subtitle_detail(track), "3 cues");
+        // What the overlay draws at a moment inside the first cue, and between
+        // two of them -- the fixture's own timings (0.5-1.5 s, 2.0-3.25 s).
+        let text = |t: f64| -> Vec<String> {
+            cues_at(&track.cues, t)
+                .into_iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        assert_eq!(text(0.7), ["first line"]);
+        assert!(text(1.8).is_empty(), "between two cues the plate goes");
+        assert_eq!(text(2.5), ["second line\nwith a break"]);
+        // Where the strip puts that first cue: 0.5 s in at 40 px to the second
+        // is 20 px along, and a second of cue is 40 px wide.
+        let scale = Scale::default();
+        assert_eq!(scale.pps, PPS_DEFAULT);
+        assert_eq!(cue_box(scale, &track.cues[0]), (20., 40.));
+        // Zoomed right out, a cue worth a fraction of a pixel is still a mark.
+        let far = Scale {
+            pps: 0.01,
+            start: 0.,
+        };
+        assert_eq!(cue_box(far, &track.cues[0]).1, SUB_CUE_MIN_W);
+        // ...and scrolled past, its left edge is negative, exactly as a clip
+        // box's is: the bed clips it.
+        let scrolled = Scale {
+            pps: PPS_DEFAULT,
+            start: 1.,
+        };
+        assert_eq!(cue_box(scrolled, &track.cues[0]).0, -20.);
+
+        // Inside the media: the tracks of an mkv, taken by the same call every
+        // open and import door makes. Two of them in the fixture, named by what
+        // the file says rather than by number.
+        let notice =
+            subtitle_notice(&mut session, &asset("test_subs.mkv")).expect("the mkv carries two");
+        assert!(notice.contains('2'), "{notice}");
+        assert_eq!(session.subtitles().len(), 3);
+        assert_eq!(session.subtitles()[1].label, "eng");
+        assert_eq!(session.subtitles()[2].label, "fra — Signs");
+        assert_eq!(subtitle_detail(&session.subtitles()[1]), "3 cues");
+        // The same file twice adds nothing and says nothing.
+        assert_eq!(subtitle_notice(&mut session, &asset("test_subs.mkv")), None);
+        // A container that cannot hold them is never even read.
+        assert_eq!(subtitle_notice(&mut session, &asset("test_av.mp4")), None);
+
+        // A track that could not be read says why, where its cue count would
+        // be: what the greyed library row prints, and the whole difference
+        // between "this film has no subtitles" and "these four are pictures".
+        let refused = engine::subtitle::SubtitleTrack {
+            path: PathBuf::from("/a/remux.mkv"),
+            track: Some(1),
+            label: "eng".into(),
+            cues: Vec::new(),
+            refused: Some("S_HDMV/PGS subtitles are pictures, not text".into()),
+        };
+        assert!(subtitle_detail(&refused).contains("pictures"));
+        assert!(cues_at(&refused.cues, 1.).is_empty());
+    }
+
     #[test]
     fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
         // Every hit target in the panel, including the scrub strip -- whose bar
@@ -14733,14 +15407,39 @@ fn main() {
     // not fatal -- the others still load -- but the window must not open
     // silently pretending the file was taken, so the first one seeds the notice.
     for extra in std::env::args().skip(2) {
+        let extra = PathBuf::from(&extra);
         // Only reachable with a first argument, so there is a timeline.
-        if let Some(session) = &mut session
-            && let Err(e) = session.import(std::path::Path::new(&extra))
-        {
-            let text = format!("IMPORT FAILED: {e}");
-            eprintln!("{extra}: {text}");
-            notice.get_or_insert(text);
+        let Some(session) = &mut session else {
+            continue;
+        };
+        // A subtitle file named on the command line is not a source: it goes
+        // through the engine's other door, exactly as a dropped one does.
+        let imported = match is_subtitle(&extra) {
+            true => session.import_subtitles(&extra).map(|_| 0),
+            false => session.import(&extra),
+        };
+        match imported {
+            // The file's own tracks with it, as every other import door takes
+            // them.
+            Ok(_) => {
+                if let Some(text) = subtitle_notice(session, &extra) {
+                    eprintln!("{}: {text}", extra.display());
+                }
+            }
+            Err(e) => {
+                let text = format!("IMPORT FAILED: {e}");
+                eprintln!("{}: {text}", extra.display());
+                notice.get_or_insert(text);
+            }
         }
+    }
+    // The subtitle tracks inside the file that *is* the timeline, taken at the
+    // launch the window opens from -- the same pickup the drop and the Import
+    // button make (`open_media`).
+    if let (Some(session), Some(arg)) = (&mut session, &arg)
+        && let Some(text) = subtitle_notice(session, arg)
+    {
+        eprintln!("{text}");
     }
     // A file that plays silent is as much news at launch as it is on a drop, and
     // behind the keymap notice for the same reason an import refusal is.
@@ -14840,6 +15539,8 @@ fn main() {
                     trim: None,
                     grab: 0,
                     snap: true,
+                    subs_on: true,
+                    sub_track: 0,
                     snap_cue: None,
                     ghost: None,
                     last_scrub: Instant::now(),
