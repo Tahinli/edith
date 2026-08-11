@@ -1640,6 +1640,7 @@ dependencies = [
  "rav1e",
  "rusty_aac",
  "rusty_h264",
+ "rusty_mp3",
  "symphonia",
  "symphonia-codec-aac",
  "symphonia-core",
@@ -4923,6 +4924,12 @@ checksum = "f4fb69d8977d1d067d6d603df0614678c4a35ac1201fff38783c8847e429c879"
 dependencies = [
  "rusty_h264-common",
 ]
+
+[[package]]
+name = "rusty_mp3"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a99f339ec9a2d84eec8fc2a42baa92426966b25238c498e79d57b4e49b14fbad"
 
 [[package]]
 name = "rustybuzz"

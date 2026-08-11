@@ -185,7 +185,7 @@ fn a_gap_segment_is_silence_of_its_own_length() {
     );
 }
 
-/// The copy side of a gap: there is no AAC encoder here, so the hole is copied
+/// The copy side of a gap: a copy never encodes, so the hole is copied
 /// as hand-written silent packets -- real access units, one 1024-frame stts
 /// entry each, the rounding debt carried through them like any other segment.
 /// Every packet after the gap therefore still lands at its timeline position.
