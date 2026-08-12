@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use mp4::{MediaType, Mp4Reader, Mp4Track, TrackType};
+use mp4::{Mp4Reader, Mp4Track, TrackType};
 
 use crate::audio::{edit_media_time, packet_at, stts_pairs};
 use crate::colorspace::{ColorDescription, ContentLight, Tags, bitstream_tags};
@@ -67,6 +67,65 @@ impl Codec {
     }
 }
 
+/// The capability matrix: every [`Codec`] the decoder layer can be handed, with
+/// the id that names it in each container -- the Matroska `CodecID` and the mp4
+/// `stsd` sample entry fourcc. Both dispatches read *this*, so a codec is
+/// reachable from both containers or from neither, never from one because
+/// somebody wrote an arm and forgot its twin (VP9 was exactly that: decoded out
+/// of an mp4, refused out of a `.webm`, with the VA-API decoder wired all along).
+///
+/// A cell that is deliberately absent is a row in [`UNSUPPORTED`] with a reason,
+/// never a silent fall-through; `every_codec_is_reachable_from_both_containers`
+/// holds both halves.
+const CODEC_IDS: &[(Codec, &str, &[u8; 4])] = &[
+    (Codec::H264, "V_MPEG4/ISO/AVC", b"avc1"),
+    (Codec::Hevc, "V_MPEGH/ISO/HEVC", b"hvc1"),
+    (Codec::Vp9, "V_VP9", b"vp09"),
+    (Codec::Av1, "V_AV1", b"av01"),
+];
+
+/// The written-down gaps: container ids -- a Matroska `CodecID` or a four-byte
+/// mp4 fourcc -- this reads no picture out of, and why. Asserted to be genuinely
+/// unreachable by the same test that asserts [`CODEC_IDS`] is reachable, so a gap
+/// that gets closed has to be moved out of here rather than left lying as a false
+/// claim.
+const UNSUPPORTED: &[(&str, &str)] = &[
+    // The mp4 path re-injects the parameter sets out of the `avcC` ahead of
+    // every sync sample and has nothing to inject for an `avc3` track, which
+    // carries them in-band only; `mp4 0.14` parses no `avc3` sample entry at all
+    // either, so `sequence_parameter_set()` would come back empty-handed.
+    ("avc3", "H.264 with parameter sets in-band only"),
+    ("vp08", "no VP8 decoder: cros-codecs carries none"),
+    ("V_VP8", "no VP8 decoder: cros-codecs carries none"),
+    ("V_MPEG2", "no MPEG-2 decoder, hardware or software"),
+    (
+        "V_MS/VFW/FOURCC",
+        "a codec inside a BITMAPINFOHEADER; nothing here unwraps one",
+    ),
+];
+
+/// Which codec a Matroska `CodecID` names, or `None` for a track this reads no
+/// picture out of. The mkv half of [`CODEC_IDS`].
+fn mkv_codec(id: &str) -> Option<Codec> {
+    CODEC_IDS
+        .iter()
+        .find(|(_, mkv, _)| *mkv == id)
+        .map(|&(codec, ..)| codec)
+}
+
+/// Which codec an mp4 `stsd` sample entry fourcc names. The mp4 half of
+/// [`CODEC_IDS`], plus `hev1`: HEVC arrives under either fourcc and the record
+/// the parameter sets come out of is the same `hvcC` either way.
+fn mp4_codec(fourcc: &[u8; 4]) -> Option<Codec> {
+    if fourcc == b"hev1" {
+        return Some(Codec::Hevc);
+    }
+    CODEC_IDS
+        .iter()
+        .find(|(_, _, mp4)| *mp4 == fourcc)
+        .map(|&(codec, ..)| codec)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoMeta {
     pub width: u32,
@@ -98,6 +157,7 @@ impl Demuxer {
             (meta, Self::Mp4(mp4))
         };
         demuxer.fill_sei_light();
+        demuxer.fill_vp9_depth()?;
         Ok((meta, demuxer))
     }
 
@@ -144,6 +204,42 @@ impl Demuxer {
             Self::Mp4(d) => d.light = found,
             Self::Mkv(d) => d.light = found,
         }
+    }
+
+    /// The bitstream tier of [`Self::bit_depth`] for VP9, which is *all* of it:
+    /// an HEVC track states its depth in an `hvcC` and an AV1 one in an `av1C`,
+    /// and a VP9 track states it nowhere either demuxer reads -- a Matroska
+    /// `TrackEntry` carries no configuration record at all, and the `vpcC` an mp4
+    /// writes is optional and describes the file rather than the frame. So it is
+    /// read where it is always true: the uncompressed header of the first
+    /// keyframe, which is what [`vp9_bit_depth`] parses.
+    ///
+    /// Assuming 8 instead is how a profile 2 stream would decode into an NV12
+    /// pool and come back as garbage -- the plugin picks its surface pool off
+    /// this number ([`crate::hw`]).
+    fn fill_vp9_depth(&mut self) -> crate::Result<()> {
+        let codec = match self {
+            Self::Mp4(d) => d.codec,
+            Self::Mkv(d) => d.codec,
+        };
+        if codec != Codec::Vp9 {
+            return Ok(());
+        }
+        let first = self.next_access_unit();
+        self.seek_to_sync_at_or_before(0);
+        let Ok(Some(au)) = first else {
+            return Ok(());
+        };
+        // A 12-bit stream is refused by name here, exactly as a 12-bit AV1 is in
+        // `parse_av1c`: the plugin has an NV12 pool and a P010 one and no third.
+        let Some(depth) = vp9_bit_depth(&au)? else {
+            return Ok(());
+        };
+        match self {
+            Self::Mp4(d) => d.bit_depth = depth,
+            Self::Mkv(d) => d.bit_depth = depth,
+        }
+        Ok(())
     }
 
     /// Next access unit in decode order, `None` at end of track.
@@ -221,35 +317,39 @@ impl Mp4Demuxer {
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
 
-        let track = reader
-            .tracks()
-            .values()
-            .find_map(|t| match t.media_type() {
-                Ok(MediaType::H264) => Some((t, Codec::H264)),
-                Ok(MediaType::H265) => Some((t, Codec::Hevc)),
-                Ok(MediaType::VP9) => Some((t, Codec::Vp9)),
-                // `mp4 0.14`'s `stsd` parser knows only a `hev1` sample entry
-                // (`stsd.rs:107`) and no `av01` at all, so an `hvc1`-tagged HEVC
-                // track -- what Apple and ffmpeg's mov muxer write in practice
-                // -- and every AV1 track report no media type, and such a file
-                // used to read back as having no video. Its sample tables
-                // (`stts`/`stsz`/`stsc`/`stss`) are parsed regardless of the
-                // entry the crate dropped, so only the fourcc has to be read
-                // here by hand. hvc1 differs from hev1 in that the parameter
-                // sets may not repeat in-band, which costs nothing: they are
-                // re-injected out of `hvcC` ahead of every sync sample either
-                // way, exactly as an AV1 sequence header is out of `av1C`.
-                _ => matches!(t.track_type(), Ok(TrackType::Video))
+        // In *file* order, out of `moov.traks` rather than `Mp4Reader::tracks`,
+        // which is a `HashMap`: iterating that would make "the video track" a
+        // different one from one run to the next on a file carrying two, and a
+        // saved `.edith` would reopen on the other picture. The audio side reads
+        // the same box for the same reason ([`crate::audio::audio_track_ids`]).
+        //
+        // The fourcc of the sample entry is what names the codec, read out of the
+        // file by hand: `mp4 0.14`'s `stsd` parser knows only a `hev1` entry
+        // (`stsd.rs:107`) and no `av01` at all, so an `hvc1`-tagged HEVC track --
+        // what Apple and ffmpeg's mov muxer write in practice -- and every AV1
+        // track report no media type through `media_type()`, and such a file used
+        // to read back as having no video. Its sample tables
+        // (`stts`/`stsz`/`stsc`/`stss`) are parsed regardless of the entry the
+        // crate dropped, so the fourcc is all that is missing. hvc1 differs from
+        // hev1 in that the parameter sets may not repeat in-band, which costs
+        // nothing: they are re-injected out of `hvcC` ahead of every sync sample
+        // either way, exactly as an AV1 sequence header is out of `av1C`.
+        let (track, codec) = reader
+            .moov
+            .traks
+            .iter()
+            .filter_map(|trak| reader.tracks().get(&trak.tkhd.track_id))
+            .find_map(|t| {
+                matches!(t.track_type(), Ok(TrackType::Video))
                     .then(|| sample_entry(path, t.track_id()).ok())
                     .flatten()
-                    .and_then(|(kind, _)| match &kind {
-                        b"hvc1" => Some((t, Codec::Hevc)),
-                        b"av01" => Some((t, Codec::Av1)),
-                        _ => None,
-                    }),
+                    .and_then(|(kind, _)| mp4_codec(&kind))
+                    .map(|codec| (t, codec))
             })
-            .ok_or("no H.264, HEVC, VP9 or AV1 video track in file")?;
-        let (track, codec) = track;
+            // Named, for the same reason the Matroska door names it: "no video
+            // track" is a lie about a file that has one in a codec this does not
+            // read, and the fourcc is what tells a user which.
+            .ok_or_else(|| mp4_no_video(path, &reader))?;
 
         let track_id = track.track_id();
         let meta = VideoMeta {
@@ -467,9 +567,16 @@ impl MkvDemuxer {
             // in a codec this does not read.
             None => {
                 return Err(match other {
-                    Some(codec) => format!(
-                        "{codec} video in a Matroska file is not supported — AV1, HEVC and H.264 are"
-                    ),
+                    // By the reason the table gives where there is one, so the
+                    // refusal says what is missing rather than only what is not.
+                    Some(codec) => match UNSUPPORTED.iter().find(|(id, _)| *id == codec) {
+                        Some((_, why)) => {
+                            format!("{codec} video in a Matroska file is not supported — {why}")
+                        }
+                        None => format!(
+                            "{codec} video in a Matroska file is not supported — AV1, HEVC, H.264 and VP9 are"
+                        ),
+                    },
                     None => "this Matroska file has no video track".to_string(),
                 }
                 .into());
@@ -544,8 +651,9 @@ impl MkvDemuxer {
     }
 
     /// Next access unit in decode order: the block verbatim for AV1, which is
-    /// one temporal unit already, and Annex-B for HEVC, whose block holds the
-    /// same length-prefixed NALs an mp4 sample does.
+    /// one temporal unit already, and for VP9, whose block is one (super)frame;
+    /// Annex-B for HEVC and H.264, whose blocks hold the same length-prefixed
+    /// NALs an mp4 sample does.
     fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
         let Some(&block) = self.blocks.get(self.next) else {
             return Ok(None);
@@ -564,7 +672,7 @@ impl MkvDemuxer {
         // the bytes as a codec's: a stripped block is not a NAL and an inflated
         // one is not where it was read from.
         unpack.frame(scratch)?;
-        if self.codec == Codec::Av1 {
+        if matches!(self.codec, Codec::Av1 | Codec::Vp9) {
             let mut au = Vec::with_capacity(head + self.scratch.len());
             au.extend_from_slice(&self.config[..head]);
             au.extend_from_slice(&self.scratch);
@@ -1097,39 +1205,59 @@ fn mkv_track_entry(
     // A Matroska `CodecPrivate` is the codec's own configuration record --
     // `av1C` for AV1 and an `hvcC` for HEVC, byte for byte the one an mp4
     // sample entry carries, so it parses with the very same reader.
-    let (codec, nal_length, config, bit_depth) = match (kind, codec.as_str()) {
-        (1, "V_AV1") => {
+    //
+    // Which codec the id names is [`mkv_codec`]'s answer and not a match arm of
+    // its own, so this cannot know a codec the mp4 side does not; the match below
+    // is exhaustive over [`Codec`] for the other half of it -- a variant added to
+    // the enum fails to compile here rather than falling through to a refusal.
+    if kind == 2 {
+        return Ok(MkvEntry::Audio(MkvAudioTrack {
+            number,
+            codec,
+            // What a `TrackEntry` without a `Language` element means, by spec --
+            // the same default the subtitle walk applies.
+            language: if language.is_empty() {
+                "und".into()
+            } else {
+                language
+            },
+            name,
+            unpack,
+        }));
+    }
+    if kind != 1 {
+        return Ok(MkvEntry::Other);
+    }
+    // The inner match carries no wildcard on purpose: a codec added to [`Codec`]
+    // fails to compile here rather than falling through to a refusal, which is
+    // how a VP9 `.webm` came to be refused by a build whose VA-API VP9 decoder
+    // was wired.
+    let Some(known) = mkv_codec(&codec) else {
+        return Ok(MkvEntry::OtherVideo(codec));
+    };
+    let (codec, nal_length, config, bit_depth) = match known {
+        Codec::Av1 => {
             let (sets, bit_depth) = parse_av1c(&config)?;
             (Codec::Av1, 4, sets, bit_depth)
         }
-        (1, "V_MPEGH/ISO/HEVC") => {
+        Codec::Hevc => {
             let (nal_length, sets, bit_depth) = parse_hvcc(&config)?;
             (Codec::Hevc, nal_length, sets, bit_depth)
         }
         // The `avcC` beside them, and the same story: length-prefixed blocks and
         // the SPS/PPS out of the record. Taken as 8-bit, which is what the whole
         // H.264 path here assumes of an mp4's `avc1` too.
-        (1, "V_MPEG4/ISO/AVC") => {
+        Codec::H264 => {
             let (nal_length, sets) = parse_avcc(&config)?;
             (Codec::H264, nal_length, sets, 8)
         }
-        (1, _) => return Ok(MkvEntry::OtherVideo(codec)),
-        (2, _) => {
-            return Ok(MkvEntry::Audio(MkvAudioTrack {
-                number,
-                codec,
-                // What a `TrackEntry` without a `Language` element means, by
-                // spec -- the same default the subtitle walk applies.
-                language: if language.is_empty() {
-                    "und".into()
-                } else {
-                    language
-                },
-                name,
-                unpack,
-            }));
-        }
-        _ => return Ok(MkvEntry::Other),
+        // A VP9 block is one self-contained (super)frame: no length prefixes to
+        // strip and no configuration record to re-inject -- a `.webm` writes no
+        // `CodecPrivate` at all, and the `vpcC` an mp4 writes is not bitstream
+        // and would corrupt the frame if it were prepended. The depth is not in
+        // the container either, so it is read off the first keyframe by
+        // [`Demuxer::fill_vp9_depth`]; 8 here is what that probe starts from.
+        Codec::Vp9 => (Codec::Vp9, 0, Vec::new(), 8),
     };
     Ok(MkvEntry::Video(MkvVideo {
         number,
@@ -1220,6 +1348,94 @@ fn parse_av1c(rec: &[u8]) -> crate::Result<(Vec<u8>, u8)> {
         _ => 8,
     };
     Ok((rec.get(4..).unwrap_or_default().to_vec(), bit_depth))
+}
+
+/// Why an mp4 came back with no picture, by the fourcc of the video track it
+/// does carry: `avc3` and `mp4v` are files with video in them, and telling their
+/// owner there is none sends them looking for a fault that is not in the file.
+/// [`UNSUPPORTED`]'s reason where the table has one, the fourcc itself where it
+/// does not.
+fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
+    let found = reader
+        .moov
+        .traks
+        .iter()
+        .filter(|trak| {
+            matches!(
+                TrackType::try_from(&trak.mdia.hdlr.handler_type),
+                Ok(TrackType::Video)
+            )
+        })
+        .find_map(|trak| sample_entry(path, trak.tkhd.track_id).ok())
+        .map(|(kind, _)| String::from_utf8_lossy(&kind).trim().to_string());
+    match found {
+        Some(kind) => match UNSUPPORTED.iter().find(|(id, _)| *id == kind) {
+            Some((_, why)) => format!("{kind} video in this mp4 is not supported — {why}"),
+            None => {
+                format!("{kind} video in this mp4 is not supported — H.264, HEVC, VP9 and AV1 are")
+            }
+        },
+        None => "no H.264, HEVC, VP9 or AV1 video track in file".to_string(),
+    }
+    .into()
+}
+
+/// Bits per luma sample out of a VP9 keyframe's uncompressed header (VP9
+/// bitstream spec §6.2 `uncompressed_header` and §6.4.1 `color_config`), which is
+/// the one place a VP9 stream states its own depth -- see
+/// [`Demuxer::fill_vp9_depth`] for why neither container is asked.
+///
+/// `None` when this access unit cannot answer -- not a keyframe, a
+/// `show_existing_frame`, a truncated block -- which leaves the caller's 8-bit
+/// default standing rather than guessing; profile 0 and 1 *are* 8-bit by
+/// definition, and they are all a `.webm` off the web ever is.
+fn vp9_bit_depth(au: &[u8]) -> crate::Result<Option<u8>> {
+    /// `count` bits, MSB first, from bit offset `at`. Up to 24 at a time, which
+    /// is the frame sync code and the widest field read here.
+    fn bits(au: &[u8], at: &mut usize, count: usize) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..count {
+            let byte = *au.get(*at / 8)?;
+            value = value << 1 | u32::from(byte >> (7 - *at % 8) & 1);
+            *at += 1;
+        }
+        Some(value)
+    }
+    let at = &mut 0;
+    // frame_marker, then the profile as two bits written low one first; profile 3
+    // spends a reserved bit before the rest.
+    if bits(au, at, 2) != Some(2) {
+        return Ok(None);
+    }
+    let (Some(low), Some(high)) = (bits(au, at, 1), bits(au, at, 1)) else {
+        return Ok(None);
+    };
+    let profile = high << 1 | low;
+    if profile == 3 && bits(au, at, 1).is_none() {
+        return Ok(None);
+    }
+    // show_existing_frame: such a frame is a reference already decoded and its
+    // header stops right here. Then frame_type (0 is a keyframe), show_frame and
+    // error_resilient_mode, and only a keyframe carries the colour config.
+    if bits(au, at, 1) != Some(0) || bits(au, at, 1) != Some(0) {
+        return Ok(None);
+    }
+    if bits(au, at, 2).is_none() {
+        return Ok(None);
+    }
+    if bits(au, at, 24) != Some(0x49_8342) {
+        return Ok(None);
+    }
+    if profile < 2 {
+        return Ok(Some(8));
+    }
+    match bits(au, at, 1) {
+        Some(0) => Ok(Some(10)),
+        Some(_) => {
+            Err("12-bit VP9 is not supported — 8- and 10-bit are what the decoder carries".into())
+        }
+        None => Ok(None),
+    }
 }
 
 /// Every block of track `number`, in storage order, with the presentation span
@@ -2098,6 +2314,89 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capability matrix, as an assert: every codec the decoder layer can be
+    /// handed is reachable from *both* container dispatches, and every gap is a
+    /// row in [`UNSUPPORTED`] that is genuinely a gap. A codec wired into
+    /// `engine-hw` and reachable from one container only is the defect this
+    /// exists for -- VP9 was decodable out of an mp4 and refused out of a
+    /// `.webm`, with the VA-API VP9 decoder compiled in the whole time.
+    ///
+    /// The `Codec::` list is written out rather than iterated because there is no
+    /// variant list to iterate: what makes it stay complete is that both
+    /// dispatches match on [`Codec`] with no wildcard, so a new variant fails to
+    /// compile until it has been routed.
+    #[test]
+    fn every_codec_is_reachable_from_both_containers() {
+        for codec in [Codec::H264, Codec::Hevc, Codec::Vp9, Codec::Av1] {
+            let row = CODEC_IDS
+                .iter()
+                .find(|(c, ..)| *c == codec)
+                .unwrap_or_else(|| panic!("{} has no row in CODEC_IDS", codec.name()));
+            assert_eq!(
+                mkv_codec(row.1),
+                Some(codec),
+                "{} is not reachable from a Matroska file",
+                codec.name()
+            );
+            assert_eq!(
+                mp4_codec(row.2),
+                Some(codec),
+                "{} is not reachable from an mp4",
+                codec.name()
+            );
+        }
+        // hev1 and hvc1 are one codec in two fourccs; both are HEVC.
+        assert_eq!(mp4_codec(b"hev1"), Some(Codec::Hevc));
+
+        for (id, why) in UNSUPPORTED {
+            assert_eq!(mkv_codec(id), None, "{id} is supported after all ({why})");
+            if let Ok(fourcc) = <&[u8; 4]>::try_from(id.as_bytes()) {
+                assert_eq!(
+                    mp4_codec(fourcc),
+                    None,
+                    "{id} is supported after all ({why})"
+                );
+            }
+        }
+        // ...and a codec nothing here reads is refused rather than mistaken for
+        // its neighbour in the table.
+        assert_eq!(mkv_codec("V_MPEG4/ISO/ASP"), None);
+        assert_eq!(mp4_codec(b"jpeg"), None);
+    }
+
+    /// The one place a VP9 stream states its own depth. Byte-aligned by
+    /// construction: the fields ahead of the frame sync code are exactly 8 bits
+    /// for profiles 0-2.
+    #[test]
+    fn a_vp9_keyframe_states_its_own_bit_depth() {
+        // frame_marker 10, profile bits, show_existing 0, frame_type 0 (key),
+        // show_frame 1, error_resilient 0, then the sync code 49 83 42.
+        let profile0 = [0b1000_0010, 0x49, 0x83, 0x42];
+        assert_eq!(vp9_bit_depth(&profile0).unwrap(), Some(8));
+        // profile 2 (low 0, high 1), then ten_or_twelve_bit = 0.
+        let profile2 = [0b1001_0010, 0x49, 0x83, 0x42, 0b0000_0000];
+        assert_eq!(vp9_bit_depth(&profile2).unwrap(), Some(10));
+        // ...and with it set: 12-bit, which has no surface pool here and is
+        // refused by name rather than decoded into garbage.
+        let twelve = [0b1001_0010, 0x49, 0x83, 0x42, 0b1000_0000];
+        let refused = vp9_bit_depth(&twelve).unwrap_err().to_string();
+        assert!(refused.contains("12-bit VP9"), "{refused}");
+        // Nothing to answer with is not an answer: an inter frame, a
+        // show_existing_frame, a truncated block and a non-VP9 payload all leave
+        // the caller's default standing.
+        assert_eq!(
+            vp9_bit_depth(&[0b1000_0110, 0x49, 0x83, 0x42]).unwrap(),
+            None
+        );
+        assert_eq!(
+            vp9_bit_depth(&[0b1000_1010, 0x49, 0x83, 0x42]).unwrap(),
+            None
+        );
+        assert_eq!(vp9_bit_depth(&profile2[..3]).unwrap(), None);
+        assert_eq!(vp9_bit_depth(&[0, 0, 0, 1, 0x65]).unwrap(), None);
+        assert_eq!(vp9_bit_depth(&[]).unwrap(), None);
+    }
 
     #[test]
     fn splits_two_nals() {
