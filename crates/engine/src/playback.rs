@@ -892,12 +892,19 @@ impl PlaybackSession {
         crate::export::planned_audio(&self.project, format)
     }
 
-    /// What an export would do about the subtitle track at `pick` --
+    /// What an export would do about the tracks at `picks` --
     /// [`crate::export::planned_subtitles`], asked of the project a front-end is
-    /// holding, and pure for the same reason. `pick` is a row of
-    /// [`subtitles`](Self::subtitles).
-    pub fn planned_subtitles(&self, format: crate::export::Format, pick: Option<usize>) -> String {
-        crate::export::planned_subtitles(&self.project, format, pick)
+    /// holding, and pure for the same reason. `picks` is any run of rows of
+    /// [`subtitles`](Self::subtitles): the whole
+    /// [`ExportSettings::subtitles`](crate::export::ExportSettings::subtitles)
+    /// list a card is about to send (`picks.iter().copied()`) as much as a
+    /// single `Some(row)`.
+    pub fn planned_subtitles(
+        &self,
+        format: crate::export::Format,
+        picks: impl IntoIterator<Item = usize>,
+    ) -> String {
+        crate::export::planned_subtitles(&self.project, format, picks)
     }
 
     /// Where the cues of the track at `pick` land on *this* timeline --
@@ -959,11 +966,33 @@ impl PlaybackSession {
     /// [`crate::subtitle::open`] gives. Nothing else about the timeline moves:
     /// subtitles are not clips and land on no lane.
     pub fn import_subtitles(&mut self, path: &Path) -> crate::Result<usize> {
-        let tracks = match path.extension().is_some_and(|e| {
-            let e = e.to_string_lossy().to_ascii_lowercase();
-            e == "mkv" || e == "webm"
-        }) {
-            true => crate::subtitle::of_matroska(path)?,
+        Ok(self.add_subtitle_tracks(Self::parse_subtitles(path)?))
+    }
+
+    /// The reading half of [`import_subtitles`](Self::import_subtitles), with no
+    /// session in it: every subtitle track of a Matroska file, or the one track
+    /// a standalone `.srt`/`.vtt`/`.ass` is, cues and all. Same refusal rule.
+    ///
+    /// This is the half that costs -- a walk of the whole container, measured at
+    /// 210 ms on a 25 GB 35-track file and 1.3 s on a 3 GB one whose pages were
+    /// cold -- so a front-end runs *this* on its background executor and hands
+    /// what comes back to [`add_subtitle_tracks`](Self::add_subtitle_tracks),
+    /// which costs a push. Both doors are this one function, so the import
+    /// button and the background one cannot drift apart.
+    pub fn parse_subtitles(path: &Path) -> crate::Result<Vec<crate::subtitle::SubtitleTrack>> {
+        // The containers that carry subtitle tracks *inside* them: every
+        // Matroska one ([`crate::demux::is_matroska`], which is where `.mks` --
+        // the subtitles alone -- comes in) and the mp4 family, whose `tx3g`
+        // timed text is what an mp4 export of this project's own writes, so a
+        // file edith wrote is a file edith imports back.
+        let tracks = match crate::demux::is_matroska(path)
+            || path.extension().is_some_and(|e| {
+                matches!(
+                    e.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "mp4" | "m4v" | "mov"
+                )
+            }) {
+            true => crate::subtitle::of_media(path)?,
             false => vec![crate::subtitle::open(path, None)],
         };
         // A standalone file that could not be parsed is a refusal here rather
@@ -975,10 +1004,40 @@ impl PlaybackSession {
         {
             return Err(why.clone().into());
         }
-        Ok(tracks
+        Ok(tracks)
+    }
+
+    /// Puts tracks already read by [`parse_subtitles`](Self::parse_subtitles)
+    /// on this timeline, in the order given. Hands back how many actually went
+    /// on: [`Project::add_subtitles`] drops the ones already here -- same file,
+    /// same track number -- so 0 is "this file's subtitles are on the timeline
+    /// already", which is the sentence a front-end says.
+    ///
+    /// The whole of what an import costs the thread that calls it, which is why
+    /// the parse is a separate door: nothing here opens, seeks or decodes.
+    /// Subtitles are not clips and land on no lane, so nothing playable changes
+    /// and no undo step is pushed ([`Project::remove_subtitles`] says why).
+    pub fn add_subtitle_tracks(&mut self, tracks: Vec<crate::subtitle::SubtitleTrack>) -> usize {
+        tracks
             .into_iter()
             .filter(|t| self.project.add_subtitles(t))
-            .count())
+            .count()
+    }
+
+    /// Takes the track at `idx` off this timeline -- the door a subtitle row's
+    /// own remove goes through, the way [`import_subtitles`](
+    /// Self::import_subtitles) is the door that puts one on. Refused in
+    /// [`Project::remove_subtitles`]'s words for a row this timeline does not
+    /// have.
+    ///
+    /// Nothing playable changes and no worker was opened against a cue, so
+    /// unlike [`remove_source`](Self::remove_source) this does not reseek. Rows
+    /// past `idx` move down by one: a caller holding a picked row (the export's
+    /// subtitle pick) has to fix it up or drop it. Not an undo step, for the
+    /// reason [`Project::remove_subtitles`] gives -- the inverse is a
+    /// re-import.
+    pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
+        self.project.remove_subtitles(idx)
     }
 
     /// Writes the timeline to `path` as a `.edith`, atomically (see

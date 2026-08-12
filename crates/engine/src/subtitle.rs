@@ -148,8 +148,23 @@ pub struct SubtitleTrack {
     /// Which track of `path`, for one embedded in a Matroska file. `None` when
     /// `path` *is* the subtitle file.
     pub track: Option<u64>,
-    /// What a list shows: a language, a muxer's name for the track, or the
-    /// file's own name for a standalone one.
+    /// What language the track is in, as the container states it (`eng`, `fra`,
+    /// `und` for a file that says nothing -- which is what both demuxers hand
+    /// over rather than an empty string). Empty only for a standalone file,
+    /// which states no language at all.
+    ///
+    /// Kept apart from [`name`](Self::name) because a container keeps them
+    /// apart: an export writes `TRACK_LANGUAGE` and `TRACK_NAME` as two fields
+    /// ([`crate::mux::SubParams`]), and a French track whose language is folded
+    /// into its title leaves as an English one.
+    pub language: String,
+    /// What the track is *called* beside its language (`Signs`, `Forced`), or
+    /// the file's own name for a standalone one. Empty where it has none.
+    pub name: String,
+    /// What a list shows: the [`language`](Self::language), the
+    /// [`name`](Self::name), or the pair ([`label_of`]) -- flattened here
+    /// because a row shows one string, and derived from the two rather than
+    /// being what they are derived from.
     pub label: String,
     /// In start order. Empty when [`refused`](Self::refused) says why.
     pub cues: Vec<Cue>,
@@ -173,10 +188,16 @@ impl SubtitleTrack {
     /// A track that is there and cannot be read, named and kept: a project
     /// re-saved after one of these still lists it, which is the difference
     /// between "your subtitles are missing" and losing them for good.
+    ///
+    /// No language and no name: what is refused is never *written* (an export
+    /// drops it before the muxer, [`crate::export::planned_subtitles`]), and the
+    /// row it leaves behind shows the `label` it was refused under.
     fn refused(path: &Path, track: Option<u64>, label: String, why: String) -> Self {
         Self {
             path: path.to_path_buf(),
             track,
+            language: String::new(),
+            name: String::new(),
             label,
             cues: Vec::new(),
             bitmap: false,
@@ -194,7 +215,8 @@ impl SubtitleTrack {
 }
 
 /// The one door a saved subtitle line comes back in through: a standalone file
-/// (`track` is `None`) or track `n` of a Matroska file.
+/// (`track` is `None`) or track `n` of a media file, Matroska or mp4
+/// ([`of_media`]).
 ///
 /// Never an error, whatever is wrong: a deleted `.srt`, a media file that is
 /// not there any more, a track number the file no longer has, a codec of
@@ -235,7 +257,7 @@ pub fn open_all(rows: &[(PathBuf, Option<u64>)]) -> Vec<SubtitleTrack> {
             let label = format!("track {number}");
             let tracks = walked
                 .entry(path.as_path())
-                .or_insert_with(|| of_matroska(path));
+                .or_insert_with(|| of_media(path));
             let tracks = match tracks {
                 Ok(tracks) => tracks,
                 Err(why) => return SubtitleTrack::refused(path, *track, label, why.to_string()),
@@ -263,6 +285,11 @@ fn external(path: &Path) -> SubtitleTrack {
         Ok(cues) => SubtitleTrack {
             path: path.to_path_buf(),
             track: None,
+            // A file beside the media states no language of its own -- and its
+            // name is the only thing it does state, which is what an export
+            // writes it as.
+            language: String::new(),
+            name: label.clone(),
             label,
             cues,
             // Every format `parse_file` reads is text.
@@ -273,22 +300,96 @@ fn external(path: &Path) -> SubtitleTrack {
     }
 }
 
+/// Every subtitle track *inside* a media file, whichever container it is: a
+/// Matroska's ([`of_matroska`]) or an mp4's timed text ([`of_mp4`]).
+///
+/// The one door for it, so a project row, an import and an export's read-back
+/// cannot disagree about what a file carries -- and so an mp4 this project
+/// wrote comes back into it, which is the whole reason the mp4 reader exists:
+/// mp4 is the default export format, and a file edith writes and cannot open
+/// is not a round trip.
+pub fn of_media(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
+    match crate::demux::is_matroska(path) {
+        true => of_matroska(path),
+        false => of_mp4(path),
+    }
+}
+
+/// Every timed-text (`tx3g`) subtitle track of an mp4, in track order, with its
+/// cues -- the mp4 twin of [`of_matroska`].
+///
+/// A `tx3g` track is *continuous*: it states one sample per instant of the film
+/// and the stretches with nothing on screen are samples of no text, so those are
+/// dropped here rather than kept as cues with an empty line
+/// ([`crate::demux::Mp4TextSample::payload`]). What is left is the cues, timed
+/// on the file's own clock, and a track whose samples are all empty comes back
+/// with none rather than with one per instant.
+///
+/// Never a bitmap: an mp4 carries no PGS track this reads, so the refusal
+/// [`of_matroska`] has for one has no counterpart here.
+pub fn of_mp4(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
+    Ok(crate::demux::mp4_subtitles(path)?
+        .into_iter()
+        .map(|t| SubtitleTrack {
+            path: path.to_path_buf(),
+            track: Some(t.number),
+            label: label_of(&t.language, &t.name),
+            language: t.language,
+            name: t.name,
+            cues: t.samples.iter().filter_map(tx3g_cue).collect(),
+            bitmap: false,
+            refused: None,
+        })
+        .collect())
+}
+
+/// One `tx3g` sample as a cue, or `None` for the sample that is not one: the
+/// empty one that says nothing is on screen between here and the next line, and
+/// the truncated one whose declared length runs past its own bytes.
+fn tx3g_cue(sample: &crate::demux::Mp4TextSample) -> Option<Cue> {
+    let len = usize::from(u16::from_be_bytes([
+        *sample.payload.first()?,
+        *sample.payload.get(1)?,
+    ]));
+    let text = String::from_utf8_lossy(sample.payload.get(2..2 + len)?);
+    (!text.is_empty()).then(|| Cue {
+        start_us: sample.start_us,
+        end_us: sample.end_us,
+        text: text.into_owned(),
+        image: None,
+    })
+}
+
+/// What a list row shows for a track a container declares: the language, the
+/// muxer's title, or the pair.
+///
+/// A row shows one string, so the two are flattened for it -- and *only* for it.
+/// Both are kept on the track beside this
+/// ([`SubtitleTrack::language`], [`SubtitleTrack::name`]), so an export writes
+/// the container's own two fields rather than guessing them back out of this
+/// string, which is what used to leave every French track marked English.
+fn label_of(language: &str, name: &str) -> String {
+    match (name.is_empty(), language) {
+        (true, lang) => lang.to_owned(),
+        (false, "und") => name.to_owned(),
+        (false, lang) => format!("{lang} — {name}"),
+    }
+}
+
 /// Every subtitle track of a Matroska file, in file order -- the text ones with
 /// their cues, the bitmap ones refused by name (see the module docs).
 pub fn of_matroska(path: &Path) -> crate::Result<Vec<SubtitleTrack>> {
     Ok(crate::demux::matroska_subtitles(path)?
         .into_iter()
         .map(|mut t| {
-            let label = match (t.name.is_empty(), t.language.as_str()) {
-                (true, lang) => lang.to_owned(),
-                (false, "und") => t.name.clone(),
-                (false, lang) => format!("{lang} — {}", t.name),
-            };
+            let label = label_of(&t.language, &t.name);
             let bitmap = t.codec == crate::demux::PGS;
             match cues_of(&mut t) {
                 Ok(cues) => SubtitleTrack {
                     path: path.to_path_buf(),
                     track: Some(t.number),
+                    language: t.language,
+                    name: t.name,
                     label,
                     cues,
                     bitmap,
@@ -505,8 +606,14 @@ fn parse_file(path: &Path) -> crate::Result<Vec<Cue>> {
         "vtt" | "webvtt" => oxideav_subtitle::webvtt::parse,
         "ass" | "ssa" => oxideav_ass::parse,
         other => {
+            // What is *genuinely* accepted, all of it: the subtitle files this
+            // parses and the containers [`of_media`] walks for the tracks
+            // inside them (`.mkv`, `.mka`, `.mks`, `.mk3d`, `.webm`, `.mp4`,
+            // `.m4v`, `.mov`). The old sentence named the four text formats
+            // alone and so refused a `.mks` this very binary reads.
             return Err(format!(
-                "{other:?} is not a subtitle format this reads — .srt, .vtt, .ass and .ssa are"
+                "{other:?} is not a subtitle format this reads — .srt, .vtt, .ass and .ssa are, \
+                 as are the subtitle tracks inside a Matroska or an mp4"
             )
             .into());
         }
@@ -543,6 +650,44 @@ mod tests {
     fn srt_markup_is_resolved_not_carried() {
         assert_eq!(srt_body("<i>tilted</i> and plain"), "tilted and plain");
         assert_eq!(srt_body("two\nlines\n"), "two\nlines");
+    }
+
+    /// The sample that is not a cue: a `tx3g` track states one sample per
+    /// instant, so the stretches with nothing on screen are samples of no text
+    /// -- a track of nothing but those is a track with no cues, not one blank
+    /// cue per instant.
+    #[test]
+    fn an_empty_timed_text_sample_is_not_a_cue() {
+        let sample = |payload: Vec<u8>| crate::demux::Mp4TextSample {
+            start_us: 500_000,
+            end_us: 1_500_000,
+            payload,
+        };
+        let mut text = vec![0, 5];
+        text.extend_from_slice(b"lines");
+        let cue = tx3g_cue(&sample(text)).expect("a sample with words is a cue");
+        assert_eq!(
+            (cue.start_us, cue.end_us, &cue.text[..]),
+            (500_000, 1_500_000, "lines")
+        );
+        // The empty sample, the one an export writes between two cues and past
+        // the last of them...
+        assert!(tx3g_cue(&sample(vec![0, 0])).is_none());
+        // ...and the bytes that are not a sample: a length past the payload,
+        // and no length at all.
+        assert!(tx3g_cue(&sample(vec![0, 9, b'h', b'i'])).is_none());
+        assert!(tx3g_cue(&sample(Vec::new())).is_none());
+    }
+
+    /// What a row shows, and what an export has to split back apart: the pair a
+    /// container states, flattened the one way both readers flatten it.
+    #[test]
+    fn a_label_is_the_language_the_title_or_the_two() {
+        assert_eq!(label_of("eng", ""), "eng");
+        assert_eq!(label_of("fra", "Signs"), "fra — Signs");
+        // An undetermined language is no language: the title stands alone.
+        assert_eq!(label_of("und", "Commentary"), "Commentary");
+        assert_eq!(label_of("und", ""), "und");
     }
 
     #[test]

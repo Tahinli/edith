@@ -1087,6 +1087,8 @@ mod tests {
         SubtitleTrack {
             path: PathBuf::from(path),
             track,
+            language: String::new(),
+            name: String::new(),
             label: String::new(),
             cues: Vec::new(),
             bitmap: false,

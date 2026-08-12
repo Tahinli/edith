@@ -11,7 +11,9 @@
 //! `avc1` entry and this patches that entry into the `av01` + `av1C` pair the
 //! spec asks for, which is the only box in a whole mp4 the crate cannot spell.
 //! Both containers carry the timeline's AAC, so no format here writes a picture
-//! whose sound was silently left behind.
+//! whose sound was silently left behind -- and both carry its subtitles, an mp4
+//! as the `tx3g` timed text `mp4 0.14` *can* spell ([`Mp4Muxer::write_subtitles`])
+//! and Matroska as `S_TEXT/UTF8` blocks, so neither is a file whose words were.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -19,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use mp4::{
     AacConfig, AudioObjectType, AvcConfig, Bytes, ChannelConfig, FourCC, MediaConfig, Mp4Config,
-    Mp4Sample, Mp4Writer, SampleFreqIndex, TrackConfig, TrackType,
+    Mp4Sample, Mp4Writer, SampleFreqIndex, TrackConfig, TrackType, TtxtConfig,
 };
 
 use crate::colorspace::ColorDescription;
@@ -35,6 +37,10 @@ const NTSC_TICKS: u32 = 1001;
 /// An AAC-LC packet is always 1024 samples, so with timescale == sample rate the
 /// per-packet duration is this constant.
 const AAC_PACKET_SAMPLES: u32 = 1024;
+/// The clock a `tx3g` track counts in: one millisecond, the very tick a Matroska
+/// block's timestamp is written at ([`TIMESTAMP_SCALE_NS`]), so a cue lands on
+/// the same instant whichever of the two containers carries it.
+const SUB_TIMESCALE: u32 = 1_000;
 
 const NAL_IDR: u8 = 5;
 const NAL_SEI: u8 = 6;
@@ -81,6 +87,17 @@ pub struct Mp4Muxer {
     /// Where the file is, for that patch: the writer owns the handle it wrote
     /// through and the patch reopens the finished file.
     path: PathBuf,
+    /// The video track's clock and how many pictures have been written on it --
+    /// which is where the file *ends*, and a timed-text track is written out to
+    /// that instant ([`write_subtitles`](Mp4Muxer::write_subtitles)).
+    timescale: u32,
+    frames: u64,
+    /// What the subtitle tracks are *called*, in the order they were written:
+    /// an mp4 states a track's title in a `trak/udta/name` box, which `mp4 0.14`
+    /// has no field for, so it is patched in at [`finish`](Mp4Muxer::finish)
+    /// beside the sample entry. Empty where no track carries a title, which is
+    /// every file that has no subtitles at all.
+    sub_names: Vec<String>,
 }
 
 /// A `ColourInformationBox` payload, ISO/IEC 14496-12 §12.1.5: the `nclx` tag
@@ -270,6 +287,9 @@ impl Mp4Muxer {
             entry,
             colr: colr_nclx(ColorDescription::output(video.height)),
             path: path.to_path_buf(),
+            timescale,
+            frames: 0,
+            sub_names: Vec::new(),
         })
     }
 
@@ -287,6 +307,7 @@ impl Mp4Muxer {
                 bytes: Bytes::from(bytes),
             },
         )?;
+        self.frames += 1;
         Ok(())
     }
 
@@ -310,6 +331,7 @@ impl Mp4Muxer {
                 bytes: Bytes::copy_from_slice(obus),
             },
         )?;
+        self.frames += 1;
         Ok(())
     }
 
@@ -335,6 +357,80 @@ impl Mp4Muxer {
         Ok(())
     }
 
+    /// The soft subtitle tracks this file carries, written after the picture and
+    /// the sound exactly as [`MkvMuxer`] writes its own into the clusters -- one
+    /// `tx3g` timed-text track per [`SubParams`], which is the text an mp4 says
+    /// a cue with and the one `ffmpeg` calls `mov_text`. Called once, before
+    /// [`finish`](Mp4Muxer::finish); an empty list writes nothing at all, which
+    /// is why an export with no pick is the file it always was, byte for byte.
+    ///
+    /// The samples are *continuous*: a timed-text track states one sample per
+    /// instant of the film and nothing between them, so the stretches with
+    /// nothing to say are empty samples (a 16-bit zero length and no text) and
+    /// not holes -- a hole is where a player keeps the last line on screen until
+    /// the next one arrives. The run is built out of the cue *boundaries*, so
+    /// cues that overlap are one sample of both their lines rather than one of
+    /// them dropped: a `tx3g` track shows one sample at a time where a Matroska
+    /// one may show two blocks at once, and joining them is what keeps the words
+    /// a viewer saw over the picture.
+    ///
+    /// ponytail: the `tx3g` sample entry is the one `mp4 0.14` writes and there
+    /// is no field to reach into it -- `MediaConfig::TtxtConfig` carries nothing
+    /// -- so its `data_reference_index` is the crate's 0 where §8.5.2 says an
+    /// index into `dref` counts from 1, and it holds no `ftab` font table.
+    /// ffmpeg and mpv both read the track (measured, 2026-08-12); a reader that
+    /// checks the index would not. The upgrade path is the trick the `av01`
+    /// entry already takes: rewrite the 46 fixed bytes of that entry in
+    /// [`patch_entry`] the way the video one is rewritten.
+    pub fn write_subtitles(&mut self, subs: &[SubParams]) -> crate::Result<()> {
+        if subs.is_empty() {
+            return Ok(());
+        }
+        // Where the picture ends, in the text track's own tick: the last sample
+        // runs out to it, so the track covers the film rather than stopping at
+        // the last thing anybody says.
+        let end = (self.frames * u64::from(self.frame_duration) * u64::from(SUB_TIMESCALE)
+            / u64::from(self.timescale)) as i64;
+        // The picture is track 1 and the sound, where there is any, track 2:
+        // `mp4 0.14` numbers a track by the order it was added in, so the text
+        // starts after them and each further track is the next number up.
+        for (track_id, subs) in (2 + u32::from(self.has_audio)..).zip(subs) {
+            self.writer.add_track(&TrackConfig {
+                track_type: TrackType::Subtitle,
+                timescale: SUB_TIMESCALE,
+                // `und` and not an empty string where the source states no
+                // language: an mp4 packs the three letters into a 16-bit field
+                // and has no way to leave it out, and `und` is the code that
+                // says *undetermined* -- while three zero bits would spell a
+                // language nobody speaks.
+                language: match subs.language.is_empty() {
+                    true => "und".to_string(),
+                    false => subs.language.clone(),
+                },
+                media_conf: MediaConfig::TtxtConfig(TtxtConfig {}),
+            })?;
+            for (bytes, duration) in timed_text(&subs.cues, end)? {
+                self.writer.write_sample(
+                    track_id,
+                    &Mp4Sample {
+                        start_time: 0, // ignored by the writer, as everywhere here
+                        duration,
+                        rendering_offset: 0,
+                        // Every text sample is one a player may start at, and
+                        // saying so per-sample would emit an `stss` listing all
+                        // of them where no `stss` means the same thing -- the
+                        // audio track's reason, and what ffmpeg's own `tx3g`
+                        // track does.
+                        is_sync: false,
+                        bytes: Bytes::from(bytes),
+                    },
+                )?;
+            }
+        }
+        self.sub_names = subs.iter().map(|subs| subs.name.clone()).collect();
+        Ok(())
+    }
+
     pub fn finish(mut self) -> crate::Result<()> {
         self.writer.write_end()?;
         let Self {
@@ -342,14 +438,83 @@ impl Mp4Muxer {
             entry,
             colr,
             path,
+            sub_names,
             ..
         } = self;
         // Not a `drop`: the buffered tail of `moov` has to be on disk before the
         // patch below reads it back, and a `BufWriter` swallows the error of
         // flushing it on drop.
         writer.into_writer().flush()?;
-        patch_entry(&path, entry.as_ref(), &colr)
+        patch_entry(&path, entry.as_ref(), &colr, &sub_names)
     }
+}
+
+/// The cues of one subtitle track as the run of `tx3g` samples an mp4 carries
+/// them in -- `(payload, duration in milliseconds)`, from instant 0 to `end`,
+/// with no instant left out.
+///
+/// A sample's payload is the ISO/IEC 14496-17 one: the text's length in 16 bits
+/// and then the UTF-8 itself, which is two zero bytes where there is nothing on
+/// screen. The run is walked over the cue *boundaries* rather than over the cues,
+/// which is what makes a gap an empty sample and an overlap one sample carrying
+/// both lines -- the two things a track of samples has to say that a list of
+/// cues does not.
+///
+/// ponytail: the active set is looked for from the front of the list at every
+/// boundary, so this is quadratic in the cues of one track (a 5 000-cue film
+/// costs ~25 M compares once, at the end of an export that took minutes). The
+/// upgrade path is a sweep holding the open cues in a heap keyed on their end.
+fn timed_text(cues: &[crate::subtitle::Cue], end: i64) -> crate::Result<Vec<(Vec<u8>, u32)>> {
+    // Milliseconds, the tick this track is written in -- and a cue that rounds
+    // onto its own start stays up for one of them rather than vanishing, which
+    // is what the Matroska writer's `BlockDuration` does with it.
+    let ms = |us: i64| (us + 500) / 1_000;
+    let spans: Vec<(i64, i64)> = cues
+        .iter()
+        .map(|cue| {
+            let start = ms(cue.start_us);
+            (start, ms(cue.end_us).max(start + 1))
+        })
+        .collect();
+    let mut times: Vec<i64> = vec![0, end.max(0)];
+    for &(start, stop) in &spans {
+        times.push(start);
+        times.push(stop);
+    }
+    times.sort_unstable();
+    times.dedup();
+    let mut out = Vec::with_capacity(times.len());
+    for pair in times.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let mut text = String::new();
+        for (span, cue) in spans.iter().zip(cues) {
+            // The cues arrive in start order (`export::timeline_cues` sorts
+            // them), so nothing past this one has opened yet.
+            if span.0 > from {
+                break;
+            }
+            if span.1 > from {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&cue.text);
+            }
+        }
+        let len = u16::try_from(text.len()).map_err(|_| {
+            format!(
+                "a subtitle cue of {} bytes: a tx3g sample states its text length in 16 bits, so \
+                 one cue carries at most {} -- export a Matroska, whose blocks state no length at \
+                 all",
+                text.len(),
+                u16::MAX
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(text.len() + 2);
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        out.push((bytes, u32::try_from(to - from)?));
+    }
+    Ok(out)
 }
 
 /// Rewrites the finished file's one video sample entry: `colr` appended to it
@@ -365,11 +530,13 @@ fn patch_entry(
     path: &Path,
     entry: Option<&([u8; 4], [u8; 4], Vec<u8>)>,
     colr: &[u8],
+    sub_names: &[String],
 ) -> crate::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let end = file.metadata()?.len();
     let (at, payload) = top_level(&mut file, end, b"moov")?.ok_or("no moov box to patch")?;
     let patched = swap_entry(&payload, 0, entry, colr).ok_or("no avc1 sample entry to rewrite")?;
+    let patched = name_subtitles(patched, sub_names);
     let mut out = Vec::with_capacity(patched.len() + 8);
     push_box(&mut out, b"moov", &patched);
     file.seek(SeekFrom::Start(at))?;
@@ -463,6 +630,54 @@ fn swap_entry(
         }
     }
     done.then_some(out)
+}
+
+/// The title of each subtitle track into the `trak` that carries it, in the
+/// order they were written: a `udta` holding a `name` box, which is where an mp4
+/// says what a track is *called* (`Signs`) beside the `mdhd` language it is in
+/// -- the pair Matroska spells as `Name` and `Language`, and the very boxes
+/// ffmpeg writes a `-metadata:s:s:0 title=` into and reads back out.
+/// `mp4 0.14`'s `TrakBox` has no `udta` field at all, so it is appended here
+/// beside the sample entry rewrite, on the same rebuilt `moov`.
+///
+/// Untouched where no track has a title -- and returned as it came for a file
+/// with no subtitles at all, which is every export that picked none.
+fn name_subtitles(moov: Vec<u8>, names: &[String]) -> Vec<u8> {
+    if names.iter().all(|name| name.is_empty()) {
+        return moov;
+    }
+    let mut names = names.iter();
+    let mut out = Vec::with_capacity(moov.len() + 32 * names.len());
+    for (kind, child) in crate::demux::boxes(&moov) {
+        // A subtitle `trak` is the one whose media handler says `sbtl`, which is
+        // what `TrackType::Subtitle` wrote -- asked of the file rather than
+        // counted, so the picture's and the sound's `trak`s cannot be miscounted
+        // into.
+        let name = match kind == b"trak" && is_subtitle_trak(child) {
+            true => names.next().filter(|name| !name.is_empty()),
+            false => None,
+        };
+        let Some(name) = name else {
+            push_box(&mut out, kind, child);
+            continue;
+        };
+        let mut trak = child.to_vec();
+        let mut udta = Vec::new();
+        push_box(&mut udta, b"name", name.as_bytes());
+        push_box(&mut trak, b"udta", &udta);
+        push_box(&mut out, kind, &trak);
+    }
+    out
+}
+
+/// Whether a `trak` is a subtitle one: its `mdia`'s `hdlr` names the `sbtl`
+/// handler, which sits after the box's version, flags and the four `pre_defined`
+/// bytes.
+fn is_subtitle_trak(trak: &[u8]) -> bool {
+    crate::demux::boxes(trak)
+        .filter(|(kind, _)| *kind == b"mdia")
+        .flat_map(|(_, mdia)| crate::demux::boxes(mdia))
+        .any(|(kind, hdlr)| kind == b"hdlr" && hdlr.get(8..12) == Some(&b"sbtl"[..]))
 }
 
 /// One mp4 box: 32-bit size, four-character type, payload. Every box inside a
@@ -572,32 +787,41 @@ pub struct HevcParams<'a> {
     pub hvcc: &'a [u8],
 }
 
-/// The soft subtitle track a Matroska file carries beside the picture: text,
-/// timed, still text in the file -- a player draws it and a user can turn it
-/// off, which is what "soft" means and what burning it into the pixels is not.
+/// The soft subtitle track a file carries beside the picture: text, timed, still
+/// text in the file -- a player draws it and a user can turn it off, which is
+/// what "soft" means and what burning it into the pixels is not.
+///
+/// Both containers carry one: Matroska as an `S_TEXT/UTF8` track whose blocks
+/// are the cues themselves ([`MkvMuxer`]), an mp4 as a `tx3g` timed-text track
+/// whose samples run end to end over the film
+/// ([`Mp4Muxer::write_subtitles`]).
 ///
 /// The cues are the *exported timeline's* (`export::timeline_cues` puts them
 /// there), because the file's clock is the timeline's; nothing here shifts
 /// anything.
 pub struct SubParams {
-    /// What the track is called in the file. A three-letter code goes in as
-    /// `Language`, which is what a player's subtitle menu reads; anything else
-    /// is a `Name`, which is what it shows when there is no language to show.
-    ///
-    /// ponytail: one string for both because a [`crate::subtitle::SubtitleTrack`]
-    /// carries one label and not a (language, name) pair. The upgrade path is to
-    /// keep the two apart from the demuxer down -- `MkvSubtitle` already has
-    /// them -- and it belongs to whoever needs a per-language export list.
-    pub label: String,
+    /// What language the track is in, as the three-letter code Matroska says it
+    /// with (`fra`, `tur`): the field a player's subtitle menu reads. Empty
+    /// where the source states none -- and *only* then, because a `TrackEntry`
+    /// without a `Language` means `eng` by spec, so a French track that leaves
+    /// this empty leaves as an English one.
+    pub language: String,
+    /// What the track is *called*, where it has a title of its own beside its
+    /// language (`Signs`, `Forced`). Empty where it has none.
+    pub name: String,
     /// In start order, which is the order they are written in.
     pub cues: Vec<crate::subtitle::Cue>,
 }
 
-/// The cues waiting to be interleaved into the clusters, [`MkvAudio`]'s twin.
+/// The cues of one subtitle track waiting to be interleaved into the clusters,
+/// [`MkvAudio`]'s twin. One of these per track the file carries.
 struct MkvSubs {
     cues: Vec<crate::subtitle::Cue>,
     /// Cues already written.
     next: usize,
+    /// Which track its blocks name -- 3 for the first, one more for each after
+    /// it ([`SUB_TRACK_FIRST`]).
+    track_no: u8,
 }
 
 /// Writes one AV1 video track as Matroska (`.mkv`), and the timeline's AAC
@@ -630,9 +854,9 @@ pub struct MkvMuxer {
     /// The AAC track, if the timeline has sound, and how far it has been
     /// written.
     audio: Option<MkvAudio>,
-    /// The subtitle track, if one travels with the file, and how far it has
-    /// been written.
-    subs: Option<MkvSubs>,
+    /// The subtitle tracks travelling with the file, in the order they were
+    /// declared, and how far each has been written. Empty where none does.
+    subs: Vec<MkvSubs>,
 }
 
 /// The sound waiting to be interleaved into the clusters.
@@ -659,7 +883,7 @@ impl MkvMuxer {
         path: &Path,
         video: &Av1Params,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
-        subs: Option<SubParams>,
+        subs: Vec<SubParams>,
     ) -> crate::Result<Self> {
         if video.config.is_empty() {
             return Err("no AV1 sequence header for the track's CodecPrivate".into());
@@ -689,7 +913,7 @@ impl MkvMuxer {
         path: &Path,
         video: &HevcParams,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
-        subs: Option<SubParams>,
+        subs: Vec<SubParams>,
     ) -> crate::Result<Self> {
         if video.hvcc.is_empty() {
             return Err("no hvcC record for the track's CodecPrivate".into());
@@ -715,10 +939,21 @@ impl MkvMuxer {
         codec_id: &[u8],
         codec_private: &[u8],
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
-        subs: Option<SubParams>,
+        subs: Vec<SubParams>,
     ) -> crate::Result<Self> {
         if !frame_rate.is_finite() || frame_rate <= 0.0 {
             return Err(format!("bad frame rate {frame_rate}").into());
+        }
+        // Said before a byte is written, and by name: past this the block header
+        // could not hold the track number ([`MAX_SUB_TRACKS`]) and the file would
+        // be quietly wrong rather than absent.
+        if subs.len() > MAX_SUB_TRACKS {
+            return Err(format!(
+                "{} subtitle tracks: a Matroska block writes its track number in \
+                 one byte, so one file carries at most {MAX_SUB_TRACKS}",
+                subs.len()
+            )
+            .into());
         }
         if width == 0 || height == 0 {
             return Err(format!("bad dimensions {width}x{height}").into());
@@ -788,11 +1023,17 @@ impl MkvMuxer {
         if let Some((audio, _)) = &audio {
             elem(&mut tracks, TRACK_ENTRY, &aac_track_entry(audio)?);
         }
-        // Declared even where the audio track is not: the numbers are fixed
-        // (1 picture, 2 sound, 3 text) rather than counted, so a file with
-        // subtitles and no sound still says track 3 in its blocks.
-        if let Some(subs) = &subs {
-            elem(&mut tracks, TRACK_ENTRY, &subtitle_track_entry(&subs.label));
+        // Declared even where the audio track is not: the picture is always 1
+        // and the sound always 2, so the text starts at 3 whether or not there
+        // is any sound -- and each further track is the next number up, which is
+        // the only counting in the file.
+        for (i, subs) in subs.iter().enumerate() {
+            let track_no = SUB_TRACK_FIRST + i as u8;
+            elem(
+                &mut tracks,
+                TRACK_ENTRY,
+                &subtitle_track_entry(&subs.language, &subs.name, track_no),
+            );
         }
         elem(&mut head, TRACKS, &tracks);
 
@@ -812,10 +1053,15 @@ impl MkvMuxer {
                 samples: 0,
                 sample_rate: params.sample_rate.max(1),
             }),
-            subs: subs.map(|subs| MkvSubs {
-                cues: subs.cues,
-                next: 0,
-            }),
+            subs: subs
+                .into_iter()
+                .enumerate()
+                .map(|(i, subs)| MkvSubs {
+                    cues: subs.cues,
+                    next: 0,
+                    track_no: SUB_TRACK_FIRST + i as u8,
+                })
+                .collect(),
         })
     }
 
@@ -891,35 +1137,38 @@ impl MkvMuxer {
     /// [`drain_audio`](MkvMuxer::drain_audio)'s twin, and `i64::MAX` at
     /// [`finish`](MkvMuxer::finish) writes what is left: a cue may still be on
     /// screen over the last picture, and one written nowhere is one a player
-    /// never shows.
+    /// never shows. Every track in turn, in the order they were declared.
     fn drain_subs(&mut self, until: i64) -> crate::Result<()> {
-        loop {
-            let Some(subs) = &mut self.subs else {
-                return Ok(());
-            };
-            let Some(cue) = subs.cues.get_mut(subs.next) else {
-                return Ok(());
-            };
-            // Milliseconds, the tick this file is written in: a cue is read for
-            // a second or more and no eye finds the half a tick it rounds by.
-            let ts = (cue.start_us + 500) / 1_000;
-            if ts > until {
-                return Ok(());
+        for track in 0..self.subs.len() {
+            loop {
+                let subs = &mut self.subs[track];
+                let Some(cue) = subs.cues.get_mut(subs.next) else {
+                    break;
+                };
+                // Milliseconds, the tick this file is written in: a cue is read
+                // for a second or more and no eye finds the half a tick it
+                // rounds by.
+                let ts = (cue.start_us + 500) / 1_000;
+                if ts > until {
+                    break;
+                }
+                // A cue that says it ends before it starts stays up for one tick
+                // rather than for a duration a reader would take as unsigned.
+                let ms = ((cue.end_us - cue.start_us + 500) / 1_000).max(1) as u64;
+                let text = std::mem::take(&mut cue.text);
+                subs.next += 1;
+                let track_no = subs.track_no;
+                // A cluster of its own where the text has run past what a 16-bit
+                // relative timestamp reaches, exactly as the sound's drain does.
+                if self.cluster.is_empty() || ts - self.cluster_ts >= CLUSTER_MS {
+                    self.flush()?;
+                    self.cluster_ts = ts;
+                    uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
+                }
+                self.block_group(track_no, ts, ms, text.as_bytes());
             }
-            // A cue that says it ends before it starts stays up for one tick
-            // rather than for a duration a reader would take as unsigned.
-            let ms = ((cue.end_us - cue.start_us + 500) / 1_000).max(1) as u64;
-            let text = std::mem::take(&mut cue.text);
-            subs.next += 1;
-            // A cluster of its own where the text has run past what a 16-bit
-            // relative timestamp reaches, exactly as the sound's drain does.
-            if self.cluster.is_empty() || ts - self.cluster_ts >= CLUSTER_MS {
-                self.flush()?;
-                self.cluster_ts = ts;
-                uint(&mut self.cluster, CLUSTER_TIMESTAMP, ts as u64);
-            }
-            self.block_group(SUB_TRACK, ts, ms, text.as_bytes());
         }
+        Ok(())
     }
 
     /// One `SimpleBlock` of `track`, timed against the open cluster. Every AAC
@@ -1035,32 +1284,49 @@ fn aac_track_entry(audio: &AudioParams) -> crate::Result<Vec<u8>> {
     Ok(entry)
 }
 
-/// Which track a subtitle block names. Fixed, like the picture's 1 and the
-/// sound's 2: a file with no audio track still writes its text on 3, so nothing
-/// has to count tracks to read a block.
-const SUB_TRACK: u8 = 3;
+/// Which track the *first* subtitle block names, the picture's 1 and the sound's
+/// 2 being fixed: a file with no audio track still writes its first text track
+/// on 3, so nothing has to count the tracks before it to read a block. Each
+/// further subtitle track is the next number up.
+const SUB_TRACK_FIRST: u8 = 3;
+
+/// How many subtitle tracks one file may carry. A block writes its track number
+/// as a one-byte EBML integer (`0x80 | track`, [`MkvMuxer::block`]), and 127 is
+/// one number too far: its byte is `0xFF`, the all-ones variable-length integer
+/// EBML spells *unknown* with, which this project's own reader hands back as
+/// `u64::MAX` (`demux`'s `vint`) -- so track 127's blocks would match no track,
+/// its cues would vanish on the way back in, and the file would be one edith
+/// wrote and cannot read. The numbers therefore run `3..=126` and the count is
+/// what is left of them -- derived from the encoding, so it cannot drift from
+/// it. A file asking for more is refused by name in [`MkvMuxer::open`] rather
+/// than written with a byte that means another track, or none.
+pub const MAX_SUB_TRACKS: usize = 0x7F - SUB_TRACK_FIRST as usize;
 
 /// The `TrackEntry` of the subtitle track: type 0x11 (subtitles) and
 /// `S_TEXT/UTF8`, whose blocks are the cue's own UTF-8 text and whose timing is
 /// the block's -- the codec every player draws and the one this project's own
 /// reader parses back (`subtitle::cues_of`).
 ///
-/// The label is a `Language` where it is one (`eng`, `tur`: three letters is
-/// what ISO-639-2 is) and a `Name` otherwise, which is exactly what
-/// [`crate::subtitle::of_matroska`] reads back out, so a track exported and
-/// re-imported keeps the name it had.
-fn subtitle_track_entry(label: &str) -> Vec<u8> {
+/// The two names a track has are written as the two fields Matroska has for
+/// them: `Language` is what a player's subtitle menu offers and what a "play
+/// French" setting matches on, `Name` is the title beside it (`Signs`). Both
+/// where the source has both -- a track carrying only a name is an *English*
+/// track to every reader, that being the spec's default, which is how a
+/// multi-language film used to export as several English ones. Either is left
+/// out where it is empty, and [`crate::subtitle::of_matroska`] reads exactly
+/// this back, so a track exported and re-imported keeps what it had.
+fn subtitle_track_entry(language: &str, name: &str, track_no: u8) -> Vec<u8> {
     let mut entry = Vec::new();
-    uint(&mut entry, TRACK_NUMBER, u64::from(SUB_TRACK));
-    uint(&mut entry, TRACK_UID, u64::from(SUB_TRACK));
+    uint(&mut entry, TRACK_NUMBER, u64::from(track_no));
+    uint(&mut entry, TRACK_UID, u64::from(track_no));
     uint(&mut entry, TRACK_TYPE, 0x11);
     uint(&mut entry, FLAG_LACING, 0);
     elem(&mut entry, CODEC_ID, b"S_TEXT/UTF8");
-    let code = label.len() == 3 && label.bytes().all(|b| b.is_ascii_lowercase());
-    match (code, label.is_empty()) {
-        (true, _) => elem(&mut entry, TRACK_LANGUAGE, label.as_bytes()),
-        (false, false) => elem(&mut entry, TRACK_NAME, label.as_bytes()),
-        (false, true) => {}
+    if !language.is_empty() {
+        elem(&mut entry, TRACK_LANGUAGE, language.as_bytes());
+    }
+    if !name.is_empty() {
+        elem(&mut entry, TRACK_NAME, name.as_bytes());
     }
     entry
 }
@@ -1348,6 +1614,58 @@ mod tests {
         v
     }
 
+    fn cue(start_ms: i64, end_ms: i64, text: &str) -> crate::subtitle::Cue {
+        crate::subtitle::Cue {
+            start_us: start_ms * 1_000,
+            end_us: end_ms * 1_000,
+            text: text.into(),
+            image: None,
+        }
+    }
+
+    /// What a `tx3g` track is made of: one sample per instant of the film and no
+    /// hole anywhere. The gaps -- before the first cue, between two, after the
+    /// last -- are empty samples (a 16-bit zero and nothing else), and the whole
+    /// run adds up to the length it was asked for, which is what stops a player
+    /// leaving the last line on screen over the rest of the film.
+    #[test]
+    fn a_timed_text_track_covers_every_instant() {
+        let cues = [cue(500, 1_500, "first"), cue(4_000, 4_750, "third")];
+        let samples = timed_text(&cues, 5_000).unwrap();
+        let times: Vec<u32> = samples.iter().map(|(_, ms)| *ms).collect();
+        assert_eq!(times, [500, 1_000, 2_500, 750, 250], "{samples:?}");
+        assert_eq!(times.iter().sum::<u32>(), 5_000, "the film, end to end");
+        let texts: Vec<&[u8]> = samples.iter().map(|(bytes, _)| &bytes[..]).collect();
+        assert_eq!(texts[0], b"\0\0", "nothing is said until 0.5 s");
+        assert_eq!(texts[1], b"\0\x05first");
+        assert_eq!(texts[2], b"\0\0", "...nor between the two cues");
+        assert_eq!(texts[3], b"\0\x05third");
+        assert_eq!(texts[4], b"\0\0", "...nor after the last one");
+    }
+
+    /// Two cues over one another: a Matroska file shows both blocks at once and
+    /// a `tx3g` track has one sample per instant, so the overlap is *one* sample
+    /// carrying both lines rather than one of them dropped -- the words a viewer
+    /// saw over the picture, which is what this file is a copy of.
+    #[test]
+    fn overlapping_cues_are_one_sample_of_both_lines() {
+        let cues = [cue(0, 2_000, "sign"), cue(1_000, 3_000, "dialogue")];
+        let samples = timed_text(&cues, 3_000).unwrap();
+        let got: Vec<(String, u32)> = samples
+            .iter()
+            .map(|(bytes, ms)| (String::from_utf8_lossy(&bytes[2..]).into_owned(), *ms))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("sign".into(), 1_000),
+                ("sign\ndialogue".into(), 1_000),
+                ("dialogue".into(), 1_000),
+            ],
+            "{samples:?}"
+        );
+    }
+
     #[test]
     fn splits_both_start_code_lengths() {
         let src = [
@@ -1633,7 +1951,7 @@ mod tests {
                 },
                 packets,
             )),
-            None,
+            Vec::new(),
         )
         .unwrap();
         // Half a second of picture under a second of sound: the tail of the
@@ -1761,7 +2079,7 @@ mod tests {
                 config,
             },
             None,
-            None,
+            Vec::new(),
         )
         .unwrap();
         muxer.write_frame(&key, true).unwrap();
@@ -1805,7 +2123,7 @@ mod tests {
                     config: &[],
                 },
                 None,
-                None,
+                Vec::new(),
             )
             .is_err()
         );
