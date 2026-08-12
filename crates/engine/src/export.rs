@@ -578,6 +578,31 @@ fn audio_label(
     }
 }
 
+/// What the export *did* to the sound, for the line it publishes while it runs:
+/// [`audio_label`]'s words with the one thing no prediction can know filled in
+/// -- whether the Opus seat took the track or handed it back
+/// ([`encode_opus`]'s gate).
+///
+/// `sound` is `Some(copied)` for a track and `None` for a file with no sound.
+/// Naming Opus for *every* Matroska encode is what made that fallback
+/// invisible: a track the gate refused was written as AAC and the line still
+/// said Opus, on the one path where the difference is audible.
+fn measured_audio_label(
+    project: &Project,
+    format: Format,
+    sound: Option<bool>,
+    opus: bool,
+) -> &'static str {
+    match (sound, opus) {
+        (_, true) => "Opus · SW encode (opus-rs)",
+        // Encoded, into a container that would have carried Opus, and it is not
+        // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or the
+        // mix was not the 48 kHz stereo that seat is measured in.
+        (Some(false), false) if format.is_mkv() => "AAC · SW encode (rusty_aac)",
+        _ => audio_label(project, format, sound.is_some(), sound),
+    }
+}
+
 /// What [`start`] would write this timeline's sound with, before one is
 /// started. Pure: no probe and no file opened, so a card may ask it per repaint.
 pub fn planned_audio(project: &Project, format: Format) -> &'static str {
@@ -1511,7 +1536,7 @@ const FIDELITY_FLOOR: f64 = 1e-9;
 /// A packet the decoder refuses is 0.0 and no argument: a track this project
 /// cannot read is exactly what this is here to catch.
 ///
-/// **Sampled, above a minute of sound, and the worst window is the answer.**
+/// **Sampled above a minute of sound, and the median window is the answer.**
 /// This decode is the whole cost of exporting a feature film: `ruopus` runs its
 /// inverse MDCT at 0.2x real time here (measured, 24.2 s for 121.5 s of stereo),
 /// so judging every packet of a two-and-a-half-hour film costs half an hour
@@ -1520,10 +1545,27 @@ const FIDELITY_FLOOR: f64 = 1e-9;
 /// [`FIDELITY_WINDOWS`] windows spread evenly across the track cost the same
 /// minute of decode whatever the film's length, and what they are looking for
 /// survives sampling: [`OPUS_MAX_KBPS`]'s cliff is a *rate* the encoder falls
-/// off, measured over one-second spans, not a defect of one bar of music. It is
-/// also strictly harsher per window than the old whole-track sum, which let a
-/// ruined minute average away against two good hours -- the answer here is the
-/// worst window, not the mean.
+/// off everywhere that rate is used, not a defect of one bar of music.
+///
+/// The **median** and not the worst, and that is measured rather than cautious.
+/// Forty five-second windows of a real 5.1 film's mix, encoded here at 128 kbps
+/// and decoded back, in order:
+///
+/// ```text
+/// 0.803  0.835  0.938  0.940  0.960  0.987  0.994  ... median 0.998 ... 0.999
+/// ```
+///
+/// Five of the thirty-nine that carried sound sit under [`OPUS_MIN_FIDELITY`] on
+/// a track that is *good* -- which is the same thing the table in
+/// [`OPUS_MAX_KBPS`] shows, where a span scoring 0.937 at 128 kbps is inside the
+/// usable band. A worst-window rule at 0.95 therefore refuses films this encoder
+/// handles perfectly well, while the failure it exists for is the opposite
+/// shape: at 136 kbps the same three measured spans read 0.452, 0.697, 0.951,
+/// and at 256 kbps the whole track correlates 0.06. Half a track cannot be
+/// ruined without the middle of the list moving, so the median separates the two
+/// by a margin no single window can (0.998 against under 0.7) -- and a track
+/// under a minute is one window, where median and whole-track correlation are
+/// the same number the gate always used.
 fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize) -> f64 {
     // Short enough to hear all of: every fixture, every unit test, and any
     // track under a minute. There is nothing to sample from.
@@ -1535,7 +1577,7 @@ fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize)
     // own warm-up would show, and the last starts a window short of the end so
     // no window runs past the packets.
     let step = (packets.len() - FIDELITY_WINDOW) / (FIDELITY_WINDOWS - 1);
-    let mut worst: Option<f64> = None;
+    let mut scores: Vec<f64> = Vec::with_capacity(FIDELITY_WINDOWS);
     for w in 0..FIDELITY_WINDOWS {
         let at = w * step;
         let from = at.saturating_sub(FIDELITY_WARMUP);
@@ -1544,10 +1586,14 @@ fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize)
         else {
             continue; // silence: nothing to correlate, and not a failure
         };
-        worst = Some(worst.map_or(fidelity, |w: f64| w.min(fidelity)));
+        scores.push(fidelity);
     }
     // Every window silent is a silent track, which this codec writes as silence.
-    worst.unwrap_or(1.0)
+    if scores.is_empty() {
+        return 1.0;
+    }
+    scores.sort_by(f64::total_cmp);
+    scores[scores.len() / 2]
 }
 
 /// [`opus_fidelity`] over `packets[measure..to]`, with `packets[from..measure]`
@@ -1664,10 +1710,7 @@ fn run(
             // it: the mix has been opened by now, so a line that fell back to
             // AAC says AAC. Naming the prediction here would make the fallback
             // invisible on precisely the exports that are over in seconds.
-            match opus {
-                true => "Opus · SW encode (opus-rs)",
-                false => audio_label(project, settings.format, sound.is_some(), sound),
-            }
+            measured_audio_label(project, settings.format, sound, opus)
         ));
         return plan.run(
             out,
@@ -1723,10 +1766,7 @@ fn run(
     *shared.encoders.lock().unwrap() = Some(format!(
         "{} · {}",
         encoder.label(),
-        match opus {
-            true => "Opus · SW encode (opus-rs)",
-            false => audio_label(project, settings.format, sound.is_some(), sound),
-        }
+        measured_audio_label(project, settings.format, sound, opus)
     ));
     let mut muxer = None;
     let mut done = 0u32;
@@ -3346,18 +3386,19 @@ mod tests {
         );
     }
 
-    /// The gate on a track too long to listen to whole: it samples, and what it
-    /// samples it judges one window at a time. A five-second stretch that is not
-    /// the mix fails the whole track -- where the old whole-track sum would have
-    /// let it average away against the minutes either side -- and a silent track
-    /// is not a failure at all, which is what it used to be scored as (0.0
-    /// against a denominator of nothing, and an all-quiet timeline fell back to
-    /// AAC for it).
+    /// The gate on a track too long to listen to whole: it samples, and the
+    /// middle of what it hears is the answer. A track whose sound is *not* what
+    /// was encoded fails it; one bad five-second window does not, which is
+    /// deliberate and measured ([`opus_fidelity`] carries the distribution:
+    /// five windows of a good film's mix score under 0.95, the lowest 0.803).
+    /// A silent track is not a failure either, which is what it used to be
+    /// scored as -- 0.0 against a denominator of nothing, and an all-quiet
+    /// timeline fell back to AAC for it.
     ///
     /// 61 s of sound: one second past the minute the gate stops listening whole,
     /// which is what puts this on the sampled path at all.
     #[test]
-    fn a_long_track_is_judged_by_its_worst_sampled_window() {
+    fn a_long_track_is_judged_by_the_middle_of_what_it_samples() {
         let pcm = two_tones(61);
         let (packets, pre_skip) = encode_opus(&pcm, 96)
             .expect("the encoder opens")
@@ -3374,17 +3415,32 @@ mod tests {
         // One window's worth of the *mix* replaced by its own phase inverse:
         // the packets still decode, they are simply no longer this sound. Placed
         // on a window the gate samples -- window 6 of the twelve, by the same
-        // arithmetic the gate spreads them with.
+        // arithmetic the gate spreads them with. The track still passes, and
+        // that is the measured decision, not an oversight: this codec really
+        // does score 0.80 on five seconds of film it otherwise handles at 0.998.
         let step = (packets.len() - FIDELITY_WINDOW) / (FIDELITY_WINDOWS - 1);
         let from = (6 * step * OPUS_FRAME).saturating_sub(pre_skip) * 2;
-        let mut ruined = pcm.clone();
-        for sample in &mut ruined[from..(from + FIDELITY_WINDOW * OPUS_FRAME * 2).min(pcm.len())] {
+        let mut one_bad = pcm.clone();
+        for sample in &mut one_bad[from..(from + FIDELITY_WINDOW * OPUS_FRAME * 2).min(pcm.len())] {
             *sample = -*sample;
         }
-        let worst = opus_fidelity(&packets, &ruined, pre_skip);
+        let dip = opus_fidelity(&packets, &one_bad, pre_skip);
         assert!(
-            worst < OPUS_MIN_FIDELITY,
-            "five seconds of a long track that is not the mix scored {worst:.4}"
+            dip >= OPUS_MIN_FIDELITY,
+            "one ruined window sank the whole track ({dip:.4})"
+        );
+
+        // ...and the shape the gate is actually for, which is what a rate the
+        // encoder cannot hold does: the track is not the mix any more, not one
+        // window of it. The middle of the list moves with it.
+        let mut ruined = pcm.clone();
+        for sample in &mut ruined[pcm.len() / 4..] {
+            *sample = -*sample;
+        }
+        let ruined = opus_fidelity(&packets, &ruined, pre_skip);
+        assert!(
+            ruined < OPUS_MIN_FIDELITY,
+            "a track that is no longer the mix scored {ruined:.4}"
         );
 
         // ...and silence is silence: nothing to correlate is not a round trip
