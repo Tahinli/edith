@@ -179,3 +179,179 @@ fn chirp_second(meta: &engine::audio::AudioMeta, samples: impl Iterator<Item = f
     // The window's *midpoint* is what its mean frequency dates.
     (crossings as f64 / 2.0 / WINDOW - 200.0) / 160.0 - WINDOW / 2.0
 }
+
+/// His own film, which is where the desync was measured and where the fixture
+/// cannot follow: a 5 GB AV1 remux with a 5.1 Opus track and a cue table, seeked
+/// to three seconds spread across two hours and correlated against ffmpeg's
+/// decode of the same window.
+///
+/// The chirp fixture above proves the rule on 30 seconds of one cluster layout.
+/// This proves it where it broke: `fix(audio): a seek into a Matroska lands on
+/// the second it asked for` measured +1.473 s at 600 s and +3.394 s at 610 s on
+/// this file and left no runnable check behind it, so a regression would come
+/// back the way the original did -- through his ears, after a scrub.
+///
+/// Skipped, not failed, without the film or without ffmpeg: a claim about his
+/// library cannot be made by a machine that does not have it.
+#[test]
+fn a_seek_into_his_film_lands_on_the_second_it_asked_for() {
+    let film = PathBuf::from(
+        "/path/to/a-real-av1-opus-5.1-film.mkv",
+    );
+    if !film.exists() {
+        eprintln!("skipped: {} is not on this machine", film.display());
+        return;
+    }
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!("skipped: no ffmpeg to decode the reference window with");
+        return;
+    }
+    // Five seconds either side of the request: the landings this exists to catch
+    // were +1.5 and +3.4 s, and a narrow search is a search that cannot pick the
+    // wrong repeat of a phrase.
+    const SEARCH: f64 = 5.0;
+    for want in [600.0, 610.0, 3600.0] {
+        let (meta, rx) = AudioSession::open_at(&film, want)
+            .expect("open")
+            .expect("the film has audio");
+        let rate = f64::from(meta.sample_rate);
+        let channels = usize::from(meta.channels);
+        // One second of what came out, summed to mono: what is being located is
+        // the content, and a fold's channel balance is not part of that. Taken a
+        // chunk at a time and then dropped -- this window is open-ended, and
+        // draining it is decoding the rest of a two-hour film.
+        let mut probe: Vec<f32> = Vec::with_capacity(meta.sample_rate as usize);
+        for chunk in &rx {
+            probe.extend(
+                chunk
+                    .samples
+                    .chunks_exact(channels)
+                    .map(|f| f.iter().sum::<f32>() / channels as f32),
+            );
+            if probe.len() >= meta.sample_rate as usize {
+                break;
+            }
+        }
+        drop(rx);
+        probe.truncate(meta.sample_rate as usize);
+        assert_eq!(probe.len(), meta.sample_rate as usize, "a second to locate");
+
+        let from = want - SEARCH;
+        let reference = ffmpeg_mono(&film, from, 2.0 * SEARCH + 2.0, meta.sample_rate);
+        let (lag, score) = best_lag(&probe, &reference);
+        let at = from + lag as f64 / rate;
+        eprintln!("asked {want}s, content at {at:.3}s (correlation {score:.3})");
+        assert!(
+            score > 0.5,
+            "asked {want}s: nothing in the reference window correlates ({score:.3}) -- \
+             the measurement, not the seek, is what failed"
+        );
+        assert!(
+            (at - want).abs() <= 0.05,
+            "asked {want}s, heard {at:.3}s -- {:+.3}s of sound against picture",
+            at - want
+        );
+    }
+}
+
+/// `dur` seconds of `path`'s first audio track from `start`, decoded by ffmpeg,
+/// summed to mono at `rate`. The reference this engine's own landing is measured
+/// against, because a decoder cannot be its own witness about where it landed.
+fn ffmpeg_mono(path: &std::path::Path, start: f64, dur: f64, rate: u32) -> Vec<f32> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-ss"])
+        .arg(format!("{start}"))
+        .arg("-t")
+        .arg(format!("{dur}"))
+        .arg("-i")
+        .arg(path)
+        .args(["-map", "0:a:0", "-ac", "1", "-ar"])
+        .arg(rate.to_string())
+        .args(["-f", "f32le", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    out.stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Where in `reference` the `probe` sits, and how well: the offset in samples of
+/// the best normalised cross-correlation, which is 1.0 for the same content and
+/// falls away fast for anything else.
+///
+/// Coarse then fine, because the naive product over a ten-second window at
+/// 48 kHz is 3e10 multiplies: both signals are averaged down by [`DECIMATE`]
+/// first -- a crude low-pass, and the peak of a correlation is broad -- then the
+/// winner is refined at full rate over the one block around it. The normalisation
+/// is what makes the two comparable at all, since this fold is 7.7 dB quieter
+/// than ffmpeg's.
+fn best_lag(probe: &[f32], reference: &[f32]) -> (usize, f64) {
+    const DECIMATE: usize = 32;
+    let down = |xs: &[f32]| -> Vec<f64> {
+        xs.chunks_exact(DECIMATE)
+            .map(|c| c.iter().map(|s| f64::from(*s)).sum::<f64>() / DECIMATE as f64)
+            .collect()
+    };
+    let (coarse, at) = scan(&down(probe), &down(reference), 1);
+    let from = (at * DECIMATE).saturating_sub(DECIMATE);
+    let span = 3 * DECIMATE + probe.len();
+    // The score reported is the coarse one, over the whole search window: the
+    // fine pass only sharpens the offset inside a block it has already chosen,
+    // and a score over a window that short says nothing about the match.
+    let (_, offset) = scan(
+        &probe.iter().map(|s| f64::from(*s)).collect::<Vec<f64>>(),
+        &reference[from.min(reference.len())..(from + span).min(reference.len())]
+            .iter()
+            .map(|s| f64::from(*s))
+            .collect::<Vec<f64>>(),
+        1,
+    );
+    (from + offset, coarse)
+}
+
+/// The best normalised cross-correlation of `probe` over `reference`, at `step`
+/// samples: `(score, offset)`. Both are mean-removed; the denominator is each
+/// window's own energy, so a level difference between the two decoders cannot
+/// move the peak.
+fn scan(probe: &[f64], reference: &[f64], step: usize) -> (f64, usize) {
+    if reference.len() <= probe.len() || probe.is_empty() {
+        return (0.0, 0);
+    }
+    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+    let p: Vec<f64> = {
+        let m = mean(probe);
+        probe.iter().map(|s| s - m).collect()
+    };
+    let pe = p.iter().map(|s| s * s).sum::<f64>().sqrt();
+    if pe <= 0.0 {
+        return (0.0, 0);
+    }
+    let (mut best, mut at) = (0.0, 0);
+    for offset in (0..reference.len() - p.len()).step_by(step) {
+        let window = &reference[offset..offset + p.len()];
+        let m = mean(window);
+        let (mut dot, mut energy) = (0.0, 0.0);
+        for (a, b) in p.iter().zip(window) {
+            let b = b - m;
+            dot += a * b;
+            energy += b * b;
+        }
+        let score = match energy > 0.0 {
+            true => dot / (pe * energy.sqrt()),
+            false => 0.0,
+        };
+        if score > best {
+            best = score;
+            at = offset;
+        }
+    }
+    (best, at)
+}
