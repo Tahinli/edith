@@ -4112,7 +4112,15 @@ impl Parser {
             let max = if !pps.tiles_enabled_flag && pps.entropy_coding_sync_enabled_flag {
                 sps.pic_height_in_ctbs_y - 1
             } else if pps.tiles_enabled_flag && !pps.entropy_coding_sync_enabled_flag {
-                u32::from((pps.num_tile_columns_minus1 + 1) * (pps.num_tile_rows_minus1 + 1) - 1)
+                // Widened first: the tile counts are `u8`, and §7.4.3.3.1 lets
+                // this parser accept 20 columns by 22 rows, whose product is
+                // 440 -- past a `u8` long before it is past the §7.4.7.1 bound.
+                // Multiplied narrow it wrapped to 183 in release (every entry
+                // point past the 184th refused on a conformant stream, which is
+                // this bug's own black picture again) and panicked in debug.
+                (u32::from(pps.num_tile_columns_minus1) + 1)
+                    * (u32::from(pps.num_tile_rows_minus1) + 1)
+                    - 1
             } else {
                 (u32::from(pps.num_tile_columns_minus1) + 1) * sps.pic_height_in_ctbs_y - 1
             };
