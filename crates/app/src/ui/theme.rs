@@ -84,6 +84,28 @@ pub const STATUS_ERROR: u32 = 0xef4444;
 pub const STATUS_WARNING: u32 = 0xf59e0b;
 pub const STATUS_SUCCESS: u32 = 0x34d399;
 pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+/// Which of the feedback colours a message wears. Read off the words rather
+/// than carried alongside them: every message in this editor already opens with
+/// what it is ("EXPORT DONE", "SCAN FAILED", "NOTHING DETACHED"), and a second
+/// `tone` argument at seventy call sites is seventy chances to disagree with the
+/// sentence it labels.
+///
+/// ponytail: prefix matching, so a message worded outside these families reads
+/// as neutral rather than wrong. Ceiling: a `Notice { text, tone }` struct the
+/// day a message needs a colour its own words do not say.
+pub fn notice_tone(message: &str) -> u32 {
+    let has = |word: &str| message.contains(word);
+    if has("FAILED") || has("ERROR") || has("REFUSED") || has("CANNOT") || has("COULD NOT") {
+        STATUS_ERROR
+    } else if message.starts_with(crate::EXPORT_DONE) || has("SAVED") || has("DONE") {
+        STATUS_SUCCESS
+    } else if has("NOTHING") || has("NO ") || has("EMPTY") {
+        STATUS_WARNING
+    } else {
+        ACCENT_PRIMARY
+    }
+}
+
 /// The mirror of [`BG_SELECTED`]: a drop the lane will not take, tinting the
 /// shadow the drag draws so a refusal is seen before the release.
 pub const DROP_REFUSE: u32 = 0x8f2740;

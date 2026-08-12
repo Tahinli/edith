@@ -1468,10 +1468,14 @@ struct Player {
     /// The action whose row is waiting for a stroke. The next key that is
     /// neither escape nor a lone modifier becomes the whole of what reaches it.
     rebinding: Option<ActionId>,
-    /// What the last file action had to say. Holds its own bar above the panel
-    /// until it is answered -- any key retires it, so does a click on it -- so a
-    /// failure is read in full instead of blinking past.
-    notice: Option<SharedString>,
+    /// What the file actions have had to say, oldest first. A *queue* and not a
+    /// slot: two imports that fail back to back used to be one message, because
+    /// the second overwrote the first before a frame had drawn it -- the failure
+    /// a user never learns about is the one that was answered by another
+    /// failure. The front holds its own bar above the panel until it is answered
+    /// -- any key retires it, so does a click on it -- the bar says how many are
+    /// behind it, and answering it brings the next one up.
+    notices: std::collections::VecDeque<SharedString>,
     /// What the last finished export wrote, so the notice can be the way to it.
     /// Only the [`EXPORT_DONE`] line reads it -- any later notice has replaced
     /// that text -- so a click never opens a file the bar is not naming.
@@ -1625,7 +1629,7 @@ impl Player {
             // A state refusal is spoken: the thing exists and cannot happen
             // *now*, which is exactly what a silent key press fails to say.
             Enable::No(why) => {
-                self.notice = Some(format!("{} — {why}", action.label()).into());
+                self.notify_user(format!("{} — {why}", action.label()).into());
                 cx.notify();
                 return;
             }
@@ -1695,6 +1699,24 @@ impl Player {
         }
     }
 
+    /// Says something to the user. The one door: every message in this editor
+    /// comes through here, so "queued rather than overwritten" is a property of
+    /// the field and not of seventy call sites remembering to be polite.
+    ///
+    /// A repeat of what is already at the back is dropped -- holding a key that
+    /// refuses would otherwise fill the queue with one sentence, and the count
+    /// on the bar would be a count of how long the key was held.
+    fn notify_user(&mut self, message: SharedString) {
+        push_notice(&mut self.notices, message);
+    }
+
+    /// Answers the message on the bar and brings up the next one. Whether there
+    /// was one to answer, because a key that dismissed a notice owes a repaint
+    /// and a key that dismissed nothing does not.
+    fn dismiss_notice(&mut self) -> bool {
+        self.notices.pop_front().is_some()
+    }
+
     /// The magnet off and on again, in words: a snap that stops working
     /// silently reads as a bug, and one that starts working silently reads as
     /// one too. The line goes with it -- nothing is being promised any more.
@@ -1702,7 +1724,7 @@ impl Player {
         self.snap = !self.snap;
         self.snap_cue = None;
         self.ghost = None;
-        self.notice = Some(match self.snap {
+        self.notify_user(match self.snap {
             true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
             false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
         });
@@ -1752,7 +1774,7 @@ impl Player {
             .as_ref()
             .and_then(|session| sub_pick_name(session.subtitles(), self.sub_track))
             .unwrap_or_else(|| "nothing imported".to_string());
-        self.notice = Some(
+        self.notify_user(
             match self.subs_on {
                 true => format!("SUBTITLES ON — {label}"),
                 false => format!("SUBTITLES OFF — {label} is still on the timeline"),
@@ -1880,7 +1902,7 @@ impl Player {
     fn select_under_playhead(&mut self, cx: &mut Context<Self>) {
         let under = self.under_playhead();
         let Some(&first) = under.first() else {
-            self.notice = Some("NOTHING UNDER THE PLAYHEAD — move it onto a clip first".into());
+            self.notify_user("NOTHING UNDER THE PLAYHEAD — move it onto a clip first".into());
             cx.notify();
             return;
         };
@@ -1930,7 +1952,7 @@ impl Player {
             return;
         }
         let Some(session) = &mut self.session else {
-            self.notice = Some("no timeline to fit — open a file first".into());
+            self.notify_user("no timeline to fit — open a file first".into());
             cx.notify();
             return;
         };
@@ -1939,7 +1961,7 @@ impl Player {
             .filter(|(lane, _)| lane.kind == LaneKind::Video)
             .or_else(|| session.video_clip_at(session.now()));
         let Some((lane, idx)) = target else {
-            self.notice = Some("no clip under the playhead to fit".into());
+            self.notify_user("no clip under the playhead to fit".into());
             cx.notify();
             return;
         };
@@ -1955,7 +1977,7 @@ impl Player {
             && session.set_fit(lane, idx, fit)
         {
             let (w, h) = session.resolution();
-            self.notice = Some(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
+            self.notify_user(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -2005,7 +2027,7 @@ impl Player {
             return;
         }
         let Some(session) = &mut self.session else {
-            self.notice = Some("no timeline to resize — open a file first".into());
+            self.notify_user("no timeline to resize — open a file first".into());
             cx.notify();
             return;
         };
@@ -2019,7 +2041,7 @@ impl Player {
         if let Some(session) = &mut self.session
             && session.set_resolution(width, height)
         {
-            self.notice = Some(format!("PROJECT: {width}x{height}").into());
+            self.notify_user(format!("PROJECT: {width}x{height}").into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -2036,7 +2058,7 @@ impl Player {
             && session.set_frame_rate(fps)
         {
             self.fps = session.meta().frame_rate;
-            self.notice = Some(format!("PROJECT: {} fps", fps_label(fps)).into());
+            self.notify_user(format!("PROJECT: {} fps", fps_label(fps)).into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -2052,7 +2074,7 @@ impl Player {
         if let Some(session) = &mut self.session
             && session.set_tone(preset)
         {
-            self.notice = Some(format!("HDR: {} — affects HDR media", tone_label(preset)).into());
+            self.notify_user(format!("HDR: {} — affects HDR media", tone_label(preset)).into());
             self.reset_after_reseek();
         }
         cx.notify();
@@ -2118,7 +2140,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notice = Some("no timeline to grade — open a file first".into());
+            self.notify_user("no timeline to grade — open a file first".into());
             cx.notify();
             return;
         };
@@ -2139,7 +2161,7 @@ impl Player {
                 self.export_open = false;
                 self.context_menu = None;
             }
-            None => self.notice = Some("no clip under the playhead to grade".into()),
+            None => self.notify_user("no clip under the playhead to grade".into()),
         }
         cx.notify();
     }
@@ -2250,7 +2272,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notice = Some("no timeline to re-time — open a file first".into());
+            self.notify_user("no timeline to re-time — open a file first".into());
             cx.notify();
             return;
         };
@@ -2271,7 +2293,7 @@ impl Player {
                 self.close_silence();
                 self.context_menu = None;
             }
-            None => self.notice = Some("no clip under the playhead to re-time".into()),
+            None => self.notify_user("no clip under the playhead to re-time".into()),
         }
         cx.notify();
     }
@@ -2319,7 +2341,7 @@ impl Player {
             };
             match wrote {
                 Ok(()) => self.reset_after_reseek(),
-                Err(e) => self.notice = Some(e.to_string().into()),
+                Err(e) => self.notify_user(e.to_string().into()),
             }
         }
         cx.notify();
@@ -2391,7 +2413,7 @@ impl Player {
             return;
         }
         let Some(session) = &self.session else {
-            self.notice = Some("no timeline to scan — open a file first".into());
+            self.notify_user("no timeline to scan — open a file first".into());
             cx.notify();
             return;
         };
@@ -2415,7 +2437,7 @@ impl Player {
                     return;
                 };
                 if engine::is_image(&source.path) {
-                    self.notice = Some(unscannable(lane, idx, &source.path).into());
+                    self.notify_user(unscannable(lane, idx, &source.path).into());
                     cx.notify();
                     return;
                 }
@@ -2439,7 +2461,7 @@ impl Player {
                     ScanPlan::Wait => {}
                 }
             }
-            None => self.notice = Some("no clip under the playhead to scan".into()),
+            None => self.notify_user("no clip under the playhead to scan".into()),
         }
         cx.notify();
     }
@@ -2585,13 +2607,13 @@ impl Player {
                     // user knows which one it meant.
                     Ok(None) => {
                         if let Some((lane, idx)) = this.silence_open {
-                            this.notice = Some(unscannable(lane, idx, &key.0).into());
+                            this.notify_user(unscannable(lane, idx, &key.0).into());
                         }
                         this.close_silence();
                     }
                     Err(e) => {
                         this.close_silence();
-                        this.notice = Some(format!("SCAN FAILED: {e}").into());
+                        this.notify_user(format!("SCAN FAILED: {e}").into());
                     }
                 }
                 cx.notify();
@@ -2719,7 +2741,7 @@ impl Player {
     /// nothing.
     fn previewed(&mut self) -> Option<(Vec<(u32, u32)>, Vec<Lane>)> {
         if self.silence_marks.is_empty() {
-            self.notice = Some(
+            self.notify_user(
                 format!(
                     "no silence under {:.0} dBFS lasting {:.2} s — raise the threshold or forgive less",
                     self.silence.threshold_db, self.silence.min_silence
@@ -2771,7 +2793,7 @@ impl Player {
                 // moves indexes (a delete, a paste, an undo).
                 self.selected = None;
                 self.reset_after_reseek();
-                self.notice = Some(
+                self.notify_user(
                     format!(
                         "{count} SILENCES CUT {reach} — {} shorter, {} takes it back",
                         secs_label(saved),
@@ -2780,7 +2802,7 @@ impl Player {
                     .into(),
                 );
             }
-            Err(e) => self.notice = Some(e.to_string().into()),
+            Err(e) => self.notify_user(e.to_string().into()),
         }
         cx.notify();
     }
@@ -2810,7 +2832,7 @@ impl Player {
                 // goes with them.
                 self.selected = None;
                 self.reset_after_reseek();
-                self.notice = Some(
+                self.notify_user(
                     format!(
                         "{count} SILENCES AT {rate} {reach} — {} takes it back",
                         self.keymap.display(ActionId::Undo)
@@ -2818,7 +2840,7 @@ impl Player {
                     .into(),
                 );
             }
-            Err(e) => self.notice = Some(e.to_string().into()),
+            Err(e) => self.notify_user(e.to_string().into()),
         }
         cx.notify();
     }
@@ -2926,7 +2948,7 @@ impl Player {
             _ => None,
         };
         if let Some(refusal) = refusal {
-            self.notice = Some(refusal.into());
+            self.notify_user(refusal.into());
             cx.notify();
             return;
         }
@@ -3016,7 +3038,7 @@ impl Player {
     /// band that was just made. Refused rather than silently ignored at the cap.
     fn add_band(&mut self, cx: &mut Context<Self>) {
         if self.eq_params.bands.len() >= EQ_BANDS_MAX {
-            self.notice = Some(
+            self.notify_user(
                 format!(
                     "EQUALIZER FULL — {EQ_BANDS_MAX} bands is all this card holds; move one instead"
                 )
@@ -3035,7 +3057,7 @@ impl Player {
     /// is a card with nothing to edit, and flattening is what "off" means here.
     fn remove_band(&mut self, cx: &mut Context<Self>) {
         if self.eq_params.bands.len() <= 1 {
-            self.notice = Some("LAST BAND — flatten it instead (r), or close the card".into());
+            self.notify_user("LAST BAND — flatten it instead (r), or close the card".into());
             cx.notify();
             return;
         }
@@ -3122,7 +3144,7 @@ impl Player {
             if session.regroup_at(session.now()) {
                 self.selected = None;
             } else {
-                self.notice = Some(
+                self.notify_user(
                     "NOTHING TO REGROUP — put the playhead where two clips meet, on frames that were cut apart"
                         .into(),
                 );
@@ -3142,12 +3164,13 @@ impl Player {
         match (&mut self.session, self.selected) {
             (Some(session), Some((lane, idx))) => {
                 if !session.ungroup(lane, idx) {
-                    self.notice =
-                        Some("NOTHING DETACHED — that clip is not grouped with another".into());
+                    self.notify_user(
+                        "NOTHING DETACHED — that clip is not grouped with another".into(),
+                    );
                 }
             }
             (Some(_), None) => {
-                self.notice = Some("NOTHING DETACHED — click the take to take apart first".into())
+                self.notify_user("NOTHING DETACHED — click the take to take apart first".into())
             }
             (None, _) => {}
         }
@@ -3171,17 +3194,17 @@ impl Player {
         match (&mut self.session, self.selected, partner) {
             (Some(session), Some((lane, idx)), Some((other, o_idx))) => {
                 if let Err(e) = session.group(lane, idx, other, o_idx) {
-                    self.notice = Some(format!("NOT GROUPED — {e}").into());
+                    self.notify_user(format!("NOT GROUPED — {e}").into());
                 }
             }
             (Some(_), Some(_), None) => {
-                self.notice = Some(
+                self.notify_user(
                     "NOTHING TO GROUP WITH — no clip on another track covers exactly these frames"
                         .into(),
                 )
             }
             (Some(_), None, _) => {
-                self.notice = Some("NOTHING GROUPED — click one of the halves first".into())
+                self.notify_user("NOTHING GROUPED — click one of the halves first".into())
             }
             (None, ..) => {}
         }
@@ -3211,7 +3234,7 @@ impl Player {
             _ => false,
         };
         if selected.is_some() && !deleted {
-            self.notice = Some("NOTHING DELETED — that clip is no longer there".into());
+            self.notify_user("NOTHING DELETED — that clip is no longer there".into());
         }
         if deleted {
             self.reset_after_reseek();
@@ -3231,11 +3254,11 @@ impl Player {
                 if session.lift_clip(lane, idx) {
                     self.reset_after_reseek();
                 } else {
-                    self.notice = Some("NOTHING LIFTED — that half is no longer there".into());
+                    self.notify_user("NOTHING LIFTED — that half is no longer there".into());
                 }
             }
             (Some(_), None) => {
-                self.notice = Some("NOTHING LIFTED — click the half to remove first".into())
+                self.notify_user("NOTHING LIFTED — click the half to remove first".into())
             }
             (None, _) => {}
         }
@@ -3516,7 +3539,7 @@ impl Player {
             // Everything else that could refuse (a clip that is not there)
             // cannot be dragged.
             false if from.kind != to.kind => {
-                self.notice = Some(
+                self.notify_user(
                     format!(
                         "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
                         to.label()
@@ -3528,7 +3551,7 @@ impl Player {
             // says nothing.
             false if from == to && start == was => {}
             false => {
-                self.notice = Some(
+                self.notify_user(
                     format!(
                         "NOT MOVED — another clip already covers those frames on {}",
                         to.label()
@@ -3909,7 +3932,7 @@ impl Player {
         // refused here -- where a file goes when nobody says is the engine's
         // choice, in `place_stream_at`, not one made twice here.
         if let Some(why) = onto.and_then(|lane| lane_refuses(path, lane)) {
-            self.notice = Some(why.into());
+            self.notify_user(why.into());
             cx.notify();
             return;
         }
@@ -3936,9 +3959,9 @@ impl Player {
             }
             // The engine's own words: a stream that cannot join this timeline
             // says which property disagrees, exactly as a refused import does.
-            Err(e) => self.notice = Some(format!("NOTHING ADDED — {e}").into()),
+            Err(e) => self.notify_user(format!("NOTHING ADDED — {e}").into()),
             Ok(false) => {
-                self.notice = Some("NOTHING ADDED — that file could not be placed here".into())
+                self.notify_user("NOTHING ADDED — that file could not be placed here".into())
             }
         }
         cx.notify();
@@ -3999,7 +4022,7 @@ impl Player {
             Some(Err(e)) => format!("NOT REMOVED — {e}"),
             None => "NO TIMELINE — open a file first".to_string(),
         };
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4279,7 +4302,7 @@ impl Player {
                     Landed::Media(opened, place) => {
                         let text = self.install_media(path, opened, place);
                         eprintln!("{text}");
-                        self.notice = Some(text.into());
+                        self.notify_user(text.into());
                         cx.notify();
                     }
                     Landed::Read(..) => unreachable!("matched above"),
@@ -4347,7 +4370,7 @@ impl Player {
             None => self.open_media(path, false, subs),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4431,7 +4454,7 @@ impl Player {
                 Ok(None) => {}
                 Err(text) => {
                     eprintln!("{text}");
-                    this.notice = Some(text.into());
+                    this.notify_user(text.into());
                     cx.notify();
                 }
             })
@@ -4456,7 +4479,7 @@ impl Player {
         if let Some(why) = self.enable(ActionId::AddSubtitleTrack, None).why() {
             let text = format!("NO SUBTITLES ADDED — {why}");
             eprintln!("{text}");
-            self.notice = Some(text.into());
+            self.notify_user(text.into());
             cx.notify();
             return;
         }
@@ -4471,7 +4494,7 @@ impl Player {
                 Ok(None) => {}
                 Err(text) => {
                     eprintln!("{text}");
-                    this.notice = Some(text.into());
+                    this.notify_user(text.into());
                     cx.notify();
                 }
             })
@@ -4495,7 +4518,7 @@ impl Player {
             self.landed_subtitles(path, None, cx);
             return;
         }
-        self.notice = Some(format!("READING {} for subtitles…", file_name(path)).into());
+        self.notify_user(format!("READING {} for subtitles…", file_name(path)).into());
         let parsed = cx.background_executor().spawn({
             let path = path.to_path_buf();
             async move { engine::PlaybackSession::parse_subtitles(&path) }
@@ -4553,7 +4576,7 @@ impl Player {
             None => "NO SUBTITLES ADDED — open a file for them to run against first".to_string(),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4576,7 +4599,7 @@ impl Player {
         if let Some(why) = self.enable(ActionId::RemoveSubtitleTrack, None).why() {
             let text = format!("NO SUBTITLES REMOVED — {why}");
             eprintln!("{text}");
-            self.notice = Some(text.into());
+            self.notify_user(text.into());
             cx.notify();
             return;
         }
@@ -4609,7 +4632,7 @@ impl Player {
             None => "NO SUBTITLES REMOVED — open a file first".to_string(),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4672,7 +4695,7 @@ impl Player {
             Err(e) => format!("OPEN FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4689,7 +4712,7 @@ impl Player {
             None => "NOTHING TO SAVE — open a file first".to_string(),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4704,7 +4727,7 @@ impl Player {
         match &mut self.session {
             Some(session) => {
                 let lane = session.add_lane(kind);
-                self.notice = Some(
+                self.notify_user(
                     format!(
                         "{} ADDED — drag a clip onto it, {} takes it back",
                         lane.label(),
@@ -4713,7 +4736,7 @@ impl Player {
                     .into(),
                 );
             }
-            None => self.notice = Some("NO TRACK ADDED — open a file first".into()),
+            None => self.notify_user("NO TRACK ADDED — open a file first".into()),
         }
         cx.notify();
     }
@@ -4752,7 +4775,7 @@ impl Player {
             Some(Err(e)) => format!("NO TRACK REMOVED — {e}"),
             None => "NO TRACK REMOVED — open a file first".to_string(),
         };
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
@@ -4770,7 +4793,7 @@ impl Player {
         match last {
             Some(lane) => self.remove_lane(lane, cx),
             None => {
-                self.notice = Some("NO TRACK REMOVED — open a file first".into());
+                self.notify_user("NO TRACK REMOVED — open a file first".into());
                 cx.notify();
             }
         }
@@ -4804,7 +4827,7 @@ impl Player {
         if !chord.bindable() {
             let text = format!("THAT KEY CANNOT BE BOUND — {}", chord.pretty());
             eprintln!("{text}");
-            self.notice = Some(text.into());
+            self.notify_user(text.into());
             return;
         }
         let text = match self.keymap.rebind_action(action, chord.clone()) {
@@ -4821,7 +4844,7 @@ impl Player {
             Err(holder) => format!("ALREADY BOUND — {} is {}", chord.pretty(), holder.label()),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
     }
 
     /// Seeks to where the pointer sits along the ruler. `commit` is the press
@@ -4889,7 +4912,7 @@ impl Player {
         if nothing_to_play(self.session.as_ref()) {
             match self.session.as_mut().filter(|s| s.is_playing()) {
                 Some(session) => session.pause(),
-                None => self.notice = Some(NOTHING_TO_PLAY.into()),
+                None => self.notify_user(NOTHING_TO_PLAY.into()),
             }
             cx.notify();
             return;
@@ -4932,7 +4955,7 @@ impl Player {
         // Nothing to write out, and a refusal rather than a card about it: the
         // window is empty and the export path is not even chosen yet.
         if self.session.is_none() {
-            self.notice = Some("NOTHING TO EXPORT — open a file first".into());
+            self.notify_user("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
             return;
         }
@@ -4957,7 +4980,7 @@ impl Player {
             .as_ref()
             .and_then(|session| format_refusal(session, format))
         {
-            self.notice = Some(format!("NOT {} — {why}", format_label(format)).into());
+            self.notify_user(format!("NOT {} — {why}", format_label(format)).into());
             return;
         }
         self.format = format;
@@ -4977,7 +5000,7 @@ impl Player {
     /// looking broken.
     fn cycle_quality(&mut self) {
         if let Some(why) = bitrate_refusal(self.format) {
-            self.notice = Some(why.into());
+            self.notify_user(why.into());
             return;
         }
         let at = Quality::ALL
@@ -4994,7 +5017,7 @@ impl Player {
     /// card looking broken.
     fn cycle_audio_kbps(&mut self) {
         if let Some(why) = self.audio_rate_refusal() {
-            self.notice = Some(why.into());
+            self.notify_user(why.into());
             return;
         }
         self.audio_kbps = next_audio_kbps(self.audio_kbps);
@@ -5055,7 +5078,7 @@ impl Player {
                     Ok(None) => {}
                     Err(text) => {
                         eprintln!("{text}");
-                        this.notice = Some(text.into());
+                        this.notify_user(text.into());
                     }
                 }
                 cx.notify();
@@ -5123,7 +5146,7 @@ impl Player {
         // calls for the *estimate* and which nothing else needs a subtitle for.
         settings.subtitles = self.export_subs();
         let Some(session) = &mut self.session else {
-            self.notice = Some("NOTHING TO EXPORT — open a file first".into());
+            self.notify_user("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
             return;
         };
@@ -5133,7 +5156,7 @@ impl Player {
         // that is not this button cannot get past it either. Two fences on
         // purpose: this one is the one with a keystroke to blame.
         if session.is_empty() {
-            self.notice = Some("NOTHING TO EXPORT — the timeline is empty".into());
+            self.notify_user("NOTHING TO EXPORT — the timeline is empty".into());
             cx.notify();
             return;
         }
@@ -5142,7 +5165,7 @@ impl Player {
         // edit away -- so the button asks again rather than starting a worker
         // that will only settle with the same refusal minutes later.
         if let Some(why) = format_refusal(session, self.format) {
-            self.notice = Some(format!("NOT EXPORTED — {why}").into());
+            self.notify_user(format!("NOT EXPORTED — {why}").into());
             cx.notify();
             return;
         }
@@ -5202,7 +5225,7 @@ impl Player {
             Err(e) => format!("EXPORT FAILED: {e}"),
         };
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
     }
 }
 
@@ -5293,11 +5316,12 @@ impl Render for Player {
                 {
                     return;
                 }
-                // Any key retires the last message, whatever it was -- and owes
+                // Any key answers the message on the bar and brings the next of
+                // them up, whatever it was -- and owes
                 // the repaint itself: a notice no longer keeps the render loop
                 // alive, and the arms below that do notify are not all of them
                 // (an unbound key, or the copy chord, changes nothing else).
-                if this.notice.take().is_some() {
+                if this.dismiss_notice() {
                     cx.notify();
                 }
                 // A row is waiting for a stroke, and while it is, that stroke is
@@ -6114,6 +6138,28 @@ fn file_name(path: &std::path::Path) -> String {
         || path.display().to_string(),
         |n| n.to_string_lossy().into(),
     )
+}
+
+/// How many messages wait behind the one on the bar before the oldest is
+/// dropped. A queue with no ceiling is a way for a stuck loop to eat the heap;
+/// eight is more than a user will ever answer in a row.
+const NOTICES_MAX: usize = 8;
+
+/// The whole of the queue's policy, where it can be read at once and tested
+/// without a window: dedupe against the back, a ceiling, oldest out first.
+/// [`Player::notify_user`] is the door every message comes through; this is what
+/// the door does.
+fn push_notice(notices: &mut std::collections::VecDeque<SharedString>, message: SharedString) {
+    // A repeat of what is already at the back is dropped -- holding a key that
+    // refuses would otherwise fill the queue with one sentence, and the count on
+    // the bar would be a count of how long the key was held.
+    if notices.back() == Some(&message) {
+        return;
+    }
+    if notices.len() >= NOTICES_MAX {
+        notices.pop_front();
+    }
+    notices.push_back(message);
 }
 
 /// The tail an open/load notice grows when the file has sound the engine cannot
@@ -9510,7 +9556,8 @@ mod tests {
         marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
         retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
         SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
-        typed, unseen_paths, unseen_sources,
+        EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
+        push_notice, typed, unseen_paths, unseen_sources,
         whole_take, window_title,
     };
     use super::{
@@ -9566,6 +9613,7 @@ mod tests {
     fn ui_source() -> String {
         [
             include_str!("main.rs").split("#[cfg(test)]").next().unwrap(),
+            include_str!("ui/theme.rs"),
             include_str!("ui/toolbar.rs"),
             include_str!("ui/inspector.rs"),
             include_str!("ui/timeline.rs"),
@@ -14279,6 +14327,46 @@ mod tests {
         assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
     }
 
+    /// The failure a user never learns about is the one that was answered by
+    /// another failure: two imports failing back to back are two messages, in
+    /// the order they happened, and the second does not overwrite the first
+    /// before a frame has drawn it.
+    #[test]
+    fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
+        let mut q = std::collections::VecDeque::new();
+        push_notice(&mut q, "NOTHING ADDED — no video stream".into());
+        push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.front().map(|n: &gpui::SharedString| n.as_ref()), Some("NOTHING ADDED — no video stream"));
+
+        // A held key that refuses says its one sentence once: the count on the
+        // bar is a count of messages, not of how long the key was held.
+        push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
+        assert_eq!(q.len(), 2);
+
+        // ...and the ceiling drops the oldest rather than the newest: the thing
+        // that just happened is the thing worth reading.
+        for i in 0..NOTICES_MAX + 3 {
+            push_notice(&mut q, format!("SCAN FAILED: {i}").into());
+        }
+        assert_eq!(q.len(), NOTICES_MAX);
+        assert_eq!(q.back().map(|n: &gpui::SharedString| n.as_ref()), Some("SCAN FAILED: 10"));
+
+        // Answering the bar brings the next one up, oldest first.
+        let front = q.pop_front();
+        assert_ne!(front, q.front().cloned());
+    }
+
+    /// The bar colours itself off the words the message already opens with, so
+    /// the tone cannot disagree with the sentence it labels.
+    #[test]
+    fn a_message_wears_the_colour_its_own_words_say() {
+        assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR);
+        assert_eq!(notice_tone(&format!("{EXPORT_DONE}out.mp4")), STATUS_SUCCESS);
+        assert_eq!(notice_tone("NOTHING DETACHED — not grouped"), STATUS_WARNING);
+        assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY);
+    }
+
     /// The cards are sections of the inspector, not sheets over the timeline:
     /// adjusting a clip must never hide the clip. Structural, because that is
     /// where the rule lives -- a card rendered from the root again would be an
@@ -15382,7 +15470,7 @@ fn main() {
                     // there was anything to pick.
                     format: Format::default(),
                     rebinding: None,
-                    notice: notice.clone().map(SharedString::from),
+                    notices: notice.clone().map(SharedString::from).into_iter().collect(),
                     exported: None,
                     // The whole of argv, waiting for the first repaint to start
                     // it: the window is up before a byte of it is read.
