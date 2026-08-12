@@ -1226,6 +1226,30 @@ impl Project {
         true
     }
 
+    /// Takes the track at `idx` off the list -- what a row's own remove goes
+    /// through, so whatever an import added can be taken back out. Refused by
+    /// name for a row this project does not have, rather than a silent no-op:
+    /// a front-end holding a stale index has picked the wrong row and needs to
+    /// hear it.
+    ///
+    /// Every index past `idx` moves down by one, as [`remove_source`](
+    /// Project::remove_source)'s do: a caller holding a picked row (an export's
+    /// [`crate::export::ExportSettings::subtitles`]) has to fix it up or drop
+    /// it, or it names a different track afterwards.
+    ///
+    /// ponytail: not an undo step, for the reason the limiter is not -- the
+    /// history snapshots hold the lane list and subtitles are not on it
+    /// ([`Project::subtitles`]). The inverse is a re-import, not a ctrl+z, and
+    /// the upgrade path is the same one: a history entry holding the project's
+    /// own settings beside the lanes.
+    pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
+        if idx >= self.subtitles.len() {
+            return Err(format!("there is no subtitle track {idx} to remove").into());
+        }
+        self.subtitles.remove(idx);
+        Ok(())
+    }
+
     /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
     /// lanes is multiplied by on its way into the mix: the same lanes in the
     /// same order, as *amplitudes*, so the mixer never sees a decibel. `1.0`

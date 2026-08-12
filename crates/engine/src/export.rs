@@ -226,7 +226,7 @@ impl Format {
 /// What the caller gets to decide about the output. The codec is not among it:
 /// [`Format`] names a container *and* what goes in it, because every pair we
 /// can write is a pair we can also read back.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportSettings {
     /// Bits per second, clamped to the same sane range the automatic value uses.
     /// `None` picks it from the picture size and frame rate. Video only.
@@ -244,16 +244,22 @@ pub struct ExportSettings {
     /// it used to. Means nothing to WAV and FLAC, which code no rate, and
     /// nothing to a *copied* AAC track, which carries its source's.
     pub audio_kbps: Option<u32>,
-    /// Which of the project's subtitle tracks travels with the file: an index
-    /// into [`Project::subtitles`], which is the same list a front-end picks a
-    /// row of. `None` writes none -- what every caller wrote before there was a
-    /// choice, so an export of a timeline without subtitles is the file it
-    /// always was, byte for byte.
+    /// Which of the project's subtitle tracks travel with the file: indices into
+    /// [`Project::subtitles`], which is the same list a front-end picks rows of.
+    /// As many as the timeline holds, in the order given -- the file declares
+    /// them in that order and a player's subtitle menu lists them in it. Empty
+    /// writes none -- what every caller wrote before there was a choice, so an
+    /// export of a timeline without subtitles is the file it always was, byte
+    /// for byte.
     ///
-    /// Only a Matroska container carries it: an mp4's `tx3g` is a different
-    /// beast and nothing here writes one, so an mp4 export says so
-    /// ([`planned_subtitles`]) rather than dropping the track in silence.
-    pub subtitles: Option<usize>,
+    /// Every container that carries picture carries them: Matroska as
+    /// `S_TEXT/UTF8` blocks, an mp4 as a `tx3g` timed-text track
+    /// ([`crate::mux::Mp4Muxer::write_subtitles`]). A Matroska block names its
+    /// track in one byte, so a Matroska file carries at most
+    /// [`crate::mux::MAX_SUB_TRACKS`] of them and asking for more is refused by
+    /// name rather than truncated; an mp4 numbers its tracks in 32 bits and has
+    /// no such ceiling.
+    pub subtitles: Vec<usize>,
 }
 
 struct Shared {
@@ -317,7 +323,7 @@ pub fn start(
     out: &Path,
     settings: &ExportSettings,
 ) -> ExportHandle {
-    let settings = *settings;
+    let settings = settings.clone();
     let shared = Arc::new(Shared {
         progress: AtomicU32::new(0),
         cancel: AtomicBool::new(false),
@@ -559,30 +565,48 @@ pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static 
     }
 }
 
-/// The track a Matroska export carries, or `None`: no pick, a pick nothing
-/// answers, a track that could not be read, one with no cue left on the
-/// exported timeline -- and every mp4, whose refusal [`planned_subtitles`] says
-/// out loud before the button is pressed.
+/// The tracks an export carries, in the order they were picked, and empty where
+/// it carries none: no pick, a pick nothing answers, a track that could not be
+/// read, one with no cue left on the exported timeline -- and every format that
+/// is the sound alone, which has nowhere to put them. Filtered *per track*, so
+/// one unusable pick costs its own row and not the others.
+///
+/// Both containers, since the mp4 muxer gained its `tx3g` track: what the two
+/// do with the very same [`SubParams`] is theirs to say
+/// ([`crate::mux::Mp4Muxer::write_subtitles`], [`MkvMuxer`]), and nothing here
+/// asks which one is being written.
 fn export_subtitles(
     project: &Project,
     meta: &VideoMeta,
     settings: &ExportSettings,
-) -> Option<SubParams> {
-    if !matches!(settings.format, Format::Av1 | Format::Hevc) {
-        return None;
+) -> Vec<SubParams> {
+    if !settings.format.has_video() {
+        return Vec::new();
     }
-    let track = project.subtitles().get(settings.subtitles?)?;
-    // A picture is not a line: the muxer writes an `S_TEXT/UTF8` track and a
-    // PGS cue has no words to put in one. `planned_subtitles` says so before
-    // the button is pressed rather than the file coming out short.
-    if track.refused.is_some() || track.is_bitmap() {
-        return None;
-    }
-    let cues = timeline_cues(project, track, meta.frame_rate);
-    (!cues.is_empty()).then(|| SubParams {
-        label: track.label.clone(),
-        cues,
-    })
+    settings
+        .subtitles
+        .iter()
+        .filter_map(|&pick| {
+            let track = project.subtitles().get(pick)?;
+            // A picture is not a line: the muxer writes an `S_TEXT/UTF8` track
+            // and a PGS cue has no words to put in one. `planned_subtitles` says
+            // so before the button is pressed rather than the file coming out
+            // short.
+            if track.refused.is_some() || track.is_bitmap() {
+                return None;
+            }
+            let cues = timeline_cues(project, track, meta.frame_rate);
+            // The container's own two fields, carried as two
+            // ([`SubtitleTrack::language`]): a `TrackEntry` with no `Language`
+            // means `eng` by spec, so a French track that arrives here as one
+            // flattened string leaves as an English one.
+            (!cues.is_empty()).then(|| SubParams {
+                language: track.language.clone(),
+                name: track.name.clone(),
+                cues,
+            })
+        })
+        .collect()
 }
 
 /// The track's cues where the *exported* timeline puts them, which is the only
@@ -676,30 +700,66 @@ pub fn timeline_cues(project: &Project, track: &SubtitleTrack, fps: f64) -> Vec<
     out
 }
 
-/// What [`start`] would do about the subtitles, in the words a card shows.
-/// Pure, like [`planned_audio`]: no file is opened, so it may be asked per
-/// repaint.
-pub fn planned_subtitles(project: &Project, format: Format, pick: Option<usize>) -> String {
-    let Some(track) = pick.and_then(|i| project.subtitles().get(i)) else {
-        return "none".into();
+/// What [`start`] would do about the subtitles, in the words a card shows: what
+/// travels, and the reason beside every pick that does not. Pure, like
+/// [`planned_audio`]: no file is opened, so it may be asked per repaint.
+///
+/// `picks` is any run of indices into [`Project::subtitles`] -- an
+/// [`ExportSettings::subtitles`] list (`picks.iter().copied()`) as much as a
+/// single `Some(row)`, which is what a front-end holding one row still hands it.
+pub fn planned_subtitles(
+    project: &Project,
+    format: Format,
+    picks: impl IntoIterator<Item = usize>,
+) -> String {
+    let mut embedded: Vec<&str> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let picks: Vec<usize> = picks.into_iter().collect();
+    // One statement about the *file*, said before any about a track: a format
+    // that is the sound alone has nowhere to put a single one of them, and the
+    // reason a pick would not have travelled anyway (a picture track, no cues)
+    // is not the reason it does not travel here. Nothing picked is "none" --
+    // there is nothing to say a container cannot carry.
+    if !picks.is_empty() && !format.has_video() {
+        return "none — this format is the sound alone".into();
+    }
+    for pick in picks {
+        // A pick the project has no row for: a caller holding an index the list
+        // no longer has (a removed row shifts every later one down). Every other
+        // reason a pick does not travel is named on this card, so this one is
+        // too -- a bug that says nothing is a bug found in the finished file.
+        let Some(track) = project.subtitles().get(pick) else {
+            dropped.push(format!("#{pick} — no such track"));
+            continue;
+        };
+        if let Some(why) = &track.refused {
+            dropped.push(format!("{} — {why}", track.label));
+        } else if track.is_bitmap() {
+            // Drawn over the picture, written into no file: the exported track
+            // is text and these cues are bitmaps. Said whatever the format,
+            // because it is the track and not the container that cannot be
+            // carried.
+            dropped.push(format!("{} — pictures; drawn, not written", track.label));
+        } else if track.cues.is_empty() {
+            dropped.push(format!("{} — no cues", track.label));
+        } else {
+            // Whichever container: a Matroska carries the track as
+            // `S_TEXT/UTF8` blocks and an mp4 as a `tx3g` timed-text track, and
+            // a pick travels either way. There is no container refusal left on
+            // this card -- the sound-alone one above is about the *file* and the
+            // ones beside it about the *track*.
+            embedded.push(&track.label);
+        }
+    }
+    let mut parts = match embedded.len() {
+        0 => Vec::new(),
+        1 => vec![format!("{} → embedded", embedded[0])],
+        n => vec![format!("{n} tracks → embedded ({})", embedded.join(", "))],
     };
-    if let Some(why) = &track.refused {
-        return format!("{} — {why}", track.label);
-    }
-    // Drawn over the picture, written into no file: the exported track is text
-    // and these cues are bitmaps. Said whatever the format, because it is the
-    // track and not the container that cannot be carried.
-    if track.is_bitmap() {
-        return format!("{} — pictures; drawn, not written", track.label);
-    }
-    match format {
-        _ if track.cues.is_empty() => "none".into(),
-        Format::Av1 | Format::Hevc => format!("{} → embedded", track.label),
-        // Said before the export rather than after it: an mp4 carries text in
-        // `tx3g` and nothing here writes one, so the honest answer is the
-        // container that does.
-        format if format.has_video() => "mkv only — an mp4 carries none".into(),
-        _ => "none — this format is the sound alone".into(),
+    parts.extend(dropped);
+    match parts.is_empty() {
+        true => "none".into(),
+        false => parts.join("; "),
     }
 }
 
@@ -1191,16 +1251,19 @@ fn run(
     let Some(muxer) = muxer else {
         return Err("export produced no coded pictures".into());
     };
-    // The mp4's audio track after its picture -- the Matroska one interleaved
-    // its own as it went and left `packets` empty behind it.
-    let muxer = match (muxer, packets) {
-        (Muxer::Mp4(mut mp4), Some(packets)) => {
-            for packet in packets {
+    // The mp4's audio and subtitle tracks after its picture -- the Matroska one
+    // interleaved its own as it went and left `packets` and `subs` empty behind
+    // it. The text last, so its samples are written knowing how long the picture
+    // turned out to be.
+    let muxer = match muxer {
+        Muxer::Mp4(mut mp4) => {
+            for packet in packets.into_iter().flatten() {
                 mp4.write_audio_packet(&packet.bytes)?;
             }
+            mp4.write_subtitles(&subs)?;
             Muxer::Mp4(mp4)
         }
-        (muxer, _) => muxer,
+        muxer => muxer,
     };
     cancelled(shared)?;
     muxer.finish()?;
@@ -1674,7 +1737,7 @@ fn write_video(
     settings: &ExportSettings,
     audio: Option<&AudioParams>,
     packets: &mut Option<Vec<crate::AacPacket>>,
-    subs: &mut Option<SubParams>,
+    subs: &mut Vec<SubParams>,
     au: &[u8],
     key: bool,
 ) -> crate::Result<()> {
@@ -1702,7 +1765,7 @@ fn write_video(
                             hvcc: &hvcc,
                         },
                         sound,
-                        subs.take(),
+                        std::mem::take(subs),
                     )?)) else {
                         unreachable!("just inserted a Matroska muxer")
                     };
@@ -1759,7 +1822,7 @@ fn write_video(
                         out,
                         &params(meta, au)?,
                         sound,
-                        subs.take(),
+                        std::mem::take(subs),
                     )?)) else {
                         unreachable!("just inserted a Matroska muxer")
                     };
@@ -2517,6 +2580,8 @@ mod tests {
         SubtitleTrack {
             path: path.into(),
             track,
+            language: "eng".into(),
+            name: String::new(),
             label: "eng".into(),
             bitmap: false,
             cues: vec![
