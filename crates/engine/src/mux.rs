@@ -787,6 +787,31 @@ pub struct HevcParams<'a> {
     pub hvcc: &'a [u8],
 }
 
+/// What a *copied* track declares: the source's own codec id and configuration
+/// record, in the space its samples are really in.
+///
+/// Nothing here is derived from the timeline -- the copy exists precisely
+/// because none of it changed -- so the picture keeps the size, the rate, the
+/// curve and the parameter sets it was coded with.
+pub struct CopyParams<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    /// The Matroska codec id, `V_MPEGH/ISO/HEVC` or `V_AV1`.
+    pub codec_id: &'a [u8],
+    /// `CodecPrivate` as the source holds it ([`crate::demux::MkvDemuxer::codec_private`]).
+    pub codec_private: &'a [u8],
+    /// The source's own `Colour`: a copied HDR film leaves as the HDR film it
+    /// is, because not one of its samples was touched.
+    ///
+    /// ponytail: the `MasteringMetadata` and MaxCLL beside it are not carried --
+    /// this engine parses them ([`crate::demux::ContentLight`]) but has nowhere
+    /// to write them yet, so a copied HDR file states its curve and not its
+    /// grading display. Upgrade path is a `Colour` element written from that
+    /// same struct.
+    pub colour: ColorDescription,
+}
+
 /// The soft subtitle track a file carries beside the picture: text, timed, still
 /// text in the file -- a player draws it and a user can turn it off, which is
 /// what "soft" means and what burning it into the pixels is not.
@@ -851,6 +876,11 @@ pub struct MkvMuxer {
     cluster: Vec<u8>,
     cluster_ts: i64,
     frames: u64,
+    /// The latest timestamp any picture was written at. Equal to the frame
+    /// counter's own for a track this project encoded; for a *copied* one the
+    /// blocks carry their source's timing and a cut can leave the last picture
+    /// on screen, so the duration is measured rather than counted.
+    last_ts: i64,
     /// The AAC track, if the timeline has sound, and how far it has been
     /// written.
     audio: Option<MkvAudio>,
@@ -897,6 +927,7 @@ impl MkvMuxer {
             video.frame_rate,
             b"V_AV1",
             &av1c,
+            ColorDescription::output(video.height),
             audio,
             subs,
         )
@@ -925,6 +956,39 @@ impl MkvMuxer {
             video.frame_rate,
             b"V_MPEGH/ISO/HEVC",
             video.hvcc,
+            ColorDescription::output(video.height),
+            audio,
+            subs,
+        )
+    }
+
+    /// The same file with a track *copied* out of another one: the source's own
+    /// codec id and `CodecPrivate`, and its own `Colour` beside them
+    /// ([`crate::export`]'s copy path).
+    ///
+    /// Not [`Self::create_hevc`] with the source's record, because the picture
+    /// is not this project's own: a copy writes the file the source's samples
+    /// already are -- an HDR film stays on its PQ curve rather than being
+    /// declared the SDR the encoders here write -- and the blocks are timed by
+    /// [`Self::write_block`] off the source's clock rather than by a frame
+    /// counter, which is the other half of the same statement.
+    pub fn create_copy(
+        path: &Path,
+        video: &CopyParams,
+        audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+        subs: Vec<SubParams>,
+    ) -> crate::Result<Self> {
+        if video.codec_private.is_empty() {
+            return Err("the source track carries no CodecPrivate to copy".into());
+        }
+        Self::open(
+            path,
+            video.width,
+            video.height,
+            video.frame_rate,
+            video.codec_id,
+            video.codec_private,
+            video.colour,
             audio,
             subs,
         )
@@ -938,6 +1002,7 @@ impl MkvMuxer {
         frame_rate: f64,
         codec_id: &[u8],
         codec_private: &[u8],
+        colour: ColorDescription,
         audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
         subs: Vec<SubParams>,
     ) -> crate::Result<Self> {
@@ -1004,11 +1069,11 @@ impl MkvMuxer {
         uint(&mut dims, PIXEL_WIDTH, u64::from(width));
         uint(&mut dims, PIXEL_HEIGHT, u64::from(height));
         // What the samples in those pixels mean. Written rather than left to a
-        // reader's own 720-line guess -- the guess is right for this file (the
-        // export remaps every clip into exactly that space) but a remuxer or a
-        // scaler downstream has no reason to make it, and an untagged file is
-        // how a 601 source ends up displayed as 709.
-        let colour = ColorDescription::output(height);
+        // reader's own 720-line guess -- the guess is right for an encoded file
+        // (the export remaps every clip into exactly that space) but a remuxer
+        // or a scaler downstream has no reason to make it, and an untagged file
+        // is how a 601 source ends up displayed as 709. A *copied* track states
+        // its source's space instead, which is the one its samples are in.
         let (primaries, transfer, matrix) = colour.codes();
         let mut tags = Vec::new();
         uint(&mut tags, MATRIX_COEFFICIENTS, u64::from(matrix));
@@ -1047,6 +1112,7 @@ impl MkvMuxer {
             cluster: Vec::new(),
             cluster_ts: 0,
             frames: 0,
+            last_ts: 0,
             audio: audio.map(|(params, packets)| MkvAudio {
                 packets,
                 next: 0,
@@ -1075,6 +1141,29 @@ impl MkvMuxer {
         }
         let ts = (self.frames * self.frame_ns + TIMESTAMP_SCALE_NS / 2) as i64
             / TIMESTAMP_SCALE_NS as i64;
+        self.put(obus, key, ts)
+    }
+
+    /// One coded picture *copied* out of another file, shown at `ts_ns` on this
+    /// file's clock rather than at the next frame of a counter.
+    ///
+    /// A copy has to be timed by the source's own timestamps and not by the
+    /// order the blocks arrive in: a stream with B-frames is stored in decode
+    /// order, so its timestamps step backwards over a group of pictures, and
+    /// re-timing those blocks one frame apart would play the group in the order
+    /// it was coded in. Matroska times every block in presentation and the
+    /// relative timestamp in a block header is signed, so what a copy writes
+    /// here is exactly what its source said.
+    pub fn write_block(&mut self, payload: &[u8], key: bool, ts_ns: i64) -> crate::Result<()> {
+        if payload.is_empty() {
+            return Err("an empty coded block".into());
+        }
+        let ts = (ts_ns + TIMESTAMP_SCALE_NS as i64 / 2) / TIMESTAMP_SCALE_NS as i64;
+        self.put(payload, key, ts)
+    }
+
+    /// One block into the cluster it belongs in, whatever timed it.
+    fn put(&mut self, payload: &[u8], key: bool, ts: i64) -> crate::Result<()> {
         // A new cluster at every keyframe -- a seek lands on one, so a cluster
         // is a whole GOP -- and at the two limits a cluster has whatever the
         // encoder keys: what it may weigh, and how far a 16-bit relative
@@ -1093,8 +1182,9 @@ impl MkvMuxer {
         // them, for the same reason.
         self.drain_audio(ts)?;
         self.drain_subs(ts)?;
-        self.block(1, ts, key, obus);
+        self.block(1, ts, key, payload);
         self.frames += 1;
+        self.last_ts = self.last_ts.max(ts);
         Ok(())
     }
 
@@ -1230,7 +1320,11 @@ impl MkvMuxer {
         let size = (1u64 << 56) | body;
         self.file.seek(SeekFrom::Start(self.segment_size_at))?;
         self.file.write_all(&size.to_be_bytes())?;
-        let ms = self.frames as f64 * self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64;
+        // One frame past the last picture shown, which is where the file really
+        // ends: counting the frames instead would cut a copied track short by
+        // however many pictures a cut left the one before it on screen for.
+        let ms = (self.frames as f64 * self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64)
+            .max(self.last_ts as f64 + self.frame_ns as f64 / TIMESTAMP_SCALE_NS as f64);
         self.file.seek(SeekFrom::Start(self.duration_at))?;
         self.file.write_all(&ms.to_be_bytes())?;
         self.file.flush()?;

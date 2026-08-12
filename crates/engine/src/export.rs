@@ -9,10 +9,17 @@
 //! That makes it an intraframe master in the family of ProRes and DNxHD — large
 //! files, every frame a cut point — and not a delivery codec.
 //!
-//! Video is fully re-encoded — a cut lands mid-GOP, so stream-copying across it
-//! is impossible — while audio is copied packet for packet wherever a copy can
-//! say what the timeline says: a copy is exact, free and never a generation of
-//! loss. Where it *cannot* — a second audio lane to mix in, a speeded clip, an
+//! Picture and sound are both **copied wherever a copy says exactly what the
+//! timeline says** — a copy is exact, free and never a generation of loss. For
+//! the sound that is packet for packet ([`copy_audio`]); for the picture it is
+//! block for block out of a Matroska source into a Matroska file ([`CopyPlan`]),
+//! which is what makes a cut in a two-hour film cost the reading of it rather
+//! than the re-encoding of it. The picture's copy is all-or-nothing per export,
+//! because a copied span and an encoded one cannot share one track: what it
+//! needs of a cut is that it lands on a sync point, and everything else — a
+//! grade, a speed, a gap, a source of another size or codec, an mp4 — goes
+//! through the encoder exactly as it always did. Where the *sound* cannot be
+//! copied — a second audio lane to mix in, a speeded clip, an
 //! equalized one, a source that is not AAC inside an mp4's own sample table —
 //! the sound is decoded, mixed and encoded again with `rusty_aac`
 //! ([`encode_audio`]). The audio-only formats have no such split: `hound` writes
@@ -65,9 +72,11 @@ use oxideav_core::Muxer as _;
 
 use crate::audio::{AudioMeta, AudioSession};
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
-use crate::demux::{Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, MkvDemuxer, VideoMeta};
 use crate::hw::{HwEncoder, HwSession};
-use crate::mux::{AudioParams, Av1Params, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams};
+use crate::mux::{
+    AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
+};
 use crate::project::{LaneKind, Project, Rate};
 use crate::scale::Composer;
 use crate::subtitle::{Cue, SubtitleTrack};
@@ -893,6 +902,234 @@ fn copy_audio(
     }
 }
 
+/// The picture's half of [`copy_audio`]: a Matroska export whose every span is
+/// its source's own coded blocks, written back out without a decoder or an
+/// encoder anywhere in the path.
+///
+/// **When.** A copy is entered only where it says *exactly* what the timeline
+/// says, which is the audio gate's rule and not a looser one: the file this
+/// export writes is Matroska, the source's codec is the one that file would
+/// carry ([`Format::Hevc`] over HEVC, [`Format::Av1`] over AV1), and nothing on
+/// the way has touched a sample -- no grade, no speed, no rate conversion, no
+/// gap to fill with black, no source of another size to place on the canvas,
+/// no `ContentEncodings` packing to undo. Anything else re-encodes exactly as
+/// it always did; there is no half-copied file.
+///
+/// **All or nothing, per export.** A copied span and an encoded one cannot
+/// share one track: this project's encoders write 8-bit SDR streams whose
+/// parameter sets are their own, so splicing them into (say) a Main 10 HDR
+/// source would change bit depth and colour mid-track, and a container states
+/// its configuration record once. So the head and tail fragments of a cut that
+/// lands mid-GOP are *not* re-encoded into the copy -- they are what makes the
+/// whole export fall back to the encoder. What a copy needs instead is that
+/// every span begins on a sync point and ends where the next one begins, which
+/// is what a cut placed on a keyframe gives it.
+///
+/// **What a cut costs.** An open-GOP source (x265's default) writes leading
+/// pictures after a sync point that are shown *before* it and reference the
+/// group before it. At the start of a copied region those references are not in
+/// the file, so they are dropped -- the picture before the cut is held for those
+/// few frames (four at this film's B-depth, a sixth of a second) rather than
+/// being written as pictures that cannot decode. The region still starts at the
+/// timeline frame it owns, so the sound never drifts.
+///
+/// ponytail: mp4 is not copied (its `hvc1` sample entry forbids in-band
+/// parameter sets, and the mp4 muxer here writes its sample table from a frame
+/// counter), and neither is H.264, which this project only writes into mp4. The
+/// upgrade path for both is a sample-table writer that takes explicit
+/// timestamps, which is what [`MkvMuxer::write_block`] already is for Matroska.
+struct CopyPlan {
+    /// Every source a region reads, by the index the project names it with;
+    /// `None` for a source no clip plays from.
+    sources: Vec<Option<MkvDemuxer>>,
+    regions: Vec<CopyRegion>,
+    codec_id: &'static [u8],
+    /// The `CodecPrivate` every region's source agrees on -- a track is declared
+    /// once, so two sources that disagree about their parameter sets are not one
+    /// copy.
+    private: Vec<u8>,
+    colour: ColorDescription,
+    width: u32,
+    height: u32,
+}
+
+/// A run of source blocks copied in one piece: what a cut leaves behind, and
+/// what two spans that continue each other in the same file merge back into.
+struct CopyRegion {
+    source: usize,
+    /// Blocks of that source, in the file's own decode order.
+    blocks: std::ops::Range<usize>,
+    /// The timeline frame the region's first picture is shown at.
+    start: u32,
+}
+
+impl CopyPlan {
+    /// The plan for this timeline, or `None` where anything at all makes a copy
+    /// say something other than what the timeline says -- in which case the
+    /// caller encodes, which is what it always did.
+    fn of(project: &Project, meta: &VideoMeta, settings: &ExportSettings) -> Option<Self> {
+        let (codec_id, codec): (&'static [u8], Codec) = match settings.format {
+            Format::Hevc => (b"V_MPEGH/ISO/HEVC", Codec::Hevc),
+            Format::Av1 => (b"V_AV1", Codec::Av1),
+            _ => return None,
+        };
+        let entries = project.sources();
+        let mut sources: Vec<Option<MkvDemuxer>> = (0..entries.len()).map(|_| None).collect();
+        let mut declared: Option<(Vec<u8>, ColorDescription)> = None;
+        let mut regions: Vec<CopyRegion> = Vec::new();
+        for span in project.composite_spans_from(0) {
+            // A gap is black frames, which only an encoder makes.
+            let (source, in_frame) = span.from?;
+            if !span.speed.is_normal() {
+                return None;
+            }
+            // The grade playback shows, which a copied packet never went
+            // through. `None` and the identity are the same untouched picture.
+            if project
+                .composite_color_at(span.start)
+                .is_some_and(|params| !params.is_identity())
+            {
+                return None;
+            }
+            let path = &entries.get(source)?.path;
+            if sources.get(source)?.is_none() {
+                if !crate::demux::is_matroska(path) {
+                    return None;
+                }
+                let (source_meta, demuxer) = Demuxer::open(path).ok()?;
+                let Demuxer::Mkv(demuxer) = demuxer else {
+                    return None;
+                };
+                // The stream this file would carry, at the size and the rate the
+                // timeline is in: anything else is a picture that has to be
+                // coded again to become this file's.
+                if source_meta.codec != codec
+                    || source_meta.width != meta.width
+                    || source_meta.height != meta.height
+                    || Rate::from_fps(source_meta.frame_rate, meta.frame_rate).ok()?
+                        != Rate::REAL_TIME
+                    || !demuxer.plain_blocks()
+                {
+                    return None;
+                }
+                // One track, one configuration record and one `Colour`: two
+                // sources that disagree about either are two streams, and this
+                // writes one.
+                let declares = (demuxer.codec_private().to_vec(), source_meta.color);
+                if declared.get_or_insert(declares.clone()) != &declares {
+                    return None;
+                }
+                sources[source] = Some(demuxer);
+            }
+            let demuxer = sources.get_mut(source)?.as_mut()?;
+            // The window this span reads, in the blocks the whole engine counts
+            // a source's frames in. It has to *be* whole groups of pictures: a
+            // copy that began between two sync points would hand a decoder
+            // pictures whose references are not in the file, and one that ended
+            // between them would drop a reference the pictures before it need.
+            let (start, end) = (in_frame as usize, in_frame as usize + span.len as usize);
+            if end > demuxer.block_count()
+                || !demuxer.is_sync(start)
+                || (end < demuxer.block_count() && !demuxer.is_sync(end))
+            {
+                return None;
+            }
+            // Two spans that continue each other in one file are one region:
+            // nothing was cut between them, so the leading pictures across that
+            // boundary still have every reference they need.
+            match regions.last_mut() {
+                Some(last)
+                    if last.source == source
+                        && last.blocks.end == start
+                        && last.start + (last.blocks.end - last.blocks.start) as u32
+                            == span.start =>
+                {
+                    last.blocks.end = end;
+                }
+                _ => regions.push(CopyRegion {
+                    source,
+                    blocks: start..end,
+                    start: span.start,
+                }),
+            }
+        }
+        let (private, colour) = declared?;
+        Some(Self {
+            sources,
+            regions,
+            codec_id,
+            private,
+            colour,
+            width: meta.width,
+            height: meta.height,
+        })
+    }
+
+    /// The file itself: one Matroska muxer, every region's blocks through it in
+    /// the order and at the timing their source states.
+    fn run(
+        mut self,
+        out: &Path,
+        meta: &VideoMeta,
+        shared: &Shared,
+        audio: Option<(&AudioParams, Vec<crate::AacPacket>)>,
+        subs: Vec<SubParams>,
+        total: u32,
+    ) -> crate::Result<()> {
+        let mut muxer = MkvMuxer::create_copy(
+            out,
+            &CopyParams {
+                width: self.width,
+                height: self.height,
+                frame_rate: meta.frame_rate,
+                codec_id: self.codec_id,
+                codec_private: &self.private,
+                colour: self.colour,
+            },
+            audio,
+            subs,
+        )?;
+        // Nanoseconds a timeline frame lasts, which is what a region's own
+        // position on the timeline is measured in.
+        let frame_ns = 1e9 / meta.frame_rate;
+        let mut done = 0u32;
+        for region in &self.regions {
+            let demuxer = self.sources[region.source]
+                .as_mut()
+                .ok_or("a copied region names a source that was never opened")?;
+            let base = (f64::from(region.start) * frame_ns).round() as i64;
+            // When the region's first picture is shown on its source's clock;
+            // everything after it is written that far along from `base`.
+            let mut origin: Option<i64> = None;
+            for index in region.blocks.clone() {
+                cancelled(shared)?;
+                let Some(block) = demuxer.coded_block(index)? else {
+                    break;
+                };
+                let origin = *origin.get_or_insert(block.ts_ns);
+                // The leading pictures of the group this region opens on: shown
+                // before it, coded against the group before it, and that group
+                // is not in this file. Dropped rather than written as pictures
+                // no decoder can put back together.
+                if block.ts_ns < origin {
+                    continue;
+                }
+                muxer.write_block(block.bytes, block.key, base + block.ts_ns - origin)?;
+                done += 1;
+                shared
+                    .progress
+                    .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
+            }
+        }
+        // Everything up to here is still cancellable, exactly as the encoded
+        // path is up to its own `finish`.
+        cancelled(shared)?;
+        muxer.finish()?;
+        shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// The same lane, *decoded*: what a packet copy cannot carry comes out here as
 /// AAC written by this project's own encoder.
 ///
@@ -1012,6 +1249,28 @@ fn run(
     // declared in the header and its blocks are interleaved into the clusters,
     // so the muxer needs the lot before the first picture is written.
     let mut subs = export_subtitles(project, meta, settings);
+
+    // Before an encoder is opened at all: a timeline nobody has touched, whose
+    // sources this file can hold as they are, is written by copying their coded
+    // blocks -- the picture's half of what `copy_audio` just did for the sound,
+    // and the difference between an export bounded by the *edited* spans and one
+    // that re-encodes a whole film to change a cut. [`CopyPlan`] states the
+    // whole rule; anything at all outside it falls through to the walk below.
+    if let Some(plan) = CopyPlan::of(project, meta, settings) {
+        eprintln!("export video: copy (source packets)");
+        *shared.encoders.lock().unwrap() = Some(format!(
+            "copy · {}",
+            audio_label(project, settings.format, sound.is_some(), sound)
+        ));
+        return plan.run(
+            out,
+            meta,
+            shared,
+            audio_params.as_ref().zip(packets.take()),
+            std::mem::take(&mut subs),
+            total,
+        );
+    }
 
     // One header parse per source, before any of them is decoded: what rate
     // each file was shot at against the timeline's ([`Rate`]), which is how the
