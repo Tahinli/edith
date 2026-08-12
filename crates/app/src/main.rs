@@ -4373,7 +4373,10 @@ impl Player {
                     file_name(path)
                 )
             }
-            Some(Err(e)) => format!("IMPORT FAILED: {e}"),
+            // Named, because two files can fail in one launch and the queue now
+            // shows both: "No such file or directory" twice over, with nothing
+            // saying which file, is two messages that answer nothing.
+            Some(Err(e)) => format!("IMPORT FAILED: {} — {e}", file_name(path)),
             None => self.open_media(path, false, subs),
         };
         eprintln!("{text}");
