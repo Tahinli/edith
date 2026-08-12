@@ -17,6 +17,7 @@ pub mod limiter;
 pub mod mux;
 pub mod playback;
 pub mod project;
+pub mod real_library;
 pub mod scale;
 pub mod scratch;
 pub mod silence;

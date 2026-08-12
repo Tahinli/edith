@@ -393,13 +393,10 @@ fn what_cannot_be_undone_is_refused_by_name() {
 /// proves is a picture on the timeline and not a well-shaped byte string.
 #[test]
 fn the_stripped_bluray_remux_decodes_a_picture() {
-    let path = Path::new(
-        "/path/to/a-real-h264-dual-audio-film.mkv",
-    );
-    if !path.exists() {
-        eprintln!("skipped: {} is not on this machine", path.display());
+    let Some(path) = engine::real_library::film("h264_dual_audio") else {
         return;
-    }
+    };
+    let path = path.as_path();
     let mut session = engine::PlaybackSession::open(path).expect("open the remux");
     assert_eq!(session.meta().codec, Codec::H264);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -431,13 +428,10 @@ fn the_stripped_bluray_remux_decodes_a_picture() {
 /// `AudioSession`, which is what the timeline opens it with.
 #[test]
 fn the_laced_eac3_remux_decodes_sound() {
-    let path = Path::new(
-        "/path/to/a-real-4k-hdr10-film.mkv",
-    );
-    if !path.exists() {
-        eprintln!("skipped: {} is not on this machine", path.display());
+    let Some(path) = engine::real_library::film("hevc_4k_hdr") else {
         return;
-    }
+    };
+    let path = path.as_path();
     let (meta, rx) = engine::AudioSession::open(path)
         .expect("open the sound")
         .expect("the film has an E-AC-3 track");

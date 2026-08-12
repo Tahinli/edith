@@ -234,13 +234,10 @@ fn range_stops_at_end() {
 fn the_hdr_film_renders_tone_mapped() {
     // Two minutes in: past the studio logos, inside lit footage.
     const TARGET: u32 = 3000;
-    let path = Path::new(
-        "/path/to/a-real-4k-hdr10-film.mkv",
-    );
-    if !path.exists() {
-        eprintln!("skipped: {} is not on this machine", path.display());
+    let Some(path) = engine::real_library::film("hevc_4k_hdr") else {
         return;
-    }
+    };
+    let path = path.as_path();
     // SAFETY: --test-threads=1. There is no software HEVC decoder, so a pinned
     // VE_SW from another test in this binary would refuse the file outright.
     unsafe { std::env::remove_var("VE_SW") };

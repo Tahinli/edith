@@ -1367,8 +1367,8 @@ enum MkvEntry {
 ///
 /// **`LanguageBCP47` wins**, which is the spec's own precedence and not a
 /// preference: a modern file states its languages there and leaves the legacy
-/// element out, so reading only the old one lost them. His
-/// *a dual-language remux* carries 37 `LanguageBCP47` elements against 33 legacy
+/// element out, so reading only the old one lost them. One real 4K web remux
+/// carries 37 `LanguageBCP47` elements against 33 legacy
 /// ones and every English track of it is BCP-47 only -- they all used to come in
 /// as `und` and export with no language at all.
 ///

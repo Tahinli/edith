@@ -1576,8 +1576,8 @@ impl SymTrack {
                 Err(e) => eprintln!("audio reopen failed: {e}"),
             }
             // Asking for the beginning is asking for nothing: a fresh reader is
-            // already there, and *seeking* there is how the first 167 ms of his
-            // the remux went missing -- the cue table's first point put the
+            // already there, and *seeking* there is how the first 167 ms of a
+            // real 5.1 Opus remux went missing -- the cue table's first point put the
             // reader past them and no window rule can reach back.
             if from == 0 {
                 return;
