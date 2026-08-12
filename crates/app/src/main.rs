@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use engine::audio::StreamInfo;
@@ -134,7 +135,13 @@ const RULER_HIT_H: f32 = HIT_MIN;
 const TIME_W: f32 = 200.;
 /// The keybindings card: a row per action, a title and a status line, inside a
 /// 360 px tall window. The rows are click targets, so `HIT_MIN` binds them too.
-const KEYS_W: f32 = 320.;
+/// Wider than the export card, and for the same reason that one is wider than
+/// this used to be: at 320 the longest labels ("Remove the last video track (it
+/// must be empty)") ran straight over the stroke printed at the other end of
+/// their row. Every label in the registry fits beside its stroke here, and the
+/// one that cannot -- a row waiting for a key to be pressed -- truncates rather
+/// than overprinting. Still inside the 640 px floor.
+const KEYS_W: f32 = 480.;
 const KEYS_ROW_H: f32 = HIT_MIN;
 /// How much of the row list is on screen at once; past this it scrolls. What
 /// keeps the card inside the smallest window no matter how many actions the
@@ -168,11 +175,6 @@ const EXPORT_FIXED_H: f32 = 17. + 28. + 15. + 30. + CONTROL_H + 4. + 10. + 24.;
 const MENU_W: f32 = 260.;
 const MENU_ROW_H: f32 = HIT_MIN;
 const MENU_PAD: f32 = 6.;
-/// How much of the item list is on screen at once, capped and scrolling like the
-/// keybindings and export lists: every action the pointer can reach is an item
-/// here, and a menu taller than the 640x360 floor would hang its last items off
-/// the bottom edge, where nobody can click them.
-const MENU_ROWS_H: f32 = 12. * MENU_ROW_H;
 
 /// The subtitle over the picture: white on a black plate, because a cue is read
 /// against whatever the film happens to be showing under it and the chrome's own
@@ -500,6 +502,18 @@ fn clip_width(span: f32) -> f32 {
     span.max(HIT_MIN)
 }
 
+/// The sheet a card or a menu is painted on: the whole window, and the mouse
+/// stops at it. Occluding is what tells gpui that nothing under this sheet is
+/// hovered any more (`Hitbox::is_hovered`) -- without it the window carries on
+/// hovering behind an open menu and pops *its* tooltip over the menu's items,
+/// which is a card being painted over by the thing it covers.
+///
+/// Every card and every menu takes its sheet from here, so no surface can be
+/// drawn over the top of one by having been given a plain scrim.
+fn scrim() -> Div {
+    div().absolute().inset_0().occlude()
+}
+
 /// A press that stops here. What every card's body hands its scrim: the scrim
 /// closes the card on a press, and the card is painted after it, so this listener
 /// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
@@ -618,8 +632,11 @@ impl RowItem {
     /// the item will do to the timeline, so nothing here is a surprise.
     fn hint(self) -> &'static str {
         match self {
-            Self::Add => "inserts the whole file",
-            Self::Remove => "only if nothing plays it",
+            // Short enough to sit beside its label inside `MENU_W`, the clip
+            // menu's rule for a refusal: this column truncates, and a hint cut
+            // off mid-word says less than a shorter one.
+            Self::Add => "the whole file",
+            Self::Remove => "nothing plays it",
             Self::Reveal => "file manager",
             Self::Properties => "…",
         }
@@ -1703,29 +1720,76 @@ impl Player {
     ///
     /// The player's half of [`enable`]: it reads the state, the table decides.
     fn enable(&self, action: ActionId, on: Option<(Lane, usize)>) -> Enable {
+        enable(action, self.ctx(on))
+    }
+
+    /// The state every one of those questions is asked against, read off the
+    /// player once: [`menu_items`] filters a whole menu with it, so the rows a
+    /// menu draws and the answers it dims them by come from the same reading.
+    fn ctx(&self, on: Option<(Lane, usize)>) -> Ctx {
         let Some(session) = &self.session else {
-            return enable(action, Ctx::default());
+            return Ctx::default();
         };
         let clip = on
             .or(self.selected)
             .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
-        enable(
-            action,
-            Ctx {
-                clip,
-                image: clip.is_some_and(|(clip, _)| {
-                    session
-                        .sources()
-                        .get(clip.source)
-                        .is_some_and(|s| engine::is_image(&s.path))
-                }),
-                playhead: frame_at(session.now(), self.fps),
-                timeline: true,
-                clipboard: self.clipboard.is_some(),
-                subtitles: !session.subtitles().is_empty(),
-                exporting: self.exporting().is_some(),
-            },
-        )
+        Ctx {
+            clip,
+            image: clip.is_some_and(|(clip, _)| {
+                session
+                    .sources()
+                    .get(clip.source)
+                    .is_some_and(|s| engine::is_image(&s.path))
+            }),
+            playhead: frame_at(session.now(), self.fps),
+            timeline: true,
+            clipboard: self.clipboard.is_some(),
+            subtitles: !session.subtitles().is_empty(),
+            exporting: self.exporting().is_some(),
+        }
+    }
+
+    /// The same reading for a library row: whether this file can join this
+    /// timeline -- the very answer the list greys the row by, so the menu over a
+    /// row and the row under it cannot disagree -- and how many clips play it.
+    /// [`Player::ctx`] for the other panel.
+    fn row_ctx(&self, path: &Path, stream: usize) -> RowCtx {
+        let placed = self.session.as_ref().map_or(0, |session| {
+            let of_row = session
+                .sources()
+                .iter()
+                .position(|s| s.path == path && s.audio_stream == stream);
+            of_row.map_or(0, |idx| {
+                session
+                    .lanes()
+                    .into_iter()
+                    .flat_map(|lane| session.lane_clips(lane))
+                    .filter(|c| c.source == idx)
+                    .count()
+            })
+        });
+        let sources = self
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        RowCtx {
+            timeline: self.session.is_some(),
+            exporting: self.exporting().is_some(),
+            usable: library_rows(
+                sources,
+                &self.streams,
+                &self.decoders,
+                self.timeline_audio(),
+                |path| {
+                    self.session
+                        .as_ref()
+                        .map_or(0, |session| session.file_frames(path))
+                },
+            )
+            .iter()
+            .any(|row| row.path == path && row.stream == stream && row.unusable.is_none()),
+            placed,
+        }
     }
 
     /// The one place a clip becomes *the* selected one: a click, a right-click
@@ -2704,6 +2768,17 @@ impl Player {
     /// Whether a card owns the window. While one does the timeline under it is
     /// out of reach, so a right-click there opens no menu -- the same rule the
     /// key handler and the drop target already follow.
+    /// Whether anything at all is drawn over the window -- a card, a menu or an
+    /// open list. What the hover labels stand aside for ([`OVERLAID`]): a
+    /// tooltip belongs to the surface the pointer is on, and while one of these
+    /// is up that surface is behind it.
+    fn overlaid(&self) -> bool {
+        self.modal()
+            || self.context_menu.is_some()
+            || self.library_menu.is_some()
+            || self.picker.is_some()
+    }
+
     fn modal(&self) -> bool {
         self.keys_open
             || self.export_open
@@ -4801,6 +4876,9 @@ impl Render for Player {
             session.tick();
         }
         self.pump(window);
+        // What every hover label asks before it paints: a card or a menu is
+        // drawn over whatever the pointer is resting on.
+        OVERLAID.store(self.overlaid(), Ordering::Relaxed);
         // A cleared seek is a frame delivered, which is the one readiness signal
         // there is: whatever a slider drag held back is written here.
         if self.seek_since.is_none() {
@@ -7004,6 +7082,12 @@ impl Player {
                                 .flex()
                                 .min_h(px(KEYS_ROW_H))
                                 .items_center()
+                                // One line, cut where the stroke's column
+                                // starts: a label longer than the room it has
+                                // printed straight over the stroke beside it,
+                                // and two overprinted words are less readable
+                                // than one truncated one.
+                                .truncate()
                                 .child(action.label())
                                 // The reason rides on the label rather than in
                                 // the stroke column, which the rebind half
@@ -7068,9 +7152,7 @@ impl Player {
             });
         }
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -7147,6 +7229,15 @@ impl Player {
                                 .flex_col()
                                 .gap(px(2.))
                                 .max_h(px(KEYS_ROWS_H))
+                                // The line the list scrolls under: a row half
+                                // out of the viewport sat against the search
+                                // line with nothing between them, and read as a
+                                // row painted over the heading rather than as a
+                                // list with more above it.
+                                .mt(px(4.))
+                                .border_t_1()
+                                .border_color(rgb(CHROME))
+                                .pt(px(4.))
                                 .overflow_y_scroll()
                                 // The wheel's offset and the arrow keys' are
                                 // the same one, so the two cannot disagree
@@ -7578,9 +7669,7 @@ impl Player {
             None => "Export".into(),
         };
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -7881,9 +7970,7 @@ impl Player {
         // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
         // already say what the box is worth per pixel.
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -8208,9 +8295,7 @@ impl Player {
             })
             .collect();
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -8326,9 +8411,7 @@ impl Player {
             })
             .collect();
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -8525,9 +8608,7 @@ impl Player {
             })
             .collect();
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_center()
@@ -8740,9 +8821,7 @@ impl Player {
                 .child(text)
         };
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .flex()
                 .justify_center()
                 .items_start()
@@ -8832,6 +8911,8 @@ impl Player {
                 .rounded(px(3.))
         };
         let mut rows: Vec<AnyElement> = Vec::new();
+        // What every item of this menu is answered from, read once.
+        let ctx = self.row_ctx(&path, menu.stream);
         if menu.details {
             // What the library knows about this row and nothing probed for the
             // card: the streams table is filled once per file at import.
@@ -8846,20 +8927,7 @@ impl Player {
             // How many clips play from this exact row -- the number that
             // decides whether Remove is refused, so the card answers the
             // question the refusal would otherwise raise.
-            let placed = self.session.as_ref().map_or(0, |session| {
-                let of_row = session
-                    .sources()
-                    .iter()
-                    .position(|s| s.path == path && s.audio_stream == menu.stream);
-                of_row.map_or(0, |idx| {
-                    session
-                        .lanes()
-                        .into_iter()
-                        .flat_map(|lane| session.lane_clips(lane))
-                        .filter(|c| c.source == idx)
-                        .count()
-                })
-            });
+            let placed = ctx.placed;
             // A still is described by what it has -- a picture, a size, and a
             // longest it may be held for -- where a media file is described by
             // its streams and its length. Same card, the rows that mean
@@ -8903,19 +8971,23 @@ impl Player {
                 );
             }
         } else {
-            // Everything but Add works without a timeline open -- and with no
-            // timeline there are no rows to right-click at all, so this is the
-            // export guard's shape and not a second policy.
-            let live = self.session.is_some() && self.exporting().is_none();
-            for item in ROW_ITEMS {
-                let enabled = match item {
-                    RowItem::Add | RowItem::Remove => live,
-                    RowItem::Reveal | RowItem::Properties => true,
-                };
+            // The oracle's list, exactly as the clip menu takes its rows from
+            // `menu_items`: an item that means nothing for the file that was
+            // right-clicked is not a row, and one this moment refuses is drawn
+            // dimmed and says why in place of its hint.
+            for item in row_items(ctx) {
+                let refusal = row_enable(item, ctx);
+                let enabled = refusal.yes();
                 rows.push(
                     row(rows.len())
                         .child(item.label())
-                        .child(div().text_color(rgb(INK_DIM)).child(item.hint()))
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(rgb(INK_DIM))
+                                .child(refusal.why().unwrap_or_else(|| item.hint())),
+                        )
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
@@ -8928,16 +9000,13 @@ impl Player {
                 );
             }
         }
-        let (x, y) = menu_at(
-            menu.at,
-            viewport,
-            MENU_PAD * 2. + rows.len() as f32 * MENU_ROW_H,
-        );
+        // Placed by the height it is drawn to, and drawn to what the window has
+        // room for -- the clip menu's rule, one function for all three.
+        let list_h = menu_rows_h(rows.len(), viewport);
+        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -8978,7 +9047,18 @@ impl Player {
                         .when(menu.details, |d| {
                             d.tooltip(move |_, cx| cx.new(|_| Tip(full.clone())).into())
                         })
-                        .children(rows),
+                        // Scrolls where the window has no room for the list,
+                        // like the clip menu's -- an item hanging off the bottom
+                        // edge is an item nobody can click.
+                        .child(
+                            div()
+                                .id("library-menu-rows")
+                                .flex()
+                                .flex_col()
+                                .max_h(px(list_h))
+                                .overflow_y_scroll()
+                                .children(rows),
+                        ),
                 ),
         )
     }
@@ -9053,20 +9133,19 @@ impl Player {
                 );
             }
         } else {
-            for action in MENU_ITEMS {
+            // A grade on a waveform, an equalizer on a picture, a silence scan
+            // on a still: things that do not exist for what was right-clicked,
+            // so the menu is the list of what this clip can do rather than the
+            // registry with most of it struck through. One filter, in
+            // `menu_items`, so there is no second answer to keep in step. The
+            // state refusals below stay, dimmed and saying why -- the next
+            // click of the playhead lights them.
+            let ctx = self.ctx(Some((menu.lane, menu.idx)));
+            for action in menu_items(ctx) {
                 // The registry's own answer, the same one the actions card
                 // dims a row with -- and a row that takes no click says *why*
                 // rather than printing a stroke that would do nothing.
-                let refusal = self.enable(action, Some((menu.lane, menu.idx)));
-                // A grade on a waveform, an equalizer on a picture, a silence
-                // scan on a still: things that do not exist for what was
-                // right-clicked, so the menu is the list of what this clip can
-                // do rather than the registry with most of it struck through.
-                // The state refusals below stay, dimmed and saying why -- the
-                // next click of the playhead lights them.
-                if !refusal.listed() {
-                    continue;
-                }
+                let refusal = enable(action, ctx);
                 let enabled = refusal.yes();
                 // The one item that is not about this clip says so, and says it
                 // here rather than in the registry: the stroke is global too,
@@ -9137,19 +9216,14 @@ impl Player {
                     .into_any_element(),
             );
         }
-        let (x, y) = menu_at(
-            menu.at,
-            viewport,
-            // The cap once the list is longer than it: past that the list
-            // scrolls and the card stops growing, exactly as the keybindings and
-            // export lists do.
-            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
-        );
+        // The height the card is *placed* by and the height its list is drawn
+        // to are one number: placed by a taller one, the card would hang off the
+        // window's floor -- the very thing the clamp is for.
+        let list_h = menu_rows_h(rows.len(), viewport);
+        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source.path.display().to_string().into();
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 // Click away closes it, either button, and the press is
                 // swallowed so nothing under the menu also takes it. No tint,
                 // unlike the modal cards: the timeline this menu is about has
@@ -9206,7 +9280,7 @@ impl Player {
                                 .id("menu-rows")
                                 .flex()
                                 .flex_col()
-                                .max_h(px(MENU_ROWS_H))
+                                .max_h(px(list_h))
                                 .overflow_y_scroll()
                                 .children(rows),
                         ),
@@ -9282,17 +9356,12 @@ impl Player {
                     .into_any_element()
             })
             .collect();
-        let (x, y) = menu_at(
-            picker.at,
-            viewport,
-            // Past the cap the list scrolls and the card stops growing, exactly
-            // as the menus and the export list do.
-            MENU_PAD * 2. + (rows.len() as f32 * MENU_ROW_H).min(MENU_ROWS_H),
-        );
+        // The window's own room, and the list scrolls only where the window has
+        // none -- the clip menu's rule, one function for both.
+        let list_h = menu_rows_h(rows.len(), viewport);
+        let (x, y) = menu_at(picker.at, viewport, MENU_PAD * 2. + list_h);
         Some(
-            div()
-                .absolute()
-                .inset_0()
+            scrim()
                 // Click away closes it, either button, swallowed so nothing
                 // under the list also takes the press -- the clip menu's rule.
                 .on_mouse_down(
@@ -9337,7 +9406,7 @@ impl Player {
                                 .id("picker-rows")
                                 .flex()
                                 .flex_col()
-                                .max_h(px(MENU_ROWS_H))
+                                .max_h(px(list_h))
                                 .overflow_y_scroll()
                                 .children(rows),
                         ),
@@ -10830,6 +10899,72 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // needs nothing but a timeline.
         _ => Enable::Yes,
     }
+}
+
+/// The rows a clip menu draws, for the clip it was opened on: the registry
+/// filtered by the one availability oracle, and the *only* way that menu is
+/// built. An action that means nothing for what was right-clicked -- a grade on
+/// a waveform, an equalizer on a picture -- is not a row at all, so a future
+/// action cannot appear where it does not apply by being added to
+/// [`MENU_ITEMS`] alone.
+fn menu_items(ctx: Ctx) -> Vec<ActionId> {
+    MENU_ITEMS
+        .into_iter()
+        .filter(|&action| enable(action, ctx).listed())
+        .collect()
+}
+
+/// What a library row's items are asked *about*: the file that was
+/// right-clicked and the little of the editor's state the answers need. The
+/// library's [`Ctx`], handed in for the same reason.
+#[derive(Clone, Copy, Default)]
+struct RowCtx {
+    /// A timeline to put it on.
+    timeline: bool,
+    exporting: bool,
+    /// This row can join *this* timeline: what greys it in the list, and what
+    /// the engine would otherwise refuse the Add with after the click.
+    usable: bool,
+    /// How many clips play this exact row -- a source with any is one the
+    /// engine will not take out of the list.
+    placed: usize,
+}
+
+/// Whether a library row's item can be asked for. The library's half of
+/// [`enable`], and the same rule: one table, no second policy in the render.
+fn row_enable(item: RowItem, ctx: RowCtx) -> Enable {
+    match item {
+        // The two that change the timeline, so an export reading it stops them
+        // both -- the key handler's rule, applied to a menu.
+        RowItem::Add | RowItem::Remove if ctx.exporting => Enable::No("an export is running"),
+        RowItem::Add | RowItem::Remove if !ctx.timeline => Enable::No("no timeline open"),
+        // Dimmed and saying why rather than clicked and refused afterwards: the
+        // row's own grey already says the file cannot join this timeline.
+        RowItem::Add if !ctx.usable => Enable::No("it cannot join this one"),
+        RowItem::Remove if ctx.placed > 0 => Enable::No("clips play it"),
+        // Neither of these touches the timeline: a file can be found on disk and
+        // described whatever the editor is doing, with no timeline at all.
+        _ => Enable::Yes,
+    }
+}
+
+/// The rows a library menu draws, for the row it was opened on -- the clip
+/// menu's [`menu_items`] on the other panel, and the only way that menu is
+/// built.
+fn row_items(ctx: RowCtx) -> Vec<RowItem> {
+    ROW_ITEMS
+        .into_iter()
+        .filter(|&item| row_enable(item, ctx).listed())
+        .collect()
+}
+
+/// How tall a menu's list may draw: the whole of it where the window has room,
+/// and what the window has where it has not -- only then does the list scroll.
+/// A cap fixed at twelve rows put the last items behind a scroll on a window
+/// with room to spare, which reads as a menu cut off by the bottom edge.
+fn menu_rows_h(rows: usize, viewport: Size<Pixels>) -> f32 {
+    let room = f32::from(viewport.height) - MENU_PAD * 2.;
+    (rows as f32 * MENU_ROW_H).min(room.max(MENU_ROW_H))
 }
 
 /// Where the menu actually hangs: at the pointer, pulled back inside the window
@@ -12612,6 +12747,19 @@ fn separator() -> impl IntoElement {
         .bg(rgb(HOVER))
 }
 
+/// Whether a card or a menu is drawn over the window, as the hover labels see
+/// it: written once a frame by [`Player::render`], read by every [`Tip`] before
+/// it paints.
+///
+/// A tooltip already on screen when an overlay opens *stays* on screen in gpui:
+/// occluding the surface under it does not take it back, because the check that
+/// keeps it visible works off the element's absolute bounds and knows nothing
+/// about what was painted over it (`div.rs::handle_tooltip_mouse_move`, its own
+/// TODO). So the tip is what has to stand aside -- here, once, for every hover
+/// label in this window, rather than at fifteen call sites of which the
+/// sixteenth would be forgotten.
+static OVERLAID: AtomicBool = AtomicBool::new(false);
+
 /// A tooltip is a view in gpui and nothing smaller, so this is the smallest one
 /// that carries a line of text. It paints outside the window's element tree and
 /// therefore owns its colours.
@@ -12619,6 +12767,12 @@ struct Tip(SharedString);
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // A card or a menu is up: nothing. A line of text over the items of the
+        // menu that just opened under the pointer is the card being painted
+        // over by the window it covers.
+        if OVERLAID.load(Ordering::Relaxed) {
+            return div();
+        }
         div()
             .px(px(6.))
             .py(px(3.))
@@ -13378,7 +13532,7 @@ mod tests {
         Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
         INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
         LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
-        MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MENU_ROWS_H, MENU_W, NO_FILE, NumberEdit, PANEL_H,
+        MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
         Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
         Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
@@ -13389,8 +13543,8 @@ mod tests {
         format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
         frame_rate_ladder, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
-        marked, menu_at, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
-        retarget, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
+        marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
+        retarget, row_enable, row_items, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
         source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
         typed, unseen_paths, unseen_sources,
         whole_take, window_title,
@@ -13954,19 +14108,176 @@ mod tests {
             assert_ne!(keymap.display(action), "unbound", "{action:?}");
         }
         // ...and the whole card still fits the 640x360 floor, however many items
-        // it grows to: the list is what scrolls past the cap, never the card.
+        // it grows to: the list is what scrolls where the window is too short
+        // for it, never the card that grows.
         let items = MENU_ITEMS.len() + 1; // Properties
-        assert!(MENU_PAD * 2. + MENU_ROWS_H <= 360., "menu too tall");
+        let floor = size(px(640.), px(360.));
+        assert!(MENU_PAD * 2. + menu_rows_h(items, floor) <= 360., "too tall");
         assert!(
-            MENU_ROWS_H / MENU_ROW_H >= 12.,
-            "too few items visible to scan"
+            menu_rows_h(items, floor) / MENU_ROW_H >= 12.,
+            "too few items visible to scan on the smallest window"
         );
         assert_eq!(
-            menu_at(point(px(0.), px(0.)), size(px(640.), px(360.)), {
-                MENU_PAD * 2. + (items as f32 * MENU_ROW_H).min(MENU_ROWS_H)
+            menu_at(point(px(0.), px(0.)), floor, {
+                MENU_PAD * 2. + menu_rows_h(items, floor)
             }),
             (0., 0.)
         );
+    }
+
+    /// Both menus, at the two things they can be opened on, and the box each
+    /// one is drawn in. Two rules, and the render obeys them by *calling* what
+    /// this calls -- [`menu_items`] and [`row_items`] are the only lists either
+    /// menu is built from, and [`menu_rows_h`] is the height each is both placed
+    /// by and drawn to:
+    ///
+    /// 1. a row exists only where the oracle lists the action for the very thing
+    ///    that was right-clicked, so an item can never offer a video action on a
+    ///    waveform (the complaint this comes from) and a new action added to
+    ///    `MENU_ITEMS` cannot appear where it does not apply;
+    /// 2. the whole card is inside the window, wherever it was opened and
+    ///    however long the list -- a menu drawn past the bottom edge is a menu
+    ///    whose last items nobody can click.
+    #[test]
+    fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
+        use keymap::ActionId;
+        let clip = Clip {
+            start: 30,
+            in_frame: 0,
+            out_frame: 60,
+            source: 0,
+            link: Some(1),
+            eq: None,
+            color: None,
+            fit: FitPolicy::default(),
+            speed: Speed::NORMAL,
+        };
+        let ctx = |lane, image| Ctx {
+            clip: Some((clip, lane)),
+            image,
+            playhead: 60,
+            timeline: true,
+            ..Ctx::default()
+        };
+        // The oracle is the whole of what the menu draws: every item it lists is
+        // one the oracle would list, and every item it leaves out is one the
+        // oracle hides -- there is no third answer, and no hand-written list.
+        for (lane, image) in [(Lane::V1, false), (Lane::A1, false), (Lane::V1, true)] {
+            let ctx = ctx(lane, image);
+            let rows = menu_items(ctx);
+            for action in MENU_ITEMS {
+                assert_eq!(
+                    rows.contains(&action),
+                    enable(action, ctx).listed(),
+                    "{action:?} on {lane:?}, image={image}"
+                );
+            }
+        }
+        // Sound has no picture settings; picture has no equalizer of its own; a
+        // still has no sound to scan. The user's own words: an audio clip must
+        // not be offered what only a picture can be given.
+        let sound = menu_items(ctx(Lane::A1, false));
+        assert!(!sound.contains(&ActionId::Color), "{sound:?}");
+        assert!(!sound.contains(&ActionId::Fit), "{sound:?}");
+        assert!(sound.contains(&ActionId::Equalizer));
+        let picture = menu_items(ctx(Lane::V1, false));
+        assert!(!picture.contains(&ActionId::Equalizer), "{picture:?}");
+        assert!(picture.contains(&ActionId::Color));
+        assert!(!menu_items(ctx(Lane::V1, true)).contains(&ActionId::Silence));
+        // The library menu is the same rule on the other panel: its items come
+        // off `row_items` and nothing else, and the two that change the timeline
+        // say why rather than being clicked and refused afterwards.
+        let live = RowCtx {
+            timeline: true,
+            usable: true,
+            ..RowCtx::default()
+        };
+        for ctx in [
+            live,
+            RowCtx {
+                usable: false,
+                ..live
+            },
+            RowCtx { placed: 2, ..live },
+            RowCtx {
+                exporting: true,
+                ..live
+            },
+            RowCtx::default(),
+        ] {
+            let rows = row_items(ctx);
+            for item in ROW_ITEMS {
+                assert_eq!(rows.contains(&item), row_enable(item, ctx).listed());
+            }
+            // Whatever the state, the two that need neither timeline nor edit
+            // list are offered: a file is always describable and findable.
+            assert!(row_enable(RowItem::Reveal, ctx).yes());
+            assert!(row_enable(RowItem::Properties, ctx).yes());
+        }
+        assert!(row_enable(RowItem::Add, live).yes());
+        assert!(
+            !row_enable(
+                RowItem::Add,
+                RowCtx {
+                    usable: false,
+                    ..live
+                }
+            )
+            .yes(),
+            "a file that cannot join this timeline is not an Add anybody can ask for"
+        );
+        assert!(!row_enable(RowItem::Remove, RowCtx { placed: 1, ..live }).yes());
+        assert!(!row_enable(RowItem::Add, RowCtx::default()).yes());
+        // Every refusal is short enough to sit in the hint column beside its
+        // label, the clip menu's rule.
+        for item in ROW_ITEMS {
+            for ctx in [live, RowCtx::default()] {
+                if let Some(why) = row_enable(item, ctx).why() {
+                    assert!(!why.is_empty() && why.len() <= 30, "{why:?}");
+                }
+            }
+        }
+        // ...and the box. Every window from the floor up, every corner of it,
+        // and every list length either menu can have: the card is placed by
+        // `MENU_PAD * 2 + menu_rows_h` and drawn to it, so this is the card.
+        for viewport in [
+            size(px(640.), px(360.)),
+            size(px(800.), px(600.)),
+            size(px(1280.), px(690.)),
+            // Smaller than the floor the layout is sized for: it still may not
+            // draw outside the window it has.
+            size(px(320.), px(200.)),
+        ] {
+            for rows in 1..=MENU_ITEMS.len() + 1 {
+                let h = MENU_PAD * 2. + menu_rows_h(rows, viewport);
+                for at in [
+                    point(px(0.), px(0.)),
+                    point(px(10.), px(10.)),
+                    // The click that started all this: low in the window, where
+                    // the menu used to hang off the bottom edge.
+                    point(px(0.), viewport.height - px(4.)),
+                    point(viewport.width - px(4.), viewport.height - px(4.)),
+                    point(viewport.width * 2., viewport.height * 2.),
+                ] {
+                    let (x, y) = menu_at(at, viewport, h);
+                    assert!(x >= 0. && y >= 0., "{x},{y} outside {viewport:?}");
+                    assert!(
+                        x + MENU_W <= f32::from(viewport.width) + 0.01,
+                        "{rows} rows at {at:?} hang off the right of {viewport:?}"
+                    );
+                    assert!(
+                        y + h <= f32::from(viewport.height) + 0.01,
+                        "{rows} rows at {at:?} hang off the bottom of {viewport:?}"
+                    );
+                }
+            }
+        }
+        // On any window with the room, the whole list is drawn rather than
+        // twelve rows of it and a scroll nobody is told about.
+        let items = MENU_ITEMS.len() + 1;
+        let real = size(px(1280.), px(690.));
+        assert_eq!(menu_rows_h(items, real), items as f32 * MENU_ROW_H);
+        assert!(menu_rows_h(items, size(px(640.), px(360.))) < items as f32 * MENU_ROW_H);
     }
 
     /// The other half of the keys menu's guarantee, and the audit this batch was
@@ -15605,8 +15916,10 @@ mod tests {
         let search = 15.; // 11 px text, one line: it never wraps
         let gaps = 4. * 2.;
         let padding = 24.;
+        // The line the list scrolls under: margin, rule, padding.
+        let separator = 4. + 1. + 4.;
         assert!(
-            title + status + search + KEYS_ROWS_H + gaps + padding <= 360.,
+            title + status + search + separator + KEYS_ROWS_H + gaps + padding <= 360.,
             "card too tall"
         );
         // ...and the list is the only part that grows with the editor, so the

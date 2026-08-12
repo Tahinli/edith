@@ -125,7 +125,10 @@ impl ActionId {
             ActionId::Paste => "Paste",
             ActionId::Cut => "Cut",
             ActionId::Regroup => "Regroup",
-            ActionId::Detach => "Detach the sound from the picture",
+            // Neither half's action: it takes the *pair* apart, and the menu
+            // that offers it hangs on whichever half was right-clicked -- worded
+            // from the picture's side it read as a video item on an audio clip.
+            ActionId::Detach => "Ungroup the picture and the sound",
             ActionId::Group => "Group with the clip on another track",
             ActionId::Select => "Select the clip under the playhead (again for the next lane)",
             ActionId::SelectNext => "Select the next clip in the lane",
