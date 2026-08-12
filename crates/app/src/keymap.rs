@@ -36,10 +36,31 @@ use std::path::{Path, PathBuf};
 /// First line, exactly. The version is part of it, as in the project file.
 const MAGIC: &str = "edith-keys 1";
 
-/// Everything a stroke can ask for. Not the mouse's actions: only what a key
-/// can reach is bindable.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ActionId {
+/// The action list, written once: the enum and the display-order array come out
+/// of the same names, so an action added here is in [`ActionId::ALL`] by
+/// construction. It used to be two lists, and a variant added to one of them
+/// compiled, passed every test, and was simply missing from the keys card --
+/// the pointer-unreachable action this editor opened with.
+macro_rules! actions {
+    ($($(#[$note:meta])* $variant:ident),+ $(,)?) => {
+        /// Everything a stroke can ask for. Not the mouse's actions: only what a
+        /// key can reach is bindable.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum ActionId {
+            $($(#[$note])* $variant,)+
+        }
+
+        impl ActionId {
+            /// Display order everywhere -- the editor lists them in it and
+            /// [`Keymap::defaults`] binds them in it. Derived from the list
+            /// above, so there is no second place to forget.
+            pub const ALL: [ActionId; [$(stringify!($variant)),+].len()] =
+                [$(ActionId::$variant),+];
+        }
+    };
+}
+
+actions! {
     Play,
     StepBack,
     StepForward,
@@ -88,53 +109,6 @@ pub enum ActionId {
 }
 
 impl ActionId {
-    /// Display order everywhere -- the editor lists them in it and
-    /// [`Keymap::defaults`] binds them in it.
-    pub const ALL: [ActionId; 42] = [
-        ActionId::Play,
-        ActionId::StepBack,
-        ActionId::StepForward,
-        ActionId::JumpBack,
-        ActionId::JumpForward,
-        ActionId::GoStart,
-        ActionId::GoEnd,
-        ActionId::Export,
-        ActionId::Save,
-        ActionId::Copy,
-        ActionId::Paste,
-        ActionId::Cut,
-        ActionId::Regroup,
-        ActionId::Detach,
-        ActionId::Group,
-        ActionId::Select,
-        ActionId::SelectNext,
-        ActionId::SelectPrev,
-        ActionId::Delete,
-        ActionId::Lift,
-        ActionId::Color,
-        ActionId::Fit,
-        ActionId::Resolution,
-        ActionId::ZoomIn,
-        ActionId::ZoomOut,
-        ActionId::ZoomFit,
-        ActionId::Undo,
-        ActionId::AddVideoLane,
-        ActionId::AddAudioLane,
-        ActionId::RemoveVideoLane,
-        ActionId::RemoveAudioLane,
-        ActionId::ToggleMute,
-        ActionId::VolumeUp,
-        ActionId::VolumeDown,
-        ActionId::Equalizer,
-        ActionId::Speed,
-        ActionId::Silence,
-        ActionId::Mix,
-        ActionId::ToggleSnap,
-        ActionId::ToggleSubtitles,
-        ActionId::CancelExport,
-        ActionId::ShowActions,
-    ];
-
     /// What a person calls it.
     pub fn label(self) -> &'static str {
         match self {
@@ -347,171 +321,234 @@ impl Category {
 /// and fails on any key that reaches neither this table nor a binding.
 pub struct Fixed {
     /// As a person reads it, which for a single key is [`Chord::pretty`]'s
-    /// spelling and for a family of keys is the family (`0–9`).
-    pub chord: &'static str,
+    /// spelling and for a family of keys is the family (`0–9`). A `String`
+    /// because one of them is generated: the codec row's keys are the export
+    /// card's own table, not a line typed a second time here.
+    pub chord: String,
     pub label: &'static str,
     pub category: Category,
+    /// What a hand with only a mouse does instead. Every stroke here is
+    /// card-local, and a card whose rows only a keyboard can reach is half this
+    /// editor's users locked out of it, so each row names the thing on its card
+    /// -- `every_action_is_reachable_without_the_keyboard` looks each id up in
+    /// the render's own source.
+    pub reach: Reach,
 }
 
-pub const FIXED: [Fixed; 28] = [
-    // Not a chord at all but a way of pressing one, and the only place the
-    // editor can say so: holding a key that moves a *value* runs it, and
-    // holding anything else still does what one press did.
-    Fixed {
-        chord: "hold ← → ↑ ↓",
-        label: "Run a card's slider, or the volume and zoom keys, while held",
-        category: Category::View,
-    },
-    Fixed {
-        chord: "esc",
-        label: "Close this card or menu, or cancel a capture",
-        category: Category::View,
-    },
-    Fixed {
-        chord: "n",
-        label: "Open the custom export bitrate field — ↑↓ step it",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "0–9",
-        label: "Type into that field — nothing outside it",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "m / a / h / w / f / p",
-        label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC, MP3 or OGG",
-        category: Category::File,
-    },
-    // The rest of the export card's own rows, each on the letter its row is
-    // named after. They shadow the clip keys of the same letter while the card
-    // is up, exactly as its digits shadow nothing and its arrows would: a modal
-    // card owns the keyboard, and cutting a clip under it is not a thing that
-    // can happen anyway.
-    Fixed {
-        chord: "c",
-        label: "Switch the export container: Matroska or MP4",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "q",
-        label: "Step through the export quality rows",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "b",
-        label: "Step through the export sound bitrates",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "d",
-        label: "Choose where the export is written",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "g",
-        label: "Export card: sections or one flat list",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "r",
-        label: "Export card: the formats with no encoder as rows or as one line",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "enter",
-        label: "Start the export — or commit the bitrate field",
-        category: Category::File,
-    },
-    Fixed {
-        chord: "backspace",
-        label: "Erase a digit in the bitrate field",
-        category: Category::File,
-    },
-    // The equalizer card's own input, for the same reason the export card has
-    // its own: a band nothing but a drag can reach is a band half the users of
-    // this editor cannot move at all. Card-local, so none of them is bindable.
-    Fixed {
-        chord: "1–9, 0",
-        label: "Pick an equalizer band",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "up",
-        label: "Raise the picked band 1 dB",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "down",
-        label: "Lower the picked band 1 dB",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "← / →",
-        label: "Move the picked band down or up in frequency",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "shift ← / →",
-        label: "Widen or narrow the picked band (its Q)",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "a",
-        label: "Add an equalizer band beside the picked one",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "x",
-        label: "Remove the picked equalizer band",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "f",
-        label: "Flatten the picked band (double-click does the same)",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "r",
-        label: "Flatten every band",
-        category: Category::Audio,
-    },
-    Fixed {
-        chord: "s",
-        label: "Show or hide the spectrum behind the curve",
-        category: Category::Audio,
-    },
-    // The colour card's own three, which mean nothing outside it -- the same
-    // card-local input the export card's digits are.
-    Fixed {
-        chord: "↑ / ↓",
-        label: "Pick a colour slider",
-        category: Category::Clips,
-    },
-    Fixed {
-        chord: "← / →",
-        label: "Move the picked colour slider",
-        category: Category::Clips,
-    },
-    Fixed {
-        chord: "r",
-        label: "Take the colour grade off the clip",
-        category: Category::Clips,
-    },
-    // The silence card's two apply keys. Card-local like every stroke above --
-    // they mean nothing while it is closed -- but the card is the one place in
-    // this editor where a key rewrites forty places at once, so both of them
-    // are listed rather than hidden in the card's own hint line.
-    Fixed {
-        chord: "enter",
-        label: "Cut every silence the card found",
-        category: Category::Clips,
-    },
-    Fixed {
-        chord: "f",
-        label: "Speed the silences up instead of cutting them",
-        category: Category::Clips,
-    },
-];
+/// The pointer's answer to a fixed stroke.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// The id of the element on the card that does the same thing by click or
+    /// by drag.
+    Click(&'static str),
+    /// Not an action a pointer takes: the way *out* of a card, and the hold
+    /// that only repeats what a drag already does continuously. A variant
+    /// rather than an omission, so a row with nothing to click is a decision
+    /// somebody wrote down instead of a line missing from a list.
+    Gesture,
+}
+
+/// The codec row's keys, from the export card's own table. Typed out here once,
+/// it named six of the seven codecs the same row's label advertised -- OGG had
+/// a key (`o`) that this card never said.
+fn codec_chord() -> String {
+    crate::FORMATS
+        .iter()
+        .map(|(_, stroke, ..)| *stroke)
+        .filter(|stroke| !stroke.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+pub static FIXED: std::sync::LazyLock<[Fixed; 28]> = std::sync::LazyLock::new(|| {
+    [
+        // Not a chord at all but a way of pressing one, and the only place the
+        // editor can say so: holding a key that moves a *value* runs it, and
+        // holding anything else still does what one press did.
+        Fixed {
+            chord: "hold ← → ↑ ↓".into(),
+            label: "Run a card's slider, or the volume and zoom keys, while held",
+            category: Category::View,
+            reach: Reach::Gesture,
+        },
+        Fixed {
+            chord: "esc".into(),
+            label: "Close this card or menu, or cancel a capture",
+            category: Category::View,
+            reach: Reach::Gesture,
+        },
+        Fixed {
+            chord: "n".into(),
+            label: "Open the custom export bitrate field — ↑↓ step it",
+            category: Category::File,
+            reach: Reach::Click("quality"),
+        },
+        Fixed {
+            chord: "0–9".into(),
+            label: "Type into that field — nothing outside it",
+            category: Category::File,
+            reach: Reach::Click("mbps-up"),
+        },
+        Fixed {
+            chord: codec_chord(),
+            label: "Pick the export codec: H.264, AV1, HEVC, WAV, FLAC, MP3 or OGG",
+            category: Category::File,
+            reach: Reach::Click("format"),
+        },
+        // The rest of the export card's own rows, each on the letter its row is
+        // named after. They shadow the clip keys of the same letter while the card
+        // is up, exactly as its digits shadow nothing and its arrows would: a modal
+        // card owns the keyboard, and cutting a clip under it is not a thing that
+        // can happen anyway.
+        Fixed {
+            chord: "c".into(),
+            label: "Switch the export container: Matroska or MP4",
+            category: Category::File,
+            reach: Reach::Click("container"),
+        },
+        Fixed {
+            chord: "q".into(),
+            label: "Step through the export quality rows",
+            category: Category::File,
+            reach: Reach::Click("quality"),
+        },
+        Fixed {
+            chord: "b".into(),
+            label: "Step through the export sound bitrates",
+            category: Category::File,
+            reach: Reach::Click("sound"),
+        },
+        Fixed {
+            chord: "d".into(),
+            label: "Choose where the export is written",
+            category: Category::File,
+            reach: Reach::Click("destination"),
+        },
+        Fixed {
+            chord: "g".into(),
+            label: "Export card: sections or one flat list",
+            category: Category::File,
+            reach: Reach::Click("export-layout"),
+        },
+        Fixed {
+            chord: "r".into(),
+            label: "Export card: the formats with no encoder as rows or as one line",
+            category: Category::File,
+            reach: Reach::Click("export-refusals"),
+        },
+        Fixed {
+            chord: "enter".into(),
+            label: "Start the export — or commit the bitrate field",
+            category: Category::File,
+            reach: Reach::Click("export-confirm"),
+        },
+        Fixed {
+            chord: "backspace".into(),
+            label: "Erase a digit in the bitrate field",
+            category: Category::File,
+            reach: Reach::Click("mbps-down"),
+        },
+        // The equalizer card's own input, for the same reason the export card has
+        // its own: a band nothing but a drag can reach is a band half the users of
+        // this editor cannot move at all. Card-local, so none of them is bindable.
+        Fixed {
+            chord: "1–9, 0".into(),
+            label: "Pick an equalizer band",
+            category: Category::Audio,
+            reach: Reach::Click("eq-graph"),
+        },
+        Fixed {
+            chord: "up".into(),
+            label: "Raise the picked band 1 dB",
+            category: Category::Audio,
+            reach: Reach::Click("eq-gain-up"),
+        },
+        Fixed {
+            chord: "down".into(),
+            label: "Lower the picked band 1 dB",
+            category: Category::Audio,
+            reach: Reach::Click("eq-gain-down"),
+        },
+        Fixed {
+            chord: "← / →".into(),
+            label: "Move the picked band down or up in frequency",
+            category: Category::Audio,
+            reach: Reach::Click("eq-freq-up"),
+        },
+        Fixed {
+            chord: "shift ← / →".into(),
+            label: "Widen or narrow the picked band (its Q)",
+            category: Category::Audio,
+            reach: Reach::Click("eq-q-wider"),
+        },
+        Fixed {
+            chord: "a".into(),
+            label: "Add an equalizer band beside the picked one",
+            category: Category::Audio,
+            reach: Reach::Click("eq-add"),
+        },
+        Fixed {
+            chord: "x".into(),
+            label: "Remove the picked equalizer band",
+            category: Category::Audio,
+            reach: Reach::Click("eq-remove"),
+        },
+        Fixed {
+            chord: "f".into(),
+            label: "Flatten the picked band (double-click does the same)",
+            category: Category::Audio,
+            reach: Reach::Click("eq-flat-band"),
+        },
+        Fixed {
+            chord: "r".into(),
+            label: "Flatten every band",
+            category: Category::Audio,
+            reach: Reach::Click("eq-reset"),
+        },
+        Fixed {
+            chord: "s".into(),
+            label: "Show or hide the spectrum behind the curve",
+            category: Category::Audio,
+            reach: Reach::Click("eq-spectrum"),
+        },
+        // The colour card's own three, which mean nothing outside it -- the same
+        // card-local input the export card's digits are.
+        Fixed {
+            chord: "↑ / ↓".into(),
+            label: "Pick a colour slider",
+            category: Category::Clips,
+            reach: Reach::Click("color-row"),
+        },
+        Fixed {
+            chord: "← / →".into(),
+            label: "Move the picked colour slider",
+            category: Category::Clips,
+            reach: Reach::Click("color-bar"),
+        },
+        Fixed {
+            chord: "r".into(),
+            label: "Take the colour grade off the clip",
+            category: Category::Clips,
+            reach: Reach::Click("color-reset"),
+        },
+        // The silence card's two apply keys. Card-local like every stroke above --
+        // they mean nothing while it is closed -- but the card is the one place in
+        // this editor where a key rewrites forty places at once, so both of them
+        // are listed rather than hidden in the card's own hint line.
+        Fixed {
+            chord: "enter".into(),
+            label: "Cut every silence the card found",
+            category: Category::Clips,
+            reach: Reach::Click("silence-apply"),
+        },
+        Fixed {
+            chord: "f".into(),
+            label: "Speed the silences up instead of cutting them",
+            category: Category::Clips,
+            reach: Reach::Click("silence-apply"),
+        },
+    ]
+});
 
 /// A stroke as the key handler sees it: gpui's key name plus the one modifier
 /// this editor binds. Nothing else is a chord here -- shift and alt are part of
@@ -1222,11 +1259,50 @@ mod tests {
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
-        assert_eq!(ActionId::ALL.len(), 42);
         assert_eq!(k.display(ActionId::ToggleSnap), "n");
         assert_eq!(k.display(ActionId::ShowActions), "f1");
         assert_eq!(k.display(ActionId::ToggleSubtitles), "t");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
+    }
+
+    /// The one row of [`FIXED`] that speaks for a whole table elsewhere: it
+    /// named six keys for seven codecs, and OGG's `o` was a stroke the card
+    /// never mentioned. The chord is generated from `FORMATS` now, and this
+    /// holds the *label* to the same table -- a codec added there with no name
+    /// in this row fails here rather than in a user's hands.
+    #[test]
+    fn the_codec_row_says_every_codec_the_export_card_offers() {
+        let row = super::FIXED
+            .iter()
+            .find(|f| f.label.starts_with("Pick the export codec"))
+            .expect("the codec row");
+        let keys: Vec<&str> = row.chord.split(" / ").collect();
+        for (boxes, stroke, label, _) in crate::FORMATS {
+            if stroke.is_empty() {
+                // A codec this program cannot write at all has no key and no
+                // business in this row.
+                assert!(boxes.is_empty(), "{label} has a box but no stroke");
+                assert!(!keys.contains(&stroke));
+                continue;
+            }
+            assert!(
+                keys.contains(&stroke),
+                "{label}'s key {stroke:?} is not in {:?}",
+                row.chord
+            );
+            assert!(
+                row.label.contains(label),
+                "{label} is not named in {:?}",
+                row.label
+            );
+        }
+        assert_eq!(
+            keys.len(),
+            crate::FORMATS
+                .iter()
+                .filter(|(_, s, ..)| !s.is_empty())
+                .count()
+        );
     }
 
     #[test]
