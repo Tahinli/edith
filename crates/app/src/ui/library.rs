@@ -212,6 +212,7 @@ impl Player {
         })
         .collect();
         div()
+            .id("library")
             .flex_none()
             .w(px(width))
             .h_full()
@@ -220,6 +221,14 @@ impl Player {
             .gap(px(6.))
             .p(px(8.))
             .bg(rgb(BG_PANEL))
+            // The column itself scrolls at a short window. Its five stacked
+            // things want 140 px and the 640x360 floor gives the region 136, so
+            // the list -- the only child that may shrink -- was being squeezed to
+            // nothing: tabs, an Import button, a way to add at the playhead, and
+            // no sight of what had been imported. Everything keeps its own size
+            // and the column carries the remainder, which is the same answer the
+            // lanes and the inspector give.
+            .overflow_y_scroll()
             .child(
                 div()
                     .flex_none()
@@ -299,7 +308,9 @@ impl Player {
                 div()
                     .id("library-rows")
                     .flex_1()
-                    .min_h(px(0.))
+                    // Never nothing: a media list with no room left is a library
+                    // column that has stopped being a library column.
+                    .min_h(px(ROW_H))
                     .flex()
                     .flex_col()
                     .gap(px(2.))
