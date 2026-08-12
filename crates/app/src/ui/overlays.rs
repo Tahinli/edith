@@ -147,6 +147,14 @@ impl Player {
                 })
                 .flex_none()
                 .flex()
+                // The hint keeps its own width, and at the 640x360 floor the
+                // picture region is narrower than the hint alone: with both on
+                // one line the message was squeezed to nothing and wrapped a
+                // character per line -- a notice rendered as a column of
+                // letters. Wrapping puts the hint on its own line instead, so
+                // the message keeps the whole width and the queue counter
+                // stays on screen under it.
+                .flex_wrap()
                 .items_start()
                 .gap(px(12.))
                 .px(px(12.))
@@ -170,7 +178,14 @@ impl Player {
                     this.dismiss_notice();
                     cx.notify();
                 }))
-                .child(div().flex_1().min_w(px(0.)).child(notice))
+                // Shrinkable, because a gpui text element measures its
+                // min-content as the *whole line* (`TextLayout::layout` only
+                // wraps against a definite width) -- without a `min_w` the
+                // message would refuse to shrink at all and run off the region
+                // instead. With a floor under it, it shrinks to that floor,
+                // which pushes the hint onto its own line and leaves the
+                // message the width it needs to wrap like a sentence.
+                .child(div().flex_1().min_w(px(NOTICE_MIN_W)).child(notice))
                 .child(
                     div()
                         .flex_none()
