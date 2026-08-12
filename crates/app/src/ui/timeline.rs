@@ -1,0 +1,1645 @@
+//! The bottom region: the ruler, the lanes and the subtitle strip.
+
+use crate::*;
+use crate::ui::widgets::*;
+
+impl Player {
+    /// Transport, edit and file buttons, timecode, playhead, clips lane.
+    pub(crate) fn panel(
+        &self,
+        position: f64,
+        duration: f64,
+        state: Transport,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Where the playhead is *on the bed*, in pixels from its left edge.
+        // Clamped to the bed because it is drawn as a width as well as an
+        // offset, and the view follows the playhead anyway, so it is never off
+        // the bed for long.
+        let bed_w = f32::from(self.ruler.get().size.width);
+        let filled = self.scale.px_at(position).clamp(0., bed_w);
+        // An export owns the hint slot and the ruler while it runs: the
+        // percentage and the accent bar are the same number, so the playhead
+        // fill doubles as the progress bar for free.
+        let exporting = self.exporting().is_some();
+        // Everything but Import and Keys needs a timeline to act on: with none
+        // open they are dimmed rather than silently doing nothing.
+        let live = state != Transport::Stopped && !exporting;
+        // The project's own picture size, for the button that cycles it: read
+        // per render like everything else here, so a cycle shows on the button
+        // that made it.
+        let resolution = self.session.as_ref().map(PlaybackSession::resolution);
+        let key = |action| self.keymap.display(action);
+        // The lanes the project has, or the pair a fresh one starts with so the
+        // panel reads the same before a file is open as after.
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or_else(|| vec![Lane::V1, Lane::A1], PlaybackSession::lanes);
+        // A loop rather than a `map`: each row takes `cx` in turn, where a
+        // closure would hold it for as long as the iterator lives.
+        let mut rows = Vec::new();
+        for &lane in &lanes {
+            rows.push(self.lane_row(lane, filled, cx));
+        }
+        // Built from the same playhead pixel the lanes are, and before the
+        // export takes `filled` over below: the strip is a picture of the
+        // timeline, not of an export's progress.
+        let strip = self.subtitle_strip(filled);
+        let strip_h = subtitle_strip_h(strip.is_some());
+        let (hint, filled) = if let Some(export) = self.exporting() {
+            let progress = export.progress();
+            let elapsed = self
+                .export_started
+                .map_or(0., |t| t.elapsed().as_secs_f32());
+            // Two numbers that must both be honest: the one that counts up is
+            // measured, the one that counts down is a guess and says so.
+            let left = eta_secs(&self.export_marks, elapsed, progress).map_or_else(
+                || "estimating…".to_owned(),
+                |s| format!("~{} left", clock(s)),
+            );
+            (
+                format!(
+                    // Clocks, then the way out, then what is encoding: at the
+                    // 640 px floor the tail is what truncation eats, and the
+                    // codec pair is the one part of this line the card already
+                    // said. The escape must not be what goes missing.
+                    "EXPORTING {}% · {} elapsed · {left} — {} cancels · {} · {}",
+                    (progress * 100.) as u32,
+                    clock(elapsed),
+                    key(ActionId::CancelExport),
+                    // The row that was picked; the engine's line below names the
+                    // seats alone, since the library is what identifies a codec.
+                    format_label(self.format),
+                    // What the worker actually opened, so a fallback to the
+                    // software encoder shows here rather than being invisible.
+                    export
+                        .encoders()
+                        .unwrap_or_else(|| "opening the encoder".to_string()),
+                ),
+                progress,
+            )
+        } else {
+            // The strokes no button carries; the rest ride on the buttons'
+            // tooltips. Keys first: at a 640 px window the tail is what a
+            // truncation eats, and the two hints at the end are also on the
+            // ruler's and Import's tooltips.
+            // While it plays, what is decoding it goes first: it is the
+            // answer that changes as the playhead crosses a cut, and the tail
+            // of this line is what a narrow window truncates.
+            (
+                join_detail(
+                    &self.live_decode(position, state.is_playing()),
+                    &format!(
+                        "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
+                         import",
+                        key(ActionId::Copy),
+                        key(ActionId::Paste),
+                        key(ActionId::Undo)
+                    ),
+                ),
+                filled,
+            )
+        };
+        div()
+            .flex_none()
+            .h(px(panel_h(lanes.len()) + strip_h))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(8.))
+            .bg(rgb(BG_PANEL))
+            // Transport | edit | file: three groups, so the eye can skip two of
+            // them. Every button says what it does; the tooltip adds its key.
+            //
+            // The row scrolls rather than losing its tail: at the 640 px floor
+            // this window is sized for it is wider than the panel, and a button
+            // off the right edge is a button a pointer cannot press. A plain
+            // wheel moves it -- gpui puts a vertical delta on the x axis when
+            // that is the only one scrolling (div.rs:2424).
+            //
+            // ...and "it scrolls" is not "it can be found": the button beside
+            // the row is pinned outside it and never scrolls away, so Export,
+            // Save and the rest are one press from the smallest window even
+            // when the row's tail is off the edge.
+            // `toolbar_fits_the_smallest_window` is the guard.
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id("controls")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .overflow_x_scroll()
+                            .child(control(
+                                "transport",
+                                Some(transport_glyph(state).into_any_element()),
+                                if state.is_playing() { "Pause" } else { "Play" },
+                                if nothing_to_play(self.session.as_ref()) && !state.is_playing() {
+                                    format!("{} — put a clip on a lane first", key(ActionId::Play))
+                                } else {
+                                    key(ActionId::Play)
+                                },
+                                // An empty timeline has nothing to play, so the button
+                                // says so by being dim rather than by starting a clock
+                                // against nothing (the key press answers with the
+                                // notice). Still live while it *is* playing: a delete
+                                // can empty the timeline mid-play and that has to stop.
+                                live && (state.is_playing() || !nothing_to_play(self.session.as_ref())),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
+                            ))
+                            .child(separator())
+                            .child(control(
+                                "cut",
+                                Some(cut_glyph().into_any_element()),
+                                "Cut",
+                                format!(
+                                    "{} — splits the clip under the playhead",
+                                    key(ActionId::Cut)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
+                            ))
+                            .child(control(
+                                "delete",
+                                Some(delete_glyph().into_any_element()),
+                                "Delete",
+                                if self.selected.is_some() {
+                                    key(ActionId::Delete)
+                                } else {
+                                    format!("{} — click a clip below first", key(ActionId::Delete))
+                                },
+                                live && self.selected.is_some(),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                            ))
+                            // The way back from every one of them. It was a stroke and
+                            // nothing else, which made the whole edit group a one-way
+                            // door for anyone working with a pointer.
+                            .child(control(
+                                "undo",
+                                None,
+                                "Undo",
+                                format!("{} — takes the last edit back", key(ActionId::Undo)),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
+                            ))
+                            // With the edit group, beside the buttons that change the
+                            // edit list: a track is a row of it, and adding one is an
+                            // undoable edit like the rest. Two buttons rather than one
+                            // with a choice, because the choice is the whole action.
+                            .child(control(
+                                "add-video-lane",
+                                None,
+                                "+ V",
+                                format!(
+                                    "{} — adds a video track under the ones there",
+                                    key(ActionId::AddVideoLane)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.add_lane(LaneKind::Video, cx)
+                                }),
+                            ))
+                            .child(control(
+                                "add-audio-lane",
+                                None,
+                                "+ A",
+                                format!(
+                                    "{} — adds an audio track under the ones there",
+                                    key(ActionId::AddAudioLane)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.add_lane(LaneKind::Audio, cx)
+                                }),
+                            ))
+                            // The third kind of track this timeline carries, and
+                            // the only one that arrived through a drop alone: a
+                            // subtitle file nobody thought to drag was a track
+                            // the editor could not be asked for. What it opens is
+                            // a chooser rather than an empty row -- a subtitle
+                            // track is its file, and there is nothing to add
+                            // before one is named.
+                            .child(control(
+                                "add-subtitle-track",
+                                None,
+                                "+ S",
+                                // Dim, and saying why it is dim, out of the one
+                                // oracle -- the very words the key answers with
+                                // (`Player::pick_and_add_subtitles`), so the
+                                // tooltip and the notice cannot come to differ.
+                                match self.enable(ActionId::AddSubtitleTrack, None).why() {
+                                    Some(why) => {
+                                        format!("{} — {why}", key(ActionId::AddSubtitleTrack))
+                                    }
+                                    None => format!(
+                                        "{} — adds every subtitle track in a file you pick",
+                                        key(ActionId::AddSubtitleTrack)
+                                    ),
+                                },
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.pick_and_add_subtitles(cx)
+                                }),
+                            ))
+                            // With the transport, not the edit group: it changes what
+                            // the file sounds like, never what it is. Reads as its own
+                            // state, so muted is legible without a tooltip.
+                            .child(control(
+                                "volume",
+                                None,
+                                self.volume.label(),
+                                format!(
+                                    "{} mutes · {} louder · {} quieter",
+                                    key(ActionId::ToggleMute),
+                                    key(ActionId::VolumeUp),
+                                    key(ActionId::VolumeDown)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                                }),
+                            ))
+                            // The level itself, to drag. The button beside it stays the
+                            // mute -- one gesture each -- and the label above is what
+                            // this writes, live, so the number follows the hand.
+                            .child(volume_slider(
+                                self.volume,
+                                self.volume_bar.clone(),
+                                live,
+                                cx,
+                            ))
+                            .child(separator())
+                            // The size every clip is composed onto, which is also the
+                            // size the export comes out at. Five sizes, so a click opens
+                            // the list of them with this one marked and picks whichever
+                            // was meant: a button that stepped one on per press made the
+                            // user click round the ladder to get back to where they
+                            // were. The stroke still steps, for the hand already on it.
+                            .child(control(
+                                "resolution",
+                                None,
+                                resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                                match resolution {
+                                    Some((w, h)) => format!(
+                                        "click to pick a size — the project is {w}x{h}; {} steps to the next",
+                                        key(ActionId::Resolution)
+                                    ),
+                                    None => format!("{} — open a file first", key(ActionId::Resolution)),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Resolution, event.position(), cx)
+                                }),
+                            ))
+                            // The rate every clip is counted in, which is also the rate
+                            // the export is written at -- the other half of "the project
+                            // is not the media", and the one the panel could only ever
+                            // read out before. A click opens the rates with this one
+                            // marked; picking one conforms the whole timeline to it.
+                            .child(control(
+                                "fps",
+                                None,
+                                match self.session.is_some() {
+                                    true => format!("{} fps", fps_label(self.fps)),
+                                    false => "Rate".to_string(),
+                                },
+                                match self.session.is_some() {
+                                    true => format!(
+                                        "click to pick a frame rate — the project is cut at {} fps",
+                                        fps_label(self.fps)
+                                    ),
+                                    false => "the project's frame rate — open a file first".to_string(),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Fps, event.position(), cx)
+                                }),
+                            ))
+                            // ...and which rendition its HDR media is watched in, the
+                            // third thing that is the project's rather than the media's.
+                            // Listed whatever is on the timeline, and the tooltip says
+                            // who it acts on: a control that came and went with the
+                            // media would be one nobody could find when they wanted it.
+                            .child(control(
+                                "tonemap",
+                                None,
+                                match &self.session {
+                                    Some(session) => format!("HDR {}", tone_label(session.tone())),
+                                    None => "HDR".to_string(),
+                                },
+                                match &self.session {
+                                    Some(session) => format!(
+                                        "click to pick the HDR rendition — the project is {}; SDR media is untouched",
+                                        tone_label(session.tone())
+                                    ),
+                                    None => "the HDR rendition — open a file first".to_string(),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Tone, event.position(), cx)
+                                }),
+                            ))
+                            // How much of the timeline the panel below is showing --
+                            // beside the resolution, since neither of them edits
+                            // anything: they are both what is being looked at. The
+                            // middle one says how much of it is on the bed, and is the
+                            // way back to the whole of it.
+                            .child(control(
+                                "zoom-out",
+                                None,
+                                "−",
+                                format!(
+                                    "{} — show more of the timeline; stops with all of it on the bed",
+                                    key(ActionId::ZoomOut)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.zoom(1. / ZOOM_STEP, None, cx)
+                                }),
+                            ))
+                            .child(control(
+                                "zoom-fit",
+                                None,
+                                // How much timeline is on the bed, not a multiple of
+                                // "the whole of it": the scale no longer knows what the
+                                // whole of it is, and a number that changed on every
+                                // import was a number that lied.
+                                span_label(self.view().span()),
+                                format!(
+                                    "{} — fit the whole timeline; showing {} to {}",
+                                    key(ActionId::ZoomFit),
+                                    timecode(self.scale.start, self.fps),
+                                    timecode(
+                                        (self.scale.start + self.view().span()).min(duration),
+                                        self.fps
+                                    )
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_fit(cx)),
+                            ))
+                            .child(control(
+                                "zoom-in",
+                                None,
+                                "+",
+                                format!(
+                                    "{} — magnify around the playhead; ctrl+wheel on the bar zooms at the pointer",
+                                    key(ActionId::ZoomIn)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
+                            ))
+                            // The magnet, beside the zoom for the zoom's own reason: it
+                            // changes nothing on the timeline, it changes how the hand
+                            // meets it. The label is the state, as the volume's is --
+                            // a toggle that looks the same either way says nothing.
+                            .child(control(
+                                "snap",
+                                None,
+                                if self.snap { "Snap" } else { "No snap" },
+                                format!(
+                                    "{} — {}",
+                                    key(ActionId::ToggleSnap),
+                                    match self.snap {
+                                        true => "drags and trims land on clip edges, the playhead and the start",
+                                        false => "drags and trims land exactly where the hand leaves them",
+                                    }
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
+                            ))
+                            // The cues over the picture, off and on -- beside the zoom
+                            // and the snap, since like both of them it changes what is
+                            // being looked at and nothing about the edit. The label is
+                            // the state, as the snap's is, and it says what there is to
+                            // toggle when there is nothing.
+                            .child(control(
+                                "subs",
+                                None,
+                                match (self.subtitle_track().is_some(), self.subs_on) {
+                                    (false, _) => "No subs",
+                                    (true, true) => "Subs",
+                                    (true, false) => "Subs off",
+                                },
+                                match self.enable(ActionId::ToggleSubtitles, None).why() {
+                                    Some(why) => format!(
+                                        "{} — {why}; drop a .srt on the window, or open an mkv that carries them",
+                                        key(ActionId::ToggleSubtitles)
+                                    ),
+                                    None => format!(
+                                        "{} — {}",
+                                        key(ActionId::ToggleSubtitles),
+                                        match self.subs_on {
+                                            true => "the cue under the playhead is drawn over the picture",
+                                            false => "the cues are on the timeline and off the picture",
+                                        }
+                                    ),
+                                },
+                                live && self.enable(ActionId::ToggleSubtitles, None).yes(),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_subtitles(cx)),
+                            ))
+                            // Import is not here: it belongs to the media list it adds
+                            // to, and two doors into one action is a question about
+                            // which one is the real one.
+                            //
+                            // While one runs, this button is the way out of it: the
+                            // progress line promised esc and nothing else, which left a
+                            // pointer no way to stop an export it had started.
+                            .child(control(
+                                "export",
+                                None,
+                                if exporting { "Cancel" } else { "Export" },
+                                if exporting {
+                                    format!(
+                                        "{} — stops the export; the part-written file goes",
+                                        key(ActionId::CancelExport)
+                                    )
+                                } else {
+                                    format!(
+                                        "{} — quality and destination, then writes the timeline out",
+                                        key(ActionId::Export)
+                                    )
+                                },
+                                if exporting {
+                                    true
+                                } else {
+                                    live && self.export.is_none()
+                                },
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if this.exporting().is_some() {
+                                        this.cancel_export();
+                                        cx.notify();
+                                    } else {
+                                        this.open_export(cx);
+                                    }
+                                }),
+                            ))
+                            .child(control(
+                                "save",
+                                None,
+                                "Save",
+                                format!("{} — writes the project file", key(ActionId::Save)),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
+                            ))
+                            // Closed while an export runs, which is what keeps a waiting
+                            // row from swallowing the escape the progress line promises
+                            // cancels the export.
+                            .child(control(
+                                "keys",
+                                None,
+                                "Actions",
+                                // The pointer's way to every action there is, including
+                                // the ones no button here has room for.
+                                format!(
+                                    "{} — do any action, or change the key that does it",
+                                    key(ActionId::ShowActions)
+                                ),
+                                !exporting,
+                                cx.listener(|this, _: &ClickEvent, _, cx| match this.keys_open {
+                                    true => {
+                                        this.keys_open = false;
+                                        this.rebinding = None;
+                                        cx.notify();
+                                    }
+                                    false => this.show_actions(cx),
+                                }),
+                            ))
+                    )
+                    // The door to everything the row cannot show at this
+                    // window: the same card the Actions button opens, by the
+                    // same call, pinned where a scroll cannot take it.
+                    .child(control(
+                        "controls-more",
+                        None,
+                        "⋯",
+                        format!(
+                            "{} — every action, including the ones scrolled off this row",
+                            key(ActionId::ShowActions)
+                        ),
+                        !exporting,
+                        cx.listener(|this, _: &ClickEvent, _, cx| match this.keys_open {
+                            true => {
+                                this.keys_open = false;
+                                this.rebinding = None;
+                                cx.notify();
+                            }
+                            false => this.show_actions(cx),
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    // Fixed width and one line: changing digits must not push
+                    // the row around, nor wrap and change its height.
+                    // The timeline's own length, never the drawn one: a tail
+                    // being dragged inflates the bed to the room that edge has
+                    // ([`Player::drawn_duration`]), and for a still that room is
+                    // ten minutes -- a total that jumped to 10:00:00 the moment
+                    // a picture's edge was pressed, and back on release.
+                    .child(div().flex_none().w(px(TIME_W)).truncate().child(format!(
+                        "{} / {}",
+                        timecode(position, self.fps),
+                        timecode(
+                            self.session
+                                .as_ref()
+                                .map_or(0., PlaybackSession::timeline_duration),
+                            self.fps
+                        )
+                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(rgb(FG_SECONDARY))
+                            .child(hint),
+                    ),
+            )
+            // Press to seek, drag to scrub: the move and release halves live on
+            // the root, since the pointer leaves the bar immediately. The bar
+            // stays 6 px to look at; the strip that takes the click is 24, so
+            // it can be hit without aiming (WCAG 2.5.8).
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .gap(px(HEADER_GAP))
+                    // The lanes' header column, empty here: the ruler's own bar
+                    // has to start where their beds start, or the playhead
+                    // would point at a different moment in each row.
+                    .child(div().flex_none().w(px(HEADER_W)))
+                    .child(
+                        div()
+                            .id("ruler")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(RULER_HIT_H))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER_DIM)))
+                            // The strip carries no text, so the tooltip is the only
+                            // place it can say what it is.
+                            .tooltip(|_, cx| {
+                                cx.new(|_| Tip("Seek — click or drag; ctrl+wheel zooms".into()))
+                                    .into()
+                            })
+                            // Ctrl+wheel is what every timeline zooms with, and
+                            // the point held still is the one under the pointer
+                            // rather than the playhead. Only with ctrl: a bare
+                            // wheel here is the window's to scroll, and the
+                            // controls row above scrolls on exactly that.
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    if !event.modifiers.control {
+                                        return;
+                                    }
+                                    let dy = match event.delta {
+                                        ScrollDelta::Lines(d) => d.y,
+                                        ScrollDelta::Pixels(d) => f32::from(d.y),
+                                    };
+                                    if dy == 0. {
+                                        return;
+                                    }
+                                    let anchor = px_along(event.position.x, this.ruler.get());
+                                    let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
+                                    this.zoom(factor, Some(anchor), cx);
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.scrubbing = true;
+                                    this.scrub_to(event.position.x, true, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(6.))
+                                    .rounded(px(3.))
+                                    .bg(rgb(BG_RAISED))
+                                    .child(bounds_probe(self.ruler.clone()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(px(filled))
+                                            .rounded(px(3.))
+                                            .bg(rgb(ACCENT_PRIMARY)),
+                                    ),
+                            ),
+                    ),
+            )
+            // Every lane the project has, in its own order -- and its own
+            // column, so a project with more lanes than the panel is tall
+            // scrolls its tracks instead of pushing the picture off the window.
+            // The gap is the panel's own, so two lanes lay out exactly as they
+            // did when they were two children of it.
+            .child(
+                div()
+                    .id("lanes")
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .max_h(px(lanes_h(LANES_MAX)))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            // Under the tracks and outside their scrolling column: a subtitle is
+            // not a track -- nothing can be dropped on it and nothing dragged
+            // along it -- and a strip that scrolled away with the sixth lane
+            // would be a strip nobody could see while editing.
+            .children(strip)
+    }
+
+    /// The subtitle tracks this timeline holds, under the media list: one row
+    /// each, the picked one marked, and a click makes another one the picked one
+    /// -- which is the whole of choosing between the two tracks of a film. A row
+    /// per track and no cycle: three of them is an ordinary number for a remux,
+    /// and a key that steps through three is a key nobody can aim.
+    ///
+    /// A track that could not be read is *here*, greyed and saying why, exactly
+    /// as a media row the timeline cannot take is: PGS subtitles are pictures,
+    /// and a film carrying four of them says so instead of listing nothing.
+    ///
+    /// Every row names the file it came out of itself, in words and in the tint
+    /// that file's clips wear on the lanes -- but only where there is more than
+    /// one file to tell apart, the way [`row_name`] numbers audio streams only
+    /// where a file gave several. Where the window is tall enough for it
+    /// ([`sub_headers_fit`]) each file's block is headed by its name as well: a
+    /// label and nothing more, no click and nothing to fold, so the rows under
+    /// it are the only things anybody has to aim at. At the 640x360 floor the
+    /// headers are gone and the rows still say whose they are.
+    ///
+    /// `None` when there are none -- an empty heading is a section about
+    /// nothing.
+    pub(crate) fn subtitle_section(
+        &self,
+        width: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let tracks = self.session.as_ref()?.subtitles();
+        if tracks.is_empty() {
+            return None;
+        }
+        let groups = subtitle_rows(tracks);
+        // One file's tracks need no prefix saying which file: it is the only
+        // one, and every row would carry the same word.
+        let several_files = groups.len() > 1;
+        let headed = several_files && sub_headers_fit(viewport_h);
+        let text_w = row_text_w(width);
+        let rows: Vec<_> = groups
+            .into_iter()
+            .map(|SubGroup { name, path, rows }| {
+                // The file's own colour, the one its media rows and its clips
+                // wear -- and none at all for a standalone `.srt`, which came
+                // off no file on this timeline.
+                let tint = file_tint(self.sources(), &path);
+                let numbered = rows.len() > 1;
+                // The name twice over: all of it the header can hold, and the
+                // share of a row a prefix may take in front of the label.
+                let head = clip_middle(&name, text_w);
+                let prefix = clip_middle(&name, text_w * SUB_STEM_SHARE);
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let track = row.track;
+                        let picked = track == self.sub_track;
+                        let usable = row.refused.is_none();
+                        // Two tracks off one remux that both say "eng" are told
+                        // apart by their number and by nothing else -- the same
+                        // count [`sub_pick_name`] echoes.
+                        let title = match numbered {
+                            true => format!("{} {}", row.label, row.number),
+                            false => row.label,
+                        };
+                        // A standalone `.srt` is named after its own file, so
+                        // the file in front of it says the same word twice
+                        // ("Legend.of.… · Legend.of.…"). [`sub_pick_name`]'s
+                        // rule, on the row it is about.
+                        let owned = several_files && !title.starts_with(name.as_str());
+                        // The whole path, never clipped: the row says which
+                        // file, and the tooltip says which one on disk.
+                        let tip: SharedString = match &row.refused {
+                            Some(why) => format!("{} — {why}", path.display()),
+                            None => format!(
+                                "{} — click to show this track over the picture",
+                                path.display()
+                            ),
+                        }
+                        .into();
+                        // Named, because a × is the same glyph on every row and
+                        // the tooltip is what says which track it takes off.
+                        let remove_tip: SharedString =
+                            format!("Remove {title} — importing the file again brings it back")
+                                .into();
+                        div()
+                            // The *flat* index into the session's add-order
+                            // list, which is what a pick is and what a save
+                            // writes: the grouping moved the row on screen and
+                            // never the track it stands for.
+                            .id(("subtitle-track", track))
+                            .flex_none()
+                            .h(px(ROW_H))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .pr(px(6.))
+                            .rounded(px(3.))
+                            .when(!usable, |d| d.text_color(rgb(FG_SECONDARY)).opacity(0.55))
+                            .when(usable, |d| {
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.sub_track = track;
+                                        // Picking a track is asking to see it: a
+                                        // click that changed nothing on screen
+                                        // because the toggle was off would read
+                                        // as a dead row.
+                                        this.subs_on = true;
+                                        cx.notify();
+                                    }))
+                            })
+                            .when(picked, |d| d.bg(rgb(BG_SELECTED)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                            // The media rows' bar, same width and hard against
+                            // the same edge: one association across the panel
+                            // and the lanes. Kept as room rather than dropped
+                            // where there is no tint, so a standalone `.srt`
+                            // still lines its words up with the rest.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(SWATCH_W))
+                                    .h_full()
+                                    .rounded(px(2.))
+                                    .when_some(tint, |d, tint| d.bg(rgb(tint))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .text_size(px(11.))
+                                            // In front, because the column
+                                            // truncates from the right: an
+                                            // ownership word at the end is a
+                                            // word the floor never shows.
+                                            .when(owned, |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex_none()
+                                                        // Said twice where a
+                                                        // header says it above:
+                                                        // still there, out of
+                                                        // the way.
+                                                        .when(headed, |d| {
+                                                            d.text_color(rgb(FG_SECONDARY))
+                                                        })
+                                                        .child(format!("{prefix} · ")),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(title),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(FG_SECONDARY))
+                                            .child(row.detail),
+                                    ),
+                            )
+                            // The way back off the timeline, on every row and on
+                            // the last one too -- a list of subtitles is allowed
+                            // to be empty, unlike a lane. A `HIT_MIN` target and
+                            // never hidden, the lane header's ×, and it stops
+                            // the click there: the row under it picks a track,
+                            // and picking the track that has just gone would
+                            // leave the pick naming nothing.
+                            .child(
+                                div()
+                                    .id(("subtitle-remove", track))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_subtitle_track(track, cx);
+                                        },
+                                    ))
+                                    .child("×"),
+                            )
+                    })
+                    .collect();
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    // The header: which film these came out of, in words and not
+                    // in colour alone. No id, no click, nothing to fold -- a
+                    // label, which is why it is allowed under `HIT_MIN`.
+                    .when(headed, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .h(px(SUB_HEAD_H))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(10.))
+                                .text_color(rgb(FG_SECONDARY))
+                                .when_some(tint, |d, tint| {
+                                    d.child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(SWATCH_W))
+                                            .h_full()
+                                            .rounded(px(2.))
+                                            .bg(rgb(tint)),
+                                    )
+                                })
+                                .child(div().flex_1().min_w(px(0.)).truncate().child(head)),
+                        )
+                    })
+                    .children(rows)
+            })
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(rgb(FG_SECONDARY))
+                        .child(match (self.subs_on, sub_pick_name(tracks, self.sub_track)) {
+                            // Which of them is on screen, named by its film:
+                            // the heading over a list of five is where the one
+                            // being shown is worth saying out loud.
+                            (true, Some(pick)) => format!("Subtitles — {pick}"),
+                            (true, None) => "Subtitles".to_string(),
+                            // The toggle's state where the tracks are listed: a
+                            // list of subtitles nothing on screen is showing has
+                            // to say that it is showing none.
+                            (false, _) => "Subtitles — hidden".to_string(),
+                        }),
+                )
+                .child(
+                    div()
+                        .id("subtitle-rows")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .max_h(px(SUB_ROWS_H))
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+        )
+    }
+
+    /// One lane of the edit list made visible: a fixed header saying which lane
+    /// it is, then a bed with a box per clip, placed and sized by its share of
+    /// the timeline. A cut adds a box without moving anything, a delete closes
+    /// the hole, a lift leaves one. A clip too narrow for its name says what it
+    /// is by its tint, and the tooltip is where every box says what clicking it
+    /// does. Never focusable, so the root keeps focus and the play binding still
+    /// works after a click (ledger:182).
+    /// The subtitle strip: where the picked track's cues are along the very same
+    /// bed the lanes are drawn on, through the very same [`Scale`], so a cue
+    /// lines up with the take it belongs to at every zoom.
+    ///
+    /// Display only -- no drag, no trim, no drop. What it is *for* is the
+    /// question "is there a subtitle here", which a timeline could not answer at
+    /// all before: the cues are the project's and are edited in the file they
+    /// came from.
+    ///
+    /// `None` with no track picked, so a timeline without subtitles is the panel
+    /// it has always been.
+    pub(crate) fn subtitle_strip(&self, filled: f32) -> Option<impl IntoElement + use<>> {
+        let track = self.subtitle_track()?;
+        let scale = self.scale;
+        // The pick with its film on it, not the raw tag: two films' "eng"
+        // tracks read alike otherwise, and a header saying "und" names a
+        // language nobody speaks.
+        let label = sub_pick_name(self.session.as_ref()?.subtitles(), self.sub_track)?;
+        // The colour the file's own rows and clips wear, so the strip says
+        // whose subtitles these are before the tooltip is asked. `None` for a
+        // standalone `.srt` -- nobody's stream, and the first film's colour
+        // would be a lie about where it came from.
+        let tint = file_tint(self.sources(), &track.path).unwrap_or(BG_RAISED);
+        // The whole of what the row says in words, since a 40 px column can hold
+        // three characters of it: which track of which file, how many cues, the
+        // file itself in full -- one stem is two films when they are two cuts of
+        // it -- and, for a track that could not be read, the engine's own reason,
+        // where the library row's grey already says the same thing.
+        let tip: SharedString = match track.refused.is_some() {
+            true => format!(
+                "Subtitles: {label} — {} — {}",
+                subtitle_detail(track),
+                track.path.display()
+            ),
+            false => format!(
+                "Subtitles: {label} — {}, {} hides them — {}",
+                subtitle_detail(track),
+                self.keymap.display(ActionId::ToggleSubtitles),
+                track.path.display()
+            ),
+        }
+        .into();
+        // Where the cues are on *this* timeline and not in the file they came
+        // from ([`PlaybackSession::timeline_cues`]) -- the same map the plate
+        // over the picture and the export both go through, which is what keeps
+        // a mark under the take it is spoken over after a cut.
+        let cues: Vec<(f32, f32)> = self
+            .session
+            .as_ref()?
+            .timeline_cues(self.sub_track)
+            .iter()
+            .map(|cue| cue_box(scale, cue))
+            .collect();
+        Some(
+            div()
+                .flex_none()
+                .h(px(SUB_LANE_H))
+                .flex()
+                .gap(px(HEADER_GAP))
+                .child(
+                    // Identified for the tooltip's sake and for nothing else:
+                    // the whole of what a 40 px column can say is three
+                    // characters, and the rest of it hangs off the hover.
+                    div()
+                        .id("subtitle-lane")
+                        .flex_none()
+                        .w(px(HEADER_W))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        // From the left rather than centred, unlike a lane's
+                        // `V1`: a track label is a language or a file name, and
+                        // a centred truncation eats both of its ends.
+                        .px(px(2.))
+                        .rounded(px(3.))
+                        .bg(rgb(tint))
+                        .text_size(px(9.))
+                        .text_color(rgb(FG_SECONDARY))
+                        .truncate()
+                        .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .rounded(px(3.))
+                        .bg(rgb(BG_CANVAS))
+                        .overflow_hidden()
+                        .children(cues.into_iter().map(|(left, width)| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(left))
+                                .w(px(width))
+                                .rounded(px(2.))
+                                .bg(rgb(BG_SELECTED))
+                        }))
+                        // The playhead again, last and in the lanes' own colour:
+                        // the strip is only worth anything beside them if it
+                        // reads as the same moment.
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(filled))
+                                .w(px(1.))
+                                .bg(rgb(ACCENT_PRIMARY)),
+                        ),
+                ),
+        )
+    }
+
+    pub(crate) fn lane_row(
+        &self,
+        lane: Lane,
+        // Where the playhead is on the bed, in pixels: worked out once by the
+        // panel so the ruler's line and every lane's draw the same one.
+        filled: f32,
+        cx: &mut Context<Self>,
+        // Borrows nothing it was given (`use<>`): the rows are built one after
+        // another into a list, and a row still holding `cx` would be the only
+        // one that could be built.
+    ) -> impl IntoElement + use<> {
+        // The mapping, copied out once: every box in the row is placed through
+        // it, so all of them move together when it does. No bed width is needed
+        // to place them any more -- a second is so many pixels wherever it is.
+        let scale = self.scale;
+        // How much bed there is to be seen on, measured off the ruler's own
+        // probe like every other question about it: what a box draws *inside*
+        // itself is clipped to this ([`visible_slice`]), because a box at a deep
+        // zoom is far wider than the strip it is being watched through.
+        let bed = f32::from(self.ruler.get().size.width);
+        // Where the snap line stands, in the same pixels every box is placed
+        // through -- and only while a gesture is actually live: gpui drops a
+        // drag without telling anyone, so this asks whether one is in flight
+        // (`App::has_active_drag`) rather than remembering that one was.
+        let cue = self
+            .snap_cue
+            .filter(|_| self.trim.is_some() || cx.has_active_drag())
+            .map(|frame| scale.px_at(f64::from(frame) / self.fps));
+        // The shadow, on the one lane the pointer is over -- and, like the line,
+        // only while the drag that asked for it is still in flight.
+        let ghost = self
+            .ghost
+            .filter(|g| g.lane == lane && cx.has_active_drag());
+        let clips = self
+            .session
+            .as_ref()
+            .map_or(&[][..], |session| session.lane_clips(lane));
+        // The group ids some *other* lane carries: a clip whose id is in here
+        // has a half elsewhere, and one whose is not is a detached half however
+        // many lanes there are.
+        let others: Vec<u32> = self.session.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .lanes()
+                .into_iter()
+                .filter(|&other| other != lane)
+                .flat_map(|other| session.lane_clips(other))
+                .filter_map(|clip| clip.link)
+                .collect()
+        });
+        let name = lane.label();
+        let row_id: SharedString = format!("{name}-clip").into();
+        let remove_id: SharedString = format!("{name}-remove").into();
+        let remove_tip: SharedString = format!(
+            "Remove {name} — it must be empty first, and {} brings it back",
+            self.keymap.display(ActionId::Undo)
+        )
+        .into();
+        let sources = self
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        let (sel, sel_link) = (self.selected, self.selected_link());
+        let audio = lane.kind == LaneKind::Audio;
+        // What this track plays at, on the header it belongs to: shown only
+        // when it is not unity, because a column 40 px wide has room for a
+        // number or for a name, and the name is what a header is for. The
+        // press opens the mix card on this very track.
+        let gain_db = self
+            .session
+            .as_ref()
+            .map_or(0., |session| session.lane_gain_db(lane));
+        let gain_tip: SharedString = format!(
+            "{name} plays at {gain_db:+.0} dB — opens the mix ({}); the whole track, every frequency, unlike the equalizer",
+            self.keymap.display(ActionId::Mix)
+        )
+        .into();
+        let tip: SharedString = format!(
+            "Select (or {} under the playhead, {}/{} along the lane) — drag it to move it, an end to trim, {} removes the take, {} leaves a gap, {} rejoins a cut",
+            self.keymap.display(ActionId::Select),
+            self.keymap.display(ActionId::SelectPrev),
+            self.keymap.display(ActionId::SelectNext),
+            self.keymap.display(ActionId::Delete),
+            self.keymap.display(ActionId::Lift),
+            self.keymap.display(ActionId::Regroup)
+        )
+        .into();
+        div()
+            .flex_none()
+            .h(px(LANE_H))
+            .flex()
+            .gap(px(HEADER_GAP))
+            // The fixed column the ruler above is offset by as well. Full lane
+            // height, so it reads as the bed continuing rather than as a chip.
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(HEADER_W))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(rgb(BG_RAISED))
+                    .text_size(px(11.))
+                    .text_color(rgb(FG_SECONDARY))
+                    .child(match audio {
+                        // A button, not a label: the one setting a track has of
+                        // its own used to be reachable from nowhere.
+                        true => div()
+                            .id(("mix-lane", lane.ord))
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(gain_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.open_mix(Some(lane), cx)
+                            }))
+                            .child(match gain_db == 0. {
+                                true => name.clone(),
+                                false => format!("{name} {gain_db:+.0}"),
+                            })
+                            .into_any_element(),
+                        false => div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .child(name.clone())
+                            .into_any_element(),
+                    })
+                    // The one thing a header does: take this track away again.
+                    // A `HIT_MIN` target rather than a glyph-sized one, and it
+                    // stays put on a track holding clips instead of hiding --
+                    // the refusal names them, and a control that vanishes
+                    // teaches nothing.
+                    .child(
+                        div()
+                            .id(remove_id)
+                            .flex_none()
+                            .w_full()
+                            .h(px(HIT_MIN))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.remove_lane(lane, cx)
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                // Clips are placed at their own start rather than queued edge
+                // to edge: a lift leaves a hole in the lane, and the bare bed
+                // showing through it *is* how a gap looks.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .rounded(px(3.))
+                    .bg(rgb(BG_CANVAS))
+                    .overflow_hidden()
+                    // A library row let go over a lane is the same insert the
+                    // Add button makes, through the same call -- but where the
+                    // pointer let it go, not at the playhead: a hand that
+                    // carried a file to a place on the bed named that place.
+                    // gpui hands a drop no event, so the pointer is read off
+                    // the window, which took it from the release that fired
+                    // this (gpui window.rs:3602).
+                    .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
+                        // Onto the edges near it, exactly as a clip carried by
+                        // hand lands: the line drawn while it was in flight is
+                        // the frame it goes down on.
+                        let at = this.place_frame(window.mouse_position().x).0;
+                        this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
+                    }))
+                    .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM)))
+                    // The shadow of the row in flight, drawn by the lane the
+                    // pointer is inside: `on_drag_move` fires on every painted
+                    // element while a drag of its type is live, wherever the
+                    // pointer is, and hands each one its own box -- which is how
+                    // a lane knows the pointer is over *it* (gpui div.rs:282).
+                    // The root cleared it a moment ago, so exactly one lane
+                    // draws one.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let path = event.drag(cx).0.clone();
+                            this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
+                        },
+                    ))
+                    // ...and a clip let go over a lane lands the same way: on
+                    // the track it was dropped on, at the frame it was carried
+                    // to -- its own included, which is the drag that moves a
+                    // take along its track.
+                    .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+                        // Against the lane as it is *now* ([`Player::dragged`]),
+                        // and then snapped by `move_clip` like any other drop:
+                        // which clip is being moved and where it lands are two
+                        // questions, and this is the first one.
+                        let Some(idx) = this.dragged(drag) else {
+                            return;
+                        };
+                        this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
+                    }))
+                    .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM)))
+                    // ...and the same shadow for the clip in the hand, seated on
+                    // this lane when the pointer is inside it.
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            let drag = *event.drag(cx);
+                            this.preview_ghost(&drag, lane, event.event.position.x, cx);
+                        },
+                    ))
+                    .children(clips.iter().enumerate().map(|(i, clip)| {
+                        // The clip as the lane holds it, for the drag payload:
+                        // what a drop looks itself up by has to be the placed
+                        // clip, never the preview an edge drag is drawing.
+                        let placed = *clip;
+                        // What a drag on an edge is showing, which is the clip
+                        // itself while nothing is being dragged.
+                        let clip = &self.trimmed(lane, i, *clip);
+                        // Its *timeline* length, which a speed halves or
+                        // quadruples: the box is as wide as the clip is long
+                        // where it sits, not as long as the source it reads.
+                        let (start, len) = (
+                            f64::from(clip.start) / self.fps,
+                            f64::from(clip.frames()) / self.fps,
+                        );
+                        let on = marked((lane, i), clip.link, sel, sel_link);
+                        // A group with a half in the other lane wears its tint;
+                        // one without is outlined, so a detached half is visible
+                        // as detached before anyone clicks it.
+                        let grouped = clip.link.is_some_and(|link| others.contains(&link));
+                        // Tinted by *file*, not by source entry: two audio
+                        // streams of one file are two sources, and the library
+                        // gives them one swatch because they are one file.
+                        let tint = self.clip_tint(clip.source);
+                        // What the clip is worth in pixels, and how wide its box
+                        // is drawn -- the two part company on a take too short
+                        // to be hit at this zoom ([`clip_width`]).
+                        let span = scale.width_px(len);
+                        let width = clip_width(span);
+                        let left = scale.px_at(start);
+                        // The slice of this box that is on the bed: where its
+                        // name, its badge and its waveform go, so none of the
+                        // three is drawn out at a zoomed-in box's own edges.
+                        let (vis_x, vis_w) = visible_slice(left, width, bed);
+                        let label = sources.get(clip.source).map(|s| file_name(&s.path));
+                        let wave = sources
+                            .get(clip.source)
+                            .and_then(|s| self.waves.get(&(s.path.clone(), s.audio_stream)))
+                            .cloned();
+                        // The source seconds that slice plays -- not the clip's
+                        // whole range: the envelope is drawn for the part of the
+                        // box that can be seen, at the resolution of the pixels
+                        // it actually has, and never one column per two pixels
+                        // of a box millions of pixels wide.
+                        let along = |x: f32| match width > 0. {
+                            true => {
+                                f64::from(clip.in_frame)
+                                    + f64::from(clip.out_frame - clip.in_frame)
+                                        * f64::from(x / width)
+                            }
+                            false => f64::from(clip.in_frame),
+                        };
+                        let (from, to) = (along(vis_x) / self.fps, along(vis_x + vis_w) / self.fps);
+                        let tip = tip.clone();
+                        // What the pointer carries on the way to another lane:
+                        // the file the box is showing, the same ghost a library
+                        // row makes. A box too narrow for its own label still
+                        // says what is moving.
+                        let ghost: SharedString =
+                            label.clone().unwrap_or_else(|| lane.label()).into();
+                        // Its head in frames, for the press below: the `start`
+                        // above is the same moment in seconds, which is what
+                        // the box is *drawn* from.
+                        let head = clip.start;
+                        div()
+                            // Named per lane: two rows numbering their clips
+                            // from zero would hand gpui the same id twice.
+                            .id((row_id.clone(), i))
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            // Negative once the clip's head has been scrolled
+                            // off the left edge: the bed clips what hangs out
+                            // of it, so a half-visible clip is drawn as the
+                            // half of itself that is on screen.
+                            .left(px(left))
+                            .w(px(width))
+                            .overflow_hidden()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(if on {
+                                ACCENT_PRIMARY
+                            } else if grouped {
+                                tint
+                            } else {
+                                FG_SECONDARY
+                            }))
+                            .bg(rgb(if on { BG_SELECTED } else { tint }))
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(rgb(ACCENT_PRIMARY)))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                            // Dragged, it *moves*: to the frame it was let go on
+                            // and to the lane it was let go over. The click that
+                            // starts the drag still selects, so picking a clip
+                            // up and putting it back down where it was is
+                            // exactly a click.
+                            .on_drag(
+                                ClipDrag {
+                                    lane,
+                                    idx: i,
+                                    clip: placed,
+                                },
+                                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone())),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    // Where in the box the hand took hold of it,
+                                    // for the drag this press may become: the
+                                    // clip has to move with the pointer rather
+                                    // than jump its head under it.
+                                    this.grab =
+                                        this.frame_under(event.position.x).saturating_sub(head);
+                                    this.select((lane, i), cx);
+                                }),
+                            )
+                            // The right button selects exactly as the left one
+                            // does -- the menu acts on the clip it names, so
+                            // opening one has to pick it -- and then hangs the
+                            // menu at the pointer.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.open_menu(lane, i, event.position, cx);
+                                }),
+                            )
+                            // The two strips a drag *lengthens* the clip by,
+                            // one at each end. They occlude the box behind
+                            // them, which is what keeps one gesture one thing:
+                            // a press here trims, a press anywhere else on the
+                            // box still starts the move to another lane.
+                            //
+                            // Asked of the clip's own width and not of the box's
+                            // floor: a take drawn at `HIT_MIN` because it is
+                            // shorter than that has no *pixels* to trim by -- one
+                            // would move it by seconds -- so it keeps all of its
+                            // padded box as a body to select and drag by, and is
+                            // trimmed after zooming in, exactly as [`trims`] says.
+                            .children(
+                                [Edge::Start, Edge::End]
+                                    .into_iter()
+                                    .filter(|_| trims(span))
+                                    .map(|edge| {
+                                        let mut zone = div()
+                                            .absolute()
+                                            .top_0()
+                                            .h_full()
+                                            .w(px(EDGE_W))
+                                            .occlude()
+                                            .cursor(CursorStyle::ResizeLeftRight)
+                                            .hover(|s| s.bg(rgb(ACCENT_PRIMARY)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _, cx| {
+                                                        this.start_trim(lane, i, edge, cx);
+                                                    },
+                                                ),
+                                            )
+                                            // Occluded, so the box's own right-button
+                                            // listener never fires here: the menu is
+                                            // the same menu, opened by the same call.
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.open_menu(lane, i, event.position, cx);
+                                                    },
+                                                ),
+                                            );
+                                        zone = match edge {
+                                            Edge::Start => zone.left_0(),
+                                            Edge::End => zone.right_0(),
+                                        };
+                                        zone
+                                    }),
+                            )
+                            // Under the label row, never through it.
+                            .children(wave.filter(|_| audio && vis_w > 0.).and_then(|wave| {
+                                let inner: AnyElement = match wave {
+                                    Wave::Peaks(peaks) => {
+                                        waveform(peaks, from, to).into_any_element()
+                                    }
+                                    // A bed while the decode runs, and dimmer
+                                    // than any waveform is drawn: a flat
+                                    // `FG_SECONDARY` line here would be the shape a
+                                    // silent file makes, which this file is not
+                                    // known to be yet.
+                                    Wave::Loading => div()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .child(div().w_full().h(px(1.)).bg(rgb(BG_HOVER)))
+                                        .into_any_element(),
+                                    // No audio track: nothing, never a fake.
+                                    Wave::Silent => return None,
+                                    // Could not be read: a band that says so in
+                                    // words, because the empty band a silent
+                                    // file draws would claim this file has no
+                                    // sound. The reason itself went to the log.
+                                    Wave::Failed => div()
+                                        .h_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .truncate()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(FG_SECONDARY))
+                                        .child("audio unreadable")
+                                        .into_any_element(),
+                                };
+                                Some(
+                                    div()
+                                        .absolute()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
+                                        .top(px(LABEL_H))
+                                        .bottom_0()
+                                        .child(inner),
+                                )
+                            }))
+                            // A speeded clip says so on the box, in the corner
+                            // the label does not reach: the box's width alone
+                            // cannot say whether a short clip is a trim or a
+                            // clip at 4x, and that is the difference between a
+                            // cut and a re-time.
+                            // Against the right edge of what is *visible* of the
+                            // box, not of the box: zoomed in, the box's own
+                            // right edge is off the screen and the badge with
+                            // it, which is a clip that stops saying it is
+                            // speeded exactly when it is being looked at
+                            // closely.
+                            .when(!clip.speed.is_normal() && vis_w > 0., |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
+                                        .flex()
+                                        .justify_end()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .px(px(3.))
+                                                .rounded(px(3.))
+                                                .bg(rgb(ACCENT_PRIMARY))
+                                                .text_size(px(9.))
+                                                .text_color(rgb(BG_RAISED))
+                                                .child(format!("{}", clip.speed)),
+                                        ),
+                                )
+                            })
+                            // ...and the name sits at the left edge of the same
+                            // slice, for the same reason: a box scrolled half
+                            // off names itself on the half that is on screen.
+                            .when_some(label.filter(|_| show_label(vis_w)), |d, label| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left(px(vis_x))
+                                        .w(px(vis_w))
+                                        .h(px(LABEL_H))
+                                        .px(px(4.))
+                                        .truncate()
+                                        .text_size(px(10.))
+                                        .child(label),
+                                )
+                            })
+                    }))
+                    // What the silence card found, over the clips it found them
+                    // in and over the waveform band that shows why: on the lane
+                    // the scan ran on and no other, because that is the only
+                    // lane whose sound was read. Drawn before anything is cut,
+                    // and replaced -- never stacked -- by every re-run.
+                    .children(
+                        self.silence_marks
+                            .iter()
+                            .filter(|_| self.silence_open.is_some_and(|(on, _)| on == lane))
+                            .map(|&(at, len)| {
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .h_full()
+                                    .left(px(scale.px_at(f64::from(at) / self.fps)))
+                                    // Floored like a cue's mark and for the same
+                                    // reason: a half-second silence on a zoomed-
+                                    // out bed rounds to nothing, and a preview
+                                    // that draws nothing reads as a scan that
+                                    // found nothing.
+                                    .w(px(scale
+                                        .width_px(f64::from(len) / self.fps)
+                                        .max(SUB_CUE_MIN_W)))
+                                    .bg(rgba(ACCENT_WASH))
+                            }),
+                    )
+                    // Where the thing in the hand would come to rest, at the size
+                    // it would come to rest at: the shadow a proper editor draws
+                    // under a drag. Over the clips (it is translucent, so what
+                    // it would cover shows through) and under the line, which
+                    // marks the frame this box merely fills.
+                    .children(ghost.map(|g| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(scale.px_at(f64::from(g.start) / self.fps)))
+                            // A row whose length the engine has not measured
+                            // draws a head marker rather than nothing: where it
+                            // lands is known, how long it is is not.
+                            .w(px(scale
+                                .width_px(f64::from(g.frames) / self.fps)
+                                .max(GHOST_MIN)))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(if g.refused { DROP_REFUSE } else { FG_PRIMARY }))
+                            // The file's own swatch at a third of its weight, so
+                            // the box beneath is still legible through it -- and
+                            // the refusal red instead, for a lane that will not
+                            // take this drop at all.
+                            .bg(rgba(
+                                ((if g.refused { DROP_REFUSE } else { g.tint }) << 8) | GHOST_ALPHA,
+                            ))
+                    }))
+                    // What the gesture in flight is about to land on, drawn on
+                    // every lane so a clip lining up with a take one track over
+                    // can be seen to line up with it. Under the playhead's line
+                    // and in another colour, since the two mean different
+                    // things and often stand on the same pixel.
+                    .children(cue.map(|x| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(x))
+                            .w(px(1.))
+                            .bg(rgb(FG_PRIMARY))
+                    }))
+                    // Last, so it is over the clips: the same fraction in both
+                    // lanes, which is the playhead being one line.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(px(filled))
+                            .w(px(1.))
+                            .bg(rgb(ACCENT_PRIMARY)),
+                    ),
+            )
+    }
+}

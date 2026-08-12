@@ -1,0 +1,169 @@
+//! The picture: what is drawn over it and what is read off it.
+
+use crate::*;
+use crate::ui::widgets::*;
+
+impl Player {
+    /// The cues of the picked track that are on screen at `at`, over the picture
+    /// and nothing else: bottom-centred where every player puts them, white on a
+    /// plate so the film underneath cannot swallow them, and each cue its own
+    /// plate so two at one moment stack rather than run together.
+    ///
+    /// `None` -- no element at all -- while the toggle is off, with no track
+    /// picked, and between cues: the picture is what this window is for, and a
+    /// permanent empty band across it would be in the way of exactly that.
+    ///
+    /// The cues are the *timeline's* ([`PlaybackSession::timeline_cues`]) and
+    /// not the track's own: on a cut timeline an embedded track's cues ride the
+    /// pictures they belong to, and this is the same map the export writes the
+    /// file with -- so what is read here is what the file says.
+    ///
+    /// A cue off a PGS track is a *picture* and not a line
+    /// ([`engine::subtitle::CueImage`]), and is drawn as one: the disc's whole
+    /// canvas fitted over the picture region exactly as the picture itself is,
+    /// which puts every cue where the disc put it relative to its own frame.
+    ///
+    /// ponytail: exact only while the canvas and the encode are the same shape
+    /// -- a 16:9 canvas over a 2.39:1 encode fits to the region's height and
+    /// the film to its width, so a cue sits a little low on a scope film. The
+    /// upgrade path is the picture's own rect, which wants `VideoMeta`'s aspect
+    /// and the measured bounds rather than the shared `Contain`.
+    pub(crate) fn subtitle_overlay(
+        &mut self,
+        at: f64,
+        window: &mut Window,
+    ) -> Option<impl IntoElement + use<>> {
+        // One way out, and it lets the drawn picture go on the way: the toggle
+        // going off, the file closing and the gap between two cues are the same
+        // "nothing on screen", and an 8 MB atlas tile may not survive any of
+        // them (an early return above this leaked one per toggle-off).
+        let mapped = match self.session.as_ref().filter(|_| self.subs_on) {
+            Some(session) => session.timeline_cues(self.sub_track),
+            None => Vec::new(),
+        };
+        let cues = cues_at(&mapped, at);
+        if cues.is_empty() {
+            self.drop_sub_image(window);
+            return None;
+        }
+        // The first picture cue up, decoded once and kept: two bitmap cues at
+        // one moment is a thing PGS composes into one display set, so there is
+        // never a second picture to stack under the first.
+        let picture = cues
+            .iter()
+            .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
+            .and_then(|(start_us, image)| self.sub_picture(start_us, image, window));
+        // A picture is fitted onto the whole region and a plate hangs off the
+        // bottom of it, and a track is one or the other -- so they are two
+        // shapes and not one with the parts switched off.
+        if let Some(image) = picture {
+            // A *flex* box with the canvas as its one growing item: a percentage
+            // size (`size_full`) inside an absolutely placed box has nothing to
+            // be a percentage of and lays the picture out to nothing, while a
+            // flex item is sized by the box itself. Fitted the way the picture
+            // above it is -- `Contain` over the same box -- so a canvas of the
+            // picture's own shape lands exactly on it.
+            return Some(div().absolute().inset_0().flex().child(
+                img(image).flex_1().h_full().object_fit(gpui::ObjectFit::Contain),
+            ));
+        }
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom(px(SUB_BOTTOM))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(2.))
+                // The plate takes no click: the picture behind it is still the
+                // drop target the whole window is.
+                .children(cues.into_iter().filter(|c| c.image.is_none()).map(|cue| {
+                    div()
+                        .max_w(relative(0.9))
+                        .px(px(6.))
+                        .rounded(px(3.))
+                        .bg(rgba(SUB_SHADE))
+                        .text_size(px(SUB_TEXT))
+                        .text_color(rgb(SUB_FG))
+                        .text_align(TextAlign::Center)
+                        // A line of the cue is a line on screen: the break the
+                        // parser kept is not whitespace to be re-flowed. What a
+                        // *long* line does is wrap inside its own div, which is
+                        // what the width cap above is for.
+                        .children(
+                            cue.text
+                                .split('\n')
+                                .map(|line| div().min_h(px(SUB_LINE_H)).child(line.to_string())),
+                        )
+                })),
+        )
+    }
+
+    /// The cue starting at `start_us` as a drawable picture, decoded on the
+    /// first repaint it is up for and kept until another cue takes its place
+    /// ([`Player::sub_image`]). `None` for a display set the decoder refuses,
+    /// which draws nothing rather than failing the frame.
+    ///
+    /// Its atlas tile is released as the video's is: every [`RenderImage`] gets
+    /// a fresh id and its own tile, so a film's worth of cues would grow the
+    /// sprite atlas by the whole film.
+    pub(crate) fn sub_picture(
+        &mut self,
+        start_us: i64,
+        image: &engine::subtitle::CueImage,
+        window: &mut Window,
+    ) -> Option<Arc<RenderImage>> {
+        let key = (self.sub_track, start_us);
+        if let Some((up, ready)) = &self.sub_image
+            && *up == key
+        {
+            return Some(ready.clone());
+        }
+        let mut rgba = image.rgba()?;
+        // gpui's atlas is BGRA with straight alpha; PGS decodes to RGBA with
+        // straight alpha. The same swap the video frames get.
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let buf = image::RgbaImage::from_raw(image.width, image.height, rgba)?;
+        let next = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+        self.drop_sub_image(window);
+        self.sub_image = Some((key, next.clone()));
+        Some(next)
+    }
+
+    /// Lets go of the drawn cue and its atlas tile. Called where the cue stops
+    /// being on screen, which is every gap between two of them: an 8 MB tile
+    /// per cue is not a thing to leave behind a film.
+    pub(crate) fn drop_sub_image(&mut self, window: &mut Window) {
+        if let Some((_, old)) = self.sub_image.take() {
+            let _ = window.drop_image(old);
+        }
+    }
+
+    /// What is decoding the picture right now, for the transport line: the
+    /// backend is the running worker's own (it is written where a hardware
+    /// session falls back to software, so this follows reality), and the codec
+    /// comes from the clip under the playhead. Empty when nothing is playing --
+    /// the question is about what is happening, not about what would.
+    pub(crate) fn live_decode(&self, position: f64, playing: bool) -> String {
+        let Some(session) = self.session.as_ref().filter(|_| playing) else {
+            return String::new();
+        };
+        let backend = session.decode_backend();
+        let codec = session
+            .video_clip_at(position)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| clip.source))
+            .and_then(|source| session.sources().get(source))
+            .and_then(|source| self.decoders.get(&source.path).copied().flatten())
+            .and_then(|(codec, _)| codec);
+        match backend {
+            // Neither is a decode, and saying "SW" of them would be a lie.
+            Backend::Gap => "gap · nothing to decode".to_string(),
+            Backend::Still => "still · one decode, held".to_string(),
+            _ => format!("{} decode", decode_label(codec, backend)),
+        }
+    }
+}
