@@ -192,9 +192,10 @@ const SUB_BOTTOM: f32 = 8.;
 /// the cues are and nothing on it can be dragged -- `HIT_MIN` binds targets, and
 /// this row has none.
 const SUB_LANE_H: f32 = 16.;
-/// A cue narrower than this is still drawn this wide: a one-frame cue on a
+/// A mark narrower than this is still drawn this wide: a one-frame cue on a
 /// zoomed-out bed is worth a fraction of a pixel, and a mark nobody can see says
-/// the track is empty.
+/// the track is empty. The silence preview's marks are floored by it too -- they
+/// are the same kind of thing, a picture of where something is and no target.
 const SUB_CUE_MIN_W: f32 = 2.;
 /// How much of the subtitle list in the library column is on screen at once,
 /// past which it scrolls -- the media list above it is what keeps the height.
@@ -483,6 +484,29 @@ const EDGE_W: f32 = 6.;
 /// bed is a magnifier, and the strip grows with the box.
 fn trims(width: f32) -> bool {
     width >= 3. * EDGE_W
+}
+
+/// How wide a clip's box is *drawn*, given the width its own length is worth
+/// (`span`). Never under [`HIT_MIN`], even where that is wider than the clip is
+/// long: zoomed far out a short take is worth a fraction of a pixel, and a box
+/// nobody can put a pointer on is a clip that cannot be selected, dragged, given
+/// a menu or reached at all -- which is strictly worse than one drawn a few
+/// pixels too wide. The same call [`cue_box`] makes for a mark, and what every
+/// editor draws.
+///
+/// A drawing only: [`Scale::time_at`] still reads the bed, so a press inside the
+/// padding names the frame it points at, and the box's head is the clip's own.
+fn clip_width(span: f32) -> f32 {
+    span.max(HIT_MIN)
+}
+
+/// A press that stops here. What every card's body hands its scrim: the scrim
+/// closes the card on a press, and the card is painted after it, so this listener
+/// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
+/// for a button never closes the card out from under its own click -- the rule
+/// the menus already follow ([`Player::library_card`]).
+fn swallow(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
+    cx.stop_propagation();
 }
 
 /// How close to an edge a dragged clip has to be let go for it to land *on* it:
@@ -2689,6 +2713,35 @@ impl Player {
             || self.silence_open.is_some()
             || self.mix_open
             || self.exporting().is_some()
+    }
+
+    /// The pointer's way out of whatever card is up: what every scrim's press
+    /// calls, so `esc` is *a* way out and never the only one. One list, and the
+    /// same one [`Player::modal`] reads -- a card that can be counted there but
+    /// not closed here is a card a hand alone cannot shut, which is what
+    /// `every_card_closes_without_the_keyboard` fails on.
+    ///
+    /// Every card at once because only one is ever up (`export_open`): closing
+    /// "the" card and closing all of them are the same act.
+    fn close_card(&mut self) {
+        self.keys_open = false;
+        self.keys_search.clear();
+        self.rebinding = None;
+        self.export_open = false;
+        // The two things typed *into* the export card go with it: a field left
+        // open would take the next keystroke for a card that is gone.
+        self.mbps_edit = None;
+        self.picker = None;
+        self.eq_open = None;
+        self.eq_dragging = false;
+        self.color_open = None;
+        self.speed_open = None;
+        // Marks and a running scan go with this one, which is why it is a call
+        // and not an assignment ([`Player::close_silence`]).
+        if self.silence_open.is_some() {
+            self.close_silence();
+        }
+        self.mix_open = false;
     }
 
     /// Which of [`Repeat`]'s three the window is in, for the hold gate at the
@@ -6911,7 +6964,7 @@ impl Player {
         // left under it -- a filter that found nothing has to say so, or the
         // card reads as a list that lost its rows.
         let search = if self.keys_search.is_empty() {
-            "search: type to filter · ↑ ↓ scroll the list".to_string()
+            "search: type to filter · ↑ ↓ scroll the list · a click away closes".to_string()
         } else {
             let rows = found
                 .iter()
@@ -7022,14 +7075,22 @@ impl Player {
                 .justify_center()
                 .items_center()
                 // The picture behind is out of reach, and looks it. The press is
-                // swallowed here so a button under the scrim cannot take it.
+                // swallowed here so a button under the scrim cannot take it --
+                // and it closes the card on the way, which is the pointer's exit
+                // from every card here ([`Player::close_card`]).
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(KEYS_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -7524,12 +7585,19 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(EXPORT_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -7561,7 +7629,7 @@ impl Player {
                                     }
                                     (None, Some(notice)) => notice.clone(),
                                     (None, None) => "the keys are on the rows · enter exports · \
-                                                     esc closes · g/r change the layout"
+                                                     a click away or esc closes · g/r change the layout"
                                         .into(),
                                 }),
                         )
@@ -7820,12 +7888,19 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(eq_card_w(f32::from(viewport.width))))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -7846,7 +7921,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(self.notice.clone().unwrap_or_else(|| {
-                                    "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum, esc closes".into()
+                                    "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
                                 })),
                         )
                         .child(graph)
@@ -8140,12 +8215,19 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(COLOR_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(2.))
@@ -8164,7 +8246,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — esc closes",
+                                    "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — a click away or esc closes",
                                 ),
                         )
                         // The frame as it is being graded, over the controls
@@ -8251,12 +8333,19 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(COLOR_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -8275,7 +8364,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; esc closes",
+                                    "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes",
                                 ),
                         )
                         .child(
@@ -8443,12 +8532,19 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(0x101010cc))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(COLOR_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .max_h(px(360. - 24.))
                         .flex()
                         .flex_col()
@@ -8469,7 +8565,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; esc closes",
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; a click away or esc closes",
                                 ),
                         )
                         .child(
@@ -8654,12 +8750,20 @@ impl Player {
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
                 .bg(rgba(0x10101055))
-                .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation()
-                })
+                // Click away closes it, as on every card here -- and the marks
+                // go with it, which is what makes this one a call and not a flag.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .w(px(COLOR_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
                         .gap(px(6.))
@@ -8678,7 +8782,7 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(INK_DIM))
                                 .child(
-                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; esc closes",
+                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes",
                                 ),
                         )
                         .children(rows)
@@ -9617,7 +9721,11 @@ impl Player {
                         // streams of one file are two sources, and the library
                         // gives them one swatch because they are one file.
                         let tint = self.clip_tint(clip.source);
-                        let width = scale.width_px(len);
+                        // What the clip is worth in pixels, and how wide its box
+                        // is drawn -- the two part company on a take too short
+                        // to be hit at this zoom ([`clip_width`]).
+                        let span = scale.width_px(len);
+                        let width = clip_width(span);
                         let left = scale.px_at(start);
                         // The slice of this box that is on the bed: where its
                         // name, its badge and its waveform go, so none of the
@@ -9720,10 +9828,17 @@ impl Player {
                             // them, which is what keeps one gesture one thing:
                             // a press here trims, a press anywhere else on the
                             // box still starts the move to another lane.
+                            //
+                            // Asked of the clip's own width and not of the box's
+                            // floor: a take drawn at `HIT_MIN` because it is
+                            // shorter than that has no *pixels* to trim by -- one
+                            // would move it by seconds -- so it keeps all of its
+                            // padded box as a body to select and drag by, and is
+                            // trimmed after zooming in, exactly as [`trims`] says.
                             .children(
                                 [Edge::Start, Edge::End]
                                     .into_iter()
-                                    .filter(|_| trims(width))
+                                    .filter(|_| trims(span))
                                     .map(|edge| {
                                         let mut zone = div()
                                             .absolute()
@@ -9869,7 +9984,14 @@ impl Player {
                                     .top_0()
                                     .h_full()
                                     .left(px(scale.px_at(f64::from(at) / self.fps)))
-                                    .w(px(scale.width_px(f64::from(len) / self.fps)))
+                                    // Floored like a cue's mark and for the same
+                                    // reason: a half-second silence on a zoomed-
+                                    // out bed rounds to nothing, and a preview
+                                    // that draws nothing reads as a scan that
+                                    // found nothing.
+                                    .w(px(scale
+                                        .width_px(f64::from(len) / self.fps)
+                                        .max(SUB_CUE_MIN_W)))
                                     .bg(rgba(0x4a9effaa))
                             }),
                     )
@@ -13283,7 +13405,7 @@ mod tests {
         Landing, arrival, launch_queue,
         read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
-        trimmed_clip, trims, unscannable,
+        clip_width, trimmed_clip, trims, unscannable,
         visible_slice,
     };
     use super::{
@@ -13920,6 +14042,97 @@ mod tests {
                 keymap::Reach::Gesture => {}
             }
         }
+    }
+
+    /// The other half of "getting out of a card is a `Reach::Gesture`": the
+    /// gesture has to exist. Every card's scrim closes it on a press, so a hand
+    /// that never touches the keyboard can shut every one of them -- for seven
+    /// cards `esc` was the only exit, which is the same complaint as an action
+    /// reachable by stroke alone, said about the way out instead of the way in.
+    ///
+    /// Read off [`Player::modal`] rather than off a list written here: a card
+    /// counted there and not closed by [`Player::close_card`] fails this test
+    /// the day it is added, which is the only way the two stay in step.
+    #[test]
+    fn every_card_closes_without_the_keyboard() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        // A fn's source, up to the next one: enough of a body to scan.
+        let body = |name: &str| -> &str {
+            let at = source
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("no fn {name} in main.rs"));
+            let rest = &source[at..];
+            &rest[..rest[1..].find("\n    fn ").map_or(rest.len(), |e| e + 1)]
+        };
+        for card in [
+            "keys_overlay",
+            "export_card",
+            "eq_card",
+            "color_card",
+            "speed_card",
+            "mix_card",
+            "silence_card",
+        ] {
+            let src = body(card);
+            assert!(
+                src.contains("this.close_card()"),
+                "{card}'s scrim swallows the press without closing the card: \
+                 escape is the only way out of it"
+            );
+            assert!(
+                src.contains("MouseButton::Left, swallow"),
+                "{card}'s body does not swallow its own presses, so a press on \
+                 one of its controls would close the card under itself"
+            );
+        }
+        // ...and every state that makes the window modal is a state that press
+        // clears. `exporting()` is not one of them: a running export is a job
+        // with a cancel button, not a card with a scrim.
+        let close = body("close_card");
+        for field in body("modal").split("self.").skip(1).filter_map(|rest| {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!rest[name.len()..].starts_with('(')).then_some(name)
+        }) {
+            assert!(
+                close.contains(&format!("self.{field}")),
+                "{field} makes the window modal and `close_card` leaves it set: \
+                 that card cannot be closed by pointer"
+            );
+        }
+    }
+
+    /// A clip too short to hit is still a clip: at a far zoom-out its box is
+    /// drawn [`HIT_MIN`] wide rather than the fraction of a pixel it is worth,
+    /// because a box nobody can put a pointer on cannot be selected, dragged,
+    /// trimmed or given a menu -- and an invisible unselectable take is strictly
+    /// worse than one drawn a few pixels too wide.
+    #[test]
+    fn a_clip_box_is_never_narrower_than_its_target() {
+        // Two seconds on a bed showing an hour: a fifth of a pixel.
+        let far = Scale {
+            pps: 0.1,
+            start: 0.,
+        };
+        assert!(far.width_px(2.) < 1., "the fixture is not zoomed out enough");
+        assert_eq!(clip_width(far.width_px(2.)), HIT_MIN);
+        // Zero is the floor's own case: a clip trimmed to nothing, and the
+        // width a lane draws before its first frame is measured.
+        assert_eq!(clip_width(0.), HIT_MIN);
+        // What is already wide enough keeps its own width, to the pixel: the
+        // floor is a floor and never a resize.
+        let near = Scale::default();
+        assert_eq!(clip_width(near.width_px(5.)), near.width_px(5.));
+        // ...and the padding is not trimmable: the strips are asked of the
+        // clip's own width, so a box drawn wider than its length keeps all of
+        // that box as a body to select and drag by ([`trims`]).
+        assert!(!trims(far.width_px(2.)));
+        assert!(clip_width(far.width_px(2.)) >= HIT_MIN);
     }
 
     /// What the Detach and Group items do to a real timeline: a music video's
