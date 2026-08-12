@@ -224,9 +224,21 @@ pub fn probe_bitrate(path: &Path) -> MediaBitrate {
             audio: total,
         };
     }
-    let Ok((meta, demuxer)) = Demuxer::open(path) else {
+    let Ok((meta, mut demuxer)) = Demuxer::open(path) else {
         return unstated;
     };
+    // The one caller that wants the whole index rather than a window: this adds
+    // block *lengths* up, and a Matroska open only walks the clusters a read
+    // asked for ([`MkvDemuxer`]). So the walk this probe always paid is paid
+    // here, where the numbers need it, and not by the opens that seek and
+    // decode. A file that will not walk keeps whatever window it has -- the
+    // rates then describe part of the file, which is why the failure is not
+    // ignored but taken as "no measurement".
+    if let Demuxer::Mkv(d) = &mut demuxer
+        && d.complete_index().is_err()
+    {
+        return unstated;
+    }
     // How long the *file* plays, which on a well-made file is how long its
     // picture plays and on a badly-made one is not: a 2 s clip carrying a 60 s
     // commentary is 60 s of file, and dividing its bytes by 2 claims thirty
@@ -735,12 +747,29 @@ struct Block {
 
 /// AV1, HEVC or H.264 out of a Matroska file (`.mkv`/`.webm`).
 ///
-/// The whole segment is walked once at open -- element *headers* only, the block
-/// payloads are seeked over -- because Matroska carries no sample table: the
-/// frame count and the sync points exist nowhere else, and Cues index only some
-/// keyframes and only when a muxer bothered to write them.
+/// Matroska carries no sample table, so where an mp4 has an `stss` this has to
+/// read the file. What it reads is the file's own **`Cues`**: the seek index a
+/// muxer writes at the far end of the segment, one entry per keyframe, found
+/// through the `SeekHead` in kilobytes rather than gigabytes. The clusters
+/// themselves are walked **only where a caller asks to read** -- one cue
+/// interval at a time, ten seconds of film -- and the window of [`Block`]s that
+/// walk builds is what [`Self::next_access_unit`] hands out.
+///
+/// That turned a 4.9 GB film's open from 3.2 s cold (9.9 MB of element headers,
+/// every cluster in the file) into ~30 ms, and an open happens on every seek and
+/// every clip span, not once per file.
+///
+/// A file with no usable `Cues` -- no index at all, or a track that declares no
+/// `DefaultDuration`, so a cue time cannot be turned into a frame number -- gets
+/// the whole-segment walk this always did ([`mkv_blocks`]), which is also where
+/// a cue index caught disagreeing with the blocks it names degrades to
+/// ([`Self::cues_agree`]). Both paths answer the same questions with the same
+/// numbers; only what they read to do it differs.
 pub struct MkvDemuxer {
     file: File,
+    /// The blocks walked so far, which for a lazily indexed file is the window
+    /// around what has been read and not the file: `blocks[i]` is the file's
+    /// block `base + i`.
     blocks: Vec<Block>,
     codec: Codec,
     /// The `av1C` configuration OBUs (the sequence header), re-injected ahead of
@@ -765,14 +794,39 @@ pub struct MkvDemuxer {
     /// megabyte and it is reframed, not handed over, so the read needs a
     /// landing place of its own.
     scratch: Vec<u8>,
+    /// The file's own number for the block handed out next -- an index into
+    /// `blocks` only after `base` is taken off it.
     next: usize,
+    /// The file's number for `blocks[0]`; `0` whenever the index is the whole
+    /// walk, which is what makes the two paths one lookup.
+    base: usize,
+    /// The keyframe index off the file's `Cues`, empty for a file walked whole.
+    cues: Vec<Cue>,
+    /// Where the next cluster to be walked into the window begins, and where the
+    /// segment it belongs to starts and ends.
+    reach: u64,
+    segment: (u64, u64),
+    /// `TrackNumber` of the picture, which the lazy walk needs to filter the
+    /// clusters it opens later by.
+    number: u64,
+    /// How many blocks the track has in the whole file: `blocks.len()` for a
+    /// walked file, and for a cued one the last cue's index plus the blocks
+    /// after it, counted at open ([`Self::count_frames`]). Exact either way --
+    /// it is the clip's length on the timeline.
+    frames: usize,
+    /// Whether `blocks` is the whole file rather than a window: what
+    /// [`probe_bitrate`] needs before it adds block lengths up, and what says a
+    /// read past the end of `blocks` is the end of the track and not a cluster
+    /// nobody has walked yet.
+    complete: bool,
     /// What the track's `ContentEncodings` asks of every block; [`Unpack::None`]
     /// for a file that declares none, which is most of them.
     unpack: Unpack,
-    /// Block bytes per `TrackNumber`, counted by the one walk the open already
-    /// does -- the sound track's as well as the picture's. [`probe_bitrate`] is
-    /// the only reader; see [`mkv_blocks`] for why it is collected here rather
-    /// than by a pass of its own.
+    /// Block bytes per `TrackNumber` over the clusters walked so far -- the
+    /// sound track's as well as the picture's, since a block's length is already
+    /// parsed on the way to skipping it. [`probe_bitrate`] is the only reader,
+    /// and it completes the index first: on a lazily opened file this holds the
+    /// window's tracks and not the file's.
     track_bytes: Vec<(u64, u64)>,
     /// `TrackNumber` of the file's first audio track, the one
     /// [`matroska_audio_codec`] also answers for; `None` for a silent file.
@@ -815,8 +869,47 @@ impl MkvDemuxer {
         if let Unpack::Refused(why) = &video.unpack {
             return Err(why.clone().into());
         }
-        let (blocks, span, track_bytes) = mkv_blocks(&mut file, segment, video.number)?;
-        if blocks.is_empty() {
+        // `DefaultDuration` is nanoseconds a frame and exact -- 33333333 for
+        // 30 fps, 41708333 for 23.976 -- and it is what turns a `CueTime` into a
+        // frame number, so a track that states one can be opened off the file's
+        // seek index. `TimestampScale` is nanoseconds a tick, so their ratio is
+        // ticks a frame, which is the unit `Cues` speak in.
+        let ticks_per_frame = video
+            .default_duration
+            .map(|ns| ns as f64 / video.timestamp_scale as f64)
+            .filter(|&t| t > 0.0);
+        let cues = match ticks_per_frame {
+            Some(ticks) => mkv_cues(&mut file, segment, video.number, ticks)?,
+            None => Vec::new(),
+        };
+        let mut mkv = Self {
+            file,
+            blocks: Vec::new(),
+            codec: video.codec,
+            config: video.config,
+            nal_length: video.nal_length,
+            bit_depth: video.bit_depth,
+            light: video.light,
+            scratch: Vec::new(),
+            next: 0,
+            base: 0,
+            cues,
+            reach: segment.0,
+            segment,
+            number: video.number,
+            frames: 0,
+            complete: false,
+            unpack: video.unpack,
+            track_bytes: Vec::new(),
+            audio_number: audio.first().map(|t| t.number),
+            container_secs,
+        };
+        // What the first cluster holds, and -- for a cued file -- how many
+        // blocks there are in the whole of it. Either answer may find the cue
+        // index unusable and fall back to the walk, which is why the frame count
+        // is read off the demuxer afterwards rather than returned from here.
+        mkv.count_frames()?;
+        if mkv.frames == 0 {
             return Err(format!(
                 "the {} track in this Matroska file has no frames",
                 video.codec.name()
@@ -824,11 +917,12 @@ impl MkvDemuxer {
             .into());
         }
         // Timing, in this order: what the track declares, then what its own
-        // timestamps say. `DefaultDuration` is nanoseconds and exact -- 33333333
-        // for 30 fps, 41708333 for 23.976 -- which is the whole reason it is
-        // preferred; the fallback measures the presentation span instead, and
-        // that is in `TimestampScale` ticks (a millisecond, as good as every
-        // muxer writes), so it lands within ~0.05 % rather than exactly.
+        // timestamps say. `DefaultDuration` is preferred for being exact; the
+        // fallback measures the presentation span instead, and that is in
+        // `TimestampScale` ticks (a millisecond, as good as every muxer writes),
+        // so it lands within ~0.05 % rather than exactly. Only a file with no
+        // `DefaultDuration` reaches it, and such a file was walked whole just
+        // above -- the span is the window's, and the window is the file.
         //
         // ponytail: a genuinely variable-rate file is averaged to one rate here,
         // because a timeline frame is a fixed slice of a second everywhere else
@@ -836,49 +930,238 @@ impl MkvDemuxer {
         // a project-wide change, not a demuxer one.
         let frame_rate = match video.default_duration {
             Some(ns) => 1e9 / ns as f64,
-            None => match span {
-                Some((first, last)) if last > first && blocks.len() > 1 => {
-                    (blocks.len() - 1) as f64 * 1e9
-                        / ((last - first) as f64 * video.timestamp_scale as f64)
+            None => {
+                let span = mkv
+                    .blocks
+                    .iter()
+                    .map(|b| b.ts)
+                    .min()
+                    .zip(mkv.blocks.iter().map(|b| b.ts).max());
+                match span {
+                    Some((first, last)) if last > first && mkv.blocks.len() > 1 => {
+                        (mkv.blocks.len() - 1) as f64 * 1e9
+                            / ((last - first) as f64 * video.timestamp_scale as f64)
+                    }
+                    // Nothing said and nothing measurable: `fps_from_stts`
+                    // answers an mp4 with no timing the same way.
+                    _ => 0.0,
                 }
-                // Nothing said and nothing measurable: `fps_from_stts` answers
-                // an mp4 with no timing the same way.
-                _ => 0.0,
-            },
+            }
         };
         let meta = VideoMeta {
             width: video.width,
             height: video.height,
             frame_rate,
-            frame_count: blocks.len() as u32,
+            frame_count: mkv.frames as u32,
             codec: video.codec,
             // `config` is the parameter sets by now -- Annex-B for H.264 and
             // HEVC, the sequence header OBU for AV1 -- which is what the
             // bitstream tier reads.
             color: ColorDescription::resolve(
                 video.tags,
-                bitstream_tags(video.codec, &video.config),
+                bitstream_tags(video.codec, &mkv.config),
                 video.height,
             ),
         };
-        Ok((
-            meta,
-            Self {
-                file,
-                blocks,
-                codec: video.codec,
-                config: video.config,
-                nal_length: video.nal_length,
-                bit_depth: video.bit_depth,
-                light: video.light,
-                scratch: Vec::new(),
-                next: 0,
-                unpack: video.unpack,
-                track_bytes,
-                audio_number: audio.first().map(|t| t.number),
-                container_secs,
-            },
-        ))
+        Ok((meta, mkv))
+    }
+
+    /// How many blocks the track has, and a window ready at the front of the
+    /// file for the read that follows.
+    ///
+    /// For a walked file that is the walk's own length. For a cued one it is the
+    /// **last cue's index plus the blocks after it**, counted by walking from
+    /// that cue to the end of the segment -- one cue interval, ten seconds of
+    /// film, rather than all of it. Exact at open, not a duration times a rate
+    /// corrected later: a clip's length on the timeline is the first thing the
+    /// UI shows and the last thing that may move under it.
+    ///
+    /// The first cluster is walked before that, so the cue arithmetic is checked
+    /// against real blocks at index 0 (where the file's own numbering starts)
+    /// before anything is counted off it.
+    fn count_frames(&mut self) -> crate::Result<()> {
+        if self.cues.is_empty() {
+            return self.complete_index();
+        }
+        self.walk_cluster()?;
+        if !self.cues_agree() {
+            return self.complete_index();
+        }
+        let Some(&last) = self.cues.last() else {
+            return self.complete_index();
+        };
+        self.jump(last)?;
+        while self.walk_cluster()? {}
+        if !self.complete {
+            self.frames = self.base + self.blocks.len();
+            // Back to the front: what a decoder asks for first is frame 0, and
+            // the tail window is the wrong end of the file for it.
+            self.blocks.clear();
+            self.track_bytes.clear();
+            self.base = 0;
+            self.reach = self.segment.0;
+        }
+        Ok(())
+    }
+
+    /// The whole segment walked, as every open used to do it: what a file with
+    /// no usable `Cues` gets, and what a cue index caught disagreeing with the
+    /// file's own blocks degrades to. Idempotent, and the only thing that sets
+    /// [`Self::complete`].
+    fn complete_index(&mut self) -> crate::Result<()> {
+        if self.complete {
+            return Ok(());
+        }
+        let (blocks, _, track_bytes) = mkv_blocks(&mut self.file, self.segment, self.number)?;
+        self.frames = blocks.len();
+        self.blocks = blocks;
+        self.track_bytes = track_bytes;
+        self.base = 0;
+        self.reach = self.segment.1;
+        self.cues.clear();
+        self.complete = true;
+        Ok(())
+    }
+
+    /// Walks the next `Cluster` at or after [`Self::reach`] onto the end of the
+    /// window. `false` once the segment is out of clusters.
+    fn walk_cluster(&mut self) -> crate::Result<bool> {
+        let Self {
+            file,
+            blocks,
+            track_bytes,
+            reach,
+            segment,
+            number,
+            ..
+        } = self;
+        let mut laced = Vec::new();
+        while let Some((id, body, stop)) = ebml_element(file, *reach, segment.1)? {
+            *reach = stop;
+            if id != CLUSTER {
+                continue;
+            }
+            mkv_cluster(file, body, stop, *number, blocks, track_bytes, &mut laced)?;
+            // Per window rather than per file, which is the one thing the two
+            // paths do differently: the last lace of a window has no block after
+            // it *yet*. Video is never laced -- lacing is a sound-track trick,
+            // and `MkvAudio` reads sound off the whole walk -- so this is a
+            // difference of principle rather than one anything exercises.
+            mkv_spread_laces(blocks, &laced);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Where the block a cue names sits in the window, and what the file's own
+    /// number for that block is -- `None` when the window does not hold it.
+    ///
+    /// The second number is the whole subtlety of reading `Cues`. A cue states a
+    /// *timestamp*, and a Matroska timestamp is a presentation time: a stream
+    /// with B-frames does not store its blocks in that order, so the count of
+    /// frames shown before a cue is not the count of blocks written before it.
+    /// The difference is exactly the blocks that sit *after* this one in the
+    /// file and are shown before it -- the encoder's reordering depth, two or
+    /// three frames -- and it is counted here, in the window that block was
+    /// found in, rather than assumed to be zero. Assumed zero, a 60-frame HEVC
+    /// fixture reports 62 frames and seeks two frames past every cut.
+    fn anchor(&self, cue: Cue) -> Option<(usize, usize)> {
+        let at = self.blocks.iter().position(|b| b.ts == cue.time)?;
+        let lag = self.blocks[at + 1..]
+            .iter()
+            .filter(|b| b.ts < cue.time)
+            .count();
+        Some((at, cue.index.checked_sub(lag)?))
+    }
+
+    /// Every cue the window reaches names a block whose timestamp it states, at
+    /// the index the arithmetic says.
+    ///
+    /// This is what makes a cue index safe to count frames off: `CueTime` over
+    /// `DefaultDuration` is a frame number only while the track really runs at
+    /// that rate, and a file where it does not -- a variable-rate capture, a
+    /// muxer whose cue times name no block at all -- is caught here, wherever
+    /// the walk meets a cue, and degrades to the whole walk rather than seeking
+    /// to a frame that is not the one asked for.
+    ///
+    /// Cues within [`REORDER`] of the far end of the window are left for the
+    /// next cluster: their own reordering has not been walked yet, so checking
+    /// them here would fail a file that is perfectly consistent.
+    fn cues_agree(&self) -> bool {
+        let end = (self.base + self.blocks.len()).saturating_sub(REORDER);
+        self.cues
+            .iter()
+            .filter(|c| (self.base..end).contains(&c.index))
+            .all(|&c| matches!(self.anchor(c), Some((at, index)) if self.base + at == index))
+    }
+
+    /// Drops the window and rebuilds it at `cue`'s cluster: the one place the
+    /// file is read out of order, and the whole point of parsing `Cues`.
+    ///
+    /// The cue's own block is found in that cluster by the timestamp the cue
+    /// states, and [`Self::anchor`]'s number for it is what fixes the window's
+    /// `base` -- so a cue naming the third block of its cluster still leaves the
+    /// two before it numbered as the file numbers them.
+    fn jump(&mut self, cue: Cue) -> crate::Result<()> {
+        self.blocks.clear();
+        self.track_bytes.clear();
+        self.base = cue.index;
+        self.reach = cue.cluster;
+        self.walk_cluster()?;
+        // Enough of the file past the cue's own block to count what was
+        // reordered around it, which the last cluster of a segment may not have.
+        while self
+            .blocks
+            .iter()
+            .position(|b| b.ts == cue.time)
+            .is_some_and(|at| self.blocks.len() < at + 1 + REORDER)
+            && self.walk_cluster()?
+        {}
+        match self.anchor(cue) {
+            Some((at, index)) if index >= at => self.base = index - at,
+            // The cluster the cue points at does not hold the block it names, or
+            // names it at an index the file cannot have: the index is not
+            // describing this file, so stop believing it.
+            _ => self.complete_index()?,
+        }
+        Ok(())
+    }
+
+    /// Walks clusters until the window holds the file's block `want`, or until
+    /// the segment runs out of them.
+    fn extend_to(&mut self, want: usize) -> crate::Result<()> {
+        while !self.complete && self.base + self.blocks.len() <= want {
+            if !self.walk_cluster()? {
+                break;
+            }
+            if !self.cues_agree() {
+                return self.complete_index();
+            }
+        }
+        Ok(())
+    }
+
+    /// The window that holds the file's block `frame`, starting at a keyframe at
+    /// or before it -- the cue at or before `frame`, which is where the walk
+    /// this replaces would have found one too.
+    ///
+    /// Reached forward where the window already runs that far (playing on
+    /// through a cue costs no jump), rebuilt at the cue where it does not.
+    fn window_for(&mut self, frame: usize) -> crate::Result<()> {
+        if self.complete {
+            return Ok(());
+        }
+        let Some(cue) = self.cues.iter().rposition(|c| c.index <= frame) else {
+            // A file cued from somewhere after its own first frame, seeked to
+            // before the first cue: nothing indexes that stretch, so the walk
+            // does.
+            return self.complete_index();
+        };
+        let cue = self.cues[cue];
+        if !(self.base..self.base + self.blocks.len()).contains(&cue.index) {
+            self.jump(cue)?;
+        }
+        self.extend_to(frame)
     }
 
     /// Next access unit in decode order: the block verbatim for AV1, which is
@@ -886,7 +1169,17 @@ impl MkvDemuxer {
     /// Annex-B for HEVC and H.264, whose blocks hold the same length-prefixed
     /// NALs an mp4 sample does.
     fn next_access_unit(&mut self) -> crate::Result<Option<Vec<u8>>> {
-        let Some(&block) = self.blocks.get(self.next) else {
+        // Reading off the end of the window is not the end of the track: it is
+        // the next cluster, not yet walked. The end of the track is the end of
+        // the segment, which is what `extend_to` stops at.
+        if self.next >= self.base + self.blocks.len() {
+            self.extend_to(self.next)?;
+        }
+        let Some(&block) = self
+            .next
+            .checked_sub(self.base)
+            .and_then(|i| self.blocks.get(i))
+        else {
             return Ok(None);
         };
         self.next += 1;
@@ -918,14 +1211,26 @@ impl MkvDemuxer {
     /// As [`Mp4Demuxer::seek_to_sync_at_or_before`]. Never negative: Matroska
     /// has no edit list, so block 0 is frame 0.
     fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
-        let target = (frame as usize).min(self.blocks.len().saturating_sub(1));
+        let target = (frame as usize).min(self.frames.saturating_sub(1));
+        // The window that holds it, off the `Cues`. A file that cannot be
+        // indexed that way answers here by having been walked whole -- either at
+        // open or by this call -- so a read error is not a refusal, it is the
+        // window staying where it was.
+        let _ = self.window_for(target);
+        let local = target
+            .saturating_sub(self.base)
+            .min(self.blocks.len().saturating_sub(1));
         // The keyframe at or before the target, or -- for a stream whose first
         // block is not one -- the earliest block there is, which is the only
-        // place a decoder can be started from anyway.
-        self.next = self.blocks[..=target]
-            .iter()
-            .rposition(|b| b.key)
+        // place a decoder can be started from anyway. The window starts at a cue,
+        // which *is* a keyframe, so "the earliest block there is" is the same
+        // block the whole walk would have landed on.
+        let chosen = self
+            .blocks
+            .get(..=local)
+            .and_then(|window| window.iter().rposition(|b| b.key))
             .unwrap_or(0);
+        self.next = self.base + chosen;
         self.next as i64
     }
 }
@@ -1263,6 +1568,19 @@ const CONTENT_ENCODING_TYPE: u32 = 0x5033;
 const CONTENT_COMPRESSION: u32 = 0x5034;
 const CONTENT_COMP_ALGO: u32 = 0x4254;
 const CONTENT_COMP_SETTINGS: u32 = 0x4255;
+// The seek index and the table of contents that points at it. `SeekHead` is
+// how a file whose `Cues` sit at the far end -- which is where every muxer but
+// `-cues_to_front` writes them -- is found without reading what is in between.
+const SEEK_HEAD: u32 = 0x114D_9B74;
+const SEEK: u32 = 0x4DBB;
+const SEEK_ID: u32 = 0x53AB;
+const SEEK_POSITION: u32 = 0x53AC;
+const CUES: u32 = 0x1C53_BB6B;
+const CUE_POINT: u32 = 0xBB;
+const CUE_TIME: u32 = 0xB3;
+const CUE_TRACK_POSITIONS: u32 = 0xB7;
+const CUE_TRACK: u32 = 0xF7;
+const CUE_CLUSTER_POSITION: u32 = 0xF1;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -1788,6 +2106,188 @@ fn vp9_bit_depth(au: &[u8]) -> crate::Result<Option<u8>> {
     }
 }
 
+/// How many blocks past a cue's own the walk looks to count what the encoder
+/// reordered around it ([`MkvDemuxer::anchor`]). Wider than any real stream
+/// needs: H.264 and HEVC cap `max_num_reorder_frames` at 16, and what a muxer
+/// actually writes is two or three.
+///
+/// ponytail: a stream that reorders further than this would have its blocks
+/// numbered a frame or two off. The upgrade path is the bitstream's own
+/// `max_num_reorder_frames` out of the SPS, which this demuxer does not parse;
+/// [`MkvDemuxer::cues_agree`] is what stands between that file and a wrong seek
+/// in the meantime -- it degrades to the whole walk instead.
+const REORDER: usize = 32;
+
+/// One `CuePoint` of the picture track: the timestamp it names, which block of
+/// the track that timestamp *is*, and where the `Cluster` holding it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cue {
+    /// `CueTime`, in `TimestampScale` ticks -- the block's own timestamp, which
+    /// is what picks it out of its cluster once that cluster is walked.
+    time: i64,
+    /// How many frames are *shown* before it: `CueTime` over the track's
+    /// `DefaultDuration`. Matroska indexes time and everything above this
+    /// demuxer counts frames, so this one division is what the lazy index rests
+    /// on -- and it is a display count, which on a stream with B-frames is not
+    /// the block's place in the file ([`MkvDemuxer::anchor`] takes the
+    /// difference out). [`MkvDemuxer::cues_agree`] checks the whole arithmetic
+    /// against the file's own blocks wherever the walk meets a cue.
+    index: usize,
+    /// Absolute file offset of that `Cluster`; `CueClusterPosition` states it
+    /// relative to the start of the segment's payload.
+    cluster: u64,
+}
+
+/// The picture track's `Cues` in index order, empty for a file carrying none
+/// this can use -- Matroska's own seek index, which is what a player reads
+/// instead of the film to know where its keyframes are.
+///
+/// Approach referenced from `matroska-demuxer 0.8.1` (hasenbanck), which
+/// resolves a seek the same way: the `CueTrackPositions` of the wanted track,
+/// its `CueClusterPosition` off the segment, then that cluster. The parsing is
+/// this file's own EBML reader -- no dependency is added for four elements.
+///
+/// `ticks_per_frame` is the track's `DefaultDuration` in `TimestampScale`
+/// ticks. Without it a cue time cannot become a frame number at all, which is
+/// why the caller keeps the whole walk for a track that declares no duration.
+fn mkv_cues(
+    file: &mut File,
+    segment: (u64, u64),
+    number: u64,
+    ticks_per_frame: f64,
+) -> crate::Result<Vec<Cue>> {
+    let Some((body, end)) = mkv_cues_element(file, segment)? else {
+        return Ok(Vec::new());
+    };
+    // Read whole and parsed in memory, not element by element through the file:
+    // a 2160p film's index is ten thousand cue points and a hundred thousand
+    // EBML elements, and one `pread` apiece is 120 ms of open against 5 ms. The
+    // ceiling is what keeps a crafted header from asking for all the memory
+    // there is -- an hour of 24 fps cues to about 200 KB.
+    const LIMIT: u64 = 64 << 20;
+    if end.saturating_sub(body) > LIMIT {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; (end - body) as usize];
+    read_exact_at(file, body, &mut buf)?;
+    let mut cues = Vec::new();
+    let mut at = 0;
+    while let Some((id, body, stop)) = ebml_in(&buf, at) {
+        at = stop;
+        if id != CUE_POINT {
+            continue;
+        }
+        let (mut time, mut cluster) = (None, None);
+        let mut child = body;
+        while let Some((id, body, stop)) = ebml_in(&buf[..stop], child) {
+            child = stop;
+            match id {
+                CUE_TIME => time = Some(uint_in(&buf, body, stop) as i64),
+                // One `CuePoint` carries a position per track -- a film's
+                // picture and its sound are cued at the same instant -- so the
+                // picture's is picked by `CueTrack` and the others skipped.
+                // Taking them all is an index three times too long, two thirds
+                // of it naming another track's clusters: his AV1 remux writes
+                // 3928 `CueTrackPositions` for 1174 keyframes.
+                CUE_TRACK_POSITIONS => {
+                    let (mut track, mut pos) = (None, None);
+                    let mut child = body;
+                    while let Some((id, body, stop)) = ebml_in(&buf[..stop], child) {
+                        child = stop;
+                        match id {
+                            CUE_TRACK => track = Some(uint_in(&buf, body, stop)),
+                            CUE_CLUSTER_POSITION => pos = Some(uint_in(&buf, body, stop)),
+                            _ => {}
+                        }
+                    }
+                    if track == Some(number) {
+                        cluster = cluster.or(pos);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(time), Some(cluster)) = (time, cluster) {
+            cues.push(Cue {
+                time,
+                index: (time as f64 / ticks_per_frame).round().max(0.0) as usize,
+                cluster: segment.0 + cluster,
+            });
+        }
+    }
+    // In index order whatever order the file wrote them in: the seek picks the
+    // last cue at or before a frame, which is a statement about a sorted list.
+    cues.sort_unstable_by_key(|c| c.index);
+    Ok(cues)
+}
+
+/// Body range of the segment's `Cues` element: found among the header elements
+/// where a muxer wrote it in front of the clusters (`ffmpeg -cues_to_front`),
+/// and through the `SeekHead` where it wrote it at the far end, which is where
+/// nearly every file has it. `None` for a file with neither -- a live capture,
+/// a stream remuxed without an index -- which is the file that keeps the walk.
+fn mkv_cues_element(file: &mut File, segment: (u64, u64)) -> crate::Result<Option<(u64, u64)>> {
+    let mut seek = None;
+    let mut at = segment.0;
+    while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        at = stop;
+        match id {
+            CUES => return Ok(Some((body, stop))),
+            SEEK_HEAD => seek = seek.or(mkv_seek_position(file, body, stop, CUES)?),
+            // Past here the file is clusters, which is what this exists not to
+            // read.
+            CLUSTER => break,
+            _ => {}
+        }
+    }
+    let Some(pos) = seek else {
+        return Ok(None);
+    };
+    // The pointer is believed only as far as the element it lands on: a stale
+    // `SeekHead` -- a file edited by a tool that moved the index and left the
+    // table behind -- points at something that is not `Cues`, and reading that
+    // as one is a seek into the middle of a frame.
+    match ebml_element(file, segment.0 + pos, segment.1)? {
+        Some((CUES, body, stop)) => Ok(Some((body, stop))),
+        _ => Ok(None),
+    }
+}
+
+/// Where a `SeekHead` says the element with id `want` is, relative to the start
+/// of the segment's payload. Only the one level: a `SeekHead` pointing at
+/// another `SeekHead` (what a muxer writes when it appends an index later) is
+/// not followed, and that file falls back to the walk rather than to a guess.
+fn mkv_seek_position(
+    file: &mut File,
+    body: u64,
+    end: u64,
+    want: u32,
+) -> crate::Result<Option<u64>> {
+    let mut at = body;
+    while let Some((id, body, stop)) = ebml_element(file, at, end)? {
+        at = stop;
+        if id != SEEK {
+            continue;
+        }
+        let (mut found, mut pos) = (None, None);
+        let mut child = body;
+        while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
+            child = stop;
+            match id {
+                // The id is written as the element's own bytes, marker bit and
+                // all -- the same number this file's constants are.
+                SEEK_ID => found = Some(ebml_uint(file, body, stop)?),
+                SEEK_POSITION => pos = Some(ebml_uint(file, body, stop)?),
+                _ => {}
+            }
+        }
+        if found == Some(u64::from(want)) && pos.is_some() {
+            return Ok(pos);
+        }
+    }
+    Ok(None)
+}
+
 /// Every block of track `number`, in storage order, with the presentation span
 /// (first and last timestamp in `TimestampScale` ticks) the frame-rate fallback
 /// needs -- and, third, how many block bytes *every* track of the file spends,
@@ -1820,85 +2320,126 @@ fn mkv_blocks(
         if id != CLUSTER {
             continue;
         }
-        let mut cluster_ts = 0i64;
-        let mut child = body;
-        while let Some((id, body, stop)) = ebml_element(file, child, stop)? {
-            child = stop;
-            let (block, key) = match id {
-                CLUSTER_TIMESTAMP => {
-                    cluster_ts = ebml_uint(file, body, stop)? as i64;
-                    continue;
-                }
-                SIMPLE_BLOCK => {
-                    let block = mkv_block(file, body, stop)?;
-                    // Bit 7 of the flags is the keyframe bit; a `Block` inside a
-                    // `BlockGroup` has no such bit, which is the case below.
-                    (block, block.flags & 0x80 != 0)
-                }
-                BLOCK_GROUP => {
-                    let (mut found, mut key) = (None, true);
-                    let mut child = body;
-                    while let Some(e) = ebml_element(file, child, stop)? {
-                        match e.0 {
-                            BLOCK => found = Some(mkv_block(file, e.1, e.2)?),
-                            // A block that references another is not one a
-                            // decoder can be started from.
-                            REFERENCE_BLOCK => key = false,
-                            _ => {}
-                        }
-                        child = e.2;
-                    }
-                    match found {
-                        Some(block) => (block, key),
-                        None => continue,
-                    }
-                }
-                _ => continue,
-            };
-            // Before the track filter, so this counts the whole file: the block
-            // as it sits on disk, lace header included, which is what that track
-            // costs the container. No read is added -- `len` came out of the
-            // header that was parsed to get here.
-            match track_bytes.iter_mut().find(|(n, _)| *n == block.number) {
-                Some((_, bytes)) => *bytes += block.len as u64,
-                None => track_bytes.push((block.number, block.len as u64)),
-            }
-            if block.number != number {
-                continue;
-            }
-            let ts = cluster_ts + i64::from(block.rel);
-            if block.flags & 0x06 == 0 {
-                blocks.push(Block {
-                    at: block.at,
-                    len: block.len,
-                    key,
-                    ts,
-                });
-                continue;
-            }
-            // A laced block is several frames behind a header of sizes: one
-            // `Block` each, and only the first of them is a point a decoder can
-            // be started from -- the rest are inside the same lace.
-            let start = blocks.len();
-            for (i, (at, len)) in mkv_lace(file, &block)?.into_iter().enumerate() {
-                blocks.push(Block {
-                    at,
-                    len,
-                    key: key && i == 0,
-                    ts,
-                });
-            }
-            laced.push((start, blocks.len() - start));
-        }
+        mkv_cluster(
+            file,
+            body,
+            stop,
+            number,
+            &mut blocks,
+            &mut track_bytes,
+            &mut laced,
+        )?;
     }
-    // The lace fixup: a laced block writes one timestamp for all its frames, and
-    // stacking six E-AC-3 frames on one instant is a sound track that drifts a
-    // fifth of a second away from the picture inside a cluster. The gap to the
-    // next block of the same track is what the lace really spans, so the frames
-    // are spread across it; the last lace of a file has no block after it and
-    // keeps the step the one before it measured.
+    mkv_spread_laces(&mut blocks, &laced);
+    let span = blocks
+        .iter()
+        .map(|b| b.ts)
+        .min()
+        .zip(blocks.iter().map(|b| b.ts).max());
+    Ok((blocks, span, track_bytes))
+}
+
+/// One `Cluster`'s blocks, appended: those of track `number` to `blocks`, and
+/// every track's byte count to `track_bytes`. The laces met on the way are
+/// recorded in `laced` for [`mkv_spread_laces`], which the caller runs once its
+/// walk is over -- a lace's real span is measured against the block *after* it,
+/// which the next cluster may hold.
+///
+/// Split out of [`mkv_blocks`] so the lazy index ([`MkvDemuxer::walk_cluster`])
+/// walks a cluster by exactly the code the whole-segment walk does: two readers
+/// of one container that disagreed about what a block is would be two different
+/// files to seek in.
+fn mkv_cluster(
+    file: &mut File,
+    body: u64,
+    end: u64,
+    number: u64,
+    blocks: &mut Vec<Block>,
+    track_bytes: &mut Vec<(u64, u64)>,
+    laced: &mut Vec<(usize, usize)>,
+) -> crate::Result<()> {
+    let mut cluster_ts = 0i64;
+    let mut child = body;
+    while let Some((id, body, stop)) = ebml_element(file, child, end)? {
+        child = stop;
+        let (block, key) = match id {
+            CLUSTER_TIMESTAMP => {
+                cluster_ts = ebml_uint(file, body, stop)? as i64;
+                continue;
+            }
+            SIMPLE_BLOCK => {
+                let block = mkv_block(file, body, stop)?;
+                // Bit 7 of the flags is the keyframe bit; a `Block` inside a
+                // `BlockGroup` has no such bit, which is the case below.
+                (block, block.flags & 0x80 != 0)
+            }
+            BLOCK_GROUP => {
+                let (mut found, mut key) = (None, true);
+                let mut child = body;
+                while let Some(e) = ebml_element(file, child, stop)? {
+                    match e.0 {
+                        BLOCK => found = Some(mkv_block(file, e.1, e.2)?),
+                        // A block that references another is not one a
+                        // decoder can be started from.
+                        REFERENCE_BLOCK => key = false,
+                        _ => {}
+                    }
+                    child = e.2;
+                }
+                match found {
+                    Some(block) => (block, key),
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+        // Before the track filter, so this counts the whole file: the block
+        // as it sits on disk, lace header included, which is what that track
+        // costs the container. No read is added -- `len` came out of the
+        // header that was parsed to get here.
+        match track_bytes.iter_mut().find(|(n, _)| *n == block.number) {
+            Some((_, bytes)) => *bytes += block.len as u64,
+            None => track_bytes.push((block.number, block.len as u64)),
+        }
+        if block.number != number {
+            continue;
+        }
+        let ts = cluster_ts + i64::from(block.rel);
+        if block.flags & 0x06 == 0 {
+            blocks.push(Block {
+                at: block.at,
+                len: block.len,
+                key,
+                ts,
+            });
+            continue;
+        }
+        // A laced block is several frames behind a header of sizes: one
+        // `Block` each, and only the first of them is a point a decoder can
+        // be started from -- the rest are inside the same lace.
+        let start = blocks.len();
+        for (i, (at, len)) in mkv_lace(file, &block)?.into_iter().enumerate() {
+            blocks.push(Block {
+                at,
+                len,
+                key: key && i == 0,
+                ts,
+            });
+        }
+        laced.push((start, blocks.len() - start));
+    }
+    Ok(())
+}
+
+/// The lace fixup: a laced block writes one timestamp for all its frames, and
+/// stacking six E-AC-3 frames on one instant is a sound track that drifts a
+/// fifth of a second away from the picture inside a cluster. The gap to the
+/// next block of the same track is what the lace really spans, so the frames
+/// are spread across it; the last lace of a walk has no block after it and
+/// keeps the step the one before it measured.
+fn mkv_spread_laces(blocks: &mut [Block], laced: &[(usize, usize)]) {
     let mut step = 0.0;
-    for (start, count) in laced {
+    for &(start, count) in laced {
         let first = blocks[start].ts;
         if let Some(next) = blocks
             .get(start + count)
@@ -1911,12 +2452,6 @@ fn mkv_blocks(
             blocks[start + i].ts = first + (i as f64 * step).round() as i64;
         }
     }
-    let span = blocks
-        .iter()
-        .map(|b| b.ts)
-        .min()
-        .zip(blocks.iter().map(|b| b.ts).max());
-    Ok((blocks, span, track_bytes))
 }
 
 /// The frames inside a laced block: one `(offset, length)` each, in order.
@@ -2083,6 +2618,31 @@ fn ebml_vint(buf: &[u8], strip: bool) -> crate::Result<(u64, usize)> {
 
 /// An EBML unsigned integer element: big-endian, as many bytes as it was
 /// written with, and an absent one is a zero by the spec's own default.
+/// The EBML element at `at` inside a slice already in memory: its id, where its
+/// payload starts and where the element ends. `None` at the end of the slice,
+/// and for a header claiming more bytes than the slice holds -- which is how a
+/// caller bounds a child to its parent, by handing over the parent's bytes.
+///
+/// The file-backed [`ebml_element`] costs a `pread` an element, which is right
+/// for the handful a header is and wrong for the hundred thousand a film's
+/// `Cues` are. Same shapes, same unknown-length rule left out: a `Cues` element
+/// of unknown length is one nobody has finished writing.
+fn ebml_in(buf: &[u8], at: usize) -> Option<(u32, usize, usize)> {
+    let head = buf.get(at..).filter(|h| !h.is_empty())?;
+    let (id, id_len) = ebml_vint(head, false).ok()?;
+    let (size, size_len) = ebml_vint(head.get(id_len..)?, true).ok()?;
+    let body = at + id_len + size_len;
+    let stop = body.checked_add(usize::try_from(size).ok()?)?;
+    (stop <= buf.len()).then_some((u32::try_from(id).ok()?, body, stop))
+}
+
+/// An unsigned EBML integer out of a slice, big-endian as they all are.
+fn uint_in(buf: &[u8], body: usize, stop: usize) -> u64 {
+    buf[body..stop]
+        .iter()
+        .fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
+}
+
 fn ebml_uint(file: &mut File, body: u64, stop: u64) -> crate::Result<u64> {
     Ok(ebml_bytes(file, body, stop)?
         .iter()
@@ -2801,6 +3361,131 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asset(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    }
+
+    /// Every Matroska fixture in `assets`, whichever of them holds a picture
+    /// this reads: the audio-only and subtitle-only ones refuse to open and are
+    /// not the subject here, so they are skipped by name of their own refusal.
+    fn matroska_fixtures() -> Vec<std::path::PathBuf> {
+        let mut found: Vec<_> = std::fs::read_dir(asset(""))
+            .expect("the assets directory -- run scripts/gen_fixtures.sh")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| is_matroska(p))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// **The lazy index is the same index.** For every Matroska fixture, the
+    /// window built off the file's `Cues` and the whole-segment walk it replaced
+    /// agree on: the block list, the frame count, and where every one of the
+    /// file's frames seeks to.
+    ///
+    /// This is the claim the `Cues` path rests on -- a seek index read out of
+    /// the container is only worth having while it lands on the block the walk
+    /// would have landed on -- and it is asserted per frame rather than sampled.
+    #[test]
+    fn the_cue_index_and_the_whole_walk_are_the_same_index() {
+        let (mut cued, mut compared) = (0, 0);
+        for path in matroska_fixtures() {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let Ok((meta, mut lazy)) = MkvDemuxer::open(&path) else {
+                continue;
+            };
+            compared += 1;
+            cued += usize::from(!lazy.complete);
+            // The walk, built beside it out of the same file.
+            let mut file = File::open(&path).expect(&name);
+            let (walk, _, _) = mkv_blocks(&mut file, lazy.segment, lazy.number).expect(&name);
+
+            assert_eq!(
+                meta.frame_count as usize,
+                walk.len(),
+                "{name}: the frame count off the cues is not the walk's"
+            );
+            // The window grown to the whole file is the whole walk, block for
+            // block -- offsets, lengths, keyframe flags and timestamps.
+            let mut whole = MkvDemuxer::open(&path).expect(&name).1;
+            whole.extend_to(usize::MAX).expect(&name);
+            assert_eq!(whole.base, 0, "{name}: a sequential read moved the base");
+            assert_eq!(whole.blocks, walk, "{name}: the lazy walk is not the walk");
+            // ...and every seek lands where the walk's own rule says, jumping
+            // backwards and forwards through the cues to get there.
+            for frame in (0..walk.len()).chain((0..walk.len()).rev()) {
+                let landed = lazy.seek_to_sync_at_or_before(frame as u32);
+                let want = walk[..=frame].iter().rposition(|b| b.key).unwrap_or(0);
+                assert_eq!(landed, want as i64, "{name}: seek to frame {frame}");
+                assert_eq!(
+                    lazy.blocks[lazy.next - lazy.base],
+                    walk[want],
+                    "{name}: the block frame {frame} lands on"
+                );
+            }
+        }
+        assert!(compared >= 12, "only {compared} Matroska fixtures opened");
+        assert!(
+            cued * 2 > compared,
+            "only {cued} of {compared} fixtures took the cue path -- the test is \
+             asserting the fallback against itself"
+        );
+    }
+
+    /// A file with no `Cues` at all -- legal, and what a live capture is -- is
+    /// the whole walk it always was, and answers every seek the same way.
+    ///
+    /// Made by hand rather than by a muxer: neither `ffmpeg` nor `mkvmerge`
+    /// writes a Matroska file without an index (ffmpeg's `-cues_to_front` moves
+    /// them, it cannot drop them), so the fixture is a real file with the `Cues`
+    /// element id and the `SeekHead` pointer at it overwritten by an id nothing
+    /// defines. Every byte else is where it was: an EBML reader skips an unknown
+    /// element, which is exactly the file that has no index.
+    #[test]
+    fn a_file_with_no_cues_is_the_walk_it_always_was() {
+        let source = asset("test_h264.mkv");
+        let mut bytes = std::fs::read(&source).expect("test_h264.mkv");
+        let cues = CUES.to_be_bytes();
+        // One byte down in the last nibble: still a well-formed 4-byte EBML id,
+        // and not one this reader (or the spec) knows.
+        let unknown = (CUES - 1).to_be_bytes();
+        let mut hidden = 0;
+        for at in 0..bytes.len().saturating_sub(4) {
+            if bytes[at..at + 4] == cues {
+                bytes[at..at + 4].copy_from_slice(&unknown);
+                hidden += 1;
+            }
+        }
+        assert!(
+            hidden >= 2,
+            "the fixture states its Cues neither in a SeekHead nor as an element"
+        );
+        let path = crate::scratch::Scratch::file("no_cues", "mkv");
+        std::fs::write(&path, &bytes).expect("the stripped fixture");
+
+        let (want, mut walked) = MkvDemuxer::open(&source).expect("the cued file");
+        let (got, mut fallback) = MkvDemuxer::open(&path).expect("the file with no cues");
+        assert!(
+            fallback.complete && fallback.cues.is_empty(),
+            "a file with no Cues was not walked whole"
+        );
+        assert!(
+            !walked.complete,
+            "the source fixture carries no usable Cues"
+        );
+        assert_eq!(got.frame_count, want.frame_count, "frame count");
+        assert_eq!(got.frame_rate, want.frame_rate, "frame rate");
+        for frame in 0..got.frame_count {
+            assert_eq!(
+                fallback.seek_to_sync_at_or_before(frame),
+                walked.seek_to_sync_at_or_before(frame),
+                "seek to frame {frame} without cues"
+            );
+        }
+    }
 
     /// What a `TrackEntry` states it is in, whichever of the two elements it
     /// states it in -- [`mkv_language`]'s whole rule, as asserts.
