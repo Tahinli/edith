@@ -7,6 +7,11 @@ edition.workspace = true
 name = "edith"
 path = "src/main.rs"
 
+[features]
+# The warm palette instead of the default cool one: same role names, different
+# numbers (`ui/theme.rs`). `cargo run -p edith --features warm`.
+warm = []
+
 [dependencies]
 engine = { path = "../engine" }
 gpui = "0.2.2"

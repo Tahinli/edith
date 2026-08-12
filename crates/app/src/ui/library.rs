@@ -279,7 +279,15 @@ impl Player {
                         // there, whatever tab is open and however narrow the
                         // window is.
                         width - 16.,
-                        BG_RAISED,
+                        // Filled with the accent while there is nothing to work
+                        // on, because with an empty library this *is* the
+                        // primary action -- and Export, which wears the accent
+                        // the rest of the time, is dimmed until something is
+                        // imported. One live accent in the window either way.
+                        match rows.is_empty() {
+                            true => ACCENT_PRIMARY,
+                            false => BG_RAISED,
+                        },
                         None,
                         "Import",
                         "adds a file to this list — or drop one on the window".to_string(),
