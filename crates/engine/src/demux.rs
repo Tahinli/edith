@@ -829,6 +829,12 @@ pub struct MkvDemuxer {
     /// reason, as the one [`Mp4Demuxer`] carries; for H.264 the SPS/PPS off the
     /// `avcC` beside it, which is that record's H.264 twin.
     config: Vec<u8>,
+    /// The `CodecPrivate` record verbatim; see [`MkvVideo::private`].
+    private: Vec<u8>,
+    /// Nanoseconds a timestamp tick is worth -- `TimestampScale`, a millisecond
+    /// in every file anything writes. What turns a block's own timestamp into
+    /// the nanoseconds a copy re-times it by.
+    timestamp_scale: u64,
     /// Bytes of the NAL length prefix an HEVC or H.264 block is written with;
     /// unused by AV1, whose block is one temporal unit and carries no prefixes.
     nal_length: usize,
@@ -942,6 +948,8 @@ impl MkvDemuxer {
             blocks: Vec::new(),
             codec: video.codec,
             config: video.config,
+            private: video.private,
+            timestamp_scale: video.timestamp_scale,
             nal_length: video.nal_length,
             bit_depth: video.bit_depth,
             light: video.light,
@@ -1399,6 +1407,95 @@ impl MkvDemuxer {
         // reordered, and never more than the reorder depth out.
         self.base as i64
     }
+
+    /// The picture track's `CodecPrivate` as the file holds it: what a copied
+    /// track is declared with, so the record and the blocks under it come out of
+    /// one file rather than two ([`MkvVideo::private`]).
+    pub fn codec_private(&self) -> &[u8] {
+        &self.private
+    }
+
+    /// How many coded blocks the picture track has -- the count
+    /// [`crate::VideoMeta::frame_count`] is, indexed the same way every seek and
+    /// every clip in point already indexes it.
+    ///
+    /// The track's own count and not the open window's: a file opened off its
+    /// `Cues` holds ten seconds of blocks and knows the length of all of them
+    /// ([`Self::count_frames`]), which is the number a clip was cut against.
+    pub fn block_count(&self) -> usize {
+        self.frames
+    }
+
+    /// Whether block `index` is one a decoder may be started from, which is what
+    /// makes it a place a copy may begin or end.
+    ///
+    /// Asks the whole index, because it is asked about any block of the file and
+    /// a window holds one stretch of it. That is the walk this demuxer otherwise
+    /// avoids -- paid once per source, by a caller that is about to read every
+    /// block anyway, and cheap on the second export of the same file
+    /// ([`Self::complete_index`] and the sidecar under it). A file that cannot be
+    /// walked answers `false`, which is a copy refused rather than a copy of the
+    /// wrong bytes.
+    pub fn is_sync(&mut self, index: usize) -> bool {
+        if self.complete_index().is_err() {
+            return false;
+        }
+        self.blocks.get(index).is_some_and(|b| b.key)
+    }
+
+    /// Whether the blocks are the codec's own bytes -- no `ContentEncodings`
+    /// stripping or compression over them. A copy of anything else would hand
+    /// the muxer bytes it would have to re-pack, which is no longer a copy.
+    pub fn plain_blocks(&self) -> bool {
+        self.unpack == Unpack::None
+    }
+
+    /// Block `index` exactly as it sits in the file: its bytes, whether it is a
+    /// sync point and when it is shown, in nanoseconds off the file's own clock.
+    ///
+    /// Presentation and not decode: Matroska blocks are stored in decode order
+    /// and timestamped in display order, so a stream with B-frames hands back
+    /// timestamps that step backwards -- which is exactly what a copy has to
+    /// preserve, and why this is not "block index times the frame duration".
+    ///
+    /// The bytes are borrowed from the read scratch and live until the next
+    /// call, as [`Self::next_access_unit`]'s do.
+    ///
+    /// `index` is the file's own block number, so this holds the whole index
+    /// rather than whatever window is open ([`Self::is_sync`] says why, and this
+    /// is the caller that makes the walk worth it: a copy reads every block).
+    pub fn coded_block(&mut self, index: usize) -> crate::Result<Option<CodedBlock<'_>>> {
+        self.complete_index()?;
+        let Some(&block) = self.blocks.get(index) else {
+            return Ok(None);
+        };
+        // The cursor moves with it, so a copy that stops and hands the file back
+        // to a decoder leaves it where a sequential read would.
+        self.next = index + 1;
+        let Self {
+            file,
+            scratch,
+            unpack,
+            ..
+        } = self;
+        scratch.resize(block.len, 0);
+        read_exact_at(file, block.at, scratch)?;
+        unpack.frame(scratch)?;
+        Ok(Some(CodedBlock {
+            bytes: &self.scratch,
+            key: block.key,
+            ts_ns: block.ts * self.timestamp_scale as i64,
+        }))
+    }
+}
+
+/// One coded picture as a file holds it, for the export's copy path
+/// ([`MkvDemuxer::coded_block`]): the very bytes the muxer writes back out, the
+/// sync flag a container states beside them, and when the picture is shown.
+pub struct CodedBlock<'a> {
+    pub bytes: &'a [u8],
+    pub key: bool,
+    pub ts_ns: i64,
 }
 
 /// The codec id of `path`'s first audio track (`A_AAC`, `A_OPUS`, ...), or
@@ -1574,6 +1671,13 @@ struct MkvVideo {
     timestamp_scale: u64,
     codec: Codec,
     config: Vec<u8>,
+    /// `CodecPrivate` as the file holds it -- the `hvcC`/`avcC`/`av1C` record
+    /// itself, before [`parse_hvcc`] and its siblings turn it into the
+    /// parameter sets `config` carries. Kept because a copy hands the very same
+    /// record to the muxer ([`MkvDemuxer::codec_private`]): a track written from
+    /// a re-derived record would declare a stream subtly other than the blocks
+    /// under it.
+    private: Vec<u8>,
     nal_length: usize,
     bit_depth: u8,
     unpack: Unpack,
@@ -2069,6 +2173,8 @@ fn mkv_track_entry(
     let Some(known) = mkv_codec(&codec) else {
         return Ok(MkvEntry::OtherVideo(codec));
     };
+    // The record itself, before any of the arms below reads it apart.
+    let private = config.clone();
     let (codec, nal_length, config, bit_depth) = match known {
         Codec::Av1 => {
             let (sets, bit_depth) = parse_av1c(&config)?;
@@ -2103,6 +2209,7 @@ fn mkv_track_entry(
         timestamp_scale,
         codec,
         config,
+        private,
         nal_length,
         bit_depth,
         unpack,
