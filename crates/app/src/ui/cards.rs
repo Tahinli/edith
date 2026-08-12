@@ -403,10 +403,19 @@ impl Player {
             .session
             .as_ref()
             .map(|s| (s.resolution(), s.meta().frame_rate));
-        let audio = self
-            .session
-            .as_ref()
-            .map_or("", |s| s.planned_audio(self.format));
+        // The probe's answer where it has one -- the export's own decision,
+        // sound included ([`engine::export::planned_seats`]) -- and the pure
+        // prediction from the format alone until it lands, which is the same
+        // line this card always showed.
+        let seats = self.export_seat.as_ref().and_then(|(.., seats)| *seats);
+        let audio = seats.map_or_else(
+            || {
+                self.session
+                    .as_ref()
+                    .map_or("", |s| s.planned_audio(self.format))
+            },
+            |(_, audio)| audio,
+        );
         let settings =
             export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
         let size = estimated_bytes(
@@ -419,7 +428,7 @@ impl Player {
         let tail = summary_tail(
             &self.export_path,
             size,
-            self.export_seat.as_ref().and_then(|(.., seat)| *seat),
+            seats.and_then(|(video, _)| video),
             self.format.has_video(),
         );
         // The button says the refusal *before* it is pressed: the picked codec

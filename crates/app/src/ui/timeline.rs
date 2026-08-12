@@ -85,15 +85,26 @@ impl Player {
             // While it plays, what is decoding it goes first: it is the
             // answer that changes as the playhead crosses a cut, and the tail
             // of this line is what a narrow window truncates.
+            // ...and ahead of even that, where the playhead is standing when
+            // that is a frame a cut is free at: it decides whether an export of
+            // this film is minutes of copying or hours of encoding, which is
+            // the one thing on this line worth interrupting the hints for.
+            let sync = match self.on_sync_point() {
+                true => "SYNC POINT — a cut here is copied, not re-encoded",
+                false => "",
+            };
             (
                 join_detail(
-                    &self.live_decode(position, state.is_playing()),
-                    &format!(
-                        "{} copy · {} paste · {} undo · click the bar to seek · drop a file to \
-                         import",
-                        key(ActionId::Copy),
-                        key(ActionId::Paste),
-                        key(ActionId::Undo)
+                    sync,
+                    &join_detail(
+                        &self.live_decode(position, state.is_playing()),
+                        &format!(
+                            "{} copy · {} paste · {} undo · click the bar to seek · drop a file \
+                             to import",
+                            key(ActionId::Copy),
+                            key(ActionId::Paste),
+                            key(ActionId::Undo)
+                        ),
                     ),
                 ),
                 filled,
