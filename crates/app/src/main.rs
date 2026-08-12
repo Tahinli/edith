@@ -2966,7 +2966,7 @@ impl Player {
         let refusal = match (self.selected, &self.session) {
             (_, None) => Some("NO TIMELINE — open a file first".to_string()),
             (None, _) => Some(format!(
-                "NOTHING BG_SELECTED — click an audio clip or press {}, then ask again",
+                "NOTHING SELECTED — click an audio clip or press {}, then ask again",
                 self.keymap.display(ActionId::Select)
             )),
             (Some((lane, _)), _) if lane.kind != LaneKind::Audio => Some(
