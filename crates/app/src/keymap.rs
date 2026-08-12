@@ -68,6 +68,13 @@ actions! {
     JumpForward,
     GoStart,
     GoEnd,
+    /// The two that put the playhead on a *source* sync point -- the frames a
+    /// cut may be placed on for an export to copy the film's own coded pictures
+    /// instead of decoding and coding every one of them again. Playback keys by
+    /// what they do (they move the playhead and nothing else) and editing keys
+    /// by what they are for.
+    PrevSyncPoint,
+    NextSyncPoint,
     Export,
     Save,
     Copy,
@@ -121,6 +128,8 @@ impl ActionId {
             ActionId::JumpForward => "One second forward",
             ActionId::GoStart => "Go to the start",
             ActionId::GoEnd => "Go to the last frame",
+            ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
+            ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
             ActionId::Export => "Export",
             ActionId::Save => "Save",
             ActionId::Copy => "Copy",
@@ -175,6 +184,8 @@ impl ActionId {
             ActionId::JumpForward => "jump-forward",
             ActionId::GoStart => "go-start",
             ActionId::GoEnd => "go-end",
+            ActionId::PrevSyncPoint => "prev-sync-point",
+            ActionId::NextSyncPoint => "next-sync-point",
             ActionId::Export => "export",
             ActionId::Save => "save",
             ActionId::Copy => "copy",
@@ -230,7 +241,9 @@ impl ActionId {
             | ActionId::JumpBack
             | ActionId::JumpForward
             | ActionId::GoStart
-            | ActionId::GoEnd => Category::Playback,
+            | ActionId::GoEnd
+            | ActionId::PrevSyncPoint
+            | ActionId::NextSyncPoint => Category::Playback,
             ActionId::Copy
             | ActionId::Paste
             | ActionId::Select
@@ -677,6 +690,12 @@ impl Keymap {
                 b(ActionId::JumpForward, "right", true),
                 b(ActionId::GoStart, "home", false),
                 b(ActionId::GoEnd, "end", false),
+                // The sync-point pair, on the brackets that already mean "the
+                // one before / the one after" here (they select the clip either
+                // side) -- with ctrl, which was free on both, because these
+                // step through the same timeline by the source's own grid.
+                b(ActionId::PrevSyncPoint, "[", true),
+                b(ActionId::NextSyncPoint, "]", true),
                 b(ActionId::Export, "e", false),
                 b(ActionId::Save, "s", true),
                 b(ActionId::Copy, "c", true),
@@ -1042,7 +1061,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 46);
+        assert_eq!(k.entries().len(), 48);
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
@@ -1053,6 +1072,13 @@ mod tests {
         assert_eq!(k.lookup("right", true), Some(ActionId::JumpForward));
         assert_eq!(k.lookup("home", false), Some(ActionId::GoStart));
         assert_eq!(k.lookup("end", false), Some(ActionId::GoEnd));
+        // ...and the source's own grid, which is neither a frame nor a second:
+        // the brackets bare select the clip either side, with ctrl they step
+        // the sync points a cut has to land on to be copied.
+        assert_eq!(k.lookup("[", true), Some(ActionId::PrevSyncPoint));
+        assert_eq!(k.lookup("]", true), Some(ActionId::NextSyncPoint));
+        assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
+        assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
         assert_eq!(k.lookup("c", true), Some(ActionId::Copy));
