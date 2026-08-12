@@ -7134,15 +7134,22 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // clip, only at a frame its own rate can address, which is the same
         // question `splittable` asks.
         ActionId::Cut => match ctx.clip {
-            Some((clip, _))
-                if !(clip.start < ctx.playhead
-                    && ctx.playhead < clip.end()
-                    && clip
-                        .speed
-                        .split_at(clip.len(), ctx.playhead - clip.start)
-                        .is_some()) =>
-            {
+            Some((clip, _)) if !(clip.start < ctx.playhead && ctx.playhead < clip.end()) => {
                 Enable::No("only from inside a clip")
+            }
+            // Inside it, and still not a cut: a slowed clip shows one frame of
+            // the file for several frames of the timeline, and only the first of
+            // those is a frame the file has ([`Speed::split_at`]). Cutting
+            // between two showings of one frame would leave halves whose lengths
+            // no longer add up, so it is refused -- and it says *that* rather
+            // than repeating "inside a clip" at a playhead that plainly is.
+            Some((clip, _))
+                if clip
+                    .speed
+                    .split_at(clip.len(), ctx.playhead - clip.start)
+                    .is_none() =>
+            {
+                Enable::No("this speed holds one frame here — step to the next")
             }
             _ => Enable::Yes,
         },
@@ -10165,6 +10172,28 @@ mod tests {
         assert!(!offered(&clip, v1, ActionId::Cut, 30));
         assert!(!offered(&clip, v1, ActionId::Cut, 90));
         assert!(!offered(&clip, v1, ActionId::Cut, 200));
+        // A slowed clip refuses more than the edges do, and it may not say the
+        // edges' words while doing it: at a quarter speed each of its sixty
+        // source frames is on screen four timeline frames, and only the first of
+        // the four is a frame the file has. The three between are inside the
+        // clip by any reading of the playhead, so "only from inside a clip"
+        // there is a refusal claiming something the screen contradicts.
+        let slow = Clip {
+            speed: Speed::MIN,
+            ..clip
+        };
+        assert_eq!(slow.frames(), 240, "a quarter speed is four times as long");
+        assert!(offered(&slow, v1, ActionId::Cut, 34), "34 is a source frame");
+        assert!(!offered(&slow, v1, ActionId::Cut, 35));
+        assert_eq!(
+            on(&slow, v1, ActionId::Cut, 35).why(),
+            Some("this speed holds one frame here — step to the next"),
+        );
+        assert_eq!(
+            on(&slow, v1, ActionId::Cut, 30).why(),
+            Some("only from inside a clip"),
+            "the head is still the edge's refusal, speed or no speed",
+        );
         // Regroup is the other way round: only where this clip meets another.
         assert!(offered(&clip, v1, ActionId::Regroup, 30));
         assert!(offered(&clip, v1, ActionId::Regroup, 90));
