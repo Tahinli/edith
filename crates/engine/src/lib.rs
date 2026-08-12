@@ -33,7 +33,7 @@ pub use decode::{DecodeSession, Frame, image_size};
 pub use demux::{Codec, MediaBitrate, VideoMeta, probe_bitrate};
 pub use export::ExportHandle;
 pub use mux::{AudioParams, Mp4Muxer, VideoParams};
-pub use playback::PlaybackSession;
+pub use playback::{ImportGate, ImportProbe, PlaybackSession};
 pub use project::{Clip, Project, Rate, Speed};
 
 /// Whether a path names a standalone audio file -- a source with no picture,

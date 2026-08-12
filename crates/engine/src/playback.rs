@@ -318,6 +318,28 @@ enum Dirty {
     Both,
 }
 
+/// What an import is held to, off a timeline that is already up: the sources
+/// its sound has to agree with and the meta its rate is read against. Owned and
+/// `Send`, so the check itself can run on a worker with no session in reach --
+/// which is the whole point ([`PlaybackSession::probe_import`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImportGate {
+    sources: Vec<Source>,
+    timeline: VideoMeta,
+}
+
+/// A file read and accepted, waiting to be registered: what
+/// [`PlaybackSession::probe_import`] found and
+/// [`PlaybackSession::import_probed`] pushes. Carries the gate it was decided
+/// against, so a timeline that moved under it can be noticed rather than
+/// trusted.
+#[derive(Clone, Debug)]
+pub struct ImportProbe {
+    gate: ImportGate,
+    meta: VideoMeta,
+    rate: Rate,
+}
+
 impl PlaybackSession {
     /// Opens `path` and starts both decode workers. Only video failure is fatal:
     /// a file we cannot hear is still a file we can watch.
@@ -2085,21 +2107,83 @@ impl PlaybackSession {
         if crate::is_image(path) {
             return self.import_image(path);
         }
+        // Both halves on this thread, which is what a caller with nothing else
+        // to do wants; a front-end splits them across a worker instead
+        // ([`probe_import`](Self::probe_import)).
+        let probe = Self::probe_import(self.import_gate(), path)?;
+        Ok(self.take_probe(path, probe))
+    }
+
+    /// Everything an import is *checked against*, taken off this timeline in
+    /// one owned piece: the sources its audio must agree with and the meta its
+    /// rate is read against. Costs two clones and touches no disk, so the
+    /// thread holding the session can hand it to a worker and go on painting.
+    pub fn import_gate(&self) -> ImportGate {
+        ImportGate {
+            sources: self.project.sources().to_vec(),
+            timeline: self.meta,
+        }
+    }
+
+    /// The reading half of [`import`](Self::import), with no session in it: the
+    /// container's header, the decoder this machine would open it with, and the
+    /// audio check against the gate -- every read an import pays.
+    ///
+    /// This is the half that costs. Measured on a 24 GB 4K HEVC remux: 21.4 s of
+    /// header with the pages cold, 429 ms warm, plus 1-4 s of probing the
+    /// timeline's own first source. So a front-end runs *this* on its background
+    /// executor and hands what comes back to
+    /// [`import_probed`](Self::import_probed), which costs a push -- the same
+    /// split [`parse_subtitles`](Self::parse_subtitles) makes, for the same
+    /// reason.
+    ///
+    /// The container fork only: a song and a still fork before the demuxer
+    /// ([`import`](Self::import)) and pay a header read of their own.
+    ///
+    /// The `Err` is the refusal [`import`](Self::import) would have given, in
+    /// the same words -- nothing is refused twice and nothing is worded twice.
+    pub fn probe_import(gate: ImportGate, path: &Path) -> crate::Result<ImportProbe> {
         let (meta, _) = Demuxer::open(path)?;
-        let first = self.first_audio()?;
+        let first = first_audio_of(&gate.sources)?;
         // Stream 0: an import brings a file in on its first audio track, and
         // [`place_stream_at`](Self::place_stream_at) is how any other one of
         // its streams reaches the timeline afterwards.
         // ...and the rate it will be read at comes back from the check that
         // accepted it, so the number the refusal was decided on is the number
         // the file is played by.
-        let rate = matches_timeline(&Source::new(path, 0), &meta, &self.meta, &first)?;
+        let rate = matches_timeline(&Source::new(path, 0), &meta, &gate.timeline, &first)?;
+        Ok(ImportProbe { gate, meta, rate })
+    }
+
+    /// Registers a file already read by [`probe_import`](Self::probe_import).
+    /// The whole of what an import costs the thread that calls it: a source
+    /// entry and its length, no open, no seek, no decode -- which is why the
+    /// probe is a separate door.
+    ///
+    /// The timeline may have moved while the worker read: a source removed or a
+    /// file opened is a different set of things the probe was checked against,
+    /// so the probe is re-read here ([`ImportGate`]) and a stale one is simply
+    /// imported the slow way rather than trusted. Same answer either way, so no
+    /// caller has to know which arm it took.
+    pub fn import_probed(&mut self, path: &Path, probe: ImportProbe) -> crate::Result<usize> {
+        match probe.gate.sources == self.project.sources() && probe.gate.timeline == self.meta {
+            true => Ok(self.take_probe(path, probe)),
+            false => self.import(path),
+        }
+    }
+
+    /// The push both import doors end at.
+    fn take_probe(&mut self, path: &Path, probe: ImportProbe) -> usize {
         let source = self.project.import(path, 0);
         // Its length *on this timeline*: a file shot slower than the timeline
         // runs covers more frames than it holds, which is the whole of what
         // placing it at another rate means ([`Rate`]).
-        self.note_frames(source, rate.timeline_at(meta.frame_count), rate);
-        Ok(source)
+        self.note_frames(
+            source,
+            probe.rate.timeline_at(probe.meta.frame_count),
+            probe.rate,
+        );
+        source
     }
 
     /// The same registration for a standalone audio file: a song has no
