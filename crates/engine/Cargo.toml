@@ -98,6 +98,23 @@ rusty_vorbis = "0.1.1"
 # correlation of 1.0000 on all six channels. Pinned exactly, like `oxideav-ac3`
 # below, because a decoder is a bit-exactness dependency.
 ruopus = { version = "=0.1.2", default-features = false, features = ["std"] }
+# The Opus *encoder*, the other half of that pair: a pure-Rust port of libopus
+# 1.6, BSD-3, `build.rs`-less and with **no dependencies at all** -- checked, not
+# taken from the README (`cargo tree` is two lines; there is not one `.c`, `.h`
+# or `.S` file in the crate). It is what lets an edited Opus source leave in a
+# Matroska file as Opus instead of being downgraded to AAC on the way out.
+#
+# Used inside a measured envelope, and that envelope is the whole reason this
+# line is not simply "the encoder": 48 kHz **stereo** at **at most**
+# [`crate::export::OPUS_MAX_KBPS`]. Above roughly 165 kbps stereo this encoder
+# writes packets that only its *own* decoder reads back -- `ruopus` decodes them
+# as noise (correlation 0.06 at 256 kbps against the source, 0.9999 at 160), and
+# `ruopus` is not the suspect: it decodes ffmpeg's own libopus at 256 kbps to
+# correlation 1.00000 on the same signal. Mono is worse and at every rate, which
+# is why a mono mix keeps the AAC path. Both measured in
+# `tests/opus_export.rs`, which fails the day the crate is unpinned onto a
+# version that has fixed it -- that is the upgrade signal.
+opus-rs = "=0.1.26"
 # The Ogg container, and the only new *name* here that is not a new crate tree:
 # its one dependency is `oxideav-core`, which the AC-3 decoder above already
 # pulls in. MIT. Vorbis-aware where it counts -- `xiph_lace` builds the

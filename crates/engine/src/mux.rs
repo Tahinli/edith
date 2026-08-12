@@ -65,6 +65,13 @@ pub struct AudioParams {
     pub freq_index: u8,
     pub chan_conf: u8,
     pub sample_rate: u32,
+    /// Set where the packets are **Opus** and not AAC, to the track's pre-skip
+    /// in samples at 48 kHz ([`crate::export`] writes those only for a Matroska
+    /// file). It is the whole difference between the two tracks a writer here
+    /// can declare: `A_OPUS` with an `OpusHead` in `CodecPrivate`
+    /// ([`opus_track_entry`]) against `A_AAC` with an `AudioSpecificConfig`
+    /// ([`aac_track_entry`]). `None` is AAC, which is every mp4 and every copy.
+    pub opus_pre_skip: Option<u16>,
 }
 
 /// Writes one H.264 *or* AV1 track plus an optional AAC track. mp4 0.14 ignores
@@ -262,6 +269,14 @@ impl Mp4Muxer {
             }),
         })?;
         if let Some(audio) = audio {
+            // The one thing this writer must never do quietly: an `mp4a` sample
+            // entry declares AAC, so Opus packets in it would be a file that
+            // says one codec and holds another. `export` never asks -- Opus is
+            // written for Matroska alone -- and this is the backstop that keeps
+            // that true if a format is ever added on the other side.
+            if audio.opus_pre_skip.is_some() {
+                return Err("an Opus track in an mp4: this writer declares `mp4a` only".into());
+            }
             let freq_index = SampleFreqIndex::try_from(audio.freq_index)?;
             // The index's own rate, not `audio.sample_rate`: this is the clock
             // an `stts` counts in and the `esds` states the index, so the two
@@ -729,6 +744,7 @@ const AUDIO: u32 = 0xE1;
 const SAMPLING_FREQUENCY: u32 = 0xB5;
 const CHANNELS: u32 = 0x9F;
 const CODEC_DELAY: u32 = 0x56AA;
+const SEEK_PRE_ROLL: u32 = 0x56BB;
 const CLUSTER: u32 = 0x1F43_B675;
 const CLUSTER_TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -1086,7 +1102,11 @@ impl MkvMuxer {
         let mut tracks = Vec::new();
         elem(&mut tracks, TRACK_ENTRY, &entry);
         if let Some((audio, _)) = &audio {
-            elem(&mut tracks, TRACK_ENTRY, &aac_track_entry(audio)?);
+            let entry = match audio.opus_pre_skip {
+                Some(pre_skip) => opus_track_entry(audio, pre_skip)?,
+                None => aac_track_entry(audio)?,
+            };
+            elem(&mut tracks, TRACK_ENTRY, &entry);
         }
         // Declared even where the audio track is not: the picture is always 1
         // and the sound always 2, so the text starts at 3 whether or not there
@@ -1369,6 +1389,67 @@ fn aac_track_entry(audio: &AudioParams) -> crate::Result<Vec<u8>> {
         CODEC_DELAY,
         u64::from(AAC_PACKET_SAMPLES) * 1_000_000_000 / u64::from(rate),
     );
+    let mut audio_elem = Vec::new();
+    put_id(&mut audio_elem, SAMPLING_FREQUENCY);
+    put_size(&mut audio_elem, 8);
+    audio_elem.extend_from_slice(&f64::from(rate).to_be_bytes());
+    uint(&mut audio_elem, CHANNELS, u64::from(audio.chan_conf));
+    elem(&mut entry, AUDIO, &audio_elem);
+    Ok(entry)
+}
+
+/// The same track when the sound is Opus: `A_OPUS`, whose `CodecPrivate` is the
+/// 19-byte `OpusHead` identification header of RFC 7845 §5.1 -- the very bytes
+/// an Ogg Opus file opens with, which is why one writer serves both containers
+/// and why this project's own reader configures itself from it unchanged
+/// (`audio::opus_pre_skip` and `audio::opus_layout` parse exactly this).
+///
+/// Mapping family 0: mono or stereo, no channel-mapping table, which is the only
+/// shape [`crate::export::encode_opus`] writes. The rate field is what the
+/// *input* was, not what the stream is coded at -- every Opus decoder runs at
+/// 48 kHz whatever it says -- and the output gain is 0 because the mix is
+/// already at the level the timeline asked for.
+///
+/// Two elements no AAC track needs, and both are the difference between a file
+/// that plays in sync and one that does not:
+/// * `CodecDelay`, the pre-skip in nanoseconds. Matroska times an Opus block for
+///   the *audible* stream while the decoder hands back the pre-skip in front of
+///   it, so a reader that ignores this starts 2.5 ms early -- measured the other
+///   way round on a real film remux (`audio::Track::samples_at`).
+/// * `SeekPreRoll`, fixed at 80 ms for Opus by the Matroska spec: how much has
+///   to be decoded and thrown away before a seek target for the decoder to be
+///   warm. It is a constant of the codec, not of the file.
+fn opus_track_entry(audio: &AudioParams, pre_skip: u16) -> crate::Result<Vec<u8>> {
+    let rate = audio.sample_rate;
+    if rate == 0 || !(1..=2).contains(&audio.chan_conf) {
+        return Err(format!(
+            "an Opus track at {rate} Hz with {} channels",
+            audio.chan_conf
+        )
+        .into());
+    }
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1); // version
+    head.push(audio.chan_conf);
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&rate.to_le_bytes());
+    head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+    head.push(0); // mapping family
+
+    let mut entry = Vec::new();
+    uint(&mut entry, TRACK_NUMBER, 2);
+    uint(&mut entry, TRACK_UID, 2);
+    uint(&mut entry, TRACK_TYPE, 2); // audio
+    uint(&mut entry, FLAG_LACING, 0);
+    elem(&mut entry, CODEC_ID, b"A_OPUS");
+    elem(&mut entry, CODEC_PRIVATE, &head);
+    uint(
+        &mut entry,
+        CODEC_DELAY,
+        u64::from(pre_skip) * 1_000_000_000 / u64::from(rate),
+    );
+    uint(&mut entry, SEEK_PRE_ROLL, 80_000_000);
     let mut audio_elem = Vec::new();
     put_id(&mut audio_elem, SAMPLING_FREQUENCY);
     put_size(&mut audio_elem, 8);
@@ -1898,6 +1979,7 @@ mod tests {
                 freq_index: 4, // 44100
                 chan_conf: 2,
                 sample_rate: 44_100,
+                opus_pre_skip: None,
             }),
         )
         .unwrap();
@@ -2042,6 +2124,7 @@ mod tests {
                     freq_index: 3, // 48000
                     chan_conf: 2,
                     sample_rate: 48_000,
+                    opus_pre_skip: None,
                 },
                 packets,
             )),
@@ -2113,6 +2196,7 @@ mod tests {
                 freq_index: 3,
                 chan_conf: 2,
                 sample_rate: 48_000,
+                opus_pre_skip: None,
             }),
         )
         .unwrap();

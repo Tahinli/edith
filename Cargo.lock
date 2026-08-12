@@ -1642,6 +1642,7 @@ dependencies = [
  "libloading",
  "miniz_oxide",
  "mp4",
+ "opus-rs",
  "oxideav-ac3",
  "oxideav-ass",
  "oxideav-core",
@@ -3933,6 +3934,12 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f1ce2826529746cac003d7338e9c0f47cdd2979ba769c61cc26fdebc402f4c"
 
 [[package]]
 name = "ordered-stream"
