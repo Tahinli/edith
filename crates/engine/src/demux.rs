@@ -802,6 +802,10 @@ pub struct MkvDemuxer {
     base: usize,
     /// The keyframe index off the file's `Cues`, empty for a file walked whole.
     cues: Vec<Cue>,
+    /// How far [`Self::cues_agree`] has got through `cues`: everything before it
+    /// has been checked against real blocks, or walked past by a jump, and is
+    /// never looked at again.
+    checked: usize,
     /// Where the next cluster to be walked into the window begins, and where the
     /// segment it belongs to starts and ends.
     reach: u64,
@@ -894,6 +898,7 @@ impl MkvDemuxer {
             next: 0,
             base: 0,
             cues,
+            checked: 0,
             reach: segment.0,
             segment,
             number: video.number,
@@ -1065,9 +1070,29 @@ impl MkvDemuxer {
     /// three frames -- and it is counted here, in the window that block was
     /// found in, rather than assumed to be zero. Assumed zero, a 60-frame HEVC
     /// fixture reports 62 frames and seeks two frames past every cut.
+    ///
+    /// Both scans are bounded, and that is not an optimisation: the window grows
+    /// by a cluster on every sequential read, so a scan of it per cue was a walk
+    /// of the whole film per ten seconds of it -- 4.8 s of reading a 4.9 GB file
+    /// became 192 s. The block a cue names sits at `cue.index - base` less
+    /// whatever was reordered across it, so it is looked for in the [`REORDER`]
+    /// blocks ending there and only a cue that is not where it says it is costs
+    /// the full scan -- once, because that answer degrades to the whole walk.
     fn anchor(&self, cue: Cue) -> Option<(usize, usize)> {
-        let at = self.blocks.iter().position(|b| b.ts == cue.time)?;
-        let lag = self.blocks[at + 1..]
+        let hint = cue.index.saturating_sub(self.base);
+        let lo = hint.saturating_sub(REORDER);
+        let hi = (hint + 1).min(self.blocks.len());
+        let at = self.blocks[lo..hi]
+            .iter()
+            .position(|b| b.ts == cue.time)
+            .map(|at| lo + at)
+            .or_else(|| self.blocks.iter().position(|b| b.ts == cue.time))?;
+        // Same bound on the other side: a picture shown before the cue's own is
+        // within the encoder's reorder depth of it in storage, which is what
+        // `REORDER` is. Counting to the end of the window instead only ever
+        // added blocks nothing reordered.
+        let tail = self.blocks.len().min(at + 1 + REORDER);
+        let lag = self.blocks[at + 1..tail]
             .iter()
             .filter(|b| b.ts < cue.time)
             .count();
@@ -1087,12 +1112,29 @@ impl MkvDemuxer {
     /// Cues within [`REORDER`] of the far end of the window are left for the
     /// next cluster: their own reordering has not been walked yet, so checking
     /// them here would fail a file that is perfectly consistent.
-    fn cues_agree(&self) -> bool {
+    ///
+    /// Each cue is checked **once**, in index order, [`Self::checked`] being how
+    /// far that has got: a sequential read calls this per cluster, and rechecking
+    /// every cue the window had already covered turned reading a film into
+    /// quadratic work. A cue the window skipped past -- one before `base` after a
+    /// jump -- cannot be checked against blocks nobody walked, so it is stepped
+    /// over rather than failed; the cue a seek actually anchors on is checked by
+    /// [`Self::jump`] itself.
+    fn cues_agree(&mut self) -> bool {
         let end = (self.base + self.blocks.len()).saturating_sub(REORDER);
-        self.cues
-            .iter()
-            .filter(|c| (self.base..end).contains(&c.index))
-            .all(|&c| matches!(self.anchor(c), Some((at, index)) if self.base + at == index))
+        while let Some(&cue) = self.cues.get(self.checked) {
+            if cue.index >= end {
+                break;
+            }
+            self.checked += 1;
+            if cue.index < self.base {
+                continue;
+            }
+            if !matches!(self.anchor(cue), Some((at, index)) if self.base + at == index) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Drops the window and rebuilds it at `cue`'s cluster: the one place the
@@ -1151,7 +1193,9 @@ impl MkvDemuxer {
         if self.complete {
             return Ok(());
         }
-        let Some(cue) = self.cues.iter().rposition(|c| c.index <= frame) else {
+        // Binary search, the cues being sorted by index: a 2160p film indexes
+        // eleven thousand keyframes and a seek asks this per call.
+        let Some(cue) = self.cues.partition_point(|c| c.index <= frame).checked_sub(1) else {
             // A file cued from somewhere after its own first frame, seeked to
             // before the first cue: nothing indexes that stretch, so the walk
             // does.
@@ -1214,9 +1258,19 @@ impl MkvDemuxer {
         let target = (frame as usize).min(self.frames.saturating_sub(1));
         // The window that holds it, off the `Cues`. A file that cannot be
         // indexed that way answers here by having been walked whole -- either at
-        // open or by this call -- so a read error is not a refusal, it is the
-        // window staying where it was.
-        let _ = self.window_for(target);
+        // open or by this call.
+        //
+        // A read that fails while rebuilding the window leaves the window it had,
+        // which is a *different part of the file* -- answering the seek off it
+        // would land somewhere the caller did not ask for. So the fallback is
+        // named rather than swallowed: the whole walk, the one index that does
+        // not depend on the window. If the file cannot be read at all that fails
+        // too, and then the window is genuinely all there is; the same error
+        // comes back out of the next `next_access_unit`, which has a `Result` to
+        // carry it and is where a caller learns the file went away.
+        if self.window_for(target).is_err() {
+            let _ = self.complete_index();
+        }
         let local = target
             .saturating_sub(self.base)
             .min(self.blocks.len().saturating_sub(1));
@@ -3485,6 +3539,92 @@ mod tests {
                 "seek to frame {frame} without cues"
             );
         }
+    }
+
+    /// A `Cues` element that lies is caught and the file is read anyway: the
+    /// whole walk answers, and the caller cannot tell.
+    ///
+    /// The fixture is a real one with its first `CueTime` overwritten -- one
+    /// tick on, so it is still a well-formed integer of the same width naming a
+    /// frame number the file could have, and still a timestamp no block in the
+    /// file carries. That is the shape of the file this whole path exists to
+    /// survive: an index whose arithmetic cannot be checked against a block, from
+    /// a variable-rate capture or a muxer with a bug. [`MkvDemuxer::cues_agree`]
+    /// refuses it at open and [`MkvDemuxer::complete_index`] takes over, and what
+    /// must not differ is the answer -- frame count, and where every frame of the
+    /// file seeks to.
+    #[test]
+    fn a_cue_that_lies_about_its_time_degrades_to_the_walk() {
+        let source = asset("test_hevc.mkv");
+        let mut bytes = std::fs::read(&source).expect("test_hevc.mkv");
+        // Where the first `CueTime` sits, found with the reader's own parsers
+        // rather than by scanning the file for a byte pattern.
+        let mut file = File::open(&source).expect("test_hevc.mkv");
+        let end = file.metadata().expect("stat").len();
+        let segment = mkv_segment(&mut file, end).expect("segment");
+        let (body, stop) = mkv_cues_element(&mut file, segment)
+            .expect("the Cues element")
+            .expect("a fixture that carries cues");
+        let mut cues = vec![0u8; (stop - body) as usize];
+        read_exact_at(&mut file, body, &mut cues).expect("the Cues element's bytes");
+        let (at, width) = first_cue_time(&cues).expect("a CueTime in the fixture");
+        let was = uint_in(&cues, at, at + width);
+        let at = body as usize + at;
+        bytes[at..at + width].copy_from_slice(&(was + 1).to_be_bytes()[8 - width..]);
+        let path = crate::scratch::Scratch::file("lying_cue", "mkv");
+        std::fs::write(&path, &bytes).expect("the fixture with one cue changed");
+
+        let (want, mut walked) = MkvDemuxer::open(&source).expect("the honest file");
+        let (got, mut lying) = MkvDemuxer::open(&path).expect("the file whose cue lies");
+        assert!(
+            !walked.complete && !walked.cues.is_empty(),
+            "the source fixture is the cue path, so the comparison means something"
+        );
+        assert!(
+            !lying.complete,
+            "the lie is not visible at open -- it is caught where the walk meets it"
+        );
+        assert_eq!(got.frame_count, want.frame_count, "frame count");
+        // Reading the file is what walks past the lying cue, and `cues_agree`
+        // catches it there: a cue is only checkable once the blocks around it
+        // have been walked, which for a cue at the front of the file is one
+        // cluster in.
+        let mut read = 0;
+        while lying.next_access_unit().expect("read past the lying cue").is_some() {
+            read += 1;
+        }
+        assert_eq!(read, got.frame_count, "every frame of the file came back");
+        assert!(
+            lying.complete && lying.cues.is_empty(),
+            "a cue naming no block was believed"
+        );
+        for frame in 0..got.frame_count {
+            assert_eq!(
+                lying.seek_to_sync_at_or_before(frame),
+                walked.seek_to_sync_at_or_before(frame),
+                "seek to frame {frame} off a cue index that lies"
+            );
+        }
+    }
+
+    /// Offset (into the `Cues` element's own bytes) and width of the first
+    /// `CueTime` there, for the test above.
+    fn first_cue_time(cues: &[u8]) -> Option<(usize, usize)> {
+        let mut at = 0;
+        while let Some((id, body, stop)) = ebml_in(cues, at) {
+            at = stop;
+            if id != CUE_POINT {
+                continue;
+            }
+            let mut child = body;
+            while let Some((id, body, stop)) = ebml_in(&cues[..stop], child) {
+                child = stop;
+                if id == CUE_TIME {
+                    return Some((body, stop - body));
+                }
+            }
+        }
+        None
     }
 
     /// What a `TrackEntry` states it is in, whichever of the two elements it
