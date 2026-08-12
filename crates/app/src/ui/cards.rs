@@ -763,7 +763,14 @@ impl Player {
                 )
                 .child(
                     div()
-                        .w(px(eq_card_w(f32::from(viewport.width))))
+                        // A cap, not a width: the card is docked in the
+                        // inspector now, and that column is narrower than the
+                        // floor a graph wants -- asking for [`eq_card_w`]
+                        // outright hung the card's right-hand third off the edge
+                        // of the window. The two cards beside it are built this
+                        // way for the same reason.
+                        .w_full()
+                        .max_w(px(eq_card_w(f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -899,6 +906,10 @@ impl Player {
         let row = div()
             .flex_none()
             .flex()
+            // Three numbers and their steppers are wider than the inspector
+            // column: without this the Q pair and the flatten button hang off
+            // the card, which off the right-hand column means off the window.
+            .flex_wrap()
             .items_center()
             .gap(px(10.))
             .px(px(6.))
