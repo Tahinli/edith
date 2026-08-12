@@ -306,6 +306,48 @@ impl Default for Volume {
     }
 }
 
+/// The library's three categories, in the order the giants list them: the
+/// pictures, the sound, and the words. A file is in exactly one of them, so a
+/// tab is a question with an answer rather than a filter with a guess.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LibraryTab {
+    Media,
+    Audio,
+    Text,
+}
+
+const LIBRARY_TABS: [LibraryTab; 3] = [LibraryTab::Media, LibraryTab::Audio, LibraryTab::Text];
+
+impl LibraryTab {
+    fn label(self) -> &'static str {
+        match self {
+            LibraryTab::Media => "Media",
+            LibraryTab::Audio => "Audio",
+            LibraryTab::Text => "Text",
+        }
+    }
+
+    /// Whether a source belongs on this tab. Subtitles are not sources at all
+    /// -- they are the [`Player::subtitle_section`] under the list -- so the
+    /// Text tab holds no rows of its own and says so.
+    fn holds(self, path: &Path) -> bool {
+        match self {
+            LibraryTab::Media => !engine::is_audio(path),
+            LibraryTab::Audio => engine::is_audio(path),
+            LibraryTab::Text => false,
+        }
+    }
+
+    /// What an empty tab says instead of being a blank column.
+    fn empty(self) -> &'static str {
+        match self {
+            LibraryTab::Media => "No video or stills yet — Import, or drop a file on the window",
+            LibraryTab::Audio => "No sound yet — Import, or drop a file on the window",
+            LibraryTab::Text => "No subtitles yet — drop an .srt on the window, or + S in the toolbar",
+        }
+    }
+}
+
 /// What is known about a source's audio. Three states and not two, because a
 /// file whose peaks have not come back yet must not be drawn as one that has no
 /// audio at all: the first shows a bed, the second shows nothing.
@@ -1121,6 +1163,10 @@ struct Player {
     /// rebuilt. Its own selection and not the timeline's: Delete keeps acting
     /// on the clip that was clicked in a lane, whatever the library is showing.
     selected_asset: Option<(PathBuf, usize)>,
+    /// Which category of the library is being looked at. A tab and not a
+    /// filter box: the categories are what the media *is*, and every editor
+    /// this one is measured against splits its pool the same way.
+    library_tab: LibraryTab,
     /// What is known about each source's audio, taken once and kept. Keyed on
     /// the path *and stream* -- two streams of one file are two envelopes -- and
     /// the key is inserted the moment the decode is *started*: presence means
@@ -8233,12 +8279,19 @@ fn panel_h(lanes: usize) -> f32 {
     PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
 }
 
-/// ...and how tall the timeline region alone is: the panel without the button
-/// row that used to sit inside it, which is now its own region above
-/// ([`Player::toolbar`], [`TOOLBAR_H`]).
+/// How tall the timeline region is: its own padding, the timecode line, the
+/// ruler and the gaps between them, plus a row per lane. Measured from its
+/// parts rather than taken off [`PANEL_H`] -- the button row moved out of it
+/// ([`Player::toolbar`]), and a height still carrying that row's pixels is a
+/// height that cuts the last lane off the bottom of the window.
 fn timeline_h(lanes: usize) -> f32 {
-    panel_h(lanes) - TOOLBAR_H
+    TIMELINE_FIXED_H + lanes_h(lanes.clamp(2, LANES_MAX))
 }
+
+/// 8+8 padding, the timecode line, the 24 px ruler strip and the two 8 px gaps
+/// between the three rows, with a couple of px of slack so a taller text line
+/// cannot push a lane off the bottom.
+const TIMELINE_FIXED_H: f32 = 16. + 18. + 8. + RULER_HIT_H + 8. + 4.;
 
 /// The edit toolbar directly above the timeline: one control's height in its
 /// own padding, fixed so nothing in it can push the timeline down.
@@ -14174,6 +14227,85 @@ mod tests {
         );
     }
 
+    /// The whole reason `ui/theme.rs` exists: a colour written anywhere else is
+    /// a colour the next palette sweep will miss, which is exactly how 186 grey
+    /// calls survived every previous attempt at this.
+    #[test]
+    fn no_colour_is_written_outside_the_theme() {
+        let source = ui_source();
+        let stray: Vec<&str> = source
+            .lines()
+            .filter(|l| l.contains("rgb(0x") || l.contains("rgba(0x"))
+            .collect();
+        assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
+    }
+
+    /// The cards are sections of the inspector, not sheets over the timeline:
+    /// adjusting a clip must never hide the clip. Structural, because that is
+    /// where the rule lives -- a card rendered from the root again would be an
+    /// overlay again, whatever it looked like on the day it was written.
+    #[test]
+    fn an_inspector_section_occludes_no_timeline() {
+        let inspector = include_str!("ui/inspector.rs");
+        let root = include_str!("main.rs").split("#[cfg(test)]").next().unwrap();
+        let render = &root[root.find("impl Render for Player").expect("the root render")..];
+        for card in [
+            "eq_card", "color_card", "speed_card", "silence_card", "mix_card",
+        ] {
+            assert!(
+                inspector.contains(&format!("self.{card}(")),
+                "{card} is not a section of the inspector"
+            );
+            assert!(
+                !render.contains(&format!("self.{card}(")),
+                "{card} is drawn from the root again -- it is an overlay over the timeline"
+            );
+        }
+        // The docked cards are placed against the inspector's own box, which is
+        // what turns `scrim()` (`absolute().inset_0()`) from a window-wide sheet
+        // into this column.
+        assert!(
+            inspector.contains(".relative()"),
+            "the inspector is not a positioning context: its cards would cover the window"
+        );
+    }
+
+    /// MUST 1, on the two named offenders: the button that relabels itself
+    /// mid-export and the one that used to read "Muted 80%". Both live in a
+    /// rect that is reserved once, so the words change and the box does not.
+    #[test]
+    fn a_stateful_button_keeps_its_rect() {
+        use crate::ui::toolbar::{EXPORT_SLOT_W, SNAP_SLOT_W, VOLUME_SLOT_W};
+        // Widest word each slot can hold, at the 12 px text this window is set
+        // in -- ~7 px a character plus the 16 px of padding.
+        let fits = |slot: f32, word: &str| slot >= word.chars().count() as f32 * 7. + 16.;
+        for word in ["Export", "Cancel"] {
+            assert!(fits(EXPORT_SLOT_W, word), "{word} overflows its rect");
+        }
+        for word in ["Snap on", "Snap off", "No subs", "Subs off"] {
+            assert!(fits(SNAP_SLOT_W, word), "{word} overflows its rect");
+        }
+        for word in ["100%", "× 100%"] {
+            assert!(fits(VOLUME_SLOT_W, word), "{word} overflows its rect");
+        }
+        // And the rect is passed, not hoped for: every stateful control in the
+        // three chrome rows names its width.
+        let toolbar = include_str!("ui/toolbar.rs");
+        for (id, slot) in [
+            ("\"export\"", "EXPORT_SLOT_W"),
+            ("\"snap\"", "SNAP_SLOT_W"),
+            ("\"subs\"", "SNAP_SLOT_W"),
+            ("\"volume\"", "VOLUME_SLOT_W"),
+            ("\"zoom-fit\"", "ZOOM_SLOT_W"),
+        ] {
+            let at = toolbar.find(id).unwrap_or_else(|| panic!("no {id} button"));
+            assert!(
+                toolbar[at..at + 120].contains(slot),
+                "{id} does not reserve {slot}"
+            );
+        }
+    }
+
     #[test]
     fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
         // Every hit target in the panel, including the scrub strip -- whose bar
@@ -15128,6 +15260,7 @@ fn main() {
                     picker: None,
                     library_menu: None,
                     selected_asset: None,
+                    library_tab: LibraryTab::Media,
                     waves: HashMap::new(),
                     streams: HashMap::new(),
                     bitrates: HashMap::new(),
