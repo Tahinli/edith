@@ -1271,7 +1271,8 @@ fn encode_audio(
         params: crate::AacTrackParams {
             freq_index,
             // 1 and 2 are the ISO channel configurations for mono and stereo,
-            // and the opener refuses anything wider than stereo already.
+            // and what the opener hands the timeline is one of those whatever
+            // the source carried ([`crate::audio::downmix`]).
             chan_conf: audio.channels.max(1) as u8,
             sample_rate: audio.sample_rate,
         },

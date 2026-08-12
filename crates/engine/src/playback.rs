@@ -1881,9 +1881,9 @@ impl PlaybackSession {
     /// Refused, changing nothing, unless that stream can join *this* timeline:
     /// same audio parameters as the first source, in the same words
     /// [`import`](Self::import) refuses a file with. One output device and one
-    /// copied AAC track mean one set of audio parameters for the whole
-    /// timeline, so a 22 kHz mono track cannot join a 44.1 kHz stereo one --
-    /// there is no resampler here to make one rate of two.
+    /// copied AAC track mean one *layout* for the whole timeline, so a mono
+    /// track cannot join a stereo one. Its sample rate may be its own: the
+    /// segment's resampler conforms it at the decoder's door.
     /// A front-end greys such a row out; this is the backstop that keeps a
     /// stale one from making the whole timeline silent.
     ///
@@ -2650,16 +2650,18 @@ fn matches_timeline(
 }
 
 /// Whether a candidate's audio may join a timeline whose first source probes as
-/// `first`: same rate, same layout -- or no audio of its own at all, which is
-/// silence over the clip's span and agrees with everything. One output device
-/// and one exported track is all there is, and no resampler.
+/// `first`: same layout -- or no audio of its own at all, which is silence over
+/// the clip's span and agrees with everything. One output device and one
+/// exported track is all there is, so one width; the *rate* is conformed rather
+/// than matched ([`crate::audio::Resample`]), which is why it is not asked
+/// about here.
 ///
 /// The audio half of [`matches_timeline`], which a stream placed on its own
 /// ([`PlaybackSession::place_stream_at`]) has to pass while the picture it
 /// comes with is already on the timeline.
 ///
 /// The format itself is deliberately *not* part of this: an mp3 that agrees on
-/// rate and layout plays alongside a timeline of mp4s perfectly well. What it
+/// layout plays alongside a timeline of mp4s perfectly well. What it
 /// cannot do is be copied into an export, which is a refusal of its own, at
 /// export time (`AudioSession::copy_multi_streams`).
 /// What a timeline's audio is held to: the probe of the first source that could
@@ -2695,10 +2697,13 @@ fn audio_source_of(sources: &[Source]) -> Option<&Source> {
 }
 
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
-    // Whole-probe equality: rate and layout, which the audio worker holds every
-    // source to anyway. Both silent is a match.
+    // The layout, which the audio worker holds every source to anyway -- and not
+    // the rate any more: a file written at another one is resampled to the
+    // timeline's at the decoder's door ([`crate::audio::Resample`]), exactly as
+    // a file shot at another frame rate is read through [`Rate`]. Both silent is
+    // a match.
     let probe = AudioSession::probe(&source.path, source.audio_stream)?;
-    if probe == *first {
+    if probe.map(|p| p.channels) == first.map(|p| p.channels) {
         return Ok(());
     }
     // ...and a *silent* file joins whatever the timeline is: it contributes
@@ -2712,8 +2717,8 @@ fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::R
     Err(match first {
         None => "the file has audio, the timeline is silent".to_string(),
         Some(b) => format!(
-            "audio {} Hz {} ch does not match the timeline's {} Hz {} ch",
-            probe.sample_rate, probe.channels, b.sample_rate, b.channels
+            "audio {} ch does not match the timeline's {} ch",
+            probe.channels, b.channels
         ),
     }
     .into())

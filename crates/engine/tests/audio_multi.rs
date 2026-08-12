@@ -250,11 +250,12 @@ fn the_join_carries_no_second_priming_packet() {
 }
 
 #[test]
-fn a_source_that_disagrees_on_rate_or_layout_is_refused() {
-    // Import refuses these up front (one output device, one set of parameters);
-    // the copy and the decode paths refuse them again rather than mislabel one
-    // esds for two different tracks. Stream 1 of the multi-audio fixture is
-    // 22.05 kHz mono against the timeline's 44.1 kHz stereo.
+fn a_source_that_disagrees_on_layout_is_refused() {
+    // Import refuses these up front (one output device, one *layout*); the copy
+    // and the decode paths refuse them again rather than mislabel one esds for
+    // two different tracks. Stream 1 of the multi-audio fixture is 22.05 kHz
+    // mono against the timeline's 44.1 kHz stereo -- its rate is conformed at
+    // the decoder's door now, its layout is what is left to refuse.
     let mixed = [(asset("test_av.mp4"), 0), (asset("test_multiaudio.mp4"), 1)];
     let segs = [(Some(0), 0.0, 1.0), (Some(1), 0.0, 1.0)];
     // (`.err()`, not `unwrap_err`: neither Ok payload is `Debug`.)
