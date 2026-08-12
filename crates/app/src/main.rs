@@ -550,6 +550,25 @@ fn scrim() -> Div {
     div().absolute().inset_0().occlude()
 }
 
+/// The sheet a card with a *slider* in it takes instead: the same scrim, with
+/// the window's own drag listeners on it as well.
+///
+/// A scrim occludes, and occluding is where gpui's hit test stops
+/// (`Hitbox::is_hovered`, window.rs:788) -- so while a card is up the root is
+/// not hovered anywhere behind it and its `on_mouse_move`/`on_mouse_up` hear
+/// nothing at all. Every drag in this window is tracked from the root, because
+/// each of them starts on a strip a few pixels wide that the pointer leaves at
+/// once ([`Player::drag_move`]), so a card's handles were set by the press and
+/// then frozen: the value never followed the hand and the release never wrote.
+/// The scrim is the one surface above the occluder that covers the whole card,
+/// so the same two listeners go here, and a drag that leaves the card is picked
+/// up by the root's copy of them without a seam.
+fn drag_scrim(cx: &mut Context<Player>) -> Div {
+    scrim()
+        .on_mouse_move(cx.listener(Player::drag_move))
+        .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
+}
+
 /// A press that stops here. What every card's body hands its scrim: the scrim
 /// closes the card on a press, and the card is painted after it, so this listener
 /// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
@@ -5097,6 +5116,137 @@ impl Player {
         self.set_volume(|volume| volume.set_along(along), cx);
     }
 
+    /// One sample of whatever drag is in the hand: the equalizer's handle, a
+    /// clip's edge, a colour bar, the speed bar, the volume slider or the
+    /// playhead. Each of those starts on a strip a few pixels wide that the
+    /// pointer leaves immediately, so none of them can be tracked from the
+    /// element it started on -- the gesture is followed here instead, on a
+    /// hitbox that covers everything the hand can reach.
+    ///
+    /// Registered on the root *and* on the scrim of every card that holds a
+    /// slider ([`Player::drag_scrim`]). An occluding sheet ends gpui's hit test
+    /// where it sits (`Hitbox::is_hovered`, window.rs:788), so while a card is
+    /// up the root is not hovered anywhere under it and hears none of this: the
+    /// press set a value and the drag then froze on it.
+    fn drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A handle is 10 px across and the pointer leaves it at once, so
+        // the equalizer drag is tracked here for the ruler's reason.
+        if self.eq_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_band(event.position, cx);
+            } else {
+                // Released outside the window: the up below never came,
+                // so this is where the gesture ends -- and it still owes
+                // the one write the whole drag is worth.
+                self.eq_dragging = false;
+                self.commit_eq(cx);
+            }
+            return;
+        }
+        // A clip edge is 6 px wide and the pointer leaves it on the
+        // first drag, so the gesture is tracked here for the same
+        // reason -- and it ends here too when the button came up
+        // outside the window, still owing its one edit.
+        if self.trim.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.trim_to(event.position.x, cx),
+                _ => self.commit_trim(cx),
+            }
+            return;
+        }
+        // A colour slider is 4 px tall and the pointer leaves it just as
+        // fast; every sample is live, so the release owes no write of
+        // its own -- what the last sample set is what the clip carries.
+        if self.color_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_color(event.position.x, false, cx);
+            } else {
+                // The release happened outside the window, so this is
+                // where the gesture ends -- and it may not end on a
+                // sample the worker was too busy to take.
+                self.color_dragging = false;
+                self.flush_drag(cx);
+            }
+            return;
+        }
+        // The speed bar, the same 4 px and the same live writes: the
+        // press took the undo step and every sample since is live.
+        if self.speed_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_speed(event.position.x, false, cx);
+            } else {
+                self.speed_dragging = false;
+                self.flush_drag(cx);
+            }
+            return;
+        }
+        // The volume slider, the same live writes: what the hand is on
+        // is what the speakers are doing, and there is nothing to undo.
+        if self.volume_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_volume(event.position.x, cx);
+            } else {
+                self.volume_dragging = false;
+            }
+            return;
+        }
+        if !self.scrubbing {
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.scrub_to(event.position.x, false, cx);
+        } else {
+            // A release outside the window never reaches the handler
+            // below, so the first button-up move is when we learn the
+            // drag is over. Without this the next hover would scrub.
+            self.scrubbing = false;
+        }
+    }
+
+    /// Where a drag ends: the release lands exactly, and whatever the gesture
+    /// owes -- one undo step for the equalizer and the trim, a flush for the
+    /// live-writing bars -- is paid here. On the root and on a card's scrim
+    /// both, for [`Player::drag_move`]'s reason: a release over an open card
+    /// never reaches the root.
+    fn drag_release(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.eq_dragging) {
+            // The release lands exactly, then the gesture is written
+            // once -- the append-only table's whole reason.
+            self.drag_band(event.position, cx);
+            self.commit_eq(cx);
+            return;
+        }
+        if self.trim.is_some() {
+            // The release lands exactly, then the gesture is
+            // written once -- one edit, one undo step.
+            self.trim_to(event.position.x, cx);
+            self.commit_trim(cx);
+            return;
+        }
+        if std::mem::take(&mut self.color_dragging) {
+            // The release lands exactly where the hand let go, and
+            // it is a live write like every other sample: the undo
+            // step the gesture rolls back to was the press's. The
+            // flush is what makes "exactly" true while the worker is
+            // still busy -- the sample above would only be held.
+            self.drag_color(event.position.x, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.speed_dragging) {
+            self.drag_speed(event.position.x, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.volume_dragging) {
+            self.drag_volume(event.position.x, cx);
+            return;
+        }
+        if std::mem::take(&mut self.scrubbing) {
+            self.scrub_to(event.position.x, true, cx);
+        }
+    }
+
     fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -5894,121 +6044,8 @@ impl Render for Player {
             // Scrubbing is tracked on the root because the pointer leaves the
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                // A handle is 10 px across and the pointer leaves it at once, so
-                // the equalizer drag is tracked here for the ruler's reason.
-                if this.eq_dragging {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_band(event.position, cx);
-                    } else {
-                        // Released outside the window: the up below never came,
-                        // so this is where the gesture ends -- and it still owes
-                        // the one write the whole drag is worth.
-                        this.eq_dragging = false;
-                        this.commit_eq(cx);
-                    }
-                    return;
-                }
-                // A clip edge is 6 px wide and the pointer leaves it on the
-                // first drag, so the gesture is tracked here for the same
-                // reason -- and it ends here too when the button came up
-                // outside the window, still owing its one edit.
-                if this.trim.is_some() {
-                    match event.pressed_button {
-                        Some(MouseButton::Left) => this.trim_to(event.position.x, cx),
-                        _ => this.commit_trim(cx),
-                    }
-                    return;
-                }
-                // A colour slider is 4 px tall and the pointer leaves it just as
-                // fast; every sample is live, so the release owes no write of
-                // its own -- what the last sample set is what the clip carries.
-                if this.color_dragging {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_color(event.position.x, false, cx);
-                    } else {
-                        // The release happened outside the window, so this is
-                        // where the gesture ends -- and it may not end on a
-                        // sample the worker was too busy to take.
-                        this.color_dragging = false;
-                        this.flush_drag(cx);
-                    }
-                    return;
-                }
-                // The speed bar, the same 4 px and the same live writes: the
-                // press took the undo step and every sample since is live.
-                if this.speed_dragging {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_speed(event.position.x, false, cx);
-                    } else {
-                        this.speed_dragging = false;
-                        this.flush_drag(cx);
-                    }
-                    return;
-                }
-                // The volume slider, the same live writes: what the hand is on
-                // is what the speakers are doing, and there is nothing to undo.
-                if this.volume_dragging {
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        this.drag_volume(event.position.x, cx);
-                    } else {
-                        this.volume_dragging = false;
-                    }
-                    return;
-                }
-                if !this.scrubbing {
-                    return;
-                }
-                if event.pressed_button == Some(MouseButton::Left) {
-                    this.scrub_to(event.position.x, false, cx);
-                } else {
-                    // A release outside the window never reaches the handler
-                    // below, so the first button-up move is when we learn the
-                    // drag is over. Without this the next hover would scrub.
-                    this.scrubbing = false;
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                    if std::mem::take(&mut this.eq_dragging) {
-                        // The release lands exactly, then the gesture is written
-                        // once -- the append-only table's whole reason.
-                        this.drag_band(event.position, cx);
-                        this.commit_eq(cx);
-                        return;
-                    }
-                    if this.trim.is_some() {
-                        // The release lands exactly, then the gesture is
-                        // written once -- one edit, one undo step.
-                        this.trim_to(event.position.x, cx);
-                        this.commit_trim(cx);
-                        return;
-                    }
-                    if std::mem::take(&mut this.color_dragging) {
-                        // The release lands exactly where the hand let go, and
-                        // it is a live write like every other sample: the undo
-                        // step the gesture rolls back to was the press's. The
-                        // flush is what makes "exactly" true while the worker is
-                        // still busy -- the sample above would only be held.
-                        this.drag_color(event.position.x, false, cx);
-                        this.flush_drag(cx);
-                        return;
-                    }
-                    if std::mem::take(&mut this.speed_dragging) {
-                        this.drag_speed(event.position.x, false, cx);
-                        this.flush_drag(cx);
-                        return;
-                    }
-                    if std::mem::take(&mut this.volume_dragging) {
-                        this.drag_volume(event.position.x, cx);
-                        return;
-                    }
-                    if std::mem::take(&mut this.scrubbing) {
-                        this.scrub_to(event.position.x, true, cx);
-                    }
-                }),
-            )
+            .on_mouse_move(cx.listener(Self::drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::drag_release))
             .size_full()
             .flex()
             .flex_col()
