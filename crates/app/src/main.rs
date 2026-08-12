@@ -1189,6 +1189,14 @@ struct Player {
     /// `None` is a file with no picture to report (every source that is not an
     /// image, and one whose header would not read).
     sizes: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Every frame of each source a decoder may be started from -- its sync
+    /// points ([`engine::demux::sync_points`]), which are the frames a cut may
+    /// be placed on for an export to *copy* the film instead of coding all of
+    /// it again. Filled like `bitrates` and off the render thread for the same
+    /// reason, and more so: the answer is that Matroska cluster walk. An empty
+    /// list is a source with no grid to offer (an mp4, a still, a song), which
+    /// must stay in the map or every repaint would ask again.
+    syncs: HashMap<PathBuf, Vec<u32>>,
     /// Which decoder each source will run on, probed once at import and kept:
     /// the codec (`None` for a still) and the seat the engine picked for it.
     /// What a library row says *before* anything plays; the running answer is
@@ -1197,11 +1205,19 @@ struct Player {
     /// `None` is a source with no decoder to name -- a song, or one the probe
     /// refused -- which must stay in the map or every repaint would ask again.
     decoders: HashMap<PathBuf, Option<(Option<Codec>, Backend)>>,
-    /// Which encoder an export of the picked settings would open, and what it
-    /// was asked about: the probe opens a real VA-API encoder (~100 ms), so it
-    /// runs off the render thread and only while the export card is up. The
-    /// inner `None` is "asked, not answered yet".
-    export_seat: Option<(ExportSettings, (u32, u32), Option<&'static str>)>,
+    /// What an export of the picked settings would open -- the picture's seat
+    /// or the copy that means it opens none, and the sound's -- and what it was
+    /// asked about: the settings, the canvas and the *cuts*, since where they
+    /// land is what decides whether the picture is copied at all. The probe
+    /// opens a real VA-API encoder (~100 ms) and reads every source's header,
+    /// so it runs off the render thread and only while the export card is up.
+    /// The inner `None` is "asked, not answered yet".
+    export_seat: Option<(
+        ExportSettings,
+        (u32, u32),
+        Vec<Clip>,
+        Option<(Option<&'static str>, &'static str)>,
+    )>,
     /// What this machine's GPU decodes and encodes, as the plugin answered it:
     /// asked once, off the render thread like `export_seat` and for the same
     /// reason (a VA-API init), and kept for the life of the process because the
@@ -1655,6 +1671,10 @@ impl Player {
             // The ends, as a step nothing can be far enough from.
             ActionId::GoStart => self.step(i64::MIN, cx),
             ActionId::GoEnd => self.step(i64::MAX, cx),
+            // Not a step at all: the grid these land on is the *source's*, and
+            // where the next one is depends on the file rather than on the rate.
+            ActionId::PrevSyncPoint => self.jump_sync(false, cx),
+            ActionId::NextSyncPoint => self.jump_sync(true, cx),
             ActionId::Export => self.open_export(cx),
             ActionId::Save => self.save_project(cx),
             ActionId::Copy => self.copy_selected(),
@@ -3131,8 +3151,22 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        // Snapped to the source's own grid where one is within reach
+        // ([`Player::cut_frame`]): a cut a third of a second off a sync point
+        // looks identical on the bed and turns an export that copies its
+        // picture in minutes into one that codes every frame of it for hours.
+        // The playhead goes with it -- what was cut has to be where the line
+        // is, or the next stroke acts a few frames from where it looks.
+        let Some(session) = &self.session else {
+            return;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let at = self.cut_frame(now);
+        if at != now {
+            self.seek(f64::from(at) / self.fps, cx);
+        }
         if let Some(session) = &mut self.session {
-            session.cut_at(session.now());
+            session.cut_at(f64::from(at) / self.fps);
         }
         self.selected = None;
         cx.notify();
@@ -3350,6 +3384,27 @@ impl Player {
             })
             .detach();
         }
+        // Where this file's own groups of pictures begin, for the cut that
+        // wants to land on one ([`Player::sync_frames`]). The heaviest probe
+        // here -- a Matroska's whole cluster walk, seconds on a film -- and the
+        // one nothing waits for: until it answers, the snap is the clip-edge
+        // snap it always was.
+        for path in unseen_paths(session.sources(), &self.syncs) {
+            self.syncs.insert(path.clone(), Vec::new());
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                async move { engine::demux::sync_points(&path) }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.syncs.insert(path, probed);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         // Which decoder each file will run on, for the row that says so before
         // a frame of it plays. Off the render thread like the streams above: a
         // stream the plugin takes costs one VA-API init (~90 ms) to answer.
@@ -3406,12 +3461,18 @@ impl Player {
         }
     }
 
-    /// Probes the encoder an export would open, once per (settings,
-    /// resolution) and only while the export card is up -- it opens the very
-    /// VA-API encoder the export would, which is what makes the card's line a
+    /// Probes what an export would open, once per (settings, resolution, cuts)
+    /// and only while the export card is up -- it opens the very VA-API encoder
+    /// the export would and asks [`engine::export::planned_seats`] the very
+    /// question the export asks itself, which is what makes the card's line a
     /// measurement instead of a promise, and also what makes it too slow for
     /// the render thread. Written before the spawn, like the probes above, so
     /// the repaints during it start no second one.
+    ///
+    /// The cuts are in the key because they are in the answer: moving one onto
+    /// a sync point is exactly what turns "SW encode" into "copy", and a card
+    /// that kept the old line would be lying about the file it is about to
+    /// write.
     fn cache_export_seat(&mut self, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
@@ -3429,32 +3490,38 @@ impl Player {
             self.export_seat = None;
             return;
         }
-        let meta = *session.meta();
+        // The timeline an export would be started with, owned so the probe can
+        // run on a worker -- and the clips beside it, which are what tells this
+        // that the question has changed.
+        let (project, meta) = session.export_snapshot();
+        let clips: Vec<Clip> = session
+            .lanes()
+            .into_iter()
+            .flat_map(|lane| session.lane_clips(lane).to_vec())
+            .collect();
         // Cloned rather than copied: the settings carry the picked subtitle
         // rows, which is a `Vec` ([`engine::export::ExportSettings`]).
-        let key = (settings.clone(), (meta.width, meta.height));
+        let key = (settings.clone(), (meta.width, meta.height), clips);
         if self
             .export_seat
             .as_ref()
-            .is_some_and(|(asked, size, _)| (asked, size) == (&key.0, &key.1))
+            .is_some_and(|(asked, size, cuts, _)| (asked, size, cuts) == (&key.0, &key.1, &key.2))
         {
             return;
         }
-        self.export_seat = Some((key.0.clone(), key.1, None));
-        let probed = cx
-            .background_executor()
-            .spawn(async move { engine::export::planned_video(&meta, &settings) });
+        self.export_seat = Some((key.0.clone(), key.1, key.2.clone(), None));
+        let probed = cx.background_executor().spawn(async move {
+            engine::export::planned_seats(&project, &meta, &settings)
+        });
         cx.spawn(async move |this, cx| {
             let probed = probed.await;
             this.update(cx, |this, cx| {
                 // Only if the card is still asking the same question: a format
                 // changed while the plugin opened has a probe of its own.
-                if let Some(seat) = this
-                    .export_seat
-                    .as_mut()
-                    .filter(|(asked, size, _)| (asked, size) == (&key.0, &key.1))
-                {
-                    seat.2 = probed;
+                if let Some(seat) = this.export_seat.as_mut().filter(|(asked, size, cuts, _)| {
+                    (asked, size, cuts) == (&key.0, &key.1, &key.2)
+                }) {
+                    seat.3 = Some(probed);
                 }
                 cx.notify();
             })
@@ -3738,6 +3805,126 @@ impl Player {
     /// the switch honoured: snapping off, nothing moves and no line is drawn.
     fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
         snap_cue(self.snap, raw, len, self.snap_frames(), marks)
+    }
+
+    /// Every timeline frame that is a *source* sync point: each clip's own
+    /// grid ([`Player::syncs`]), moved onto the frames the clip plays it at.
+    /// Ascending, because the clips are and each grid is.
+    ///
+    /// This is the difference between an export that copies its picture and one
+    /// that decodes and re-codes every frame of a feature film. A cut anywhere
+    /// else leaves the copy path with a region that begins between two sync
+    /// points -- pictures whose references are not in the file -- and the whole
+    /// export falls back to the encoder ([`engine::export`] states the rule).
+    ///
+    /// Only clips at their own speed, and only video lanes: a re-timed clip is
+    /// resampled pictures, which is not a copy at any cut, and a sound lane has
+    /// no groups of pictures to begin with.
+    fn sync_frames(&self) -> Vec<u32> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let sources = session.sources();
+        let mut marks = Vec::new();
+        for lane in session.lanes() {
+            if lane.kind != LaneKind::Video {
+                continue;
+            }
+            for clip in session.lane_clips(lane) {
+                let Some(keys) = sources
+                    .get(clip.source)
+                    .and_then(|entry| self.syncs.get(&entry.path))
+                    .filter(|_| clip.speed.is_normal())
+                else {
+                    continue;
+                };
+                marks.extend(
+                    keys.iter()
+                        .filter(|&&key| key >= clip.in_frame && key < clip.out_frame)
+                        .map(|&key| clip.start + (key - clip.in_frame)),
+                );
+            }
+        }
+        marks.sort_unstable();
+        marks
+    }
+
+    /// The frame a cut asked for at `raw` really lands on: the nearest source
+    /// sync point within the snap's own tolerance, or `raw` itself where the
+    /// magnet is off, where nothing is near enough, or where the source has no
+    /// grid to offer (the walk has not answered yet, or the file is not one
+    /// this project can copy at all).
+    ///
+    /// The same tolerance the clip-edge snap uses, so one switch and one
+    /// distance govern every landing on this timeline.
+    fn cut_frame(&self, raw: u32) -> u32 {
+        if !self.snap {
+            return raw;
+        }
+        let tol = self.snap_frames();
+        self.sync_frames()
+            .into_iter()
+            .filter(|mark| mark.abs_diff(raw) <= tol)
+            .min_by_key(|mark| mark.abs_diff(raw))
+            .unwrap_or(raw)
+    }
+
+    /// Whether the playhead is standing exactly on one: what the timeline's own
+    /// line says out loud, so "a cut here is copied" is on screen before the cut
+    /// rather than discovered in the export card afterwards.
+    ///
+    /// Asked every repaint, so it walks the *playhead* into each clip's source
+    /// and looks it up in that source's own sorted grid -- where
+    /// [`Player::sync_frames`] builds the whole list, which is a film's worth of
+    /// marks to allocate and sort sixty times a second.
+    fn on_sync_point(&self) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let sources = session.sources();
+        session.lanes().into_iter().any(|lane| {
+            lane.kind == LaneKind::Video
+                && session.lane_clips(lane).iter().any(|clip| {
+                    clip.speed.is_normal()
+                        && (clip.start..clip.start + (clip.out_frame - clip.in_frame))
+                            .contains(&now)
+                        && sources
+                            .get(clip.source)
+                            .and_then(|entry| self.syncs.get(&entry.path))
+                            .is_some_and(|keys| {
+                                keys.binary_search(&(clip.in_frame + (now - clip.start))).is_ok()
+                            })
+                })
+        })
+    }
+
+    /// Puts the playhead on the sync point before or after it -- the keyboard's
+    /// half of placing a cut where the export can copy it, and the only way to
+    /// reach one exactly on a timeline zoomed out to a whole film, where one
+    /// pixel is seconds.
+    fn jump_sync(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let marks = self.sync_frames();
+        let mark = match forward {
+            true => marks.iter().find(|&&mark| mark > now).copied(),
+            false => marks.iter().rev().find(|&&mark| mark < now).copied(),
+        };
+        match mark {
+            Some(mark) => self.seek(f64::from(mark) / self.fps, cx),
+            // Said rather than swallowed: the two most likely reasons are a walk
+            // that has not answered yet and a source with no grid at all, and a
+            // key that does nothing looks broken either way.
+            None => self.notify_user(match marks.is_empty() {
+                true => "NO SYNC POINTS — this source has no keyframe grid to jump by (or it is \
+                         still being read)"
+                    .into(),
+                false => "NO SYNC POINT THAT WAY — the playhead is past the last one".into(),
+            }),
+        }
     }
 
     /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
@@ -4069,6 +4256,7 @@ impl Player {
         self.streams.clear();
         self.bitrates.clear();
         self.sizes.clear();
+        self.syncs.clear();
         // Scanned off sources that are not in the library any more.
         self.silence_levels.clear();
         // Every gesture in flight, dropped for `reset_after_reseek`'s reason
@@ -15472,6 +15660,7 @@ fn main() {
                     streams: HashMap::new(),
                     bitrates: HashMap::new(),
                     sizes: HashMap::new(),
+                    syncs: HashMap::new(),
                     decoders: HashMap::new(),
                     export_seat: None,
                     hw_caps: None,
