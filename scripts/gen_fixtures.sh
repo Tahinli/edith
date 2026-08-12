@@ -463,4 +463,16 @@ ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" \
     -f lavfi -i "sine=frequency=880:duration=3" \
     -filter_complex "$tone" -map "[a]" -ar 48000 -c:a pcm_s16le \
     assets/test_tone_48k.wav
+# A file long enough to have a *cue table*, whose audio says where in it you
+# are: a 30 s chirp from 200 Hz rising 160 Hz a second, so the frequency of any
+# quarter second of it names the second it came from. That is what makes a seek
+# landing measurable without a reference decode (`tests/audio_seek.rs`), and the
+# length is the point -- symphonia's Matroska seek goes through the cues, and on
+# a two-second fixture there are none to go wrong. Opus in an mkv because that
+# is the film the desync was measured on, keyframes every five seconds because
+# that is what writes a cue point per cluster.
+ffmpeg -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=30" \
+    -f lavfi -i "aevalsrc=sin(2*PI*(200*t+80*t*t)):s=48000:d=30" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 120 \
+    -c:a libopus -b:a 128k assets/test_seek_chirp.mkv
 echo "fixtures written to assets/"

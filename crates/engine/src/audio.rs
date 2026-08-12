@@ -1358,6 +1358,9 @@ impl Track {
 /// out carry their own timestamps.
 struct SymTrack {
     reader: Box<dyn FormatReader>,
+    /// The file the reader reads, kept because a seek builds a *new* one
+    /// ([`SymTrack::seek_to`]).
+    path: PathBuf,
     track_id: u32,
     sample_rate: u32,
     /// What reaches the timeline: the file's own layout, or 2 for a 5.1 track,
@@ -1411,19 +1414,7 @@ impl SymTrack {
     }
 
     fn open_inner(path: &Path, number: Option<u64>) -> crate::Result<Option<Self>> {
-        let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
-        // The extension is a hint, not a decision: the probe reads the magic and
-        // is free to disagree, which is what makes a mislabelled file work.
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-        let reader = symphonia::default::get_probe().probe(
-            &hint,
-            mss,
-            FormatOptions::default(),
-            MetadataOptions::default(),
-        )?;
+        let reader = sym_reader(path)?;
         let track = match number {
             Some(number) => reader
                 .tracks()
@@ -1469,6 +1460,7 @@ impl SymTrack {
         };
         Ok(Some(Self {
             reader,
+            path: path.to_path_buf(),
             track_id,
             sample_rate,
             // 5.1 arrives as a stereo source, whatever it was stored as; every
@@ -1533,11 +1525,104 @@ impl SymTrack {
         ((secs * f64::from(self.sample_rate)) as u64).saturating_add(self.priming)
     }
 
-    /// A packet timestamp in the track's time base, as samples per channel.
+    /// A packet timestamp in the track's time base, as a media position: the
+    /// scale [`media`](Self::media) hands out, so a landing compares directly
+    /// against a segment's target.
+    ///
+    /// The priming comes *off* it because a Matroska Opus track's blocks are
+    /// timestamped for the audible stream while the decoder hands its samples
+    /// back with the pre-skip still in front of them. Measured against ffmpeg's
+    /// decode of the same second of a real 5.1 Opus remux: without this term a seeked
+    /// Opus track came out 6.5 ms -- one pre-skip, 312 samples -- ahead of it,
+    /// with it, on the same sample.
     fn samples_at(&self, ts: symphonia_core::units::Timestamp) -> u64 {
         let secs = self.time_base.calc_time_saturating(ts).as_secs_f64();
-        (secs.max(0.0) * f64::from(self.sample_rate)) as u64
+        ((secs.max(0.0) * f64::from(self.sample_rate)) as u64).saturating_sub(self.priming)
     }
+
+    /// Puts the reader **at or before** `media_target`, [`SYM_PRE_ROLL`] ahead
+    /// of it where the container allows, so that everything the caller did not
+    /// ask for is decoder warm-up that [`emit`] drops.
+    ///
+    /// At or before is the whole point, and it is not what one seek gives. A
+    /// Matroska seek lands on the first frame whose timestamp is at or past the
+    /// one asked for, and its cue table can put that a whole cluster further on
+    /// still: measured on a real 5.1 Opus remux, asking for 599.83 s (600 s less the
+    /// pre-roll) landed at 601.487 s and asking for 609.83 s at 613.407 s.
+    /// Samples that far *behind* the reader can never be emitted, and the film
+    /// played from there while the timeline said 600 s -- 1.5 s of sound
+    /// against picture, which is the seek desync this exists to kill. So the
+    /// landing is read back, and an overshoot is asked again from far enough
+    /// before it to swallow the overshoot.
+    ///
+    /// Each attempt gets a **new reader**, because symphonia's mkv seek is
+    /// reliable exactly once per reader: it neither clears the frames it has
+    /// already queued (they come out ahead of the new position, carrying the
+    /// old block's timestamp) nor recovers its element iterator, and a second
+    /// seek measured on the same file landed the reader back at the first
+    /// cluster, 0.094 s, whatever it was asked for. Opening again costs 2 ms on
+    /// a 5 GB film, which is what a seek is allowed to cost.
+    fn seek_to(&mut self, media_target: u64) {
+        let rate = f64::from(self.sample_rate.max(1));
+        let mut back = SYM_PRE_ROLL;
+        // Enough for any overshoot a cue table can hold: each attempt asks from
+        // strictly further back than the last, and the seek to 0 is the floor.
+        for _ in 0..8 {
+            let from = media_target.saturating_sub(back);
+            match sym_reader(&self.path) {
+                Ok(reader) => self.reader = reader,
+                // Whatever the file did, the reader in hand still reads: fall
+                // back to seeking that one, exactly as before this loop existed.
+                Err(e) => eprintln!("audio reopen failed: {e}"),
+            }
+            // Asking for the beginning is asking for nothing: a fresh reader is
+            // already there, and *seeking* there is how the first 167 ms of his
+            // the remux went missing -- the cue table's first point put the
+            // reader past them and no window rule can reach back.
+            if from == 0 {
+                return;
+            }
+            let secs = from as f64 / rate;
+            let Some(time) = Time::try_from_secs_f64(secs) else {
+                return;
+            };
+            let to = SeekTo::Time {
+                time,
+                track_id: Some(self.track_id),
+            };
+            // A failed seek is not fatal: it leaves the reader where it was, and
+            // the window rules still only emit what the segment asked for.
+            let landed = match self.reader.seek(SeekMode::Accurate, to) {
+                Ok(landed) => self.samples_at(landed.actual_ts),
+                Err(e) => {
+                    eprintln!("audio seek to {secs:.3}s failed: {e}");
+                    return;
+                }
+            };
+            if landed <= media_target {
+                return;
+            }
+            back += (landed - media_target) + SYM_PRE_ROLL;
+        }
+    }
+}
+
+/// One symphonia reader over `path`, which is both how a track is opened and
+/// how it is seeked ([`SymTrack::seek_to`]).
+fn sym_reader(path: &Path) -> crate::Result<Box<dyn FormatReader>> {
+    let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
+    // The extension is a hint, not a decision: the probe reads the magic and
+    // is free to disagree, which is what makes a mislabelled file work.
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    Ok(symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    )?)
 }
 
 /// One packet in, interleaved f32 out — whichever library did the decoding, and
@@ -2975,20 +3060,13 @@ fn run_sym(
             return true;
         }
     };
-    let rate = f64::from(track.sample_rate.max(1));
-    let from = seg.media_target.saturating_sub(SYM_PRE_ROLL) as f64 / rate;
-    if let Some(time) = Time::try_from_secs_f64(from) {
-        let to = SeekTo::Time {
-            time,
-            track_id: Some(track.track_id),
-        };
-        // A failed seek is not fatal: it leaves the reader where it was, and
-        // the window rules below still only emit what the segment asked for.
-        if let Err(e) = track.reader.seek(SeekMode::Accurate, to) {
-            eprintln!("audio seek to {from:.3}s failed: {e}");
-        }
-    }
+    track.seek_to(seg.media_target);
     let mut interleaved = Vec::new();
+    // Media position of the next frame to decode: the landing for the first
+    // packet, and the decoder's own count from there on. A packet's timestamp
+    // cannot carry it, because the frames of one laced block all share the
+    // block's -- accumulating is what both mp4 readers here already do.
+    let mut at: Option<u64> = None;
     loop {
         let packet = match track.reader.next_packet() {
             Ok(Some(packet)) => packet,
@@ -3001,7 +3079,7 @@ fn run_sym(
         if packet.track_id != track.track_id {
             continue; // another track of the same container
         }
-        let pos = track.samples_at(packet.pts);
+        let pos = *at.get_or_insert_with(|| track.samples_at(packet.pts));
         if pos >= seg.media_end {
             return true; // segment done, on to the next one
         }
@@ -3010,6 +3088,7 @@ fn run_sym(
             return true;
         }
         let next = pos + (interleaved.len() / channels) as u64;
+        at = Some(next);
         // Reborrowed per packet: the filter memory has to carry across the
         // packet boundary, so this is one `EqState` for the whole segment.
         if !emit(

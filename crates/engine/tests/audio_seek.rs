@@ -109,3 +109,73 @@ fn open_at_past_duration_ends_clean() {
         tail.len()
     );
 }
+
+/// The seek lands on the second it was asked for, in *content*, ten and twenty
+/// seconds into a file that has a cue table.
+///
+/// That is not what one symphonia seek gives on a Matroska file: it goes
+/// through the cues and lands on the first frame at or past the *cluster* the
+/// cue names, which on this fixture is up to 4.99 s later than the request
+/// (asking 25.0 s landed the reader at 29.987 s) and on his 5.1 Opus film was
+/// 1.47 s at 600 s and 3.39 s at 610 s. Nothing downstream can recover samples
+/// the reader is already past, so the film simply played from there while the
+/// timeline said otherwise -- sound against picture, after every scrub.
+///
+/// The chirp is what makes that measurable without a reference decode: 200 Hz
+/// rising 160 Hz a second, so the frequency of a quarter second of audio names
+/// the second of the file it was cut from.
+#[test]
+fn a_seek_into_a_cued_matroska_lands_on_its_own_second() {
+    for start in [5.0, 12.5, 25.0] {
+        let (meta, rx) = AudioSession::open_at(asset("test_seek_chirp.mkv"), start)
+            .expect("open")
+            .expect("test_seek_chirp.mkv has an audio track");
+        let at = chirp_second(&meta, rx.into_iter().flat_map(|c| c.samples));
+        assert!(
+            (at - start).abs() < 0.1,
+            "asked {start}s of the chirp, heard {at:.3}s"
+        );
+    }
+}
+
+/// ...and the *second* segment of one session lands too. Two clips of one file
+/// is two seeks on one reader, which is where symphonia's mkv reader gives up
+/// altogether: it hands out the frames left over from the first landing and
+/// then reads on from wherever its iterator ended up -- measured on his film as
+/// the second seek playing the *first cluster* of it, 0.094 s in, whatever it
+/// was asked for.
+#[test]
+fn the_second_segment_of_a_session_lands_too() {
+    let (meta, rx) =
+        AudioSession::open_segments(asset("test_seek_chirp.mkv"), &[(5.0, 6.0), (22.5, 23.5)])
+            .expect("open")
+            .expect("test_seek_chirp.mkv has an audio track");
+    let channels = usize::from(meta.channels);
+    let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let second = meta.sample_rate as usize * channels;
+    assert_eq!(samples.len(), 2 * second, "two one-second segments");
+    for (want, cut) in [(5.0, &samples[..second]), (22.5, &samples[second..])] {
+        let at = chirp_second(&meta, cut.iter().copied());
+        assert!(
+            (at - want).abs() < 0.1,
+            "segment from {want}s of the chirp came out as {at:.3}s"
+        );
+    }
+}
+
+/// Where in `test_seek_chirp.mkv` a stream of samples was cut from, by the
+/// frequency of its first quarter second: the chirp starts at 200 Hz and rises
+/// 160 Hz a second, and zero crossings date it without a reference decode.
+fn chirp_second(meta: &engine::audio::AudioMeta, samples: impl Iterator<Item = f32>) -> f64 {
+    const WINDOW: f64 = 0.25;
+    let channels = usize::from(meta.channels);
+    let want = (WINDOW * f64::from(meta.sample_rate)) as usize * channels;
+    let first: Vec<f32> = samples.take(want).step_by(channels).collect();
+    assert_eq!(first.len(), want / channels, "short of a window to date");
+    let crossings = first
+        .windows(2)
+        .filter(|p| (p[0] < 0.0) != (p[1] < 0.0))
+        .count();
+    // The window's *midpoint* is what its mean frequency dates.
+    (crossings as f64 / 2.0 / WINDOW - 200.0) / 160.0 - WINDOW / 2.0
+}
