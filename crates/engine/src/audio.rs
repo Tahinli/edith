@@ -581,11 +581,10 @@ impl AudioSession {
         limiter: Limiter,
         live: Option<&Arc<MixControls>>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        let [first, rest @ ..] = lanes else {
+        let [first, ..] = lanes else {
             return Ok(None);
         };
-        let mastered = limiter.is_active() || gains.iter().any(|&g| g != 1.0);
-        if rest.is_empty() && !mastered {
+        if !Self::is_mixed(lanes.len(), gains, limiter) {
             let flat = Vec::new();
             let plain = Vec::new();
             return Self::open_multi_streams_speed(
@@ -638,6 +637,19 @@ impl AudioSession {
             .name("audio-mix".into())
             .spawn(move || mix(&rxs, channels, gains, state, rate, live.as_deref(), &tx))?;
         Ok(Some((meta, rx)))
+    }
+
+    /// Whether these settings put the timeline through the **mixer**: more than
+    /// one lane to sum, a lane off unity, or a limiter over the sum. Anything
+    /// else is the single-lane flat path, which is `open_multi_streams`
+    /// verbatim and has no mixer thread to talk to.
+    ///
+    /// Public to the crate because [`crate::PlaybackSession`] has to know the
+    /// answer *before* the open now that it happens on another thread, and the
+    /// answer must not be spelled out twice: what it decides is whether a fader
+    /// is handed to a running mixer or rebuilds the stream.
+    pub(crate) fn is_mixed(lanes: usize, gains: &[f32], limiter: Limiter) -> bool {
+        lanes > 1 || limiter.is_active() || gains.iter().any(|&g| g != 1.0)
     }
 
     /// Why [`open`](Self::open) came back silent for a file that *has* sound:
