@@ -81,6 +81,41 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libvpx-vp9 -b:v 2M -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_vp9.mp4
+# The same VP9 stream in Matroska, which is where a yt-dlp download and every
+# other VP9 file in the wild actually arrives: `V_VP9` used to fall through the
+# mkv track dispatch and be refused by name while the mp4 twin above decoded.
+# Opus audio because that is what a .webm carries; the sound is a separate
+# refusal (no Opus decoder here) and the picture must not depend on it.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -c:v libvpx-vp9 -b:v 2M -g 30 -pix_fmt yuv420p \
+    -c:a libopus -b:a 96k assets/test_vp9.webm
+# ...and profile 2, 10-bit, which no container states: an mkv `TrackEntry`
+# carries no configuration record for VP9 at all and the `vpcC` in an mp4 is
+# optional, so the depth is read off the keyframe's uncompressed header
+# (`demux::vp9_bit_depth`) -- the difference between a P010 surface pool and a
+# picture of garbage.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -c:v libvpx-vp9 -b:v 2M -g 30 -profile:v 2 -pix_fmt yuv420p10le \
+    -an assets/test_vp9_10.webm
+# One Matroska file per audio codec the refusal string in `audio.rs` claims is
+# decodable, as five tracks of one file: FLAC, MP3, Vorbis, ALAC and PCM. The
+# string said "AAC and AC-3 only" long after every one of these decoded, which is
+# the shape of refusal this suite exists to stop (`tests/capability_matrix.rs`).
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2" \
+    -map 0:v -map 1:a -map 1:a -map 1:a -map 1:a -map 1:a \
+    -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a:0 flac -c:a:1 libmp3lame -c:a:2 libvorbis -c:a:3 alac -c:a:4 pcm_s16le \
+    assets/test_mkv_audio.mkv
+# Two video tracks in one mp4, at different sizes so a test can tell which one
+# the demuxer picked. `Mp4Reader::tracks()` is a HashMap and iterating it made
+# "the video track" a different one from one run to the next; the pick comes out
+# of `moov.traks` (file order) and this is what holds it there.
+ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
+    -f lavfi -i testsrc=size=320x240:rate=30:duration=2 \
+    -map 0:v -map 1:v -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    assets/test_two_video.mp4
 # HEVC fixture: the same A/V shape again, so the tests measure the codec and
 # nothing else. 8-bit Main profile, because the plugin's NV12 read-back cannot
 # carry Main 10.

@@ -61,6 +61,23 @@ const DEFAULT_PRIMING: u64 = 1024;
 /// An edit list entry that only shifts the timeline, carrying no media.
 const EMPTY_EDIT: u64 = u32::MAX as u64;
 
+/// What the sound of a *Matroska* file is read with, named for a refusal:
+/// symphonia's registry as this project enables it (see the feature list in
+/// `Cargo.toml`) plus the AC-3 family, which no symphonia version carries and
+/// `oxideav-ac3` does ([`MkvAc3Track`]).
+///
+/// Written down per container because capability is not one set: an mp4 video's
+/// sound never reaches symphonia ([`Track::open`] answers before it), so it
+/// reads fewer codecs than a Matroska file does. Both strings were "AAC only"
+/// long after that stopped being true, which is how a user came to re-encode a
+/// film whose FLAC track already played; `capability_matrix` opens one file per
+/// codec named here.
+const MKV_DECODED: &str = "AAC, AC-3/E-AC-3, ALAC, FLAC, MP3, PCM and Vorbis";
+
+/// ...and the mp4 half: [`AacTrack`] and [`Ac3Track`], which is where a video
+/// file's sound is read and where it stops.
+const MP4_DECODED: &str = "AAC-LC and AC-3/E-AC-3";
+
 /// Packets decoded and thrown away ahead of a seek target: one for the MDCT
 /// overlap-add that reconstructs the target packet, one to warm the decoder.
 const PRE_ROLL: u32 = 2;
@@ -653,8 +670,8 @@ impl AudioSession {
     }
 
     /// Why [`open`](Self::open) came back silent for a file that *has* sound:
-    /// `Some(reason)` when there is an audio track and it is not the AAC-LC
-    /// this decodes (an AC-3 remux, say). `None` when the file is simply silent
+    /// `Some(reason)` when there is an audio track in a codec this does not
+    /// decode (an Opus web rip, say). `None` when the file is simply silent
     /// -- nothing to tell the user there. Header only, and only worth calling
     /// once the open has already returned no audio.
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
@@ -674,7 +691,7 @@ impl AudioSession {
             return Ok(Some(match MkvAc3Track::open(path.as_ref()) {
                 Ok(Some(_)) => return Ok(None),
                 Ok(None) => format!(
-                    "the {codec} track of this Matroska file cannot be decoded (AAC and AC-3 only)"
+                    "the {codec} track of this Matroska file cannot be decoded — {MKV_DECODED} are"
                 ),
                 Err(e) => format!("the {codec} track of this Matroska file cannot be decoded: {e}"),
             }));
@@ -682,14 +699,19 @@ impl AudioSession {
         let file = File::open(path.as_ref())?;
         let size = file.metadata()?.len();
         let reader = Mp4Reader::read_header(BufReader::new(file), size)?;
-        Ok(reader
-            .tracks()
-            .values()
-            .find(|t| matches!(t.track_type(), Ok(TrackType::Audio)))
+        // File order, out of `moov.traks`: naming a codec off a `HashMap` walk
+        // would tell the user about a different track from one run to the next
+        // on a film with two ([`audio_track_ids`], and the same trap the video
+        // pick had in `demux::Mp4Demuxer::open`).
+        Ok(audio_track_ids(&reader)
+            .first()
+            .and_then(|id| reader.tracks().get(id))
             .map(|t| match t.media_type() {
-                Ok(media) => format!("the {media} audio track cannot be decoded (AAC-LC only)"),
+                Ok(media) => {
+                    format!("the {media} audio track cannot be decoded — {MP4_DECODED} are")
+                }
                 Err(_) => {
-                    "the audio track is in a codec we cannot decode (AAC-LC only)".to_string()
+                    format!("the audio track is in a codec we cannot decode — {MP4_DECODED} are")
                 }
             }))
     }

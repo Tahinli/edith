@@ -59,8 +59,8 @@ type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 /// still loads and still decodes H.264 (it simply refuses the newer codecs'
 /// files at `Demuxer`).
 ///
-/// 4:2:0 only, 8- or 10-bit: HEVC Main and Main 10, VP9 profile 0, AV1 Main at
-/// either depth.
+/// 4:2:0 only, 8- or 10-bit: HEVC Main and Main 10, VP9 profile 0 and 2, AV1
+/// Main at either depth.
 /// A 10-bit stream decodes into a P010 pool and is read back down to the 8-bit
 /// I420 every frame here is ([`Session::emit`]).
 ///
@@ -68,8 +68,10 @@ type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 /// interface all the way to the renderer. That costs the low two bits of a Main
 /// 10 source; the upgrade path is a 16-bit `VhFrame`, which is a change to every
 /// stage between here and the texture upload, not to this file.
-/// VP9 profile 2 is still refused by `Demuxer`: a VP9 stream does not state its
-/// depth where that reads it (an `av1C` and an `hvcC` both do).
+/// VP9 profile 2 reaches the P010 pool like the rest: a VP9 stream states its
+/// depth in no container record the way an `av1C` or an `hvcC` does, so
+/// `Demuxer` reads it off the first keyframe's uncompressed header
+/// (`demux::vp9_bit_depth`) rather than assuming the 8 bits of profile 0.
 enum Decoder {
     H264(Dec<H264>),
     Hevc(Dec<H265>),
