@@ -249,6 +249,7 @@ impl Player {
                     .items_center()
                     .gap(px(8.))
                     .overflow_x_scroll()
+                    .child(group_label("Edit"))
                     .child(self.action_control(
                         "cut",
                         0.,
@@ -280,6 +281,7 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
                     ))
                     .child(separator())
+                    .child(group_label("Track"))
                     .child(self.action_control(
                         "add-video-lane",
                         0.,
@@ -317,6 +319,7 @@ impl Player {
                         }),
                     ))
                     .child(separator())
+                    .child(group_label("View"))
                     // Both toggles keep a rect of their own: the label is the
                     // state, and a state that resized its own button is what
                     // made the row shuffle every time it was pressed.

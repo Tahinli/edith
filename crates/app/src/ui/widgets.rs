@@ -73,13 +73,33 @@ pub(crate) fn control(
         .rounded(px(4.))
         .bg(rgb(bg))
         .when(bg == ACCENT_PRIMARY, |d| d.text_color(rgb(BG_CANVAS)))
-        .children(glyph)
+        // A glyph sits in a box of its own width, never in the width it happens
+        // to draw: the pause bars are 12 px wide and the play triangle is 11, so
+        // pressing Play used to slide every button in the row one pixel left. A
+        // slot is the only fix that holds for the next glyph as well as this one.
+        .children(glyph.map(|glyph| {
+            div()
+                .flex_none()
+                .w(px(GLYPH_SLOT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(glyph)
+        }))
         .child(label)
         .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
         .when(enabled, |d| {
+            // An accented button keeps its accent under the pointer: hovering it
+            // to the chrome's own hover colour reads as the primary action
+            // turning itself off.
             d.cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(move |s| {
+                    s.bg(rgb(match bg == ACCENT_PRIMARY {
+                        true => ACCENT_HOVER,
+                        false => BG_HOVER,
+                    }))
+                })
                 .on_click(on_click)
         })
 }
@@ -138,6 +158,17 @@ pub(crate) fn volume_slider(
 }
 
 /// The line between two groups of buttons.
+/// What a group of buttons is *for*, printed in front of it. A toolbar of
+/// twelve unlabelled boxes is a toolbar nobody reads twice; three named groups
+/// are three things to skip.
+pub(crate) fn group_label(name: &'static str) -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_size(px(10.))
+        .text_color(rgb(FG_SECONDARY))
+        .child(name)
+}
+
 pub(crate) fn separator() -> impl IntoElement {
     div()
         .flex_none()
