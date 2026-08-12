@@ -139,6 +139,214 @@ pub struct VideoMeta {
     pub color: ColorDescription,
 }
 
+/// What a file spends its bytes at, in bits per second -- the whole file, and
+/// what each of its streams costs inside it.
+///
+/// The three are one budget split three ways, so all three are measured over
+/// **the same seconds**: the container's own duration, not each track's. That
+/// is what makes the line read as a breakdown -- `total` can never come out
+/// below `video + audio`, because those are disjoint byte counts over a shared
+/// denominator, and the leftover is the container's overhead. Dividing each
+/// track by its own length is how a file with 2 s of picture and 60 s of sound
+/// reports a total thirty times its real byte rate, under components that add
+/// up to a thirtieth of it.
+///
+/// Every field is `None` rather than `0` wherever the container does not state
+/// the number and nothing here derives it. A properties row a header did not
+/// give is left out rather than shown as a zero, and a fabricated `0 kbps` is
+/// not a missing measurement, it is a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MediaBitrate {
+    /// Every byte of the file over its playing time -- both streams, the
+    /// container's overhead and all -- which is what "the bitrate of a file"
+    /// means to anyone reading it, and what `ffprobe` calls `format=bit_rate`.
+    pub total: Option<u64>,
+    /// The picture track's own bytes over that same time.
+    pub video: Option<u64>,
+    /// The bytes of the **one sound track this engine would play**, over that
+    /// same time -- first in file order, which is the rule
+    /// [`crate::audio::AudioSession::probe_streams`] hands out stream 0 by and
+    /// the one playback and export open. A dual-audio file has more, and this
+    /// number describes neither their sum nor the biggest of them; ask
+    /// `probe_streams` how many there are before calling this "the sound".
+    pub audio: Option<u64>,
+}
+
+/// What `path` is coded at, from its header and its sample table alone --
+/// **no decoder is opened**, which is what lets a library probe run this over
+/// every file it lists.
+///
+/// The cost is one [`Demuxer::open`]: an mp4's boxes, or a Matroska segment's
+/// element headers, both of which the caller's other per-file probes already
+/// pay. Nothing here reads a block payload.
+///
+/// Cheap is not instant, and the caller has to know which: measured over
+/// `a local media folder`, every mp4 answered in single-digit milliseconds, and a
+/// 12.9 GB 2160p AV1 Matroska took **seconds** cold and ~150 ms warm --
+/// Matroska indexes no samples, so its open walks every cluster header in the
+/// file, and what that costs is disk, not arithmetic. Timings on that file
+/// swing between ~150 ms and ~1.2 s run to run on the same build, so treat any
+/// figure here as an order of magnitude and nothing finer. This belongs on
+/// `background_executor` like every other open, never on a repaint.
+///
+/// A file that will not open at all -- no video track, a codec nothing reads,
+/// a still image, which has no playing time of its own -- comes back all
+/// `None`. That is the answer, not an error: the cards this feeds show the
+/// rows they have.
+pub fn probe_bitrate(path: &Path) -> MediaBitrate {
+    let unstated = MediaBitrate::default();
+    let Ok(bytes) = std::fs::metadata(path).map(|m| m.len()) else {
+        return unstated;
+    };
+    // A still is as long as the clip is stretched to, so there is no per-second
+    // anything to state about the file.
+    if crate::is_image(path) {
+        return unstated;
+    }
+    // A standalone audio file's length is not a frame count; it is what the
+    // audio header says, exactly as `PlaybackSession::import` reads it.
+    //
+    // ponytail: `duration_secs` falls back to a decode for a stream whose
+    // header states no length (a bare mp3 with no Xing header), which is the
+    // one input here that is not header-only -- ~0.5 ms per source second, the
+    // same cost import already pays for that file. Upgrade path is a
+    // header-only variant that answers `None` instead of decoding.
+    if crate::is_audio(path) {
+        let Ok(Some(secs)) = crate::AudioSession::duration_secs(path) else {
+            return unstated;
+        };
+        let total = bits_per_second(bytes, secs);
+        // One stream and nothing else in the file: what a second of it costs is
+        // what a second of its sound costs, give or take a header.
+        return MediaBitrate {
+            total,
+            video: None,
+            audio: total,
+        };
+    }
+    let Ok((meta, demuxer)) = Demuxer::open(path) else {
+        return unstated;
+    };
+    // How long the *file* plays, which on a well-made file is how long its
+    // picture plays and on a badly-made one is not: a 2 s clip carrying a 60 s
+    // commentary is 60 s of file, and dividing its bytes by 2 claims thirty
+    // times the byte rate it really has. Both containers state this outright --
+    // an mp4 in the `mvhd` (the movie header, which spans every track), a
+    // Matroska in `Info.Duration` -- so it is read rather than derived.
+    //
+    // Where a file states none, the picture's own length is the fallback and
+    // the old answer: frame count over frame rate, the same length the timeline
+    // lays the clip out at.
+    let stated = match &demuxer {
+        Demuxer::Mkv(d) => d.container_secs,
+        Demuxer::Mp4(d) => {
+            let mvhd = &d.reader.moov.mvhd;
+            (mvhd.timescale > 0 && mvhd.duration > 0)
+                .then(|| mvhd.duration as f64 / f64::from(mvhd.timescale))
+        }
+    };
+    let secs = stated.unwrap_or(match meta.frame_rate > 0.0 {
+        true => f64::from(meta.frame_count) / meta.frame_rate,
+        false => 0.0,
+    });
+    let (video, audio) = match &demuxer {
+        // Matroska indexes no samples, so what the open's one walk counted *is*
+        // the sample table: block bytes per track number ([`mkv_blocks`]), the
+        // sound's beside the picture's, neither of them costing a second pass.
+        Demuxer::Mkv(d) => {
+            let bytes_of = |number| {
+                d.track_bytes
+                    .iter()
+                    .find(|(n, _)| *n == number)
+                    .map(|&(_, bytes)| bytes)
+            };
+            (
+                // The picture's blocks are indexed, so its size is that index.
+                // Measured, this is the same number `track_bytes` holds for the
+                // same track on every fixture and every file in `a local media folder`;
+                // the two can only part on a *laced* video track, where one
+                // block becomes several `Block`s over the frame bytes alone and
+                // the lace header is left out. Nothing here has ever produced
+                // one -- lacing is a sound-track trick -- so this is a
+                // difference of principle, not one anything has exercised.
+                bits_per_second(d.blocks.iter().map(|b| b.len as u64).sum(), secs),
+                // The sound's, from the raw block lengths, lace headers
+                // included: the two components are measured on slightly
+                // different bases for that reason, which is worth tens of bytes
+                // a block and nothing on the rate.
+                d.audio_number
+                    .and_then(bytes_of)
+                    .and_then(|bytes| bits_per_second(bytes, secs)),
+            )
+        }
+        Demuxer::Mp4(d) => {
+            let tracks = d.reader.tracks();
+            // In file order, out of `moov.traks`, for [`Mp4Demuxer::open`]'s
+            // reason and for `audio::audio_track_ids`': `tracks()` is a
+            // `HashMap`, so "the audio track" of a dual-audio file would
+            // otherwise be a different one per run. Deliberately the *same*
+            // first-in-file rule the audio path picks stream 0 by, so the
+            // bitrate row and the audio row of one card name one track -- see
+            // [`MediaBitrate::audio`], which says what that number is not.
+            let audio = d
+                .reader
+                .moov
+                .traks
+                .iter()
+                .map(|trak| trak.tkhd.track_id)
+                .find(|id| {
+                    tracks
+                        .get(id)
+                        .is_some_and(|t| matches!(t.track_type(), Ok(TrackType::Audio)))
+                });
+            let rate = |id| {
+                tracks
+                    .get(id)
+                    .map(mp4_track_bytes)
+                    .and_then(|bytes| bits_per_second(bytes, secs))
+            };
+            (rate(&d.track_id), audio.as_ref().and_then(rate))
+        }
+    };
+    MediaBitrate {
+        total: bits_per_second(bytes, secs),
+        video,
+        audio,
+    }
+}
+
+/// `bytes` over `secs`, in bits per second, or `None` where that is not a
+/// number worth showing: nothing measured either side, or a rate that rounds to
+/// zero. A `0` here would read as a real measurement, which is the one answer
+/// this must never give.
+fn bits_per_second(bytes: u64, secs: f64) -> Option<u64> {
+    (secs > 0.0)
+        .then(|| (bytes as f64 * 8.0 / secs) as u64)
+        .filter(|&bps| bps > 0)
+}
+
+/// How many bytes of the file an mp4 track's samples are -- its share of the
+/// `mdat`, which over the container's seconds is its share of the byte rate.
+///
+/// Not `Mp4Track::bitrate`, deliberately, though that looks like the ready-made
+/// answer. It divides by the track's *own* duration, which is the arithmetic
+/// [`MediaBitrate`] exists to not do; it truncates that duration to whole
+/// seconds (`mp4-0.14.0/src/track.rs:213`), so a file under a second comes back
+/// `0`; and for an `mp4a` track it answers `esds.avg_bitrate` instead, a number
+/// the encoder declared rather than one the file spends, which is `0` on any
+/// `esds` that declared none. Bytes are what all three of these fields agree to
+/// be measured in.
+///
+/// `Mp4Track::total_sample_size` is private to that crate; this is it, off the
+/// `stsz` fields that are not.
+fn mp4_track_bytes(track: &Mp4Track) -> u64 {
+    let stsz = &track.trak.mdia.minf.stbl.stsz;
+    match stsz.sample_size {
+        0 => stsz.sample_sizes.iter().map(|&n| u64::from(n)).sum(),
+        uniform => u64::from(uniform) * u64::from(track.sample_count()),
+    }
+}
+
 /// The file, whichever container it came in. Which one is decided by the
 /// extension at [`Demuxer::open`] and never again: everything downstream --
 /// playback, export, the plugin -- speaks access units and display frames.
@@ -279,10 +487,18 @@ impl Demuxer {
 /// the demuxer is what really decides, but the audio path has to know before it
 /// opens anything that this file's sound is read by symphonia's `mkv` reader
 /// and not by either mp4 one (see [`crate::audio::Track::open`]).
+///
+/// *Every* extension Matroska states, not the two that carry a film: `.mka` is
+/// the sound alone and `.mks` the subtitles alone -- the same bytes, the same
+/// reader, so refusing them was this engine refusing a file it parses. The set
+/// is the standard's own and closed by it.
 pub fn is_matroska(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "mkv" | "mka" | "mks" | "mk3d" | "webm"
+        )
+    })
 }
 
 pub struct Mp4Demuxer {
@@ -553,6 +769,18 @@ pub struct MkvDemuxer {
     /// What the track's `ContentEncodings` asks of every block; [`Unpack::None`]
     /// for a file that declares none, which is most of them.
     unpack: Unpack,
+    /// Block bytes per `TrackNumber`, counted by the one walk the open already
+    /// does -- the sound track's as well as the picture's. [`probe_bitrate`] is
+    /// the only reader; see [`mkv_blocks`] for why it is collected here rather
+    /// than by a pass of its own.
+    track_bytes: Vec<(u64, u64)>,
+    /// `TrackNumber` of the file's first audio track, the one
+    /// [`matroska_audio_codec`] also answers for; `None` for a silent file.
+    audio_number: Option<u64>,
+    /// What `Info.Duration` says the whole *file* plays for, in seconds --
+    /// which is not the picture's length on a file whose sound outlasts it.
+    /// `None` for the rare file that states none. [`probe_bitrate`] only.
+    container_secs: Option<f64>,
 }
 
 impl MkvDemuxer {
@@ -560,7 +788,7 @@ impl MkvDemuxer {
         let mut file = File::open(path)?;
         let end = file.metadata()?.len();
         let segment = mkv_segment(&mut file, end)?;
-        let (video, _, other, _) = mkv_tracks(&mut file, segment)?;
+        let (video, audio, other, _, container_secs) = mkv_tracks(&mut file, segment)?;
         let video = match video {
             Some(video) => video,
             // Named, because "no video track" is a lie about a file that has one
@@ -587,7 +815,7 @@ impl MkvDemuxer {
         if let Unpack::Refused(why) = &video.unpack {
             return Err(why.clone().into());
         }
-        let (blocks, span) = mkv_blocks(&mut file, segment, video.number)?;
+        let (blocks, span, track_bytes) = mkv_blocks(&mut file, segment, video.number)?;
         if blocks.is_empty() {
             return Err(format!(
                 "the {} track in this Matroska file has no frames",
@@ -646,6 +874,9 @@ impl MkvDemuxer {
                 scratch: Vec::new(),
                 next: 0,
                 unpack: video.unpack,
+                track_bytes,
+                audio_number: audio.first().map(|t| t.number),
+                container_secs,
             },
         ))
     }
@@ -783,7 +1014,7 @@ impl MkvAudio {
         let mut file = File::open(path)?;
         let end = file.metadata()?.len();
         let segment = mkv_segment(&mut file, end)?;
-        let (_, audio, _, timestamp_scale) = mkv_tracks(&mut file, segment)?;
+        let (_, audio, _, timestamp_scale, _) = mkv_tracks(&mut file, segment)?;
         let Some(MkvAudioTrack {
             number,
             codec,
@@ -807,7 +1038,7 @@ impl MkvAudio {
         if let Unpack::Refused(why) = &unpack {
             return Err(why.clone().into());
         }
-        let (blocks, _) = mkv_blocks(&mut file, segment, number)?;
+        let (blocks, _, _) = mkv_blocks(&mut file, segment, number)?;
         if blocks.is_empty() {
             return Err("the AC-3 track in this Matroska file has no blocks".into());
         }
@@ -992,6 +1223,7 @@ fn mkv_content_encoding(file: &mut File, body: u64, end: u64) -> crate::Result<U
 const SEGMENT: u32 = 0x1853_8067;
 const INFO: u32 = 0x1549_A966;
 const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const DURATION: u32 = 0x4489;
 const TRACKS: u32 = 0x1654_AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
@@ -1019,6 +1251,10 @@ const MASTERING_METADATA: u32 = 0x55D0;
 const LUMINANCE_MAX: u32 = 0x55D9;
 const LUMINANCE_MIN: u32 = 0x55DA;
 const TRACK_LANGUAGE: u32 = 0x22B59C;
+/// What a modern muxer states a language with instead ([`mkv_language`]): the
+/// legacy element above holds an ISO 639-2 code and nothing else, this one a
+/// whole BCP-47 tag (`en`, `pt-BR`, `zh-Hans`).
+const TRACK_LANGUAGE_BCP47: u32 = 0x22B59D;
 const TRACK_NAME: u32 = 0x536E;
 const CONTENT_ENCODINGS: u32 = 0x6D80;
 const CONTENT_ENCODING: u32 = 0x6240;
@@ -1058,10 +1294,21 @@ fn mkv_segment(file: &mut File, end: u64) -> crate::Result<(u64, u64)> {
 fn mkv_tracks(
     file: &mut File,
     segment: (u64, u64),
-) -> crate::Result<(Option<MkvVideo>, Vec<MkvAudioTrack>, Option<String>, u64)> {
+) -> crate::Result<(
+    Option<MkvVideo>,
+    Vec<MkvAudioTrack>,
+    Option<String>,
+    u64,
+    Option<f64>,
+)> {
     let (mut video, mut other) = (None, None);
     let mut audio = Vec::new();
     let mut timestamp_scale = 1_000_000;
+    // `Info.Duration`, in `TimestampScale` ticks: how long the *file* is, which
+    // is not how long its picture is -- see [`probe_bitrate`], which divides by
+    // this. Written by every muxer in practice and optional by the spec, so the
+    // absence of it is a `None` and not a zero.
+    let mut duration = None;
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
         match id {
@@ -1069,8 +1316,10 @@ fn mkv_tracks(
             INFO => {
                 let mut at = body;
                 while let Some(e) = ebml_element(file, at, stop)? {
-                    if e.0 == TIMESTAMP_SCALE {
-                        timestamp_scale = ebml_uint(file, e.1, e.2)?.max(1);
+                    match e.0 {
+                        TIMESTAMP_SCALE => timestamp_scale = ebml_uint(file, e.1, e.2)?.max(1),
+                        DURATION => duration = Some(ebml_float(file, e.1, e.2)?),
+                        _ => {}
                     }
                     at = e.2;
                 }
@@ -1097,7 +1346,9 @@ fn mkv_tracks(
         }
         at = stop;
     }
-    Ok((video, audio, other, timestamp_scale))
+    // Ticks to seconds: `TimestampScale` is nanoseconds a tick is worth.
+    let secs = duration.filter(|d| *d > 0.0).map(|d| d * timestamp_scale as f64 / 1e9);
+    Ok((video, audio, other, timestamp_scale, secs))
 }
 
 /// What one `TrackEntry` turned out to be.
@@ -1110,6 +1361,107 @@ enum MkvEntry {
     Other,
 }
 
+/// What language a `TrackEntry` states, as the three-letter ISO 639-2 code the
+/// rest of this engine speaks -- the one the muxer writes back into
+/// `TRACK_LANGUAGE` and the one an mp4's `mdhd` packs into 16 bits.
+///
+/// **`LanguageBCP47` wins**, which is the spec's own precedence and not a
+/// preference: a modern file states its languages there and leaves the legacy
+/// element out, so reading only the old one lost them. His
+/// *a dual-language remux* carries 37 `LanguageBCP47` elements against 33 legacy
+/// ones and every English track of it is BCP-47 only -- they all used to come in
+/// as `und` and export with no language at all.
+///
+/// A tag is cut to its primary subtag and mapped by [`ISO_639_1_TO_2`], so `en`
+/// and `en-US` are both `eng`: the region is not the language, and neither the
+/// Matroska element nor the mp4 field can hold one. Three letters already
+/// (`fil`, and every ISO 639-3 tag) are kept as they are. Anything else -- a
+/// private `x-…` tag, a tag nothing maps -- falls back to the legacy element
+/// rather than throwing the file's word away.
+///
+/// `und` for a track that states neither. The spec's *default* is `eng`
+/// (measured: ffmpeg 8.1.2 reports `eng` for a `TrackEntry` with no `Language`
+/// element, and reads no `LanguageBCP47` at all), but writing English into a
+/// track whose file never said so is this engine's claim and not the file's --
+/// a Japanese film's untitled track would export labelled English. What is
+/// *stated* is kept; the default is left to the readers that want it.
+fn mkv_language(legacy: &str, bcp47: &str) -> String {
+    let primary = bcp47
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mapped = match primary.len() {
+        2 => ISO_639_1_TO_2
+            .iter()
+            .find(|(two, _)| *two == primary)
+            .map(|(_, three)| (*three).to_owned()),
+        3 => Some(primary),
+        _ => None,
+    };
+    match mapped {
+        Some(code) => code,
+        None if !legacy.is_empty() => legacy.to_owned(),
+        None => "und".into(),
+    }
+}
+
+/// Every ISO 639-1 code and the 639-2 (terminology) one it names the same
+/// language with -- what [`mkv_language`] maps a BCP-47 primary subtag through.
+///
+/// The whole standard and not the languages a test happened to use: generated
+/// from `iso-codes`' own `iso_639-2.json`, so a Kannada track is as readable as
+/// an English one.
+#[rustfmt::skip]
+const ISO_639_1_TO_2: &[(&str, &str)] = &[
+    ("aa", "aar"), ("ab", "abk"), ("ae", "ave"), ("af", "afr"),
+    ("ak", "aka"), ("am", "amh"), ("an", "arg"), ("ar", "ara"),
+    ("as", "asm"), ("av", "ava"), ("ay", "aym"), ("az", "aze"),
+    ("ba", "bak"), ("be", "bel"), ("bg", "bul"), ("bi", "bis"),
+    ("bm", "bam"), ("bn", "ben"), ("bo", "bod"), ("br", "bre"),
+    ("bs", "bos"), ("ca", "cat"), ("ce", "che"), ("ch", "cha"),
+    ("co", "cos"), ("cr", "cre"), ("cs", "ces"), ("cu", "chu"),
+    ("cv", "chv"), ("cy", "cym"), ("da", "dan"), ("de", "deu"),
+    ("dv", "div"), ("dz", "dzo"), ("ee", "ewe"), ("el", "ell"),
+    ("en", "eng"), ("eo", "epo"), ("es", "spa"), ("et", "est"),
+    ("eu", "eus"), ("fa", "fas"), ("ff", "ful"), ("fi", "fin"),
+    ("fj", "fij"), ("fo", "fao"), ("fr", "fra"), ("fy", "fry"),
+    ("ga", "gle"), ("gd", "gla"), ("gl", "glg"), ("gn", "grn"),
+    ("gu", "guj"), ("gv", "glv"), ("ha", "hau"), ("he", "heb"),
+    ("hi", "hin"), ("ho", "hmo"), ("hr", "hrv"), ("ht", "hat"),
+    ("hu", "hun"), ("hy", "hye"), ("hz", "her"), ("ia", "ina"),
+    ("id", "ind"), ("ie", "ile"), ("ig", "ibo"), ("ii", "iii"),
+    ("ik", "ipk"), ("io", "ido"), ("is", "isl"), ("it", "ita"),
+    ("iu", "iku"), ("ja", "jpn"), ("jv", "jav"), ("ka", "kat"),
+    ("kg", "kon"), ("ki", "kik"), ("kj", "kua"), ("kk", "kaz"),
+    ("kl", "kal"), ("km", "khm"), ("kn", "kan"), ("ko", "kor"),
+    ("kr", "kau"), ("ks", "kas"), ("ku", "kur"), ("kv", "kom"),
+    ("kw", "cor"), ("ky", "kir"), ("la", "lat"), ("lb", "ltz"),
+    ("lg", "lug"), ("li", "lim"), ("ln", "lin"), ("lo", "lao"),
+    ("lt", "lit"), ("lu", "lub"), ("lv", "lav"), ("mg", "mlg"),
+    ("mh", "mah"), ("mi", "mri"), ("mk", "mkd"), ("ml", "mal"),
+    ("mn", "mon"), ("mr", "mar"), ("ms", "msa"), ("mt", "mlt"),
+    ("my", "mya"), ("na", "nau"), ("nb", "nob"), ("nd", "nde"),
+    ("ne", "nep"), ("ng", "ndo"), ("nl", "nld"), ("nn", "nno"),
+    ("no", "nor"), ("nr", "nbl"), ("nv", "nav"), ("ny", "nya"),
+    ("oc", "oci"), ("oj", "oji"), ("om", "orm"), ("or", "ori"),
+    ("os", "oss"), ("pa", "pan"), ("pi", "pli"), ("pl", "pol"),
+    ("ps", "pus"), ("pt", "por"), ("qu", "que"), ("rm", "roh"),
+    ("rn", "run"), ("ro", "ron"), ("ru", "rus"), ("rw", "kin"),
+    ("sa", "san"), ("sc", "srd"), ("sd", "snd"), ("se", "sme"),
+    ("sg", "sag"), ("si", "sin"), ("sk", "slk"), ("sl", "slv"),
+    ("sm", "smo"), ("sn", "sna"), ("so", "som"), ("sq", "sqi"),
+    ("sr", "srp"), ("ss", "ssw"), ("st", "sot"), ("su", "sun"),
+    ("sv", "swe"), ("sw", "swa"), ("ta", "tam"), ("te", "tel"),
+    ("tg", "tgk"), ("th", "tha"), ("ti", "tir"), ("tk", "tuk"),
+    ("tl", "tgl"), ("tn", "tsn"), ("to", "ton"), ("tr", "tur"),
+    ("ts", "tso"), ("tt", "tat"), ("tw", "twi"), ("ty", "tah"),
+    ("ug", "uig"), ("uk", "ukr"), ("ur", "urd"), ("uz", "uzb"),
+    ("ve", "ven"), ("vi", "vie"), ("vo", "vol"), ("wa", "wln"),
+    ("wo", "wol"), ("xh", "xho"), ("yi", "yid"), ("yo", "yor"),
+    ("za", "zha"), ("zh", "zho"), ("zu", "zul"),
+];
+
 /// One `TrackEntry`, read for what it is.
 fn mkv_track_entry(
     file: &mut File,
@@ -1119,7 +1471,7 @@ fn mkv_track_entry(
 ) -> crate::Result<MkvEntry> {
     let (mut number, mut kind, mut codec, mut default_duration) = (0, 0, String::new(), None);
     let (mut width, mut height, mut config) = (0, 0, Vec::new());
-    let (mut language, mut name) = (String::new(), String::new());
+    let (mut language, mut name, mut bcp47) = (String::new(), String::new(), String::new());
     let mut tags = Tags::default();
     let mut light = ContentLight::default();
     let mut unpack = Unpack::None;
@@ -1130,6 +1482,7 @@ fn mkv_track_entry(
             CONTENT_ENCODINGS => unpack = mkv_content_encoding(file, body, stop)?,
             TRACK_TYPE => kind = ebml_uint(file, body, stop)?,
             TRACK_LANGUAGE => language = string_of(file, body, stop)?,
+            TRACK_LANGUAGE_BCP47 => bcp47 = string_of(file, body, stop)?,
             TRACK_NAME => name = string_of(file, body, stop)?,
             DEFAULT_DURATION => {
                 default_duration = Some(ebml_uint(file, body, stop)?).filter(|d| *d > 0)
@@ -1214,13 +1567,10 @@ fn mkv_track_entry(
         return Ok(MkvEntry::Audio(MkvAudioTrack {
             number,
             codec,
-            // What a `TrackEntry` without a `Language` element means, by spec --
-            // the same default the subtitle walk applies.
-            language: if language.is_empty() {
-                "und".into()
-            } else {
-                language
-            },
+            // Whichever element the file states it in, and `und` for one that
+            // states neither ([`mkv_language`]) -- the same answer the subtitle
+            // walk gets, so a dual-audio remux and its subtitles agree.
+            language: mkv_language(&language, &bcp47),
             name,
             unpack,
         }));
@@ -1440,7 +1790,14 @@ fn vp9_bit_depth(au: &[u8]) -> crate::Result<Option<u8>> {
 
 /// Every block of track `number`, in storage order, with the presentation span
 /// (first and last timestamp in `TimestampScale` ticks) the frame-rate fallback
-/// needs.
+/// needs -- and, third, how many block bytes *every* track of the file spends,
+/// `(TrackNumber, bytes)` in first-seen order.
+///
+/// That third answer is why this is one pass and not two: a block's length is
+/// already parsed out of its header here, on the way to deciding it belongs to
+/// another track and skipping it, so the sound track's size costs a lookup in a
+/// list of two or three rather than a second walk of the segment (six seconds of
+/// one, on a 12 GB film). [`probe_bitrate`] is what reads it.
 ///
 /// Only element headers are read: a block's payload is seeked over and fetched
 /// later by [`MkvDemuxer::next_access_unit`], which is what keeps this an index
@@ -1449,8 +1806,11 @@ fn mkv_blocks(
     file: &mut File,
     segment: (u64, u64),
     number: u64,
-) -> crate::Result<(Vec<Block>, Option<(i64, i64)>)> {
+) -> crate::Result<(Vec<Block>, Option<(i64, i64)>, Vec<(u64, u64)>)> {
     let mut blocks = Vec::new();
+    // A file has a handful of tracks, so this is a shorter linear scan than a
+    // hash would be a hash.
+    let mut track_bytes: Vec<(u64, u64)> = Vec::new();
     // Where each laced block's frames landed, so their timestamps can be spread
     // once the block after is known -- see the fixup below.
     let mut laced: Vec<(usize, usize)> = Vec::new();
@@ -1495,6 +1855,14 @@ fn mkv_blocks(
                 }
                 _ => continue,
             };
+            // Before the track filter, so this counts the whole file: the block
+            // as it sits on disk, lace header included, which is what that track
+            // costs the container. No read is added -- `len` came out of the
+            // header that was parsed to get here.
+            match track_bytes.iter_mut().find(|(n, _)| *n == block.number) {
+                Some((_, bytes)) => *bytes += block.len as u64,
+                None => track_bytes.push((block.number, block.len as u64)),
+            }
             if block.number != number {
                 continue;
             }
@@ -1548,7 +1916,7 @@ fn mkv_blocks(
         .map(|b| b.ts)
         .min()
         .zip(blocks.iter().map(|b| b.ts).max());
-    Ok((blocks, span))
+    Ok((blocks, span, track_bytes))
 }
 
 /// The frames inside a laced block: one `(offset, length)` each, in order.
@@ -2127,10 +2495,9 @@ pub struct MkvCue {
 /// display sets, read by [`crate::subtitle`] as [`MkvCue`]s like any other.
 pub const PGS: &str = "S_HDMV/PGS";
 
-/// The subtitle tracks of a Matroska file, in file order. An mp4's are not read
-/// (its `tx3g` is a different beast, and no file this project opens carries
-/// one); anything that is not a Matroska file at all is an error, as it is for
-/// [`matroska_audio_codec`].
+/// The subtitle tracks of a Matroska file, in file order. An mp4's are a
+/// different beast and are read by [`mp4_subtitles`]; anything that is not a
+/// Matroska file at all is an error, as it is for [`matroska_audio_codec`].
 ///
 /// Two passes at most: the header walk stops at the first `Cluster`, and the
 /// cue pass runs only when there is a text track to fill.
@@ -2178,11 +2545,133 @@ pub fn matroska_subtitles(path: &Path) -> crate::Result<Vec<MkvSubtitle>> {
     Ok(tracks)
 }
 
+/// One timed-text subtitle track of an mp4 -- the `tx3g` sample entry ffmpeg
+/// calls `mov_text` -- exactly as its `trak` declares it. The mp4 half of
+/// [`MkvSubtitle`]: what the samples *mean* is [`crate::subtitle`]'s business,
+/// this is the walk.
+#[derive(Debug)]
+pub struct Mp4Subtitle {
+    /// The `tkhd` track id, which is what a `.edith` row names the track by.
+    pub number: u64,
+    /// The `mdhd` language, ISO-639-2. `und` where the file states none, which
+    /// is the only thing that field can say -- an mp4 packs three letters into
+    /// sixteen bits and cannot leave them out.
+    pub language: String,
+    /// `trak/udta/name`, the title a muxer wrote (`Signs`), empty for the far
+    /// more common track that has none. The box ffmpeg reads and writes a
+    /// `-metadata:s:s:0 title=` in, and the one [`crate::mux`] patches in.
+    pub name: String,
+    /// Every sample of the track, in storage order.
+    pub samples: Vec<Mp4TextSample>,
+}
+
+/// One timed-text sample: when it shows, when it stops, and the bytes.
+#[derive(Debug)]
+pub struct Mp4TextSample {
+    /// Microseconds from the start of the file -- the sample's decode time
+    /// scaled by the track's own `mdhd` timescale, which is milliseconds in
+    /// what this project writes and microseconds in what ffmpeg writes.
+    pub start_us: i64,
+    /// Where the next sample begins: a timed-text track states one sample per
+    /// instant and leaves no holes, so this is the sample's `stts` duration on
+    /// top of its start and not a guess ([`crate::subtitle`]'s Matroska side
+    /// has to guess -- see `end_of` there).
+    pub end_us: i64,
+    /// ISO/IEC 14496-17: the text's length in 16 bits, then the UTF-8 itself.
+    /// A payload of `00 00` is a sample of *no text*, which is the stretch
+    /// between two cues rather than a cue with nothing in it.
+    pub payload: Vec<u8>,
+}
+
+/// The timed-text subtitle tracks of an mp4, in track-id order -- the reader
+/// that makes an mp4 export of this project's own openable again, and reads a
+/// `mov_text` track ffmpeg muxed just the same.
+///
+/// The samples come out of the `mp4` crate, which walks `stts`/`stsz`/`stco`
+/// for any track type; the *title* does not, because that crate's `TrakBox` has
+/// no `udta` field at all -- so the one box carrying it is read by hand out of
+/// the `moov`, the way [`sample_entry`] reads an `stsd` entry the crate drops.
+///
+/// A file with no timed-text track comes back empty, never an error; a file that
+/// is not an mp4 at all is an error, as [`matroska_subtitles`] is for a
+/// non-Matroska.
+pub fn mp4_subtitles(path: &Path) -> crate::Result<Vec<Mp4Subtitle>> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut reader = Mp4Reader::read_header(BufReader::new(file), size)?;
+    let mut ids: Vec<u32> = reader
+        .tracks()
+        .iter()
+        .filter(|(_, track)| matches!(track.track_type(), Ok(TrackType::Subtitle)))
+        .map(|(id, _)| *id)
+        .collect();
+    // By track id, which is the order the tracks were written in: a `HashMap`
+    // hands them over in whatever order it likes, and a row picks a track by
+    // its number out of a list a user saw.
+    ids.sort_unstable();
+    let names = mp4_track_names(path)?;
+    let mut tracks = Vec::with_capacity(ids.len());
+    for id in ids {
+        let track = &reader.tracks()[&id];
+        // Off the borrow before the samples, which need the reader itself.
+        let language = track.language().to_owned();
+        let timescale = i128::from(track.timescale().max(1));
+        let count = track.sample_count();
+        let mut samples = Vec::with_capacity(count as usize);
+        for i in 1..=count {
+            // Sample ids count from 1. A sample the tables cannot reach is
+            // skipped rather than raised: the other cues of the track are still
+            // the words a viewer needs.
+            let Some(sample) = reader.read_sample(id, i)? else {
+                continue;
+            };
+            let us = |ticks: u64| (i128::from(ticks) * 1_000_000 / timescale) as i64;
+            samples.push(Mp4TextSample {
+                start_us: us(sample.start_time),
+                end_us: us(sample.start_time + u64::from(sample.duration)),
+                payload: sample.bytes.to_vec(),
+            });
+        }
+        tracks.push(Mp4Subtitle {
+            number: u64::from(id),
+            language,
+            name: names
+                .iter()
+                .find(|(track_id, _)| *track_id == id)
+                .map(|(_, name)| name.clone())
+                .unwrap_or_default(),
+            samples,
+        });
+    }
+    Ok(tracks)
+}
+
+/// Each `trak`'s `udta/name`, by track id, for the traks that have one -- an
+/// mp4's word for what a track is *called*, beside the `mdhd` language it is
+/// in. Read by hand for the reason [`mp4_subtitles`] gives.
+fn mp4_track_names(path: &Path) -> crate::Result<Vec<(u32, String)>> {
+    let Some(moov) = read_top_level(path, b"moov")? else {
+        return Ok(Vec::new());
+    };
+    Ok(boxes(&moov)
+        .filter(|(kind, _)| *kind == b"trak")
+        .filter_map(|(_, trak)| {
+            let id = child(trak, b"tkhd").and_then(tkhd_track_id)?;
+            let name = child(trak, b"udta").and_then(|udta| child(udta, b"name"))?;
+            // Raw bytes, no version or flags -- and a writer that terminates the
+            // string is not lying about the title, it is padding it.
+            let name = String::from_utf8_lossy(name);
+            Some((id, name.trim_end_matches('\0').to_owned()))
+        })
+        .collect())
+}
+
 /// One `TrackEntry`, `Some` only for track type 0x11 -- the subtitles.
 fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Option<MkvSubtitle>> {
     const SUBTITLE: u64 = 0x11;
     let (mut number, mut kind, mut codec) = (0, 0, String::new());
     let (mut language, mut name, mut private) = (String::new(), String::new(), Vec::new());
+    let mut bcp47 = String::new();
     let mut unpack = Unpack::None;
     let mut at = body;
     while let Some((id, body, stop)) = ebml_element(file, at, end)? {
@@ -2193,6 +2682,7 @@ fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Opt
             CODEC_ID => codec = string_of(file, body, stop)?,
             CODEC_PRIVATE => private = ebml_bytes(file, body, stop)?,
             TRACK_LANGUAGE => language = string_of(file, body, stop)?,
+            TRACK_LANGUAGE_BCP47 => bcp47 = string_of(file, body, stop)?,
             TRACK_NAME => name = string_of(file, body, stop)?,
             _ => {}
         }
@@ -2201,12 +2691,9 @@ fn mkv_subtitle_entry(file: &mut File, body: u64, end: u64) -> crate::Result<Opt
     Ok((kind == SUBTITLE).then(|| MkvSubtitle {
         number,
         codec,
-        // What a `TrackEntry` without a `Language` element means, by spec.
-        language: if language.is_empty() {
-            "und".into()
-        } else {
-            language
-        },
+        // Whichever element the file states it in, `und` for a track that states
+        // neither -- [`mkv_language`] says why that is not the spec's `eng`.
+        language: mkv_language(&language, &bcp47),
         name,
         private,
         cues: Vec::new(),
@@ -2314,6 +2801,61 @@ fn string_of(file: &mut File, body: u64, stop: u64) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a `TrackEntry` states it is in, whichever of the two elements it
+    /// states it in -- [`mkv_language`]'s whole rule, as asserts.
+    #[test]
+    fn a_track_states_its_language_in_either_element() {
+        // The modern element wins over the legacy one, which is the spec's own
+        // precedence: his films carry a Bulgarian legacy code beside an English
+        // BCP-47 tag on different tracks, and the English ones state nothing
+        // else at all.
+        assert_eq!(mkv_language("", "en"), "eng");
+        assert_eq!(mkv_language("bul", "en"), "eng");
+        // A region is not a language: neither Matroska's legacy element nor an
+        // mp4's 16-bit field can hold one, so `en-US` is the English it is.
+        assert_eq!(mkv_language("", "en-US"), "eng");
+        assert_eq!(mkv_language("", "pt-BR"), "por");
+        assert_eq!(mkv_language("", "zh-Hans"), "zho");
+        // ...and every other language of the table, not the ones a test used.
+        assert_eq!(mkv_language("", "kn"), "kan");
+        assert_eq!(mkv_language("", "JA"), "jpn");
+        // Three letters already: an ISO 639-3 tag is what the code is.
+        assert_eq!(mkv_language("", "fil"), "fil");
+        // What nothing maps falls back to the file's other word rather than
+        // being thrown away, and `und` is only for a file that said neither.
+        assert_eq!(mkv_language("fra", "x-pig-latin"), "fra");
+        assert_eq!(mkv_language("", "x-pig-latin"), "und");
+        assert_eq!(mkv_language("fra", ""), "fra");
+        assert_eq!(mkv_language("und", ""), "und");
+        assert_eq!(mkv_language("", ""), "und");
+        // The table is the standard's own: one entry per ISO 639-1 code, none
+        // of them doubled, every code the two and three letters it is.
+        let mut seen: Vec<&str> = ISO_639_1_TO_2.iter().map(|(two, _)| *two).collect();
+        let count = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), count, "a doubled ISO 639-1 code");
+        for (two, three) in ISO_639_1_TO_2 {
+            assert!(
+                two.len() == 2 && three.len() == 3,
+                "{two} → {three} is not a 639-1 → 639-2 pair"
+            );
+        }
+    }
+
+    /// Every extension Matroska states, and nothing that is not one: `.mks` is
+    /// the subtitles alone and `.mka` the sound alone, both the same bytes the
+    /// `.mkv` reader already walks.
+    #[test]
+    fn every_matroska_extension_is_a_matroska() {
+        for name in ["a.mkv", "a.mka", "a.mks", "a.mk3d", "a.webm", "A.MKS"] {
+            assert!(is_matroska(Path::new(name)), "{name}");
+        }
+        for name in ["a.mp4", "a.m4v", "a.mov", "a.srt", "a", "a.mk"] {
+            assert!(!is_matroska(Path::new(name)), "{name}");
+        }
+    }
 
     /// The capability matrix, as an assert: every codec the decoder layer can be
     /// handed is reachable from *both* container dispatches, and every gap is a

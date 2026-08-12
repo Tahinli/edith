@@ -291,6 +291,131 @@ fn a_project_keeps_its_subtitles_across_a_save() {
     );
 }
 
+/// The two-door import: the parse runs with no session in hand -- which is what
+/// lets a front-end run it off the render thread -- and the tracks it hands back
+/// go on the timeline for the cost of a push. Same dedupe as the one-call door,
+/// so the same file twice is still one set of rows, and what lands is saved and
+/// loaded as a reference exactly like an `import_subtitles` row.
+#[test]
+fn parsed_tracks_can_be_handed_to_a_session_without_it_reading_the_file() {
+    let dir = scratch("handoff");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    let mkv = dir.join("test_subs.mkv");
+    std::fs::copy(asset("test_subs.mkv"), &mkv).expect("copy the subtitle fixture");
+
+    // The door a background executor calls: no `&self`, so nothing about the
+    // session is borrowed while the container is walked.
+    let tracks =
+        engine::PlaybackSession::parse_subtitles(&mkv).expect("the mkv is walked off-thread");
+    assert_eq!(tracks.len(), 2, "both tracks of the fixture");
+    // Owned data all the way down, so the parse may run on a background task
+    // and its result be sent back: a track holding a handle would put the walk
+    // back on the thread that draws.
+    fn sendable<T: Send + 'static>(_: &T) {}
+    sendable(&tracks);
+
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    assert_eq!(session.add_subtitle_tracks(tracks.clone()), 2, "both go on");
+    // The same tracks again are the same subtitles: the (path, track) dedupe is
+    // what a front-end's "already on the timeline" line falls out of.
+    assert_eq!(session.add_subtitle_tracks(tracks), 0, "and no repeat rows");
+    assert_eq!(session.subtitles().len(), 2);
+    // And the one-call door agrees with it, over the very same file.
+    assert_eq!(session.import_subtitles(&mkv).expect("no error"), 0);
+    assert_eq!(session.subtitles()[0].cues, expected());
+
+    let project = dir.join("cut.edith");
+    session.save_project(&project).expect("save");
+    let back = engine::PlaybackSession::open_project(&project).expect("open the project");
+    assert_eq!(
+        back.subtitles().iter().map(|t| t.track).collect::<Vec<_>>(),
+        session
+            .subtitles()
+            .iter()
+            .map(|t| t.track)
+            .collect::<Vec<_>>(),
+        "a handed-over row is a reference like any other"
+    );
+    assert_eq!(back.subtitles()[1].cues, expected());
+}
+
+/// Whatever an import added comes back off: three tracks go on, the middle one
+/// is removed, and what is left is the other two *in the order they were added*
+/// -- a save then writes exactly those two references and a load reads back
+/// exactly them. The bad index is a refusal naming the index, not a silent
+/// no-op, since a front-end holding a stale row has picked the wrong one.
+#[test]
+fn a_subtitle_row_can_be_removed_and_the_survivors_round_trip() {
+    let dir = scratch("remove");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    // Three files rather than three tracks of one: `add_subtitles` dedupes by
+    // (path, track), so three names are three rows.
+    for name in ["a.srt", "b.srt", "c.srt"] {
+        std::fs::copy(data("test_subs.srt"), dir.join(name)).expect("copy the subtitle fixture");
+    }
+
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    for name in ["a.srt", "b.srt", "c.srt"] {
+        assert_eq!(
+            session
+                .import_subtitles(&dir.join(name))
+                .expect("the .srt imports"),
+            1
+        );
+    }
+    assert_eq!(session.subtitles().len(), 3);
+
+    session.remove_subtitles(1).expect("the middle row goes");
+    let names: Vec<String> = session
+        .subtitles()
+        .iter()
+        .map(|t| {
+            t.path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(names, vec!["a.srt", "c.srt"], "the survivors keep their order");
+    assert_eq!(session.subtitles()[0].cues, expected(), "and their cues");
+
+    let project = dir.join("cut.edith");
+    session.save_project(&project).expect("save");
+    let text = std::fs::read_to_string(&project).expect("read the project back");
+    assert!(
+        text.contains("\nsubtitle - a.srt\n") && text.contains("\nsubtitle - c.srt\n"),
+        "the survivors are written, by reference: {text}"
+    );
+    assert!(
+        !text.contains("b.srt"),
+        "and the removed one is not: {text}"
+    );
+
+    let back = engine::PlaybackSession::open_project(&project).expect("open the project");
+    assert_eq!(
+        back.subtitles()
+            .iter()
+            .map(|t| t.path.file_name().expect("a name").to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["a.srt", "c.srt"],
+        "and a load is the same two, in the same order"
+    );
+    assert_eq!(back.subtitles()[1].cues, expected());
+
+    // A row that is not there says so, naming the index a front-end passed.
+    let why = session
+        .remove_subtitles(9)
+        .expect_err("there is no row 9")
+        .to_string();
+    assert!(why.contains('9') && why.contains("subtitle"), "{why}");
+    assert_eq!(session.subtitles().len(), 2, "and nothing moved");
+}
+
 /// A bitmap track survives a save the same way a text one does, and for the
 /// same reason: a `.edith` holds the file and the track number, never a cue, so
 /// what comes back is what the file still says. The pictures are read out of
@@ -447,6 +572,67 @@ fn importing_something_that_is_not_a_subtitle_says_so() {
         .to_string();
     assert!(err.contains("txt"), "{err}");
     assert_eq!(session.subtitles().len(), 0, "and nothing was added");
+}
+
+/// The Matroska that is the subtitles alone: `.mks`, what a subtitle release
+/// ships beside the film, imported by the door an `.mkv` is imported by.
+///
+/// The refusal it used to get -- *"mks" is not a subtitle format this reads* --
+/// was a claim about a container this very binary parses: the bytes are a
+/// Matroska's and the same walk reads them, so only the extension list said no.
+#[test]
+fn a_matroska_that_is_the_subtitles_alone_imports_like_any_other() {
+    let dir = scratch("mks");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    let added = session
+        .import_subtitles(&asset("test_subs.mks"))
+        .expect("a .mks is a Matroska and imports as one");
+    assert_eq!(added, 2, "both its tracks came in");
+    let labels: Vec<&str> = session.subtitles().iter().map(|t| &*t.label).collect();
+    assert_eq!(labels, ["eng", "fra — Signs"], "with their own names");
+    for track in session.subtitles() {
+        assert_eq!(track.refused, None, "{} parses", track.label);
+        assert_eq!(track.cues, expected(), "{} holds the cues", track.label);
+    }
+}
+
+/// A track that states its language the way a modern muxer states it --
+/// `LanguageBCP47` and no legacy `Language` element at all -- keeps that
+/// language, where it used to come in as `und`.
+///
+/// The shape of every English track of his *a dual-language remux* and all four
+/// of his *a 17-track library file* ones: they read as `und` while the file said `en`,
+/// and the loss survived into the exported file's track list.
+#[test]
+fn a_track_that_states_its_language_the_modern_way_keeps_it() {
+    // The fixture is what it claims to be: the modern element is in it and the
+    // legacy one is not, so what is being read is the new element and not a
+    // leftover of the old one.
+    let bytes = std::fs::read(asset("test_subs_bcp47.mkv")).expect("the fixture is there");
+    assert!(
+        bytes.windows(3).any(|w| w == [0x22, 0xB5, 0x9D]),
+        "the fixture states LanguageBCP47"
+    );
+    for legacy in [b"\x22\xb5\x9c\x83eng".as_slice(), b"\x22\xb5\x9c\x83fra"] {
+        assert!(
+            !bytes.windows(legacy.len()).any(|w| w == legacy),
+            "and states no legacy Language element for its subtitle tracks"
+        );
+    }
+
+    let tracks = subtitle::of_matroska(&asset("test_subs_bcp47.mkv")).expect("the mkv is walked");
+    let languages: Vec<&str> = tracks.iter().map(|t| &*t.language).collect();
+    assert_eq!(languages, ["eng", "fra"], "`en` is English, `fr` is French");
+    // ...and the same file with the legacy element reads exactly the same, which
+    // is the point: which element a muxer chose is not something a row shows.
+    let legacy = subtitle::of_matroska(&asset("test_subs.mkv")).expect("the mkv is walked");
+    let want: Vec<&str> = legacy.iter().map(|t| &*t.label).collect();
+    let got: Vec<&str> = tracks.iter().map(|t| &*t.label).collect();
+    assert_eq!(got, want, "the two files list the same two tracks");
 }
 
 /// An EBML element: its id as it is written in the file, then an 8-byte

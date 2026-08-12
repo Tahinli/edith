@@ -92,6 +92,8 @@ actions! {
     AddAudioLane,
     RemoveVideoLane,
     RemoveAudioLane,
+    AddSubtitleTrack,
+    RemoveSubtitleTrack,
     ToggleMute,
     VolumeUp,
     VolumeDown,
@@ -146,6 +148,8 @@ impl ActionId {
             ActionId::AddAudioLane => "Add an audio track",
             ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
             ActionId::RemoveAudioLane => "Remove the last audio track (it must be empty)",
+            ActionId::AddSubtitleTrack => "Add subtitles from a file…",
+            ActionId::RemoveSubtitleTrack => "Remove the picked subtitle track",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
@@ -195,6 +199,8 @@ impl ActionId {
             ActionId::AddAudioLane => "add-audio-lane",
             ActionId::RemoveVideoLane => "remove-video-lane",
             ActionId::RemoveAudioLane => "remove-audio-lane",
+            ActionId::AddSubtitleTrack => "add-subtitle-track",
+            ActionId::RemoveSubtitleTrack => "remove-subtitle-track",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
@@ -264,6 +270,12 @@ impl ActionId {
             // Not a view setting despite being a pointer aid: it decides where
             // a drag actually lands, which is an edit and not a magnification.
             | ActionId::ToggleSnap
+            // The subtitle pair is a track pair like the lanes above it: what
+            // they add is on the timeline and goes into the file an export
+            // writes, where the toggle two headings down only decides whether
+            // this window draws it.
+            | ActionId::AddSubtitleTrack
+            | ActionId::RemoveSubtitleTrack
             | ActionId::RemoveAudioLane => Category::Editing,
             ActionId::ToggleMute
             | ActionId::VolumeUp
@@ -723,6 +735,13 @@ impl Keymap {
                 // key beside it.
                 b(ActionId::RemoveVideoLane, "b", true),
                 b(ActionId::RemoveAudioLane, "a", true),
+                // The subtitle pair reads the same way: the unshifted initial
+                // adds one -- "s" is free, the save is the *ctrl* chord -- and a
+                // ctrl chord takes it back. Ctrl+s is that save, so the removal
+                // takes the other letter subtitles already answer to here: "t"
+                // shows and hides them, and ctrl+t takes one off the timeline.
+                b(ActionId::AddSubtitleTrack, "s", false),
+                b(ActionId::RemoveSubtitleTrack, "t", true),
                 b(ActionId::ToggleMute, "m", false),
                 // The unshifted pair, which is what gpui reports for those two
                 // keys ("=" and "-", platform.rs:862): the volume keys every
@@ -1023,7 +1042,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 44);
+        assert_eq!(k.entries().len(), 46);
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
@@ -1062,6 +1081,10 @@ mod tests {
         // press. Ctrl+v is the paste, so the video one sits beside it.
         assert_eq!(k.lookup("b", true), Some(ActionId::RemoveVideoLane));
         assert_eq!(k.lookup("a", true), Some(ActionId::RemoveAudioLane));
+        // The subtitle pair, the third kind of track: the initial adds and the
+        // subtitle letter's chord takes it back.
+        assert_eq!(k.lookup("s", false), Some(ActionId::AddSubtitleTrack));
+        assert_eq!(k.lookup("t", true), Some(ActionId::RemoveSubtitleTrack));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
         assert_eq!(k.lookup("q", false), Some(ActionId::Equalizer));
         // The volume pair is the unshifted one, so neither needs a modifier

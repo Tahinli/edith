@@ -19,7 +19,7 @@ use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::tonemap::Preset;
-use engine::{Clip, Codec, ExportHandle, Frame, PlaybackSession};
+use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
     FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -222,6 +222,16 @@ const LIST_CHAR_W: f32 = 6.;
 /// The fewest characters a clipped name is cut to, however narrow the column
 /// gets: past this there is nothing on either side of the gap to read.
 const LIST_CLIP_MIN: usize = 5;
+/// How long the export card's Subtitles line may get before it counts tracks
+/// instead of naming them ([`subtitle_plan`]). Three lines of that row's value
+/// box, at [`LIST_CHAR_W`] to a character: [`EXPORT_W`] less the row's padding
+/// and gap, its tick and [`EXPORT_KEY_W`] key column, and the word "Subtitles"
+/// in front of the value. Not a track count -- what walks the Destination row
+/// off the bottom of the card is the *wrapping*, and thirty-five one-word
+/// labels wrap less than three long ones.
+const SUB_PLAN_CHARS: usize = (3.
+    * (EXPORT_W - 12. - 12. - (10. + 8. + EXPORT_KEY_W + 8. + 9. * LIST_CHAR_W))
+    / LIST_CHAR_W) as usize;
 
 /// The one key name this file still spells out, and gpui's spelling of it: it
 /// is the way out of a capture and out of the overlay, and both have to work
@@ -1153,6 +1163,12 @@ struct Player {
     /// presence means "asked" -- and an empty list is a silent file, which is
     /// exactly one row and no stream tags.
     streams: HashMap<PathBuf, Vec<StreamInfo>>,
+    /// What each source is coded at, read off its header once and kept: what a
+    /// properties card says about a file's rate. Filled like `streams` --
+    /// presence means "asked" -- and the inner `None` is "asked, not answered
+    /// yet", which the card draws as an ellipsis: the probe walks a Matroska's
+    /// clusters, so a big film answers in seconds rather than at once.
+    bitrates: HashMap<PathBuf, Option<MediaBitrate>>,
     /// How big each still source's picture is, read from its header once and
     /// kept -- what a library row and its card say about a file that has no
     /// streams to describe. Filled like `streams`: presence means "asked", and
@@ -1623,6 +1639,11 @@ impl Player {
             // through the × in its own header.
             ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
             ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
+            // The same chooser the + S button opens, and the picked row -- the
+            // one the panel draws highlighted -- for the removal: the × on any
+            // other row is that row's own door, and both doors are one call.
+            ActionId::AddSubtitleTrack => self.pick_and_add_subtitles(cx),
+            ActionId::RemoveSubtitleTrack => self.remove_subtitle_track(self.sub_track, cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
@@ -2716,7 +2737,8 @@ impl Player {
                 self.reset_after_reseek();
                 self.notice = Some(
                     format!(
-                        "{count} SILENCES CUT {reach} — {saved:.1}s shorter, {} takes it back",
+                        "{count} SILENCES CUT {reach} — {} shorter, {} takes it back",
+                        secs_label(saved),
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -3242,6 +3264,26 @@ impl Player {
             })
             .detach();
         }
+        // What each file is coded at, for the card that says so. Header and
+        // sample table only, but a Matroska indexes no samples and its open
+        // walks every cluster header -- 6.7 s on a 12.9 GB film -- so this of
+        // all of them cannot be on the render thread.
+        for path in unseen_paths(session.sources(), &self.bitrates) {
+            self.bitrates.insert(path.clone(), None);
+            let probed = cx.background_executor().spawn({
+                let path = path.clone();
+                async move { engine::probe_bitrate(&path) }
+            });
+            cx.spawn(async move |this, cx| {
+                let probed = probed.await;
+                this.update(cx, |this, cx| {
+                    this.bitrates.insert(path, Some(probed));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         // Which decoder each file will run on, for the row that says so before
         // a frame of it plays. Off the render thread like the streams above: a
         // stream the plugin takes costs one VA-API init (~90 ms) to answer.
@@ -3322,14 +3364,17 @@ impl Player {
             return;
         }
         let meta = *session.meta();
-        let key = (settings, (meta.width, meta.height));
+        // Cloned rather than copied: the settings carry the picked subtitle
+        // rows, which is a `Vec` ([`engine::export::ExportSettings`]).
+        let key = (settings.clone(), (meta.width, meta.height));
         if self
             .export_seat
-            .is_some_and(|(asked, size, _)| (asked, size) == key)
+            .as_ref()
+            .is_some_and(|(asked, size, _)| (asked, size) == (&key.0, &key.1))
         {
             return;
         }
-        self.export_seat = Some((key.0, key.1, None));
+        self.export_seat = Some((key.0.clone(), key.1, None));
         let probed = cx
             .background_executor()
             .spawn(async move { engine::export::planned_video(&meta, &settings) });
@@ -3341,7 +3386,7 @@ impl Player {
                 if let Some(seat) = this
                     .export_seat
                     .as_mut()
-                    .filter(|(asked, size, _)| (*asked, *size) == key)
+                    .filter(|(asked, size, _)| (asked, size) == (&key.0, &key.1))
                 {
                     seat.2 = probed;
                 }
@@ -3956,6 +4001,7 @@ impl Player {
         self.close_silence();
         self.waves.clear();
         self.streams.clear();
+        self.bitrates.clear();
         self.sizes.clear();
         // Scanned off sources that are not in the library any more.
         self.silence_levels.clear();
@@ -4138,8 +4184,8 @@ impl Player {
         // All that is left here is to hang everything derived from it off the
         // window -- the clock, the title, where an export and a save go -- and
         // that is arithmetic, not a read.
-        match landed {
-            Landed::Read => {}
+        let subs = match landed {
+            Landed::Read(subs) => subs,
             what => {
                 self.opening = None;
                 match what {
@@ -4150,7 +4196,7 @@ impl Player {
                         self.notice = Some(text.into());
                         cx.notify();
                     }
-                    Landed::Read => unreachable!("matched above"),
+                    Landed::Read(_) => unreachable!("matched above"),
                 }
                 // The line a launch has always printed, now printed when the
                 // file actually arrives: it is the mark that says the timeline
@@ -4167,7 +4213,7 @@ impl Player {
                 }
                 return;
             }
-        }
+        };
         // An empty window has no library to add to yet: the file opens one, and
         // the timeline under it stays empty, because an import is an import
         // whether or not a session was already up. A file *named at launch* is
@@ -4178,44 +4224,27 @@ impl Player {
         // section shows and what the overlay draws. With no timeline open there
         // is nothing for the cues to be timed against, and it says so.
         if is_subtitle(path) {
-            let text = match self
-                .session
-                .as_mut()
-                .map(|session| session.import_subtitles(path))
-            {
-                Some(Ok(0)) => format!("{} is already on the timeline", file_name(path)),
-                Some(Ok(_)) => format!(
-                    "SUBTITLES {} — showing over the picture, {} hides them",
-                    file_name(path),
-                    self.keymap.display(ActionId::ToggleSubtitles)
-                ),
-                Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
-                None => {
-                    "NO SUBTITLES ADDED — open a file for them to run against first".to_string()
-                }
-            };
-            eprintln!("{text}");
-            self.notice = Some(text.into());
-            cx.notify();
+            self.take_subtitles(path, subs, cx);
             return;
         }
         let text = match self.session.as_mut().map(|session| session.import(path)) {
             Some(Ok(_)) => {
                 // The file's own subtitle tracks with it, exactly as an open
                 // takes them: an import is the other door the same file arrives
-                // through.
-                let subs = self
+                // through. The cues were read on the worker
+                // ([`read_ahead`]); what happens here is the push.
+                let tail = self
                     .session
                     .as_mut()
-                    .and_then(|session| subtitle_notice(session, path))
+                    .and_then(|session| subtitle_tail(session, subs))
                     .unwrap_or_default();
                 format!(
-                    "IMPORTED {} to the library — drag it onto a lane to place it{subs}",
+                    "IMPORTED {} to the library — drag it onto a lane to place it{tail}",
                     file_name(path)
                 )
             }
             Some(Err(e)) => format!("IMPORT FAILED: {e}"),
-            None => self.open_media(path, false),
+            None => self.open_media(path, false, subs),
         };
         eprintln!("{text}");
         self.notice = Some(text.into());
@@ -4231,8 +4260,8 @@ impl Player {
     /// `place` is the difference between the two doors that come here: a file
     /// *opened* is the timeline, one *imported* into an empty window fills the
     /// library and leaves the lanes empty for a drag.
-    fn open_media(&mut self, path: &std::path::Path, place: bool) -> String {
-        self.install_media(path, open_session(path, place), place)
+    fn open_media(&mut self, path: &std::path::Path, place: bool, subs: Subs) -> String {
+        self.install_media(path, open_session(path, place, subs), place)
     }
 
     /// The second half of it: everything the window derives from a session that
@@ -4288,7 +4317,9 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let picked = cx.background_executor().spawn(async { pick_file() });
+        let picked = cx
+            .background_executor()
+            .spawn(async { pick_file("edith — import") });
         cx.spawn(async move |this, cx| {
             let picked = picked.await;
             this.update(cx, |this, cx| match picked {
@@ -4307,6 +4338,179 @@ impl Player {
             .ok();
         })
         .detach();
+    }
+
+    /// The `+ S` button and its key: asks the desktop for a file and takes the
+    /// subtitle tracks out of it -- a standalone `.srt`/`.vtt`/`.ass` is one of
+    /// them, a Matroska however many are inside. Only the subtitles: the file
+    /// itself does not join the library, which is what the Import button beside
+    /// this one is for.
+    ///
+    /// The chooser is another process and the user may sit in it, so it runs on
+    /// a background thread, exactly as [`Player::pick_and_import`] does.
+    fn pick_and_add_subtitles(&mut self, cx: &mut Context<Self>) {
+        // What dims the `+ S` button, asked here as well so the key answers the
+        // same question -- and *before* the chooser rather than after it: a door
+        // that opens a dialog, waits for a file and only then says the timeline
+        // was never there is the second door disagreeing with the first.
+        if let Some(why) = self.enable(ActionId::AddSubtitleTrack, None).why() {
+            let text = format!("NO SUBTITLES ADDED — {why}");
+            eprintln!("{text}");
+            self.notice = Some(text.into());
+            cx.notify();
+            return;
+        }
+        let picked = cx
+            .background_executor()
+            .spawn(async { pick_file("edith — subtitles to add") });
+        cx.spawn(async move |this, cx| {
+            let picked = picked.await;
+            this.update(cx, |this, cx| match picked {
+                Ok(Some(path)) => this.add_subtitles(&path, cx),
+                // Cancelled: the user already knows what happened.
+                Ok(None) => {}
+                Err(text) => {
+                    eprintln!("{text}");
+                    this.notice = Some(text.into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Takes a file's subtitle tracks onto the timeline, off the render thread.
+    /// The walk reads the whole container for its cues
+    /// (`engine::PlaybackSession::parse_subtitles`) -- ~200 ms on a two-hour 4K
+    /// remux and 1.3 s on a cold 3 GB one -- and a button that costs the window
+    /// that many frames is a button that freezes it. So the *parse* is the
+    /// worker's, whole, and the UI thread only pushes what came back
+    /// ([`PlaybackSession::add_subtitle_tracks`]): no borrow crosses the await,
+    /// because the parse is an associated fn that owns nothing.
+    fn add_subtitles(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // Nothing to time the cues against: said now rather than after a walk
+        // of a 25 GB file that was never going to be kept.
+        if self.session.is_none() {
+            self.landed_subtitles(path, None, cx);
+            return;
+        }
+        self.notice = Some(format!("READING {} for subtitles…", file_name(path)).into());
+        let parsed = cx.background_executor().spawn({
+            let path = path.to_path_buf();
+            async move { engine::PlaybackSession::parse_subtitles(&path) }
+        });
+        let path = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let parsed = parsed.await;
+            this.update(cx, |this, cx| {
+                // The dedupe lives inside the push, so a second `+ S` on the
+                // same file still answers 0 and still says so below.
+                let added = this
+                    .session
+                    .as_mut()
+                    .map(|session| parsed.map(|tracks| session.add_subtitle_tracks(tracks)));
+                this.landed_subtitles(&path, added, cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Every subtitle track a `.srt`/`.vtt`/`.ass` carries, onto the timeline
+    /// and nowhere else: they are not clips and land on no lane. The cues came
+    /// off the worker that read the file ([`read_ahead`]), like every other
+    /// door's do, and what is left here is the push. The engine dedupes by
+    /// (file, track), so the same `.srt` twice is one row and says so.
+    fn take_subtitles(&mut self, path: &std::path::Path, subs: Subs, cx: &mut Context<Self>) {
+        let added = self
+            .session
+            .as_mut()
+            .map(|session| subs.map(|tracks| session.add_subtitle_tracks(tracks)));
+        self.landed_subtitles(path, added, cx);
+    }
+
+    /// What the timeline says once the tracks are on it, whichever worker did
+    /// the reading: the `+ S` button and its key ([`Self::add_subtitles`]), a
+    /// dropped or imported subtitle file ([`Self::take_subtitles`]), and a
+    /// window with nothing to time cues against all word the outcome here,
+    /// once, so no two doors can drift apart.
+    fn landed_subtitles(
+        &mut self,
+        path: &std::path::Path,
+        added: Option<engine::Result<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match added {
+            Some(Ok(0)) => format!("{} is already on the timeline", file_name(path)),
+            Some(Ok(n)) => format!(
+                "SUBTITLES {} — {n} track(s), showing over the picture, {} hides them",
+                file_name(path),
+                self.keymap.display(ActionId::ToggleSubtitles)
+            ),
+            Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
+            None => "NO SUBTITLES ADDED — open a file for them to run against first".to_string(),
+        };
+        eprintln!("{text}");
+        self.notice = Some(text.into());
+        cx.notify();
+    }
+
+    /// The × on a subtitle row, and the stroke that takes the picked one off:
+    /// the track leaves the timeline and the pick moves with it. Every index
+    /// past the one that went moves down
+    /// ([`engine::Project::remove_subtitles`]), so a pick left where it was
+    /// would name a *different* track -- and the pick is what an export writes
+    /// into the file.
+    ///
+    /// Not an undo step: subtitles are not on the history's snapshots, so the
+    /// way back is importing the file again. The notice says that rather than
+    /// promising a ctrl+z that would do nothing.
+    fn remove_subtitle_track(&mut self, track: usize, cx: &mut Context<Self>) {
+        // The one availability oracle, for the same reason the × on a row and
+        // the stroke are one call: an empty list is not a failure, it is an
+        // action with nothing to act on, and the engine's "there is no subtitle
+        // track 0" is an index nobody typed. A real removal that fails still
+        // says what the engine said, below.
+        if let Some(why) = self.enable(ActionId::RemoveSubtitleTrack, None).why() {
+            let text = format!("NO SUBTITLES REMOVED — {why}");
+            eprintln!("{text}");
+            self.notice = Some(text.into());
+            cx.notify();
+            return;
+        }
+        // Read before it goes: a notice naming an index names nothing.
+        let name = self
+            .session
+            .as_ref()
+            .and_then(|session| sub_pick_name(session.subtitles(), track))
+            .unwrap_or_else(|| format!("subtitle track {track}"));
+        let text = match self
+            .session
+            .as_mut()
+            .map(|session| session.remove_subtitles(track))
+        {
+            Some(Ok(())) => {
+                let left = self
+                    .session
+                    .as_ref()
+                    .map_or(0, |session| session.subtitles().len());
+                self.sub_track = sub_pick_after_removal(self.sub_track, track, left);
+                // The drawn cue is keyed by that index ([`Player::sub_picture`])
+                // and the index now stands for another track.
+                //
+                // ponytail: its atlas tile is not released -- `close_session`'s
+                // note, for its reason and with its upgrade path.
+                self.sub_image = None;
+                format!("{name} REMOVED — importing the file again brings it back")
+            }
+            Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
+            None => "NO SUBTITLES REMOVED — open a file first".to_string(),
+        };
+        eprintln!("{text}");
+        self.notice = Some(text.into());
+        cx.notify();
     }
 
     /// Swaps the whole timeline for one restored from a `.edith`. Like an
@@ -4766,6 +4970,46 @@ impl Player {
         .detach();
     }
 
+    /// The subtitle tracks an export of this timeline carries: every one with a
+    /// cue left in the exported range ([`PlaybackSession::timeline_cues`], the
+    /// very map the file is written from), in the library's own order.
+    ///
+    /// Worked out from the cues each time rather than kept as a pick, which is
+    /// what makes it impossible to desync: a row added or taken off shifts every
+    /// index after it, and a stored list would then name tracks nobody chose.
+    /// `Player::sub_track` stays what it always was -- which track the *overlay*
+    /// draws -- and has no say here.
+    ///
+    /// The honest input and not the final answer: the engine filters it again
+    /// per track (a track that could not be read, a picture one) and says so in
+    /// the card's own words ([`engine::export::planned_subtitles`]).
+    fn export_subs(&self) -> Vec<usize> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        (0..session.subtitles().len())
+            .filter(|&i| !session.timeline_cues(i).is_empty())
+            .collect()
+    }
+
+    /// That list in the card's words ([`subtitle_plan`]): what travels, and the
+    /// reason beside every track that does not -- including the ones
+    /// [`Self::export_subs`] filtered out before the engine ever saw them.
+    fn subtitle_line(&self) -> String {
+        let Some(session) = self.session.as_ref() else {
+            return "none".to_string();
+        };
+        let picks = self.export_subs();
+        let plan = session.planned_subtitles(self.format, picks.iter().copied());
+        match self.format.has_video() {
+            true => subtitle_plan(plan, session.subtitles(), &picks),
+            // A format that is the sound alone has nowhere to put any of them
+            // and the engine says that once, about the file. Naming the cues of
+            // each track under it answers a question the format already closed.
+            false => plan,
+        }
+    }
+
     /// Writes the edit list out, at the settings the card was left at. Playback
     /// stops first: the exporter opens its own decoder -- and, on the hardware
     /// path, an encoder -- so a running player would only compete with it for
@@ -4778,11 +5022,11 @@ impl Player {
         }
         let mut settings =
             export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
-        // The track the library has picked is the one that travels -- the same
-        // row the overlay draws, so the file carries what was watched. Set here
-        // rather than inside `export_settings`, which the card also calls for
-        // the *estimate* and which nothing else needs a subtitle for.
-        settings.subtitles = Some(self.sub_track);
+        // Whatever is on the timeline travels -- every track with a cue in the
+        // exported range, not the one row the overlay happens to be drawing.
+        // Set here rather than inside `export_settings`, which the card also
+        // calls for the *estimate* and which nothing else needs a subtitle for.
+        settings.subtitles = self.export_subs();
         let Some(session) = &mut self.session else {
             self.notice = Some("NOTHING TO EXPORT — open a file first".into());
             cx.notify();
@@ -5894,6 +6138,11 @@ impl Player {
                             true => format!("{} {}", row.label, row.number),
                             false => row.label,
                         };
+                        // A standalone `.srt` is named after its own file, so
+                        // the file in front of it says the same word twice
+                        // ("Legend.of.… · Legend.of.…"). [`sub_pick_name`]'s
+                        // rule, on the row it is about.
+                        let owned = several_files && !title.starts_with(name.as_str());
                         // The whole path, never clipped: the row says which
                         // file, and the tooltip says which one on disk.
                         let tip: SharedString = match &row.refused {
@@ -5904,6 +6153,11 @@ impl Player {
                             ),
                         }
                         .into();
+                        // Named, because a × is the same glyph on every row and
+                        // the tooltip is what says which track it takes off.
+                        let remove_tip: SharedString =
+                            format!("Remove {title} — importing the file again brings it back")
+                                .into();
                         div()
                             // The *flat* index into the session's add-order
                             // list, which is what a pick is and what a save
@@ -5960,7 +6214,7 @@ impl Player {
                                             // truncates from the right: an
                                             // ownership word at the end is a
                                             // word the floor never shows.
-                                            .when(several_files, |d| {
+                                            .when(owned, |d| {
                                                 d.child(
                                                     div()
                                                         .flex_none()
@@ -5989,6 +6243,34 @@ impl Player {
                                             .text_color(rgb(INK_DIM))
                                             .child(row.detail),
                                     ),
+                            )
+                            // The way back off the timeline, on every row and on
+                            // the last one too -- a list of subtitles is allowed
+                            // to be empty, unlike a lane. A `HIT_MIN` target and
+                            // never hidden, the lane header's ×, and it stops
+                            // the click there: the row under it picks a track,
+                            // and picking the track that has just gone would
+                            // leave the pick naming nothing.
+                            .child(
+                                div()
+                                    .id(("subtitle-remove", track))
+                                    .flex_none()
+                                    .w(px(HIT_MIN))
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_subtitle_track(track, cx);
+                                        },
+                                    ))
+                                    .child("×"),
                             )
                     })
                     .collect();
@@ -6440,6 +6722,35 @@ impl Player {
                                 live,
                                 cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.add_lane(LaneKind::Audio, cx)
+                                }),
+                            ))
+                            // The third kind of track this timeline carries, and
+                            // the only one that arrived through a drop alone: a
+                            // subtitle file nobody thought to drag was a track
+                            // the editor could not be asked for. What it opens is
+                            // a chooser rather than an empty row -- a subtitle
+                            // track is its file, and there is nothing to add
+                            // before one is named.
+                            .child(control(
+                                "add-subtitle-track",
+                                None,
+                                "+ S",
+                                // Dim, and saying why it is dim, out of the one
+                                // oracle -- the very words the key answers with
+                                // (`Player::pick_and_add_subtitles`), so the
+                                // tooltip and the notice cannot come to differ.
+                                match self.enable(ActionId::AddSubtitleTrack, None).why() {
+                                    Some(why) => {
+                                        format!("{} — {why}", key(ActionId::AddSubtitleTrack))
+                                    }
+                                    None => format!(
+                                        "{} — adds every subtitle track in a file you pick",
+                                        key(ActionId::AddSubtitleTrack)
+                                    ),
+                                },
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.pick_and_add_subtitles(cx)
                                 }),
                             ))
                             // With the transport, not the edit group: it changes what
@@ -7029,7 +7340,11 @@ impl Player {
             div()
                 .flex()
                 // The floor, not the height: a row that needed two lines
-                // would otherwise paint over the one under it.
+                // would otherwise paint over the one under it -- which it did
+                // anyway until this said `flex_none`, a row inside a capped
+                // scrolling list being shrunk to fit by default (the export
+                // card's rows had the same shape and the same overlap).
+                .flex_none()
                 .min_h(px(KEYS_ROW_H))
                 .items_center()
                 .justify_between()
@@ -7282,7 +7597,13 @@ impl Player {
                 .id(id)
                 .flex()
                 // The floor, not the height: the destination's path wraps on a
-                // long name and must not paint over the row under it.
+                // long name and must not paint over the row under it. Which it
+                // did: inside a capped, scrolling list a row shrinks to fit by
+                // default, so a wrapped detail was drawn over the row beneath
+                // it (the Sound row's "the source's own packets are copied…"
+                // over Subtitles). The list scrolls -- a row is as tall as what
+                // it has to say.
+                .flex_none()
                 .min_h(px(KEYS_ROW_H))
                 .items_center()
                 .justify_between()
@@ -7511,22 +7832,29 @@ impl Player {
             }));
         }
         list.push(r.into_any_element());
-        // What happens to the picked subtitle track, in one line: it is written
-        // into the file, or the reason it is not. Nothing to pick here -- which
-        // track is the library's row and the container is the format row above
-        // -- so the row says and does not answer, like the machine lines below.
+        // What happens to the subtitles on this timeline, in one line: how many
+        // are written into the file and under what names, or the reason each one
+        // is not. Which tracks travel is not a pick -- everything with a cue on
+        // the timeline goes ([`Player::export_subs`]) -- so the row says rather
+        // than offers, like the machine lines below.
+        // ...and the ones that do not travel are named here too, which they were
+        // not: `export_subs` had already filtered a track with no cue on *this*
+        // timeline out of the engine's sight, so the card said nothing about a
+        // row the list was still showing ([`subtitle_plan`]).
+        let plan = self.subtitle_line();
+        // The row used to end in "click for <fmt> in MKV" whenever the picture
+        // was going into an mp4, on the grounds that only Matroska carries a
+        // text track. An mp4 carries one now (`Mp4Muxer::write_subtitles` writes
+        // `tx3g`), so that was a refusal offering a way out of nothing: the
+        // container the card is already set to embeds them. The refusals left in
+        // `planned_subtitles` are the true ones -- a sound-only format has
+        // nowhere to put a track, and a PGS track is pictures whatever the box.
         list.push(
             entry(
                 ("subtitles", 0),
                 "",
                 "Subtitles".into(),
-                self.session
-                    .as_ref()
-                    .map_or_else(
-                        || "none".into(),
-                        |s| s.planned_subtitles(self.format, Some(self.sub_track)),
-                    )
-                    .into(),
+                plan.into(),
                 false,
                 false,
             )
@@ -7641,7 +7969,7 @@ impl Player {
             .map_or("", |s| s.planned_audio(self.format));
         let settings =
             export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
-        let mb = estimated_mb(
+        let size = estimated_bytes(
             settings.bitrate.filter(|_| self.format.has_video()),
             self.session
                 .as_ref()
@@ -7650,8 +7978,8 @@ impl Player {
         let head = summary_head(self.format, picture, audio);
         let tail = summary_tail(
             &self.export_path,
-            mb,
-            self.export_seat.and_then(|(.., seat)| seat),
+            size,
+            self.export_seat.as_ref().and_then(|(.., seat)| *seat),
             self.format.has_video(),
         );
         // The button says the refusal *before* it is pressed: the picked codec
@@ -8732,8 +9060,8 @@ impl Player {
             ),
             None => match found {
                 0 => "nothing quiet enough for long enough".to_string(),
-                1 => format!("1 silence, {secs:.1}s"),
-                n => format!("{n} silences, {secs:.1}s"),
+                1 => format!("1 silence, {}", secs_label(secs)),
+                n => format!("{n} silences, {}", secs_label(secs)),
             },
         };
         let rows: Vec<_> = rows
@@ -8947,6 +9275,13 @@ impl Player {
                         info.map_or_else(|| "no track of its own".to_string(), stream_detail),
                     ),
                 },
+                (
+                    "Bitrate",
+                    bitrate_detail(
+                        self.bitrates.get(&path).copied().flatten(),
+                        self.streams.get(&path).map_or(0, Vec::len),
+                    ),
+                ),
                 match image {
                     true => (
                         "Longest hold",
@@ -9114,6 +9449,13 @@ impl Player {
                 ("This clip", secs(clip.frames())),
                 ("Speed", format!("{} (tape)", clip.speed)),
                 ("Source duration", secs(session.file_frames(&source.path))),
+                (
+                    "Bitrate",
+                    bitrate_detail(
+                        self.bitrates.get(&source.path).copied().flatten(),
+                        self.streams.get(&source.path).map_or(0, Vec::len),
+                    ),
+                ),
             ] {
                 rows.push(
                     row(rows.len())
@@ -10249,11 +10591,18 @@ fn run_picker(pickers: [(&str, Vec<String>); 2]) -> Option<Option<PathBuf>> {
     None
 }
 
-fn pick_file() -> Result<Option<PathBuf>, &'static str> {
+/// `title` is what the dialog calls itself: two buttons open this same chooser
+/// for two different questions -- a file to import, a file to take subtitles out
+/// of -- and a dialog titled "import" over the second one is the wrong question
+/// answered. No extension filter on either: what can be read is the engine's
+/// answer (`PlaybackSession::parse_subtitles` takes a container as readily as a
+/// `.srt`), and a list of suffixes written here would hide a file edith would
+/// have taken.
+fn pick_file(title: &str) -> Result<Option<PathBuf>, &'static str> {
     run_picker([
         (
             "zenity",
-            vec!["--file-selection".into(), "--title=edith — import".into()],
+            vec!["--file-selection".into(), format!("--title={title}")],
         ),
         ("kdialog", vec!["--getopenfilename".into()]),
     ])
@@ -10333,31 +10682,51 @@ fn audio_notice(session: &PlaybackSession) -> Option<String> {
 /// formats `engine::subtitle` parses, lowercased, for [`engine::is_audio`]'s
 /// reason -- the import door has to know which of the engine's two doors a file
 /// goes through before anything is opened.
+///
+/// `.mks` is one of them, and it is the only Matroska extension that is: it is
+/// the *subtitles alone*, so there is no source in it to import and a drop of
+/// one used to be refused for having no video track -- while `+ S` on the same
+/// bytes took it ([`PlaybackSession::parse_subtitles`] reads it as Matroska).
+/// The other two are media and stay media: `.mka` is the sound alone, which
+/// [`engine::is_audio`] already imports as a song, and `.mk3d` is a film. Both
+/// may *carry* subtitles, which is [`carries_subtitles`] and not this.
 fn is_subtitle(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "srt" | "vtt" | "webvtt" | "ass" | "ssa"
+            "srt" | "vtt" | "webvtt" | "ass" | "ssa" | "mks"
         )
     })
 }
 
 /// Whether a media path is a container that can carry subtitle tracks *inside*
-/// it -- the two Matroska extensions, which is what
-/// [`PlaybackSession::import_subtitles`] walks for them.
-fn is_matroska(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "mkv" | "webm"))
+/// it -- every Matroska extension and the three ISO-BMFF ones, which is the list
+/// [`PlaybackSession::parse_subtitles`] walks (Matroska blocks and mp4 `tx3g`
+/// alike). Named for what it gates and not for one of the two families, because
+/// an mp4 answers `true` here now.
+///
+/// Matroska's set is the standard's own and closed by it
+/// (`engine::demux::is_matroska`), so it is copied whole rather than trimmed to
+/// the two that carry a film: a `.mk3d` opened as media has its tracks walked
+/// like the `.mkv` it is, and a `.mka` song can hold a lyric track. A suffix
+/// wider than the engine's would be a file taken here and refused deeper down.
+fn carries_subtitles(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "mkv" | "mka" | "mks" | "mk3d" | "webm" | "mp4" | "m4v" | "mov"
+        )
+    })
 }
 
 /// What a worker hands back, which is the fork [`arrival`] made when it was
 /// started. An import is *read* and thrown away; the file argv named is opened
 /// outright, because nothing else is going to open it afterwards.
 enum Landed {
-    /// An import: pages warmed, nothing kept. [`Player::take_import`] opens the
-    /// file again, warm, and that second open is the 150 ms one.
-    Read,
+    /// An import: pages warmed, and the subtitle tracks the walk found *kept* --
+    /// the walk is the expensive half and the worker is where it belongs, so
+    /// [`Player::take_import`] is left with a push ([`subtitle_tail`]).
+    Read(Subs),
     /// The media argv named, with the tail its subtitle tracks earn: a whole
     /// timeline, ready to be hung off the window, or the engine's refusal.
     Media(Result<(PlaybackSession, String), String>),
@@ -10371,14 +10740,18 @@ enum Landed {
 ///
 /// `place` is which door: a file *opened* is the timeline, one *imported* into
 /// an empty window fills the library and leaves the lanes empty for a drag.
-fn open_session(path: &std::path::Path, place: bool) -> Result<(PlaybackSession, String), String> {
+fn open_session(
+    path: &std::path::Path,
+    place: bool,
+    subs: Subs,
+) -> Result<(PlaybackSession, String), String> {
     let opened = match place {
         true => PlaybackSession::open(path),
         false => PlaybackSession::open_library(path),
     };
     let mut session = opened.map_err(|e| e.to_string())?;
-    let subs = subtitle_notice(&mut session, path).unwrap_or_default();
-    Ok((session, subs))
+    let tail = subtitle_tail(&mut session, subs).unwrap_or_default();
+    Ok((session, tail))
 }
 
 /// The whole of what a queued file costs, off the UI thread. An import only
@@ -10392,10 +10765,7 @@ fn open_ahead(
 ) -> Landed {
     use std::sync::atomic::Ordering::Relaxed;
     match what {
-        Landing::Import => {
-            read_ahead(path, stage);
-            Landed::Read
-        }
+        Landing::Import => Landed::Read(read_ahead(path, stage)),
         Landing::Project => {
             let opened = PlaybackSession::open_project(path).map_err(|e| e.to_string());
             Landed::Project(opened)
@@ -10414,24 +10784,33 @@ fn open_ahead(
 }
 
 /// Reads, off the UI thread, exactly what the import that follows is about to
-/// read -- and throws every byte away. The point is the page cache: a cold
-/// header walk of a 29 GB remux is 11 s and a warm one is 150 ms (measured,
-/// `a real 4K HEVC film` 2160p h265), so this call is the eleven seconds and
-/// [`Player::take_import`] is the hundred and fifty milliseconds. The window
-/// keeps painting through the eleven.
+/// read. The container's header is read for the page cache and thrown away: a
+/// cold header walk of a 29 GB remux is 11 s and a warm one is 150 ms
+/// (measured, `a real 4K HEVC film` 2160p h265), so this call is the eleven
+/// seconds and [`Player::take_import`] is the hundred and fifty milliseconds.
+/// The window keeps painting through the eleven.
 ///
-/// Errors are dropped on purpose: a file that cannot be read is refused by the
-/// engine a moment later, in the engine's own words, and a refusal read twice
-/// is a refusal worded twice.
+/// Header errors are dropped on purpose: a file that cannot be read is refused
+/// by the engine a moment later, in the engine's own words, and a refusal read
+/// twice is a refusal worded twice. The *subtitle* refusal is carried back
+/// instead of dropped, for exactly that reason -- nothing walks those cues a
+/// second time to re-word it.
 ///
 /// `stage` is what the line above the panel is naming while this runs.
 ///
-/// ponytail: the cache is the whole handoff, so a machine that evicts those
-/// pages between this read and the next frame pays the cold walk on the UI
-/// thread after all. Ceiling: memory pressure inside one repaint of a 25 GB
-/// file. The upgrade is an engine door that takes the header this already
-/// parsed ([`PlaybackSession::import`] opens the demuxer again today).
-fn read_ahead(path: &std::path::Path, stage: &std::sync::atomic::AtomicU8) {
+/// The subtitle half is not thrown away: it is *the* answer, handed back for
+/// [`Player::take_import`] to push ([`subtitle_tail`]) rather than walked a
+/// second time on the render thread -- 234 ms of a warmed 25 GB remux and 1.3 s
+/// of a cold 3 GB one, which is what a frozen window is made of.
+///
+/// ponytail: only the subtitle half is handed over. The container's own header
+/// is still merely *warmed* here, so [`PlaybackSession::import`] and
+/// [`open_session`] walk it again on the UI thread -- 2.8 s of that same 25 GB
+/// file. Ceiling: the media walk, not the subtitle one. The upgrade is the
+/// engine door this comment has always named: one that takes the header this
+/// already parsed, the way [`PlaybackSession::add_subtitle_tracks`] takes the
+/// cues this already read.
+fn read_ahead(path: &std::path::Path, stage: &std::sync::atomic::AtomicU8) -> Subs {
     use std::sync::atomic::Ordering::Relaxed;
     stage.store(ImportStage::Header as u8, Relaxed);
     // The three doors an import goes through, each warmed by the call the
@@ -10443,34 +10822,67 @@ fn read_ahead(path: &std::path::Path, stage: &std::sync::atomic::AtomicU8) {
         engine::demux::Demuxer::open(path).ok();
     }
     stage.store(ImportStage::Subtitles as u8, Relaxed);
-    // ...and the tracks inside it, which `subtitle_notice` walks straight
-    // after. A standalone `.srt` is small enough to be nobody's wait.
-    if is_matroska(path) {
-        engine::subtitle::of_matroska(path).ok();
+    // ...and the tracks inside it, kept.
+    walk_subtitles(path)
+}
+
+/// Every subtitle track a file carries, cues and all -- the walk that costs, in
+/// the one place every door that pays it goes through. `Ok` and empty for a file
+/// with none to read, which is what a file that is neither a container we can
+/// walk ([`carries_subtitles`]) nor a subtitle file is: the same answer
+/// `add_subtitle_tracks` gives it, and nothing is opened to find that out.
+///
+/// Nothing in here is a session, on purpose ([`PlaybackSession::parse_subtitles`]
+/// is an associated fn): no borrow crosses the await, so this runs whole on a
+/// worker while the window keeps painting.
+fn walk_subtitles(path: &std::path::Path) -> Subs {
+    match carries_subtitles(path) || is_subtitle(path) {
+        true => PlaybackSession::parse_subtitles(path),
+        false => Ok(Vec::new()),
     }
 }
 
 /// The subtitle tracks a media file carries, taken into the session as it is
-/// opened, and the tail the notice grows for them: an mkv with subtitles in it
-/// arrives with its subtitles, because a track nobody imported is a track nobody
-/// knows is there. Every other container answers `None` without being read.
+/// opened, and the tail the notice grows for them: an mkv or an mp4 with
+/// subtitles in it arrives with its subtitles, because a track nobody imported
+/// is a track nobody knows is there. Every other container answers `None`
+/// without being read.
 ///
 /// A refusal is a tail too, never a failure of the open: the picture and the
 /// sound of a film whose subtitle tracks cannot be walked are still the film.
 ///
-/// The walk reads the whole file for its cues
-/// (`engine::subtitle::of_matroska`) -- ~200 ms on a two-hour 4K remux, and an
-/// *import* pays it on a worker first ([`read_ahead`]), so what happens here is
-/// the warm second pass. A file *opened* at launch pays it cold and pays it
-/// once -- this runs on the worker beside the open itself ([`open_ahead`]),
-/// with the window already up and naming the read.
+/// Both halves at once, which only a *worker* may do: the walk reads the whole
+/// file for its cues (`engine::subtitle::of_matroska`) -- ~200 ms on a two-hour
+/// 4K remux, 9.7 s on a cold 25 GB one. The one caller is the open beside which
+/// this runs on the worker ([`open_ahead`]), never the render thread; an
+/// import splits the two halves across the hop instead ([`read_ahead`] walks,
+/// [`subtitle_tail`] pushes).
 fn subtitle_notice(session: &mut PlaybackSession, path: &std::path::Path) -> Option<String> {
-    if !is_matroska(path) {
-        return None;
-    }
-    match session.import_subtitles(path) {
-        Ok(0) => None,
-        Ok(n) => Some(format!(" — {n} subtitle track(s) in the file")),
+    subtitle_tail(session, walk_subtitles(path))
+}
+
+/// What a subtitle walk ([`walk_subtitles`]) gave, on its way from whichever
+/// thread paid for it to the timeline. `Send` all the way down (`sendable()`,
+/// `engine/tests/subtitles.rs`), which is what lets the walk be a worker's.
+type Subs = engine::Result<Vec<engine::subtitle::SubtitleTrack>>;
+
+/// The tail a file's own subtitle tracks earn on the notice that names it, and
+/// the push that puts them on the timeline -- the second half of the walk, the
+/// cheap one ([`PlaybackSession::add_subtitle_tracks`]: no open, no seek, no
+/// decode). Every door that arrives with a *file* words it here, once: the file
+/// argv named, an import, and an import into an empty window cannot say the same
+/// thing differently, whichever thread read the cues.
+///
+/// `None` for a file that gave none and for one whose tracks are on the timeline
+/// already -- an import that adds nothing says nothing about subtitles. A
+/// refusal is a tail too, never a failure of the import: the picture and the
+/// sound of a film whose subtitle tracks cannot be walked are still the film.
+fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option<String> {
+    match subs {
+        Ok(tracks) => match session.add_subtitle_tracks(tracks) {
+            0 => None,
+            n => Some(format!(" — {n} subtitle track(s) in the file")),
+        },
         Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
     }
 }
@@ -10487,6 +10899,85 @@ fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
         (None, true) => format!("{} cues — pictures", track.cues.len()),
         (None, false) => format!("{} cues", track.cues.len()),
     }
+}
+
+/// What the export card's Subtitles row says: the engine's own words for the
+/// tracks an export carries (`plan`, [`engine::export::planned_subtitles`] asked
+/// about `picks`) and, beside them, the rows it is carrying nothing of.
+///
+/// `picks` is [`Player::export_subs`] -- every track with a cue left in the
+/// exported range -- so a track sitting in the list with eighty-three cues
+/// nowhere near a trimmed timeline never reaches the engine at all, and the card
+/// said nothing about it while the list went on showing it. Which tracks have
+/// cues *here* is this side's answer and nobody else's, so this side words it.
+///
+/// Past [`SUB_PLAN_CHARS`] the line counts rather than names: every name is more
+/// words in a value box `MENU_W` wide, and at 35 tracks the row wrapped to ten
+/// lines and pushed the Destination row under the fold of the card. The names
+/// are still one row each in the Subtitles list, with the cue count and the
+/// reason under them ([`subtitle_detail`]) -- more than this line ever said.
+///
+/// The counted split follows the engine's own order of reasons (`refused`, then
+/// pictures, then no cues), with the last asked of the timeline instead of the
+/// track.
+///
+/// ponytail: that split reads the same public fields the list rows read
+/// (`refused`, [`engine::subtitle::SubtitleTrack::is_bitmap`]) rather than the
+/// engine's decision, so a *new* reason to drop a track would be counted here as
+/// embedded until this follows it -- the named line, which is the engine's
+/// string verbatim, would say it correctly meanwhile. Upgrade path: reasons out
+/// of `planned_subtitles` as data rather than as one sentence, which is an
+/// engine change.
+fn subtitle_plan(
+    plan: String,
+    tracks: &[engine::subtitle::SubtitleTrack],
+    picks: &[usize],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // "none" is the engine's word for an empty pick list and would read as a
+    // verdict on the tracks named after it.
+    if !picks.is_empty() {
+        parts.push(plan);
+    }
+    parts.extend(
+        tracks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !picks.contains(i))
+            .map(|(_, track)| format!("{} — no cues here", track.label)),
+    );
+    let named = parts.join("; ");
+    if named.chars().count() <= SUB_PLAN_CHARS {
+        return match named.is_empty() {
+            true => "none".to_string(),
+            false => named,
+        };
+    }
+    let (mut embedded, mut unread, mut pictures, mut off) = (0, 0, 0, 0);
+    for (i, track) in tracks.iter().enumerate() {
+        match (
+            track.refused.is_some(),
+            track.is_bitmap(),
+            picks.contains(&i),
+        ) {
+            (true, _, _) => unread += 1,
+            (_, true, _) => pictures += 1,
+            (_, _, false) => off += 1,
+            _ => embedded += 1,
+        }
+    }
+    let mut counted = vec![format!("{embedded} of {} → embedded", tracks.len())];
+    counted.extend(
+        [
+            (pictures, "pictures"),
+            (unread, "unread"),
+            (off, "no cues here"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, why)| format!("{n} {why}")),
+    );
+    counted.join("; ")
 }
 
 /// Every subtitle track one file gave, kept together. Plain data, planned
@@ -10531,6 +11022,32 @@ struct SubRow {
     bitmap: bool,
 }
 
+/// What a subtitle row is called, off the two fields the container really
+/// stated rather than out of the flattened
+/// [`label`](engine::subtitle::SubtitleTrack::label). The pair is what an export
+/// writes (`TRACK_LANGUAGE` and `TRACK_NAME` are two fields), and reading the
+/// display string back apart is the very heuristic that sent every French track
+/// out as English: `lang_human` on a whole "und — Signs" matches nothing and
+/// names a language nobody speaks.
+///
+/// The three shapes a track arrives in, all three of them real: a standalone
+/// file states no language and is its own name, an embedded one states a
+/// language and sometimes a title beside it, and a refused one states neither
+/// and keeps the label it was refused under (`SubtitleTrack::refused`).
+fn sub_title(sub: &engine::subtitle::SubtitleTrack) -> String {
+    match (sub.language.as_str(), sub.name.as_str()) {
+        ("", "") => sub.label.clone(),
+        ("", name) => name.to_string(),
+        // A track whose only name is the tag for "nobody said" says that in
+        // words rather than showing the tag itself.
+        (lang, "") => lang_human(lang).to_string(),
+        // ...and one that says "nobody said" *and* gives a title is the title:
+        // "unknown language — Signs" pads it with a word the file never said.
+        ("und", name) => name.to_string(),
+        (lang, name) => format!("{lang} — {name}"),
+    }
+}
+
 /// The subtitle list as rows under the file each came out of: one group per
 /// distinct path, in the order the files first appear, and each file's tracks
 /// in the order they were added. Two remuxes' tracks arriving interleaved --
@@ -10555,9 +11072,7 @@ fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<SubGroup> {
         group.rows.push(SubRow {
             track,
             number: group.rows.len() + 1,
-            // A track whose only name is the tag for "nobody said" says that
-            // in words, here, rather than showing the tag itself.
-            label: lang_human(&sub.label).to_string(),
+            label: sub_title(sub),
             detail: subtitle_detail(sub),
             refused: sub.refused.clone(),
             bitmap: sub.is_bitmap(),
@@ -10581,6 +11096,27 @@ fn subtitle_rows(tracks: &[engine::subtitle::SubtitleTrack]) -> Vec<SubGroup> {
 ///
 /// `None` for an index no track answers to, which is the silence
 /// [`Player::subtitle_track`] gives at the same moment.
+/// Where the picked subtitle row lands once `removed` has been taken off a list
+/// that is `left` long afterwards. The pick follows the list: the same *track*
+/// while it is still there -- every index past the one that went moves down
+/// ([`engine::Project::remove_subtitles`]) -- the row that slid into the empty
+/// place when the picked one is what went, and the last row when that was the
+/// last. Zero on an emptied list, which is the index the section is not drawn at
+/// all.
+///
+/// Its own function because the pick is what the overlay draws: left where it
+/// was it would name a different track, and the plate over the picture would
+/// change language on its own the moment a row above it went. What an export
+/// writes is *not* this pick and cannot be desynced by a removal -- it is worked
+/// out from the cues on the timeline each time ([`Player::export_subs`]).
+fn sub_pick_after_removal(picked: usize, removed: usize, left: usize) -> usize {
+    let picked = match removed < picked {
+        true => picked - 1,
+        false => picked,
+    };
+    picked.min(left.saturating_sub(1))
+}
+
 fn sub_pick_name(tracks: &[engine::subtitle::SubtitleTrack], track: usize) -> Option<String> {
     subtitle_rows(tracks).into_iter().find_map(|group| {
         let row = group.rows.iter().find(|row| row.track == track)?;
@@ -10891,7 +11427,11 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // Nothing to draw over the picture, so nothing to switch off: the
         // library says how subtitles arrive, and this row would flip a state
         // with no visible half either way.
-        ActionId::ToggleSubtitles if !ctx.subtitles => Enable::No("no subtitles yet"),
+        // ...and nothing to take off the timeline either, for the same reason:
+        // the row would name a track that is not there.
+        ActionId::ToggleSubtitles | ActionId::RemoveSubtitleTrack if !ctx.subtitles => {
+            Enable::No("no subtitles yet")
+        }
         ActionId::CancelExport => Enable::No("nothing is exporting"),
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
@@ -11150,6 +11690,106 @@ fn stream_detail(info: &StreamInfo) -> String {
     }
     parts.extend(layout(info.channels));
     parts.join(" ")
+}
+
+/// What a file is coded at, for the properties cards: the rate of the whole
+/// file, then each track's own beside it. A component the container does not
+/// state is left out for `stream_detail`'s reason -- a fabricated `0` would be
+/// saying something -- and a file that states none of the three says so rather
+/// than showing an empty row. `None` is the probe still running, which is a
+/// real wait: it walks a Matroska's clusters.
+///
+/// The whole file's rate is the one that carries the unit and no word: named
+/// "total" as well, the line loses its last component to `MENU_W`'s truncation
+/// on an ordinary 1080p file -- and a rate cut to "0.13 soun" is a number the
+/// card did not give.
+///
+/// `tracks` is how many sound tracks the file has, from `probe_streams`. The
+/// rate is the one track this engine plays -- the first, neither their sum nor
+/// the biggest -- so a file with more says which of how many: a bare "0.16
+/// sound" on a file whose name says AC3.5.1 names a track without saying it is
+/// one of two, and the card's Audio row above it may be describing the other.
+///
+/// The marker costs the word "sound", the way the whole file's rate costs the
+/// word "total" above, and for the same reason. Measured in Noto Sans 11 px
+/// against the 186 px this value has beside a "Bitrate" label: "0.16 sound 1/2"
+/// wants 192 px on a small film's 4.7 Mb/s and 205 on the 39.8 Mb/s remux --
+/// the marker is what gets cut, which is the one part of the line that is new.
+/// Nothing that keeps the word fits the wide files -- the shortest, "snd 1/2",
+/// still wants 188 px on that remux -- so the word goes and the number keeps
+/// the answer: "0.16 1 of 2" wants 172 px, and 185 on the widest line his
+/// library can produce (the 10.9 Mb/s three-track film).
+fn bitrate_detail(rate: Option<MediaBitrate>, tracks: usize) -> String {
+    let Some(rate) = rate else {
+        return "…".to_string();
+    };
+    let (per, unit) = rate_scale(rate);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(total) = rate.total {
+        // One unit for the three numbers, carried once, on the whole file's
+        // rate: the components are read against it.
+        parts.push(format!("{} {unit}", scaled(total, per)));
+    }
+    if let Some(video) = rate.video {
+        parts.push(format!("{} video", scaled(video, per)));
+    }
+    if let Some(audio) = rate.audio {
+        parts.push(match tracks > 1 {
+            true => format!("{} 1 of {tracks}", scaled(audio, per)),
+            false => format!("{} sound", scaled(audio, per)),
+        });
+    }
+    match parts.is_empty() {
+        true => "not stated".to_string(),
+        false => parts.join(" · "),
+    }
+}
+
+/// Below this a megabit's two decimals cannot state a rate, so the line is read
+/// in kilobits instead.
+const MB_FLOOR: u64 = 10_000;
+
+/// What the line counts in, and the name of it: the largest unit that can state
+/// its *smallest* component, because that is the one a bigger unit rounds away.
+/// Megabits for everything a real file produces -- the smallest component over
+/// an 18-file sweep of his library was 0.13 Mb/s -- kilobits for the sub-32x32
+/// encodes below that.
+///
+/// ponytail: one unit for the whole line, so a file mixing a multi-megabit
+/// picture with a sub-10 kb/s sound track prints the picture as four or five
+/// digits of kilobits and loses the line's tail to `MENU_W`. No such file
+/// exists in his library, and both units at once ("0.01 Mb/s · 1.2 kb/s video ·
+/// 9.5 kb/s sound") wants 215 px of the 186 the row has. Upgrade path is a
+/// suffix per component ("1.2k video"), which measures 177 px.
+fn rate_scale(rate: MediaBitrate) -> (f64, &'static str) {
+    match [rate.total, rate.video, rate.audio]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        // A rate this small is a broken header rather than a track, but it is
+        // still a number the file stated, and bits state it.
+        Some(bits) if bits < 10 => (1., "b/s"),
+        Some(bits) if bits < MB_FLOOR => (1_000., "kb/s"),
+        _ => (1_000_000., "Mb/s"),
+    }
+}
+
+/// A rate in the line's unit as a person reads it: one decimal above 1 of it,
+/// two below -- a 128 kbps song rounded to one decimal is "0.1", which reads as
+/// a guess where "0.13" reads as a measurement.
+///
+/// Never `0.00`: [`rate_scale`] picks the unit off the smallest component, so
+/// two decimals always reach it. Every rate that gets here is one the container
+/// really stated (the probe leaves out what it does not state, it never zeroes
+/// it), and a "0.00 sound" would be this card saying a track that plays is
+/// silent.
+fn scaled(bits: u64, per: f64) -> String {
+    let n = bits as f64 / per;
+    match n >= 1. {
+        true => format!("{n:.1}"),
+        false => format!("{n:.2}"),
+    }
 }
 
 /// A language tag as a person reads it. Everything a file writes is passed
@@ -11801,8 +12441,8 @@ fn summary_head(format: Format, picture: Option<((u32, u32), f64)>, audio: &str)
 /// The second: where it lands, roughly how big, and what will encode the
 /// picture -- the seat as the probe found it (`…` until it lands, never a
 /// guess), which is what the running export then names on its progress line.
-fn summary_tail(path: &Path, mb: Option<u64>, seat: Option<&'static str>, video: bool) -> String {
-    let size = mb.map_or_else(String::new, |mb| format!("≈ {mb} MB"));
+fn summary_tail(path: &Path, bytes: Option<u64>, seat: Option<&'static str>, video: bool) -> String {
+    let size = bytes.map_or_else(String::new, |bytes| format!("≈ {}", size_label(bytes)));
     let seat = match (video, seat) {
         (true, Some(seat)) => seat,
         (true, None) => "encoder …",
@@ -11823,14 +12463,28 @@ fn fps_label(fps: f64) -> String {
     }
 }
 
-/// About how big a *chosen* bitrate makes the file: the picture's megabits over
-/// the timeline's length. `None` for `Auto`, whose figure is the encoder's to
+/// About how big a *chosen* bitrate makes the file: the picture's bits over the
+/// timeline's length, in bytes -- the unit the line is written in is
+/// [`size_label`]'s to pick. `None` for `Auto`, whose figure is the encoder's to
 /// decide, and for a format with no bitrate at all -- a number nobody picked is
 /// not an estimate. The sound and the container's own overhead are not in it,
 /// which is why the card says "≈".
-fn estimated_mb(bitrate: Option<u64>, duration: f64) -> Option<u64> {
+fn estimated_bytes(bitrate: Option<u64>, duration: f64) -> Option<u64> {
     let bitrate = bitrate.filter(|&b| b > 0 && duration > 0.)?;
-    Some((bitrate as f64 * duration / 8e6).round() as u64)
+    Some((bitrate as f64 * duration / 8.).round() as u64)
+}
+
+/// A size in the largest unit that can state it, [`rate_scale`]'s rule:
+/// megabytes for an export of any length, kilobytes below the one a whole
+/// megabyte rounds away. A three second clip at the floor bitrate really is
+/// 375 kB, and "≈ 0 MB" would be this line saying the file it is about to write
+/// is empty -- the one thing the size field is there to deny. Never "0 kB"
+/// either: an estimate that exists is at least a kilobyte of file.
+fn size_label(bytes: u64) -> String {
+    match (bytes as f64 / 1e6).round() as u64 {
+        0 => format!("{} kB", (bytes as f64 / 1e3).round().max(1.) as u64),
+        mb => format!("{mb} MB"),
+    }
 }
 
 /// What is in the file and what box it is in, which is the head of the summary.
@@ -11906,7 +12560,7 @@ fn export_settings(
         // The picked track is put on by `start_export`, which is the only
         // caller that writes a file; the rest of them are asking about the
         // bitrate and the format.
-        subtitles: None,
+        subtitles: Vec::new(),
     }
 }
 
@@ -12184,7 +12838,20 @@ fn span_label(span: f64) -> String {
         s if s >= 600. => format!("{:.0}m", s / 60.),
         s if s >= 60. => format!("{:.1}m", s / 60.),
         s if s >= 10. => format!("{s:.0}s"),
-        s => format!("{s:.1}s"),
+        s => secs_label(s),
+    }
+}
+
+/// A span of seconds as a person reads it: one decimal above a second, two
+/// below -- [`scaled`]'s rule, for its reason. The tightest zoom is
+/// [`ZOOM_MIN_FRAMES`] across the bed, which on the 240 fps slow-motion a phone
+/// writes is 0.03s, and a single frame of quiet at 60 fps is 0.02s: one decimal
+/// prints both as "0.0s", a pill and a notice saying the thing they are about
+/// has no length at all.
+fn secs_label(secs: f64) -> String {
+    match secs >= 1. {
+        true => format!("{secs:.1}s"),
+        false => format!("{secs:.2}s"),
     }
 }
 
@@ -13532,20 +14199,20 @@ mod tests {
         Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, INK,
         INK_DIM, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
         LETTERBOX, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
-        MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
+        MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MB_FLOOR, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
         Quality, ROW_H, RULER_HIT_H, SELECTED, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, SURFACE, SWATCH_W, Source, Speed, StreamInfo,
         Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
-        bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
+        bitrate_detail, bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
         containers,
         enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
-        estimated_mb, export_path, export_settings, format_key,
+        estimated_bytes, export_path, export_settings, format_key,
         format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
         frame_rate_ladder, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
         marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
-        retarget, row_enable, row_items, scrub_due, show_label, silence_rate, snap_cue, snap_marks, snapped,
-        source_tint, span_partner, speed_at, summary_head, summary_tail, timecode, transport,
+        retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
+        SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
         typed, unseen_paths, unseen_sources,
         whole_take, window_title,
     };
@@ -13565,9 +14232,9 @@ mod tests {
     use super::{
         SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_INK, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H,
         SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box,
-        cues_at, file_tint, is_matroska, is_subtitle, lang_human, row_text_w, sub_headers_fit,
-        subtitle_detail, subtitle_notice,
-        sub_pick_name, subtitle_rows, subtitle_strip_h,
+        carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
+        Subs, subtitle_detail, subtitle_notice, subtitle_tail,
+        sub_pick_name, subtitle_rows, subtitle_strip_h, walk_subtitles,
     };
 
     /// What the file manager is handed: the parts a path keeps as they are, and
@@ -15281,6 +15948,102 @@ mod tests {
         assert_eq!(snap_cue(false, 158, 40, 4, &marks), (158, None));
     }
 
+    /// The card's rate row: every component the container states and no other,
+    /// so a track the header is silent about is absent from the line rather
+    /// than sitting in it as a zero.
+    #[test]
+    fn a_rate_row_says_only_what_the_container_stated() {
+        use super::MediaBitrate;
+        let all = MediaBitrate {
+            total: Some(8_432_000),
+            video: Some(7_918_000),
+            audio: Some(128_000),
+        };
+        assert_eq!(
+            bitrate_detail(Some(all), 1),
+            "8.4 Mb/s · 7.9 video · 0.13 sound"
+        );
+        // A Matroska states no audio rate of its own: the sound is dropped from
+        // the line, never drawn as "0".
+        assert_eq!(
+            bitrate_detail(
+                Some(MediaBitrate {
+                    audio: None,
+                    ..all
+                }),
+                1
+            ),
+            "8.4 Mb/s · 7.9 video"
+        );
+        // A still, or anything that would not open: the probe answered, and the
+        // answer is that nobody said.
+        assert_eq!(
+            bitrate_detail(Some(MediaBitrate::default()), 0),
+            "not stated"
+        );
+        // Asked, not answered yet -- a 12 GB film's walk takes seconds.
+        assert_eq!(bitrate_detail(None, 2), "…");
+        // A dual-audio file: the number is the track that plays, and the line
+        // says so rather than letting it stand for the AC-3 beside it.
+        assert_eq!(
+            bitrate_detail(Some(all), 2),
+            "8.4 Mb/s · 7.9 video · 0.13 1 of 2"
+        );
+        // Every component of a tiny file is stated, and small: the line changes
+        // unit, so not one of them reads as the zero it is not. In megabits
+        // this file was "0.00 Mb/s · 0.00 video · 0.00 sound".
+        assert_eq!(
+            bitrate_detail(
+                Some(MediaBitrate {
+                    total: Some(4_998),
+                    video: Some(113),
+                    audio: Some(2_400),
+                }),
+                1
+            ),
+            "5.0 kb/s · 0.11 video · 2.4 sound"
+        );
+    }
+
+    /// The invariant under the row above, over every rate a container can
+    /// state: a component the file *does* state never renders as a zero. The
+    /// probe leaves out what is unstated, so a "0.00" on this card would be it
+    /// saying a track that plays is silent.
+    #[test]
+    fn a_stated_rate_never_renders_as_a_zero() {
+        use super::MediaBitrate;
+        // Every decade from 1 bit a second to a 100 Mb/s master, the rounding
+        // edges of each unit switch, and every pair of them in one line: the
+        // line's unit is picked off its smallest component, so the widest
+        // spread is the one that could round the biggest away.
+        let edges: Vec<u64> = (0..12)
+            .flat_map(|e| {
+                let decade = 10_u64.pow(e);
+                [decade, decade * 4, decade * 5, decade * 9]
+            })
+            .chain([MB_FLOOR - 1, MB_FLOOR, 999_999, 4_998, 113, 2_400])
+            .collect();
+        for &small in &edges {
+            for &big in &edges {
+                let line = bitrate_detail(
+                    Some(MediaBitrate {
+                        total: Some(small.max(big)),
+                        video: Some(big),
+                        audio: Some(small),
+                    }),
+                    2,
+                );
+                for number in line
+                    .split(" · ")
+                    .filter_map(|part| part.split(' ').next())
+                    .filter_map(|n| n.parse::<f64>().ok())
+                {
+                    assert!(number > 0., "{small}/{big} bits a second rendered as {line:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn timecode_counts_frames_inside_the_second() {
         assert_eq!(timecode(0., 30.), "00:00:00:00");
@@ -15734,6 +16497,18 @@ mod tests {
         // Before the first paint there is no bed and so no answer to give.
         assert_eq!(span_label(0.), "—");
         assert_eq!(span_label(f64::NAN), "—");
+        // A span under a second is a span: the tightest zoom is
+        // `ZOOM_MIN_FRAMES` across the bed, which on 240 fps slow-motion is
+        // 0.03s, and "0.0s" would be the pill saying nothing is on the bed.
+        for fps in [60., 120., 240., 1000.] {
+            let label = span_label(ZOOM_MIN_FRAMES / fps);
+            assert_ne!(label, "0.0s", "{fps} fps");
+            assert_ne!(label, "0.00s", "{fps} fps");
+        }
+        assert_eq!(span_label(ZOOM_MIN_FRAMES / 240.), "0.03s");
+        // A frame of quiet at 60 fps, which the silence card says out loud.
+        assert_eq!(secs_label(1. / 60.), "0.02s");
+        assert_eq!(secs_label(4.5), "4.5s");
     }
 
     #[test]
@@ -17366,7 +18141,11 @@ mod tests {
         let warmed = {
             let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
             session.set_gain(0.0);
-            read_ahead(&asset("test_av2.mp4"), &stage);
+            let subs = read_ahead(&asset("test_av2.mp4"), &stage).expect("an mp4 is readable");
+            // This mp4 is walked now (an mp4 can carry `tx3g`) and has no
+            // subtitle track in it, so the worker hands over an empty list --
+            // the same thing the import lands with.
+            assert!(subs.is_empty());
             session.import(&asset("test_av2.mp4")).expect("av2 matches");
             (
                 session.sources().to_vec(),
@@ -17385,7 +18164,7 @@ mod tests {
         // another rate is no more importable for having been read first.
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
         session.set_gain(0.0);
-        read_ahead(&asset("test_25fps.mp4"), &stage);
+        drop(read_ahead(&asset("test_25fps.mp4"), &stage));
         let warmed = session.import(&asset("test_25fps.mp4"));
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open");
         session.set_gain(0.0);
@@ -17396,8 +18175,53 @@ mod tests {
                 .map_err(|e| e.to_string())
         );
         // A path nothing can read is the worker's business to survive, not to
-        // report: the engine says so a moment later, in its own words.
-        read_ahead(std::path::Path::new("/no/such/film.mkv"), &stage);
+        // report: the engine says so a moment later, in its own words. The
+        // subtitle half *is* carried back, because nothing walks it again to
+        // re-word it -- and it is a refusal, not a panic.
+        assert!(
+            read_ahead(std::path::Path::new("/no/such/film.mkv"), &stage).is_err(),
+            "an unreadable mkv comes back as the engine's refusal"
+        );
+    }
+
+    /// The import door's two halves, split across the worker hop: what
+    /// [`read_ahead`] walks is exactly what the render thread would have walked,
+    /// and pushing it says what walking it in place used to say.
+    #[test]
+    fn an_imports_subtitles_are_read_by_the_worker_and_only_pushed_here() {
+        use std::sync::atomic::AtomicU8;
+        let stage = AtomicU8::new(ImportStage::Header as u8);
+        let film = asset("test_subs.mkv");
+        // The in-place walk (`subtitle_notice`) and the split one land the same
+        // tracks and the same tail on the same timeline.
+        let mut in_place = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+        in_place.set_gain(0.0);
+        let said = subtitle_notice(&mut in_place, &film);
+        let mut split = PlaybackSession::open(asset("test_av.mp4")).expect("open");
+        split.set_gain(0.0);
+        let walked = read_ahead(&film, &stage).expect("the mkv is readable");
+        assert_eq!(subtitle_tail(&mut split, Ok(walked)), said);
+        assert_eq!(split.subtitles().len(), in_place.subtitles().len());
+        // The same file twice is still one row, and still says so: the dedupe
+        // lives in the push, which is the half that stayed here.
+        let again = read_ahead(&film, &stage).expect("the mkv is readable");
+        assert_eq!(subtitle_tail(&mut split, Ok(again)), None);
+        // A standalone `.srt` is walked by the same worker: an import of one is
+        // not a door that reads on the render thread either.
+        let srt = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../engine/tests/data/test_subs.srt")
+            .canonicalize()
+            .expect("the subtitle fixture");
+        assert_eq!(
+            read_ahead(&srt, &stage).expect("the srt is readable").len(),
+            1
+        );
+        // ...and a refusal is worded as a tail, never as a failed import.
+        let unread: Subs = Err("nothing to read".into());
+        assert_eq!(
+            subtitle_tail(&mut split, unread),
+            Some(" — SUBTITLES UNREAD: nothing to read".to_string())
+        );
     }
 
     #[test]
@@ -17666,7 +18490,7 @@ mod tests {
         // never a guessed seat, and no seat at all for a format with no picture.
         let tail = summary_tail(
             Path::new("/a/take.export.mp4"),
-            Some(45),
+            Some(45_000_000),
             Some("VA-API"),
             true,
         );
@@ -17680,11 +18504,26 @@ mod tests {
         assert!(!summary_tail(Path::new("/a/x.wav"), None, None, false).contains("MB"));
         // 6 Mbps over a minute is 45 MB. `Auto` has no figure to estimate from
         // and an empty timeline no length: neither invents one.
-        assert_eq!(estimated_mb(Some(6_000_000), 60.), Some(45));
-        assert_eq!(estimated_mb(Some(2_000_000), 90.), Some(23));
-        assert_eq!(estimated_mb(None, 60.), None);
-        assert_eq!(estimated_mb(Some(6_000_000), 0.), None);
-        assert_eq!(estimated_mb(Some(0), 60.), None);
+        assert_eq!(estimated_bytes(Some(6_000_000), 60.), Some(45_000_000));
+        assert_eq!(estimated_bytes(Some(2_000_000), 90.), Some(22_500_000));
+        assert_eq!(estimated_bytes(None, 60.), None);
+        assert_eq!(estimated_bytes(Some(6_000_000), 0.), None);
+        assert_eq!(estimated_bytes(Some(0), 60.), None);
+        // ...and a short one is not nothing. Three seconds at the floor
+        // bitrate is 375 kB, which used to round to the "≈ 0 MB" this line
+        // exists to never say -- the shortest export a frame can make is
+        // still a real file with a real size.
+        let short = estimated_bytes(Some(1_000_000), 3.).expect("a rate and a length");
+        assert_eq!(size_label(short), "375 kB");
+        let frame = summary_tail(Path::new("/a/x.mp4"), estimated_bytes(Some(1_000_000), 1. / 60.), None, true);
+        assert!(
+            frame.contains("≈ 2 kB") && !frame.contains("0 MB") && !frame.contains("0 kB"),
+            "{frame}"
+        );
+        // The boundary reads in the unit that can state it, either side.
+        assert_eq!(size_label(999_600), "1 MB");
+        assert_eq!(size_label(499_000), "499 kB");
+        assert_eq!(size_label(1), "1 kB");
     }
 
     /// Which cue is on screen when: the whole of what the overlay decides, and
@@ -17824,14 +18663,54 @@ mod tests {
     #[test]
     fn subtitles_arrive_beside_the_media_and_inside_it() {
         // Which door a path goes through is decided before anything is opened.
-        for name in ["subs.srt", "SUBS.SRT", "a.vtt", "a.ass", "a.ssa"] {
+        // ...and a `.mks` is one, the subtitles of a Matroska file alone: it has
+        // no source in it to import, so the drop door has to send it where `+ S`
+        // sends it. Its two siblings are media and must not come here -- a
+        // `.mka` is a song this would stop importing.
+        for name in ["subs.srt", "SUBS.SRT", "a.vtt", "a.ass", "a.ssa", "s.mks", "S.MKS"] {
             assert!(is_subtitle(Path::new(name)), "{name}");
         }
-        for name in ["a.mp4", "a.mkv", "notes.txt", "a"] {
+        for name in ["a.mp4", "a.mkv", "song.mka", "film.mk3d", "notes.txt", "a"] {
             assert!(!is_subtitle(Path::new(name)), "{name}");
         }
-        assert!(is_matroska(Path::new("film.MKV")) && is_matroska(Path::new("clip.webm")));
-        assert!(!is_matroska(Path::new("clip.mp4")));
+        // Every container the engine can walk for tracks inside it, Matroska
+        // and ISO-BMFF alike -- an mp4 carries `tx3g`, so the app has to ask it.
+        // The Matroska half is the engine's own closed set, extension for
+        // extension, so no file is walked here that it would refuse there.
+        for name in [
+            "film.MKV", "clip.webm", "clip.mp4", "a.m4v", "a.MOV", "song.mka", "s.mks", "f.MK3D",
+        ] {
+            assert!(carries_subtitles(Path::new(name)), "{name}");
+            assert!(
+                engine::demux::is_matroska(Path::new(name))
+                    || matches!(
+                        Path::new(name)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("mp4" | "m4v" | "mov")
+                    ),
+                "{name} is walked by the app but not by the engine"
+            );
+        }
+        for name in ["song.wav", "still.png", "notes.txt", "a"] {
+            assert!(!carries_subtitles(Path::new(name)), "{name}");
+        }
+        // The three doors, on the one file that used to split them: what the
+        // drop/argv door does with it ([`Player::take_import`] routes on
+        // `is_subtitle`), what the worker reads for it ([`walk_subtitles`]), and
+        // what `+ S` reads ([`Player::add_subtitles`] -> `parse_subtitles`) are
+        // the same walk of the same bytes.
+        let mks = asset("test_subs.mks");
+        assert!(is_subtitle(&mks), "the drop door takes it as subtitles");
+        let dropped = walk_subtitles(&mks).expect("the drop door's worker reads it");
+        let plus_s = PlaybackSession::parse_subtitles(&mks).expect("`+ S` reads it");
+        assert!(!dropped.is_empty(), "and there are tracks in it");
+        assert_eq!(
+            dropped.iter().map(|t| &t.label).collect::<Vec<_>>(),
+            plus_s.iter().map(|t| &t.label).collect::<Vec<_>>(),
+        );
 
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
         session.set_gain(0.0);
@@ -17886,7 +18765,8 @@ mod tests {
         assert_eq!(subtitle_detail(&session.subtitles()[1]), "3 cues");
         // The same file twice adds nothing and says nothing.
         assert_eq!(subtitle_notice(&mut session, &asset("test_subs.mkv")), None);
-        // A container that cannot hold them is never even read.
+        // An mp4 is walked too (it can carry `tx3g`); this one holds none, so
+        // the notice grows no tail.
         assert_eq!(subtitle_notice(&mut session, &asset("test_av.mp4")), None);
 
         // A track that could not be read says why, where its cue count would
@@ -17895,6 +18775,11 @@ mod tests {
         let refused = engine::subtitle::SubtitleTrack {
             path: PathBuf::from("/a/remux.mkv"),
             track: Some(1),
+            // Neither field, like `SubtitleTrack::refused` leaves them: what is
+            // refused is never written, and the row keeps the label it was
+            // refused under.
+            language: String::new(),
+            name: String::new(),
             label: "eng".into(),
             cues: Vec::new(),
             bitmap: false,
@@ -18432,15 +19317,70 @@ mod tests {
         );
     }
 
+    /// The two shapes the engine really builds: a track *of* a file states a
+    /// language and no title (`of_matroska`, `of_mp4`), and a standalone file
+    /// states no language and is its own name (`external`).
     fn sub(path: &str, track: Option<u64>, label: &str) -> engine::subtitle::SubtitleTrack {
+        let (language, name) = match track {
+            Some(_) => (label.to_string(), String::new()),
+            None => (String::new(), label.to_string()),
+        };
         engine::subtitle::SubtitleTrack {
             path: PathBuf::from(path),
             track,
+            language,
+            name,
             label: label.to_string(),
             cues: Vec::new(),
             bitmap: false,
             refused: None,
         }
+    }
+
+    /// His film's two ASS tracks with the timeline trimmed to twenty seconds:
+    /// one of them still has cues there and one has none, and the card said
+    /// nothing whatever about the second while the Subtitles list went on
+    /// showing it with its eighty-three cues.
+    ///
+    /// And the 25 GB remux's thirty-five: naming those wrapped the row to ten
+    /// lines and pushed Destination under the fold, so past the value box's
+    /// three lines the same line counts instead.
+    #[test]
+    fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
+        let film = "/films/a-real-h264-dual-audio-film.mkv";
+        let two = [
+            sub(film, Some(1), "[ASS]"),
+            sub(film, Some(2), "[ASS] [FOR DUB]"),
+        ];
+        // What the engine answers about the one pick that reached it, and what
+        // this side knows about the row that did not.
+        let named = subtitle_plan("[ASS] → embedded".to_string(), &two, &[0]);
+        assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — no cues here");
+        assert!(
+            named.chars().count() <= SUB_PLAN_CHARS,
+            "two tracks fit the value box: {named}"
+        );
+        // Thirty-five off one file: twenty-two carry cues here, nine are
+        // pictures, one could not be read, three have nothing on this timeline.
+        let many: Vec<_> = (0..35)
+            .map(|i| {
+                let mut track = sub("/films/A Remux.mkv", Some(i), "eng — Subtitles");
+                track.bitmap = (22..31).contains(&i);
+                track.refused = (i == 31).then(|| "VobSub is pictures".to_string());
+                track
+            })
+            .collect();
+        // The picks are every track with a cue on the timeline: the twenty-two
+        // and the nine picture ones, which the engine drops itself.
+        let picks: Vec<usize> = (0..31usize).collect();
+        let counted = subtitle_plan("22 tracks → embedded (…)".to_string(), &many, &picks);
+        assert_eq!(counted, "22 of 35 → embedded; 9 pictures; 1 unread; 3 no cues here");
+        assert!(
+            counted.chars().count() <= SUB_PLAN_CHARS,
+            "thirty-five tracks still fit the value box: {counted}"
+        );
+        // Nothing on the timeline at all is still the engine's word for it.
+        assert_eq!(subtitle_plan("none".to_string(), &[], &[]), "none");
     }
 
     /// The list is in the order tracks were added, which is not the order a
@@ -18565,6 +19505,28 @@ mod tests {
         assert_eq!(groups[0].rows[1].track, 2);
     }
 
+    /// The × on a row shifts every track after it down one, and the pick is
+    /// what an export writes into the file -- so a pick that stayed put would
+    /// silently change which track the next export carries. Every relation
+    /// between the pick and the row that went, on a list of three.
+    #[test]
+    fn removing_a_subtitle_row_carries_the_pick_with_it() {
+        // A row *before* the pick: the same track stays picked, one index down.
+        assert_eq!(sub_pick_after_removal(2, 0, 2), 1);
+        assert_eq!(sub_pick_after_removal(2, 1, 2), 1);
+        // A row *after* it: the pick has not moved and neither has its index.
+        assert_eq!(sub_pick_after_removal(0, 2, 2), 0);
+        assert_eq!(sub_pick_after_removal(1, 2, 2), 1);
+        // The picked row itself: the one that slid into its place...
+        assert_eq!(sub_pick_after_removal(1, 1, 2), 1);
+        // ...and the last row when the picked one was the last, since there is
+        // nothing after it to slide.
+        assert_eq!(sub_pick_after_removal(2, 2, 2), 1);
+        // The last row of all: an emptied list is legal for subtitles, and the
+        // section is not drawn at all at that point.
+        assert_eq!(sub_pick_after_removal(0, 0, 0), 0);
+    }
+
     /// The same claim from the click's end, on the order imports actually
     /// arrive in: two films opened one after the other and an `.srt` dropped
     /// last interleave in the flat list, and the display reorders them. What a
@@ -18621,6 +19583,30 @@ mod tests {
         // Reaching the subtitle rows too: a track whose only name was the tag.
         let groups = subtitle_rows(&[sub("/films/a.mkv", Some(1), "und")]);
         assert_eq!(groups[0].rows[0].label, "unknown language");
+        // The pair, read as the pair: the row title comes off `language` and
+        // `name` and never out of the flattened label, which is what let an
+        // "und" beside a title through as a language nobody speaks. A refused
+        // track states neither and keeps its label.
+        let titled = |language: &str, name: &str, label: &str| engine::subtitle::SubtitleTrack {
+            path: PathBuf::from("/films/a.mkv"),
+            track: Some(1),
+            language: language.into(),
+            name: name.into(),
+            label: label.into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        for (language, name, label, title) in [
+            ("fra", "Signs", "fra — Signs", "fra — Signs"),
+            ("und", "Signs", "Signs", "Signs"),
+            ("und", "", "und", "unknown language"),
+            ("", "late.srt", "late.srt", "late.srt"),
+            ("", "", "eng", "eng"),
+        ] {
+            let rows = subtitle_rows(&[titled(language, name, label)]);
+            assert_eq!(rows[0].rows[0].label, title, "{language:?} {name:?}");
+        }
     }
 
     /// The bug: an empty timeline is end-of-stream from its one black frame
@@ -18823,6 +19809,7 @@ fn main() {
                     selected_asset: None,
                     waves: HashMap::new(),
                     streams: HashMap::new(),
+                    bitrates: HashMap::new(),
                     sizes: HashMap::new(),
                     decoders: HashMap::new(),
                     export_seat: None,

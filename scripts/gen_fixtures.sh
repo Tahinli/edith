@@ -211,6 +211,33 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=5 \
     -c:s:0 srt -metadata:s:s:0 language=eng \
     -c:s:1 ass -metadata:s:s:1 language=fra -metadata:s:s:1 title=Signs \
     assets/test_subs.mkv
+# The same two tracks with no picture and no sound at all: `.mks`, the Matroska
+# extension that is the subtitles alone (what a subtitle release ships beside
+# the film). Refused by name until the container gate learned every Matroska
+# extension rather than the two that carry a film -- the very reader that walks
+# a `.mkv` walks this.
+ffmpeg -y -i crates/engine/tests/data/test_subs.srt \
+    -i crates/engine/tests/data/test_subs.ass -map 0:0 -map 1:0 \
+    -c:s:0 srt -metadata:s:s:0 language=eng \
+    -c:s:1 ass -metadata:s:s:1 language=fra -metadata:s:s:1 title=Signs \
+    -f matroska assets/test_subs.mks
+# ...and the same file stating its languages the way a modern muxer does: in
+# `LanguageBCP47` (0x22B59D) and *not* in the legacy `Language` (0x22B59C),
+# which is the shape of every English track of his `a dual-language remux` and
+# `a 17-track library file`. ffmpeg writes only the legacy element (8.1.2 does not read
+# the BCP-47 one either), so the element is swapped in place afterwards: the
+# 4-byte id, then the length as a two-byte VINT (`40 02`, a legal non-minimal
+# encoding) so the tag is two bytes and the element stays the eight bytes it
+# was -- every enclosing size in the file survives untouched.
+python3 - <<'PATCH'
+data = open("assets/test_subs.mkv", "rb").read()
+size = len(data)
+for legacy, tag in ((b"eng", b"en"), (b"fra", b"fr")):
+    data = data.replace(b"\x22\xb5\x9c\x83" + legacy, b"\x22\xb5\x9d\x40\x02" + tag)
+assert len(data) == size, "the swap has to be size-for-size"
+assert b"\x22\xb5\x9d" in data, "and it has to have happened"
+open("assets/test_subs_bcp47.mkv", "wb").write(data)
+PATCH
 # HEVC in Matroska: the shape a film off a disc arrives in. Same A/V shape as
 # test_hevc.mp4 so the tests measure the container and nothing else, `-g 30` for
 # the same reason test_av1.mkv has it (a second keyframe to seek to), and the
@@ -475,4 +502,14 @@ ffmpeg -y -f lavfi -i "testsrc2=size=320x180:rate=24:duration=30" \
     -f lavfi -i "aevalsrc=sin(2*PI*(200*t+80*t*t)):s=48000:d=30" \
     -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p -g 120 \
     -c:a libopus -b:a 128k assets/test_seek_chirp.mkv
+# The lopsided container: 2 s of picture under 60 s of sound, which is what a
+# still with a song over it or a botched remux looks like from the outside. The
+# point is the *denominator* -- a file 60 s long whose video track is 2 s long
+# reports thirty times its real byte rate if the bitrate row divides by the
+# picture rather than by the file (`crates/engine/tests/bitrate.rs`). Nothing
+# else here has this shape, which is exactly why it is here.
+ffmpeg -y -f lavfi -i "testsrc2=size=320x240:rate=30:duration=2" \
+    -f lavfi -i "sine=frequency=440:duration=60" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a aac -b:a 64k assets/test_short_video_long_audio.mp4
 echo "fixtures written to assets/"
