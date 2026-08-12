@@ -399,3 +399,74 @@ fn ffmpeg_decode(path: &Path) -> Option<Vec<f32>> {
             .collect(),
     )
 }
+
+/// The one line the card shows while an export runs, where the picture is
+/// copied and the sound is not. Two lanes of work meet in that sentence -- the
+/// video copy path writes it, the Opus seat decides its second half -- and the
+/// half that matters is *measured*: the copy branch used to publish the
+/// prediction the card already shows, which would have named Opus on an export
+/// that quietly fell back to AAC.
+///
+/// The picture is `test_hevc.mkv` untouched, so it is copied block for block;
+/// the sound is the 5.1 Opus source folded to the stereo mix Opus is reachable
+/// at, so it is encoded. Nothing in the file is decoded to prove this -- the
+/// container is read back for the track ids, which is what the two paths
+/// actually wrote.
+#[test]
+fn a_copied_picture_names_the_sound_it_was_written_with() {
+    pin_software();
+    let video = asset("test_hevc.mkv");
+    let sound = asset(OPUS);
+    let (meta, _) = engine::demux::Demuxer::open(&video).expect("probe the picture");
+    let frames = meta.frame_count;
+    let clip = |source, out_frame| Clip {
+        start: 0,
+        in_frame: 0,
+        out_frame,
+        source,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    // The sound is source 0, for the reason [`project`] gives: the timeline
+    // takes its rate and its width from the first source that has any.
+    let project = Project::from_parts(
+        vec![Source::new(&sound, 0), Source::new(&video, 0)],
+        vec![
+            (LaneKind::Video, vec![clip(1, frames)]),
+            (LaneKind::Audio, vec![clip(0, frames)]),
+        ],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a picture lane and an audio lane");
+    let out = out_path("copy_line");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Hevc,
+            ..Default::default()
+        },
+    );
+    let line = {
+        wait(&handle, Duration::from_secs(600)).expect("the export finishes");
+        handle.encoders().unwrap_or_default()
+    };
+    println!("the card's line: {line}");
+    assert!(
+        line.starts_with("copy · "),
+        "the untouched picture was not copied: {line}"
+    );
+    assert!(
+        line.contains("Opus"),
+        "the copied picture's line does not name the sound it was written with: {line}"
+    );
+    // ...and the file agrees with the line, on both halves.
+    let bytes = std::fs::read(&*out).expect("read the export back");
+    assert!(find(&bytes, b"A_OPUS").is_some(), "the track says A_OPUS");
+    assert!(find(&bytes, b"A_AAC").is_none(), "and nothing says A_AAC");
+}

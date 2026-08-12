@@ -1484,7 +1484,14 @@ fn run(
         eprintln!("export video: copy (source packets)");
         *shared.encoders.lock().unwrap() = Some(format!(
             "copy · {}",
-            audio_label(project, settings.format, sound.is_some(), sound)
+            // The measured codec, exactly as the encoder path below publishes
+            // it: the mix has been opened by now, so a line that fell back to
+            // AAC says AAC. Naming the prediction here would make the fallback
+            // invisible on precisely the exports that are over in seconds.
+            match opus {
+                true => "Opus · SW encode (opus-rs)",
+                false => audio_label(project, settings.format, sound.is_some(), sound),
+            }
         ));
         return plan.run(
             out,
