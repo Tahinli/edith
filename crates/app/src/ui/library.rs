@@ -232,6 +232,7 @@ impl Player {
                     )
                     .child(control(
                         "import",
+                        0.,
                         None,
                         "Import",
                         "adds a file to this list — or drop one on the window".to_string(),
@@ -266,6 +267,7 @@ impl Player {
             .children(self.subtitle_section(width, viewport_h, cx))
             .child(control(
                 "add-asset",
+                0.,
                 None,
                 "Add at playhead",
                 match self.selected_asset {

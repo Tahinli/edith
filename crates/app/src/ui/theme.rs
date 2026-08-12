@@ -53,7 +53,7 @@ pub const FG_DISABLED: u32 = 0x6c7a8b;
 pub const ACCENT_PRIMARY: u32 = 0x22d3ee;
 /// Not the accent: the playhead crosses every clip colour there is and has to
 /// stay the one line that is none of them.
-pub const ACCENT_PLAYHEAD: u32 = 0xff4d6d;
+pub const ACCENT_PLAYHEAD: u32 = 0xff9db0;
 /// The accent as a translucent wash, for the marks drawn over a clip body.
 pub const ACCENT_WASH: u32 = 0x22d3eeaa;
 

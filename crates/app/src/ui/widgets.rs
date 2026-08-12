@@ -43,6 +43,11 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
 /// A button that would do nothing says so: dimmed, no pointer, no listener.
 pub(crate) fn control(
     id: &'static str,
+    // The rect the label is allowed to change inside: 0 hugs the text, anything
+    // else is reserved once and never moves again, which is what keeps a button
+    // that relabels itself ("Export"/"Cancel") from shoving its neighbours
+    // along the row every time its state changes.
+    w: f32,
     glyph: Option<AnyElement>,
     // Not `&'static str`: the volume button's label is its state.
     label: impl Into<SharedString>,
@@ -58,9 +63,11 @@ pub(crate) fn control(
         .h(px(CONTROL_H))
         .flex()
         .items_center()
+        .justify_center()
         .gap(px(6.))
         .px(px(8.))
-        .rounded(px(3.))
+        .when(w > 0., |d| d.w(px(w)).overflow_hidden())
+        .rounded(px(4.))
         .bg(rgb(BG_RAISED))
         .children(glyph)
         .child(label)
