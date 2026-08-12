@@ -914,6 +914,16 @@ impl PlaybackSession {
         crate::export::planned_audio(&self.project, format)
     }
 
+    /// The timeline an export started right now would be run against, owned:
+    /// what lets a front-end ask [`crate::export::planned_seats`] what that
+    /// export would open *off* its render thread, which is the only way to ask
+    /// a question that opens files. The very snapshot
+    /// [`export_to_with`](Self::export_to_with) hands the worker, so the answer
+    /// is about the export that would really start.
+    pub fn export_snapshot(&self) -> (crate::project::Project, VideoMeta) {
+        (self.project.export_snapshot(), self.meta)
+    }
+
     /// What an export would do about the tracks at `picks` --
     /// [`crate::export::planned_subtitles`], asked of the project a front-end is
     /// holding, and pure for the same reason. `picks` is any run of rows of

@@ -86,6 +86,20 @@ use crate::tonemap::{self, ToneMapper};
 /// without a lock, fine enough for any progress bar.
 const PROGRESS_SCALE: u32 = 1_000;
 
+/// The head of the bar the *sound* owns, before a picture is written at all.
+/// The mix is decoded, encoded and measured before the muxer exists ([`run`]
+/// says why), and on a feature film that is a minute or two in which a bar
+/// pinned at zero is the only thing on screen -- which reads as an export that
+/// has hung. Small, because the picture is still nearly all of the work.
+const AUDIO_BAND: u32 = PROGRESS_SCALE / 20;
+
+/// Where the bar stands with `done` of `total` pictures written: the sound's
+/// band is already behind it ([`AUDIO_BAND`]), so the picture fills what is
+/// left rather than starting again from zero.
+fn picture_progress(done: u32, total: u32) -> u32 {
+    AUDIO_BAND + done.min(total) * (PROGRESS_SCALE - AUDIO_BAND) / total.max(1)
+}
+
 /// D2 rate control: bits per pixel per second, then a sane range. 720p30 lands
 /// at 2.76 Mbps, which S1 measured the software encoder hitting within 1%.
 const BITS_PER_PIXEL: f64 = 0.1;
@@ -807,6 +821,48 @@ pub fn planned_video(meta: &VideoMeta, settings: &ExportSettings) -> Option<&'st
         .then(|| video_label(settings.format, hw_seat(meta, settings).is_some()))
 }
 
+/// What [`start`] would open for *this* timeline: the picture's seat -- or the
+/// copy that means there is no encoder at all -- and the sound's, asked of the
+/// very gates the export asks ([`CopyPlan::of`] and [`copy_audio`]'s) rather
+/// than of the format alone.
+///
+/// This exists because the card and the running export used to disagree in both
+/// directions on the same file: the card named a software HEVC encode for a cut
+/// the engine copied, and named an AAC copy for a Matroska source whose sound
+/// no sample table holds and which therefore always re-encodes. A prediction
+/// that is not the decision is worse than no prediction, because a person plans
+/// their evening around it.
+///
+/// Costs what [`planned_video`] costs (an encoder opened and closed) plus a
+/// header read per source and, once per file, its cluster walk: ask it off a
+/// render thread and keep the answer until the timeline or the settings change.
+pub fn planned_seats(
+    project: &Project,
+    meta: &VideoMeta,
+    settings: &ExportSettings,
+) -> (Option<&'static str>, &'static str) {
+    let video = settings.format.has_video().then(|| {
+        match CopyPlan::of(project, meta, settings).is_some() {
+            true => "copy (source packets)",
+            false => video_label(settings.format, hw_seat(meta, settings).is_some()),
+        }
+    });
+    // The half [`audio_label`] cannot know from the format: a copy is a *sample
+    // table's* packets ([`copy_audio`] hands them to `copy_multi_streams`), and
+    // a Matroska file has none -- so every mkv source re-encodes, however
+    // untouched its lane is. Extension only, which is what `is_matroska`
+    // reads, so this costs nothing beyond what is already open.
+    let copyable = !forces_encode(project)
+        && !project
+            .sources()
+            .iter()
+            .any(|source| crate::demux::is_matroska(&source.path));
+    (
+        video,
+        audio_label(project, settings.format, has_sound(project), Some(copyable)),
+    )
+}
+
 fn settle(shared: &Shared, result: crate::Result<()>) {
     *shared.outcome.lock().unwrap() = Some(result);
     // Published last: a caller that sees the flag is guaranteed the outcome.
@@ -848,6 +904,7 @@ fn copy_audio(
     meta: &VideoMeta,
     kbps: u32,
     mkv: bool,
+    shared: &Shared,
 ) -> crate::Result<Option<ExportAudio>> {
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
@@ -872,7 +929,7 @@ fn copy_audio(
     // whole comment is about.
     let lanes = project.audio_segments_from(0, meta.frame_rate);
     let [segments] = &lanes[..] else {
-        return encode_audio(project, meta, kbps, mkv);
+        return encode_audio(project, meta, kbps, mkv, shared);
     };
     // ...and the same list names *which* lane those clips sit on, which is the
     // only way to ask what has been done to them.
@@ -910,7 +967,7 @@ fn copy_audio(
     // such a lane would write it at unity and unlimited, silently.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
     if speeded || equalized(project) || mastered(project) {
-        return encode_audio(project, meta, kbps, mkv);
+        return encode_audio(project, meta, kbps, mkv, shared);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
     // inside a Matroska file (readable, but not out of a sample table this walks
@@ -930,7 +987,7 @@ fn copy_audio(
             // (they are not in a sample table) and every one of them re-encodes.
             opus_pre_skip: None,
         })),
-        Err(_) => encode_audio(project, meta, kbps, mkv),
+        Err(_) => encode_audio(project, meta, kbps, mkv, shared),
     }
 }
 
@@ -1150,7 +1207,7 @@ impl CopyPlan {
                 done += 1;
                 shared
                     .progress
-                    .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
+                    .store(picture_progress(done, total), Ordering::Relaxed);
             }
         }
         // Everything up to here is still cancellable, exactly as the encoded
@@ -1184,11 +1241,17 @@ fn encode_audio(
     meta: &VideoMeta,
     kbps: u32,
     mkv: bool,
+    shared: &Shared,
 ) -> crate::Result<Option<ExportAudio>> {
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
     let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    // Coarse stage timers, in the same voice as `export video: copy` below: an
+    // export of a feature film spends minutes in here before a byte of picture
+    // is written, and which minutes went where is the first question asked of a
+    // slow export. Three lines an export, so they stay on.
+    let mixed = std::time::Instant::now();
     let Some((audio, chunks)) = AudioSession::open_mixed_streams_master(
         &sources,
         &segs,
@@ -1219,8 +1282,19 @@ fn encode_audio(
     let mut samples: Vec<f32> = Vec::with_capacity(total);
     for chunk in chunks {
         samples.extend(chunk.samples);
+        // The bar's first third of [`AUDIO_BAND`]: the mix is the longest of
+        // the three stages and the only one that can be counted as it goes.
+        shared.progress.store(
+            (samples.len().min(total) * (AUDIO_BAND / 3) as usize / total.max(1)) as u32,
+            Ordering::Relaxed,
+        );
     }
     samples.resize(total, 0.0);
+    eprintln!(
+        "export audio: mixed {:.1} s of sound in {:.1} s",
+        total as f64 / f64::from(audio.sample_rate.max(1)) / channels as f64,
+        mixed.elapsed().as_secs_f64()
+    );
 
     // Opus where the container carries it and the mix is inside the envelope
     // this encoder was *measured* correct in ([`encode_opus`]): a Matroska file,
@@ -1367,6 +1441,7 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
     // everybody hears in the first frame of a cut. So the first frame is fed in
     // once to warm the encoder, and thrown away again by the pre-skip: exactly
     // what pre-skip is for (RFC 7845 §4.2), at the cost of one packet.
+    let coded = std::time::Instant::now();
     let warm = samples.len().min(OPUS_FRAME * 2);
     // ...and one silent frame after the sound, for the same delay seen from the
     // other end: the encoder is [`OPUS_PRE_SKIP`] samples behind its input, so
@@ -1396,10 +1471,36 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
     // sound in a few hundred milliseconds, against a video encode that is
     // minutes). Upgrade path is deleting it, the day this encoder can be
     // trusted at the rate it is asked for.
+    let encoded = coded.elapsed().as_secs_f64();
     let pre_skip = OPUS_PRE_SKIP + OPUS_FRAME as u16;
+    let measured = std::time::Instant::now();
     let fidelity = opus_fidelity(&packets, samples, usize::from(pre_skip));
+    eprintln!(
+        "export audio: Opus encode {encoded:.1} s, fidelity {fidelity:.4} measured in {:.1} s",
+        measured.elapsed().as_secs_f64()
+    );
     Ok((fidelity >= OPUS_MIN_FIDELITY).then_some((packets, pre_skip)))
 }
+
+/// Packets one sampled window listens to: 5 s at [`OPUS_FRAME`].
+const FIDELITY_WINDOW: usize = 250;
+
+/// How many of them a long track is judged on -- a minute of sound, wherever
+/// the track's length puts them, and a constant cost rather than one that grows
+/// with the film ([`opus_fidelity`]).
+const FIDELITY_WINDOWS: usize = 12;
+
+/// Packets decoded into a window and thrown away before it is measured. CELT
+/// predicts across frames, so a decoder started cold mid-stream is behind its
+/// own history for a few frames; 100 ms is far more than it needs and is not
+/// worth counting.
+const FIDELITY_WARMUP: usize = 5;
+
+/// How much sound a window must carry before its correlation means anything:
+/// mean square per sample. A window of digital silence -- the head of a film,
+/// the gap between a feature and its credits -- correlates with nothing, and
+/// failing a track for it would send perfectly good sound to AAC.
+const FIDELITY_FLOOR: f64 = 1e-9;
 
 /// The correlation between `samples` and the decode of `packets` with the first
 /// `pre_skip` frames dropped: 1.0 is the same waveform, and this codec's failure
@@ -1409,26 +1510,86 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
 ///
 /// A packet the decoder refuses is 0.0 and no argument: a track this project
 /// cannot read is exactly what this is here to catch.
+///
+/// **Sampled, above a minute of sound, and the worst window is the answer.**
+/// This decode is the whole cost of exporting a feature film: `ruopus` runs its
+/// inverse MDCT at 0.2x real time here (measured, 24.2 s for 121.5 s of stereo),
+/// so judging every packet of a two-and-a-half-hour film costs half an hour
+/// before a byte of picture is written -- which is what it did, and what made a
+/// copy export that has no encoding to do at all sit at zero for twenty minutes.
+/// [`FIDELITY_WINDOWS`] windows spread evenly across the track cost the same
+/// minute of decode whatever the film's length, and what they are looking for
+/// survives sampling: [`OPUS_MAX_KBPS`]'s cliff is a *rate* the encoder falls
+/// off, measured over one-second spans, not a defect of one bar of music. It is
+/// also strictly harsher per window than the old whole-track sum, which let a
+/// ruined minute average away against two good hours -- the answer here is the
+/// worst window, not the mean.
 fn opus_fidelity(packets: &[crate::AacPacket], samples: &[f32], pre_skip: usize) -> f64 {
+    // Short enough to hear all of: every fixture, every unit test, and any
+    // track under a minute. There is nothing to sample from.
+    let all = FIDELITY_WINDOW * FIDELITY_WINDOWS;
+    if packets.len() <= all {
+        return window_fidelity(packets, samples, pre_skip, 0, 0, packets.len()).unwrap_or(1.0);
+    }
+    // Evenly spread, first window at the head: the head is where an encoder's
+    // own warm-up would show, and the last starts a window short of the end so
+    // no window runs past the packets.
+    let step = (packets.len() - FIDELITY_WINDOW) / (FIDELITY_WINDOWS - 1);
+    let mut worst: Option<f64> = None;
+    for w in 0..FIDELITY_WINDOWS {
+        let at = w * step;
+        let from = at.saturating_sub(FIDELITY_WARMUP);
+        let Some(fidelity) =
+            window_fidelity(packets, samples, pre_skip, from, at, at + FIDELITY_WINDOW)
+        else {
+            continue; // silence: nothing to correlate, and not a failure
+        };
+        worst = Some(worst.map_or(fidelity, |w: f64| w.min(fidelity)));
+    }
+    // Every window silent is a silent track, which this codec writes as silence.
+    worst.unwrap_or(1.0)
+}
+
+/// [`opus_fidelity`] over `packets[measure..to]`, with `packets[from..measure]`
+/// -- the warm-up -- decoded for its state and thrown away. `None` where the
+/// source window carries no sound worth correlating ([`FIDELITY_FLOOR`]).
+fn window_fidelity(
+    packets: &[crate::AacPacket],
+    samples: &[f32],
+    pre_skip: usize,
+    from: usize,
+    measure: usize,
+    to: usize,
+) -> Option<f64> {
     let mut decoder = ruopus::MultistreamDecoder::with_rate(OPUS_RATE, 1, 1, &[0, 1]);
     let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
-    let mut drop = pre_skip * 2;
-    let mut at = 0;
-    for packet in packets {
+    // Where in the mix this window's first decoded sample lands: every packet
+    // is [`OPUS_FRAME`] long, and the pre-skip is what the front of the stream
+    // owes before the first of them is the timeline's frame 0.
+    let mut at = (from * OPUS_FRAME * 2).saturating_sub(pre_skip * 2);
+    let mut drop = (pre_skip * 2).saturating_sub(from * OPUS_FRAME * 2);
+    let mut counted = 0usize;
+    for (index, packet) in packets.iter().enumerate().take(to).skip(from) {
         let Ok(pcm) = decoder.decode_packet(&packet.bytes) else {
-            return 0.0;
+            return Some(0.0);
         };
         let pcm = &pcm[drop.min(pcm.len())..];
         drop = drop.saturating_sub(packet.samples as usize * 2);
+        // The warm-up is decoded for its state and not for its numbers.
+        if index < measure {
+            at += pcm.len();
+            continue;
+        }
         for (want, got) in samples[at.min(samples.len())..].iter().zip(pcm) {
             let (x, y) = (f64::from(*want), f64::from(*got));
             num += x * y;
             da += x * x;
             db += y * y;
             at += 1;
+            counted += 1;
         }
     }
-    num / (da.sqrt() * db.sqrt()).max(1e-12)
+    (da / counted.max(1) as f64 > FIDELITY_FLOOR).then(|| num / (da.sqrt() * db.sqrt()).max(1e-12))
 }
 
 fn run(
@@ -1440,16 +1601,29 @@ fn run(
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
     let sources = project.sources();
-    // Audio first: a track has to be declared when the muxer is created, which
-    // happens as soon as the first coded picture arrives -- and the Matroska
-    // muxer wants the packets themselves that early too, because it interleaves
-    // them into the clusters as it writes. Every video format gets the same
-    // track: none of them is picture-only any more.
+    // The picture's decision first, before a sample of sound is touched: it is
+    // the answer that decides what the whole export *is*, it costs one header
+    // read per source, and it is what the line on screen has been missing --
+    // an export that copies its picture used to say nothing at all for as long
+    // as its sound took, which on a feature film was minutes. Half a line now,
+    // completed by the measured codec once the sound is known below: what is
+    // published is never a codec that did not run.
+    let plan = CopyPlan::of(project, meta, settings);
+    if plan.is_some() {
+        eprintln!("export video: copy (source packets)");
+        *shared.encoders.lock().unwrap() = Some("copy · working out the sound…".into());
+    }
+    // ...then the audio: a track has to be declared when the muxer is created,
+    // which happens as soon as the first coded picture arrives -- and the
+    // Matroska muxer wants the packets themselves that early too, because it
+    // interleaves them into the clusters as it writes. Every video format gets
+    // the same track: none of them is picture-only any more.
     let audio = copy_audio(
         project,
         meta,
         audio_kbps_of(settings),
         settings.format.is_mkv(),
+        shared,
     )?;
     let audio_params = audio.as_ref().map(|track| AudioParams {
         freq_index: track.params.freq_index,
@@ -1473,6 +1647,9 @@ fn run(
     // declared in the header and its blocks are interleaved into the clusters,
     // so the muxer needs the lot before the first picture is written.
     let mut subs = export_subtitles(project, meta, settings);
+    // The sound is done, whichever way it went: the bar stands at the head of
+    // the picture's own share ([`AUDIO_BAND`]).
+    shared.progress.store(AUDIO_BAND, Ordering::Relaxed);
 
     // Before an encoder is opened at all: a timeline nobody has touched, whose
     // sources this file can hold as they are, is written by copying their coded
@@ -1480,8 +1657,7 @@ fn run(
     // and the difference between an export bounded by the *edited* spans and one
     // that re-encodes a whole film to change a cut. [`CopyPlan`] states the
     // whole rule; anything at all outside it falls through to the walk below.
-    if let Some(plan) = CopyPlan::of(project, meta, settings) {
-        eprintln!("export video: copy (source packets)");
+    if let Some(plan) = plan {
         *shared.encoders.lock().unwrap() = Some(format!(
             "copy · {}",
             // The measured codec, exactly as the encoder path below publishes
@@ -1719,7 +1895,7 @@ fn run(
                 done += 1;
                 shared
                     .progress
-                    .store(done * PROGRESS_SCALE / total.max(1), Ordering::Relaxed);
+                    .store(picture_progress(done, total), Ordering::Relaxed);
             }
             done_here += repeats;
         }
@@ -3167,6 +3343,60 @@ mod tests {
             fidelity < OPUS_MIN_FIDELITY,
             "opus-rs now encodes 256 kbps stereo that a conformant decoder reads \
              back (fidelity {fidelity:.4}): raise OPUS_MAX_KBPS and delete this half"
+        );
+    }
+
+    /// The gate on a track too long to listen to whole: it samples, and what it
+    /// samples it judges one window at a time. A five-second stretch that is not
+    /// the mix fails the whole track -- where the old whole-track sum would have
+    /// let it average away against the minutes either side -- and a silent track
+    /// is not a failure at all, which is what it used to be scored as (0.0
+    /// against a denominator of nothing, and an all-quiet timeline fell back to
+    /// AAC for it).
+    ///
+    /// 61 s of sound: one second past the minute the gate stops listening whole,
+    /// which is what puts this on the sampled path at all.
+    #[test]
+    fn a_long_track_is_judged_by_its_worst_sampled_window() {
+        let pcm = two_tones(61);
+        let (packets, pre_skip) = encode_opus(&pcm, 96)
+            .expect("the encoder opens")
+            .expect("and passes its own round trip");
+        assert!(
+            packets.len() > FIDELITY_WINDOW * FIDELITY_WINDOWS,
+            "{} packets is not the sampled path",
+            packets.len()
+        );
+        let pre_skip = usize::from(pre_skip);
+        let whole = opus_fidelity(&packets, &pcm, pre_skip);
+        assert!(whole >= OPUS_MIN_FIDELITY, "a good track scored {whole:.4}");
+
+        // One window's worth of the *mix* replaced by its own phase inverse:
+        // the packets still decode, they are simply no longer this sound. Placed
+        // on a window the gate samples -- window 6 of the twelve, by the same
+        // arithmetic the gate spreads them with.
+        let step = (packets.len() - FIDELITY_WINDOW) / (FIDELITY_WINDOWS - 1);
+        let from = (6 * step * OPUS_FRAME).saturating_sub(pre_skip) * 2;
+        let mut ruined = pcm.clone();
+        for sample in &mut ruined[from..(from + FIDELITY_WINDOW * OPUS_FRAME * 2).min(pcm.len())] {
+            *sample = -*sample;
+        }
+        let worst = opus_fidelity(&packets, &ruined, pre_skip);
+        assert!(
+            worst < OPUS_MIN_FIDELITY,
+            "five seconds of a long track that is not the mix scored {worst:.4}"
+        );
+
+        // ...and silence is silence: nothing to correlate is not a round trip
+        // that failed. Short, because the floor is the same on either path.
+        let quiet = vec![0f32; OPUS_RATE as usize * 2 * 2];
+        let (packets, pre_skip) = encode_opus(&quiet, 96)
+            .expect("the encoder opens")
+            .expect("silence is written as Opus, not sent to AAC");
+        let fidelity = opus_fidelity(&packets, &quiet, usize::from(pre_skip));
+        assert!(
+            fidelity >= OPUS_MIN_FIDELITY,
+            "a silent track scored {fidelity:.4} and would fall back to AAC"
         );
     }
 

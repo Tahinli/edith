@@ -1498,6 +1498,35 @@ pub struct CodedBlock<'a> {
     pub ts_ns: i64,
 }
 
+/// Every block of `path`'s picture track a decoder may be started from, by the
+/// block index the whole engine counts a source's frames in -- the frames a cut
+/// may be placed on for the export to copy the film instead of coding it again
+/// ([`crate::export::planned_seats`] is the same question asked of a whole
+/// timeline).
+///
+/// Empty for anything that is not Matroska, which is exactly the set of files
+/// the copy path refuses anyway, and for a file whose clusters cannot be walked.
+///
+/// Costs that walk, once per file (6.7 s on a 12.9 GB film, then a sidecar read
+/// of a few milliseconds -- [`MkvDemuxer::is_sync`]): ask it off a render
+/// thread.
+pub fn sync_points(path: &Path) -> Vec<u32> {
+    if !is_matroska(path) {
+        return Vec::new();
+    }
+    let Ok((_, Demuxer::Mkv(mut demuxer))) = Demuxer::open(path) else {
+        return Vec::new();
+    };
+    // `is_sync` completes the index on its first call, so the count is asked
+    // after it: before that it is the open window's, not the file's.
+    if !demuxer.is_sync(0) && demuxer.block_count() == 0 {
+        return Vec::new();
+    }
+    (0..demuxer.block_count() as u32)
+        .filter(|&i| demuxer.is_sync(i as usize))
+        .collect()
+}
+
 /// The codec id of `path`'s first audio track (`A_AAC`, `A_OPUS`, ...), or
 /// `None` for a Matroska file with no sound at all. Header only, and only worth
 /// calling once a session has come up silent: a Matroska file's sound is read
