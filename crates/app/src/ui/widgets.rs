@@ -48,6 +48,9 @@ pub(crate) fn control(
     // that relabels itself ("Export"/"Cancel") from shoving its neighbours
     // along the row every time its state changes.
     w: f32,
+    // The plane the button stands on. One button in the window is the accent
+    // (Export, the primary action); everything else is `BG_RAISED`.
+    bg: u32,
     glyph: Option<AnyElement>,
     // Not `&'static str`: the volume button's label is its state.
     label: impl Into<SharedString>,
@@ -68,7 +71,8 @@ pub(crate) fn control(
         .px(px(8.))
         .when(w > 0., |d| d.w(px(w)).overflow_hidden())
         .rounded(px(4.))
-        .bg(rgb(BG_RAISED))
+        .bg(rgb(bg))
+        .when(bg == ACCENT_PRIMARY, |d| d.text_color(rgb(BG_CANVAS)))
         .children(glyph)
         .child(label)
         .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
