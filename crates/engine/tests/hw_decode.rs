@@ -185,6 +185,72 @@ fn seek_matches_linear() {
     );
 }
 
+/// The same promise as [`seek_matches_linear`], made of every container and
+/// codec pair there is a fixture for and at targets on, either side of and away
+/// from a keyframe -- because which of them holds is a property of the *stream's
+/// structure*, not of the seek code alone.
+///
+/// An open-GOP HEVC stream (x265's default, so `test_hevc.mkv` and its 10-bit
+/// twin, and every film off a disc or a web rip) stores the CRA that opens a GOP
+/// *ahead of* the RASL leading pictures that are shown *before* it: keyframe 30
+/// on screen is the 28th block in the file. A seek that counts stored positions
+/// rather than displayed pictures therefore hands back a picture two frames
+/// later than the index it labels, and by a different amount in a GOP with
+/// another number of leading pictures. `test_baseline.mp4` alone never showed
+/// it: it has exactly one keyframe, at frame 0, where the two orders agree.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn seek_matches_linear_every_container() {
+    // The hardware path for all of these: there is no software HEVC or AV1
+    // decoder to compare against. SAFETY: --test-threads=1.
+    unsafe { std::env::remove_var("VE_SW") };
+    for name in [
+        "test_baseline.mp4",
+        "test_high.mp4",
+        "test_hevc.mp4",
+        "test_hevc.mkv",
+        "test_hevc10.mkv",
+        "test_h264.mkv",
+        "test_av1.mkv",
+    ] {
+        let path = asset(name);
+        let (meta, rx) = DecodeSession::open(&path).unwrap_or_else(|e| panic!("{name}: open: {e}"));
+        // On a keyframe, either side of one, well inside a GOP, the first
+        // picture and the last -- deduplicated for a fixture short enough that
+        // some of those coincide.
+        let mut targets = vec![0, 1, 29, 30, 31, 45, meta.frame_count - 1];
+        targets.retain(|&t| t < meta.frame_count);
+        targets.sort_unstable();
+        targets.dedup();
+        let linear: Vec<(u32, Vec<u8>)> = rx
+            .into_iter()
+            .filter(|f| targets.contains(&f.index))
+            .map(|f| (f.index, f.bgra))
+            .collect();
+        assert_eq!(
+            linear.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            targets,
+            "{name}: linear decode never delivered every target"
+        );
+        for (target, want) in linear {
+            let (_, rx, _cancel) = DecodeSession::open_at(&path, target)
+                .unwrap_or_else(|e| panic!("{name}: open_at({target}): {e}"));
+            let seeked = rx
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{name}: no frame after seek to {target}"));
+            assert_eq!(
+                seeked.index, target,
+                "{name}: first frame after seek is not the target"
+            );
+            assert!(
+                seeked.bgra == want,
+                "{name}: seek to {target} handed back a different picture than a linear decode of {target}"
+            );
+        }
+    }
+}
+
 /// Drains a bounded session, returning the indices it delivered. The loop ends
 /// only on `RecvError`, i.e. the worker closed the channel by itself.
 fn range_indices(path: &Path, start: u32, end: u32) -> Vec<u32> {

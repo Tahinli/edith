@@ -535,6 +535,14 @@ pub struct Mp4Demuxer {
     /// `stss` entries, ascending 1-based sample ids. Empty means no `stss` box
     /// at all, i.e. every sample is a sync sample.
     sync_samples: Vec<u32>,
+    /// Where every sync sample really sits on screen: `(display index, 0-based
+    /// sample index)` per [`sync_display_order`]. Empty -- and then unused, the
+    /// `stss` table above answering on its own -- for a track with no `ctts`
+    /// box, whose samples are stored in the order they are shown in.
+    sync_display: Vec<(u32, u32)>,
+    /// Display index of [`Self::first_sample`], i.e. of frame 0. Zero without a
+    /// `ctts` box, and not the sample's own position with one.
+    first_display: u32,
     next_sample: u32,
     /// Bits per luma sample; see [`Demuxer::bit_depth`].
     bit_depth: u8,
@@ -655,6 +663,25 @@ impl Mp4Demuxer {
         // Where a seek to frame 0 would put the cursor: the samples the edit list
         // trims are still read, they are references for the ones that show.
         let next_sample = sync_at_or_before(&sync_samples, first_sample);
+        // Only a track that carries composition offsets stores its samples out
+        // of display order, and only an `stss` table makes "which keyframe" a
+        // question at all -- without either, a sample id *is* a display index
+        // and the table below would be an index of itself.
+        let (sync_display, first_display) = match track.trak.mdia.minf.stbl.ctts.as_ref() {
+            Some(ctts) if !sync_samples.is_empty() => {
+                let times = composition_times(
+                    stts_pairs(track),
+                    ctts.entries
+                        .iter()
+                        .map(|e| (e.sample_count, e.sample_offset)),
+                );
+                let syncs = sync_display_order(&times, |i| {
+                    sync_samples.binary_search(&(i as u32 + 1)).is_ok()
+                });
+                (syncs, display_index(&times, first_sample - 1))
+            }
+            _ => (Vec::new(), 0),
+        };
         Ok((
             VideoMeta {
                 // The samples the edit list trims off the front are not frames of
@@ -676,6 +703,8 @@ impl Mp4Demuxer {
                 parameter_sets,
                 nal_length,
                 sync_samples,
+                sync_display,
+                first_display,
                 next_sample,
                 bit_depth,
                 light: mp4_light(path, track_id),
@@ -725,6 +754,16 @@ impl Mp4Demuxer {
     /// sample sits inside what the edit list trims, i.e. those pictures decode as
     /// references but are not frame 0 or later.
     fn seek_to_sync_at_or_before(&mut self, frame: u32) -> i64 {
+        // With composition offsets in play, which sync sample is "at or before"
+        // the target is a question about display order and sample ids cannot
+        // answer it ([`sync_display_order`]).
+        if !self.sync_display.is_empty() {
+            let target = frame.saturating_add(self.first_display);
+            let (display, sample) =
+                sync_display_at_or_before(&self.sync_display, target).unwrap_or((0, 0));
+            self.next_sample = sample + 1;
+            return i64::from(display) - i64::from(self.first_display);
+        }
         let target = frame
             .saturating_add(self.first_sample)
             .clamp(1, self.sample_count.max(1));
@@ -809,6 +848,10 @@ pub struct MkvDemuxer {
     base: usize,
     /// The keyframe index off the file's `Cues`, empty for a file walked whole.
     cues: Vec<Cue>,
+    /// [`Self::window_syncs`]'s answer, and the `(base, length)` of the window it
+    /// answers for: recomputed when the window moves and not per seek.
+    syncs: Vec<(i64, usize)>,
+    syncs_for: Option<(usize, usize)>,
     /// How far [`Self::cues_agree`] has got through `cues`: everything before it
     /// has been checked against real blocks, or walked past by a jump, and is
     /// never looked at again.
@@ -906,6 +949,8 @@ impl MkvDemuxer {
             next: 0,
             base: 0,
             cues,
+            syncs: Vec::new(),
+            syncs_for: None,
             checked: 0,
             reach: segment.0,
             segment,
@@ -1280,21 +1325,79 @@ impl MkvDemuxer {
         if self.window_for(target).is_err() {
             let _ = self.complete_index();
         }
-        let local = target
-            .saturating_sub(self.base)
-            .min(self.blocks.len().saturating_sub(1));
-        // The keyframe at or before the target, or -- for a stream whose first
-        // block is not one -- the earliest block there is, which is the only
-        // place a decoder can be started from anyway. The window starts at a cue,
-        // which *is* a keyframe, so "the earliest block there is" is the same
-        // block the whole walk would have landed on.
-        let chosen = self
-            .blocks
-            .get(..=local)
-            .and_then(|window| window.iter().rposition(|b| b.key))
-            .unwrap_or(0);
-        self.next = self.base + chosen;
-        self.next as i64
+        // The keyframe shown at or before the target -- not the one *stored*
+        // before it, which is a different block on any stream that codes
+        // pictures out of order ([`sync_display_order`]).
+        let target = target as i64;
+        let syncs = self.window_syncs();
+        let (display, at) = match syncs.partition_point(|&(display, _)| display <= target) {
+            // Nothing in the window shows at or before the target: the earliest
+            // sync point it holds, which is the only place a decoder can be
+            // started from anyway. The window starts at a cue, which *is* a
+            // keyframe, so that is the block the whole walk would land on too.
+            0 => syncs.first().copied().unwrap_or((self.base as i64, 0)),
+            i => syncs[i - 1],
+        };
+        self.next = self.base + at;
+        display
+    }
+
+    /// Every keyframe of the window paired with the display index it really has
+    /// in the *file*: `(display, position in the window)`, ascending.
+    ///
+    /// Which is the one thing a window makes harder than a walk. A picture's
+    /// index everywhere above this tier is its rank on screen, and that rank is a
+    /// statement about the whole film while this holds ten seconds of it. What
+    /// ties the two together is the cue: `Cue::index` *is* a display rank, the
+    /// muxer having counted it over the whole file, so the window is ranked among
+    /// itself by timestamp ([`sync_display_order`], the same function the mp4
+    /// side uses) and that ranking is shifted onto the cue's own number. A file
+    /// walked whole is the same rule with the shift at zero -- its window is the
+    /// file, and this is then `sync_display_order` exactly.
+    ///
+    /// Kept for the window it was computed over: a seek into a file that has no
+    /// usable cues ranks the whole walk, and scrubbing must not pay that twice.
+    fn window_syncs(&mut self) -> &[(i64, usize)] {
+        let window = (self.base, self.blocks.len());
+        if self.syncs_for == Some(window) {
+            return &self.syncs;
+        }
+        let times: Vec<i64> = self.blocks.iter().map(|b| b.ts).collect();
+        let ranked = sync_display_order(&times, |i| self.blocks[i].key);
+        let shift = self.window_shift(&ranked);
+        self.syncs = ranked
+            .into_iter()
+            .map(|(display, at)| (i64::from(display) + shift, at as usize))
+            .collect();
+        self.syncs_for = Some(window);
+        &self.syncs
+    }
+
+    /// What the window's own ranking has to be moved by to be the file's: the
+    /// display index a cue states for one block of the window, less the rank the
+    /// window gives that same block. Zero for a file walked whole.
+    fn window_shift(&self, ranked: &[(u32, u32)]) -> i64 {
+        if self.complete {
+            return 0;
+        }
+        let held = self.base..self.base + self.blocks.len();
+        let first = self.cues.partition_point(|c| c.index < held.start);
+        for &cue in &self.cues[first..] {
+            if !held.contains(&cue.index) {
+                break;
+            }
+            let Some((at, _)) = self.anchor(cue) else {
+                continue;
+            };
+            if let Some(&(display, _)) = ranked.iter().find(|&&(_, pos)| pos as usize == at) {
+                return cue.index as i64 - i64::from(display);
+            }
+        }
+        // No cue of the window names a block it holds, which is the index this
+        // demuxer would already have degraded to the walk over. Until it does,
+        // the window's own numbering is the file's -- exact for anything not
+        // reordered, and never more than the reorder depth out.
+        self.base as i64
     }
 }
 
@@ -3077,6 +3180,89 @@ fn first_frame_sample(entries: impl IntoIterator<Item = (u32, u32)>, trim: Optio
     trim.map_or(1, |t| packet_at(entries, t, 0).0)
 }
 
+/// Every sync point of a track paired with the *display* index it is really at:
+/// `(display index, decode position)`, ascending. `times` holds each access
+/// unit's presentation time in **decode** order -- Matroska block timestamps,
+/// mp4 `stts + ctts` composition times -- and `sync` says which of them a
+/// decoder may be started on.
+///
+/// A picture's index everywhere above this tier is its rank in *presentation*
+/// order, and a stream that codes pictures out of order does not put its sync
+/// points at the same rank in the two: an **open-GOP** HEVC stream (x265's
+/// default, so every film off a disc or a web rip) writes the RASL leading
+/// pictures of a GOP *after* the CRA that opens it in decode order and *before*
+/// it on screen, so the keyframe stored 28th is the 30th picture shown. Seeking
+/// by its stored position and then counting frames from there lands two
+/// pictures late -- and by however many leading pictures that GOP happens to
+/// carry elsewhere, which is why no constant can stand in for this.
+///
+/// The sort is stable, so blocks sharing a timestamp keep decode order.
+fn sync_display_order(times: &[i64], sync: impl Fn(usize) -> bool) -> Vec<(u32, u32)> {
+    let mut order: Vec<u32> = (0..times.len() as u32).collect();
+    order.sort_by_key(|&i| times[i as usize]);
+    order
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, decode)| sync(decode as usize))
+        .map(|(display, decode)| (display as u32, decode))
+        .collect()
+}
+
+/// Composition (presentation) time of every sample of an mp4 track, in decode
+/// order and media ticks: the `stts` decode times with the `ctts` offsets added
+/// on, which is the pair that says a B-frame is shown before the picture stored
+/// ahead of it. Both tables arrive as their `(sample_count, value)` runs, the
+/// shape [`stts_pairs`] already hands the `stts` over in; the `ctts` runs may
+/// cover fewer samples than exist, in which case the rest carry no offset.
+fn composition_times(
+    stts: impl IntoIterator<Item = (u32, u32)>,
+    ctts: impl IntoIterator<Item = (u32, i32)>,
+) -> Vec<i64> {
+    let mut times = Vec::new();
+    let mut decode = 0i64;
+    for (count, delta) in stts {
+        for _ in 0..count {
+            times.push(decode);
+            decode += i64::from(delta);
+        }
+    }
+    let mut sample = 0usize;
+    for (count, offset) in ctts {
+        for _ in 0..count {
+            match times.get_mut(sample) {
+                Some(t) => *t += i64::from(offset),
+                None => return times,
+            }
+            sample += 1;
+        }
+    }
+    times
+}
+
+/// Rank of the sample at 0-based decode index `sample` in presentation order,
+/// tie-broken by decode order exactly as [`sync_display_order`]'s stable sort
+/// is. Used for frame 0, which an edit list can put at any sample.
+fn display_index(times: &[i64], sample: u32) -> u32 {
+    let Some(&at) = times.get(sample as usize) else {
+        return sample;
+    };
+    times
+        .iter()
+        .enumerate()
+        .filter(|&(i, &t)| (t, i as u32) < (at, sample))
+        .count() as u32
+}
+
+/// The latest sync point at or before display index `frame`, out of a
+/// [`sync_display_order`] table. `None` when the track's first sync point is
+/// already past `frame`, i.e. there is nothing decodable earlier.
+fn sync_display_at_or_before(syncs: &[(u32, u32)], frame: u32) -> Option<(u32, u32)> {
+    match syncs.partition_point(|&(display, _)| display <= frame) {
+        0 => None,
+        i => Some(syncs[i - 1]),
+    }
+}
+
 /// Largest entry of the ascending sync table that is `<= sample_id`. An empty
 /// table means every sample is a sync sample. When `sample_id` sits before the
 /// first sync sample there is nothing decodable earlier, so that one wins.
@@ -3739,14 +3925,26 @@ mod tests {
             assert_eq!(whole.base, 0, "{name}: a sequential read moved the base");
             assert_eq!(whole.blocks, walk, "{name}: the lazy walk is not the walk");
             // ...and every seek lands where the walk's own rule says, jumping
-            // backwards and forwards through the cues to get there.
+            // backwards and forwards through the cues to get there. The rule is
+            // the walk's *display* order ([`sync_display_order`]): which keyframe
+            // is "at or before" a frame is a question about the screen, and the
+            // window has to answer it out of ten seconds of the file.
+            let syncs = {
+                let times: Vec<i64> = walk.iter().map(|b| b.ts).collect();
+                sync_display_order(&times, |i| walk[i].key)
+            };
             for frame in (0..walk.len()).chain((0..walk.len()).rev()) {
                 let landed = lazy.seek_to_sync_at_or_before(frame as u32);
-                let want = walk[..=frame].iter().rposition(|b| b.key).unwrap_or(0);
-                assert_eq!(landed, want as i64, "{name}: seek to frame {frame}");
+                let (display, want) =
+                    sync_display_at_or_before(&syncs, frame as u32).unwrap_or((0, 0));
+                assert_eq!(
+                    landed,
+                    i64::from(display),
+                    "{name}: seek to frame {frame} named a picture the walk does not"
+                );
                 assert_eq!(
                     lazy.blocks[lazy.next - lazy.base],
-                    walk[want],
+                    walk[want as usize],
                     "{name}: the block frame {frame} lands on"
                 );
             }
@@ -4346,6 +4544,66 @@ mod tests {
         assert_eq!(sync_at_or_before(&[1, 31, 61], 45), 31, "between syncs");
         assert_eq!(sync_at_or_before(&[5, 31], 2), 5, "before the first sync");
         assert_eq!(sync_at_or_before(&[1, 31, 61], 900), 61, "past the last");
+    }
+
+    /// The open-GOP seek bug: `test_hevc.mkv`'s own timestamps, in the order the
+    /// file stores them. The GOP-opening CRA is block 28 and the two blocks
+    /// after it are its leading pictures, shown at 28 and 29 -- so the keyframe
+    /// is the *30th* picture, and a seek that answered 28 handed back frame 47
+    /// when it was asked for 45 (`hw_decode::seek_matches_linear_every_container`).
+    #[test]
+    fn a_keyframe_is_indexed_by_when_it_shows_not_where_it_is_stored() {
+        // ms timestamps: 0, then the 3-picture reorder x265 writes, then the CRA
+        // at 1000 ms with two leading pictures behind it in storage.
+        let mut times: Vec<i64> = (0..28).map(|i| i64::from(i) * 100 / 3).collect();
+        times.swap(1, 3);
+        times.extend([1000, 967, 933]);
+        let syncs = sync_display_order(&times, |i| i == 0 || i == 28);
+        assert_eq!(syncs, vec![(0, 0), (30, 28)], "the CRA is shown 30th");
+
+        assert_eq!(sync_display_at_or_before(&syncs, 45), Some((30, 28)));
+        assert_eq!(
+            sync_display_at_or_before(&syncs, 29),
+            Some((0, 0)),
+            "a leading picture is only reachable from the GOP before it"
+        );
+        assert_eq!(sync_display_at_or_before(&syncs, 30), Some((30, 28)));
+        assert_eq!(sync_display_at_or_before(&syncs, 900), Some((30, 28)));
+        assert_eq!(
+            sync_display_at_or_before(&[(5, 5)], 2),
+            None,
+            "nothing decodable before the first sync point"
+        );
+
+        // Decode order back when nothing is reordered, which is what keeps every
+        // closed-GOP stream exactly where it was.
+        let plain: Vec<i64> = (0..8).map(|i| i64::from(i) * 33).collect();
+        assert_eq!(
+            sync_display_order(&plain, |i| i % 4 == 0),
+            vec![(0, 0), (4, 4)]
+        );
+    }
+
+    /// `ctts` is what makes an mp4's samples arrive out of display order, and a
+    /// run it does not cover leaves those samples at their decode time.
+    #[test]
+    fn composition_times_add_the_ctts_delay() {
+        // 4 samples, 100 ticks each; the first two swapped by a 100/-100 pair.
+        let times = composition_times([(4u32, 100u32)], [(1u32, 100i32), (1, -100)]);
+        assert_eq!(times, vec![100, 0, 200, 300]);
+        assert_eq!(display_index(&times, 0), 1, "sample 1 is shown second");
+        assert_eq!(display_index(&times, 1), 0);
+        assert_eq!(display_index(&times, 3), 3);
+        assert_eq!(
+            composition_times([(2u32, 100u32)], []),
+            vec![0, 100],
+            "no ctts run at all leaves decode time standing"
+        );
+        assert_eq!(
+            composition_times([(2u32, 100u32)], [(9u32, 50i32)]),
+            vec![50, 150],
+            "a ctts run past the last sample does not panic"
+        );
     }
 
     /// The desync bug: NTSC rates must survive the sample table as themselves.
