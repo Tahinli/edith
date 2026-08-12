@@ -131,9 +131,18 @@ impl Player {
         &self,
         position: f64,
         state: Transport,
+        viewport_w: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = self.volume.muted;
+        // The room this strip actually has: the window less the two side
+        // panels. At the 640 px floor that is ~300 px, which the clock and the
+        // level together do not fit -- so the level's *bar* stands down (its
+        // button, its keys and its row on the actions card all remain), and
+        // the clock keeps a narrower rect rather than being pushed off.
+        let room = viewport_w - library_w(viewport_w) - inspector_w(viewport_w);
+        let clock_w = TIME_W.min(room - 140.).max(96.);
+        let slider = room >= TRANSPORT_ROOMY;
         div()
             .flex_none()
             .h(px(TRANSPORT_H))
@@ -160,7 +169,7 @@ impl Player {
             .child(
                 div()
                     .flex_none()
-                    .w(px(TIME_W))
+                    .w(px(clock_w))
                     .truncate()
                     .text_color(rgb(FG_PRIMARY))
                     .child(format!(
@@ -201,12 +210,14 @@ impl Player {
                 true => STATUS_WARNING,
                 false => FG_PRIMARY,
             }))
-            .child(volume_slider(
-                self.volume,
-                self.volume_bar.clone(),
-                self.enable(ActionId::ToggleMute, None).yes(),
-                cx,
-            ))
+            .when(slider, |d| {
+                d.child(volume_slider(
+                    self.volume,
+                    self.volume_bar.clone(),
+                    self.enable(ActionId::ToggleMute, None).yes(),
+                    cx,
+                ))
+            })
     }
 
     /// The edit toolbar, directly above the timeline it acts on: split, delete,
@@ -420,3 +431,7 @@ pub(crate) const ZOOM_SLOT_W: f32 = 76.;
 pub(crate) const VOLUME_SLOT_W: f32 = 76.;
 /// The HDR rendition's names are the longest words on any button here.
 pub(crate) const TONE_SLOT_W: f32 = 148.;
+
+/// The width the transport strip needs before the level's bar fits beside the
+/// clock: play + clock + the mute button + the bar, in their gaps.
+pub(crate) const TRANSPORT_ROOMY: f32 = 460.;

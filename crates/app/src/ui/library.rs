@@ -231,6 +231,11 @@ impl Player {
                             .flex_1()
                             .min_w(px(0.))
                             .flex()
+                            // Wraps rather than clipping: at the 640 px floor
+                            // this column is 128 px wide and the third tab
+                            // would hang off its edge, which is a control the
+                            // pointer cannot reach.
+                            .flex_wrap()
                             .gap(px(2.))
                             .children(LIBRARY_TABS.map(|tab| {
                                 let on = tab == self.library_tab;
@@ -264,9 +269,16 @@ impl Player {
                                     .child(tab.label())
                             })),
                     )
-                    .child(control(
+                    ,
+            )
+            .child(
+                div().flex_none().child(control(
                         "import",
-                        0.,
+                        // Full width of the column: the way media gets in is
+                        // the one affordance in this panel that is always
+                        // there, whatever tab is open and however narrow the
+                        // window is.
+                        width - 16.,
                         BG_RAISED,
                         None,
                         "Import",
