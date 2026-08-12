@@ -1708,7 +1708,12 @@ pub struct SliceHeader {
     /// num_entry_point_offsets + 1 subsets, with subset index values ranging
     /// from 0 to num_entry_point_offsets, inclusive. See the specification for
     /// more details.
-    pub entry_point_offset_minus1: [u32; 32],
+    ///
+    /// Sized by the stream, not by a guess: §7.4.7.1 bounds
+    /// `num_entry_point_offsets` by the picture's CTB grid, so a conformant
+    /// 2160p WPP stream writes up to PicHeightInCtbsY - 1 == 33 of these and a
+    /// tiled one many more. A fixed `[u32; 32]` here panicked on the 34th.
+    pub entry_point_offset_minus1: Vec<u32>,
     /// Same as NumPicTotalCurr in the specification.
     pub num_pic_total_curr: u32,
     // Size of slice_header() in bits.
@@ -1804,7 +1809,8 @@ impl<'a> Slice<'a> {
             let segment_address = self.header.segment_address;
 
             let offset_len_minus1 = self.header.offset_len_minus1;
-            let entry_point_offset_minus1 = self.header.entry_point_offset_minus1;
+            let entry_point_offset_minus1 =
+                std::mem::take(&mut self.header.entry_point_offset_minus1);
             let num_pic_total_curr = self.header.num_pic_total_curr;
             let header_bit_size = self.header.header_bit_size;
             let n_emulation_prevention_bytes = self.header.n_emulation_prevention_bytes;
@@ -2231,6 +2237,15 @@ impl Parser {
         };
 
         r.skip_bits(16)?; // vps_reserved_0xffff_16bits
+
+        // §7.4.3.1: 0..6. The three bits can say 7, and every sub-layer array
+        // below is 7 long -- refuse rather than index one out of bounds.
+        if vps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid vps_max_sub_layers_minus1 {}",
+                vps.max_sub_layers_minus1
+            ));
+        }
 
         let ptl = &mut vps.profile_tier_level;
         Self::parse_profile_tier_level(ptl, &mut r, true, vps.max_sub_layers_minus1)?;
@@ -3091,6 +3106,14 @@ impl Parser {
             ..Default::default()
         };
 
+        // §7.4.3.2.1: 0..6, and the sub-layer arrays below are 7 long.
+        if sps.max_sub_layers_minus1 > 6 {
+            return Err(format!(
+                "Invalid sps_max_sub_layers_minus1 {}",
+                sps.max_sub_layers_minus1
+            ));
+        }
+
         Self::parse_profile_tier_level(
             &mut sps.profile_tier_level,
             &mut r,
@@ -3466,8 +3489,16 @@ impl Parser {
 
         // A mix of the rbsp data and the algorithm in 6.5.1
         if pps.tiles_enabled_flag {
-            pps.num_tile_columns_minus1 = r.read_ue_max(sps.pic_width_in_ctbs_y - 1)?;
-            pps.num_tile_rows_minus1 = r.read_ue_max(sps.pic_height_in_ctbs_y - 1)?;
+            // §7.4.3.3.1 bounds these by the CTB grid, which at 4K is far more
+            // tiles than either these arrays or the VA-API picture parameter
+            // (`column_width_minus1[19]`, `row_height_minus1[21]`, the level-6
+            // tile limits) can hold. Refuse the stream instead of indexing past
+            // them -- a decode we could not have handed to the driver anyway.
+            let max_cols = pps.column_width_minus1.len() as u32 - 1;
+            let max_rows = pps.row_height_minus1.len() as u32 - 1;
+            pps.num_tile_columns_minus1 =
+                r.read_ue_max((sps.pic_width_in_ctbs_y - 1).min(max_cols))?;
+            pps.num_tile_rows_minus1 = r.read_ue_max((sps.pic_height_in_ctbs_y - 1).min(max_rows))?;
             pps.uniform_spacing_flag = r.read_bit()?;
             if !pps.uniform_spacing_flag {
                 pps.column_width_minus1[usize::from(pps.num_tile_columns_minus1)] =
@@ -3849,6 +3880,14 @@ impl Parser {
                     )?;
 
                     let num_lt = hdr.num_long_term_sps + hdr.num_long_term_pics;
+                    // §7.4.7.1 keeps the sum inside the DPB, so the 16-entry
+                    // arrays below hold every conformant stream; the two reads
+                    // above can each say more than that on their own.
+                    if usize::from(num_lt) > hdr.poc_lsb_lt.len() {
+                        return Err(format!(
+                            "Invalid num_long_term_sps + num_long_term_pics {num_lt}"
+                        ));
+                    }
                     for i in 0..usize::from(num_lt) {
                         // The variables `PocLsbLt[ i ]` and `UsedByCurrPicLt[ i ]` are derived as follows:
                         //
@@ -4081,9 +4120,10 @@ impl Parser {
             hdr.num_entry_point_offsets = r.read_ue_max(max)?;
             if hdr.num_entry_point_offsets > 0 {
                 hdr.offset_len_minus1 = r.read_ue_max(31)?;
-                for i in 0..hdr.num_entry_point_offsets as usize {
-                    let num_bits = usize::from(hdr.offset_len_minus1 + 1);
-                    hdr.entry_point_offset_minus1[i] = r.read_bits(num_bits)?;
+                let num_bits = usize::from(hdr.offset_len_minus1 + 1);
+                hdr.entry_point_offset_minus1.clear();
+                for _ in 0..hdr.num_entry_point_offsets {
+                    hdr.entry_point_offset_minus1.push(r.read_bits(num_bits)?);
                 }
             }
         }

@@ -18,7 +18,8 @@ use std::time::Instant;
 use engine::DecodeSession;
 use engine::colorspace::{ColorDescription, Matrix};
 use engine::convert::i420_to_bgra;
-use engine::demux::Demuxer;
+use engine::demux::{Codec, Demuxer};
+use engine::scratch::Scratch;
 use engine::hw::HwSession;
 use engine::tonemap::{ToneMapper, Transfer};
 
@@ -77,6 +78,57 @@ fn rejects_unopenable_files() {
         HwSession::open(Path::new("/etc/hostname")).is_none(),
         "not an mp4"
     );
+}
+
+/// 24 frames cut from a 2160p HDR remux that used to give a black picture and
+/// an instant `eof`: at 3840x2160 with CTB 64 the picture is 34 CTB rows, so
+/// wavefront slices carry `num_entry_point_offsets == 33` (§7.4.7.1 allows up
+/// to PicHeightInCtbsY - 1) and the vendored parser indexed a `[u32; 32]` with
+/// 32. Conformant stream, panicking parser -- caught at the plugin edge, which
+/// is exactly why it reached the user as a silent eof.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn hardware_decodes_4k_wavefront_slices() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_hevc_4k_wpp.mkv");
+    let mut hw = open_hw(&path);
+    let mut count = 0usize;
+    while let Some((_, _, _, w, h)) = hw.next_frame().expect("hardware decode") {
+        assert_eq!((w, h), (3840, 2160), "frame {count} dims");
+        count += 1;
+    }
+    assert!(count > 0, "4K wavefront stream decoded no pictures");
+}
+
+/// ...and the same file with its slice bytes scrambled -- a stream the plugin
+/// opens and then cannot decode a picture out of -- is refused at the door, in
+/// words that do not send the user installing a plugin they already have. The
+/// case this whole bug arrived as: never a black picture and a silent `eof`.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver"]
+fn an_undecodable_hevc_stream_is_refused_by_name() {
+    let good = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/test_hevc_4k_wpp.mkv"),
+    )
+    .expect("read the 4K fixture");
+    // Every SPS in it (`nal_unit_type` 33, so the two header bytes are 42 01)
+    // gets `sps_max_sub_layers_minus1 = 7`, which §7.4.3.2.1 does not allow and
+    // the parser now refuses instead of indexing a 7-long array with 7.
+    let mut broken = good.clone();
+    let mut patched = 0;
+    for i in 0..broken.len() - 2 {
+        if broken[i] == 0x42 && broken[i + 1] == 0x01 {
+            broken[i + 2] |= 0x0e;
+            patched += 1;
+        }
+    }
+    assert!(patched > 0, "no SPS found in the fixture");
+    let path = Scratch::file("undecodable_hevc", "mkv");
+    std::fs::write(&path, &broken).expect("write the broken copy");
+
+    let refused = DecodeSession::open(&path)
+        .expect_err("a stream with no decodable picture must not open")
+        .to_string();
+    assert_eq!(refused, Codec::Hevc.undecodable());
 }
 
 #[test]
