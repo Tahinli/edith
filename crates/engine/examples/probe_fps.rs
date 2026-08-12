@@ -2,11 +2,11 @@
 //! frame the master clock asks for ten minutes in -- the arithmetic behind A/V
 //! desync on NTSC-rate files, on a file too big to keep as a fixture.
 //!
-//! `cargo run --release -p engine --example probe_fps -- <file.mp4> [secs] [play]`
+//! `cargo run --release -p engine --example probe_fps -- <file> [secs] [play] [play_secs]`
 //!
-//! With `play` it also seeks there, plays two seconds against the real audio
-//! device and reports the skew between the picture on screen and the master
-//! clock -- the machine-checkable half of "lip sync holds".
+//! With `play` it also seeks there, plays `play_secs` (two by default) against the
+//! real audio device and reports the skew between the picture on screen and the
+//! master clock -- the machine-checkable half of "lip sync holds".
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -36,7 +36,34 @@ fn main() {
         secs * (meta.frame_rate - 23.0)
     );
     // Straight from the container, to show what the demuxer's frame 0 skipped.
-    let file = std::fs::File::open(&path).expect("open");
+    // mp4 only: a Matroska file has no `moov` and reading one out of it is a
+    // panic, which used to make this tool unusable on exactly the films in his
+    // library that the demuxer most needs checking against.
+    if !engine::demux::is_matroska(&path) {
+        mp4_boxes(&path);
+    }
+    match engine::AudioSession::open(&path) {
+        Ok(Some((audio, _))) => println!("  audio: {} Hz {} ch", audio.sample_rate, audio.channels),
+        Ok(None) => println!(
+            "  audio: none usable ({:?})",
+            engine::AudioSession::unsupported(&path)
+        ),
+        Err(e) => println!("  audio: refused ({e})"),
+    }
+
+    // `play [secs]`: how long to play for, two seconds by default.
+    if args.next().is_some_and(|a| a == *"play") {
+        let seconds = args
+            .next()
+            .and_then(|s| s.to_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(2.0);
+        play(&path, secs, meta.frame_rate, seconds);
+    }
+}
+
+/// The edit list and sample counts of an mp4, per track.
+fn mp4_boxes(path: &std::path::Path) {
+    let file = std::fs::File::open(path).expect("open");
     let size = file.metadata().expect("stat").len();
     let reader =
         mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size).expect("read header");
@@ -76,31 +103,19 @@ fn main() {
             track.sample_count(),
         );
     }
-    match engine::AudioSession::open(&path) {
-        Ok(Some((audio, _))) => println!("  audio: {} Hz {} ch", audio.sample_rate, audio.channels),
-        Ok(None) => println!(
-            "  audio: none usable ({:?})",
-            engine::AudioSession::unsupported(&path)
-        ),
-        Err(e) => println!("  audio: refused ({e})"),
-    }
-
-    if args.next().is_some_and(|a| a == *"play") {
-        play(&path, secs, meta.frame_rate);
-    }
 }
 
 /// Seeks in, plays two seconds against the real device, and reports where the
 /// picture stands against the master clock. The clock counts audio samples, so
 /// `frame / fps - clock` *is* the A/V skew: a truncated frame rate shows up
 /// here as tens of seconds of it, ten minutes in.
-fn play(path: &std::path::Path, secs: f64, fps: f64) {
+fn play(path: &std::path::Path, secs: f64, fps: f64, seconds: f64) {
     let mut session = engine::PlaybackSession::open(path).expect("open for playback");
     session.seek(secs);
     session.play();
     let mut last = None;
     let mut held: Option<u32> = None;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs_f64(seconds);
     while Instant::now() < deadline {
         session.tick();
         // The app's own drop-when-behind rule (`Player::pump`): show every frame
