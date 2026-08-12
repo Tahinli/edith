@@ -974,7 +974,7 @@ fn av1_color_config(b: &mut Bits, seq_profile: u32) -> Tags {
 mod tests {
     use super::*;
     use crate::demux::Demuxer;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1225,17 +1225,13 @@ mod tests {
 
     /// A real HDR film: BT.2020 non-constant-luminance, PQ, limited range, all
     /// three off the Matroska `Colour` element. Gated on the file being here --
-    /// it is a 25 GB download, not a fixture.
+    /// it is a 25 GB remux, not a fixture (`crate::real_library`).
     #[test]
     fn real_hdr_film_reads_bt2020_pq() {
-        let path = Path::new(
-            "/path/to/a-real-4k-hdr10-film.mkv",
-        );
-        if !path.exists() {
-            eprintln!("skipped: {} is not on this machine", path.display());
+        let Some(path) = crate::real_library::film("hevc_4k_hdr") else {
             return;
-        }
-        let (meta, _) = Demuxer::open(path).expect("open the HDR film");
+        };
+        let (meta, _) = Demuxer::open(&path).expect("open the HDR film");
         assert_eq!(
             meta.color,
             ColorDescription {
@@ -1251,14 +1247,10 @@ mod tests {
     /// HD material. Gated for the same reason as the one above.
     #[test]
     fn real_untagged_hd_film_reads_bt709() {
-        let path = Path::new(
-            "/path/to/a-real-h264-dual-audio-film.mkv",
-        );
-        if !path.exists() {
-            eprintln!("skipped: {} is not on this machine", path.display());
+        let Some(path) = crate::real_library::film("h264_dual_audio") else {
             return;
-        }
-        let (meta, _) = Demuxer::open(path).expect("open the untagged film");
+        };
+        let (meta, _) = Demuxer::open(&path).expect("open the untagged film");
         assert_eq!(
             meta.color,
             ColorDescription {
@@ -1575,14 +1567,10 @@ mod tests {
     /// 50/10000). Skipped, loudly, on a machine without the film.
     #[test]
     fn a_real_hdr_film_reports_the_peak_ffprobe_reports() {
-        let film = Path::new(
-            "/path/to/a-real-4k-hdr10-film.mkv",
-        );
-        if !film.exists() {
-            eprintln!("skipped: {} is not on this machine", film.display());
+        let Some(film) = crate::real_library::film("hevc_4k_hdr") else {
             return;
-        }
-        let (_, demuxer) = Demuxer::open(film).expect("open the film");
+        };
+        let (_, demuxer) = Demuxer::open(&film).expect("open the film");
         same_light(
             demuxer.light(),
             ContentLight {

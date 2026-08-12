@@ -10786,7 +10786,7 @@ fn open_ahead(
 /// Reads, off the UI thread, exactly what the import that follows is about to
 /// read. The container's header is read for the page cache and thrown away: a
 /// cold header walk of a 29 GB remux is 11 s and a warm one is 150 ms
-/// (measured, `a real 4K HEVC film` 2160p h265), so this call is the eleven
+/// (measured on a real 2160p h265 remux), so this call is the eleven
 /// seconds and [`Player::take_import`] is the hundred and fifty milliseconds.
 /// The window keeps painting through the eleven.
 ///
@@ -11713,7 +11713,7 @@ fn stream_detail(info: &StreamInfo) -> String {
 /// The marker costs the word "sound", the way the whole file's rate costs the
 /// word "total" above, and for the same reason. Measured in Noto Sans 11 px
 /// against the 186 px this value has beside a "Bitrate" label: "0.16 sound 1/2"
-/// wants 192 px on a small film's 4.7 Mb/s and 205 on the 39.8 Mb/s remux --
+/// wants 192 px on a 4.7 Mb/s film and 205 on the 39.8 Mb/s remux --
 /// the marker is what gets cut, which is the one part of the line that is new.
 /// Nothing that keeps the word fits the wide files -- the shortest, "snd 1/2",
 /// still wants 188 px on that remux -- so the word goes and the number keeps
@@ -18638,7 +18638,7 @@ mod tests {
             );
             // Both ends survive: the release's name at the front, the number
             // that tells them apart at the back.
-            assert!(clip_middle(a, width).starts_with('F'));
+            assert!(clip_middle(a, width).starts_with(&a[..2]));
             assert!(clip_middle(a, width).ends_with("01"));
             assert!(clip_middle(a, width).contains('…'));
             // Never wider than the column can hold, gap included.
@@ -19347,7 +19347,7 @@ mod tests {
     /// three lines the same line counts instead.
     #[test]
     fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
-        let film = "/films/a-real-h264-dual-audio-film.mkv";
+        let film = "/films/An Episode 01.mkv";
         let two = [
             sub(film, Some(1), "[ASS]"),
             sub(film, Some(2), "[ASS] [FOR DUB]"),

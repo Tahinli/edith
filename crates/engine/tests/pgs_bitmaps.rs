@@ -2,8 +2,8 @@
 //! the session lists the track, maps its cues onto the timeline and hands over
 //! the picture of one -- which is what the window draws over the film.
 //!
-//! Gated on the film being there: it is a 4K remux in a local folder and no
-//! fixture in this repository, so on a machine without it this says so and
+//! Gated on the film being there: it is a 4K remux named by the local
+//! `real_library.toml` and no fixture in this repository, so without it this says so and
 //! passes. What it guards is what a hand-made display set cannot -- that a real
 //! disc's blocks come whole out of the demuxer and decode, and that the map a
 //! repaint asks for is cheap enough to ask sixty times a second.
@@ -12,19 +12,15 @@
 //! cargo test -p engine --release --test pgs_bitmaps -- --nocapture
 //! ```
 
-use std::path::Path;
 use std::time::Instant;
-
-/// A remux with `S_TEXT/UTF8` + 4x `S_HDMV/PGS`.
-const FILM: &str = "/path/to/a-real-4k-pgs-film.mkv";
 
 #[test]
 fn the_session_maps_a_pgs_track_onto_the_timeline_and_draws_it() {
-    let film = Path::new(FILM);
-    if !film.exists() {
-        eprintln!("skipped: {FILM} is not on this machine");
+    // A remux with `S_TEXT/UTF8` + 4x `S_HDMV/PGS`.
+    let Some(film) = engine::real_library::film("hevc_4k_pgs") else {
         return;
-    }
+    };
+    let film = film.as_path();
     let opened = Instant::now();
     let mut session = engine::PlaybackSession::open(film).expect("the film opens");
     session.set_gain(0.0);

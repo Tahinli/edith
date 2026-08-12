@@ -904,8 +904,8 @@ mod tests {
     }
 
     /// The paid debt: the film's own declared peak is what the reference
-    /// rendition converts at. 1759 cd/m^2 is a real number -- the MaxCLL of the
-    /// HDR10 grade of *a real film*, which the container never says
+    /// rendition converts at. 1759 cd/m^2 is a real number -- the MaxCLL of a
+    /// real HDR10 grade, which the container never says
     /// and the HEVC SEI does -- and every anchor moves with it, downward,
     /// because a peak this far above the 1000 an undeclared file is assumed at
     /// is *headroom*: the same code is a smaller fraction of a brighter peak.

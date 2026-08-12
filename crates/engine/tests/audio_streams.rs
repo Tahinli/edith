@@ -240,14 +240,9 @@ fn flag_default_on_a_later_track_is_still_stream_0() {
 /// the second one has to play. Existence-gated -- it is not in the repo.
 #[test]
 fn a_real_dual_audio_remux_lists_both_tracks_and_plays_the_second() {
-    let path = PathBuf::from(
-        "/path/to/\
-a-real-h264-dual-audio-film.mkv",
-    );
-    if !path.exists() {
-        eprintln!("skipped: {} is not on this machine", path.display());
+    let Some(path) = engine::real_library::film("h264_dual_audio") else {
         return;
-    }
+    };
     let streams = AudioSession::probe_streams(&path).expect("probes");
     assert_eq!(streams.len(), 2, "two audio tracks: {streams:?}");
     for (index, info) in streams.iter().enumerate() {
