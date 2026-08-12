@@ -12,9 +12,12 @@
 //! this project exports one, and a file this cannot reopen is a file it had no
 //! business writing.
 
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 
 use mp4::{Mp4Reader, Mp4Track, TrackType};
 
@@ -767,6 +770,10 @@ struct Block {
 /// numbers; only what they read to do it differs.
 pub struct MkvDemuxer {
     file: File,
+    /// The file's own path, kept for one reason: the whole walk this falls back
+    /// to is cached beside the user's other caches, and a sidecar is named after
+    /// the file it indexes ([`mkv_blocks`]).
+    path: PathBuf,
     /// The blocks walked so far, which for a lazily indexed file is the window
     /// around what has been read and not the file: `blocks[i]` is the file's
     /// block `base + i`.
@@ -888,6 +895,7 @@ impl MkvDemuxer {
         };
         let mut mkv = Self {
             file,
+            path: path.to_path_buf(),
             blocks: Vec::new(),
             codec: video.codec,
             config: video.config,
@@ -1017,7 +1025,8 @@ impl MkvDemuxer {
         if self.complete {
             return Ok(());
         }
-        let (blocks, _, track_bytes) = mkv_blocks(&mut self.file, self.segment, self.number)?;
+        let (blocks, _, track_bytes) =
+            mkv_blocks(&self.path, &mut self.file, self.segment, self.number)?;
         self.frames = blocks.len();
         self.blocks = blocks;
         self.track_bytes = track_bytes;
@@ -1397,7 +1406,7 @@ impl MkvAudio {
         if let Unpack::Refused(why) = &unpack {
             return Err(why.clone().into());
         }
-        let (blocks, _, _) = mkv_blocks(&mut file, segment, number)?;
+        let (blocks, _, _) = mkv_blocks(path, &mut file, segment, number)?;
         if blocks.is_empty() {
             return Err("the AC-3 track in this Matroska file has no blocks".into());
         }
@@ -2356,11 +2365,34 @@ fn mkv_seek_position(
 /// Only element headers are read: a block's payload is seeked over and fetched
 /// later by [`MkvDemuxer::next_access_unit`], which is what keeps this an index
 /// pass rather than a read of the whole file.
-fn mkv_blocks(
-    file: &mut File,
-    segment: (u64, u64),
-    number: u64,
-) -> crate::Result<(Vec<Block>, Option<(i64, i64)>, Vec<(u64, u64)>)> {
+/// The walk itself is [`mkv_walk_blocks`]; this is the sidecar cache in front of
+/// it. What still reaches it is what the `Cues` cannot answer -- the sound
+/// track, which Matroska indexes not at all, and a picture whose index is absent
+/// or caught lying -- and those pay the whole walk on a file the user opens
+/// again and again. So the walk's answer is written beside the user's other
+/// caches and read back in milliseconds while the file it indexes is untouched.
+fn mkv_blocks(path: &Path, file: &mut File, segment: (u64, u64), number: u64) -> crate::Result<Index> {
+    let key = IndexKey::of(path, file, segment, number);
+    let at = key.as_ref().and_then(|key| key.sidecar());
+    if let Some((key, at)) = key.as_ref().zip(at.as_ref())
+        && let Some(index) = read_index(key, at)
+    {
+        return Ok(index);
+    }
+    let index = mkv_walk_blocks(file, segment, number)?;
+    if let Some((key, at)) = key.as_ref().zip(at.as_ref()) {
+        // A cache that cannot be written is a slow open, not a failed one.
+        let _ = write_index(key, at, &index);
+    }
+    Ok(index)
+}
+
+/// What one walk of the segment answers: the track's blocks, the span its
+/// timestamps cover, and every track's byte count. Named because it is also what
+/// the sidecar cache stores.
+type Index = (Vec<Block>, Option<(i64, i64)>, Vec<(u64, u64)>);
+
+fn mkv_walk_blocks(file: &mut File, segment: (u64, u64), number: u64) -> crate::Result<Index> {
     let mut blocks = Vec::new();
     // A file has a handful of tracks, so this is a shorter linear scan than a
     // hash would be a hash.
@@ -2507,6 +2539,244 @@ fn mkv_spread_laces(blocks: &mut [Block], laced: &[(usize, usize)]) {
         }
     }
 }
+
+/// Magic and format version of the sidecar index. The last byte is the version:
+/// bump it and every file an older build wrote is a miss, which is the whole
+/// migration story -- a sidecar is rewritten, never upgraded.
+///
+/// **Bump it whenever the walk's output changes.** The key below binds a sidecar
+/// to the *file* -- its bytes, its times, its track -- and to nothing about the
+/// code that wrote it, so a build whose blocks, timestamps or lace spreading
+/// differ from the one that filled this directory will believe every stale
+/// record in it. This byte is the only thing standing there, and it is bumped by
+/// hand.
+const INDEX_MAGIC: &[u8; 8] = b"EDMKVIX2";
+
+/// What a sidecar index is valid for and nothing else: the file it was walked
+/// from, down to the byte and the modification time, and the track it indexes.
+/// Every field is written into the sidecar and compared on the way back, so a
+/// re-encode, an append, a truncation or a hash collision on the file name are
+/// all one thing -- a miss, and the walk runs.
+struct IndexKey {
+    /// Canonical, so a symlink and its target share one entry rather than
+    /// walking the same bytes twice under two names.
+    path: PathBuf,
+    len: u64,
+    /// Seconds since the epoch and nanoseconds within it; the seconds are signed
+    /// because a file can be stamped before 1970 and that is not an error.
+    mtime: (i64, u32),
+    segment: (u64, u64),
+    number: u64,
+}
+
+impl IndexKey {
+    /// `None` when the file cannot be stat'd or the platform has no modification
+    /// time, which is a file that gets the walk every time rather than a cache
+    /// nothing can invalidate.
+    fn of(path: &Path, file: &File, segment: (u64, u64), number: u64) -> Option<Self> {
+        let meta = file.metadata().ok()?;
+        let mtime = match meta.modified().ok()?.duration_since(UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+            Err(e) => (
+                -(e.duration().as_secs() as i64),
+                e.duration().subsec_nanos(),
+            ),
+        };
+        Some(Self {
+            path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            len: meta.len(),
+            mtime,
+            segment,
+            number,
+        })
+    }
+
+    /// Where this key's sidecar lives. The name is the path's hash and the track
+    /// number, *not* the size or the time: an edited file overwrites its own
+    /// entry instead of leaving the old one behind, which is what keeps the
+    /// directory one file per track of every Matroska file ever opened.
+    ///
+    /// ponytail: nothing evicts. That is bounded (a few MB for a feature film's
+    /// picture track) and the directory is the user's own cache to delete, but a
+    /// size-capped LRU sweep at open is the upgrade path if it ever matters.
+    fn sidecar(&self) -> Option<PathBuf> {
+        let dir = index_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
+        Some(dir.join(format!(
+            "{:016x}-{}.idx",
+            fnv1a(self.path.as_os_str().as_encoded_bytes()),
+            self.number
+        )))
+    }
+}
+
+/// The path rule, with the environment handed in so it can be checked, as
+/// `keymap::config_path_in` is on the config side. An empty `XDG_CACHE_HOME` is
+/// one the spec says to ignore; with no `HOME` either there is nowhere to put a
+/// cache, and `None` -- always walk -- beats littering the working directory.
+fn index_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    xdg.filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .map(|dir| dir.join("edith").join("mkvindex"))
+}
+
+/// FNV-1a, 64-bit: what names a sidecar and what checks it. Not a cryptographic
+/// hash and not asked to be -- nothing here is adversarial. It is the guard that
+/// turns a half-written or scrambled file into a miss; a *name* collision is
+/// caught by the key inside the file, which is compared field by field.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A cursor over an encoded index. Every read is bounds-checked and hands back
+/// `None` past the end, so a truncated file runs out of bytes rather than off
+/// the end of one, and one `?` per field is the whole validation.
+struct Take<'a>(&'a [u8]);
+
+impl<'a> Take<'a> {
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.0.split_at_checked(n)?;
+        self.0 = rest;
+        Some(head)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.bytes(8)?.try_into().ok()?))
+    }
+
+    fn i64(&mut self) -> Option<i64> {
+        Some(i64::from_le_bytes(self.bytes(8)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.bytes(4)?.try_into().ok()?))
+    }
+}
+
+/// The index as bytes: the key first, then the walk's three answers. Little
+/// endian throughout and hand-rolled, because this tree carries no serializer
+/// and a flat record of fixed-width fields does not need one.
+fn encode_index(key: &IndexKey, index: &Index) -> Vec<u8> {
+    let (blocks, span, track_bytes) = index;
+    let path = key.path.as_os_str().as_encoded_bytes();
+    let mut out = Vec::with_capacity(80 + path.len() + blocks.len() * 25 + track_bytes.len() * 16);
+    out.extend_from_slice(&key.len.to_le_bytes());
+    out.extend_from_slice(&key.mtime.0.to_le_bytes());
+    out.extend_from_slice(&key.mtime.1.to_le_bytes());
+    out.extend_from_slice(&key.segment.0.to_le_bytes());
+    out.extend_from_slice(&key.segment.1.to_le_bytes());
+    out.extend_from_slice(&key.number.to_le_bytes());
+    out.extend_from_slice(&(path.len() as u64).to_le_bytes());
+    out.extend_from_slice(path);
+    // A `None` span is written at the same width as a present one, so the record
+    // stays a table of fixed-width fields.
+    out.push(u8::from(span.is_some()));
+    let (first, last) = span.unwrap_or((0, 0));
+    out.extend_from_slice(&first.to_le_bytes());
+    out.extend_from_slice(&last.to_le_bytes());
+    out.extend_from_slice(&(track_bytes.len() as u64).to_le_bytes());
+    for (number, bytes) in track_bytes {
+        out.extend_from_slice(&number.to_le_bytes());
+        out.extend_from_slice(&bytes.to_le_bytes());
+    }
+    out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+    for block in blocks {
+        out.extend_from_slice(&block.at.to_le_bytes());
+        out.extend_from_slice(&(block.len as u64).to_le_bytes());
+        out.extend_from_slice(&block.ts.to_le_bytes());
+        out.push(u8::from(block.key));
+    }
+    out
+}
+
+/// The sidecar at `at`, if it is this key's and intact. `None` for every other
+/// case there is -- absent, unreadable, another format version, a checksum that
+/// does not match, a key that does not, a record that ends early or one with
+/// bytes left over -- and every one of them means the same thing to the caller:
+/// walk the file and write this again.
+fn read_index(key: &IndexKey, at: &Path) -> Option<Index> {
+    let bytes = std::fs::read(at).ok()?;
+    let (head, body) = bytes.split_at_checked(16)?;
+    if &head[..8] != INDEX_MAGIC || u64::from_le_bytes(head[8..].try_into().ok()?) != fnv1a(body) {
+        return None;
+    }
+    let mut take = Take(body);
+    if take.u64()? != key.len
+        || take.i64()? != key.mtime.0
+        || take.u32()? != key.mtime.1
+        || take.u64()? != key.segment.0
+        || take.u64()? != key.segment.1
+        || take.u64()? != key.number
+    {
+        return None;
+    }
+    let path_len = usize::try_from(take.u64()?).ok()?;
+    if take.bytes(path_len)? != key.path.as_os_str().as_encoded_bytes() {
+        return None;
+    }
+    let present = take.bytes(1)?[0] != 0;
+    let (first, last) = (take.i64()?, take.i64()?);
+    let span = present.then_some((first, last));
+    let count = usize::try_from(take.u64()?).ok()?;
+    // Capacity is what the bytes left can actually hold, never what the record
+    // claims: the checksum has already passed, but a count is not a promise.
+    let mut track_bytes = Vec::with_capacity(count.min(take.0.len() / 16));
+    for _ in 0..count {
+        track_bytes.push((take.u64()?, take.u64()?));
+    }
+    let count = usize::try_from(take.u64()?).ok()?;
+    let mut blocks = Vec::with_capacity(count.min(take.0.len() / 25));
+    for _ in 0..count {
+        blocks.push(Block {
+            at: take.u64()?,
+            len: usize::try_from(take.u64()?).ok()?,
+            ts: take.i64()?,
+            key: take.bytes(1)?[0] != 0,
+        });
+    }
+    take.0.is_empty().then_some((blocks, span, track_bytes))
+}
+
+/// Writes the sidecar, atomically: a temporary file of its own, fsynced, then
+/// renamed over the name readers look under. A reader therefore sees the whole
+/// index or no index -- never a half-written one, which the checksum would catch
+/// anyway but only after the bytes were read.
+fn write_index(key: &IndexKey, at: &Path, index: &Index) -> std::io::Result<()> {
+    let dir = at
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a sidecar path with no directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let body = encode_index(key, index);
+    // Per process *and* per call: the picture and the sound of one file are
+    // opened by different threads, and two writers must not share a part file.
+    static NTH: AtomicU64 = AtomicU64::new(0);
+    let part = dir.join(format!(
+        "{}.{}.part",
+        std::process::id(),
+        NTH.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = File::create(&part)
+        .and_then(|mut f| {
+            f.write_all(INDEX_MAGIC)?;
+            f.write_all(&fnv1a(&body).to_le_bytes())?;
+            f.write_all(&body)?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&part, at));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
 
 /// The frames inside a laced block: one `(offset, length)` each, in order.
 ///
@@ -3455,7 +3725,7 @@ mod tests {
             cued += usize::from(!lazy.complete);
             // The walk, built beside it out of the same file.
             let mut file = File::open(&path).expect(&name);
-            let (walk, _, _) = mkv_blocks(&mut file, lazy.segment, lazy.number).expect(&name);
+            let (walk, _, _) = mkv_walk_blocks(&mut file, lazy.segment, lazy.number).expect(&name);
 
             assert_eq!(
                 meta.frame_count as usize,
@@ -3626,6 +3896,154 @@ mod tests {
         }
         None
     }
+
+    /// The sidecar index, against the walk it stands in for: what comes back out
+    /// is the walk's own answer block for block, and every way a sidecar can be
+    /// wrong is a miss rather than a wrong answer.
+    ///
+    /// The cache path itself is handed in here rather than taken from the
+    /// environment, which is what lets a truncation and a flipped byte be tested
+    /// at all; the end-to-end half below drives [`mkv_blocks`] and therefore the
+    /// real cache directory.
+    /// The fixture always, plus every path in `VE_INDEX_FILES` (`:`-separated),
+    /// which is how this is pointed at the multi-GB films it really has to hold
+    /// for without naming one of them in the tree.
+    #[test]
+    fn a_cached_block_index_is_the_walk_it_replaces() {
+        let fixture =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/test_h264.mkv");
+        index_round_trip(&fixture);
+        for path in std::env::var("VE_INDEX_FILES")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|p| !p.is_empty())
+        {
+            index_round_trip(Path::new(path));
+        }
+    }
+
+    fn index_round_trip(path: &Path) {
+        let mut file = File::open(path).expect("the file under test");
+        let end = file.metadata().expect("stat").len();
+        let segment = mkv_segment(&mut file, end).expect("segment");
+        let number = mkv_tracks(&mut file, segment)
+            .expect("tracks")
+            .0
+            .expect("a video track")
+            .number;
+        let walked = mkv_walk_blocks(&mut file, segment, number).expect("walk");
+        assert!(walked.0.len() > 1, "a file with blocks to index");
+
+        let key = IndexKey::of(path, &file, segment, number).expect("a key off the open file");
+        let at = crate::scratch::Scratch::file("ve_mkvindex", "idx");
+        assert!(read_index(&key, &at).is_none(), "nothing written yet");
+        write_index(&key, &at, &walked).expect("write the sidecar");
+        let cached = read_index(&key, &at).expect("read it back");
+        assert_eq!(cached.0, walked.0, "block for block, byte for byte");
+        assert_eq!(cached.1, walked.1, "the same timestamp span");
+        assert_eq!(cached.2, walked.2, "the same per-track byte counts");
+
+        // Every shape of a stale key: a file that grew, one re-encoded in place,
+        // and the other track of the same file.
+        for stale in [
+            IndexKey {
+                len: key.len + 1,
+                ..key_of(&key)
+            },
+            IndexKey {
+                mtime: (key.mtime.0 + 1, key.mtime.1),
+                ..key_of(&key)
+            },
+            IndexKey {
+                number: key.number + 1,
+                ..key_of(&key)
+            },
+            IndexKey {
+                path: key.path.with_extension("other"),
+                ..key_of(&key)
+            },
+        ] {
+            assert!(
+                read_index(&stale, &at).is_none(),
+                "a key that does not match is a miss, not a wrong index"
+            );
+        }
+
+        // ...and every shape of a damaged file. A flipped byte anywhere fails the
+        // checksum; a truncation runs out of bytes; extra bytes are a record this
+        // does not understand.
+        let good = std::fs::read(&at).expect("the sidecar");
+        for (why, bytes) in [
+            ("a flipped byte in the payload", {
+                let mut b = good.clone();
+                let last = b.len() - 1;
+                b[last] ^= 0x01;
+                b
+            }),
+            ("a flipped byte in the key", {
+                let mut b = good.clone();
+                b[20] ^= 0x80;
+                b
+            }),
+            ("another format version", {
+                let mut b = good.clone();
+                b[7] = b'0';
+                b
+            }),
+            ("a truncated file", good[..good.len() / 2].to_vec()),
+            ("an empty file", Vec::new()),
+            ("bytes left over", [good.clone(), vec![0u8; 4]].concat()),
+        ] {
+            std::fs::write(&at, &bytes).expect("write the damaged sidecar");
+            assert!(read_index(&key, &at).is_none(), "{why} is a miss");
+        }
+
+        // End to end, through the wrapper the demuxer calls and the real cache
+        // directory: the first open writes the sidecar, the second reads it, and
+        // neither may differ from the walk.
+        for round in 0..2 {
+            let (blocks, span, track_bytes) =
+                mkv_blocks(path, &mut file, segment, number).expect("cached open");
+            assert_eq!(blocks, walked.0, "round {round}");
+            assert_eq!(span, walked.1, "round {round}");
+            assert_eq!(track_bytes, walked.2, "round {round}");
+        }
+    }
+
+    /// `IndexKey` is not `Clone` -- nothing in the demuxer needs it to be, and a
+    /// test wanting four variants of one key is not a reason to widen it.
+    fn key_of(key: &IndexKey) -> IndexKey {
+        IndexKey {
+            path: key.path.clone(),
+            len: key.len,
+            mtime: key.mtime,
+            segment: key.segment,
+            number: key.number,
+        }
+    }
+
+    /// Where a sidecar goes, by the same rule the config file follows: the
+    /// desktop's cache directory, `~/.cache` when it names none, and nowhere at
+    /// all rather than the working directory when there is no home either.
+    #[test]
+    fn the_index_directory_follows_xdg() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            index_dir(xdg.map(OsString::from), home.map(OsString::from))
+        };
+        assert_eq!(
+            dir(Some("/x/cache"), Some("/home/u")),
+            Some(PathBuf::from("/x/cache/edith/mkvindex"))
+        );
+        // An empty XDG_CACHE_HOME is one the spec says to ignore.
+        assert_eq!(
+            dir(Some(""), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.cache/edith/mkvindex"))
+        );
+        assert!(dir(None, Some("/home/u")).expect("a home").is_absolute());
+        assert_eq!(dir(None, None), None, "no home, no cache -- walk instead");
+        assert_eq!(dir(Some(""), Some("")), None);
+    }
+
 
     /// What a `TrackEntry` states it is in, whichever of the two elements it
     /// states it in -- [`mkv_language`]'s whole rule, as asserts.
