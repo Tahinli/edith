@@ -473,7 +473,7 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY))
-                                .child(match (&self.mbps_edit, &self.notice) {
+                                .child(match (&self.mbps_edit, self.notices.front()) {
                                     // A field being typed into says so here as
                                     // well as in its row: this line is outside
                                     // the scrolling list and on screen at every
@@ -775,7 +775,7 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY))
-                                .child(self.notice.clone().unwrap_or_else(|| {
+                                .child(self.notices.front().cloned().unwrap_or_else(|| {
                                     "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
                                 })),
                         )

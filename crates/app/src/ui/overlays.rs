@@ -113,17 +113,27 @@ impl Player {
     /// now on disk, so the same click that retires it shows that file in the
     /// desktop's file manager.
     pub(crate) fn notice_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let notice = self.notice.clone()?;
+        let notice = self.notices.front().cloned()?;
         // The path travels with the text it was written for: a later notice
         // holds the bar and the click is a plain dismissal again.
         let exported = self
             .exported
             .clone()
             .filter(|_| notice.starts_with(EXPORT_DONE));
-        let hint = match exported {
-            Some(_) => "click — open file location",
-            None => "click or press any key to dismiss",
+        // How many are waiting behind this one, said out loud: a queue nobody is
+        // told about is a queue whose second message reads as the first one
+        // failing to go away.
+        let behind = self.notices.len() - 1;
+        let hint = match (exported.is_some(), behind) {
+            (true, _) => "click — open file location".to_string(),
+            (false, 0) => "click or press any key to dismiss".to_string(),
+            (false, 1) => "click or press any key — 1 more message behind this".to_string(),
+            (false, n) => format!("click or press any key — {n} more messages behind this"),
         };
+        // What the message *is*, by colour, before it is read: the words the
+        // editor shouts a failure in are the ones it opens with, so the bar can
+        // colour itself off the same text every one of them already carries.
+        let tone = notice_tone(&notice);
         Some(
             div()
                 .id("notice")
@@ -142,6 +152,11 @@ impl Player {
                 .px(px(12.))
                 .py(px(6.))
                 .bg(rgb(BG_RAISED))
+                // The tone is a stripe down the leading edge rather than the
+                // whole bar's colour: a full red bar at every refusal is an
+                // alarm, and most of these are answers.
+                .border_l(px(3.))
+                .border_color(rgb(tone))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(BG_HOVER)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -152,7 +167,7 @@ impl Player {
                             .spawn(async move { show_in_file_manager(&path) })
                             .detach();
                     }
-                    this.notice = None;
+                    this.dismiss_notice();
                     cx.notify();
                 }))
                 .child(div().flex_1().min_w(px(0.)).child(notice))
@@ -371,8 +386,9 @@ impl Player {
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY))
                                 .child(
-                                    self.notice
-                                        .clone()
+                                    self.notices
+                                        .front()
+                                        .cloned()
                                         .unwrap_or_else(|| {
                                             "click an action to do it · click its key to change it"
                                                 .into()
