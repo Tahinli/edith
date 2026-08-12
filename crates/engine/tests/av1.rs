@@ -26,6 +26,9 @@ use engine::{AudioSession, DecodeSession, PlaybackSession, Project};
 /// 1280x720@30, 2 s, keyframes 30 apart -- see `scripts/gen_fixtures.sh`.
 const FRAMES: u32 = 60;
 const KEYFRAME: u32 = 30;
+/// The film grain twin is 3 s of the same shape, for the reason its own test
+/// gives.
+const GRAIN_FRAMES: u32 = 90;
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -206,6 +209,62 @@ fn the_plugin_decodes_every_av1_frame() {
     assert!(
         first.chunks_exact(4).any(|px| px != &first[..4]),
         "frame 0 is a single colour -- no picture was decoded"
+    );
+}
+
+/// The picture's flattest 8x8 block, as a standard deviation of its green
+/// channel: 0 where the decoder handed back a smooth picture, well above it
+/// where every pixel carries synthesized grain.
+fn flattest_block(bgra: &[u8], width: u32, height: u32) -> f64 {
+    let (w, h) = (width as usize, height as usize);
+    let mut flattest = f64::MAX;
+    for y in (0..h - 8).step_by(8) {
+        for x in (0..w - 8).step_by(8) {
+            let block = (0..8).flat_map(|dy| {
+                (0..8).map(move |dx| f64::from(bgra[((y + dy) * w + x + dx) * 4 + 1]))
+            });
+            let values: Vec<f64> = block.collect();
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let var =
+                values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64;
+            flattest = flattest.min(var.sqrt());
+        }
+    }
+    flattest
+}
+
+/// The defect none of the fixtures above could see: an AV1 frame that asks for
+/// film grain is *displayed* from a second surface, which the driver
+/// synthesizes the grain into and which the decoder has to give it. Handing it
+/// none gets the picture refused outright -- radeonsi answers `vaEndPicture`
+/// with VA_STATUS_ERROR_INVALID_SURFACE -- and that killed a real 1080p AV1
+/// film at frame 49, the first of its pictures with `apply_grain` set. Every
+/// fixture beside this one is grainless, and every one of them passed.
+///
+/// Ninety frames, all of them: a grainy picture costs two pool buffers rather
+/// than one, so this turns the pool over several times and cycles the eight
+/// reference slots -- decoding "the first handful" is exactly what let the
+/// defect live.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with AV1 decode"]
+fn a_film_grain_av1_file_decodes_whole_and_keeps_its_grain() {
+    let (meta, frames) =
+        DecodeSession::open(asset("test_av1_grain.mkv")).expect("open test_av1_grain.mkv");
+    assert_eq!(meta.codec, Codec::Av1);
+    let frames: Vec<_> = frames.into_iter().collect();
+    assert_eq!(frames.len() as u32, GRAIN_FRAMES, "every frame decoded");
+
+    // ...and the grain is *in* the picture, which is the half "it did not fail"
+    // cannot say: telling the driver `apply_grain = 0` also makes every frame
+    // decode, and silently strips the film of the texture it was graded with.
+    // Grain is noise on every pixel, so no block of a grainy picture is flat;
+    // this source has plenty of flat ones without it (measured on the fixture:
+    // 0.00 with the grain off, 1.58 with it on).
+    let frame = &frames[GRAIN_FRAMES as usize - 30];
+    let flattest = flattest_block(&frame.bgra, frame.width, frame.height);
+    assert!(
+        flattest > 0.5,
+        "the grain never reached the picture: flattest 8x8 block deviation {flattest:.3}"
     );
 }
 

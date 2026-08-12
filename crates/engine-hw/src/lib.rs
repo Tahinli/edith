@@ -379,7 +379,11 @@ impl Session {
         let _ = DecodedHandle::sync(&handle);
         let borrowed = handle.borrow();
         let size = (w as u32, h as u32);
-        let image = Image::create_from(borrowed.surface(), self.nv12_format, size, size)
+        // The *display* surface, which is the reconstructed picture for every
+        // codec here but the second, grain-synthesized one for an AV1 frame that
+        // asks for film grain -- reading the reconstructed surface of such a
+        // frame would show the film with its grain stripped off.
+        let image = Image::create_from(borrowed.display_surface(), self.nv12_format, size, size)
             .expect("vaGetImage failed");
         let va = *image.image();
         let data: &[u8] = image.as_ref();
