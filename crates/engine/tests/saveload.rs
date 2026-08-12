@@ -79,11 +79,13 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     let other = copy_in(&dir, "test_multiaudio.mp4");
     let mut session = PlaybackSession::open(&other).expect("open the fixture");
     session.set_gain(0.0);
+    // Its rate would be conformed now; its *layout* is what one output device
+    // cannot have two of, and the refusal says which.
     let err = session
         .place_stream_at(0.0, &other, 1, None)
-        .expect_err("22.05 kHz mono cannot join a 44.1 kHz stereo timeline")
+        .expect_err("a mono stream cannot join a stereo timeline")
         .to_string();
-    assert!(err.contains("22050"), "unhelpful refusal: {err}");
+    assert_eq!(err, "audio 1 ch does not match the timeline's 2 ch");
     assert!(
         session
             .place_stream_at(0.0, &media, 1, None)
@@ -742,15 +744,16 @@ fn a_source_that_no_longer_matches_the_timeline_is_refused_in_import_words() {
         .expect("a source that stopped matching must not open")
         .to_string();
     // The suffix is `import`'s own refusal, word for word. The substitute is
-    // mono, which is the shape of what is left: one output device means one
-    // rate and one layout. A resolution of its own is placed on the project
-    // canvas, a rate of its own is read through `Rate`, a codec of its own
-    // opens its own decoder and a file with no sound plays silence -- none of
-    // those is a refusal any more.
+    // mono, which is the shape of what is left: one output device carries one
+    // layout. A resolution of its own is placed on the project canvas, a frame
+    // rate of its own is read through `Rate`, a *sample* rate of its own is
+    // resampled at the decoder's door, a codec of its own opens its own decoder
+    // and a file with no sound plays silence -- none of those is a refusal any
+    // more.
     assert_eq!(
         err,
         format!(
-            "source {}: audio 44100 Hz 1 ch does not match the timeline's 44100 Hz 2 ch",
+            "source {}: audio 1 ch does not match the timeline's 2 ch",
             dir.join("test_av2.mp4").display()
         )
     );

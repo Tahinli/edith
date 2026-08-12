@@ -133,12 +133,14 @@ pub struct AacPacket {
 }
 
 /// Everything an import check needs from a candidate file's audio track. Two
-/// files may share a timeline only when their probes are equal (or both `None`).
+/// files may share a timeline when their layouts agree (or both are `None`).
 ///
-/// Rate and layout only: those are what one output device and one exported track
-/// can carry, and an mp3 that agrees on both may join a timeline of mp4s even
-/// though nothing about it can be *copied* into an export -- that is a separate
-/// refusal, at export time, in [`AudioSession::copy_multi_segments`].
+/// Rate and layout, of which only the **layout** is held to the timeline's: one
+/// output device and one exported track carry one width, while a rate of its own
+/// is resampled at the decoder's door ([`Resample`]). An mp3 that agrees on the
+/// layout may join a timeline of mp4s even though nothing about it can be
+/// *copied* into an export -- that is a separate refusal, at export time, in
+/// [`AudioSession::copy_multi_segments`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioProbe {
     pub sample_rate: u32,
@@ -167,9 +169,9 @@ pub struct StreamInfo {
     pub sample_rate: u32,
     /// ISO-639-2 from the mdhd, `None` for the `und` most muxers write.
     pub lang: Option<String>,
-    /// Whether opening this stream would decode: AAC-LC, mono or stereo. The
-    /// grey-out rule, mirroring the refusals `Track::open` and `Track::channels`
-    /// make one file at a time.
+    /// Whether opening this stream would decode -- a codec question only now
+    /// that no width is refused. The grey-out rule, mirroring what `Track::open`
+    /// answers one file at a time.
     pub decodable: bool,
 }
 
@@ -291,8 +293,9 @@ impl AudioSession {
     ///
     /// Only the sources some segment names are opened. `Ok(None)` when `sources`
     /// is empty or its first entry has no AAC track; a later source that
-    /// disagrees on rate/layout is an `Err` — import refuses those up front (one
-    /// timeline, one output device), this is the backstop.
+    /// disagrees on *layout* is an `Err` — import refuses those up front (one
+    /// timeline, one output device), this is the backstop. A source at another
+    /// sample rate is not one of those: it is resampled, per segment.
     pub fn open_multi_segments(
         sources: &[PathBuf],
         segs: &[(Option<usize>, f64, f64)],
@@ -372,7 +375,7 @@ impl AudioSession {
         // match it, and the checks below hold them to that.
         let meta = AudioMeta {
             sample_rate: first.sample_rate(),
-            channels: first.channels()?,
+            channels: first.channels(),
             total_samples: first.total_samples(),
         };
         // Built here only so an undecodable stream is an `Err` from the opener
@@ -407,12 +410,16 @@ impl AudioSession {
                 silent[source] = true;
                 continue;
             };
-            if (track.sample_rate(), track.channels()?) != (meta.sample_rate, meta.channels) {
+            // The *rate* is no longer held to the timeline's: a source written at
+            // another one is read through its segment's [`Resample`] below, the
+            // very interpolator a speeded clip already goes through, so it plays
+            // at the pitch it was recorded at over the seconds it was placed for.
+            // The layout still is -- one output device carries one width, and
+            // everything wider than a pair is already folded to one.
+            if track.channels() != meta.channels {
                 return Err(format!(
-                    "source {source} is {} Hz {} ch, the timeline is {} Hz {} ch",
-                    track.sample_rate(),
-                    track.channels()?,
-                    meta.sample_rate,
+                    "source {source} is {} ch, the timeline is {} ch",
+                    track.channels(),
                     meta.channels
                 )
                 .into());
@@ -437,9 +444,15 @@ impl AudioSession {
         // Chunk numbering is continuous across every join, counted from the first
         // segment's audible start in its own source (see `open_segments`).
         let timeline = segments.first().map_or(0, |s| match s.source {
-            Some(source) => s
-                .media_target
-                .saturating_sub(tracks[source].as_ref().expect("opened above").priming()),
+            Some(source) => {
+                let track = tracks[source].as_ref().expect("opened above");
+                // ...in *timeline* frames, which is not the source's own count
+                // when it was written at another rate. Integer, so the equal-rate
+                // case -- every project before this -- is the number it always was.
+                let at = s.media_target.saturating_sub(track.priming());
+                at.saturating_mul(u64::from(meta.sample_rate))
+                    / u64::from(track.sample_rate().max(1))
+            }
             None => 0,
         });
 
@@ -460,20 +473,41 @@ impl AudioSession {
             })
             .collect();
 
-        // One resampler per speeded segment, built where the sample rate is
-        // known: what the timeline owes it is seconds there and frames here.
+        // One resampler per segment that needs one, built where the sample rate
+        // is known: what the timeline owes it is seconds there and frames here.
+        //
+        // Two things ask for one and they compose into a single step: the clip's
+        // own speed, and a source written at a rate other than the timeline's --
+        // the ratio of the two rates is exactly a speed, and reading the samples
+        // at it is what keeps a 48 kHz file's pitch on a 44.1 kHz timeline. A
+        // segment with neither has no resampler at all and reaches the mixer
+        // with the decoder's own samples, byte for byte, as it always did.
         let speeds: Vec<Option<Resample>> = segments
             .iter()
+            .zip(segs)
             .enumerate()
-            .map(|(i, _)| {
-                speeds.get(i).and_then(Option::as_ref).map(|s| {
-                    Resample::new(
-                        s.step,
-                        (s.timeline_secs * f64::from(meta.sample_rate))
-                            .round()
-                            .max(0.) as u64,
-                    )
-                })
+            .map(|(i, (seg, &(_, start_secs, end_secs)))| {
+                let rate = seg
+                    .source
+                    .and_then(|source| tracks[source].as_ref())
+                    .map_or(meta.sample_rate, Track::sample_rate);
+                let ratio = f64::from(rate) / f64::from(meta.sample_rate.max(1));
+                let stretch = speeds.get(i).and_then(Option::as_ref);
+                if stretch.is_none() && rate == meta.sample_rate {
+                    return None;
+                }
+                // A speeded clip states the timeline it owes; a plain one owes
+                // the window it was placed for, and an open-ended window owes
+                // whatever its source has ([`Resample::UNBOUNDED`]).
+                let secs = stretch.map_or(end_secs - start_secs, |s| s.timeline_secs);
+                let owed = match (secs * f64::from(meta.sample_rate)).round() {
+                    frames if frames.is_finite() && frames >= 0.0 => {
+                        (frames as u64).min(Resample::UNBOUNDED - 1)
+                    }
+                    frames if frames > 0.0 => Resample::UNBOUNDED,
+                    _ => 0,
+                };
+                Some(Resample::new(stretch.map_or(1.0, |s| s.step) * ratio, owed))
             })
             .collect();
 
@@ -741,7 +775,7 @@ impl AudioSession {
         };
         Ok(Some(AudioProbe {
             sample_rate: track.sample_rate(),
-            channels: track.channels()?,
+            channels: track.channels(),
         }))
     }
 
@@ -807,8 +841,11 @@ impl AudioSession {
                     ),
                     lang: (entry.language != "und" && !entry.language.is_empty())
                         .then(|| entry.language.clone()),
-                    decodable: matches!(channels, 1 | 2)
-                        && (ac3.is_some() || sym.is_some_and(|t| t.decoder().is_ok())),
+                    // No width gate any more: `channels` is what reaches the
+                    // timeline, which [`downmix`] makes a pair out of whatever
+                    // the file carries. What greys a row out is a codec nothing
+                    // here decodes, and nothing else.
+                    decodable: ac3.is_some() || sym.is_some_and(|t| t.decoder().is_ok()),
                 });
             }
             return Ok(streams);
@@ -823,7 +860,7 @@ impl AudioSession {
                 // Neither the mp3 nor the wav headers carry an ISO-639 tag the
                 // way an mdhd does, and a lone track needs no telling apart.
                 lang: None,
-                decodable: matches!(track.channels, 1 | 2) && track.decoder().is_ok(),
+                decodable: track.decoder().is_ok(),
             }]);
         }
         let file = File::open(path)?;
@@ -862,13 +899,17 @@ impl AudioSession {
                         |t| t.sample_rate,
                     ),
                     lang: (!lang.is_empty() && lang != "und").then(|| lang.to_string()),
-                    decodable: ac3.as_ref().is_some_and(|t| matches!(t.channels, 1 | 2))
+                    // The profile still gates -- the writer rebuilds an
+                    // AudioSpecificConfig and calls it LC -- but the layout no
+                    // longer does: a 5.1 or 7.1 AAC track decodes through
+                    // `rusty_aac` and folds to the pair the timeline carries
+                    // ([`aac_decoder`]).
+                    decodable: ac3.is_some()
                         || aac
-                        && matches!(track.audio_profile(), Ok(AudioObjectType::AacLowComplexity))
-                        && matches!(
-                            track.channel_config(),
-                            Ok(ChannelConfig::Mono | ChannelConfig::Stereo)
-                        ),
+                            && matches!(
+                                track.audio_profile(),
+                                Ok(AudioObjectType::AacLowComplexity)
+                            ),
                 }
             })
             .collect())
@@ -1266,26 +1307,20 @@ impl Track {
         }
     }
 
-    /// Mono or stereo; anything wider is refused here rather than one packet at
-    /// a time, because one output device and one copied track is all there is.
-    fn channels(&self) -> crate::Result<u16> {
+    /// What this track hands the timeline: mono, or stereo for everything else.
+    /// Nothing is refused for its width any more -- a layout wider than a pair
+    /// is folded to one at the decoder's door ([`downmix`]), because one output
+    /// device is all there is, not because the file is unreadable.
+    fn channels(&self) -> u16 {
         match self {
             Self::Aac(t) => t.channels(),
-            // Already downmixed: `channels` is what comes *out* of the decoder,
-            // which is 2 for everything from mono to 5.1 (see [`Ac3Track`]).
-            Self::Ac3(t) => match t.channels {
-                1 | 2 => Ok(t.channels),
-                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
-            },
+            // Already downmixed by the AC-3 decoder itself; `channels` is what
+            // comes *out* of it, and the 2.1 passthrough it leaves at 3 (see
+            // [`Ac3Track`]) is folded by [`decode_ac3`] like any other width.
+            Self::Ac3(t) => t.channels.min(2),
             // Downmixed by the very same decoder, out of a Matroska file.
-            Self::Mkv(t) => match t.channels {
-                1 | 2 => Ok(t.channels),
-                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
-            },
-            Self::Sym(t) => match t.channels {
-                1 | 2 => Ok(t.channels),
-                n => Err(format!("unsupported channel layout: {n} channels (max stereo)").into()),
-            },
+            Self::Mkv(t) => t.channels.min(2),
+            Self::Sym(t) => t.channels,
         }
     }
 
@@ -1336,7 +1371,7 @@ impl Track {
     fn check_decoder(&self) -> crate::Result<()> {
         match self {
             Self::Aac(t) => {
-                AacDecoder::try_new(&t.params, &AudioDecoderOptions::default())?;
+                aac_decoder(&t.params, t.source_channels())?;
             }
             Self::Ac3(t) => {
                 ac3_decoder("ac3", t.requested)?;
@@ -1363,9 +1398,9 @@ struct SymTrack {
     path: PathBuf,
     track_id: u32,
     sample_rate: u32,
-    /// What reaches the timeline: the file's own layout, or 2 for a 5.1 track,
-    /// which is folded down by [`SymDecoder`] exactly as the AC-3 reader's
-    /// decoder folds its own.
+    /// What reaches the timeline: the file's own layout, or 2 for anything
+    /// wider, which is folded down by [`SymDecoder`] exactly as the AC-3
+    /// reader's decoder folds its own.
     channels: u16,
     /// What the decoder emits, which is what the fold reads.
     source_channels: u16,
@@ -1463,10 +1498,10 @@ impl SymTrack {
             path: path.to_path_buf(),
             track_id,
             sample_rate,
-            // 5.1 arrives as a stereo source, whatever it was stored as; every
-            // other layout is passed through and refused above stereo by
-            // [`Track::channels`], where it always was.
-            channels: if channels == 6 { 2 } else { channels },
+            // Anything wider than a pair arrives as a stereo source, whatever it
+            // was stored as: 5.1, 7.1 and everything between are folded by
+            // [`downmix`] at the decoder's door ([`SymDecoder`]).
+            channels: channels.min(2),
             source_channels: channels,
             total_samples: num_frames.map(|n| n.saturating_sub(priming)),
             priming,
@@ -1488,34 +1523,27 @@ impl SymTrack {
     ///
     /// Which decoder is not the caller's business, and it is not always
     /// symphonia's: its AAC decoder refuses anything wider than stereo outright
-    /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 track
-    /// of a film in an mkv, so that one goes to `rusty_aac` instead, and it has
-    /// no Opus decoder at all, so that one goes to `ruopus`.
+    /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 and
+    /// 7.1 tracks of a film, so those go to `rusty_aac` instead
+    /// ([`aac_decoder`]), and it has no Opus decoder at all, so that one goes to
+    /// `ruopus`.
     fn decoder(&self) -> crate::Result<SymDecoder> {
-        let fold = self.source_channels != self.channels;
+        let from = usize::from(self.source_channels);
         if self.params.codec == CODEC_ID_OPUS {
-            let channels = usize::from(self.source_channels);
             let (streams, coupled, mapping) =
-                opus_layout(self.params.extra_data.as_deref().unwrap_or_default(), channels)?;
+                opus_layout(self.params.extra_data.as_deref().unwrap_or_default(), from)?;
             // 48 kHz whatever the container says: that is the only rate Opus
             // decodes at, and the rate both readers declare for it.
             let decoder = ruopus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
-            return Ok(SymDecoder::Opus(Box::new(decoder), fold));
+            return Ok(SymDecoder::Opus(Box::new(decoder), from));
         }
-        if self.params.codec == CODEC_ID_AAC && self.source_channels > 2 {
-            let asc = self
-                .params
-                .extra_data
-                .as_deref()
-                .ok_or("a multichannel AAC track with no AudioSpecificConfig")?;
-            let decoder = rusty_aac::AacDecoder::with_config_bytes(asc)
-                .map_err(|e| format!("multichannel AAC decoder init failed: {e}"))?;
-            return Ok(SymDecoder::Aac(Box::new(decoder), fold));
+        if self.params.codec == CODEC_ID_AAC {
+            return aac_decoder(&self.params, from);
         }
         Ok(SymDecoder::Sym(
             symphonia::default::get_codecs()
                 .make_audio_decoder(&self.params, &AudioDecoderOptions::default())?,
-            fold,
+            from,
         ))
     }
 
@@ -1626,46 +1654,68 @@ fn sym_reader(path: &Path) -> crate::Result<Box<dyn FormatReader>> {
 }
 
 /// One packet in, interleaved f32 out — whichever library did the decoding, and
-/// already folded to the layout [`SymTrack::channels`] promised. The flag is
-/// that fold: `true` for a 5.1 track, and there is nothing else it can be.
+/// already folded to the layout [`SymTrack::channels`] promised. The number
+/// beside each is the width the decoder itself emits, which is what
+/// [`downmix`] folds from; 1 and 2 fold to nothing.
 enum SymDecoder {
-    Sym(Box<dyn AudioDecoder>, bool),
+    Sym(Box<dyn AudioDecoder>, usize),
     /// Boxed because the decoder carries its own IMDCT tables and this enum is
     /// moved into the worker.
-    Aac(Box<rusty_aac::AacDecoder>, bool),
-    /// Every Opus track, mono to 5.1: one multistream decoder -- the streams of
+    Aac(Box<rusty_aac::AacDecoder>, usize),
+    /// Every Opus track, mono to 7.1: one multistream decoder -- the streams of
     /// a packet, the channel mapping table and the routing between them are all
-    /// its business -- and the same fold flag.
-    Opus(Box<ruopus::MultistreamDecoder>, bool),
+    /// its business -- and the same width.
+    Opus(Box<ruopus::MultistreamDecoder>, usize),
 }
 
 impl SymDecoder {
     fn decode(&mut self, packet: &Packet, out: &mut Vec<f32>) -> crate::Result<()> {
         match self {
-            Self::Sym(decoder, fold) => {
+            Self::Sym(decoder, from) => {
                 decoder.decode(packet)?.copy_to_vec_interleaved::<f32>(out);
-                fold_5_1(out, *fold);
+                downmix(out, *from);
             }
-            Self::Aac(decoder, fold) => {
+            Self::Aac(decoder, from) => {
                 let pcm = decoder
                     .decode(&packet.data, None)
                     .map_err(|e| format!("AAC decode failed: {e}"))?;
                 *out = pcm.samples;
-                fold_5_1(out, *fold);
+                downmix(out, *from);
             }
-            Self::Opus(decoder, fold) => {
+            Self::Opus(decoder, from) => {
                 *out = decoder
                     .decode_packet(&packet.data)
                     .map_err(|e| format!("Opus decode failed: {e}"))?;
                 // The encoder delay is not dropped here: it is this track's
                 // priming ([`SymTrack::open_inner`]), which the window rules
                 // subtract once for the whole segment rather than per packet.
-                vorbis_to_film_order(out, *fold);
-                fold_5_1(out, *fold);
+                vorbis_to_film_order(out, *from);
+                downmix(out, *from);
             }
         }
         Ok(())
     }
+}
+
+/// The decoder an AAC track of `from` channels needs: symphonia's own refuses
+/// anything wider than stereo outright (`aac/mod.rs:93`, "aac: aac too
+/// complex"), which is exactly the 5.1 and 7.1 tracks of a film, so those go to
+/// `rusty_aac` instead -- the same routing [`SymTrack::decoder`] does for a
+/// Matroska file, asked once here so an mp4's multichannel track takes it too.
+fn aac_decoder(params: &AudioCodecParameters, from: usize) -> crate::Result<SymDecoder> {
+    if from > 2 {
+        let asc = params
+            .extra_data
+            .as_deref()
+            .ok_or("a multichannel AAC track with no AudioSpecificConfig")?;
+        let decoder = rusty_aac::AacDecoder::with_config_bytes(asc)
+            .map_err(|e| format!("multichannel AAC decoder init failed: {e}"))?;
+        return Ok(SymDecoder::Aac(Box::new(decoder), from));
+    }
+    Ok(SymDecoder::Sym(
+        Box::new(AacDecoder::try_new(params, &AudioDecoderOptions::default())?),
+        from,
+    ))
 }
 
 /// The encoder delay of an Opus track, in samples at 48 kHz: bytes 10 and 11 of
@@ -1730,49 +1780,98 @@ fn opus_layout(head: &[u8], channels: usize) -> crate::Result<(usize, usize, Vec
     Ok((streams, coupled, mapping))
 }
 
-/// Opus 5.1 is stored in Vorbis channel order (FL, FC, FR, BL, BR, LFE) and
-/// [`fold_5_1`] reads the film order every other decoder here hands back (FL, FR,
-/// FC, LFE, BL, BR). This is that permutation, in place, and only for the 5.1
-/// track the fold is *for*: mono and stereo need none, and every other width is
-/// refused by [`Track::channels`] before a packet is ever decoded.
-fn vorbis_to_film_order(samples: &mut [f32], fold: bool) {
-    if !fold {
-        return;
-    }
-    for frame in samples.chunks_exact_mut(6) {
-        let [fl, fc, fr, bl, br, lfe] = <[f32; 6]>::try_from(&frame[..]).expect("a 5.1 frame");
-        frame.copy_from_slice(&[fl, fr, fc, lfe, bl, br]);
+/// Surround Opus is stored in Vorbis channel order (RFC 7845 §5.1.1.2) and
+/// [`downmix`] reads the film order every other decoder here hands back. This is
+/// that permutation, in place, per width: each entry says which *source* channel
+/// the output slot of that index reads. Mono, stereo and quad agree already, and
+/// a width the RFC does not lay out is left alone rather than shuffled by guess.
+fn vorbis_to_film_order(samples: &mut [f32], from: usize) {
+    let order: &[usize] = match from {
+        3 => &[0, 2, 1],                // FL FC FR
+        5 => &[0, 2, 1, 3, 4],          // FL FC FR SL SR
+        6 => &[0, 2, 1, 5, 3, 4],       // FL FC FR SL SR LFE
+        7 => &[0, 2, 1, 6, 5, 3, 4],    // FL FC FR SL SR BC LFE
+        8 => &[0, 2, 1, 7, 5, 6, 3, 4], // FL FC FR SL SR BL BR LFE
+        _ => return,
+    };
+    let mut frame = [0.0f32; 8];
+    for chunk in samples.chunks_exact_mut(from) {
+        frame[..from].copy_from_slice(chunk);
+        for (out, &src) in chunk.iter_mut().zip(order) {
+            *out = frame[src];
+        }
     }
 }
 
-/// 5.1 down to stereo, in place. ITU-R BS.775: the centre and the surround of
-/// each side join that side at -3 dB, and the LFE is dropped -- it carries no
-/// programme a stereo pair could put anywhere. Both outputs are divided by the
-/// sum of their own coefficients, so a source at full scale cannot come out
-/// clipped; that is what every player does by default.
+/// What each channel of a `from`-wide film-order layout contributes to the left
+/// and the right of a stereo fold. ITU-R BS.775: a front channel keeps its own
+/// side, the centre and the back centre go to both at -3 dB, a surround joins
+/// its own side at -3 dB, and the LFE is dropped -- it carries no programme a
+/// stereo pair could put anywhere, and neither ffmpeg's default downmix nor any
+/// player's puts it there.
 ///
-/// The layout is FL, FR, FC, LFE, BL, BR, which is what symphonia's decoders
-/// and `rusty_aac` both hand back (the latter reorders AAC's own C, L, R, Ls,
-/// Rs, LFE element order into it: `decode.rs:779`).
+/// The film order is FL, FR, FC, LFE, BL, BR, SL, SR, which is what symphonia's
+/// decoders and `rusty_aac` both hand back (the latter reorders AAC's own
+/// C, L, R, Ls, Rs, LFE element order into it: `decode.rs:779`) and what the AC-3
+/// decoder's own passthrough uses.
 ///
-/// ponytail: that normalisation costs 7.7 dB against what ffmpeg's `-ac 2` hands
-/// out, which does not normalise and can overload -- so a film plays quieter
-/// here than in a player beside it. It is the loudness the AC-3 5.1 path already
-/// has (measured within 1.3 dB), so the two agree; the upgrade path is a
-/// limiter on the output, at which point the coefficients can go back to 1.0.
-fn fold_5_1(samples: &mut Vec<f32>, fold: bool) {
-    if !fold {
+/// ponytail: a width past 7.1 (22.2, ambisonics) keeps its front pair and drops
+/// the rest -- no table here places those, and inventing one silently would be
+/// worse than a fold that is merely narrow. Upgrade path is one more arm.
+fn fold_coeffs(from: usize) -> Vec<(f32, f32)> {
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const L: (f32, f32) = (1.0, 0.0);
+    const R: (f32, f32) = (0.0, 1.0);
+    const M: (f32, f32) = (C, C);
+    const SL: (f32, f32) = (C, 0.0);
+    const SR: (f32, f32) = (0.0, C);
+    const X: (f32, f32) = (0.0, 0.0);
+    match from {
+        3 => vec![L, R, X],                    // L R LFE (the 2.1 passthrough)
+        4 => vec![L, R, SL, SR],               // FL FR BL BR
+        5 => vec![L, R, M, SL, SR],            // FL FR FC BL BR
+        6 => vec![L, R, M, X, SL, SR],         // 5.1
+        7 => vec![L, R, M, X, M, SL, SR],      // FL FR FC LFE BC SL SR
+        8 => vec![L, R, M, X, SL, SR, SL, SR], // 7.1
+        n => (0..n).map(|c| [L, R][usize::from(c > 0)]).collect(),
+    }
+}
+
+/// Anything wider than a stereo pair down to one, in place -- `from` is the
+/// channel count the decoder actually emitted, and 1 or 2 is not touched at all.
+/// This is what makes a 5.1 or 7.1 film an ordinary stereo source on the
+/// timeline instead of an import refusal.
+///
+/// Both outputs are divided by the sum of their own coefficients
+/// ([`fold_coeffs`]), so a source at full scale cannot come out clipped.
+///
+/// ponytail: that normalisation costs 7.7 dB at 5.1 (9.9 at 7.1) against what
+/// ffmpeg's `-ac 2` hands out, which does not normalise and can overload -- so a
+/// film plays quieter here than in a player beside it. It is the loudness the
+/// AC-3 5.1 path already has (measured within 1.3 dB), so the two agree; the
+/// upgrade path is a limiter on the output, at which point the coefficients can
+/// go back to 1.0.
+fn downmix(samples: &mut Vec<f32>, from: usize) {
+    if from < 3 {
         return;
     }
-    const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
-    const NORM: f32 = 1.0 / (1.0 + 2.0 * CENTRE);
-    for frame in 0..samples.len() / 6 {
-        let [fl, fr, fc, _lfe, bl, br] = <[f32; 6]>::try_from(&samples[frame * 6..frame * 6 + 6])
-            .expect("six samples of a 5.1 frame");
-        samples[2 * frame] = (fl + CENTRE * (fc + bl)) * NORM;
-        samples[2 * frame + 1] = (fr + CENTRE * (fc + br)) * NORM;
+    let coeffs = fold_coeffs(from);
+    let (left, right) = coeffs
+        .iter()
+        .fold((0.0f32, 0.0f32), |(l, r), c| (l + c.0, r + c.1));
+    // Never a boost: a layout with nothing on one side stays where it is.
+    let (left, right) = (1.0 / left.max(1.0), 1.0 / right.max(1.0));
+    for frame in 0..samples.len() / from {
+        let (mut l, mut r) = (0.0, 0.0);
+        for (c, &(cl, cr)) in coeffs.iter().enumerate() {
+            let sample = samples[frame * from + c];
+            l += cl * sample;
+            r += cr * sample;
+        }
+        samples[2 * frame] = l * left;
+        samples[2 * frame + 1] = r * right;
     }
-    samples.truncate(samples.len() / 6 * 2);
+    samples.truncate(samples.len() / from * 2);
 }
 
 /// One source's AC-3 track: the same mp4 sample tables the AAC track is read
@@ -2142,14 +2241,18 @@ impl AacTrack {
         Ok(Some(this))
     }
 
-    /// Channel count. `AacDecoder` only does mono and stereo, so anything else
-    /// is refused here rather than one packet at a time.
-    fn channels(&self) -> crate::Result<u16> {
+    /// What reaches the timeline: mono, or the stereo everything wider is folded
+    /// to by [`downmix`] at the decoder's door.
+    fn channels(&self) -> u16 {
         match self.config {
-            ChannelConfig::Mono => Ok(1),
-            ChannelConfig::Stereo => Ok(2),
-            other => Err(format!("unsupported channel layout: {other:?} (max stereo)").into()),
+            ChannelConfig::Mono => 1,
+            _ => 2,
         }
+    }
+
+    /// What the decoder emits, which is what the fold reads.
+    fn source_channels(&self) -> usize {
+        usize::from(channel_count(self.config).max(1))
     }
 
     fn track_params(&self) -> AacTrackParams {
@@ -2475,6 +2578,15 @@ impl Segment {
 /// starts one clean and drops it at the end, which is what makes a seek a reset
 /// for free -- exactly as the equalizer's state does.
 ///
+/// It is also what makes a file written at another sample rate playable at all:
+/// the step is the clip's speed *times* the source rate over the timeline's, so
+/// 48 kHz read onto a 44.1 kHz timeline is one resampler, not two, and the pitch
+/// is preserved because the frames are read at the ratio of the rates rather
+/// than dropped. Linear interpolation is what a speed change already uses here
+/// -- for a 48:44.1 ratio its worst-case image lands ~40 dB down and the
+/// alternative is a windowed-sinc kernel and a new state machine for a
+/// conversion that is not the audible risk in this path.
+///
 /// `owed` is what the timeline gives the segment, in frames per channel:
 /// resampling resolves to whole samples and a clip's own window resolves to
 /// whole *source* frames, so the two miss each other by a sample or two per
@@ -2489,11 +2601,18 @@ struct Resample {
     pos: f64,
     /// The last frame of the buffer before this one, one sample per channel.
     tail: Vec<f32>,
-    /// Output frames per channel still to be emitted for this segment.
+    /// Output frames per channel still to be emitted for this segment, or
+    /// [`Resample::UNBOUNDED`] for a window with no end of its own -- what
+    /// [`AudioSession::open_at`] asks for, where the source running out is the
+    /// end and there is no shortfall to pad.
     owed: u64,
 }
 
 impl Resample {
+    /// "As many as the source has": a segment ending at `f64::INFINITY` owes the
+    /// timeline nothing it did not decode.
+    const UNBOUNDED: u64 = u64::MAX;
+
     fn new(step: f64, owed: u64) -> Self {
         Self {
             step,
@@ -2536,7 +2655,9 @@ impl Resample {
         self.tail.clear();
         self.tail.extend_from_slice(&buf[(frames - 1) * channels..]);
         self.pos -= frames as f64;
-        self.owed -= (out.len() / channels) as u64;
+        if self.owed != Self::UNBOUNDED {
+            self.owed -= (out.len() / channels) as u64;
+        }
         *buf = out;
     }
 
@@ -2544,6 +2665,9 @@ impl Resample {
     /// timeline did -- a rounding frame or two, or a clip whose file is shorter
     /// than the edit says. `false` means the consumer went away.
     fn flush(&mut self, channels: usize, timeline: &mut u64, tx: &SyncSender<AudioChunk>) -> bool {
+        if self.owed == Self::UNBOUNDED {
+            return true; // nothing was promised, so nothing is short
+        }
         while self.owed > 0 {
             let frames = self.owed.min(u64::from(SAMPLES_PER_PACKET));
             let chunk = AudioChunk {
@@ -2780,8 +2904,7 @@ fn run(mut w: Worker) {
             }
             Track::Aac(track) => track,
         };
-        let mut decoder = match AacDecoder::try_new(&track.params, &AudioDecoderOptions::default())
-        {
+        let mut decoder = match aac_decoder(&track.params, track.source_channels()) {
             Ok(decoder) => decoder,
             Err(e) => {
                 eprintln!("audio decoder init failed: {e}");
@@ -2808,14 +2931,10 @@ fn run(mut w: Worker) {
                 units::Duration::new(u64::from(sample.duration)),
                 &sample.bytes[..],
             );
-            let buf = match decoder.decode(&packet) {
-                Ok(buf) => buf,
-                Err(e) => {
-                    eprintln!("audio decode error at sample {id}: {e}");
-                    break;
-                }
-            };
-            buf.copy_to_vec_interleaved::<f32>(&mut interleaved);
+            if let Err(e) = decoder.decode(&packet, &mut interleaved) {
+                eprintln!("audio decode error at sample {id}: {e}");
+                break;
+            }
             let next = pos + (interleaved.len() / channels) as u64;
             if !emit(
                 &mut interleaved,
@@ -2956,6 +3075,9 @@ fn run_ac3(
                 return true;
             }
         };
+        // The library's §7.8 downmix already handles everything but its own 2.1
+        // passthrough, which comes out at 3 and is folded here like any width.
+        downmix(&mut interleaved, usize::from(track.channels));
         let next = pos + samples;
         if !emit(
             &mut interleaved,
@@ -3016,6 +3138,8 @@ fn run_mkv_ac3(
                 return true;
             }
         };
+        // ...and the 2.1 passthrough folded here, as on the mp4 side.
+        downmix(&mut interleaved, usize::from(track.channels));
         let next = pos + samples;
         if !emit(
             &mut interleaved,
@@ -3109,42 +3233,110 @@ fn run_sym(
 
 #[cfg(test)]
 mod tests {
-    use super::{PRE_ROLL, SAMPLES_PER_PACKET, fold_5_1, packet_at, packet_run};
+    use super::{PRE_ROLL, SAMPLES_PER_PACKET, downmix, packet_at, packet_run, vorbis_to_film_order};
 
-    /// The 5.1 fold: each side keeps its own front channel, takes the centre
-    /// and its own surround at -3 dB, drops the LFE, and comes out unable to
-    /// clip a full-scale source. The channel order is FL, FR, FC, LFE, BL, BR.
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    /// The fold, channel by channel and width by width: each side keeps its own
+    /// front channel, takes the centre and its own surrounds at -3 dB, drops the
+    /// LFE, and comes out unable to clip a full-scale source. The channel order
+    /// is FL, FR, FC, LFE, BL, BR, SL, SR.
     #[test]
-    fn five_one_folds_to_stereo_without_clipping() {
-        // One frame per channel at full scale, one channel at a time.
-        for (channel, (left, right)) in [
-            (0, (1.0, 0.0)),                                     // FL
-            (1, (0.0, 1.0)),                                     // FR
-            (2, (std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2)), // FC
-            (3, (0.0, 0.0)),                                     // LFE, dropped
-            (4, (std::f32::consts::FRAC_1_SQRT_2, 0.0)),         // BL
-            (5, (0.0, std::f32::consts::FRAC_1_SQRT_2)),         // BR
-        ] {
-            let mut frame = vec![0.0f32; 6];
-            frame[channel] = 1.0;
-            fold_5_1(&mut frame, true);
-            let norm = 1.0 / (1.0 + 2.0 * std::f32::consts::FRAC_1_SQRT_2);
-            assert_eq!(frame.len(), 2, "one 5.1 frame is one stereo frame");
-            assert!((frame[0] - left * norm).abs() < 1e-6, "ch{channel}: {frame:?}");
-            assert!((frame[1] - right * norm).abs() < 1e-6, "ch{channel}: {frame:?}");
+    fn a_surround_frame_folds_to_stereo_without_clipping() {
+        // Per width: what each channel at full scale, alone, must land as
+        // *before* the normalisation that width carries.
+        let layouts: [(usize, &[(f32, f32)]); 6] = [
+            (3, &[(1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]),
+            (4, &[(1.0, 0.0), (0.0, 1.0), (C, 0.0), (0.0, C)]),
+            (5, &[(1.0, 0.0), (0.0, 1.0), (C, C), (C, 0.0), (0.0, C)]),
+            (
+                6,
+                &[(1.0, 0.0), (0.0, 1.0), (C, C), (0.0, 0.0), (C, 0.0), (0.0, C)],
+            ),
+            (
+                7,
+                &[
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (C, C),
+                    (0.0, 0.0),
+                    (C, C),
+                    (C, 0.0),
+                    (0.0, C),
+                ],
+            ),
+            (
+                8,
+                &[
+                    (1.0, 0.0),
+                    (0.0, 1.0),
+                    (C, C),
+                    (0.0, 0.0),
+                    (C, 0.0),
+                    (0.0, C),
+                    (C, 0.0),
+                    (0.0, C),
+                ],
+            ),
+        ];
+        for (from, want) in layouts {
+            let (nl, nr) = want
+                .iter()
+                .fold((0.0f32, 0.0f32), |(l, r), c| (l + c.0, r + c.1));
+            for (channel, &(left, right)) in want.iter().enumerate() {
+                let mut frame = vec![0.0f32; from];
+                frame[channel] = 1.0;
+                downmix(&mut frame, from);
+                assert_eq!(frame.len(), 2, "{from} ch: one frame is one stereo frame");
+                assert!(
+                    (frame[0] - left / nl).abs() < 1e-6 && (frame[1] - right / nr).abs() < 1e-6,
+                    "{from} ch{channel}: {frame:?}, want {left}/{nl} {right}/{nr}"
+                );
+            }
+            // Every channel at once is what a normalised fold exists for.
+            let mut loud = vec![1.0f32; from * 2];
+            downmix(&mut loud, from);
+            assert_eq!(loud.len(), 4, "{from} ch: two frames out of two");
+            assert!(
+                loud.iter().all(|s| (*s - 1.0).abs() < 1e-6),
+                "{from} ch: full scale in, full scale out, never past it: {loud:?}"
+            );
         }
-        // Every channel at once is what a normalised fold exists for.
-        let mut loud = vec![1.0f32; 12];
-        fold_5_1(&mut loud, true);
-        assert_eq!(loud.len(), 4);
-        assert!(
-            loud.iter().all(|s| (*s - 1.0).abs() < 1e-6),
-            "full scale in, full scale out, never past it: {loud:?}"
-        );
-        // A track that is not 5.1 is handed over untouched.
-        let mut stereo = vec![0.5f32, -0.5];
-        fold_5_1(&mut stereo, false);
-        assert_eq!(stereo, [0.5, -0.5]);
+        // Mono and stereo are handed over untouched.
+        for from in [1, 2] {
+            let mut flat = vec![0.5f32, -0.5];
+            downmix(&mut flat, from);
+            assert_eq!(flat, [0.5, -0.5], "{from} ch is not a fold");
+        }
+    }
+
+    /// The Vorbis order an Opus surround stream is stored in, into the film
+    /// order the fold reads. Each channel is its own index, so a permutation
+    /// that drifts is the value that comes out in the wrong slot.
+    #[test]
+    fn vorbis_order_becomes_film_order() {
+        // (width, film slot -> the vorbis channel it must hold)
+        for (from, want) in [
+            (3usize, &[0, 2, 1][..]),
+            (5, &[0, 2, 1, 3, 4]),
+            (6, &[0, 2, 1, 5, 3, 4]),
+            (7, &[0, 2, 1, 6, 5, 3, 4]),
+            (8, &[0, 2, 1, 7, 5, 6, 3, 4]),
+        ] {
+            // Two frames, so a permutation that reads across the frame boundary
+            // shows up as the wrong frame's value.
+            let mut samples: Vec<f32> = (0..from * 2).map(|i| i as f32).collect();
+            vorbis_to_film_order(&mut samples, from);
+            let got: Vec<usize> = samples[..from].iter().map(|&s| s as usize).collect();
+            assert_eq!(got, want, "{from} ch, first frame");
+            let second: Vec<usize> = samples[from..].iter().map(|&s| s as usize - from).collect();
+            assert_eq!(second, want, "{from} ch, second frame");
+        }
+        // 7.1's LFE is the last vorbis channel and the fourth film one.
+        let mut lfe = vec![0.0f32; 8];
+        lfe[7] = 1.0;
+        vorbis_to_film_order(&mut lfe, 8);
+        assert_eq!(lfe[3], 1.0, "the LFE lands where the fold drops it: {lfe:?}");
     }
 
     /// A real AAC track: one stts entry, N packets of 1024.

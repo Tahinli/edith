@@ -103,6 +103,9 @@ fn every_audio_codec_the_refusal_names_really_decodes() {
         ("test_vp9.webm", "opus in a webm", 1),
         // 5.1 arrives as the stereo fold, exactly as a 5.1 AC-3 track does.
         ("test_opus_51.mka", "5.1 opus in an mka", 2),
+        // ...and 7.1, the widest layout the fold has a table for and the one
+        // his own remux carries.
+        ("test_opus_71.mka", "7.1 opus in an mka", 2),
         ("test_tone.opus", "a standalone opus", 2),
     ] {
         let probe = AudioSession::probe(asset(file), 0)

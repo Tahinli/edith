@@ -172,16 +172,57 @@ fn a_song_joins_a_video_timeline_on_the_audio_lane() {
     assert!(session.lane_spans_by_source(Lane::A1).len() >= 2);
 }
 
+/// A rate one output device cannot have two of is **converted**, not refused:
+/// the 48 kHz twin of the tone joins a 44.1 kHz timeline, is placed for the
+/// seconds it lasts, and comes out at the pitch it was recorded at.
+///
+/// The pitch is the whole claim. Reading a 48 kHz file's frames one for one onto
+/// a 44.1 kHz timeline plays it 8.8% slow and 440 Hz becomes 404 -- which is
+/// what "it imported" would look like from a length check alone.
 #[test]
-fn a_rate_the_device_cannot_mix_is_refused_at_the_door() {
+fn a_rate_the_device_cannot_mix_is_converted_at_the_door() {
     let mut session = open(asset("test_av.mp4"));
-    assert_eq!(
-        refusal(session.import(&asset("test_tone_48k.wav"))),
-        "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
+    let before = session.timeline_duration();
+    import_and_place(&mut session, &asset("test_tone_48k.wav"));
+    assert_eq!(session.sources().len(), 2, "the 48k file is in the library");
+    assert_eq!(session.lane_clips(Lane::A1).len(), 2, "and on the lane");
+    // 3 s of tone placed after the video, at the timeline's own rate.
+    assert!(
+        (session.timeline_duration() - (before + 3.0)).abs() < 0.05,
+        "{} s of timeline, want {}",
+        session.timeline_duration(),
+        before + 3.0
     );
-    // Refused means unchanged: no library row, no clip, no length.
-    assert_eq!(session.sources().len(), 1);
-    assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+
+    // ...and the samples themselves, straight out of the worker the session
+    // feeds from: one second of the 48k file, resampled onto a 44.1k timeline.
+    let sources = [(asset("test_av.mp4"), 0), (asset("test_tone_48k.wav"), 0)];
+    let (meta, rx) =
+        AudioSession::open_multi_streams(&sources, &[(Some(1), 0.25, 1.25)]).expect("open").expect("the timeline has sound");
+    assert_eq!(
+        (meta.sample_rate, meta.channels),
+        (44100, 2),
+        "the timeline's rate, not the file's"
+    );
+    let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let frames = samples.len() / 2;
+    assert!(
+        (frames as i64 - 44100).abs() < 64,
+        "one second of timeline is {frames} frames of 44100"
+    );
+    // 440 Hz left, 880 Hz right -- the fixture's own tones, unmoved. Zero
+    // crossings date them without an FFT: a file read at 1:1 instead of 48:44.1
+    // would come out at 404 and 808, an 8% miss this 2% band rejects.
+    for (name, channel, hz) in [("left", 0, 440.0), ("right", 1, 880.0)] {
+        let side: Vec<f32> = samples[channel..].iter().step_by(2).copied().collect();
+        let secs = side.len() as f64 / 44100.0;
+        let crossings = side.windows(2).filter(|p| (p[0] < 0.0) != (p[1] < 0.0)).count() as f64;
+        let got = crossings / 2.0 / secs;
+        assert!(
+            (got - hz).abs() <= 0.02 * hz,
+            "{name}: {got:.1} Hz out of a {hz} Hz tone -- the resample moved the pitch"
+        );
+    }
 }
 
 /// A song *is* a timeline: it scaffolds the canvas a video would have defined,
@@ -382,15 +423,13 @@ fn a_video_joins_a_timeline_a_song_started() {
     import_and_place(&mut session, &asset("test_av.mp4"));
     assert_eq!(session.lane_clips(Lane::V1).len(), 1, "a picture at last");
     assert_eq!(session.lane_clips(Lane::A1).len(), 2);
-    // A sample rate the device cannot have two of is still refused in the
-    // timeline's own words...
-    let e = refusal(session.import(&asset("test_tone_48k.wav")));
-    assert_eq!(
-        e,
-        "audio 48000 Hz 2 ch does not match the timeline's 44100 Hz 2 ch"
-    );
-    assert_eq!(session.sources().len(), 2, "a refusal left a library row");
-    // ...but a *frame* rate of its own is not a refusal: the canvas a song
+    // A sample rate the device cannot have two of is no refusal either: it is
+    // resampled onto the timeline's, as a frame rate is conformed to the canvas.
+    session
+        .import(&asset("test_tone_48k.wav"))
+        .expect("48 kHz joins a 44.1 kHz timeline");
+    assert_eq!(session.sources().len(), 3);
+    // ...and a *frame* rate of its own is not a refusal either: the canvas a song
     // scaffolds runs at 30 fps and a 25 fps picture joins it at the length it
     // lasts in seconds (50 frames of file, 60 of timeline).
     session

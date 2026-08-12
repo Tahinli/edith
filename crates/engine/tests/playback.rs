@@ -963,16 +963,23 @@ fn import_refuses_what_does_not_match() {
         .remove_source(&asset("test_25fps.mp4"), 0)
         .expect("...and the row it made comes back off");
 
-    // What is still refused, and all that is: one output device means one rate
-    // and one layout, and there is no resampler to make two into one.
+    // A sample *rate* of its own is no longer a refusal either: one output
+    // device means one rate, and the segment's own resampler is what makes two
+    // into one now ([`engine::audio::Resample`]).
+    session
+        .import(&asset("test_tone_48k.wav"))
+        .expect("48 kHz may join a 44.1 kHz timeline");
+    session
+        .remove_source(&asset("test_tone_48k.wav"), 0)
+        .expect("...and the row it made comes back off");
+
+    // What is still refused, and all that is: one output device carries one
+    // layout, and a mono track is not the stereo pair this timeline plays.
     let err = session
         .import(&asset("test_ac3.mp4"))
         .expect_err("a mono track cannot join a stereo timeline")
         .to_string();
-    assert_eq!(
-        err,
-        "audio 44100 Hz 1 ch does not match the timeline's 44100 Hz 2 ch"
-    );
+    assert_eq!(err, "audio 1 ch does not match the timeline's 2 ch");
 
     assert!(
         session.import(&asset("no_such_file.mp4")).is_err(),
