@@ -37,7 +37,8 @@ use mp4::{AudioObjectType, ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackT
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet as Ac3Packet};
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::{
-    AudioCodecParameters, AudioDecoder, AudioDecoderOptions, well_known::CODEC_ID_AAC,
+    AudioCodecParameters, AudioDecoder, AudioDecoderOptions,
+    well_known::{CODEC_ID_AAC, CODEC_ID_OPUS},
 };
 use symphonia_core::formats::probe::Hint;
 // `TrackType` is the name both readers give their track kinds; the mp4 one is
@@ -63,8 +64,9 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 
 /// What the sound of a *Matroska* file is read with, named for a refusal:
 /// symphonia's registry as this project enables it (see the feature list in
-/// `Cargo.toml`) plus the AC-3 family, which no symphonia version carries and
-/// `oxideav-ac3` does ([`MkvAc3Track`]).
+/// `Cargo.toml`) plus the two families no symphonia version carries and this
+/// project decodes anyway -- AC-3/E-AC-3 through `oxideav-ac3` ([`MkvAc3Track`])
+/// and Opus through `ruopus` ([`SymDecoder::Opus`]).
 ///
 /// Written down per container because capability is not one set: an mp4 video's
 /// sound never reaches symphonia ([`Track::open`] answers before it), so it
@@ -72,7 +74,7 @@ const EMPTY_EDIT: u64 = u32::MAX as u64;
 /// long after that stopped being true, which is how a user came to re-encode a
 /// film whose FLAC track already played; `capability_matrix` opens one file per
 /// codec named here.
-const MKV_DECODED: &str = "AAC, AC-3/E-AC-3, ALAC, FLAC, MP3, PCM and Vorbis";
+const MKV_DECODED: &str = "AAC, AC-3/E-AC-3, ALAC, FLAC, MP3, Opus, PCM and Vorbis";
 
 /// ...and the mp4 half: [`AacTrack`] and [`Ac3Track`], which is where a video
 /// file's sound is read and where it stops.
@@ -677,10 +679,10 @@ impl AudioSession {
     pub fn unsupported(path: impl AsRef<Path>) -> crate::Result<Option<String>> {
         // Matroska: what symphonia reads out of one ([`Track::open`]) plus the
         // AC-3 and E-AC-3 whose blocks are handed to the Dolby decoder
-        // ([`MkvAc3Track`]); everything else -- Opus, DTS, which no decoder here
-        // has at any version -- is named rather than left playing silent with no
-        // reason given. A Matroska file with no audio track at all returns
-        // `None` here like any other silent file.
+        // ([`MkvAc3Track`]) and the Opus its own decoder takes; everything else
+        // -- DTS, and whatever else no decoder here has -- is named rather than
+        // left playing silent with no reason given. A Matroska file with no
+        // audio track at all returns `None` here like any other silent file.
         if crate::demux::is_matroska(path.as_ref()) {
             let Some(codec) = crate::demux::matroska_audio_codec(path.as_ref())? else {
                 return Ok(None);
@@ -690,6 +692,18 @@ impl AudioSession {
             // reader's own words are the ones worth showing.
             return Ok(Some(match MkvAc3Track::open(path.as_ref()) {
                 Ok(Some(_)) => return Ok(None),
+                // ...and the same question asked of the other reader, because a
+                // refusal is a claim: a track symphonia's side really opens and
+                // builds a decoder for is not one to tell the user about. This
+                // is what stopped naming `A_OPUS` the moment Opus decoded.
+                Ok(None) | Err(_)
+                    if SymTrack::open(path.as_ref())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| t.decoder().is_ok()) =>
+                {
+                    return Ok(None);
+                }
                 Ok(None) => format!(
                     "the {codec} track of this Matroska file cannot be decoded — {MKV_DECODED} are"
                 ),
@@ -1441,6 +1455,18 @@ impl SymTrack {
         let codec = symphonia::default::get_codecs()
             .get_audio_decoder(params.codec)
             .map_or("an unsupported format", |d| d.codec.info.short_name);
+        // The one codec here that *does* owe a priming number: Opus states its
+        // encoder delay in the stream itself (`OpusHead`'s pre-skip, 312 samples
+        // on a film remux) and neither reader drops it, because symphonia trims
+        // for its own decoders and the Opus one is this crate's. Measured against
+        // ffmpeg's decode of the same file: 312 samples late in *both* an mkv and
+        // an ogg until this is subtracted, sample-exact after (correlation
+        // 1.00000). It is priming exactly as an AAC track's is, and it is read
+        // off the stream rather than the container for that reason.
+        let priming = match params.codec {
+            CODEC_ID_OPUS => opus_pre_skip(params.extra_data.as_deref().unwrap_or_default()),
+            _ => 0,
+        };
         Ok(Some(Self {
             reader,
             track_id,
@@ -1450,8 +1476,8 @@ impl SymTrack {
             // [`Track::channels`], where it always was.
             channels: if channels == 6 { 2 } else { channels },
             source_channels: channels,
-            total_samples: num_frames,
-            priming: 0,
+            total_samples: num_frames.map(|n| n.saturating_sub(priming)),
+            priming,
             time_base,
             params,
             codec,
@@ -1471,9 +1497,19 @@ impl SymTrack {
     /// Which decoder is not the caller's business, and it is not always
     /// symphonia's: its AAC decoder refuses anything wider than stereo outright
     /// (`aac/mod.rs:93`, "aac: aac too complex"), which is exactly the 5.1 track
-    /// of a film in an mkv, so that one goes to `rusty_aac` instead.
+    /// of a film in an mkv, so that one goes to `rusty_aac` instead, and it has
+    /// no Opus decoder at all, so that one goes to `ruopus`.
     fn decoder(&self) -> crate::Result<SymDecoder> {
         let fold = self.source_channels != self.channels;
+        if self.params.codec == CODEC_ID_OPUS {
+            let channels = usize::from(self.source_channels);
+            let (streams, coupled, mapping) =
+                opus_layout(self.params.extra_data.as_deref().unwrap_or_default(), channels)?;
+            // 48 kHz whatever the container says: that is the only rate Opus
+            // decodes at, and the rate both readers declare for it.
+            let decoder = ruopus::MultistreamDecoder::with_rate(48_000, streams, coupled, &mapping);
+            return Ok(SymDecoder::Opus(Box::new(decoder), fold));
+        }
         if self.params.codec == CODEC_ID_AAC && self.source_channels > 2 {
             let asc = self
                 .params
@@ -1512,6 +1548,10 @@ enum SymDecoder {
     /// Boxed because the decoder carries its own IMDCT tables and this enum is
     /// moved into the worker.
     Aac(Box<rusty_aac::AacDecoder>, bool),
+    /// Every Opus track, mono to 5.1: one multistream decoder -- the streams of
+    /// a packet, the channel mapping table and the routing between them are all
+    /// its business -- and the same fold flag.
+    Opus(Box<ruopus::MultistreamDecoder>, bool),
 }
 
 impl SymDecoder {
@@ -1528,8 +1568,95 @@ impl SymDecoder {
                 *out = pcm.samples;
                 fold_5_1(out, *fold);
             }
+            Self::Opus(decoder, fold) => {
+                *out = decoder
+                    .decode_packet(&packet.data)
+                    .map_err(|e| format!("Opus decode failed: {e}"))?;
+                // The encoder delay is not dropped here: it is this track's
+                // priming ([`SymTrack::open_inner`]), which the window rules
+                // subtract once for the whole segment rather than per packet.
+                vorbis_to_film_order(out, *fold);
+                fold_5_1(out, *fold);
+            }
         }
         Ok(())
+    }
+}
+
+/// The encoder delay of an Opus track, in samples at 48 kHz: bytes 10 and 11 of
+/// `OpusHead`, little-endian. Zero for a track whose header is missing or too
+/// short to hold one -- there is nothing to subtract that we can trust.
+fn opus_pre_skip(head: &[u8]) -> u64 {
+    match head {
+        [b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', _, _, lo, hi, ..] => {
+            u64::from(u16::from_le_bytes([*lo, *hi]))
+        }
+        _ => 0,
+    }
+}
+
+/// The stream layout of an Opus track, off the file's own `OpusHead`: how many
+/// elementary streams one packet carries, how many of those are coupled
+/// (stereo), and which decoded channel each output channel comes from. Both
+/// readers hand the header over as `extra_data` verbatim -- an mkv's
+/// `CodecPrivate`, an ogg's identification packet.
+///
+/// Mapping family 0 carries no table at all and is mono or stereo by definition;
+/// every other family writes one (RFC 7845 §5.1), and family 1 -- the Vorbis
+/// surround layout a 5.1 film track is written with -- is four streams of which
+/// two are coupled.
+///
+/// Everything here is checked rather than trusted: `MultistreamDecoder::with_rate`
+/// *panics* on a layout that breaks the RFC's limits, and this header comes
+/// straight out of a file, so a truncated or hostile one has to come back as an
+/// `Err` and be refused like any other undecodable track.
+fn opus_layout(head: &[u8], channels: usize) -> crate::Result<(usize, usize, Vec<u8>)> {
+    if !(1..=255).contains(&channels) {
+        return Err(format!("an Opus track of {channels} channels").into());
+    }
+    let table = match head {
+        [b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', rest @ ..] if rest.len() > 10 => {
+            // Byte 18 of the header is the mapping family; the table, when there
+            // is one, is the two counts and one byte per output channel after it.
+            match rest[10] {
+                0 => None,
+                _ => Some(rest.get(11..13 + channels).ok_or("a truncated OpusHead")?),
+            }
+        }
+        // No header at all: the container declared the channel count and nothing
+        // else, which only family 0 can honestly be.
+        _ => None,
+    };
+    let Some(table) = table else {
+        if channels > 2 {
+            return Err(format!("an Opus track of {channels} channels with no mapping").into());
+        }
+        return Ok((1, channels - 1, (0..channels as u8).collect()));
+    };
+    let (streams, coupled) = (usize::from(table[0]), usize::from(table[1]));
+    let mapping = table[2..].to_vec();
+    let decoded = streams + coupled;
+    if streams < 1 || coupled > streams || decoded > 255 {
+        return Err(format!("an Opus track of {streams} streams, {coupled} coupled").into());
+    }
+    if !mapping.iter().all(|&m| m == 255 || usize::from(m) < decoded) {
+        return Err(format!("an Opus channel mapping outside its {decoded} streams").into());
+    }
+    Ok((streams, coupled, mapping))
+}
+
+/// Opus 5.1 is stored in Vorbis channel order (FL, FC, FR, BL, BR, LFE) and
+/// [`fold_5_1`] reads the film order every other decoder here hands back (FL, FR,
+/// FC, LFE, BL, BR). This is that permutation, in place, and only for the 5.1
+/// track the fold is *for*: mono and stereo need none, and every other width is
+/// refused by [`Track::channels`] before a packet is ever decoded.
+fn vorbis_to_film_order(samples: &mut [f32], fold: bool) {
+    if !fold {
+        return;
+    }
+    for frame in samples.chunks_exact_mut(6) {
+        let [fl, fc, fr, bl, br, lfe] = <[f32; 6]>::try_from(&frame[..]).expect("a 5.1 frame");
+        frame.copy_from_slice(&[fl, fr, fc, lfe, bl, br]);
     }
 }
 

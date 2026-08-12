@@ -161,6 +161,90 @@ fn an_ac3_track_decodes_and_51_comes_down_to_stereo() {
     }
 }
 
+/// Opus, which used to be the codec the refusal string was *for*: a standalone
+/// `.opus`, the `.webm` sound off the web, and the 5.1 in an `.mka` that a film
+/// soundtrack is -- four Opus streams with a channel mapping table, decoded by
+/// `ruopus` and folded to stereo by the same fold the AC-3 and AAC paths use.
+///
+/// The 5.1 fixture is the channel-order check as well: its tone is in FL and BR
+/// and silent in between, so both output channels carry sound only if the
+/// decoder's Vorbis order (FL, FC, FR, BL, BR, LFE) was put into the film order
+/// the fold reads (FL, FR, FC, LFE, BL, BR). Skipping that permutation folds BR
+/// as if it were BL and the right channel comes out silent.
+#[test]
+fn opus_decodes_from_every_container_and_51_comes_down_in_order() {
+    for (name, secs, channels) in [("test_tone.opus", 3.0, 2), ("test_vp9.webm", 2.0, 1)] {
+        let path = asset(name);
+        let (meta, rx) = AudioSession::open(&path)
+            .expect("open")
+            .expect("Opus decodes now");
+        assert_eq!((meta.sample_rate, meta.channels), (48000, channels), "{name}");
+        let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+        let decoded = (samples.len() / channels as usize) as f64 / 48000.0;
+        assert!(
+            (secs - decoded).abs() < 0.1,
+            "{name} is {secs}s, decoded {decoded:.3}s"
+        );
+        let rms = (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        assert!(
+            (0.005..0.75).contains(&rms),
+            "{name}: RMS {rms:.6} is not a sine at a sane level"
+        );
+        assert!(
+            samples.iter().all(|s| s.abs() <= 1.0),
+            "{name}: the decode must not leave the device's range"
+        );
+        // ...and the same file as a session, where the picture allows it: the
+        // webm's is VP9, which is the VA-API plugin's and not this test's.
+        if !name.ends_with(".webm") {
+            let session = engine::PlaybackSession::open(&path).expect("open for playback");
+            assert_eq!(
+                session.audio_disabled_reason(),
+                None,
+                "{name}: a track that decodes owes no excuse"
+            );
+        }
+    }
+
+    let path = asset("test_opus_51.mka");
+    let (meta, rx) = AudioSession::open(&path)
+        .expect("open")
+        .expect("5.1 Opus decodes now");
+    assert_eq!((meta.sample_rate, meta.channels), (48000, 2));
+    let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let rms = |channel: usize| {
+        let side: Vec<f64> = samples[channel..]
+            .iter()
+            .step_by(2)
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .collect();
+        (side.iter().sum::<f64>() / side.len() as f64).sqrt()
+    };
+    let (left, right) = (rms(0), rms(1));
+    assert!(left > 0.02, "the 5.1 fold came out silent on the left: {left}");
+    assert!(
+        right > 0.3 * left,
+        "BR was folded as if it were BL: left {left:.4}, right {right:.4}"
+    );
+    // ...and it is the *tone* on each side, not noise at the right level. This is
+    // the assert that bites: a multistream decoder that mis-slices the packet
+    // (all but the last stream of an Opus 5.1 packet are self-delimited) hands
+    // back full-scale hash whose RMS passes every level check above -- measured
+    // -13 dBFS of it on his film, where the film is silent.
+    let secs = (samples.len() / 2) as f64 / 48000.0;
+    for (name, channel, hz) in [("left", 0, 440.0), ("right", 1, 880.0)] {
+        let side: Vec<f32> = samples[channel..].iter().step_by(2).copied().collect();
+        let want = 2.0 * hz * secs;
+        let got = zero_crossings(&side) as f64;
+        assert!(
+            (got - want).abs() <= 0.05 * want,
+            "{name}: {got} zero crossings, want {want} +/-5% -- a decode this far off is noise"
+        );
+    }
+}
+
 /// The same two ends of the AC-3 path, in **Matroska**: a stereo AC-3 track and
 /// a 5.1 E-AC-3 one -- the codec a remux carries and the one the "(AAC only)"
 /// refusal used to fire on -- both come out of the blocks, both arrive as the

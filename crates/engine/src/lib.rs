@@ -41,14 +41,17 @@ pub use project::{Clip, Project, Rate, Speed};
 /// dropped file may land on *before* anything is opened, and so does
 /// [`PlaybackSession::import`](playback::PlaybackSession::import).
 ///
-/// Exactly the containers the engine's audio path reads (`audio::AudioSession`):
-/// no opus, ac3 or dts, for which no pure-Rust decoder exists -- those are
-/// refused by the same door that refuses a `.txt`, which is the honest answer.
+/// Exactly the containers the engine's audio path reads (`audio::AudioSession`),
+/// Opus included: `.opus` is an Ogg file symphonia's probe already reads and
+/// `ruopus` now decodes, and `.mka` is the Matroska whose sound is all it
+/// has. A `.dts` or a bare `.ac3` is refused by the same door that refuses a
+/// `.txt` -- there is no reader here that opens an elementary stream -- which is
+/// the honest answer.
 pub fn is_audio(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
-            "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac"
+            "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "mka" | "m4a" | "aac"
         )
     })
 }
@@ -96,18 +99,27 @@ mod tests {
     #[test]
     fn is_audio_admits_the_containers_the_decoder_reads() {
         for name in [
-            "song.mp3", "a.WAV", "b.flac", "c.ogg", "d.oga", "e.m4a", "f.aac",
+            "song.mp3",
+            "a.WAV",
+            "b.flac",
+            "c.ogg",
+            "d.oga",
+            "e.m4a",
+            "f.aac",
+            "g.opus",
+            "h.OPUS",
+            "i.mka",
         ] {
             assert!(super::is_audio(Path::new(name)), "{name}");
         }
-        // Video, projects, the formats with no pure-Rust decoder, and a file
-        // with no extension at all: all of them go elsewhere.
+        // Video, projects, the elementary streams no reader here opens, and a
+        // file with no extension at all: all of them go elsewhere.
         for name in [
             "clip.mp4",
             "take.MP4",
             "cut.edith",
-            "x.opus",
             "y.ac3",
+            "z.dts",
             "notes",
             "mp3",
         ] {

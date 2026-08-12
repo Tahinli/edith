@@ -84,8 +84,8 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
 # The same VP9 stream in Matroska, which is where a yt-dlp download and every
 # other VP9 file in the wild actually arrives: `V_VP9` used to fall through the
 # mkv track dispatch and be refused by name while the mp4 twin above decoded.
-# Opus audio because that is what a .webm carries; the sound is a separate
-# refusal (no Opus decoder here) and the picture must not depend on it.
+# Opus audio because that is what a .webm carries -- the sound decodes here now
+# (`ruopus`), and this is the webm cell of the Opus row in `capability_matrix`.
 ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -f lavfi -i "sine=frequency=440:duration=2" \
     -c:v libvpx-vp9 -b:v 2M -g 30 -pix_fmt yuv420p \
@@ -108,6 +108,14 @@ ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
     -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
     -c:a:0 flac -c:a:1 libmp3lame -c:a:2 libvorbis -c:a:3 alac -c:a:4 pcm_s16le \
     assets/test_mkv_audio.mkv
+# ...and the codec that really is refused, so the other half of the refusal is
+# testable too: DTS, which no decoder in this tree has (symphonia has none at any
+# version and there is no pure-Rust one to reach for, unlike AC-3 and Opus). The
+# notice must name *this* track and go on naming what would have worked.
+ffmpeg -y -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
+    -f lavfi -i "sine=frequency=440:duration=2:sample_rate=48000" \
+    -map 0:v -map 1:a -c:v libx264 -profile:v baseline -pix_fmt yuv420p \
+    -c:a dca -strict -2 -ac 2 assets/test_dts.mkv
 # Two video tracks in one mp4, at different sizes so a test can tell which one
 # the demuxer picked. `Mp4Reader::tracks()` is a HashMap and iterating it made
 # "the video track" a different one from one run to the next; the pick comes out
@@ -418,6 +426,28 @@ for fmt in mp3 wav flac ogg m4a aac; do
         -filter_complex "$tone" -map "[a]" -ar 44100 "${codec[@]}" \
         "assets/test_tone.$fmt"
 done
+# The two Opus fixtures, which cannot join the loop above: Opus decodes at 48 kHz
+# and nothing else, so these are the 48k twins of the tone rather than 44.1k ones.
+# First the standalone `.opus`, an Ogg file `crate::is_audio` now admits.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=3:sample_rate=48000" \
+    -filter_complex "$tone" -map "[a]" -c:a libopus -b:a 96k \
+    assets/test_tone.opus
+# ...and 5.1 Opus in an `.mka`, which is the shape a film soundtrack has: four
+# Opus streams with the Vorbis channel mapping, folded to stereo on the way to
+# the timeline. The tone sits in **FL and BR only**, both silent in between, so
+# the fold's channel order is checkable without an FFT: done right, 440 Hz comes
+# out left and 880 Hz right; read in the decoder's own Vorbis order (FL, FC, FR,
+# BL, BR, LFE) instead of the film order the fold wants (FL, FR, FC, LFE, BL, BR),
+# BR lands on the left with FL and the right channel comes out silent.
+# `join` needs every output channel mapped and assigns them by *name*, not by
+# input order: without the explicit `map=` the two tones land in FC and BR
+# instead, and the fixture stops testing what its comment says.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=3:sample_rate=48000" \
+    -f lavfi -i "anullsrc=r=48000:cl=quad:d=3" \
+    -filter_complex "[0:a][1:a][2:a]join=inputs=3:channel_layout=5.1:map=0.0-FL|2.0-FR|2.1-FC|2.2-LFE|2.3-BL|1.0-BR[a]" \
+    -map "[a]" -c:a libopus -b:a 256k assets/test_opus_51.mka
 # Still-image fixture: the source with a picture and no timeline in it. Two
 # bands rather than one colour, so a test can tell top from bottom (a flipped
 # decode) and red from blue (a swapped channel order); 640x360, which is 16:9
