@@ -217,7 +217,7 @@ fn the_mp4_rows_are_what_the_encoder_was_asked_for() {
 
 #[test]
 fn a_dual_audio_file_names_the_track_it_would_play_and_says_there_are_others() {
-    // `test_multiaudio.mp4` is the shape his `an AC-3 5.1 mp4` has:
+    // `test_multiaudio.mp4` is the shape a real dual-audio mp4 has:
     // an AAC stereo track and a fatter AC-3 one in the same file. Whichever the
     // bitrate row names, it names *one* of three, and the danger is calling a
     // 0.13 Mb/s stereo track "sound" on a file whose selling point is the AC-3.

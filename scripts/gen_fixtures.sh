@@ -223,8 +223,8 @@ ffmpeg -y -i crates/engine/tests/data/test_subs.srt \
     -f matroska assets/test_subs.mks
 # ...and the same file stating its languages the way a modern muxer does: in
 # `LanguageBCP47` (0x22B59D) and *not* in the legacy `Language` (0x22B59C),
-# which is the shape of every English track of his `a dual-language remux` and
-# `a 17-track library file`. ffmpeg writes only the legacy element (8.1.2 does not read
+# which is the shape of every English track of two real Blu-ray-sourced films.
+# ffmpeg writes only the legacy element (8.1.2 does not read
 # the BCP-47 one either), so the element is swapped in place afterwards: the
 # 4-byte id, then the length as a two-byte VINT (`40 02`, a legal non-minimal
 # encoding) so the tag is two bytes and the element stays the eight bytes it

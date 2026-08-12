@@ -488,13 +488,10 @@ fn an_hdr_clip_is_tone_mapped_before_it_is_graded() {
 /// double-applied conversion produces, and both are one mean away.
 #[test]
 fn a_real_hdr_film_exports_as_a_picture() {
-    let film = Path::new(
-        "/path/to/a-real-4k-hdr10-film.mkv",
-    );
-    if !film.exists() {
-        eprintln!("skipped: {} is not on this machine", film.display());
+    let Some(film) = engine::real_library::film("hevc_4k_hdr") else {
         return;
-    }
+    };
+    let film = film.as_path();
     let mut session = PlaybackSession::open(film).expect("open the film");
     assert_eq!(session.meta().color.transfer, Transfer::Pq, "an HDR10 film");
     // What this film declares about itself, and therefore what the reference

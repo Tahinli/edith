@@ -70,8 +70,8 @@ rusty_vorbis = "0.1.1"
 # sibling pick, `rusty-opus 0.9.1` -- same family as `rusty_aac`/`rusty_mp3`
 # above -- hands each self-delimited slice to a decoder that parses it as an
 # ordinary packet, so every stream but the last decodes the length prefix as
-# payload: measured on a real 5.1 Opus remux as full-scale noise at -13 dBFS where the
-# film is silent. This one matches ffmpeg's own decode of the same file to a
+# payload: measured on a real 5.1 Opus remux as full-scale noise at -13 dBFS
+# where the film is silent. This one matches ffmpeg's own decode of the same file to a
 # correlation of 1.0000 on all six channels. Pinned exactly, like `oxideav-ac3`
 # below, because a decoder is a bit-exactness dependency.
 ruopus = { version = "=0.1.2", default-features = false, features = ["std"] }

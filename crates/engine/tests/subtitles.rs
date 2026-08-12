@@ -190,17 +190,13 @@ fn a_block_holding_the_erase_after_the_picture_still_draws_the_picture() {
 
 /// The film that reported the bug: four PGS tracks beside one `S_TEXT/UTF8`
 /// one, none of them refused any more. Skipped where the file is not -- it is
-/// a 4K remux and lives in a local folder, not in this repository.
+/// a 4K remux named by the local `real_library.toml`, not in this repository.
 #[test]
 fn the_remux_that_reported_the_bug_reads_all_five_of_its_tracks() {
-    let film = std::path::Path::new(
-        "/path/to/a-real-4k-pgs-film.mkv",
-    );
-    if !film.exists() {
-        eprintln!("skipped: {} is not here", film.display());
+    let Some(film) = engine::real_library::film("hevc_4k_pgs") else {
         return;
-    }
-    let tracks = subtitle::of_matroska(film).expect("the walk");
+    };
+    let tracks = subtitle::of_matroska(&film).expect("the walk");
     assert_eq!(tracks.len(), 5);
     assert!(
         tracks.iter().all(|t| t.refused.is_none()),
@@ -604,8 +600,8 @@ fn a_matroska_that_is_the_subtitles_alone_imports_like_any_other() {
 /// `LanguageBCP47` and no legacy `Language` element at all -- keeps that
 /// language, where it used to come in as `und`.
 ///
-/// The shape of every English track of his *a dual-language remux* and all four
-/// of his *a 17-track library file* ones: they read as `und` while the file said `en`,
+/// The shape of every English track of one real 4K web remux and all four
+/// of another film's: they read as `und` while the file said `en`,
 /// and the loss survived into the exported file's track list.
 #[test]
 fn a_track_that_states_its_language_the_modern_way_keeps_it() {

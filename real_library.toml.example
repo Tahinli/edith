@@ -1,0 +1,20 @@
+# The films a few tests need and this repository cannot hold: tens of gigabytes
+# each, and every one of them somebody's own library. Copy this file to
+# `real_library.toml` beside it (gitignored) and put your own absolute paths in.
+# Every test that asks for a key this file does not name, or names at a path that
+# is not there, says so on stderr and passes.
+#
+# `key = "path"`, one per line, `#` comments. See `engine::real_library`.
+
+# 4K HDR10, HEVC Main 10 in Matroska, whose grade lives only in the bitstream
+# (MaxCLL/MaxFALL in the HEVC SEI, four code points in the `Colour` element),
+# with a fixed-laced 5.1 E-AC-3 track and BCP-47-only subtitle languages.
+hevc_4k_hdr = "/path/to/a-4k-hdr10-web-remux.mkv"
+
+# A 720p dual-audio Blu-ray rip: H.264 with its video track header stripped,
+# two AAC tracks, no colour tags anywhere in container or SPS.
+h264_dual_audio = "/path/to/a-dual-audio-bluray-rip.mkv"
+
+# A 4K Blu-ray x265 remux carrying four PGS subtitle tracks beside one
+# `S_TEXT/UTF8` one.
+hevc_4k_pgs = "/path/to/a-4k-bluray-remux-with-pgs.mkv"
