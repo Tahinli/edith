@@ -1650,6 +1650,7 @@ dependencies = [
  "oxideav-sub-image",
  "oxideav-subtitle",
  "rav1e",
+ "ruopus",
  "rusty_aac",
  "rusty_h264",
  "rusty_mp3",
@@ -4855,6 +4856,12 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "ruopus"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcfcd963c83fc1ada2180ccdac7f1568d87fb0f2ad7236b266fdc9fb9122fbfd"
 
 [[package]]
 name = "rust-embed"

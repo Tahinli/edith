@@ -94,6 +94,23 @@ fn every_audio_codec_the_refusal_names_really_decodes() {
             .unwrap_or_else(|| panic!("{codec} in a Matroska file came back silent"));
         assert_eq!(probe.sample_rate, 44_100, "{codec}");
     }
+    // Opus, every container it arrives in: a `.webm` off the web, the `.mka` a
+    // 5.1 film soundtrack is remuxed into, and the standalone `.opus`. It was
+    // the last codec the notice named as absent while both readers here already
+    // *parsed* it -- `A_OPUS` and `OpusHead` have always mapped to symphonia's
+    // `CODEC_ID_OPUS`; only the decoder was missing, and it is `ruopus` now.
+    for (file, what, channels) in [
+        ("test_vp9.webm", "opus in a webm", 1),
+        // 5.1 arrives as the stereo fold, exactly as a 5.1 AC-3 track does.
+        ("test_opus_51.mka", "5.1 opus in an mka", 2),
+        ("test_tone.opus", "a standalone opus", 2),
+    ] {
+        let probe = AudioSession::probe(asset(file), 0)
+            .unwrap_or_else(|e| panic!("{what}: {e}"))
+            .unwrap_or_else(|| panic!("{what} came back silent"));
+        assert_eq!(probe.sample_rate, 48_000, "{what}");
+        assert_eq!(probe.channels, channels, "{what}");
+    }
     for (file, codec) in [("test_av1.mkv", "aac"), ("test_ac3.mkv", "ac-3")] {
         assert!(
             AudioSession::probe(asset(file), 0).expect(codec).is_some(),
@@ -107,18 +124,27 @@ fn every_audio_codec_the_refusal_names_really_decodes() {
         );
     }
 
-    // ...and the gap the refusal is *for*: Opus has no decoder here at any
-    // version, so the notice names the track and then names what would work.
-    let refused = AudioSession::unsupported(asset("test_vp9.webm"))
+    // ...and the gap the refusal is really *for*, which is DTS and no longer
+    // Opus: no decoder in this tree has it, so the notice names the track and
+    // then names what would have worked -- Opus among them, or the refusal is
+    // back to underselling the engine.
+    let refused = AudioSession::unsupported(asset("test_dts.mkv"))
         .expect("read the header")
-        .expect("an Opus track is a reason, not silence");
-    assert!(refused.contains("A_OPUS"), "{refused}");
-    for named in ["FLAC", "MP3", "Vorbis"] {
+        .expect("a DTS track is a reason, not silence");
+    assert!(refused.contains("A_DTS"), "{refused}");
+    for named in ["FLAC", "MP3", "Opus", "Vorbis"] {
         assert!(
             refused.contains(named),
             "the refusal hides a codec that decodes ({named}): {refused}"
         );
     }
+    // The other half of that claim, and the one a stale refusal string cannot
+    // fake: a file whose track really does decode has nothing to excuse.
+    assert_eq!(
+        AudioSession::unsupported(asset("test_vp9.webm")).expect("read the header"),
+        None,
+        "an Opus track that decodes is not a refusal"
+    );
 }
 
 /// Which of two video tracks an mp4 opens on may not depend on hash order: it is

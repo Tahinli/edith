@@ -56,6 +56,25 @@ rusty_mp3 = "0.6"
 # packet. This one does the whole pipeline. Its quirks are measured and worked
 # around in [`crate::export::write_ogg`] -- read that before touching this line.
 rusty_vorbis = "0.1.1"
+# The Opus decoder: pure Rust, MIT, no C and no FFI, and no dependencies at all
+# without its default features (`spectrograms` is for its own analysis tools).
+# Symphonia has no Opus at any version -- its feature list stops at vorbis and
+# there is no `symphonia-codec-opus` crate -- while both of its containers *read*
+# the format already: `A_OPUS` and `OpusHead` have always mapped to
+# `CODEC_ID_OPUS`. The decoder was the one missing half, and the reason a 5.1
+# Opus film played silent while its picture was fine.
+#
+# Multistream is what decides which crate: a 5.1 track is four elementary Opus
+# streams in one packet, all but the last **self-delimited** (RFC 6716 App. B),
+# and this one strips that framing per stream (`multistream.rs:71`). The obvious
+# sibling pick, `rusty-opus 0.9.1` -- same family as `rusty_aac`/`rusty_mp3`
+# above -- hands each self-delimited slice to a decoder that parses it as an
+# ordinary packet, so every stream but the last decodes the length prefix as
+# payload: measured on a real 5.1 Opus remux as full-scale noise at -13 dBFS where the
+# film is silent. This one matches ffmpeg's own decode of the same file to a
+# correlation of 1.0000 on all six channels. Pinned exactly, like `oxideav-ac3`
+# below, because a decoder is a bit-exactness dependency.
+ruopus = { version = "=0.1.2", default-features = false, features = ["std"] }
 # The Ogg container, and the only new *name* here that is not a new crate tree:
 # its one dependency is `oxideav-core`, which the AC-3 decoder above already
 # pulls in. MIT. Vorbis-aware where it counts -- `xiph_lace` builds the
@@ -71,8 +90,9 @@ symphonia-codec-aac = "0.6"
 # ape, no adpcm: what is listed here is exactly what `is_audio` admits, plus
 # `mkv`, which is not an `is_audio` container at all -- it is how the *sound* of
 # a Matroska video file is read, the picture having its own demuxer here.
-# There is no opus/ac3/dts feature at any symphonia version, which is why those
-# are refused rather than promised.
+# There is no opus/ac3/dts feature at any symphonia version: AC-3 comes from
+# `oxideav-ac3` and Opus from `ruopus` above, both plugged into this crate's
+# own readers, and DTS is the one that really is refused.
 symphonia = { version = "0.6", default-features = false, features = [
     "aac",
     "alac",
