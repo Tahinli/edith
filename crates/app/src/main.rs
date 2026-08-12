@@ -1357,6 +1357,11 @@ struct Player {
     /// follow.
     lanes_scroll: ScrollHandle,
     inspector_scroll: ScrollHandle,
+    /// And where the equalizer card's own body has been taken to. It is the
+    /// tallest card in the column -- a graph with a row of numbers and a row of
+    /// buttons under it -- and at the 360 px floor its title and its buttons
+    /// were off both ends of the column with no way to reach them.
+    eq_scroll: ScrollHandle,
     /// The export options card is up: what the export action opens now, so
     /// nothing is written until the card's own button says so. One card at a
     /// time -- opening either closes the other, since both are the whole window
@@ -15767,6 +15772,7 @@ fn main() {
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),
                     inspector_scroll: ScrollHandle::new(),
+                    eq_scroll: ScrollHandle::new(),
                     export_open: false,
                     export_grouped: true,
                     export_refusals_inline: false,

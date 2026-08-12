@@ -746,6 +746,16 @@ impl Player {
         // The bottom of the axis is not named: -12 dB would land in the same
         // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
         // already say what the box is worth per pixel.
+        //
+        // The same affordance the column itself carries, read back off the
+        // card's own handle: this is the tallest card in the inspector -- a
+        // 132 px graph with a row of numbers and a row of buttons under it --
+        // and at the 360 px floor it is taller than the column it is docked in.
+        let can_scroll = f32::from(self.eq_scroll.max_offset().height) > 1.;
+        let below = px_below(
+            f32::from(self.eq_scroll.max_offset().height),
+            f32::from(self.eq_scroll.offset().y),
+        );
         Some(
             drag_scrim(cx)
                 .flex()
@@ -771,6 +781,12 @@ impl Player {
                         // way for the same reason.
                         .w_full()
                         .max_w(px(eq_card_w(f32::from(viewport.width))))
+                        // And a cap the other way, for the same reason the width
+                        // has one: the card is docked in a column now, and at the
+                        // 360 px floor it is taller than that column -- its title
+                        // ran off the top and its buttons off the bottom, with
+                        // neither reachable. Capped here, scrolled below.
+                        .max_h(relative(1.))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -778,121 +794,157 @@ impl Player {
                         .p(px(12.))
                         .rounded(px(6.))
                         .bg(rgb(BG_RAISED))
-                        // Which clip, because the card is modal and the lane it
-                        // was opened from is behind a scrim by the time it is up.
-                        .child(div().flex_none().px(px(6.)).child(format!(
-                            "Equalizer — {} clip {}",
-                            lane.label(),
-                            idx + 1
-                        )))
                         .child(
                             div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
-                                .child(self.notices.front().cloned().unwrap_or_else(|| {
-                                    "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
-                                })),
-                        )
-                        .child(graph)
-                        // Which band the keyboard is holding and every number it
-                        // is set to, each with the pair of buttons that moves it:
-                        // the curve shows the sum, and a band pushed against one
-                        // pulling the other way is not readable off it.
-                        .child(self.eq_numbers(picked, cx))
-                        .child(
-                            div()
-                                .mt(px(4.))
+                                .id("eq-card-rows")
+                                // Shrinkable below its content, which is what
+                                // makes the cap above a scroll rather than a
+                                // clip; the rows themselves keep their heights.
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.eq_scroll)
                                 .flex()
-                                .gap(px(4.))
+                                .flex_col()
+                                .gap(px(2.))
+                                // Which clip, because the card is modal and the lane it
+                                // was opened from is behind a scrim by the time it is up.
+                                .child(div().flex_none().px(px(6.)).child(format!(
+                                    "Equalizer — {} clip {}",
+                                    lane.label(),
+                                    idx + 1
+                                )))
                                 .child(
                                     div()
-                                        .id("eq-reset")
-                                        .flex()
-                                        .flex_1()
-                                        .h(px(CONTROL_H))
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(3.))
-                                        .bg(rgb(BG_SELECTED))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER)))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            for band in &mut this.eq_params.bands {
-                                                band.gain_db = 0.;
-                                            }
-                                            this.commit_eq(cx);
-                                        }))
-                                        .child("Flatten all"),
+                                        .flex_none()
+                                        .px(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(rgb(FG_SECONDARY))
+                                        .child(self.notices.front().cloned().unwrap_or_else(|| {
+                                            "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
+                                        })),
                                 )
-                                // The two that change how many bands there are.
-                                // The engine takes any cascade -- the count was
-                                // only ever fixed because this card had no way
-                                // to say otherwise.
+                                .child(graph)
+                                // Which band the keyboard is holding and every number it
+                                // is set to, each with the pair of buttons that moves it:
+                                // the curve shows the sum, and a band pushed against one
+                                // pulling the other way is not readable off it.
+                                .child(self.eq_numbers(picked, cx))
                                 .child(
                                     div()
-                                        .id("eq-add")
+                                        .mt(px(4.))
                                         .flex()
-                                        .flex_1()
-                                        .h(px(CONTROL_H))
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(3.))
-                                        .bg(rgb(BG_PANEL))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER)))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.add_band(cx)
-                                        }))
-                                        .child("Add band"),
-                                )
-                                .child(
-                                    div()
-                                        .id("eq-remove")
-                                        .flex()
-                                        .flex_1()
-                                        .h(px(CONTROL_H))
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(3.))
-                                        .bg(rgb(BG_PANEL))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER)))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.remove_band(cx)
-                                        }))
-                                        .child("Remove band"),
-                                )
-                                // The analyser's switch, next to the one other
-                                // button the card has: `s` does the same, and a
-                                // toggle only a keystroke can reach is one most
-                                // people never find.
-                                .child(
-                                    div()
-                                        .id("eq-spectrum")
-                                        .flex()
-                                        .flex_1()
-                                        .h(px(CONTROL_H))
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded(px(3.))
-                                        .bg(rgb(match self.eq_spectrum {
-                                            true => BG_SELECTED,
-                                            false => BG_HOVER_DIM,
-                                        }))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER)))
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            this.eq_spectrum = !this.eq_spectrum;
-                                            cx.notify();
-                                        }))
-                                        .child(match self.eq_spectrum {
-                                            true => "Spectrum on",
-                                            false => "Spectrum off",
-                                        }),
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .id("eq-reset")
+                                                .flex()
+                                                .flex_1()
+                                                .h(px(CONTROL_H))
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(3.))
+                                                .bg(rgb(BG_SELECTED))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    for band in &mut this.eq_params.bands {
+                                                        band.gain_db = 0.;
+                                                    }
+                                                    this.commit_eq(cx);
+                                                }))
+                                                .child("Flatten all"),
+                                        )
+                                        // The two that change how many bands there are.
+                                        // The engine takes any cascade -- the count was
+                                        // only ever fixed because this card had no way
+                                        // to say otherwise.
+                                        .child(
+                                            div()
+                                                .id("eq-add")
+                                                .flex()
+                                                .flex_1()
+                                                .h(px(CONTROL_H))
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(3.))
+                                                .bg(rgb(BG_PANEL))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    this.add_band(cx)
+                                                }))
+                                                .child("Add band"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("eq-remove")
+                                                .flex()
+                                                .flex_1()
+                                                .h(px(CONTROL_H))
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(3.))
+                                                .bg(rgb(BG_PANEL))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    this.remove_band(cx)
+                                                }))
+                                                .child("Remove band"),
+                                        )
+                                        // The analyser's switch, next to the one other
+                                        // button the card has: `s` does the same, and a
+                                        // toggle only a keystroke can reach is one most
+                                        // people never find.
+                                        .child(
+                                            div()
+                                                .id("eq-spectrum")
+                                                .flex()
+                                                .flex_1()
+                                                .h(px(CONTROL_H))
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(3.))
+                                                .bg(rgb(match self.eq_spectrum {
+                                                    true => BG_SELECTED,
+                                                    false => BG_HOVER_DIM,
+                                                }))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    this.eq_spectrum = !this.eq_spectrum;
+                                                    cx.notify();
+                                                }))
+                                                .child(match self.eq_spectrum {
+                                                    true => "Spectrum on",
+                                                    false => "Spectrum off",
+                                                }),
+                                        ),
                                 ),
-                        ),
+                        )
+                        // The column's own line, on the card that needs it for
+                        // the column's reason: a row nobody knows is under the
+                        // fold is a row that is not there.
+                        .when(can_scroll, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .h(px(LABEL_H))
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .px(px(6.))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(match below > 1. {
+                                        true => ACCENT_PRIMARY,
+                                        false => FG_SECONDARY,
+                                    }))
+                                    .child(match below > 1. {
+                                        true => "more below — scroll the card",
+                                        false => "the end — scroll up for the rest",
+                                    }),
+                            )
+                        }),
                 ),
         )
     }
