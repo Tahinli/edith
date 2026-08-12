@@ -14,6 +14,7 @@ impl Player {
         position: f64,
         duration: f64,
         state: Transport,
+        viewport_h: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Where the playhead is *on the bed*, in pixels from its left edge.
@@ -100,7 +101,10 @@ impl Player {
         };
         div()
             .flex_none()
-            .h(px(timeline_h(lanes.len()) + strip_h))
+            // Never more than its share of a short window: the lane column
+            // scrolls inside whatever it gets, and a timeline that pushes the
+            // picture off the screen at the 640x360 floor is not a timeline.
+            .h(px((timeline_h(lanes.len()) + strip_h).min(viewport_h * TIMELINE_SHARE)))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -227,7 +231,12 @@ impl Player {
             .child(
                 div()
                     .id("lanes")
-                    .flex_none()
+                    // Takes whatever the region has left and scrolls inside it:
+                    // at the 640x360 floor the region is capped
+                    // ([`TIMELINE_SHARE`]) and a fixed column would be clipped
+                    // by it rather than scrolled.
+                    .flex_1()
+                    .min_h(px(0.))
                     .flex()
                     .flex_col()
                     .gap(px(8.))

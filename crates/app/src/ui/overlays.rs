@@ -53,6 +53,9 @@ impl Player {
                             // Hugs its label: the bar's own line is what wants
                             // the width, and this button never relabels.
                             0.,
+                            // The ordinary plane -- the accent is Export's, and
+                            // a way out of a read is not the primary action.
+                            BG_RAISED,
                             None,
                             "Cancel",
                             "stops this file and anything queued behind it; the read already \
