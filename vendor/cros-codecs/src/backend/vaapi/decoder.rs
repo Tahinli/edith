@@ -152,22 +152,39 @@ pub struct VaapiDecodedHandle<V: VideoFrame> {
     state: PictureState<<V as VideoFrame>::MemDescriptor>,
     /// Actual resolution of the visible rectangle in the decoded buffer.
     display_resolution: Resolution,
+    /// LOCAL PATCH (see /Cargo.toml [patch.crates-io]): the second surface an
+    /// AV1 picture with `apply_grain` set is *displayed* from -- the driver
+    /// synthesizes the grain into it and leaves the reconstructed picture, which
+    /// is what later frames reference, untouched in `state`'s own surface.
+    /// `None` for every picture that asks for no grain, which is every picture
+    /// of every other codec.
+    display: Option<(Arc<V>, Surface<<V as VideoFrame>::MemDescriptor>)>,
 }
 
 impl<V: VideoFrame> VaapiDecodedHandle<V> {
     /// Creates a new pending handle on `surface_id`.
     fn new(picture: VaapiPicture<V>, display_resolution: Resolution) -> anyhow::Result<Self> {
         let backing_frame = picture.backing_frame;
+        let display = picture.display;
         let picture = picture.picture.begin()?.render()?.end()?;
         Ok(Self {
             backing_frame: backing_frame,
             state: PictureState::Pending(picture),
             display_resolution: display_resolution,
+            display: display,
         })
     }
 
     fn sync(&mut self) -> Result<(), VaError> {
-        self.state.sync()
+        self.state.sync()?;
+        // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): the grain is
+        // synthesized into a surface of its own, and it is that one the pixels
+        // are read back off, so waiting only on the reconstructed picture would
+        // hand out a half-written frame.
+        if let Some((_, surface)) = &self.display {
+            surface.sync()?;
+        }
+        Ok(())
     }
 
     /// Creates a new picture from the surface backing the current one. Useful for interlaced
@@ -176,6 +193,8 @@ impl<V: VideoFrame> VaapiDecodedHandle<V> {
         VaapiPicture {
             picture: self.state.new_from_same_surface(timestamp),
             backing_frame: self.backing_frame.clone(),
+            // Interlaced H.264 only, which no codec here asks film grain of.
+            display: None,
         }
     }
 
@@ -185,6 +204,17 @@ impl<V: VideoFrame> VaapiDecodedHandle<V> {
     // copy path is ~100x faster.
     pub fn surface(&self) -> &Surface<<V as VideoFrame>::MemDescriptor> {
         self.state.surface()
+    }
+
+    /// LOCAL PATCH (see /Cargo.toml [patch.crates-io]): the surface a *viewer*
+    /// wants, which is the grain-synthesized one where there is one and the
+    /// reconstructed picture everywhere else. [`Self::surface`] stays the
+    /// reconstructed one on purpose: that is what the reference lists point at.
+    pub fn display_surface(&self) -> &Surface<<V as VideoFrame>::MemDescriptor> {
+        match &self.display {
+            Some((_, surface)) => surface,
+            None => self.state.surface(),
+        }
     }
 
     /// Returns the timestamp of this handle.
@@ -305,6 +335,7 @@ impl<V: VideoFrame> VaapiBackend<V> {
 pub struct VaapiPicture<V: VideoFrame> {
     picture: Picture<PictureNew, Surface<V::MemDescriptor>>,
     backing_frame: Arc<V>,
+    display: Option<(Arc<V>, Surface<V::MemDescriptor>)>,
 }
 
 impl<V: VideoFrame> VaapiPicture<V> {
@@ -317,6 +348,31 @@ impl<V: VideoFrame> VaapiPicture<V> {
         Self {
             backing_frame: Arc::new(backing_frame),
             picture: Picture::new(timestamp, context, surface),
+            display: None,
+        }
+    }
+
+    /// LOCAL PATCH (see /Cargo.toml [patch.crates-io]): gives this picture the
+    /// second surface an AV1 frame with `apply_grain` set is displayed from. The
+    /// driver writes the reconstructed picture into the render target as always
+    /// and the grain-synthesized one into this; a driver told to apply grain with
+    /// no such target refuses the picture outright (radeonsi answers
+    /// `vaEndPicture` with VA_STATUS_ERROR_INVALID_SURFACE).
+    pub fn set_display_frame(&mut self, display: &Rc<Display>, frame: V) {
+        let surface = frame
+            .to_native_handle(display)
+            .expect("Failed to export film grain target to vaapi picture!")
+            .into();
+        self.display = Some((Arc::new(frame), surface));
+    }
+
+    /// The id [`Self::set_display_frame`] handed over, or `VA_INVALID_SURFACE`
+    /// when this picture wants no grain -- which is what the picture parameter
+    /// buffer's `current_display_picture` takes either way.
+    pub fn display_surface_id(&self) -> libva::VASurfaceID {
+        match &self.display {
+            Some((_, surface)) => surface.id(),
+            None => libva::VA_INVALID_SURFACE,
         }
     }
 

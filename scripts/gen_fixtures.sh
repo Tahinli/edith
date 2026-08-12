@@ -148,6 +148,23 @@ ffmpeg -y -f lavfi -i testsrc2=size=1280x720:rate=30:duration=2 \
     -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
     -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
     -c:a aac -b:a 128k assets/test_av1.mkv
+# ...and an AV1 file that asks for film grain, which no other fixture here does.
+# A frame with `apply_grain` set is *displayed* from a second surface the driver
+# synthesizes the grain into, and a decoder that hands it none is refused the
+# picture outright (radeonsi: VA_STATUS_ERROR_INVALID_SURFACE out of
+# `vaEndPicture`) -- which is how AV1 decode died at frame 49 of a real film
+# while every fixture above sailed through. Three seconds rather than two so the
+# surface pool wraps several times, `noise` on the source because SVT-AV1 reads
+# the grain parameters it signals *off the source* (a clean testsrc2 yields grain
+# with no amplitude at all, measured), and `film-grain-denoise=1` so the coded
+# picture is the smooth one and the grain is really the decoder's own work.
+ffmpeg -y -f lavfi -i "testsrc2=size=1280x720:rate=30:duration=3,noise=alls=24:allf=t+u" \
+    -f lavfi -i "sine=frequency=440:duration=3" \
+    -f lavfi -i "sine=frequency=880:duration=3" \
+    -filter_complex "[1:a][2:a]join=inputs=2:channel_layout=stereo,volume='0.5+0.5*sin(2*PI*t)':eval=frame[a]" \
+    -map 0:v -map "[a]" -c:v libsvtav1 -preset 8 -g 30 -pix_fmt yuv420p \
+    -svtav1-params film-grain=40:film-grain-denoise=1 \
+    -c:a aac -b:a 128k assets/test_av1_grain.mkv
 # ...and the same file 10-bit, which is what an `av1C` with `high_bitdepth` set
 # reads as and what the P010 surface pool is picked by -- the AV1 seat of the
 # pair test_hevc.mkv/test_hevc10.mkv already make for HEVC. libaom rather than

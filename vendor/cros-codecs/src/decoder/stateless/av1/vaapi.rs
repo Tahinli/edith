@@ -87,7 +87,16 @@ impl VaStreamInfo for &StreamInfo {
     }
 
     fn min_num_surfaces(&self) -> usize {
-        NUM_SURFACES
+        // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): a sequence that may
+        // synthesize film grain displays every grainy picture from a second
+        // surface (`VaapiPicture::set_display_frame`), so every one of the frames
+        // in flight -- the eight of the reference map, the one being decoded, the
+        // ones handed out but not yet read back -- can cost two. A sequence whose
+        // header says grain never happens is left at the count it always had.
+        match self.seq_header.film_grain_params_present {
+            true => 2 * NUM_SURFACES,
+            false => NUM_SURFACES,
+        }
     }
 
     fn coded_size(&self) -> Resolution {
@@ -105,10 +114,6 @@ impl VaStreamInfo for &StreamInfo {
 impl From<&FrameHeaderObu> for libva::AV1FilmGrain {
     fn from(hdr: &FrameHeaderObu) -> Self {
         let fg = &hdr.film_grain_params;
-
-        if fg.apply_grain {
-            log::warn!("Film grain is not officially supported yet.")
-        }
 
         let film_grain_fields = libva::AV1FilmGrainFields::new(
             u32::from(fg.apply_grain),
@@ -238,6 +243,7 @@ fn build_pic_param<V: VideoFrame>(
     hdr: &FrameHeaderObu,
     stream_info: &StreamInfo,
     current_frame: libva::VASurfaceID,
+    current_display_picture: libva::VASurfaceID,
     reference_frames: &[Option<VADecodedHandle<V>>; NUM_REF_FRAMES],
 ) -> anyhow::Result<libva::BufferType> {
     let seq = stream_info.seq_header.clone();
@@ -414,8 +420,8 @@ fn build_pic_param<V: VideoFrame>(
             .context("Invalid matrix_coefficients")?,
         &seq_info_fields,
         current_frame,
-        libva::VA_INVALID_SURFACE, /* film grain is unsupported for now */
-        vec![],                    /* anchor_frames_list */
+        current_display_picture,
+        vec![], /* anchor_frames_list */
         u16::try_from(hdr.upscaled_width - 1).context("Invalid frame width")?,
         u16::try_from(hdr.frame_height - 1).context("Invalid frame height")?,
         0, /* output_frame_width_in_tiles_minus_1 */
@@ -498,15 +504,26 @@ impl<V: VideoFrame> StatelessAV1DecoderBackend for VaapiBackend<V> {
 
     fn new_picture(
         &mut self,
-        _hdr: &FrameHeaderObu,
+        hdr: &FrameHeaderObu,
         timestamp: u64,
         alloc_cb: &mut dyn FnMut() -> Option<V>,
     ) -> NewPictureResult<Self::Picture> {
-        Ok(VaapiPicture::new(
+        let mut picture = VaapiPicture::new(
             timestamp,
             Rc::clone(&self.context),
             alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?,
-        ))
+        );
+        // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): a frame that asks for
+        // film grain is displayed from a second surface, so it costs two frames
+        // of the pool rather than one -- which is why `min_num_surfaces` above
+        // counts double for a sequence that may use grain. Failing the second
+        // allocation drops the first back into the pool with the picture, and the
+        // caller resubmits exactly as it does for the first.
+        if hdr.film_grain_params.apply_grain {
+            let frame = alloc_cb().ok_or(NewPictureError::OutOfOutputBuffers)?;
+            picture.set_display_frame(self.context.display(), frame);
+        }
+        Ok(picture)
     }
 
     fn begin_picture(
@@ -516,8 +533,14 @@ impl<V: VideoFrame> StatelessAV1DecoderBackend for VaapiBackend<V> {
         hdr: &FrameHeaderObu,
         reference_frames: &[Option<Self::Handle>; NUM_REF_FRAMES],
     ) -> StatelessBackendResult<()> {
-        let pic_param = build_pic_param(hdr, stream_info, picture.surface().id(), reference_frames)
-            .context("Failed to build picture parameter")?;
+        let pic_param = build_pic_param(
+            hdr,
+            stream_info,
+            picture.surface().id(),
+            picture.display_surface_id(),
+            reference_frames,
+        )
+        .context("Failed to build picture parameter")?;
         let pic_param = self
             .context
             .create_buffer(pic_param)
