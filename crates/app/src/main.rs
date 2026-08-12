@@ -1,7 +1,9 @@
 mod keymap;
 mod ui;
 
+use ui::inspector::section_head;
 use ui::theme::*;
+use ui::toolbar::{EXPORT_SLOT_W, SNAP_SLOT_W, VOLUME_SLOT_W, ZOOM_SLOT_W};
 use ui::widgets::*;
 
 use keymap::{ActionId, Keymap};
@@ -275,6 +277,12 @@ impl Volume {
     /// does.
     fn along(self) -> f32 {
         f32::from(self.steps) / f32::from(Self::MAX_STEPS)
+    }
+
+    /// The level as a whole number, for the button's fixed rect: muting swaps
+    /// the glyph beside it, never the width of the box.
+    fn percent(self) -> u32 {
+        u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS)
     }
 
     /// What the button reads. The level shows while muted too: it is what the
@@ -1559,6 +1567,18 @@ impl Player {
     /// menu item that names the same action. One table, so the two can never
     /// come to mean different things.
     fn act(&mut self, action: ActionId, cx: &mut Context<Self>) {
+        // Two doors, one oracle. This used to be the asymmetry the whole
+        // toolbar was built on: the buttons dimmed themselves off
+        // [`enable`] while the keyboard walked straight past it, so with no
+        // file open `s` toggled the snap and `v` added a track while the very
+        // same controls sat dim and *dead* to the pointer. Whatever refuses the
+        // button refuses the key, in the oracle's own words -- and a refusal
+        // that is silent from the keyboard is a bug the same size.
+        if let Some(why) = self.enable(action, None).why() {
+            self.notice = Some(format!("{} — {why}", action.label()).into());
+            cx.notify();
+            return;
+        }
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
             ActionId::StepBack => self.step(-1, cx),
@@ -1726,6 +1746,7 @@ impl Player {
             timeline: true,
             clipboard: self.clipboard.is_some(),
             subtitles: !session.subtitles().is_empty(),
+            playable: !nothing_to_play(Some(session)),
             exporting: self.exporting().is_some(),
         }
     }
@@ -5716,21 +5737,14 @@ impl Render for Player {
             .flex_col()
             .bg(rgb(BG_CANVAS))
             .text_color(rgb(FG_PRIMARY))
-            .text_size(px(13.))
-            .child(
-                div()
-                    .flex_none()
-                    .h(px(HEADER_H))
-                    .flex()
-                    .items_center()
-                    .px(px(12.))
-                    .bg(rgb(BG_PANEL))
-                    .child(self.name.clone()),
-            )
-            // The library beside the picture rather than under it: a media pool
-            // is a column in every editor that has one, and the timeline below
-            // already owns the full width. `library_w` is what keeps the
-            // picture the majority of the row at every window size.
+            .text_size(px(12.))
+            // Four regions, the arrangement every consumer editor shares:
+            // library left, picture centre, inspector right, and the timeline
+            // full width along the bottom with its edit toolbar directly above
+            // it. Nothing here moves when the state changes -- the regions are
+            // fixed and the panels keep their room whether or not anything is
+            // open in them.
+            .child(self.topbar(cx))
             .child(
                 div()
                     .flex_1()
@@ -5745,40 +5759,54 @@ impl Render for Player {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .overflow_hidden()
-                            // The bed the cue plate is placed against: it hangs
-                            // off the bottom of the picture region, which is the
-                            // one box that is the picture and nothing else.
-                            .relative()
                             .flex()
-                            .justify_center()
-                            .items_center()
-                            .children(
-                                self.image
-                                    .clone()
-                                    .map(|i| {
-                                        img(i)
-                                            .size_full()
-                                            .object_fit(gpui::ObjectFit::Contain)
-                                            .into_any_element()
-                                    })
-                                    // With no file open the letterbox is the
-                                    // whole window, and a black rectangle says
-                                    // only that something is broken -- so it
-                                    // says what it wants instead. The window is
-                                    // already the drop target.
-                                    .or_else(|| {
-                                        self.session
-                                            .is_none()
-                                            .then(|| empty_hint().into_any_element())
-                                    }),
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .overflow_hidden()
+                                    // The bed the cue plate is placed against:
+                                    // it hangs off the bottom of the picture
+                                    // region, which is the one box that is the
+                                    // picture and nothing else.
+                                    .relative()
+                                    .flex()
+                                    .justify_center()
+                                    .items_center()
+                                    .bg(rgb(BG_CANVAS))
+                                    .children(
+                                        self.image
+                                            .clone()
+                                            .map(|i| {
+                                                img(i)
+                                                    .size_full()
+                                                    .object_fit(gpui::ObjectFit::Contain)
+                                                    .into_any_element()
+                                            })
+                                            // With no file open the letterbox
+                                            // is the whole region, and a black
+                                            // rectangle says only that
+                                            // something is broken -- so it says
+                                            // what it wants instead. The window
+                                            // is already the drop target.
+                                            .or_else(|| {
+                                                self.session
+                                                    .is_none()
+                                                    .then(|| empty_hint().into_any_element())
+                                            }),
+                                    )
+                                    // After the picture, so the plate is drawn
+                                    // over it rather than under.
+                                    .children(self.subtitle_overlay(position, window)),
                             )
-                            // After the picture, so the plate is drawn over it
-                            // rather than under: siblings paint in order.
-                            .children(self.subtitle_overlay(position, window)),
-                    ),
+                            .child(self.transport_bar(position, state, cx)),
+                    )
+                    // The settings cards live in here rather than over the
+                    // timeline: adjusting a clip must not hide the clip.
+                    .child(self.inspector(window.viewport_size(), cx)),
             )
-            // Above the panel and only when there is one to show, so it costs
+            // Above the toolbar and only when there is one to show, so it costs
             // the picture nothing the rest of the time. The import's line sits
             // over the notice's: a notice is about something that has already
             // happened, and this is about something still happening.
@@ -5787,25 +5815,19 @@ impl Render for Player {
             // loud because a still picture is the only other evidence of it.
             .children(self.seek_bar())
             .children(self.notice_bar(cx))
-            .child(self.panel(position, duration, state, cx))
-            // Over the panel it was opened on, and under the cards: it is only
-            // ever up while neither of them is (`modal`).
+            .child(self.toolbar(cx))
+            .child(self.timeline(position, duration, state, cx))
+            // Over the region they were opened on, and under the modal cards:
+            // they are only ever up while none of those is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
-            // The library's own menu, the same way and for the same reason:
-            // over the panel it was opened on, under the cards, and never up
-            // while one of them is.
             .children(self.library_card(window.viewport_size(), cx))
-            // Last, so they are over everything -- they take no room in the
-            // column, and only one of the two is ever up.
+            // The two that are genuinely modal -- the whole registry, and the
+            // card that writes a file -- are the only sheets left over the
+            // window.
             .children(self.keys_overlay(cx))
             .children(self.export_card(window.viewport_size(), cx))
-            .children(self.eq_card(window.viewport_size(), cx))
-            .children(self.color_card(cx))
-            .children(self.speed_card(cx))
-            .children(self.silence_card(cx))
-            .children(self.mix_card(cx))
-            // Last, so it floats over whatever opened it -- the panel's button
-            // or a clip menu -- rather than under it.
+            // Last, so it floats over whatever opened it -- an inspector row or
+            // a clip menu -- rather than under it.
             .children(self.picker_card(window.viewport_size(), cx))
     }
 }
@@ -6719,6 +6741,10 @@ struct Ctx {
     /// This timeline has at least one subtitle track: a toggle with nothing to
     /// show is a switch that does nothing, and it says so rather than flipping.
     subtitles: bool,
+    /// There is something on the lanes to play. A transport with nothing under
+    /// it is the one refusal that is about the timeline's contents rather than
+    /// about a clip.
+    playable: bool,
     exporting: bool,
 }
 
@@ -6734,6 +6760,18 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // timeline question, and only an export shuts it (a waiting row would
     // swallow the escape the progress line promises cancels the export).
     if action == ActionId::ShowActions {
+        return match ctx.exporting {
+            true => Enable::No("an export is running"),
+            false => Enable::Yes,
+        };
+    }
+    // The four that are about the *editor* and its monitoring rather than
+    // about the edit list: they work with nothing open, the keyboard has
+    // always fired them there, and so their buttons are live there too.
+    if matches!(
+        action,
+        ActionId::ToggleSnap | ActionId::ToggleMute | ActionId::VolumeUp | ActionId::VolumeDown
+    ) {
         return match ctx.exporting {
             true => Enable::No("an export is running"),
             false => Enable::Yes,
@@ -6819,6 +6857,10 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
             Enable::No("no subtitles yet")
         }
         ActionId::CancelExport => Enable::No("nothing is exporting"),
+        // A clock started against an empty timeline is a clock counting
+        // nothing: the transport says so by being dim, which is what its own
+        // ad-hoc boolean used to say before the oracle knew the question.
+        ActionId::Play if !ctx.playable => Enable::No("put a clip on a lane first"),
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
         // refusal there is (no room). Everything else is the editor's own and
@@ -8191,6 +8233,25 @@ fn panel_h(lanes: usize) -> f32 {
     PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
 }
 
+/// ...and how tall the timeline region alone is: the panel without the button
+/// row that used to sit inside it, which is now its own region above
+/// ([`Player::toolbar`], [`TOOLBAR_H`]).
+fn timeline_h(lanes: usize) -> f32 {
+    panel_h(lanes) - TOOLBAR_H
+}
+
+/// The edit toolbar directly above the timeline: one control's height in its
+/// own padding, fixed so nothing in it can push the timeline down.
+const TOOLBAR_H: f32 = CONTROL_H + 16.;
+
+/// The top bar: the project's name on the left, the two file actions on the
+/// right. Fixed for the reason [`HEADER_H`] is.
+const TOPBAR_H: f32 = 36.;
+
+/// The transport strip under the picture -- play, timecode, volume -- where a
+/// player's own controls live in every consumer editor.
+const TRANSPORT_H: f32 = CONTROL_H + 12.;
+
 /// One press of a zoom key, or one notch of ctrl+wheel.
 const ZOOM_STEP: f32 = 1.25;
 
@@ -9405,6 +9466,26 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    /// Every line of UI source there is, as one string: the window used to be
+    /// one file and the scans below read it with `include_str!`. The regions
+    /// are modules now (`ui/`), so the scans read all of them -- a rule that
+    /// stopped at `main.rs` would pass by simply not looking where the pixels
+    /// moved to.
+    fn ui_source() -> String {
+        [
+            include_str!("main.rs").split("#[cfg(test)]").next().unwrap(),
+            include_str!("ui/toolbar.rs"),
+            include_str!("ui/inspector.rs"),
+            include_str!("ui/timeline.rs"),
+            include_str!("ui/library.rs"),
+            include_str!("ui/preview.rs"),
+            include_str!("ui/cards.rs"),
+            include_str!("ui/overlays.rs"),
+            include_str!("ui/widgets.rs"),
+        ]
+        .concat()
+    }
+
     fn asset(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
@@ -9870,9 +9951,37 @@ mod tests {
         );
         let live = Ctx {
             timeline: true,
+            playable: true,
             ..Ctx::default()
         };
         assert!(whole(ActionId::Play, live).yes());
+        // ...and an open timeline with nothing on its lanes refuses the
+        // transport in the oracle rather than in the button, which is what
+        // makes the key and the button say the same thing.
+        assert_eq!(
+            whole(
+                ActionId::Play,
+                Ctx {
+                    playable: false,
+                    ..live
+                }
+            ),
+            Enable::No("put a clip on a lane first")
+        );
+        // The magnet and the monitoring level are the editor's own and answer
+        // with no timeline at all -- the keyboard always fired them there, and
+        // now so does the toolbar.
+        for editor_wide in [
+            ActionId::ToggleSnap,
+            ActionId::ToggleMute,
+            ActionId::VolumeUp,
+            ActionId::VolumeDown,
+        ] {
+            assert!(
+                whole(editor_wide, Ctx::default()).yes(),
+                "{editor_wide:?} is dead with no file open while its key still fires"
+            );
+        }
         assert!(!whole(ActionId::Delete, live).yes());
         assert!(!whole(ActionId::Paste, live).yes());
         assert!(
@@ -10103,10 +10212,8 @@ mod tests {
     #[test]
     fn every_action_is_reachable_without_the_keyboard() {
         use keymap::ActionId;
-        let source = include_str!("main.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+        let source = ui_source();
+        let source = source.as_str();
         let element = |id: &str| source.contains(&format!("\"{id}\""));
         let listed: Vec<ActionId> = keys_rows()
             .iter()
@@ -10181,10 +10288,8 @@ mod tests {
     /// the day it is added, which is the only way the two stay in step.
     #[test]
     fn every_card_closes_without_the_keyboard() {
-        let source = include_str!("main.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+        let source = ui_source();
+        let source = source.as_str();
         // A fn's source, up to the next one: enough of a body to scan.
         let body = |name: &str| -> &str {
             let at = source
@@ -12916,12 +13021,15 @@ mod tests {
             "refusal ink {:.2}",
             contrast(FG_SECONDARY, BG_RAISED)
         );
-        // On the picked row that ink would only be 3.3:1 against the highlight,
-        // so the row it lands on lifts its key and detail to `FG_PRIMARY`.
+        // ...and on the picked row, where the highlight is the accent at
+        // surface brightness. Both inks clear 4.5:1 on it now -- the row still
+        // lifts its key and detail to `FG_PRIMARY`, as emphasis rather than as
+        // the rescue it used to be.
         assert!(contrast(FG_PRIMARY, BG_SELECTED) >= 4.5);
         assert!(
-            contrast(FG_SECONDARY, BG_SELECTED) < 4.5,
-            "the lift is still needed"
+            contrast(FG_SECONDARY, BG_SELECTED) >= 4.5,
+            "refusal ink on the picked row {:.2}",
+            contrast(FG_SECONDARY, BG_SELECTED)
         );
     }
 
@@ -14025,42 +14133,44 @@ mod tests {
         assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
     }
 
-    /// The panel's button row against the 640x360 floor the whole editor is
-    /// measured at. It does not fit and cannot be made to -- so what it may
-    /// never do is *hide* the tail: the row scrolls, and the door to everything
-    /// scrolled off it is pinned outside the scrolling box.
+    /// The edit toolbar against the 640x360 floor the whole editor is measured
+    /// at. It does not fit and cannot be made to -- so what it may never do is
+    /// *hide* the tail: the row scrolls, and the door to everything scrolled
+    /// off it is pinned outside the scrolling box.
     #[test]
     fn toolbar_fits_the_smallest_window() {
-        let source = include_str!("main.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        let panel = &source[source.find("    fn panel(").expect("the panel")
-            ..source.find("    fn import_bar(").expect("the panel's end")];
+        let toolbar = include_str!("ui/toolbar.rs");
+        let row = &toolbar[toolbar.find("pub(crate) fn toolbar(").expect("the toolbar")..];
         // Every button in the row is a hit target, so none of them is narrower
-        // than `HIT_MIN`, and they sit in 8 px gaps inside the panel's own
-        // 12 px padding. The level slider is the one fixed width among them.
-        let buttons = panel.matches("control(").count();
-        assert!(buttons >= 15, "the row's buttons moved; this scan is blind");
-        let row_w = buttons as f32 * (HIT_MIN + 8.) + VOLUME_W + 24.;
-        assert!(
-            row_w > 640.,
-            "{row_w} px of buttons now fits the floor -- the pinned door may go"
-        );
-        // So Export, Save and Actions are off the right edge at that width, and
-        // "it scrolls" is not "it can be found": this is the button that never
-        // scrolls, and the card it opens carries every action there is
+        // than `HIT_MIN`, and they sit in 8 px gaps inside the row's own 12 px
+        // padding.
+        let buttons = row.matches("action_control(").count();
+        assert!(buttons >= 11, "the row's buttons moved; this scan is blind");
+        // The row is shorter than it was -- the project's own settings (size,
+        // rate, HDR) are the inspector's now and the transport is the
+        // picture's -- so whether it fits at 640 px depends on the words in it
+        // and is not something this scan can measure. What it can hold to is
+        // the rule: "it scrolls" is not "it can be found", so the door to
+        // whatever is off the right edge is pinned outside the scrolling box
+        // and the card it opens carries every action there is
         // (`every_action_is_on_the_actions_card`).
         assert!(
-            panel.contains("\"controls-more\""),
+            row.contains("\"controls-more\""),
             "nothing pinned beside the scrolling row: the tail is unreachable at 640 px"
         );
-        // ...and it is outside the scrolling box, which is the whole point of
-        // it: one `overflow_x_scroll`, and the door is written after it closes.
-        assert_eq!(panel.matches("overflow_x_scroll").count(), 1);
+        assert_eq!(row.matches("overflow_x_scroll").count(), 1);
         assert!(
-            panel.find("\"controls-more\"") > panel.find("overflow_x_scroll"),
+            row.find("\"controls-more\"") > row.find("overflow_x_scroll"),
             "the pinned door is inside the row it is meant to outlive"
+        );
+        // ...and nothing in the row decides for itself whether it can act: the
+        // oracle does, once, for the key and the button alike. A raw `control(`
+        // in here is a button that can go dead while its stroke still fires --
+        // the bug this redesign was called in for.
+        assert_eq!(
+            row.matches("\n                    .child(control(").count(),
+            0,
+            "a toolbar button bypassing the availability oracle"
         );
     }
 
@@ -14392,7 +14502,19 @@ mod tests {
 
     #[test]
     fn every_mark_on_a_clip_is_legible_on_it() {
-        for (i, tint) in SOURCE_TINTS.iter().enumerate() {
+        // The body a name and a waveform are drawn on is the clip's kind
+        // ([`clip_kind`]); the source tint is the border and the library
+        // swatch, and is measured for telling itself apart rather than for
+        // carrying text.
+        for (i, tint) in [
+            crate::ui::theme::CLIP_VIDEO,
+            crate::ui::theme::CLIP_AUDIO,
+            crate::ui::theme::CLIP_IMAGE,
+            crate::ui::theme::CLIP_TEXT,
+        ]
+            .iter()
+            .enumerate()
+        {
             // WCAG 1.4.3: the clip's name is body text on its tint.
             assert!(
                 contrast(FG_PRIMARY, *tint) >= 4.5,
@@ -14409,10 +14531,12 @@ mod tests {
         // A selected clip's bed is the same two marks on a different colour.
         assert!(contrast(FG_PRIMARY, BG_SELECTED) >= 4.5);
         assert!(contrast(FG_SECONDARY, BG_SELECTED) >= 3.);
-        // The bed a gap shows through has to read as a hole in the lane, and
-        // the accent playhead has to be findable on it.
-        assert!(contrast(BG_CANVAS, BG_RAISED) >= 1.5);
-        assert!(contrast(ACCENT_PRIMARY, BG_CANVAS) >= 3.);
+        // The bed a gap shows through has to read as a hole in the lane -- the
+        // clip is the object, the bed is the hole -- and the playhead has to be
+        // findable on both.
+        assert!(contrast(crate::ui::theme::CLIP_VIDEO, crate::ui::theme::BG_TIMELINE) >= 1.5);
+        assert!(contrast(crate::ui::theme::ACCENT_PLAYHEAD, crate::ui::theme::BG_TIMELINE) >= 3.);
+        assert!(contrast(crate::ui::theme::ACCENT_PLAYHEAD, crate::ui::theme::CLIP_VIDEO) >= 3.);
         // The sanity check on the ratio itself: black on white is 21:1.
         assert!((contrast(0xffffff, 0x000000) - 21.).abs() < 0.01);
     }

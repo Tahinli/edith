@@ -50,6 +50,9 @@ impl Player {
                         .child(div().flex_1().min_w(px(0.)).child(line))
                         .child(control(
                             "cancel-import",
+                            // Hugs its label: the bar's own line is what wants
+                            // the width, and this button never relabels.
+                            0.,
                             None,
                             "Cancel",
                             "stops this file and anything queued behind it; the read already \
