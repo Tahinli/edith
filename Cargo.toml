@@ -7,15 +7,16 @@ exclude = [
     "vendor/cros-codecs",
     "vendor/rusty_aac",
     "vendor/oxideav-h265",
+    "vendor/rusty_h264-common",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-# Four upstream crates vendored verbatim except for one clearly marked fix each,
+# Five upstream crates vendored verbatim except for one clearly marked fix each,
 # all blockers on this machine and all still unfixed upstream as of
-# 0.0.6/0.0.13/0.5.0/0.0.9:
+# 0.0.6/0.0.13/0.5.0/0.0.9/0.9.1:
 #   cros-libva  - fails to build against libva >= 1.23 headers
 #   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses;
 #                 and creates every decode context as 8-bit 4:2:0, which no HEVC
@@ -38,8 +39,20 @@ edition = "2024"
 #                 69bde5a6e, and it is a plain path dependency (no
 #                 `[patch.crates-io]` line) because nothing else in the tree
 #                 asks for it.
-# Drop `vendor/` entirely once released versions handle all four.
+#   rusty_h264-common - declares `rusty_alloc` (its authors' own mimalloc
+#                 remake) as the `#[global_allocator]` of whatever application
+#                 links it, under a feature that `rusty_h264-{decoder,encoder}`
+#                 turn on from *their* defaults, so no downstream feature choice
+#                 can decline it. It crashed us: under sustained ruler scrubbing
+#                 edith churns decode-worker threads, and that allocator
+#                 segfaulted inside `span_from_segments` on a new thread's first
+#                 allocation (two cores, 2026-08-13). The patch is the feature
+#                 default and the six-line declaration in `src/lib.rs`; every
+#                 line of codec code is byte-identical to 0.9.1, so decode stays
+#                 bit-exact and the process gets glibc's malloc back.
+# Drop `vendor/` entirely once released versions handle all five.
 [patch.crates-io]
 cros-libva = { path = "vendor/cros-libva" }
 cros-codecs = { path = "vendor/cros-codecs" }
 rusty_aac = { path = "vendor/rusty_aac" }
+rusty_h264-common = { path = "vendor/rusty_h264-common" }
