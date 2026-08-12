@@ -40,7 +40,12 @@ impl Player {
             },
         )
         .into_iter()
+        // The tab is the one filter: `enumerate` stays *before* it, so a row's
+        // index is still its index in the whole library and the tints, the
+        // menus and the drags all keep naming the same file whichever tab is
+        // open.
         .enumerate()
+        .filter(|(_, row)| self.library_tab.holds(&row.path))
         .map(|(i, row)| {
             let picked = self
                 .selected_asset
@@ -225,14 +230,44 @@ impl Player {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(rgb(FG_SECONDARY))
-                            .child("Media"),
+                            .flex()
+                            .gap(px(2.))
+                            .children(LIBRARY_TABS.map(|tab| {
+                                let on = tab == self.library_tab;
+                                div()
+                                    .id(("library-tab", tab as usize))
+                                    .flex_none()
+                                    .h(px(HIT_MIN))
+                                    .px(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(3.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(match on {
+                                        true => FG_PRIMARY,
+                                        false => FG_SECONDARY,
+                                    }))
+                                    // One selection language everywhere: the
+                                    // same stroke a picked clip and a picked
+                                    // row wear.
+                                    .when(on, |d| {
+                                        d.bg(rgb(BG_SELECTED))
+                                            .border_b_2()
+                                            .border_color(rgb(STROKE_SELECTED))
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.library_tab = tab;
+                                        cx.notify();
+                                    }))
+                                    .child(tab.label())
+                            })),
                     )
                     .child(control(
                         "import",
                         0.,
+                        BG_RAISED,
                         None,
                         "Import",
                         "adds a file to this list — or drop one on the window".to_string(),
@@ -256,7 +291,7 @@ impl Player {
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY))
-                                .child("No media yet — Import, or drop a file on the window"),
+                                .child(self.library_tab.empty()),
                         )
                     })
                     .children(rows),
@@ -264,10 +299,13 @@ impl Player {
             // Under the media it belongs to: a subtitle track is not a source --
             // it goes on no lane and is dragged nowhere -- but it is a thing the
             // timeline holds, and this is the list of those.
-            .children(self.subtitle_section(width, viewport_h, cx))
+            .when(self.library_tab == LibraryTab::Text, |d| {
+                d.children(self.subtitle_section(width, viewport_h, cx))
+            })
             .child(control(
                 "add-asset",
                 0.,
+                BG_RAISED,
                 None,
                 "Add at playhead",
                 match self.selected_asset {

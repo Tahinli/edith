@@ -8,6 +8,7 @@
 //! (`an_inspector_section_occludes_no_timeline`).
 
 use crate::*;
+use crate::ui::toolbar::{TONE_SLOT_W, ZOOM_SLOT_W};
 use crate::ui::widgets::*;
 
 impl Player {
@@ -124,6 +125,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-speed",
                         0.,
+                        BG_RAISED,
                         None,
                         "Speed",
                         "how fast this clip and its group play",
@@ -133,6 +135,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-color",
                         0.,
+                        BG_RAISED,
                         None,
                         "Colour",
                         "exposure, contrast, saturation and temperature",
@@ -142,6 +145,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-eq",
                         0.,
+                        BG_RAISED,
                         None,
                         "Equalizer",
                         "the bands this clip's sound is filtered through",
@@ -151,6 +155,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-silence",
                         0.,
+                        BG_RAISED,
                         None,
                         "Silence",
                         "finds the quiet stretches and cuts or speeds them",
@@ -160,6 +165,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-fit",
                         0.,
+                        BG_RAISED,
                         None,
                         "Fit",
                         "how this picture is placed on the project canvas",
@@ -169,6 +175,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-delete",
                         0.,
+                        BG_RAISED,
                         None,
                         "Delete",
                         "takes this clip off the timeline",
@@ -206,6 +213,7 @@ impl Player {
                     .child(self.action_control(
                         "resolution",
                         ZOOM_SLOT_W,
+                        BG_RAISED,
                         None,
                         resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
                         "the canvas every clip is composed onto, and the size the export comes out at",
@@ -217,6 +225,7 @@ impl Player {
                     .child(self.action_control(
                         "fps",
                         ZOOM_SLOT_W,
+                        BG_RAISED,
                         None,
                         match self.session.is_some() {
                             true => format!("{} fps", fps_label(self.fps)),
@@ -230,7 +239,8 @@ impl Player {
                     ))
                     .child(self.action_control(
                         "tonemap",
-                        ZOOM_SLOT_W,
+                        TONE_SLOT_W,
+                        BG_RAISED,
                         None,
                         match &self.session {
                             Some(session) => format!("HDR {}", tone_label(session.tone())),
@@ -245,6 +255,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-mix",
                         0.,
+                        BG_RAISED,
                         None,
                         "Mix",
                         "a fader per track and the limiter over the sum of them",
