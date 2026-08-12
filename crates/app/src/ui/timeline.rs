@@ -99,12 +99,28 @@ impl Player {
                 filled,
             )
         };
+        // What the region got, and what is left inside it for the lanes: the
+        // number a scroll is measured against, and the one the affordance below
+        // counts with. The line it costs is taken off the box before the count,
+        // or the row that says "1 more" would be the row hiding it.
+        let region_h = (timeline_h(lanes.len()) + strip_h).min(viewport_h * TIMELINE_SHARE);
+        let lanes_box = (region_h - TIMELINE_FIXED_H - strip_h).max(LANE_H);
+        let overflows = lanes.len() > lanes_shown(lanes_box);
+        let lanes_box = match overflows {
+            true => (lanes_box - LABEL_H - 8.).max(LANE_H),
+            false => lanes_box,
+        };
+        // Live, not a count of the lanes: the column reports where it has been
+        // taken to, so the line empties itself as the last track comes up
+        // instead of insisting there is still something below.
+        let scrolled = -f32::from(self.lanes_scroll.offset().y);
+        let below = rows_below(lanes.len(), lanes_box, scrolled);
         div()
             .flex_none()
             // Never more than its share of a short window: the lane column
             // scrolls inside whatever it gets, and a timeline that pushes the
             // picture off the screen at the 640x360 floor is not a timeline.
-            .h(px((timeline_h(lanes.len()) + strip_h).min(viewport_h * TIMELINE_SHARE)))
+            .h(px(region_h))
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -242,8 +258,35 @@ impl Player {
                     .gap(px(8.))
                     .max_h(px(lanes_h(LANES_MAX)))
                     .overflow_y_scroll()
+                    .track_scroll(&self.lanes_scroll)
                     .children(rows),
             )
+            // "It scrolls" is not "it can be found": when the region is too
+            // short for every track -- which is what the 640x360 floor does to a
+            // three-track project -- the lanes below the fold say so, in the one
+            // place the eye is already looking. Its own flex_none row under a
+            // flex_1 column, so the thing announcing the overflow cannot be the
+            // thing the overflow pushes off the window.
+            .when(overflows, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .h(px(LABEL_H))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .text_size(px(10.))
+                        .text_color(rgb(match below {
+                            0 => FG_SECONDARY,
+                            _ => ACCENT_PRIMARY,
+                        }))
+                        .child(match below {
+                            0 => "the last track — scroll up for the rest".to_string(),
+                            1 => "1 more track below — scroll the lanes".to_string(),
+                            n => format!("{n} more tracks below — scroll the lanes"),
+                        }),
+                )
+            })
             // Under the tracks and outside their scrolling column: a subtitle is
             // not a track -- nothing can be dropped on it and nothing dragged
             // along it -- and a strip that scrolled away with the sixth lane
