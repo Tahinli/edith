@@ -21,6 +21,17 @@ impl Player {
         // The cards measure themselves against the room they are given, and the
         // room they are given is this column -- not the window.
         let room = size(px(width), viewport.height);
+        // The same affordance the lanes carry, on the column that needs it for
+        // the same reason: at the 640x360 floor the project section is below the
+        // fold, and a section nobody knows is there is a section that is not
+        // there. Rows here are not a fixed height, so the column is asked how
+        // far it can still be taken rather than counted -- and it answers with
+        // the previous frame's layout, which is what makes the line live.
+        let can_scroll = f32::from(self.inspector_scroll.max_offset().height) > 1.;
+        let below = px_below(
+            f32::from(self.inspector_scroll.max_offset().height),
+            f32::from(self.inspector_scroll.offset().y),
+        );
         div()
             .id("inspector")
             .flex_none()
@@ -41,6 +52,7 @@ impl Player {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.inspector_scroll)
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -48,6 +60,26 @@ impl Player {
                     .child(self.selection_section(cx))
                     .child(self.project_section(cx)),
             )
+            .when(can_scroll, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .h(px(LABEL_H))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .px(px(8.))
+                        .text_size(px(10.))
+                        .text_color(rgb(match below > 1. {
+                            true => ACCENT_PRIMARY,
+                            false => FG_SECONDARY,
+                        }))
+                        .child(match below > 1. {
+                            true => "more below — scroll the inspector",
+                            false => "the end — scroll up for the rest",
+                        }),
+                )
+            })
             .children(self.eq_card(room, cx))
             .children(self.color_card(cx))
             .children(self.speed_card(cx))

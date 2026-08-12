@@ -1315,6 +1315,13 @@ struct Player {
     /// and the rows past the fold have to be reachable from the keyboard that
     /// is already typing in the search box.
     keys_scroll: ScrollHandle,
+    /// Where the lane column and the inspector's rows have been taken to. Read
+    /// back at render, not only written by the wheel: the line each of them
+    /// carries about what is below the fold is a count of what is *still* below
+    /// it, and a scroll that nothing reads is a scroll the affordance cannot
+    /// follow.
+    lanes_scroll: ScrollHandle,
+    inspector_scroll: ScrollHandle,
     /// The export options card is up: what the export action opens now, so
     /// nothing is written until the card's own button says so. One card at a
     /// time -- opening either closes the other, since both are the whole window
@@ -8341,6 +8348,35 @@ fn lanes_h(lanes: usize) -> f32 {
     }
 }
 
+/// How many whole lane rows a box this tall shows. At least one: a box too
+/// short for a single lane still shows part of one, and "0 shown" would count
+/// every lane there is as hidden.
+fn lanes_shown(box_h: f32) -> usize {
+    (((box_h + 8.) / (LANE_H + 8.)).floor() as usize).max(1)
+}
+
+/// How many rows are still below the fold *now*: the count the affordance says
+/// out loud, and the reason it is a function of the scroll rather than of the
+/// lane count alone. A line that keeps saying "2 more tracks below" after the
+/// user has scrolled to the last one is a line that has stopped being true, and
+/// an affordance nobody can make go away is read as a bug rather than as an
+/// instruction.
+///
+/// `scrolled` is how far down the column has been taken, in pixels. Rounded to
+/// the nearest row: a half-scrolled row is showing, so it is not below.
+fn rows_below(total: usize, box_h: f32, scrolled: f32) -> usize {
+    let past = ((scrolled / (LANE_H + 8.)).round().max(0.)) as usize;
+    total.saturating_sub(past + lanes_shown(box_h))
+}
+
+/// The same question for a column whose rows are not one height -- the
+/// inspector's sections -- answered in pixels off what the scroll itself
+/// reports: how far it may still be taken (`max_offset`) less how far it has
+/// been (`offset`, which gpui keeps negative going down).
+fn px_below(max_offset_h: f32, offset_y: f32) -> f32 {
+    (max_offset_h + offset_y).max(0.)
+}
+
 /// What the subtitle strip adds to the panel: its own row and the panel's gap
 /// above it, and nothing at all for a timeline with no subtitles on it -- the
 /// picture does not pay for a strip that is not drawn.
@@ -9556,7 +9592,8 @@ mod tests {
         marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
         retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
         SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
-        EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
+        EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, TIMELINE_FIXED_H, TIMELINE_SHARE, lanes_shown,
+        px_below, rows_below, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
         push_notice, typed, unseen_paths, unseen_sources,
         whole_take, window_title,
     };
@@ -14327,6 +14364,46 @@ mod tests {
         assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
     }
 
+    /// "It scrolls" is not "it can be found": at the 640x360 floor the timeline
+    /// takes its share and no more, so a third track is behind a scroll -- and
+    /// the line that says so has to keep telling the truth *while* the column is
+    /// being scrolled, or it is an instruction nobody can carry out.
+    #[test]
+    fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
+        // The timeline is a region and not the window: its chrome and one whole
+        // lane fit the share it may take at the floor.
+        let floor = 360. * TIMELINE_SHARE;
+        assert!(
+            TIMELINE_FIXED_H + LANE_H <= floor,
+            "{TIMELINE_FIXED_H} px of chrome and a lane will not fit {floor} px"
+        );
+        // What is left over is measured in whole lanes, at least one.
+        assert_eq!(lanes_shown(LANE_H), 1);
+        assert_eq!(lanes_shown(LANE_H - 10.), 1);
+        assert_eq!(lanes_shown(2. * LANE_H + 8.), 2);
+
+        // Four tracks in a two-lane box: two are below, and each row scrolled
+        // past takes one off that count until none is left. This is the bug the
+        // graft fixes -- the count used to be `total - shown` forever, so the
+        // line still said "2 more below" with the last track on screen.
+        let box_h = 2. * LANE_H + 8.;
+        assert_eq!(rows_below(4, box_h, 0.), 2);
+        assert_eq!(rows_below(4, box_h, LANE_H + 8.), 1);
+        assert_eq!(rows_below(4, box_h, 2. * (LANE_H + 8.)), 0);
+        // Past the end (gpui clamps, but the arithmetic must not wrap).
+        assert_eq!(rows_below(4, box_h, 900.), 0);
+        // A project that fits says nothing at all.
+        assert_eq!(rows_below(2, box_h, 0.), 0);
+
+        // The inspector's rows are not one height, so its own line is measured
+        // in pixels off the scroll instead: gpui keeps the offset negative going
+        // down, and at the bottom the two cancel out exactly.
+        assert_eq!(px_below(120., 0.), 120.);
+        assert_eq!(px_below(120., -40.), 80.);
+        assert_eq!(px_below(120., -120.), 0.);
+        assert_eq!(px_below(0., 0.), 0.);
+    }
+
     /// The failure a user never learns about is the one that was answered by
     /// another failure: two imports failing back to back are two messages, in
     /// the order they happened, and the second does not overwrite the first
@@ -15419,6 +15496,8 @@ fn main() {
                     keys_open: false,
                     keys_search: String::new(),
                     keys_scroll: ScrollHandle::new(),
+                    lanes_scroll: ScrollHandle::new(),
+                    inspector_scroll: ScrollHandle::new(),
                     export_open: false,
                     export_grouped: true,
                     export_refusals_inline: false,
