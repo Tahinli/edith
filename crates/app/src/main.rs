@@ -473,6 +473,18 @@ struct Trim {
 /// still the body.
 const EDGE_W: f32 = 6.;
 
+/// Whether a clip box this wide gets its two trim strips at all. Below three
+/// handles wide the pair would occlude the whole box: every press on it would
+/// trim, and the clip could not be selected, dragged to another lane or picked
+/// up by its middle -- which is exactly what a jumpcut leaves behind
+/// ([`Player::cut_silences`] manufactures a great many short clips). Above it,
+/// what is left between the two strips is a handle's width of body in its own
+/// right. A clip too short for its handles is trimmed by zooming in first: the
+/// bed is a magnifier, and the strip grows with the box.
+fn trims(width: f32) -> bool {
+    width >= 3. * EDGE_W
+}
+
 /// How close to an edge a dragged clip has to be let go for it to land *on* it:
 /// the snap every timeline has, in pixels rather than frames so that it feels
 /// the same at every zoom. Narrower than [`EDGE_W`] -- a hand aiming between two
@@ -693,7 +705,7 @@ fn keys_filter(needle: &str, keymap: &Keymap) -> Vec<(usize, KeyRow)> {
             }
             KeyRow::Fixed(f) => {
                 let fixed = &keymap::FIXED[*f];
-                if hit(fixed.label, fixed.chord) {
+                if hit(fixed.label, &fixed.chord) {
                     out.extend(pending.take());
                     out.push((i, row));
                 }
@@ -6196,347 +6208,382 @@ impl Player {
             // off the right edge is a button a pointer cannot press. A plain
             // wheel moves it -- gpui puts a vertical delta on the x axis when
             // that is the only one scrolling (div.rs:2424).
+            //
+            // ...and "it scrolls" is not "it can be found": the button beside
+            // the row is pinned outside it and never scrolls away, so Export,
+            // Save and the rest are one press from the smallest window even
+            // when the row's tail is off the edge.
+            // `toolbar_fits_the_smallest_window` is the guard.
             .child(
                 div()
-                    .id("controls")
                     .flex_none()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .id("controls")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .overflow_x_scroll()
+                            .child(control(
+                                "transport",
+                                Some(transport_glyph(state).into_any_element()),
+                                if state.is_playing() { "Pause" } else { "Play" },
+                                if nothing_to_play(self.session.as_ref()) && !state.is_playing() {
+                                    format!("{} — put a clip on a lane first", key(ActionId::Play))
+                                } else {
+                                    key(ActionId::Play)
+                                },
+                                // An empty timeline has nothing to play, so the button
+                                // says so by being dim rather than by starting a clock
+                                // against nothing (the key press answers with the
+                                // notice). Still live while it *is* playing: a delete
+                                // can empty the timeline mid-play and that has to stop.
+                                live && (state.is_playing() || !nothing_to_play(self.session.as_ref())),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
+                            ))
+                            .child(separator())
+                            .child(control(
+                                "cut",
+                                Some(cut_glyph().into_any_element()),
+                                "Cut",
+                                format!(
+                                    "{} — splits the clip under the playhead",
+                                    key(ActionId::Cut)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
+                            ))
+                            .child(control(
+                                "delete",
+                                Some(delete_glyph().into_any_element()),
+                                "Delete",
+                                if self.selected.is_some() {
+                                    key(ActionId::Delete)
+                                } else {
+                                    format!("{} — click a clip below first", key(ActionId::Delete))
+                                },
+                                live && self.selected.is_some(),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
+                            ))
+                            // The way back from every one of them. It was a stroke and
+                            // nothing else, which made the whole edit group a one-way
+                            // door for anyone working with a pointer.
+                            .child(control(
+                                "undo",
+                                None,
+                                "Undo",
+                                format!("{} — takes the last edit back", key(ActionId::Undo)),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
+                            ))
+                            // With the edit group, beside the buttons that change the
+                            // edit list: a track is a row of it, and adding one is an
+                            // undoable edit like the rest. Two buttons rather than one
+                            // with a choice, because the choice is the whole action.
+                            .child(control(
+                                "add-video-lane",
+                                None,
+                                "+ V",
+                                format!(
+                                    "{} — adds a video track under the ones there",
+                                    key(ActionId::AddVideoLane)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.add_lane(LaneKind::Video, cx)
+                                }),
+                            ))
+                            .child(control(
+                                "add-audio-lane",
+                                None,
+                                "+ A",
+                                format!(
+                                    "{} — adds an audio track under the ones there",
+                                    key(ActionId::AddAudioLane)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.add_lane(LaneKind::Audio, cx)
+                                }),
+                            ))
+                            // With the transport, not the edit group: it changes what
+                            // the file sounds like, never what it is. Reads as its own
+                            // state, so muted is legible without a tooltip.
+                            .child(control(
+                                "volume",
+                                None,
+                                self.volume.label(),
+                                format!(
+                                    "{} mutes · {} louder · {} quieter",
+                                    key(ActionId::ToggleMute),
+                                    key(ActionId::VolumeUp),
+                                    key(ActionId::VolumeDown)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_volume(|volume| volume.muted = !volume.muted, cx)
+                                }),
+                            ))
+                            // The level itself, to drag. The button beside it stays the
+                            // mute -- one gesture each -- and the label above is what
+                            // this writes, live, so the number follows the hand.
+                            .child(volume_slider(
+                                self.volume,
+                                self.volume_bar.clone(),
+                                live,
+                                cx,
+                            ))
+                            .child(separator())
+                            // The size every clip is composed onto, which is also the
+                            // size the export comes out at. Five sizes, so a click opens
+                            // the list of them with this one marked and picks whichever
+                            // was meant: a button that stepped one on per press made the
+                            // user click round the ladder to get back to where they
+                            // were. The stroke still steps, for the hand already on it.
+                            .child(control(
+                                "resolution",
+                                None,
+                                resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                                match resolution {
+                                    Some((w, h)) => format!(
+                                        "click to pick a size — the project is {w}x{h}; {} steps to the next",
+                                        key(ActionId::Resolution)
+                                    ),
+                                    None => format!("{} — open a file first", key(ActionId::Resolution)),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Resolution, event.position(), cx)
+                                }),
+                            ))
+                            // The rate every clip is counted in, which is also the rate
+                            // the export is written at -- the other half of "the project
+                            // is not the media", and the one the panel could only ever
+                            // read out before. A click opens the rates with this one
+                            // marked; picking one conforms the whole timeline to it.
+                            .child(control(
+                                "fps",
+                                None,
+                                match self.session.is_some() {
+                                    true => format!("{} fps", fps_label(self.fps)),
+                                    false => "Rate".to_string(),
+                                },
+                                match self.session.is_some() {
+                                    true => format!(
+                                        "click to pick a frame rate — the project is cut at {} fps",
+                                        fps_label(self.fps)
+                                    ),
+                                    false => "the project's frame rate — open a file first".to_string(),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Fps, event.position(), cx)
+                                }),
+                            ))
+                            // ...and which rendition its HDR media is watched in, the
+                            // third thing that is the project's rather than the media's.
+                            // Listed whatever is on the timeline, and the tooltip says
+                            // who it acts on: a control that came and went with the
+                            // media would be one nobody could find when they wanted it.
+                            .child(control(
+                                "tonemap",
+                                None,
+                                match &self.session {
+                                    Some(session) => format!("HDR {}", tone_label(session.tone())),
+                                    None => "HDR".to_string(),
+                                },
+                                match &self.session {
+                                    Some(session) => format!(
+                                        "click to pick the HDR rendition — the project is {}; SDR media is untouched",
+                                        tone_label(session.tone())
+                                    ),
+                                    None => "the HDR rendition — open a file first".to_string(),
+                                },
+                                live,
+                                cx.listener(|this, event: &ClickEvent, _, cx| {
+                                    this.open_picker(Pick::Tone, event.position(), cx)
+                                }),
+                            ))
+                            // How much of the timeline the panel below is showing --
+                            // beside the resolution, since neither of them edits
+                            // anything: they are both what is being looked at. The
+                            // middle one says how much of it is on the bed, and is the
+                            // way back to the whole of it.
+                            .child(control(
+                                "zoom-out",
+                                None,
+                                "−",
+                                format!(
+                                    "{} — show more of the timeline; stops with all of it on the bed",
+                                    key(ActionId::ZoomOut)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.zoom(1. / ZOOM_STEP, None, cx)
+                                }),
+                            ))
+                            .child(control(
+                                "zoom-fit",
+                                None,
+                                // How much timeline is on the bed, not a multiple of
+                                // "the whole of it": the scale no longer knows what the
+                                // whole of it is, and a number that changed on every
+                                // import was a number that lied.
+                                span_label(self.view().span()),
+                                format!(
+                                    "{} — fit the whole timeline; showing {} to {}",
+                                    key(ActionId::ZoomFit),
+                                    timecode(self.scale.start, self.fps),
+                                    timecode(
+                                        (self.scale.start + self.view().span()).min(duration),
+                                        self.fps
+                                    )
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_fit(cx)),
+                            ))
+                            .child(control(
+                                "zoom-in",
+                                None,
+                                "+",
+                                format!(
+                                    "{} — magnify around the playhead; ctrl+wheel on the bar zooms at the pointer",
+                                    key(ActionId::ZoomIn)
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
+                            ))
+                            // The magnet, beside the zoom for the zoom's own reason: it
+                            // changes nothing on the timeline, it changes how the hand
+                            // meets it. The label is the state, as the volume's is --
+                            // a toggle that looks the same either way says nothing.
+                            .child(control(
+                                "snap",
+                                None,
+                                if self.snap { "Snap" } else { "No snap" },
+                                format!(
+                                    "{} — {}",
+                                    key(ActionId::ToggleSnap),
+                                    match self.snap {
+                                        true => "drags and trims land on clip edges, the playhead and the start",
+                                        false => "drags and trims land exactly where the hand leaves them",
+                                    }
+                                ),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
+                            ))
+                            // The cues over the picture, off and on -- beside the zoom
+                            // and the snap, since like both of them it changes what is
+                            // being looked at and nothing about the edit. The label is
+                            // the state, as the snap's is, and it says what there is to
+                            // toggle when there is nothing.
+                            .child(control(
+                                "subs",
+                                None,
+                                match (self.subtitle_track().is_some(), self.subs_on) {
+                                    (false, _) => "No subs",
+                                    (true, true) => "Subs",
+                                    (true, false) => "Subs off",
+                                },
+                                match self.enable(ActionId::ToggleSubtitles, None).why() {
+                                    Some(why) => format!(
+                                        "{} — {why}; drop a .srt on the window, or open an mkv that carries them",
+                                        key(ActionId::ToggleSubtitles)
+                                    ),
+                                    None => format!(
+                                        "{} — {}",
+                                        key(ActionId::ToggleSubtitles),
+                                        match self.subs_on {
+                                            true => "the cue under the playhead is drawn over the picture",
+                                            false => "the cues are on the timeline and off the picture",
+                                        }
+                                    ),
+                                },
+                                live && self.enable(ActionId::ToggleSubtitles, None).yes(),
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_subtitles(cx)),
+                            ))
+                            // Import is not here: it belongs to the media list it adds
+                            // to, and two doors into one action is a question about
+                            // which one is the real one.
+                            //
+                            // While one runs, this button is the way out of it: the
+                            // progress line promised esc and nothing else, which left a
+                            // pointer no way to stop an export it had started.
+                            .child(control(
+                                "export",
+                                None,
+                                if exporting { "Cancel" } else { "Export" },
+                                if exporting {
+                                    format!(
+                                        "{} — stops the export; the part-written file goes",
+                                        key(ActionId::CancelExport)
+                                    )
+                                } else {
+                                    format!(
+                                        "{} — quality and destination, then writes the timeline out",
+                                        key(ActionId::Export)
+                                    )
+                                },
+                                if exporting {
+                                    true
+                                } else {
+                                    live && self.export.is_none()
+                                },
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if this.exporting().is_some() {
+                                        this.cancel_export();
+                                        cx.notify();
+                                    } else {
+                                        this.open_export(cx);
+                                    }
+                                }),
+                            ))
+                            .child(control(
+                                "save",
+                                None,
+                                "Save",
+                                format!("{} — writes the project file", key(ActionId::Save)),
+                                live,
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
+                            ))
+                            // Closed while an export runs, which is what keeps a waiting
+                            // row from swallowing the escape the progress line promises
+                            // cancels the export.
+                            .child(control(
+                                "keys",
+                                None,
+                                "Actions",
+                                // The pointer's way to every action there is, including
+                                // the ones no button here has room for.
+                                format!(
+                                    "{} — do any action, or change the key that does it",
+                                    key(ActionId::ShowActions)
+                                ),
+                                !exporting,
+                                cx.listener(|this, _: &ClickEvent, _, cx| match this.keys_open {
+                                    true => {
+                                        this.keys_open = false;
+                                        this.rebinding = None;
+                                        cx.notify();
+                                    }
+                                    false => this.show_actions(cx),
+                                }),
+                            ))
+                    )
+                    // The door to everything the row cannot show at this
+                    // window: the same card the Actions button opens, by the
+                    // same call, pinned where a scroll cannot take it.
                     .child(control(
-                        "transport",
-                        Some(transport_glyph(state).into_any_element()),
-                        if state.is_playing() { "Pause" } else { "Play" },
-                        if nothing_to_play(self.session.as_ref()) && !state.is_playing() {
-                            format!("{} — put a clip on a lane first", key(ActionId::Play))
-                        } else {
-                            key(ActionId::Play)
-                        },
-                        // An empty timeline has nothing to play, so the button
-                        // says so by being dim rather than by starting a clock
-                        // against nothing (the key press answers with the
-                        // notice). Still live while it *is* playing: a delete
-                        // can empty the timeline mid-play and that has to stop.
-                        live && (state.is_playing() || !nothing_to_play(self.session.as_ref())),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
-                    ))
-                    .child(separator())
-                    .child(control(
-                        "cut",
-                        Some(cut_glyph().into_any_element()),
-                        "Cut",
+                        "controls-more",
+                        None,
+                        "⋯",
                         format!(
-                            "{} — splits the clip under the playhead",
-                            key(ActionId::Cut)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.cut(cx)),
-                    ))
-                    .child(control(
-                        "delete",
-                        Some(delete_glyph().into_any_element()),
-                        "Delete",
-                        if self.selected.is_some() {
-                            key(ActionId::Delete)
-                        } else {
-                            format!("{} — click a clip below first", key(ActionId::Delete))
-                        },
-                        live && self.selected.is_some(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.delete_selected(cx)),
-                    ))
-                    // The way back from every one of them. It was a stroke and
-                    // nothing else, which made the whole edit group a one-way
-                    // door for anyone working with a pointer.
-                    .child(control(
-                        "undo",
-                        None,
-                        "Undo",
-                        format!("{} — takes the last edit back", key(ActionId::Undo)),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
-                    ))
-                    // With the edit group, beside the buttons that change the
-                    // edit list: a track is a row of it, and adding one is an
-                    // undoable edit like the rest. Two buttons rather than one
-                    // with a choice, because the choice is the whole action.
-                    .child(control(
-                        "add-video-lane",
-                        None,
-                        "+ V",
-                        format!(
-                            "{} — adds a video track under the ones there",
-                            key(ActionId::AddVideoLane)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.add_lane(LaneKind::Video, cx)
-                        }),
-                    ))
-                    .child(control(
-                        "add-audio-lane",
-                        None,
-                        "+ A",
-                        format!(
-                            "{} — adds an audio track under the ones there",
-                            key(ActionId::AddAudioLane)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.add_lane(LaneKind::Audio, cx)
-                        }),
-                    ))
-                    // With the transport, not the edit group: it changes what
-                    // the file sounds like, never what it is. Reads as its own
-                    // state, so muted is legible without a tooltip.
-                    .child(control(
-                        "volume",
-                        None,
-                        self.volume.label(),
-                        format!(
-                            "{} mutes · {} louder · {} quieter",
-                            key(ActionId::ToggleMute),
-                            key(ActionId::VolumeUp),
-                            key(ActionId::VolumeDown)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.set_volume(|volume| volume.muted = !volume.muted, cx)
-                        }),
-                    ))
-                    // The level itself, to drag. The button beside it stays the
-                    // mute -- one gesture each -- and the label above is what
-                    // this writes, live, so the number follows the hand.
-                    .child(volume_slider(
-                        self.volume,
-                        self.volume_bar.clone(),
-                        live,
-                        cx,
-                    ))
-                    .child(separator())
-                    // The size every clip is composed onto, which is also the
-                    // size the export comes out at. Five sizes, so a click opens
-                    // the list of them with this one marked and picks whichever
-                    // was meant: a button that stepped one on per press made the
-                    // user click round the ladder to get back to where they
-                    // were. The stroke still steps, for the hand already on it.
-                    .child(control(
-                        "resolution",
-                        None,
-                        resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
-                        match resolution {
-                            Some((w, h)) => format!(
-                                "click to pick a size — the project is {w}x{h}; {} steps to the next",
-                                key(ActionId::Resolution)
-                            ),
-                            None => format!("{} — open a file first", key(ActionId::Resolution)),
-                        },
-                        live,
-                        cx.listener(|this, event: &ClickEvent, _, cx| {
-                            this.open_picker(Pick::Resolution, event.position(), cx)
-                        }),
-                    ))
-                    // The rate every clip is counted in, which is also the rate
-                    // the export is written at -- the other half of "the project
-                    // is not the media", and the one the panel could only ever
-                    // read out before. A click opens the rates with this one
-                    // marked; picking one conforms the whole timeline to it.
-                    .child(control(
-                        "fps",
-                        None,
-                        match self.session.is_some() {
-                            true => format!("{} fps", fps_label(self.fps)),
-                            false => "Rate".to_string(),
-                        },
-                        match self.session.is_some() {
-                            true => format!(
-                                "click to pick a frame rate — the project is cut at {} fps",
-                                fps_label(self.fps)
-                            ),
-                            false => "the project's frame rate — open a file first".to_string(),
-                        },
-                        live,
-                        cx.listener(|this, event: &ClickEvent, _, cx| {
-                            this.open_picker(Pick::Fps, event.position(), cx)
-                        }),
-                    ))
-                    // ...and which rendition its HDR media is watched in, the
-                    // third thing that is the project's rather than the media's.
-                    // Listed whatever is on the timeline, and the tooltip says
-                    // who it acts on: a control that came and went with the
-                    // media would be one nobody could find when they wanted it.
-                    .child(control(
-                        "tonemap",
-                        None,
-                        match &self.session {
-                            Some(session) => format!("HDR {}", tone_label(session.tone())),
-                            None => "HDR".to_string(),
-                        },
-                        match &self.session {
-                            Some(session) => format!(
-                                "click to pick the HDR rendition — the project is {}; SDR media is untouched",
-                                tone_label(session.tone())
-                            ),
-                            None => "the HDR rendition — open a file first".to_string(),
-                        },
-                        live,
-                        cx.listener(|this, event: &ClickEvent, _, cx| {
-                            this.open_picker(Pick::Tone, event.position(), cx)
-                        }),
-                    ))
-                    // How much of the timeline the panel below is showing --
-                    // beside the resolution, since neither of them edits
-                    // anything: they are both what is being looked at. The
-                    // middle one says how much of it is on the bed, and is the
-                    // way back to the whole of it.
-                    .child(control(
-                        "zoom-out",
-                        None,
-                        "−",
-                        format!(
-                            "{} — show more of the timeline; stops with all of it on the bed",
-                            key(ActionId::ZoomOut)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.zoom(1. / ZOOM_STEP, None, cx)
-                        }),
-                    ))
-                    .child(control(
-                        "zoom-fit",
-                        None,
-                        // How much timeline is on the bed, not a multiple of
-                        // "the whole of it": the scale no longer knows what the
-                        // whole of it is, and a number that changed on every
-                        // import was a number that lied.
-                        span_label(self.view().span()),
-                        format!(
-                            "{} — fit the whole timeline; showing {} to {}",
-                            key(ActionId::ZoomFit),
-                            timecode(self.scale.start, self.fps),
-                            timecode(
-                                (self.scale.start + self.view().span()).min(duration),
-                                self.fps
-                            )
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_fit(cx)),
-                    ))
-                    .child(control(
-                        "zoom-in",
-                        None,
-                        "+",
-                        format!(
-                            "{} — magnify around the playhead; ctrl+wheel on the bar zooms at the pointer",
-                            key(ActionId::ZoomIn)
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
-                    ))
-                    // The magnet, beside the zoom for the zoom's own reason: it
-                    // changes nothing on the timeline, it changes how the hand
-                    // meets it. The label is the state, as the volume's is --
-                    // a toggle that looks the same either way says nothing.
-                    .child(control(
-                        "snap",
-                        None,
-                        if self.snap { "Snap" } else { "No snap" },
-                        format!(
-                            "{} — {}",
-                            key(ActionId::ToggleSnap),
-                            match self.snap {
-                                true => "drags and trims land on clip edges, the playhead and the start",
-                                false => "drags and trims land exactly where the hand leaves them",
-                            }
-                        ),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_snap(cx)),
-                    ))
-                    // The cues over the picture, off and on -- beside the zoom
-                    // and the snap, since like both of them it changes what is
-                    // being looked at and nothing about the edit. The label is
-                    // the state, as the snap's is, and it says what there is to
-                    // toggle when there is nothing.
-                    .child(control(
-                        "subs",
-                        None,
-                        match (self.subtitle_track().is_some(), self.subs_on) {
-                            (false, _) => "No subs",
-                            (true, true) => "Subs",
-                            (true, false) => "Subs off",
-                        },
-                        match self.enable(ActionId::ToggleSubtitles, None).why() {
-                            Some(why) => format!(
-                                "{} — {why}; drop a .srt on the window, or open an mkv that carries them",
-                                key(ActionId::ToggleSubtitles)
-                            ),
-                            None => format!(
-                                "{} — {}",
-                                key(ActionId::ToggleSubtitles),
-                                match self.subs_on {
-                                    true => "the cue under the playhead is drawn over the picture",
-                                    false => "the cues are on the timeline and off the picture",
-                                }
-                            ),
-                        },
-                        live && self.enable(ActionId::ToggleSubtitles, None).yes(),
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_subtitles(cx)),
-                    ))
-                    // Import is not here: it belongs to the media list it adds
-                    // to, and two doors into one action is a question about
-                    // which one is the real one.
-                    //
-                    // While one runs, this button is the way out of it: the
-                    // progress line promised esc and nothing else, which left a
-                    // pointer no way to stop an export it had started.
-                    .child(control(
-                        "export",
-                        None,
-                        if exporting { "Cancel" } else { "Export" },
-                        if exporting {
-                            format!(
-                                "{} — stops the export; the part-written file goes",
-                                key(ActionId::CancelExport)
-                            )
-                        } else {
-                            format!(
-                                "{} — quality and destination, then writes the timeline out",
-                                key(ActionId::Export)
-                            )
-                        },
-                        if exporting {
-                            true
-                        } else {
-                            live && self.export.is_none()
-                        },
-                        cx.listener(|this, _: &ClickEvent, _, cx| {
-                            if this.exporting().is_some() {
-                                this.cancel_export();
-                                cx.notify();
-                            } else {
-                                this.open_export(cx);
-                            }
-                        }),
-                    ))
-                    .child(control(
-                        "save",
-                        None,
-                        "Save",
-                        format!("{} — writes the project file", key(ActionId::Save)),
-                        live,
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.save_project(cx)),
-                    ))
-                    // Closed while an export runs, which is what keeps a waiting
-                    // row from swallowing the escape the progress line promises
-                    // cancels the export.
-                    .child(control(
-                        "keys",
-                        None,
-                        "Actions",
-                        // The pointer's way to every action there is, including
-                        // the ones no button here has room for.
-                        format!(
-                            "{} — do any action, or change the key that does it",
+                            "{} — every action, including the ones scrolled off this row",
                             key(ActionId::ShowActions)
                         ),
                         !exporting,
@@ -6962,7 +7009,7 @@ impl Player {
                     row()
                         .child(f.label)
                         // Dim, and no hover: this one is not a row you can click.
-                        .child(div().text_color(rgb(INK_DIM)).child(f.chord))
+                        .child(div().text_color(rgb(INK_DIM)).child(f.chord.clone()))
                         .into_any_element()
                 }
             });
@@ -7343,6 +7390,45 @@ impl Player {
         )
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
         .into_any_element();
+        // The card's own two layout switches. They were `g` and `r` and nothing
+        // else, while the status line under the title advertised both of them:
+        // a hand on the mouse read what they do and had nothing to press.
+        list.push(
+            entry(
+                ("export-layout", 0),
+                "g",
+                "Layout".into(),
+                match self.export_grouped {
+                    true => "sections — g for one flat list".into(),
+                    false => "one flat list — g for sections".into(),
+                },
+                self.export_grouped,
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.export_grouped = !this.export_grouped;
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
+        list.push(
+            entry(
+                ("export-refusals", 0),
+                "r",
+                "Codecs with no encoder".into(),
+                match self.export_refusals_inline {
+                    true => "a dimmed row each — r collapses them".into(),
+                    false => "one line at the foot — r shows a row each".into(),
+                },
+                self.export_refusals_inline,
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.export_refusals_inline = !this.export_refusals_inline;
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
         match self.export_grouped {
             true => list.push(destination),
             // Flat: the same rows with no headers over them, and the
@@ -9634,36 +9720,45 @@ impl Player {
                             // them, which is what keeps one gesture one thing:
                             // a press here trims, a press anywhere else on the
                             // box still starts the move to another lane.
-                            .children([Edge::Start, Edge::End].map(|edge| {
-                                let mut zone = div()
-                                    .absolute()
-                                    .top_0()
-                                    .h_full()
-                                    .w(px(EDGE_W))
-                                    .occlude()
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                                    .hover(|s| s.bg(rgb(ACCENT)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                            this.start_trim(lane, i, edge, cx);
-                                        }),
-                                    )
-                                    // Occluded, so the box's own right-button
-                                    // listener never fires here: the menu is
-                                    // the same menu, opened by the same call.
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            this.open_menu(lane, i, event.position, cx);
-                                        }),
-                                    );
-                                zone = match edge {
-                                    Edge::Start => zone.left_0(),
-                                    Edge::End => zone.right_0(),
-                                };
-                                zone
-                            }))
+                            .children(
+                                [Edge::Start, Edge::End]
+                                    .into_iter()
+                                    .filter(|_| trims(width))
+                                    .map(|edge| {
+                                        let mut zone = div()
+                                            .absolute()
+                                            .top_0()
+                                            .h_full()
+                                            .w(px(EDGE_W))
+                                            .occlude()
+                                            .cursor(CursorStyle::ResizeLeftRight)
+                                            .hover(|s| s.bg(rgb(ACCENT)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, _: &MouseDownEvent, _, cx| {
+                                                        this.start_trim(lane, i, edge, cx);
+                                                    },
+                                                ),
+                                            )
+                                            // Occluded, so the box's own right-button
+                                            // listener never fires here: the menu is
+                                            // the same menu, opened by the same call.
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.open_menu(lane, i, event.position, cx);
+                                                    },
+                                                ),
+                                            );
+                                        zone = match edge {
+                                            Edge::Start => zone.left_0(),
+                                            Edge::End => zone.right_0(),
+                                        };
+                                        zone
+                                    }),
+                            )
                             // Under the label row, never through it.
                             .children(wave.filter(|_| audio && vis_w > 0.).and_then(|wave| {
                                 let inner: AnyElement = match wave {
@@ -13179,7 +13274,7 @@ mod tests {
         whole_take, window_title,
     };
     use super::{
-        Choice, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
+        Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
         Scale, View,
         ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
@@ -13188,7 +13283,7 @@ mod tests {
         Landing, arrival, launch_queue,
         read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
-        trimmed_clip, unscannable,
+        trimmed_clip, trims, unscannable,
         visible_slice,
     };
     use super::{
@@ -13805,6 +13900,25 @@ mod tests {
             "export-confirm",
         ] {
             assert!(element(id), "{id} is not on any card");
+        }
+        // ...and each one is named by the row that carries its stroke, so a
+        // card-local key added to `FIXED` with nothing to click fails here
+        // instead of being noticed by whoever tries to use the card without a
+        // keyboard. `KeyRow::Fixed` is "shown and never offered", which used to
+        // mean the twenty-eight rows below were the one part of this editor no
+        // reachability test read.
+        for fixed in keymap::FIXED.iter() {
+            match fixed.reach {
+                keymap::Reach::Click(id) => assert!(
+                    element(id),
+                    "{:?} ({}) points at {id}, which is on no card",
+                    fixed.chord,
+                    fixed.label
+                ),
+                // Nothing to click by decision, not by omission: getting out of
+                // a card, and the hold that repeats what a drag already does.
+                keymap::Reach::Gesture => {}
+            }
         }
     }
 
@@ -14772,7 +14886,7 @@ mod tests {
         for action in ActionId::ALL {
             assert!(keymap::Category::ALL.contains(&action.category()));
         }
-        for fixed in &keymap::FIXED {
+        for fixed in keymap::FIXED.iter() {
             assert!(keymap::Category::ALL.contains(&fixed.category));
         }
     }
@@ -17303,6 +17417,45 @@ mod tests {
         assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
     }
 
+    /// The panel's button row against the 640x360 floor the whole editor is
+    /// measured at. It does not fit and cannot be made to -- so what it may
+    /// never do is *hide* the tail: the row scrolls, and the door to everything
+    /// scrolled off it is pinned outside the scrolling box.
+    #[test]
+    fn toolbar_fits_the_smallest_window() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let panel = &source[source.find("    fn panel(").expect("the panel")
+            ..source.find("    fn import_bar(").expect("the panel's end")];
+        // Every button in the row is a hit target, so none of them is narrower
+        // than `HIT_MIN`, and they sit in 8 px gaps inside the panel's own
+        // 12 px padding. The level slider is the one fixed width among them.
+        let buttons = panel.matches("control(").count();
+        assert!(buttons >= 15, "the row's buttons moved; this scan is blind");
+        let row_w = buttons as f32 * (HIT_MIN + 8.) + VOLUME_W + 24.;
+        assert!(
+            row_w > 640.,
+            "{row_w} px of buttons now fits the floor -- the pinned door may go"
+        );
+        // So Export, Save and Actions are off the right edge at that width, and
+        // "it scrolls" is not "it can be found": this is the button that never
+        // scrolls, and the card it opens carries every action there is
+        // (`every_action_is_on_the_actions_card`).
+        assert!(
+            panel.contains("\"controls-more\""),
+            "nothing pinned beside the scrolling row: the tail is unreachable at 640 px"
+        );
+        // ...and it is outside the scrolling box, which is the whole point of
+        // it: one `overflow_x_scroll`, and the door is written after it closes.
+        assert_eq!(panel.matches("overflow_x_scroll").count(), 1);
+        assert!(
+            panel.find("\"controls-more\"") > panel.find("overflow_x_scroll"),
+            "the pinned door is inside the row it is meant to outlive"
+        );
+    }
+
     #[test]
     fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
         // Every hit target in the panel, including the scrub strip -- whose bar
@@ -17310,6 +17463,24 @@ mod tests {
         assert!(CONTROL_H >= HIT_MIN);
         assert!(RULER_HIT_H >= HIT_MIN);
         assert!(LANE_H >= HIT_MIN);
+        // A clip box is a hit target too, and its two trim strips occlude it:
+        // on a box narrower than the pair there is no body left to press, so
+        // the clip cannot be selected, dragged or menued at all -- which is
+        // every clip a jumpcut leaves at a normal zoom. Below three handles
+        // there are no strips.
+        assert!(!trims(0.));
+        assert!(!trims(EDGE_W));
+        assert!(!trims(2. * EDGE_W), "a box that is all handle and no clip");
+        assert!(!trims(3. * EDGE_W - 0.1));
+        // And where they are drawn, what is left between them is a hit target
+        // in its own right -- a whole handle's width of clip.
+        for width in [3. * EDGE_W, 24., 100., 4000.] {
+            assert!(trims(width));
+            assert!(
+                width - 2. * EDGE_W >= EDGE_W,
+                "{width} px of box leaves no middle"
+            );
+        }
     }
 
     /// WCAG 2.1 relative luminance of a packed `0xRRGGBB`.
