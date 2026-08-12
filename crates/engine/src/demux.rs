@@ -55,6 +55,16 @@ impl Codec {
             name = self.name()
         )
     }
+
+    /// The other refusal: the plugin *is* here and opened the file, and then
+    /// could not decode a picture out of it. Not a missing decoder, and saying
+    /// so would send the user installing something they already have.
+    pub fn undecodable(self) -> String {
+        format!(
+            "this {name} stream cannot be decoded — the VA-API plugin opened it, gave no picture",
+            name = self.name()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

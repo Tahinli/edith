@@ -118,11 +118,10 @@ pub fn probe(path: &Path) -> crate::Result<(Option<Codec>, Backend)> {
     }
     let path = path.to_path_buf();
     let (meta, _demuxer) = Demuxer::open(&path)?;
-    if open_hw(&path, 0).is_some() {
-        return Ok((Some(meta.codec), Backend::Hardware));
-    }
-    if meta.codec != Codec::H264 {
-        return Err(meta.codec.needs_plugin().into());
+    match hw_decodes(&path, 0, meta.codec) {
+        Ok(()) => return Ok((Some(meta.codec), Backend::Hardware)),
+        Err(e) if meta.codec != Codec::H264 => return Err(e.into()),
+        Err(_) => {}
     }
     Ok((Some(meta.codec), Backend::Software))
 }
@@ -408,10 +407,11 @@ impl DecodeSession {
         // No software HEVC or VP9 decoder exists, so such a file the plugin will
         // not take is refused *here*, where the caller still has somewhere to
         // show it -- a worker that opened and then produced nothing is a black
-        // screen with no explanation. The probe session is opened and dropped:
-        // it costs one extra VA-API init (~90 ms) and only off the H.264 path.
-        if meta.codec != Codec::H264 && open_hw(&path, start_frame).is_none() {
-            return Err(meta.codec.needs_plugin().into());
+        // screen with no explanation. The probe session is opened, made to
+        // decode one picture and dropped: it costs one extra VA-API init
+        // (~90 ms) plus that frame, and only off the H.264 path.
+        if meta.codec != Codec::H264 {
+            hw_decodes(&path, start_frame, meta.codec)?;
         }
         let end_frame = end_frame.min(meta.frame_count);
         // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
@@ -861,6 +861,23 @@ fn open_hw(path: &PathBuf, start_frame: u32) -> Option<HwSession> {
         return None;
     }
     HwSession::open_at(path, start_frame)
+}
+
+/// `Ok` when the plugin really decodes this file: it opens *and* hands back a
+/// first picture. Opening only reads the container -- a stream the vendored
+/// bitstream parser dies on (a 2160p wavefront HEVC did, for one) opens fine and
+/// then produces nothing, which reaches the user as a black picture with an
+/// instant `eof` unless the door asks for that first frame. Costs one decoded
+/// frame per probe.
+///
+/// The `Err` says which half failed, because "there is no decoder for this
+/// codec" and "the decoder here would not take this stream" are different
+/// refusals and a user acts on them differently.
+fn hw_decodes(path: &PathBuf, start_frame: u32, codec: Codec) -> Result<(), String> {
+    let Some(mut hw) = open_hw(path, start_frame) else {
+        return Err(codec.needs_plugin());
+    };
+    hw.next_frame().map(|_| ()).map_err(|_| codec.undecodable())
 }
 
 /// Returns whether the session was handled; `false` only when hardware decode
