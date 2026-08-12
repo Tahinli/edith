@@ -4274,7 +4274,7 @@ impl Player {
             file_name(&import.path)
         );
         eprintln!("{text}");
-        self.notice = Some(text.into());
+        self.notify_user(text.into());
         cx.notify();
     }
 
