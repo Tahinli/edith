@@ -475,6 +475,20 @@ ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
     -f lavfi -i "anullsrc=r=48000:cl=quad:d=3" \
     -filter_complex "[0:a][1:a][2:a]join=inputs=3:channel_layout=5.1:map=0.0-FL|2.0-FR|2.1-FC|2.2-LFE|2.3-BL|1.0-BR[a]" \
     -map "[a]" -c:a libopus -b:a 256k assets/test_opus_51.mka
+# ...and **7.1 Opus**, which is his largest film's soundtrack in miniature: five
+# Opus streams, three coupled, and the widest layout the fold has a table for.
+# One frequency per channel, four of the eight carrying anything, so the whole
+# downmix is checkable by picking those four out of the folded pair
+# (`tests/audio_multi.rs`): 440 in FL is left only, 880 in FC is both sides at
+# -3 dB, 1320 in the LFE must be *gone*, and 1760 in SR is right only. Get the
+# Vorbis-to-film permutation wrong at this width and every one of those moves.
+ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=880:duration=3:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=1320:duration=3:sample_rate=48000" \
+    -f lavfi -i "sine=frequency=1760:duration=3:sample_rate=48000" \
+    -f lavfi -i "anullsrc=r=48000:cl=quad:d=3" \
+    -filter_complex "[0:a][1:a][2:a][3:a][4:a]join=inputs=5:channel_layout=7.1:map=0.0-FL|4.0-FR|1.0-FC|2.0-LFE|4.1-BL|4.2-BR|4.3-SL|3.0-SR[a]" \
+    -map "[a]" -c:a libopus -b:a 320k assets/test_opus_71.mka
 # Still-image fixture: the source with a picture and no timeline in it. Two
 # bands rather than one colour, so a test can tell top from bottom (a flipped
 # decode) and red from blue (a swapped channel order); 640x360, which is 16:9

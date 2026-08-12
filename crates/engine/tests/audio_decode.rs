@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine::audio::AudioSession;
 use engine::scratch::Scratch;
@@ -241,6 +241,204 @@ fn opus_decodes_from_every_container_and_51_comes_down_in_order() {
         assert!(
             (got - want).abs() <= 0.05 * want,
             "{name}: {got} zero crossings, want {want} +/-5% -- a decode this far off is noise"
+        );
+    }
+}
+
+/// The amplitude of an `hz` sine inside `samples`, by Goertzel. The window is a
+/// whole second at 48 kHz, so every frequency this asks about is an exact bin
+/// and there is no leakage to correct for; a real sine of amplitude A puts
+/// `A * N / 2` in its bin.
+fn amplitude(samples: &[f32], hz: f64) -> f64 {
+    let n = samples.len() as f64;
+    let w = 2.0 * std::f64::consts::PI * hz / 48_000.0;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0, 0.0);
+    for &sample in samples {
+        let s0 = f64::from(sample) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    2.0 * (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt() / n
+}
+
+/// **7.1 Opus**, the widest layout the fold has a table for and the one his
+/// largest film carries: five Opus streams, three coupled, arriving on the
+/// timeline as an ordinary stereo source instead of the import refusal it used
+/// to be ("unsupported channel layout: 8 channels (max stereo)").
+///
+/// The fixture puts one frequency in each of four channels and silence in the
+/// rest (`gen_fixtures.sh`), so the whole downmix is one measurement: 440 in FL
+/// is left only, 880 in FC is both sides at -3 dB, 1320 in the LFE must be gone
+/// entirely, and 1760 in SR is right only. Every coefficient and the whole
+/// Vorbis-to-film permutation at this width fail visibly here.
+#[test]
+fn seven_one_opus_folds_to_the_stereo_the_timeline_carries() {
+    let path = asset("test_opus_71.mka");
+    let streams = AudioSession::probe_streams(&path).expect("streams");
+    assert_eq!(streams.len(), 1);
+    assert!(streams[0].decodable, "a 7.1 row is not greyed out any more");
+    assert_eq!(streams[0].channels, 2, "what reaches the timeline is a pair");
+
+    let (meta, rx) = AudioSession::open(&path)
+        .expect("open")
+        .expect("7.1 Opus decodes now");
+    assert_eq!((meta.sample_rate, meta.channels), (48000, 2));
+    let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    assert!(
+        samples.iter().all(|s| s.abs() <= 1.0),
+        "the fold must not leave the device's range"
+    );
+    // One whole second out of the middle, past any codec fade-in.
+    let second = |channel: usize| -> Vec<f32> {
+        samples[channel..]
+            .iter()
+            .step_by(2)
+            .skip(48_000)
+            .take(48_000)
+            .copied()
+            .collect()
+    };
+    // 1 + 3 * (-3 dB): FL/FR keep their side, FC and both surround pairs are the
+    // three that join it. Nothing may come out above full scale, which is what
+    // dividing by the coefficient sum buys.
+    let norm = 1.0 + 3.0 * f64::from(std::f32::consts::FRAC_1_SQRT_2);
+    let c = f64::from(std::f32::consts::FRAC_1_SQRT_2);
+    let (left, right) = (second(0), second(1));
+    // FL is the one channel that keeps its side at unity, so what it comes out
+    // as names the tone the fixture was written with -- `sine` peaks at 0.125 in
+    // ffmpeg, and reading that off the fold rather than hard-coding it keeps the
+    // coefficients below the claim instead of the generator's level. A fold that
+    // lost FL, or scaled the pair, leaves this band.
+    let source = amplitude(&left, 440.0) * norm;
+    assert!(
+        (0.10..0.15).contains(&source),
+        "FL came out as a {source:.4} tone; the fixture's is 0.125"
+    );
+    for (side, cut, want) in [
+        ("left", &left, [(440.0, 1.0), (880.0, c), (1320.0, 0.0), (1760.0, 0.0)]),
+        ("right", &right, [(440.0, 0.0), (880.0, c), (1320.0, 0.0), (1760.0, c)]),
+    ] {
+        for (hz, coeff) in want {
+            let got = amplitude(cut, hz);
+            let expect = source * coeff / norm;
+            match coeff {
+                // The LFE, and the channels this side has none of: what is left
+                // is codec noise and bleed, an order below the quietest tone.
+                0.0 => assert!(
+                    got < 0.1 * source / norm,
+                    "{side}: {hz} Hz came through at {got:.4}, and nothing there should"
+                ),
+                _ => assert!(
+                    (got - expect).abs() < 0.15 * expect,
+                    "{side}: {hz} Hz at {got:.4}, want {expect:.4} +/-15%"
+                ),
+            }
+        }
+    }
+}
+
+/// His own 7.1 remux, which is the file this whole change exists for: 12.9 GB of
+/// 2160p AV1 with an 8-channel Opus track that used to come back "IMPORT FAILED:
+/// unsupported channel layout: 8 channels (max stereo)" and take the picture
+/// with it.
+///
+/// Skipped, not failed, on a machine that does not have the film: a fixture
+/// cannot stand in for the claim (the refusal was measured on *this* file) and a
+/// test that cannot make it must say nothing rather than something false.
+#[test]
+fn his_seven_one_remux_imports_and_plays() {
+    let film = PathBuf::from(
+        "/path/to/a-real-av1-opus-7.1-film.mkv",
+    );
+    if !film.exists() {
+        eprintln!("skipped: {} is not on this machine", film.display());
+        return;
+    }
+    // The import gate itself: this is the call whose `Err` the app printed.
+    let probe = AudioSession::probe(&film, 0)
+        .expect("the 7.1 track no longer refuses the import")
+        .expect("the film has audio");
+    assert_eq!(
+        (probe.sample_rate, probe.channels),
+        (48_000, 2),
+        "7.1 reaches the timeline as a pair"
+    );
+    // ...and every one of its three tracks is offered, none greyed out.
+    let streams = AudioSession::probe_streams(&film).expect("streams");
+    assert_eq!(streams.len(), 3, "7.1 plus two 5.1 commentary tracks");
+    assert!(
+        streams.iter().all(|s| s.decodable && s.channels == 2),
+        "{streams:?}"
+    );
+
+    // Ten seconds out of the middle of the film, through the very worker
+    // playback and a WAV export both feed from -- with sound on *both* sides,
+    // which a fold that dropped half the layout would not have.
+    let (meta, rx) = AudioSession::open_segments(&film, &[(600.0, 610.0)])
+        .expect("open")
+        .expect("the film has audio");
+    assert_eq!((meta.sample_rate, meta.channels), (48_000, 2));
+    let samples: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let secs = (samples.len() / 2) as f64 / 48_000.0;
+    assert!((9.9..10.1).contains(&secs), "{secs:.3} s decoded, want 10");
+    assert!(
+        samples.iter().all(|s| s.abs() <= 1.0),
+        "the fold must not leave the device's range"
+    );
+    for (side, channel) in [("left", 0), ("right", 1)] {
+        let one: Vec<f64> = samples[channel..].iter().step_by(2).map(|s| f64::from(*s)).collect();
+        let rms = (one.iter().map(|s| s * s).sum::<f64>() / one.len() as f64).sqrt();
+        assert!(rms > 0.001, "{side} came out silent: RMS {rms:.6}");
+        eprintln!("{side}: RMS {rms:.6} over {secs:.2}s from 600s");
+    }
+
+    // ...and the whole way out: the file on a timeline, trimmed to ten seconds,
+    // written as a WAV by the export path and read back through this engine's
+    // own reader. A session open is what the app's Import does, so a picture
+    // this size failing to open would fail here rather than in his hands.
+    let mut session = engine::PlaybackSession::open(&film).expect("the film opens as a timeline");
+    assert_eq!(
+        session.audio_disabled_reason(),
+        None,
+        "a track that decodes owes no excuse"
+    );
+    let frames = (10.0 * session.meta().frame_rate).round() as u32;
+    for lane in session.lanes() {
+        session.trim_clip(lane, 0, engine::project::Edge::End, frames);
+    }
+    let out = Scratch::file("ve_seven_one", "wav");
+    let handle = session.export_to_with(
+        &out,
+        &engine::export::ExportSettings {
+            format: engine::export::Format::Wav,
+            ..Default::default()
+        },
+    );
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(started.elapsed() < Duration::from_secs(300), "export hung");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    handle.result().expect("outcome").expect("the WAV is written");
+    let (wav, rx) = AudioSession::open(&out)
+        .expect("the WAV reopens")
+        .expect("it has sound");
+    let written: Vec<f32> = rx.into_iter().flat_map(|c| c.samples).collect();
+    let channels = usize::from(wav.channels);
+    assert_eq!(channels, 2, "a stereo WAV out of a 7.1 source");
+    for (side, channel) in [("left", 0), ("right", 1)] {
+        let one: Vec<f64> = written[channel..]
+            .iter()
+            .step_by(channels)
+            .map(|s| f64::from(*s))
+            .collect();
+        let rms = (one.iter().map(|s| s * s).sum::<f64>() / one.len() as f64).sqrt();
+        assert!(rms > 0.001, "the exported {side} is silent: RMS {rms:.6}");
+        eprintln!(
+            "exported {side}: RMS {rms:.6} over {:.2}s at {} Hz",
+            one.len() as f64 / f64::from(wav.sample_rate),
+            wav.sample_rate
         );
     }
 }

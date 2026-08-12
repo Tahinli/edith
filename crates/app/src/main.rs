@@ -11826,11 +11826,14 @@ fn unusable(info: &StreamInfo, timeline_audio: Option<(u32, u16)>) -> Option<Str
             codec => format!("{codec} is not supported"),
         });
     }
-    let (rate, channels) = timeline_audio?;
-    ((info.sample_rate, info.channels) != (rate, channels)).then(|| {
+    // The **layout** and not the rate, which is what the engine's own gate now
+    // asks (`PlaybackSession::import`): a stream written at another sample rate
+    // is resampled onto the timeline's at the decoder's door, so greying its row
+    // would be this picker refusing what the timeline accepts.
+    let (_, channels) = timeline_audio?;
+    (info.channels != channels).then(|| {
         format!(
-            "the timeline is {} kHz {}",
-            f64::from(rate) / 1000.,
+            "the timeline is {}",
             layout(channels).unwrap_or_else(|| "silent".to_string())
         )
     })
@@ -14226,7 +14229,7 @@ mod tests {
         Landing, arrival, launch_queue,
         read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
-        clip_width, trimmed_clip, trims, unscannable,
+        clip_width, trimmed_clip, trims, unscannable, unusable,
         visible_slice,
     };
     use super::{
@@ -14447,13 +14450,17 @@ mod tests {
         assert_eq!(rows[1].name, "movie.mp4 [audio 2]");
         assert_eq!(rows[1].detail, "fra 44.1 kHz stereo");
         // Placeable: the one already on the timeline, and the one that matches
-        // it. The 22 kHz mono track cannot join a 44.1 kHz stereo timeline --
-        // one device and one copied AAC track for the whole of it -- and the
-        // codec we cannot read cannot join anything. Both say which.
+        // it. The mono track cannot join a stereo timeline -- one device and one
+        // copied AAC track for the whole of it -- and the codec we cannot read
+        // cannot join anything. Both say which. Its 22 kHz is *not* part of that
+        // any more: a rate of its own is resampled at the decoder's door, and a
+        // row greyed for one the engine accepts is this picker telling a lie.
         assert_eq!((&rows[0].unusable, &rows[1].unusable), (&None, &None));
+        assert_eq!(rows[2].unusable.as_deref(), Some("the timeline is stereo"));
         assert_eq!(
-            rows[2].unusable.as_deref(),
-            Some("the timeline is 44.1 kHz stereo")
+            unusable(&info(9, 48_000, 2, None, true), Some((44_100, 2))),
+            None,
+            "48 kHz stereo joins a 44.1 kHz stereo timeline"
         );
         assert_eq!(rows[3].unusable.as_deref(), Some("unsupported codec"));
         assert_eq!(
