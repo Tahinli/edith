@@ -1620,10 +1620,19 @@ impl Player {
         // same controls sat dim and *dead* to the pointer. Whatever refuses the
         // button refuses the key, in the oracle's own words -- and a refusal
         // that is silent from the keyboard is a bug the same size.
-        if let Some(why) = self.enable(action, None).why() {
-            self.notice = Some(format!("{} — {why}", action.label()).into());
-            cx.notify();
-            return;
+        match self.enable(action, None) {
+            Enable::Yes => {}
+            // A state refusal is spoken: the thing exists and cannot happen
+            // *now*, which is exactly what a silent key press fails to say.
+            Enable::No(why) => {
+                self.notice = Some(format!("{} — {why}", action.label()).into());
+                cx.notify();
+                return;
+            }
+            // A class refusal is not: the action does not exist for what is in
+            // front of the user, and `esc` with nothing exporting must not
+            // answer with a line about exports.
+            Enable::Hidden(_) => return,
         }
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
@@ -5844,25 +5853,47 @@ impl Render for Player {
                                     )
                                     // After the picture, so the plate is drawn
                                     // over it rather than under.
-                                    .children(self.subtitle_overlay(position, window)),
+                                    .children(self.subtitle_overlay(position, window))
+                                    // The three transient lines hang off the
+                                    // bottom of the picture rather than taking
+                                    // a row of the column: a notice that
+                                    // arrives must not push the transport, the
+                                    // toolbar and the timeline down by its own
+                                    // height -- which is a control moving with
+                                    // state, on every control below it at once.
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .bottom_0()
+                                            .left_0()
+                                            .right_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .children(self.import_bar(cx))
+                                            .children(self.seek_bar())
+                                            .children(self.notice_bar(cx)),
+                                    ),
                             )
-                            .child(self.transport_bar(position, state, cx)),
+                            .child(self.transport_bar(
+                                position,
+                                state,
+                                f32::from(window.viewport_size().width),
+                                cx,
+                            )),
                     )
                     // The settings cards live in here rather than over the
                     // timeline: adjusting a clip must not hide the clip.
                     .child(self.inspector(window.viewport_size(), cx)),
             )
-            // Above the toolbar and only when there is one to show, so it costs
-            // the picture nothing the rest of the time. The import's line sits
-            // over the notice's: a notice is about something that has already
-            // happened, and this is about something still happening.
-            .children(self.import_bar(cx))
-            // The same slot and the same reason: work still going on, said out
-            // loud because a still picture is the only other evidence of it.
-            .children(self.seek_bar())
-            .children(self.notice_bar(cx))
             .child(self.toolbar(cx))
-            .child(self.timeline(position, duration, state, cx))
+            .child(self.timeline(
+                position,
+                duration,
+                state,
+                f32::from(window.viewport_size().height),
+                cx,
+            ))
             // Over the region they were opened on, and under the modal cards:
             // they are only ever up while none of those is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
@@ -6902,7 +6933,10 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
         ActionId::ToggleSubtitles | ActionId::RemoveSubtitleTrack if !ctx.subtitles => {
             Enable::No("no subtitles yet")
         }
-        ActionId::CancelExport => Enable::No("nothing is exporting"),
+        // Not `No`: with nothing running there is no export for this to be
+        // about at all, which is what keeps `esc` -- the same key -- a quiet
+        // way out of a card rather than a line about exports.
+        ActionId::CancelExport => Enable::Hidden("nothing is exporting"),
         // A clock started against an empty timeline is a clock counting
         // nothing: the transport says so by being dim, which is what its own
         // ad-hoc boolean used to say before the oracle knew the question.
@@ -8292,6 +8326,11 @@ fn timeline_h(lanes: usize) -> f32 {
 /// between the three rows, with a couple of px of slack so a taller text line
 /// cannot push a lane off the bottom.
 const TIMELINE_FIXED_H: f32 = 16. + 18. + 8. + RULER_HIT_H + 8. + 4.;
+
+/// The most of a short window the timeline may take. At the 640x360 floor that
+/// is 151 px of the 360, which leaves the picture a region rather than a
+/// letterbox stripe -- and the lanes scroll inside it.
+const TIMELINE_SHARE: f32 = 0.42;
 
 /// The edit toolbar directly above the timeline: one control's height in its
 /// own padding, fixed so nothing in it can push the timeline down.
