@@ -28,7 +28,30 @@ mp4 = "0.14"
 # pulls this exact version in through `png`, and it is the pure-Rust inflate the
 # rest of the ecosystem is built on.
 miniz_oxide = "0.8"
-rusty_h264 = { version = "0.8", default-features = false }
+# The software H.264 pair, and the only software decoder this project has for
+# any format. Pinned exactly, like `ruopus` and `oxideav-ac3` below, because a
+# decoder is a bit-exactness dependency -- and 0.9.1 is where that stopped being
+# a figure of speech. Measured 2026-08-12 against ffmpeg's own decode of a 1080p
+# High and a 720p Main clip, 750 pictures between them: 0.8 matched it
+# byte-for-byte on 26 of the 750 and drifted on the rest (worst 69.8 dB PSNR --
+# invisible, but wrong); 0.9.1 matches on all 750. It is also 1.44x faster at it
+# (247 Mpx/s against 171 on the 1080p clip, single-threaded); software *encode*
+# is unchanged within noise, so this is a decode bump that the encoder came
+# along with. `default-features = false` is what keeps `asm` off: those are
+# vendored openh264 SIMD kernels that want `nasm` at build time, which this
+# project's no-install rule forbids, and the crate enables them by default.
+#
+# What that line does not turn off, and cannot: the facade asks for its three
+# sub-crates with *their* defaults, and `rusty_h264-common`'s default installs
+# `rusty_alloc` -- a pure-Rust mimalloc remake, MIT -- as the process-wide
+# `#[global_allocator]`, for the whole application rather than the codec. No
+# feature choice downstream switches it back off; only a vendored `common`
+# would. It is not a regression to pay for: the same 2M-allocation churn runs in
+# 0.104 s under it against 0.142 s under glibc's, so it stays, and this
+# paragraph is the disclosure. Frame-threaded decode arrived in 0.9 as well and
+# is opt-in through `RS_H264_FRAME_THREADS`, unset here -- the decode loop is
+# serial exactly as it was.
+rusty_h264 = { version = "=0.9.1", default-features = false }
 # Both halves of AAC, and the only crate here that is asked for both. The
 # *encoder*, so an mp4's sound can be a mix rather than a copy: an equalized (or
 # otherwise processed) lane has to be decoded, and what is decoded has to be
