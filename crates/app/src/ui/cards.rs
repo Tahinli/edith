@@ -747,7 +747,7 @@ impl Player {
         // corner as the 20 Hz tick, and the two lines above it (+6 and -6)
         // already say what the box is worth per pixel.
         Some(
-            scrim()
+            drag_scrim(cx)
                 .flex()
                 .justify_center()
                 .items_center()
@@ -1085,7 +1085,7 @@ impl Player {
             })
             .collect();
         Some(
-            scrim()
+            drag_scrim(cx)
                 .flex()
                 .justify_center()
                 .items_center()
@@ -1202,7 +1202,7 @@ impl Player {
             })
             .collect();
         Some(
-            scrim()
+            drag_scrim(cx)
                 .flex()
                 .justify_center()
                 .items_center()
