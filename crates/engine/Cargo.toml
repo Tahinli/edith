@@ -44,11 +44,13 @@ miniz_oxide = "0.8"
 # What that line does not turn off, and cannot: the facade asks for its three
 # sub-crates with *their* defaults, and `rusty_h264-common`'s default installs
 # `rusty_alloc` -- a pure-Rust mimalloc remake, MIT -- as the process-wide
-# `#[global_allocator]`, for the whole application rather than the codec. No
-# feature choice downstream switches it back off; only a vendored `common`
-# would. It is not a regression to pay for: the same 2M-allocation churn runs in
-# 0.104 s under it against 0.142 s under glibc's, so it stays, and this
-# paragraph is the disclosure. Frame-threaded decode arrived in 0.9 as well and
+# `#[global_allocator]`, for the whole application rather than the codec. It was
+# faster on a synthetic 2M-allocation churn (0.104 s against glibc's 0.142 s)
+# and it crashed the editor: sustained scrubbing churns decode-worker threads,
+# and it segfaulted on a new thread's *first* allocation. `common` is therefore
+# vendored with that declaration removed (workspace root `[patch.crates-io]`),
+# which is the only way to decline it -- the codec itself is untouched and still
+# bit-exact. Frame-threaded decode arrived in 0.9 as well and
 # is opt-in through `RS_H264_FRAME_THREADS`, unset here -- the decode loop is
 # serial exactly as it was.
 rusty_h264 = { version = "=0.9.1", default-features = false }
