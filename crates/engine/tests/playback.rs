@@ -7,6 +7,8 @@
 //! cargo test -p engine --release --test playback -- --nocapture
 //! ```
 
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -372,6 +374,88 @@ fn seek_keeps_the_audio_clock() {
         drain_to_eof(&mut session).1.or(second),
         Some(meta.frame_count - 1),
         "second run did not finish"
+    );
+}
+
+/// Drops `path` out of the page cache, so the next read of it is a real disk
+/// read. `posix_fadvise(POSIX_FADV_DONTNEED)`, glibc's own and declared here
+/// rather than pulled in as a dependency for one call.
+fn evict(path: &Path) {
+    unsafe extern "C" {
+        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+    }
+    let file = File::open(path).expect("open to evict");
+    // 0 length is "to the end of the file"; 4 is POSIX_FADV_DONTNEED on Linux.
+    let rc = unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, 4) };
+    assert_eq!(rc, 0, "could not evict {}", path.display());
+}
+
+/// What a seek costs the *caller* when the sound has to be opened again off a
+/// cold page cache -- the audio half of the move
+/// [`a_storm_of_seeks_stays_bounded_and_the_last_one_wins`] measures for the
+/// picture. That open is a `pread` per track (21 s on a cold 25 GB film,
+/// measured at the seat) and it used to run on whoever called `seek`, which in
+/// the editor is the thread that paints: one ruler click froze the window for
+/// the whole of it. On the feeder it is a thread spawn, whatever the file.
+///
+/// And the clock still anchors on the first real sample, which is the invariant
+/// the wait threatens: the timeline holds where the seek put it for however
+/// long the open takes, and starts counting from *there* rather than from the
+/// silence the device played meanwhile.
+///
+/// `assets/test_av.mp4` by default, which makes this a regression guard;
+/// `EDITH_COLD_FILM=<a big film>` makes it the measurement.
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn a_cold_audio_open_does_not_block_the_seek() {
+    let path = std::env::var_os("EDITH_COLD_FILM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| asset("test_av.mp4"));
+    let mut session = open(&path);
+    let target = session.timeline_duration() * 0.5;
+    let mut last_index = None;
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+
+    // The seek's own reads and nothing else: the open above warmed every byte
+    // of this file that anything here touches.
+    evict(&path);
+    let issued = Instant::now();
+    session.seek(target);
+    let blocked = issued.elapsed();
+    eprintln!(
+        "cold seek on {}: caller blocked {blocked:?}",
+        path.display()
+    );
+    assert!(
+        blocked < Duration::from_millis(10),
+        "the caller opened the file itself: seek blocked {blocked:?}"
+    );
+    assert!(
+        (session.now() - target).abs() < 0.05,
+        "the seek did not land: clock at {}",
+        session.now()
+    );
+
+    // The sound arrives when it arrives, and the clock does not move until it
+    // does. Long deadline: that is the point of the test.
+    let waited = Instant::now();
+    let deadline = waited + Duration::from_secs(120);
+    while session.now() <= target + 0.001 {
+        session.tick();
+        while session.try_frame().is_some() {}
+        assert!(
+            Instant::now() < deadline,
+            "the clock never moved after a cold seek"
+        );
+        sleep(Duration::from_millis(8));
+    }
+    let (moved, waited) = (session.now(), waited.elapsed().as_secs_f64());
+    eprintln!("clock moved to {moved:.3}s (target {target:.3}s) after {waited:.3}s of open");
+    assert!(
+        moved - target < 0.5,
+        "the open leaked into the timeline: {waited:.3}s of it put the clock at \
+         {moved:.3}s instead of {target:.3}s"
     );
 }
 

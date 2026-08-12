@@ -149,12 +149,42 @@ impl Audio {
     /// Starts a feeder for the current epoch, draining `rx` into the device.
     /// `false` if the thread would not start, i.e. nothing will ever be fed.
     fn spawn_feeder(&self, rx: Receiver<AudioChunk>) -> bool {
+        self.spawn_feeder_deferred(move || Some(rx))
+    }
+
+    /// As [`spawn_feeder`](Self::spawn_feeder), but the *stream* is opened on
+    /// the feeder too: `open` runs on that thread, so nothing here touches the
+    /// disk and the caller pays a thread spawn instead of a demux -- seconds off
+    /// a cold cache on a big film, which is what a seek used to cost the UI
+    /// thread ([`crate::DecodeSession::open_worker_deferred`] is the picture's
+    /// half of the same move).
+    ///
+    /// The price is the same one: there is no [`crate::audio::AudioMeta`] to
+    /// hand back and no synchronous answer to "will anything play". `None` from
+    /// `open` -- a silent timeline, a source that will not open -- is a feeder
+    /// with nothing to feed, which ends exactly as a played-out stream does and
+    /// hands the clock to wall time ([`tick`](PlaybackSession::tick)).
+    ///
+    /// The epoch is captured *here*, at the seek, not when the open returns: a
+    /// scrub abandons opens by the dozen and every one of them must still be
+    /// the stale stream it was started as, however late it lands.
+    fn spawn_feeder_deferred(
+        &self,
+        open: impl FnOnce() -> Option<Receiver<AudioChunk>> + Send + 'static,
+    ) -> bool {
         let me = self.clone();
         let epoch = self.epoch.load(Ordering::Acquire);
         thread::Builder::new()
             .name("audio-feed".into())
             .spawn(move || {
-                feed(rx, &me, epoch);
+                // Superseded before this thread was even scheduled: do not open
+                // anything at all. A scrub leaves all but the last one here.
+                if me.epoch.load(Ordering::Acquire) != epoch {
+                    return;
+                }
+                if let Some(rx) = open() {
+                    feed(rx, &me, epoch);
+                }
                 // Only the current feeder gets to declare the end of the audio:
                 // a superseded one is finished, the stream is not.
                 if me.epoch.load(Ordering::Acquire) == epoch {
@@ -2252,6 +2282,20 @@ impl PlaybackSession {
     /// Puts the device back where it was: playing if it was playing, and with
     /// the clock held until the new stream is really audible (see
     /// [`Audio::content_at`]).
+    ///
+    /// ponytail: the device is made active here, before the new stream has been
+    /// opened ([`start_audio`](Self::start_audio) opens on the feeder now), so a
+    /// cold open leaves it playing its own silence with an empty ring -- audibly
+    /// the same silence as before, and counted: a scripted cold play-seek-scrub
+    /// session goes from 5 to 1721 `engine_audio: N underruns`, one per starved
+    /// quantum, while a warm one is unchanged (46 -> 53 over the suite's 11
+    /// sessions). Ceiling: the count stops meaning "the decoder was late" during
+    /// a cold seek. Upgrade path is a `wants_active` flag written here and read
+    /// by the feeder under the device lock beside the [`Audio::content_at`]
+    /// stamp, so the device is started by the first real sample rather than by
+    /// the intent to play -- it has to be the lock and the epoch check, or a
+    /// pause during the open would be overtaken by a late activation and the
+    /// timeline would play while it says it is paused.
     fn resume(&mut self, was_playing: bool) {
         self.priming = true;
         if was_playing && let Some(audio) = &self.audio {
@@ -2260,7 +2304,21 @@ impl PlaybackSession {
     }
 
     /// Rebuilds the **sound** from `target` -- the second half of a restart --
-    /// and says whether anything will be fed.
+    /// and says whether a feeder took the job. Not whether it will find
+    /// anything to play: the stream is opened on that feeder
+    /// ([`Audio::spawn_feeder_deferred`]), so a silent timeline is heard of
+    /// there, not here. Nothing on this thread reads the file.
+    ///
+    /// The clock is unaffected by the wait, which is the reason it may be a
+    /// long one: it holds where the seek put it until the *first real sample*
+    /// is queued ([`Audio::content_at`], [`tick`](Self::tick)), whether that is
+    /// ten milliseconds later or ten seconds.
+    ///
+    /// `true` is therefore *optimistic*, and the callers' `switch_to_audio` with
+    /// it: a timeline that turns out to have nothing to play ends its feeder at
+    /// once, which sets `fed_all` and hands the clock back to wall time at the
+    /// next tick, from where it stood ([`PlaybackClock::switch_to_wall`] is
+    /// continuous, so nothing jumps).
     fn start_audio(&mut self, target: u32) -> bool {
         let fps = self.meta.frame_rate;
         let mut audio_running = false;
@@ -2306,21 +2364,39 @@ impl PlaybackSession {
             let gains = self.project.audio_gains();
             let limiter = self.project.limiter();
             let controls = crate::audio::MixControls::new(gains.clone(), limiter);
-            audio_running = match AudioSession::open_mixed_streams_live(
-                &sources,
-                &segs,
-                &eqs,
-                &speeds,
-                &gains,
-                limiter,
-                Some(&controls),
-            ) {
-                Ok(Some((_, rx))) => audio.spawn_feeder(rx),
-                _ => false,
-            };
             // Only a mixed timeline has a mixer to talk to; the single-lane
-            // flat path is the bit-exact one and has none.
-            live = (audio_running && controls.is_live()).then_some(controls);
+            // flat path is the bit-exact one and has none. Decided here from
+            // the very lists the open is about to be handed
+            // ([`AudioSession::is_mixed`]) rather than read off the handle
+            // afterwards, because there *is* no afterwards on this thread any
+            // more -- the open runs on the feeder.
+            let mixed = crate::audio::AudioSession::is_mixed(segs.len(), &gains, limiter);
+            let worker_controls = Arc::clone(&controls);
+            // ...and the open itself -- every track a segment names, its packet
+            // table, its priming -- happens there too. That is the whole point:
+            // one `pread` on a cold 25 GB film is seconds, and this is called
+            // from a ruler drag ([`Audio::spawn_feeder_deferred`]).
+            audio_running = audio.spawn_feeder_deferred(move || {
+                match AudioSession::open_mixed_streams_live(
+                    &sources,
+                    &segs,
+                    &eqs,
+                    &speeds,
+                    &gains,
+                    limiter,
+                    Some(&worker_controls),
+                ) {
+                    Ok(Some((_, rx))) => Some(rx),
+                    // A silent timeline, and a source that will not open: both
+                    // feed nothing, which the feeder itself reports by ending.
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!("timeline audio open failed: {e}");
+                        None
+                    }
+                }
+            });
+            live = (audio_running && mixed).then_some(controls);
             if !audio_running {
                 // Nothing will ever be fed again; let `tick` fall to wall time
                 // instead of waiting on a device that has no more work coming.
@@ -2706,6 +2782,17 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
             if accepted > 0 && audio.content_at.load(Ordering::Acquire) < 0 {
                 let at = ao.position().unwrap_or(0).max(0);
                 audio.content_at.store(at, Ordering::Release);
+                // ...and the device position this stream's samples are counted
+                // from ([`Audio::played_out`]). Rebased *here* rather than at
+                // the seek, because the open runs on this thread now: every
+                // millisecond it took is device time nobody fed, and counting
+                // it would make the stream read as played out that long before
+                // it really is -- an early hand-off to wall time at the end of
+                // the timeline. The seek's own rebase still stands for the
+                // stream that never queues a sample at all.
+                audio
+                    .fed
+                    .store(at as u64 * audio.channels, Ordering::Relaxed);
             }
             accepted
         };
