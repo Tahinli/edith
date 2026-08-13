@@ -723,6 +723,30 @@ pub unsafe extern "C" fn vh_caps(out: *mut VhCaps) -> i32 {
     .unwrap_or(-1)
 }
 
+/// How many pictures a group of them holds -- the low-delay predictor's
+/// `limit`, which is the *only* thing that decides whether a picture is an IDR.
+///
+/// One for an intra-only seat, and that is not a tuning: the predictor counts
+/// `counter % limit`, so a limit of one pins the counter at zero, every picture
+/// takes the keyframe branch with `idr` set, and every access unit carries a
+/// fresh SPS and PPS
+/// (`cros-codecs/encoder/stateless/predictor.rs:107`, `h264/predictor.rs:139`).
+/// Two seconds otherwise, which is what a seek may land on in an ordinary file.
+///
+/// Forcing a key frame per picture is a different thing and does *not* make an
+/// intra file: that path passes `idr = false`, writes no parameter sets, and
+/// [`fix_slice_nal_headers`] then marks the slice non-IDR -- how a 60-picture
+/// "all-intra" hardware proxy came out with one sync point in it.
+fn gop_limit(framerate: u32, intra_only: bool) -> u16 {
+    match intra_only {
+        true => 1,
+        // Saturating and clamped: the caller pins the rate to 1..240 before it
+        // gets here, and a limit that wrapped to zero would divide by zero in
+        // the predictor -- a guard costs nothing next to that.
+        false => framerate.saturating_mul(2).clamp(1, u16::MAX as u32) as u16,
+    }
+}
+
 fn align16(v: u32) -> u32 {
     v.div_ceil(16) * 16
 }
@@ -825,6 +849,19 @@ impl EncSession {
         bitrate: u64,
         codec: EncCodec,
     ) -> Option<Self> {
+        Self::open_seat(width, height, fps_num, fps_den, bitrate, codec, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_seat(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+        codec: EncCodec,
+        intra_only: bool,
+    ) -> Option<Self> {
         // NV12 chroma is half resolution, so odd dimensions have no packing;
         // and radeonsi refuses encode contexts below 64x64 (measured).
         if width < 64 || height < 64 || width % 2 != 0 || height % 2 != 0 {
@@ -873,8 +910,21 @@ impl EncSession {
         let low_power = entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP);
         // No B-frames on either codec: coded order stays display order, which is
         // what both muxers' duration-only timing assumes.
+        //
+        // A limit of **1** is what makes a seat intra-only, and it is the whole
+        // mechanism: the low-delay predictor counts `counter % limit`, so with a
+        // limit of one that counter is always zero, every picture takes the
+        // keyframe branch *with `idr` set*, and each access unit is therefore an
+        // IDR carrying a fresh SPS and PPS
+        // (`cros-codecs/encoder/stateless/predictor.rs:107` and
+        // `h264/predictor.rs:139-163`). Forcing a key frame per picture is not
+        // the same thing and does not do it: `force_keyframe` takes the same
+        // branch with `idr` **false**, so no parameter sets are written, and a
+        // driver that leaves the NAL header byte at zero then gets its slices
+        // marked non-IDR by [`fix_slice_nal_headers`] -- which is exactly how a
+        // 60-frame "all-intra" hardware proxy came out with one sync point in it.
         let pred_structure = PredictionStructure::LowDelay {
-            limit: (framerate * 2) as u16,
+            limit: gop_limit(framerate, intra_only),
         };
         let encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>> = match codec {
             EncCodec::Av1 => {
@@ -1112,6 +1162,41 @@ pub extern "C" fn vh_enc_open(
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// The same H.264 seat, **intra-only**: every access unit it hands back is an
+/// IDR carrying its own SPS and PPS, so every frame of the file is a frame a
+/// decoder may be started from. What a proxy is coded with
+/// (`engine::proxy`), and never a delivery -- the file is much bigger for it.
+///
+/// A symbol of its own rather than a flag on [`vh_enc_open`], so that a plugin
+/// built before this existed simply has no intra seat and the caller falls back
+/// to the software encoder (whose `gop_size = 1` says the same thing) instead of
+/// being handed a long-GOP file that claims to be all-intra. The session it
+/// returns is fed, drained and closed through the very same three entry points.
+#[unsafe(no_mangle)]
+pub extern "C" fn vh_enc_open_intra(
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    bitrate: u64,
+) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        match EncSession::open_seat(
+            width,
+            height,
+            fps_num,
+            fps_den,
+            bitrate,
+            EncCodec::H264,
+            true,
+        ) {
+            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
+            None => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
 /// The same, coding AV1 instead of H.264: null unless this GPU has an AV1
 /// encode entrypoint, which is recent hardware -- the caller then encodes AV1 in
 /// software instead. `bitrate` is not used by this codec (see `EncSession::open`:
@@ -1265,6 +1350,40 @@ pub unsafe extern "C" fn vh_enc_close(session: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one number that decides whether a hardware file is intra-only, and
+    /// the one this seat got wrong: a proxy asks for a group of one picture, so
+    /// every picture is an IDR with its own parameter sets. Needs no GPU --
+    /// which is the point, since the seat itself cannot be opened without one.
+    #[test]
+    fn an_intra_seat_asks_for_a_group_of_one_picture() {
+        assert_eq!(gop_limit(30, true), 1, "a proxy is every frame a start");
+        assert_eq!(gop_limit(24, true), 1);
+        // ...and an ordinary export keeps its two seconds between them.
+        assert_eq!(gop_limit(30, false), 60);
+        assert_eq!(gop_limit(24, false), 48);
+        // A rate no file has, and the clamp that keeps the limit a `u16`
+        // rather than a wrapped one: `0` would divide by zero in the predictor.
+        assert_eq!(gop_limit(0, false), 1);
+        assert_eq!(gop_limit(u32::MAX, false), u16::MAX);
+    }
+
+    /// The other half of the same fault: a slice is marked IDR only where the
+    /// access unit carries an SPS, so a "forced key frame" that writes no
+    /// parameter sets reads back as an ordinary I picture -- no decoder starts
+    /// there, and `sync_points` does not count it.
+    #[test]
+    fn only_a_unit_carrying_parameter_sets_is_marked_idr() {
+        // SPS (0x67) + PPS (0x68) + a slice the driver left at zero.
+        let mut with_sets = vec![0, 0, 1, 0x67, 9, 0, 0, 1, 0x68, 9, 0, 0, 1, 0x00, 9];
+        fix_slice_nal_headers(&mut with_sets);
+        assert_eq!(with_sets[13], 0x65, "IDR slice after an SPS");
+        // The same unit without them: a key frame the encoder was merely asked
+        // for, which is what the hardware proxy used to be full of.
+        let mut bare = vec![0, 0, 1, 0x00, 9];
+        fix_slice_nal_headers(&mut bare);
+        assert_eq!(bare[3], 0x41, "no parameter sets, no IDR");
+    }
 
     /// Runs against whatever GPU this machine has -- and passes on one with no
     /// VA-API at all, which is exactly what `None` means here. What it pins is
