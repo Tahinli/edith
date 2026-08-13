@@ -2406,6 +2406,16 @@ impl PlaybackSession {
         self.resume(was_playing);
     }
 
+    /// Abandons whatever the picture worker still owes and restarts it at the
+    /// clock. The sound and the clock are untouched -- this is the *video*
+    /// catching up to its master, not a seek -- so nothing the ear is following
+    /// moves, and a caller that is behind by more than it can watch calls this
+    /// instead of waiting for a decoder that only falls further back
+    /// (`Player::pump`).
+    pub fn resync_picture(&mut self) {
+        self.invalidate(Dirty::Picture);
+    }
+
     /// Where a seek to `secs` lands: the clamped timeline position and the
     /// timeline frame it means. The one place the clamp lives, so every
     /// invalidation below lands on the same frame a seek would.
