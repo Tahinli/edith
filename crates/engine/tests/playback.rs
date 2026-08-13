@@ -1645,4 +1645,17 @@ fn a_freshly_opened_file_queues_more_than_two_pictures() {
         "a freshly opened file queued {burst} pictures: the first worker is \
          still sizing its queue from a pass-through canvas"
     );
+
+    // ...and the same worker still answers. Four and a half seconds parked is
+    // well past the idle mark at which it closes its hardware session
+    // (`decode`'s `IDLE`), so this is the seek that has to reopen one lazily --
+    // the one path that would have gone quiet if closing it left the worker
+    // holding a decoder it could no longer use.
+    let fps = session.meta().frame_rate;
+    session.seek(2.0);
+    assert_eq!(
+        next_index(&mut session, "a seek after the worker went idle"),
+        (2.0 * fps) as u32,
+        "the worker did not come back from its idle park"
+    );
 }
