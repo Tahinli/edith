@@ -18,14 +18,19 @@
 //! * `violet` -- an indigo ground under one lavender accent.
 //! * `rose` -- a neutral ground the accent alone warms, in rose.
 //! * `amber` -- a graphite ground under one gold accent.
+//! * `ocean` -- a blue-black ground under one azure accent.
+//! * `ice` -- the crisp one: a near-black blue ground, pale ice-blue accent.
+//! * `orchid` -- a dark plum ground under one orchid accent.
+//! * `nord`, `gruvbox`, `dracula` -- the three open palettes people already
+//!   have their editors in, mapped onto these roles rather than approximated.
 //!
-//! All six are dark: colour work is judged against its surround, and a light
+//! All twelve are dark: colour work is judged against its surround, and a light
 //! ground pushes every clip body and every graded frame the wrong way -- which
-//! is why no editor of this kind ships one. All six take the clip bodies from
+//! is why no editor of this kind ships one. All twelve take the clip bodies from
 //! the cross-NLE kind convention (video blue, audio green, image teal, text
-//! purple) instead of four greys that differ by a hair, and all six are held to
-//! the same measured floors: the contrast and tint guards in `main.rs` run
-//! against *every* palette in [`PaletteId::ALL`], so the seventh lands gated
+//! purple) instead of four greys that differ by a hair, and all twelve are held
+//! to the same measured floors: the contrast and tint guards in `main.rs` run
+//! against *every* palette in [`PaletteId::ALL`], so the thirteenth lands gated
 //! rather than untested.
 //!
 //! Which family is in force is the user's, picked from the toolbar's Theme
@@ -47,7 +52,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// ponytail: the families are spelled out in [`PALETTES`] rather than derived
 /// from a second list -- `macro_rules!` cannot nest a repetition over families
 /// inside one over roles, and the escape hatch for that is unstable. Ceiling: a
-/// seventh family is one line there, one variant in [`PaletteId`], one module.
+/// thirteenth family is one line there, one variant in [`PaletteId`], one
+/// module.
 macro_rules! palette {
     ($($name:ident: $ty:ty),+ $(,)?) => {
         /// One family's numbers, in a struct so the set can be swapped whole.
@@ -66,6 +72,12 @@ macro_rules! palette {
             Palette { $($name: violet::$name,)+ },
             Palette { $($name: rose::$name,)+ },
             Palette { $($name: amber::$name,)+ },
+            Palette { $($name: ocean::$name,)+ },
+            Palette { $($name: ice::$name,)+ },
+            Palette { $($name: orchid::$name,)+ },
+            Palette { $($name: nord::$name,)+ },
+            Palette { $($name: gruvbox::$name,)+ },
+            Palette { $($name: dracula::$name,)+ },
         ];
 
         $(
@@ -126,19 +138,31 @@ pub enum PaletteId {
     Violet,
     Rose,
     Amber,
+    Ocean,
+    Ice,
+    Orchid,
+    Nord,
+    Gruvbox,
+    Dracula,
 }
 
 impl PaletteId {
     /// Display order -- the picker lists them in it, and the index into
     /// [`PALETTES`] *is* the position in it, so this order and that array are
     /// the same order or every colour is wrong.
-    pub const ALL: [PaletteId; 6] = [
+    pub const ALL: [PaletteId; 12] = [
         PaletteId::Cool,
         PaletteId::Warm,
         PaletteId::Forest,
         PaletteId::Violet,
         PaletteId::Rose,
         PaletteId::Amber,
+        PaletteId::Ocean,
+        PaletteId::Ice,
+        PaletteId::Orchid,
+        PaletteId::Nord,
+        PaletteId::Gruvbox,
+        PaletteId::Dracula,
     ];
 
     /// What the button and the picker row call it.
@@ -150,6 +174,12 @@ impl PaletteId {
             PaletteId::Violet => "Violet",
             PaletteId::Rose => "Rose",
             PaletteId::Amber => "Amber",
+            PaletteId::Ocean => "Ocean",
+            PaletteId::Ice => "Ice",
+            PaletteId::Orchid => "Orchid",
+            PaletteId::Nord => "Nord",
+            PaletteId::Gruvbox => "Gruvbox",
+            PaletteId::Dracula => "Dracula",
         }
     }
 
@@ -166,6 +196,12 @@ impl PaletteId {
             PaletteId::Violet => "indigo ground, lavender",
             PaletteId::Rose => "neutral ground, rose",
             PaletteId::Amber => "graphite ground, gold",
+            PaletteId::Ocean => "blue-black ground, azure",
+            PaletteId::Ice => "near-black blue, pale ice",
+            PaletteId::Orchid => "plum ground, orchid accent",
+            PaletteId::Nord => "polar night, frost accent",
+            PaletteId::Gruvbox => "retro brown, gruvbox orange",
+            PaletteId::Dracula => "dracula ground, pink accent",
         }
     }
 
@@ -179,6 +215,12 @@ impl PaletteId {
             PaletteId::Violet => "violet",
             PaletteId::Rose => "rose",
             PaletteId::Amber => "amber",
+            PaletteId::Ocean => "ocean",
+            PaletteId::Ice => "ice",
+            PaletteId::Orchid => "orchid",
+            PaletteId::Nord => "nord",
+            PaletteId::Gruvbox => "gruvbox",
+            PaletteId::Dracula => "dracula",
         }
     }
 
@@ -647,6 +689,392 @@ pub mod amber {
     pub const EQ_SPECTRUM_INK: u32 = 0xbdbaae66;
     pub const EQ_FILL_INK: u32 = 0xfbbf2426;
     pub const EQ_BELL_INK: u32 = 0xfbbf2466;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family G: a blue-black ground -- deeper and bluer than `cool`'s neutral --
+/// under one azure accent. Where `cool` is a grey that leans cold, this one is
+/// water: the panels themselves carry the hue and the accent is the light on it.
+pub mod ocean {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x05080f;
+    pub const BG_PANEL: u32 = 0x0d1524;
+    pub const BG_RAISED: u32 = 0x172436;
+    pub const BG_TIMELINE: u32 = 0x08101c;
+    pub const BG_HOVER: u32 = 0x223449;
+    pub const BG_HOVER_DIM: u32 = 0x14202f;
+    pub const BG_SELECTED: u32 = 0x0f3a6b;
+    pub const SCRIM: u32 = 0x05080fcc;
+    pub const SCRIM_LIGHT: u32 = 0x05080f55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x1e2d42;
+    /// Gold, not azure: on a blue ground the accent is the one hue the chrome is
+    /// full of, and a focus ring wearing it says nothing.
+    pub const STROKE_FOCUS: u32 = 0xffd166;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xe6eefb;
+    pub const FG_SECONDARY: u32 = 0xa4bcd8;
+    pub const FG_DISABLED: u32 = 0x6b8199;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0x38bdf8;
+    pub const ACCENT_HOVER: u32 = 0x7dd3fc;
+    pub const ACCENT_PLAYHEAD: u32 = 0xff9db0;
+    pub const ACCENT_WASH: u32 = 0x38bdf8aa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    pub const CLIP_TEXT: u32 = 0x6b46c1;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0x5fa8e8, 0xe8a95f, 0x5fd6a0, 0xc98fe8];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xf05252;
+    pub const STATUS_WARNING: u32 = 0xfbbf24;
+    pub const STATUS_SUCCESS: u32 = 0x4ade80;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x8a2740;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x1e2d42;
+    pub const EQ_SPECTRUM_INK: u32 = 0xa4bcd866;
+    pub const EQ_FILL_INK: u32 = 0x38bdf826;
+    pub const EQ_BELL_INK: u32 = 0x38bdf866;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family H: the crisp one. A near-black blue ground with the widest ink range
+/// in the set -- the primary text is nearly white and the canvas nearly black --
+/// under a pale ice-blue accent, for the long grade where every other family
+/// starts to read as soft.
+pub mod ice {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x03060a;
+    pub const BG_PANEL: u32 = 0x0b131c;
+    pub const BG_RAISED: u32 = 0x18232f;
+    pub const BG_TIMELINE: u32 = 0x060d15;
+    pub const BG_HOVER: u32 = 0x24323f;
+    pub const BG_HOVER_DIM: u32 = 0x121c26;
+    /// A steel blue rather than the accent: ice at surface brightness is nearly
+    /// white and would carry no ink at all (WCAG 1.4.3).
+    pub const BG_SELECTED: u32 = 0x14476b;
+    pub const SCRIM: u32 = 0x03060acc;
+    pub const SCRIM_LIGHT: u32 = 0x03060a55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x223140;
+    pub const STROKE_FOCUS: u32 = 0xfcd34d;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xf4fafe;
+    pub const FG_SECONDARY: u32 = 0xb8cfe0;
+    pub const FG_DISABLED: u32 = 0x71889b;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xa5f3fc;
+    pub const ACCENT_HOVER: u32 = 0xcffafe;
+    pub const ACCENT_PLAYHEAD: u32 = 0xff8fa3;
+    pub const ACCENT_WASH: u32 = 0xa5f3fcaa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    pub const CLIP_TEXT: u32 = 0x6b46c1;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0x7fd6e8, 0xe8b47f, 0x8fd69b, 0xc79be8];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xff6b6b;
+    pub const STATUS_WARNING: u32 = 0xfbbf24;
+    pub const STATUS_SUCCESS: u32 = 0x4ade80;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x8f2740;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x223140;
+    pub const EQ_SPECTRUM_INK: u32 = 0xb8cfe066;
+    pub const EQ_FILL_INK: u32 = 0xa5f3fc26;
+    pub const EQ_BELL_INK: u32 = 0xa5f3fc66;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family I: a dark plum ground under one orchid accent -- the warm end of the
+/// purples, where `violet` is the cold one. The text clip is pushed towards
+/// indigo here for `violet`'s reason: a text clip and "press this" may not be
+/// the same purple.
+pub mod orchid {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x0c0712;
+    pub const BG_PANEL: u32 = 0x1a0f24;
+    pub const BG_RAISED: u32 = 0x2a1a38;
+    pub const BG_TIMELINE: u32 = 0x120a19;
+    pub const BG_HOVER: u32 = 0x3b2650;
+    pub const BG_HOVER_DIM: u32 = 0x231530;
+    pub const BG_SELECTED: u32 = 0x6b1f5e;
+    pub const SCRIM: u32 = 0x0c0712cc;
+    pub const SCRIM_LIGHT: u32 = 0x0c071255;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x33203f;
+    /// Sky: the ring is neither the orchid the window is full of nor the gold
+    /// the playhead is, so all three are told apart at a glance.
+    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xf6ecf8;
+    pub const FG_SECONDARY: u32 = 0xc7b0cf;
+    pub const FG_DISABLED: u32 = 0x8e7a97;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xd946ef;
+    pub const ACCENT_HOVER: u32 = 0xe879f9;
+    pub const ACCENT_PLAYHEAD: u32 = 0xfbbf24;
+    pub const ACCENT_WASH: u32 = 0xd946efaa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    pub const CLIP_TEXT: u32 = 0x5a45b8;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0xe88fd6, 0x8fc9e8, 0xe8c48f, 0x8fe8b4];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xf87171;
+    pub const STATUS_WARNING: u32 = 0xfb923c;
+    pub const STATUS_SUCCESS: u32 = 0x4ade80;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x8f2740;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x33203f;
+    pub const EQ_SPECTRUM_INK: u32 = 0xc7b0cf66;
+    pub const EQ_FILL_INK: u32 = 0xd946ef26;
+    pub const EQ_BELL_INK: u32 = 0xd946ef66;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family J: Nord, the arctic palette (arcticicestudio/nord, MIT) -- Polar
+/// Night for the surfaces, Snow Storm for the ink, Frost for the accent, Aurora
+/// for everything that has to mean something. Its own numbers wherever they
+/// clear the floors: `nord0`..`nord3` are the panels verbatim, and the canvas
+/// and the lane bed are taken one step below `nord0`, which the set does not
+/// name, because a bed lighter than its panel stops reading as a hole.
+///
+/// The clip bodies and the dim ink are the adapted ones. Aurora is a *text*
+/// palette: `nord14` green under white is 2.6:1, and this editor draws a name
+/// and a waveform on every clip body, so the four kinds are those hues taken
+/// down to where WCAG 1.4.3 holds.
+pub mod nord {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x21262e;
+    pub const BG_PANEL: u32 = 0x2e3440;
+    pub const BG_RAISED: u32 = 0x3b4252;
+    pub const BG_TIMELINE: u32 = 0x272c36;
+    pub const BG_HOVER: u32 = 0x434c5e;
+    pub const BG_HOVER_DIM: u32 = 0x353c4a;
+    /// `nord10` is Nord's own picked row and carries the dim ink at 2.9:1, so
+    /// the row is that blue taken down until 4.5:1 holds (WCAG 1.4.3).
+    pub const BG_SELECTED: u32 = 0x2e4a6e;
+    pub const SCRIM: u32 = 0x21262ecc;
+    pub const SCRIM_LIGHT: u32 = 0x21262e55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x434c5e;
+    /// `nord12`. The Frost blue is the accent here, so the ring is Aurora's
+    /// orange -- and the playhead is the yellow beside it, never this.
+    pub const STROKE_FOCUS: u32 = 0xd08770;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xeceff4;
+    pub const FG_SECONDARY: u32 = 0xd8dee9;
+    /// Lighter than `nord3`, which is a *surface* in Nord and only 2.6:1 on the
+    /// raised one: dimmed text still has to be read (WCAG 1.4.11).
+    pub const FG_DISABLED: u32 = 0x8a94a8;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0x88c0d0;
+    pub const ACCENT_HOVER: u32 = 0x8fbcbb;
+    /// `nord13`. Orange (`nord12`) is the obvious playhead and is 2.3:1 on a
+    /// video clip -- the line has to be findable on every body it crosses.
+    pub const ACCENT_PLAYHEAD: u32 = 0xebcb8b;
+    pub const ACCENT_WASH: u32 = 0x88c0d0aa;
+
+    // -- clip kinds (Aurora, taken down to where a name is legible on it) -------
+    pub const CLIP_VIDEO: u32 = 0x3b5f8a;
+    pub const CLIP_AUDIO: u32 = 0x4d6b3f;
+    pub const CLIP_IMAGE: u32 = 0x3f6a69;
+    pub const CLIP_TEXT: u32 = 0x6b4a78;
+
+    /// Aurora and Frost at full strength: a swatch carries no text, so these are
+    /// Nord's own numbers.
+    pub const SOURCE_TINTS: [u32; 4] = [0x88c0d0, 0xd08770, 0xa3be8c, 0xb48ead];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xbf616a;
+    pub const STATUS_WARNING: u32 = 0xd08770;
+    pub const STATUS_SUCCESS: u32 = 0xa3be8c;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x7a3038;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x434c5e;
+    pub const EQ_SPECTRUM_INK: u32 = 0xd8dee966;
+    pub const EQ_FILL_INK: u32 = 0x88c0d026;
+    pub const EQ_BELL_INK: u32 = 0x88c0d066;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family K: Gruvbox dark (morhetz/gruvbox, MIT) -- the retro brown-grey ground
+/// and the warm ink that made it, under its own orange. `bg0_h`, `bg0`, `bg1`
+/// and `bg2` are the surfaces verbatim and `fg1`..`fg4` the ink; the clip bodies
+/// are the neutral-mode hues taken down for the same reason Nord's are.
+///
+/// Three of its colours do three jobs here rather than one: orange is the
+/// accent, green the playhead, blue the focus ring -- so the family is
+/// recognisable from the chrome and not only from the ground.
+pub mod gruvbox {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x1d2021;
+    pub const BG_PANEL: u32 = 0x282828;
+    pub const BG_RAISED: u32 = 0x3c3836;
+    pub const BG_TIMELINE: u32 = 0x232323;
+    pub const BG_HOVER: u32 = 0x504945;
+    pub const BG_HOVER_DIM: u32 = 0x32302f;
+    /// The orange taken to where `fg2` clears 4.5:1 on it -- `bg2`, gruvbox's
+    /// own selection, is a grey and says nothing about which row is picked.
+    pub const BG_SELECTED: u32 = 0x7c3f12;
+    pub const SCRIM: u32 = 0x1d2021cc;
+    pub const SCRIM_LIGHT: u32 = 0x1d202155;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x504945;
+    pub const STROKE_FOCUS: u32 = 0x83a598;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xebdbb2;
+    pub const FG_SECONDARY: u32 = 0xd5c4a1;
+    pub const FG_DISABLED: u32 = 0xa89984;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xfe8019;
+    pub const ACCENT_HOVER: u32 = 0xfabd2f;
+    /// Bright green: it is the one gruvbox hue that clears 3:1 on all four clip
+    /// bodies at once, which is what a line crossing every one of them owes.
+    pub const ACCENT_PLAYHEAD: u32 = 0xb8bb26;
+    pub const ACCENT_WASH: u32 = 0xfe8019aa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x35657e;
+    pub const CLIP_AUDIO: u32 = 0x4b661c;
+    pub const CLIP_IMAGE: u32 = 0x2f6a63;
+    pub const CLIP_TEXT: u32 = 0x7a4a72;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0xfe8019, 0x83a598, 0xb8bb26, 0xd3869b];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xfb4934;
+    pub const STATUS_WARNING: u32 = 0xfabd2f;
+    pub const STATUS_SUCCESS: u32 = 0x8ec07c;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x9d0006;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x504945;
+    pub const EQ_SPECTRUM_INK: u32 = 0xd5c4a166;
+    pub const EQ_FILL_INK: u32 = 0xfe801926;
+    pub const EQ_BELL_INK: u32 = 0xfe801966;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family L: Dracula (dracula/dracula-theme, MIT) -- its background, current
+/// line and foreground verbatim, and its pink for the accent rather than the
+/// purple, which `violet` already sits on. Comment (`#6272a4`) is Dracula's dim
+/// ink and measures 2.4:1 on the raised surface, so the dim ink here is lifted
+/// and the comment blue is what a *disabled* control wears.
+pub mod dracula {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x1e1f29;
+    pub const BG_PANEL: u32 = 0x282a36;
+    pub const BG_RAISED: u32 = 0x343746;
+    pub const BG_TIMELINE: u32 = 0x22232e;
+    pub const BG_HOVER: u32 = 0x44475a;
+    pub const BG_HOVER_DIM: u32 = 0x2f3141;
+    pub const BG_SELECTED: u32 = 0x6b2a70;
+    pub const SCRIM: u32 = 0x1e1f29cc;
+    pub const SCRIM_LIGHT: u32 = 0x1e1f2955;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x44475a;
+    pub const STROKE_FOCUS: u32 = 0x8be9fd;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xf8f8f2;
+    pub const FG_SECONDARY: u32 = 0xc3c5d8;
+    pub const FG_DISABLED: u32 = 0x7b8bc4;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xff79c6;
+    pub const ACCENT_HOVER: u32 = 0xff92d0;
+    pub const ACCENT_PLAYHEAD: u32 = 0xf1fa8c;
+    pub const ACCENT_WASH: u32 = 0xff79c6aa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x3f5aa6;
+    pub const CLIP_AUDIO: u32 = 0x2f7a48;
+    pub const CLIP_IMAGE: u32 = 0x2b6e78;
+    pub const CLIP_TEXT: u32 = 0x6a3fb0;
+
+    /// Dracula's own six, four of them: a swatch carries no text.
+    pub const SOURCE_TINTS: [u32; 4] = [0xff79c6, 0x8be9fd, 0x50fa7b, 0xffb86c];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xff5555;
+    pub const STATUS_WARNING: u32 = 0xffb86c;
+    pub const STATUS_SUCCESS: u32 = 0x50fa7b;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x8f2a3a;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x44475a;
+    pub const EQ_SPECTRUM_INK: u32 = 0xc3c5d866;
+    pub const EQ_FILL_INK: u32 = 0xff79c626;
+    pub const EQ_BELL_INK: u32 = 0xff79c666;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
 }
 
