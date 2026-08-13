@@ -391,7 +391,8 @@ impl Player {
                         BG_RAISED(),
                         None,
                         "+",
-                        "magnify around the playhead; ctrl+wheel on the ruler zooms at the pointer",
+                        "magnify around the playhead; ctrl+wheel over the timeline zooms at the \
+                         pointer, and a bare wheel scrolls it",
                         ActionId::ZoomIn,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.zoom(ZOOM_STEP, None, cx)),
                     ))

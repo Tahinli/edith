@@ -201,29 +201,19 @@ impl Player {
                             // The strip carries no text, so the tooltip is the only
                             // place it can say what it is.
                             .tooltip(|_, cx| {
-                                cx.new(|_| Tip("Seek — click or drag; ctrl+wheel zooms".into()))
-                                    .into()
+                                cx.new(|_| {
+                                    Tip("Seek — click or drag; wheel scrolls, ctrl+wheel zooms"
+                                        .into())
+                                })
+                                .into()
                             })
-                            // Ctrl+wheel is what every timeline zooms with, and
-                            // the point held still is the one under the pointer
-                            // rather than the playhead. Only with ctrl: a bare
-                            // wheel here is the window's to scroll, and the
-                            // controls row above scrolls on exactly that.
+                            // Ctrl+wheel zooms about the pointer and a bare one
+                            // scrolls the view along -- [`Player::timeline_wheel`],
+                            // the same answer the lanes below give, because a
+                            // hand does not aim at a strip to zoom a timeline.
                             .on_scroll_wheel(cx.listener(
                                 |this, event: &ScrollWheelEvent, _, cx| {
-                                    if !event.modifiers.control {
-                                        return;
-                                    }
-                                    let dy = match event.delta {
-                                        ScrollDelta::Lines(d) => d.y,
-                                        ScrollDelta::Pixels(d) => f32::from(d.y),
-                                    };
-                                    if dy == 0. {
-                                        return;
-                                    }
-                                    let anchor = px_along(event.position.x, this.ruler.get());
-                                    let factor = if dy > 0. { ZOOM_STEP } else { 1. / ZOOM_STEP };
-                                    this.zoom(factor, Some(anchor), cx);
+                                    this.timeline_wheel(event, cx);
                                 },
                             ))
                             .on_mouse_down(
@@ -292,9 +282,12 @@ impl Player {
                             _ => ACCENT_PRIMARY(),
                         }))
                         .child(match below {
-                            0 => "the last track — scroll up for the rest".to_string(),
-                            1 => "1 more track below — scroll the lanes".to_string(),
-                            n => format!("{n} more tracks below — scroll the lanes"),
+                            // Over the track names, not over the beds: a wheel
+                            // on a bed moves the *view* along the timeline now,
+                            // so the column names its own scroll surface.
+                            0 => "the last track — scroll the names for the rest".to_string(),
+                            1 => "1 more track below — scroll the track names".to_string(),
+                            n => format!("{n} more tracks below — scroll the track names"),
                         }),
                 )
             })
@@ -874,6 +867,18 @@ impl Player {
                     .rounded(px(3.))
                     .bg(rgb(BG_TIMELINE()))
                     .overflow_hidden()
+                    // The wheel over the clips themselves, which is where a
+                    // hand already is: ctrl zooms about the pointer, bare
+                    // scrolls the view along ([`Player::timeline_wheel`]).
+                    // Stopped here, because gpui runs the lane *column's* own
+                    // overflow scroll on the same notch (div.rs:2403) and a
+                    // gesture that slid the view sideways and the tracks upward
+                    // at once is two answers to one notch. The track headers
+                    // beside this bed are still the column's scroll surface.
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.timeline_wheel(event, cx);
+                    }))
                     // A library row let go over a lane is the same insert the
                     // Add button makes, through the same call -- but where the
                     // pointer let it go, not at the playhead: a hand that
@@ -1102,6 +1107,19 @@ impl Player {
                                                     },
                                                 ),
                                             )
+                                            // ...and occluding takes the *wheel* off
+                                            // the lane's bed with it (gpui stops the
+                                            // hit test at an occluder, ancestors
+                                            // included), so a notch aimed at a cut --
+                                            // the one place a hand aims when it wants
+                                            // to see a cut closer -- would be a dead
+                                            // strip. The same answer as the bed's.
+                                            .on_scroll_wheel(cx.listener(
+                                                |this, event: &ScrollWheelEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.timeline_wheel(event, cx);
+                                                },
+                                            ))
                                             // Occluded, so the box's own right-button
                                             // listener never fires here: the menu is
                                             // the same menu, opened by the same call.

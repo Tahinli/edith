@@ -2084,6 +2084,60 @@ impl Player {
         cx.notify();
     }
 
+    /// Slides the view along the timeline by `notches` of the wheel, later in
+    /// time for a positive one and [`SCROLL_NOTCH_SHARE`] of the bed each. The
+    /// scale is untouched: this is the timeline's scrollbar, and the only thing
+    /// on the panel that moves what is on screen without magnifying it.
+    fn scroll_view(&mut self, notches: f32, cx: &mut Context<Self>) {
+        let view = self.view();
+        // Nothing painted yet: there is no bed to measure a notch against, and
+        // a start moved against a zero width would be a jump to the head.
+        if view.bed <= 0. {
+            return;
+        }
+        self.scale = view.scrolled(notches * view.bed * SCROLL_NOTCH_SHARE);
+        cx.notify();
+    }
+
+    /// One notch of the wheel anywhere over the timeline -- the ruler or a
+    /// lane's bed alike, since a hand aims at the clip it is working on and not
+    /// at the strip above it. Ctrl zooms about the pointer, bare scrolls the
+    /// view along: the mapping Premiere, Movavi and CapCut share, and the one
+    /// the user named.
+    ///
+    /// The anchor is measured off the ruler's probe wherever the pointer is,
+    /// because that probe *is* the bed's x-to-time mapping ([`HEADER_W`]) and
+    /// every lane is drawn through the same one.
+    fn timeline_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let (dx, dy) = match event.delta {
+            ScrollDelta::Lines(d) => (d.x, d.y),
+            ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+        };
+        // A tilt wheel's own axis counts as the same gesture: it is the
+        // sideways scroll a mouse that has one sends, and this panel's sideways
+        // is the only direction it has.
+        let d = match dy == 0. {
+            true => dx,
+            false => dy,
+        };
+        if d == 0. {
+            return;
+        }
+        let factor = match d > 0. {
+            true => ZOOM_STEP,
+            false => 1. / ZOOM_STEP,
+        };
+        match event.modifiers.control {
+            true => {
+                let anchor = px_along(event.position.x, self.ruler.get());
+                self.zoom(factor, Some(anchor), cx);
+            }
+            // Up is back towards the head of the timeline, the way a wheel up
+            // is back towards the top of a page.
+            false => self.scroll_view(-d.signum(), cx),
+        }
+    }
+
     /// Cycles the *project's* resolution through [`RESOLUTIONS`], starting from
     /// the media's own -- the one size that must stay reachable, since a project
     /// moved off it has no other way back (the resolution is not an undo step).
@@ -5713,7 +5767,14 @@ impl Render for Player {
         // edit that shortens the timeline moves the far end of the view, and a
         // playhead that has run off the bed pulls the view after it -- which is
         // what makes a zoomed-in timeline scroll while it plays.
-        self.scale = self.view().following(position);
+        // ...but only a playhead that is *going* somewhere pulls it: following
+        // is what a moving one does, during playback and through a seek. A view
+        // yanked back to a playhead nobody moved is a hand's own scroll undone
+        // by the very next frame, which is what made the wheel look dead.
+        self.scale = match state.is_playing() || self.seek_since.is_some() {
+            true => self.view().following(position),
+            false => self.view().settled(),
+        };
 
         div()
             .track_focus(&self.focus)
@@ -8799,6 +8860,13 @@ const TRANSPORT_H: f32 = CONTROL_H + 12.;
 /// One press of a zoom key, or one notch of ctrl+wheel.
 const ZOOM_STEP: f32 = 1.25;
 
+/// How far one notch of a bare wheel slides the view along, as a share of what
+/// is on the bed. A *share* rather than a number of pixels or of seconds: one
+/// gesture then moves the same fraction of what is being looked at whether the
+/// bed is showing five seconds or five hours, which is the only way a wheel is
+/// usable at both ends of the zoom.
+const SCROLL_NOTCH_SHARE: f32 = 0.1;
+
 /// How few frames the bed may be narrowed down to. Past this there is nothing
 /// left to aim at -- a single frame across a whole window is a wall of colour,
 /// not an edit surface.
@@ -9011,6 +9079,24 @@ impl View {
             scale: Scale {
                 pps,
                 start: at - f64::from(anchor) / pps,
+            },
+            ..self
+        }
+        .settled()
+    }
+
+    /// Slid along by `by` pixels, later in the timeline for a positive one: the
+    /// one move that changes what is on the bed without changing how wide a
+    /// second is drawn, which is what a bare wheel does. Clamped by
+    /// [`View::settled`] like every other move, so a run at either end stops at
+    /// the end rather than scrolling the timeline off the bed -- and the extent
+    /// it stops against is the content's own length, never a number.
+    fn scrolled(self, by: f32) -> Scale {
+        let pps = self.settled().pps;
+        View {
+            scale: Scale {
+                pps,
+                start: self.scale.start + f64::from(by) / pps,
             },
             ..self
         }
@@ -9949,7 +10035,7 @@ mod tests {
         FG_SECONDARY, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
         BG_CANVAS, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
         MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MB_FLOOR, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
-        Quality, ROW_H, RULER_HIT_H, BG_SELECTED, SILENCE_ROWS,
+        Quality, ROW_H, RULER_HIT_H, BG_SELECTED, SCROLL_NOTCH_SHARE, SILENCE_ROWS,
         SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, BG_RAISED, SWATCH_W, Source, Speed, StreamInfo,
         Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
         bitrate_detail, bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
@@ -12225,6 +12311,59 @@ mod tests {
         // the stop it stopped at is one press further out.
         assert_eq!(view(wide, 2. * five_hours).settled().pps, wide.pps);
         assert!(view(wide, 2. * five_hours).zoomed(1. / ZOOM_STEP, 0.).pps < wide.pps);
+    }
+
+    /// The bare wheel's own move: the view slides along the timeline, what is
+    /// drawn where slides with it, the scale never changes, and both ends stop
+    /// against the content rather than scrolling it off the bed.
+    #[test]
+    fn a_scroll_slides_the_view_without_zooming_it() {
+        let duration = 60.;
+        // Zoomed in far enough that there is somewhere to scroll to: 10 s of a
+        // 60 s timeline on the bed.
+        let start = test_view(
+            Scale {
+                pps: f64::from(TEST_BED) / 10.,
+                start: 0.,
+            },
+            duration,
+        )
+        .settled();
+        let notch = TEST_BED * SCROLL_NOTCH_SHARE;
+        let on = test_view(start, duration).scrolled(notch);
+        // A tenth of the bed later, and drawn a tenth of the bed to the left --
+        // the two halves of one move.
+        assert_eq!(on.pps, start.pps, "a scroll is not a zoom");
+        assert!(
+            (on.start - (start.start + 1.)).abs() < 1e-9,
+            "one notch is a tenth of the 10 s on the bed: {on:?}"
+        );
+        assert!(
+            (f64::from(start.px_at(20.) - on.px_at(20.)) - f64::from(notch)).abs() < 1e-3,
+            "and what was drawn moved with it: {on:?}"
+        );
+        // Back the other way, from the same place, is the same distance.
+        let back = test_view(on, duration).scrolled(-notch);
+        assert!((back.start - start.start).abs() < 1e-9, "{back:?}");
+        // Neither end can be scrolled off: the head stops at zero, and the tail
+        // stops with the last frame on the bed -- the clamp is the timeline's
+        // own length, not a number.
+        let mut scale = start;
+        for _ in 0..200 {
+            scale = test_view(scale, duration).scrolled(notch);
+        }
+        assert_eq!(scale.pps, start.pps);
+        assert!(
+            (scale.start - (duration - 10.)).abs() < 1e-6,
+            "the tail stops with the end on the bed: {scale:?}"
+        );
+        for _ in 0..200 {
+            scale = test_view(scale, duration).scrolled(-notch);
+        }
+        assert_eq!(scale.start, 0., "and the head stops at the head: {scale:?}");
+        // A view already showing all of it has nowhere to go.
+        let whole = test_view(Scale::default(), duration).fit();
+        assert_eq!(test_view(whole, duration).scrolled(notch), whole);
     }
 
     /// What makes a zoomed timeline follow the playing head: off the bed at
