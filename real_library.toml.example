@@ -18,3 +18,11 @@ h264_dual_audio = "/path/to/a-dual-audio-bluray-rip.mkv"
 # A 4K Blu-ray x265 remux carrying four PGS subtitle tracks beside one
 # `S_TEXT/UTF8` one.
 hevc_4k_pgs = "/path/to/a-4k-bluray-remux-with-pgs.mkv"
+
+# A 2160p AV1 HDR10 remux whose main track is 8-channel Opus -- five Opus
+# streams, three of them coupled -- beside two 5.1 commentary tracks.
+av1_opus_71 = "/path/to/a-2160p-av1-opus-7.1-remux.mkv"
+
+# A feature-length 1080p AV1 remux with a 5.1 Opus track and a cue table: long
+# enough to seek an hour into, which is where a Matroska landing goes wrong.
+av1_opus_51 = "/path/to/a-1080p-av1-opus-5.1-remux.mkv"
