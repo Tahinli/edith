@@ -16,6 +16,7 @@
 //! honest [`crate::demux::Codec::needs_plugin`] refusal covers both.
 
 use std::ffi::{CString, c_char, c_void};
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -62,6 +63,87 @@ impl Default for VhFrame {
     }
 }
 
+/// One decoded picture *left on the GPU*: a DRM-PRIME buffer the encoder
+/// imports instead of the caller reading the pixels back and writing them out
+/// again. All integers, so it crosses a channel to the encoding thread the way
+/// a picture's bytes used to.
+///
+/// The `fd` belongs to whoever holds this: the plugin hands ownership over with
+/// the descriptor and [`DmaFrame`] closes it. What it does *not* own is the
+/// buffer's contents -- the decode session keeps the picture from being decoded
+/// over for a few frames only (see `vh_next_frame_dma`), which is why nothing
+/// but the export's two-deep decode channel may sit between the two calls.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VhDma {
+    /// One DRM-PRIME handle per plane, luma then chroma -- which is how the
+    /// driver hands its own surfaces out (radeonsi exports an NV12 surface as
+    /// *two* objects into one allocation, measured 2026-08-13), and describing
+    /// it any other way is guessing at what the second one means. `fd[0]` below
+    /// zero says this picture is not on the GPU at all; `fd[1]` below zero says
+    /// both planes live in the first object.
+    pub fd: [i32; 2],
+    /// `NV12` and nothing else, today.
+    pub fourcc: u32,
+    /// DRM format modifier of the buffer, passed through to the import.
+    pub modifier: u64,
+    /// The surface's own size, which is the picture's rounded up to whatever
+    /// the codec codes in -- what an encoder has to agree with, sample for
+    /// sample, before it can read this buffer at all.
+    pub coded_width: u32,
+    pub coded_height: u32,
+    /// The picture inside it.
+    pub width: u32,
+    pub height: u32,
+    /// Luma then chroma, each inside its own object above.
+    pub offset: [u32; 2],
+    pub stride: [u32; 2],
+}
+
+impl Default for VhDma {
+    fn default() -> Self {
+        Self {
+            fd: [-1, -1],
+            fourcc: 0,
+            modifier: 0,
+            coded_width: 0,
+            coded_height: 0,
+            width: 0,
+            height: 0,
+            offset: [0; 2],
+            stride: [0; 2],
+        }
+    }
+}
+
+/// A [`VhDma`] with its file descriptor owned: dropping it closes the handle,
+/// which is the only thing this side of the ABI has to get right.
+pub struct DmaFrame(VhDma);
+
+impl DmaFrame {
+    pub fn width(&self) -> u32 {
+        self.0.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.0.height
+    }
+}
+
+impl Drop for DmaFrame {
+    fn drop(&mut self) {
+        for fd in self.0.fd {
+            if fd >= 0 {
+                // SAFETY: the plugin transferred these descriptors to us with
+                // the frame and nothing else owns them; `DmaFrame` is not
+                // `Clone`, and the two are distinct handles even where they
+                // name one allocation.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+}
+
 /// What *this machine* takes, as far as the plugin implements it: one bit per
 /// codec ([`CAP_H264`] and its three neighbours) in each mask, so a caller reads
 /// "H.264 decodes and encodes here, HEVC only decodes" off three `u32`s.
@@ -90,6 +172,12 @@ struct Plugin {
     open_at: unsafe extern "C" fn(*const c_char, u32) -> *mut c_void,
     meta: unsafe extern "C" fn(*mut c_void, *mut VhMeta) -> i32,
     next_frame: unsafe extern "C" fn(*mut c_void, *mut VhFrame) -> i32,
+    /// The zero-copy door, and optional for the same reason [`Plugin::caps`] is:
+    /// a plugin built before it decodes exactly as it did, through the read-back
+    /// above.
+    next_frame_dma: Option<
+        unsafe extern "C" fn(*mut c_void, *mut VhFrame, *mut VhDma, u32, u32, u32, u32) -> i32,
+    >,
     close: unsafe extern "C" fn(*mut c_void),
     /// The capability query, and the one symbol of this table that may be
     /// missing: a plugin built before it exports the four above and not this,
@@ -134,6 +222,7 @@ fn load() -> Option<Plugin> {
                     open_at: *lib.get(b"vh_open_at\0").ok()?,
                     meta: *lib.get(b"vh_meta\0").ok()?,
                     next_frame: *lib.get(b"vh_next_frame\0").ok()?,
+                    next_frame_dma: lib.get(b"vh_next_frame_dma\0").ok().map(|s| *s),
                     close: *lib.get(b"vh_close\0").ok()?,
                     caps: lib.get(b"vh_caps\0").ok().map(|s| *s),
                     seek: lib.get(b"vh_seek\0").ok().map(|s| *s),
@@ -241,6 +330,55 @@ impl HwSession {
             1 => {}
             code => return Err(format!("hardware decode failed (code {code})").into()),
         }
+        self.pixels(&frame).map(Some)
+    }
+
+    /// The next picture *without reading it back* where the caller's encoder can
+    /// take the buffer the decoder wrote into -- which is what `want` describes,
+    /// down to the coded size, because an encoder reads a surface of its own
+    /// shape or none at all.
+    ///
+    /// Anything the plugin cannot hand over that way comes back as pixels
+    /// instead ([`HwPicture::Pixels`]), so a mismatch costs the read-back it
+    /// always cost and never a frame. A plugin too old to know the door exists
+    /// is the same answer.
+    ///
+    /// The buffer behind a [`DmaFrame`] is the decoder's, held out of its pool
+    /// for a few pictures only: encode it before asking this for a few more.
+    pub fn next_frame_dma(&mut self, want: DmaWant) -> crate::Result<Option<HwPicture<'_>>> {
+        let Some(next_dma) = self.plugin.next_frame_dma else {
+            return Ok(self.next_frame()?.map(|(y, u, v, w, h)| HwPicture::Pixels(y, u, v, w, h)));
+        };
+        let mut frame = VhFrame::default();
+        let mut dma = VhDma::default();
+        // SAFETY: as `next_frame`, plus a writable descriptor whose `fd` the
+        // plugin either hands us ownership of or leaves at -1.
+        let code = unsafe {
+            next_dma(
+                self.handle,
+                &mut frame,
+                &mut dma,
+                want.coded_width,
+                want.coded_height,
+                want.width,
+                want.height,
+            )
+        };
+        match code {
+            0 => return Ok(None),
+            1 => {}
+            code => return Err(format!("hardware decode failed (code {code})").into()),
+        }
+        if dma.fd[0] >= 0 {
+            return Ok(Some(HwPicture::Dma(DmaFrame(dma))));
+        }
+        let (y, u, v, w, h) = self.pixels(&frame)?;
+        Ok(Some(HwPicture::Pixels(y, u, v, w, h)))
+    }
+
+    /// The plugin's plane pointers as slices, checked against the strides it
+    /// declares -- the one shape this side takes.
+    fn pixels(&self, frame: &VhFrame) -> crate::Result<(&[u8], &[u8], &[u8], u32, u32)> {
         let (w, h) = (frame.width as usize, frame.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         if frame.y.is_null()
@@ -255,15 +393,32 @@ impl HwSession {
         // SAFETY: plane pointers are non-null and the strides just checked above
         // pin each plane's length; the borrow ends before the next call.
         unsafe {
-            Ok(Some((
+            Ok((
                 std::slice::from_raw_parts(frame.y, w * h),
                 std::slice::from_raw_parts(frame.u, cw * ch),
                 std::slice::from_raw_parts(frame.v, cw * ch),
                 frame.width,
                 frame.height,
-            )))
+            ))
         }
     }
+}
+
+/// What an encoder needs a decoded buffer to look like before it can read it
+/// without a copy: the surface's coded size and the picture inside it.
+#[derive(Clone, Copy)]
+pub struct DmaWant {
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One picture out of [`HwSession::next_frame_dma`]: still on the GPU, or read
+/// back like every other frame.
+pub enum HwPicture<'a> {
+    Pixels(&'a [u8], &'a [u8], &'a [u8], u32, u32),
+    Dma(DmaFrame),
 }
 
 impl Drop for HwSession {
@@ -291,6 +446,12 @@ struct EncPlugin {
     open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
     frame:
         unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
+    /// The zero-copy pair, both optional together: an older plugin exports
+    /// neither and every picture reaches it as bytes, which is what it always
+    /// did.
+    dma_geometry: Option<unsafe extern "C" fn(*mut c_void, *mut u32, *mut u32) -> i32>,
+    frame_dma:
+        Option<unsafe extern "C" fn(*mut c_void, *const VhDma, i32, *mut *const u8, *mut usize) -> i32>,
     drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
@@ -317,6 +478,8 @@ fn load_enc() -> Option<EncPlugin> {
                     open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
                     open_hevc: lib.get(b"vh_enc_hevc_open\0").ok().map(|s| *s),
                     frame: *lib.get(b"vh_enc_frame\0").ok()?,
+                    dma_geometry: lib.get(b"vh_enc_dma_geometry\0").ok().map(|s| *s),
+                    frame_dma: lib.get(b"vh_enc_frame_dma\0").ok().map(|s| *s),
                     drain: *lib.get(b"vh_enc_drain\0").ok()?,
                     close: *lib.get(b"vh_enc_close\0").ok()?,
                     _lib: lib,
@@ -447,6 +610,41 @@ impl HwEncoder {
         // were just checked against the strides we declare.
         self.take(|plugin, handle, out, out_len| unsafe {
             (plugin.frame)(handle, &frame, force_key as i32, out, out_len)
+        })
+    }
+
+    /// What a decoded buffer must look like to reach this encoder without a
+    /// copy -- the surface size it codes in, plus the picture it was opened for
+    /// -- or `None` where the plugin has no zero-copy door at all.
+    pub fn dma_want(&self, width: u32, height: u32) -> Option<DmaWant> {
+        let geometry = self.plugin.dma_geometry?;
+        self.plugin.frame_dma?;
+        let (mut coded_width, mut coded_height) = (0u32, 0u32);
+        // SAFETY: `handle` is live and both destinations are writable.
+        if unsafe { geometry(self.handle, &mut coded_width, &mut coded_height) } != 1 {
+            return None;
+        }
+        Some(DmaWant {
+            coded_width,
+            coded_height,
+            width,
+            height,
+        })
+    }
+
+    /// Feeds one picture the decoder left on the GPU. Same answer and same
+    /// lifetime rule as [`HwEncoder::encode`]; an error here is a real one, the
+    /// caller having asked [`HwEncoder::dma_want`] what this seat takes before
+    /// the decoder handed the buffer over.
+    pub fn encode_dma(&mut self, dma: &DmaFrame, force_key: bool) -> crate::Result<Option<&[u8]>> {
+        let Some(frame_dma) = self.plugin.frame_dma else {
+            return Err("hardware encoder has no zero-copy path".into());
+        };
+        let desc = dma.0;
+        // SAFETY: `handle` is live and `desc` outlives the call; the buffer it
+        // names is the decode session's, held for the caller by contract.
+        self.take(|_, handle, out, out_len| unsafe {
+            frame_dma(handle, &desc, force_key as i32, out, out_len)
         })
     }
 
