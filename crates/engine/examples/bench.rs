@@ -26,7 +26,8 @@
 //! first frame, `BENCH_EXPORT_CAP` (s, default 300) the wall clock any single
 //! export measurement may take, `BENCH_EXPORT_REPS` (default 5) how many times
 //! an export is repeated *if the cap leaves room* -- a 4K encode gets one
-//! capped rep, the small control gets five.
+//! capped rep, the small control gets five -- and `BENCH_KEEP` (unset) whether
+//! the exported file survives the run instead of being deleted with the number.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -63,7 +64,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: bench open <file>\n       bench seek <file> <secs>\n       \
          bench scrub <file>\n       bench waveform <file>\n       \
-         bench export <file> <h264sw|h264hw|av1|hevc> <out_dir>"
+         bench export <file> <h264sw|h264hw|av1|hevc|hevchw> <out_dir>"
     );
     std::process::exit(2)
 }
@@ -356,7 +357,11 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         "h264sw" => (Format::Mp4, true),
         "h264hw" => (Format::Mp4, false),
         "av1" => (Format::Av1, true),
+        // `hevc` keeps meaning the software intra seat, so a row measured
+        // against an older baseline still compares with the one beside it; the
+        // GPU seat is the new name.
         "hevc" => (Format::Hevc, true),
+        "hevchw" => (Format::Hevc, false),
         _ => usage(),
     };
     let metric = format!("export_fps_{seat}");
@@ -426,7 +431,12 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         }
         let seats = handle.encoders().unwrap_or_else(|| "?".into());
         let outcome = handle.result();
-        let _ = std::fs::remove_file(&out);
+        // A throughput run leaves nothing behind; `BENCH_KEEP=1` keeps the last
+        // one, which is how a seat is checked for *decodability* rather than
+        // speed (`ffprobe -count_frames` on the file it wrote).
+        if std::env::var_os("BENCH_KEEP").is_none() {
+            let _ = std::fs::remove_file(&out);
+        }
         if capped {
             samples.push(progress * f64::from(span) / elapsed);
             notes.push(format!("CAPPED at {:.0}s, {:.0}% done, {seats}", elapsed, progress * 100.0));

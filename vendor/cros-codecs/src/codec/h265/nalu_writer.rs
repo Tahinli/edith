@@ -40,9 +40,19 @@ impl<W: Write> EmulationPrevention<W> {
         Ok(())
     }
 
-    /// Writes a H.264 NALU header.
-    fn write_header(&mut self, idc: u8, type_: u8) -> NaluWriterResult<()> {
-        self.out.write_all(&[0x00, 0x00, 0x00, 0x01, (idc & 0b11) << 5 | (type_ & 0b11111)])?;
+    /// Writes a H.265 NALU header. See 7.3.1.2
+    fn write_header(
+        &mut self,
+        nalu_type: u8,
+        nuh_layer_id: u8,
+        nuh_temporal_id_plus1: u8,
+    ) -> NaluWriterResult<()> {
+        // forbidden_zero_bit | nal_unit_type | first bit of nuh_layer_id
+        let byte0 = (nalu_type & 0b111111) << 1 | (nuh_layer_id >> 5) & 0b1;
+        // remaining bits of nuh_layer_id | nuh_temporal_id_plus1
+        let byte1 = (nuh_layer_id & 0b11111) << 3 | (nuh_temporal_id_plus1 & 0b111);
+
+        self.out.write_all(&[0x00, 0x00, 0x00, 0x01, byte0, byte1])?;
 
         Ok(())
     }
@@ -118,7 +128,7 @@ impl From<BitWriterError> for NaluWriterError {
 
 pub type NaluWriterResult<T> = std::result::Result<T, NaluWriterError>;
 
-/// A writer for H.264 bitstream. It is capable of outputing bitstream with
+/// A writer for H.265 bitstream. It is capable of outputing bitstream with
 /// emulation-prevention.
 pub struct NaluWriter<W: Write>(BitWriter<EmulationPrevention<W>>);
 
@@ -128,12 +138,12 @@ impl<W: Write> NaluWriter<W> {
     }
 
     /// Writes fixed bit size integer (up to 32 bit) output with emulation
-    /// prevention if enabled. Corresponds to `f(n)` in H.264 spec.
+    /// prevention if enabled. Corresponds to `f(n)` in H.265 spec.
     pub fn write_f<T: Into<u32>>(&mut self, bits: usize, value: T) -> NaluWriterResult<usize> {
         self.0.write_f(bits, value).map_err(NaluWriterError::BitWriterError)
     }
 
-    /// An alias to [`Self::write_f`] Corresponds to `n(n)` in H.264 spec.
+    /// An alias to [`Self::write_f`] Corresponds to `u(n)` in H.265 spec.
     pub fn write_u<T: Into<u32>>(&mut self, bits: usize, value: T) -> NaluWriterResult<usize> {
         self.write_f(bits, value)
     }
@@ -151,7 +161,7 @@ impl<W: Write> NaluWriter<W> {
     }
 
     /// Writes a unsigned integer in exponential golumb format.
-    /// Coresponds to `ue(v)` in H.264 spec.
+    /// Coresponds to `ue(v)` in H.265 spec.
     pub fn write_ue<T: Into<u32>>(&mut self, value: T) -> NaluWriterResult<()> {
         let value = value.into();
 
@@ -159,7 +169,7 @@ impl<W: Write> NaluWriter<W> {
     }
 
     /// Writes a signed integer in exponential golumb format.
-    /// Coresponds to `se(v)` in H.264 spec.
+    /// Coresponds to `se(v)` in H.265 spec.
     pub fn write_se<T: Into<i32>>(&mut self, value: T) -> NaluWriterResult<()> {
         let value: i32 = value.into();
         let abs_value: u32 = value.unsigned_abs();
@@ -176,10 +186,16 @@ impl<W: Write> NaluWriter<W> {
         self.0.has_data_pending() || self.0.inner().has_data_pending()
     }
 
-    /// Writes a H.264 NALU header.
-    pub fn write_header(&mut self, idc: u8, _type: u8) -> NaluWriterResult<()> {
+    /// Writes a H.265 NALU header. Unlike H.264, the header is two bytes long.
+    /// See 7.3.1.2.
+    pub fn write_header(
+        &mut self,
+        nalu_type: u8,
+        nuh_layer_id: u8,
+        nuh_temporal_id_plus1: u8,
+    ) -> NaluWriterResult<()> {
         self.0.flush()?;
-        self.0.inner_mut().write_header(idc, _type)?;
+        self.0.inner_mut().write_header(nalu_type, nuh_layer_id, nuh_temporal_id_plus1)?;
         Ok(())
     }
 
@@ -193,6 +209,10 @@ impl<W: Write> NaluWriter<W> {
 mod tests {
     use super::*;
     use crate::bitstream_utils::BitReader;
+    use crate::codec::h264::nalu::Header;
+    use crate::codec::h265::parser::Nalu;
+    use crate::codec::h265::parser::NaluType;
+    use std::io::Cursor;
 
     #[test]
     fn simple_bits() {
@@ -251,22 +271,31 @@ mod tests {
         assert_eq!(reader.read_se::<i32>().unwrap(), -42);
         assert_eq!(reader.read_se::<i32>().unwrap(), 3);
         assert_eq!(reader.read_ue::<u32>().unwrap(), 5);
+    }
 
-        let mut buf = Vec::<u8>::new();
+    /// The two byte NALU header must be parsed back by the H.265 parser.
+    #[test]
+    fn writer_header() {
+        for (type_, layer_id, temporal_id_plus1) in
+            [(NaluType::VpsNut, 0u8, 1u8), (NaluType::TrailR, 63, 7), (NaluType::IdrWRadl, 1, 3)]
         {
-            let mut writer = NaluWriter::new(&mut buf, false);
-            writer.write_se(30).unwrap();
-            writer.write_ue(100u32).unwrap();
-            writer.write_se(-402).unwrap();
-            writer.write_ue(50u32).unwrap();
+            let mut buf = Vec::<u8>::new();
+            {
+                let mut writer = NaluWriter::new(&mut buf, true);
+                writer.write_header(type_ as u8, layer_id, temporal_id_plus1).unwrap();
+                // A minimal payload, as NALUs are found by looking for the
+                // start code of the *next* one.
+                writer.write_f(8, 0xffu8).unwrap();
+            }
+
+            let mut cursor = Cursor::new(&buf[..]);
+            let nalu = Nalu::next(&mut cursor).unwrap();
+
+            assert_eq!(nalu.header.type_, type_);
+            assert_eq!(nalu.header.nuh_layer_id, layer_id);
+            assert_eq!(nalu.header.nuh_temporal_id_plus1, temporal_id_plus1);
+            assert_eq!(nalu.header.len(), 2);
         }
-
-        let mut reader = BitReader::new(&buf, true);
-
-        assert_eq!(reader.read_se::<i32>().unwrap(), 30);
-        assert_eq!(reader.read_ue::<u32>().unwrap(), 100);
-        assert_eq!(reader.read_se::<i32>().unwrap(), -402);
-        assert_eq!(reader.read_ue::<u32>().unwrap(), 50);
     }
 
     #[test]

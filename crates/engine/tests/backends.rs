@@ -104,9 +104,9 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         (Format::Mp4, "mp4"),
         (Format::Av1, "mkv"),
         (Format::Av1Mp4, "mp4"),
-        // Both HEVC containers, whose seat is software whatever the box has:
-        // the plugin encodes H.264 and AV1 and no HEVC, so a card that offered
-        // a hardware seat here would be promising one that cannot exist.
+        // Both HEVC containers, whose seat is the plugin's where the picture
+        // clears the driver's floor and the software intra encoder where it does
+        // not -- which of the two is this box's business and never this test's.
         (Format::Hevc, "mkv"),
         (Format::HevcMp4, "mp4"),
     ] {
@@ -150,9 +150,80 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         assert!(planned.contains("AAC"), "{ext}: {planned}");
         if matches!(format, Format::Hevc | Format::HevcMp4) {
             assert!(
-                planned.contains("oxideav-h265 intra"),
-                "{ext}: an HEVC job names the intra encoder that writes it: {planned}"
+                planned.contains("oxideav-h265 intra") || planned.contains("HW encode"),
+                "{ext}: an HEVC job names one of the two HEVC seats: {planned}"
             );
+        }
+    }
+}
+
+/// The same pin, swept over the two things that *move* the seat under a user's
+/// hand: the picture size (the plugin refuses HEVC below the driver's 384x384
+/// floor and the software intra encoder takes the file) and the software pin on
+/// the card. The export card reads [`engine::export::planned_video`] for every
+/// one of these combinations, so a size that flips the seat and a card that kept
+/// the old line is the exact lie this sweep exists to catch.
+///
+/// Not swept: the hardware AV1 seat. It is `VE_HW_AV1=1` opt-in because opening
+/// it hung this box's GPU into a driver reset (2026-08-10), and a test suite is
+/// not the place to find out whether that is fixed -- `av1.rs` keeps that one
+/// `#[ignore]`d and by name.
+#[test]
+fn the_planned_seat_follows_the_size_and_the_pin() {
+    for (format, ext) in [
+        (Format::Mp4, "mp4"),
+        (Format::Av1, "mkv"),
+        (Format::Av1Mp4, "mp4"),
+        (Format::Hevc, "mkv"),
+        (Format::HevcMp4, "mp4"),
+    ] {
+        for (width, height) in [(320, 180), (1280, 720), (1920, 1080)] {
+            for force_sw in [false, true] {
+                let settings = ExportSettings {
+                    format,
+                    force_sw,
+                    ..ExportSettings::default()
+                };
+                let mut session =
+                    PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+                // The project resolution is what an export writes, so this is
+                // the very size the card's probe is asked about.
+                session.set_resolution(width, height);
+                let planned = engine::export::planned_video(session.meta(), &settings)
+                    .expect("these formats carry picture");
+                // A pinned job is software by definition, whatever the machine
+                // has -- the one seat this file may assert outright.
+                if force_sw {
+                    assert!(
+                        planned.starts_with("SW encode"),
+                        "{ext} {width}x{height}: a pinned job is software, got {planned}"
+                    );
+                }
+                let out = out_path("seat", ext);
+                let handle = session.export_to_with(&out, &settings);
+                let started = Instant::now();
+                let opened = loop {
+                    if let Some(line) = handle.encoders() {
+                        break line;
+                    }
+                    assert!(
+                        !handle.is_finished(),
+                        "{ext} {width}x{height}: settled before an encoder opened: {:?}",
+                        handle.result().map(|r| r.err())
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(60),
+                        "no encoder was published"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                handle.cancel();
+                wind_down(&handle);
+                assert!(
+                    opened.starts_with(planned),
+                    "{ext} {width}x{height} force_sw={force_sw}: the card said {planned}, the job opened {opened}"
+                );
+            }
         }
     }
 }
