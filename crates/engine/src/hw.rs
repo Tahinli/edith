@@ -444,6 +444,10 @@ struct EncPlugin {
     /// The HEVC seat, missing from an older plugin for the same reason and at
     /// the same cost: an HEVC export then runs on the software intra encoder.
     open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
+    /// The **intra-only** H.264 seat, missing from an older plugin for the same
+    /// reason and at the same cost: a proxy then runs on the software encoder,
+    /// which codes one frame a GOP and so writes the same kind of file.
+    open_intra: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
     frame:
         unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
     /// The zero-copy pair, both optional together: an older plugin exports
@@ -477,6 +481,7 @@ fn load_enc() -> Option<EncPlugin> {
                     open: *lib.get(b"vh_enc_open\0").ok()?,
                     open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
                     open_hevc: lib.get(b"vh_enc_hevc_open\0").ok().map(|s| *s),
+                    open_intra: lib.get(b"vh_enc_open_intra\0").ok().map(|s| *s),
                     frame: *lib.get(b"vh_enc_frame\0").ok()?,
                     dma_geometry: lib.get(b"vh_enc_dma_geometry\0").ok().map(|s| *s),
                     frame_dma: lib.get(b"vh_enc_frame_dma\0").ok().map(|s| *s),
@@ -516,6 +521,27 @@ impl HwEncoder {
             fps_den,
             bitrate,
         )
+    }
+
+    /// The same H.264 seat, **intra-only**: every picture comes back an IDR
+    /// with its own parameter sets, so every frame of the file is one a decoder
+    /// may be started from. What [`crate::proxy`] codes a stand-in with.
+    ///
+    /// `None` on everything [`HwEncoder::open`] answers `None` to *and* on a
+    /// plugin built before this seat existed -- and that `None` matters more
+    /// than the others: the caller must then take the software encoder, which
+    /// codes one frame a GOP, rather than the ordinary hardware seat, which
+    /// would write a long-GOP file under a name that promises otherwise.
+    pub fn open_intra(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+    ) -> Option<Self> {
+        let plugin = enc_plugin()?;
+        let open = plugin.open_intra?;
+        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
     }
 
     /// The same, coding AV1 instead. `None` on everything [`HwEncoder::open`]

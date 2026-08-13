@@ -329,6 +329,16 @@ impl Mp4Muxer {
         Ok(())
     }
 
+    /// Says what this file's samples mean, where that is *not* the rule the
+    /// height implies -- a picture written in its source's own space rather
+    /// than converted into the output one ([`crate::proxy`] is why: a stand-in
+    /// carries the film's colour and lets the screen convert it, once, at
+    /// preview size). The box is written when the file is finished, so this may
+    /// be said any time before then.
+    pub fn set_colour(&mut self, colour: ColorDescription) {
+        self.colr = colr_nclx(colour);
+    }
+
     /// One coded picture, Annex-B framed. Parameter sets inside it are dropped
     /// (they are already in `avcC`); an IDR slice marks the sample as a sync point.
     pub fn write_video_au(&mut self, annex_b: &[u8]) -> crate::Result<()> {

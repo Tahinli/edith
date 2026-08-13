@@ -284,6 +284,24 @@ impl Player {
                             this.open_picker(Pick::Tone, event.position(), cx)
                         }),
                     ))
+                    // Its own rect and a label that *is* the state, the rule
+                    // the snap toggle writes down: a button that resized itself
+                    // on every press made the row shuffle under the pointer.
+                    .child(self.action_control(
+                        "proxies",
+                        TONE_SLOT_W,
+                        BG_RAISED(),
+                        None,
+                        match self.session.as_ref().map(PlaybackSession::proxies) {
+                            Some(true) => format!("Proxies on{}", self.proxy_tail()),
+                            Some(false) => format!("Proxies off{}", self.proxy_tail()),
+                            None => "Proxies".to_string(),
+                        },
+                        "cuts on small stand-ins of the big films; the sound and every export \
+                         stay the film's own",
+                        ActionId::ToggleProxies,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_proxies(cx)),
+                    ))
                     .child(self.action_control(
                         "inspect-mix",
                         0.,
