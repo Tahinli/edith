@@ -771,6 +771,31 @@ impl Mp4Demuxer {
         self.next_sample = chosen;
         i64::from(chosen) - i64::from(self.first_sample)
     }
+
+    /// Every frame a decoder may be started from, by the index this engine
+    /// counts a source's frames in -- the sample table's own answer, which is
+    /// why an mp4 costs no walk to ask ([`sync_points`]). A track with no `stss`
+    /// box is every frame, which is what the box's absence means.
+    fn sync_frames(&self) -> Vec<u32> {
+        let frames = self.sample_count.saturating_sub(self.first_sample - 1);
+        if self.sync_samples.is_empty() {
+            return (0..frames).collect();
+        }
+        // With composition offsets in play a sample id is not a frame index, and
+        // the display-order table beside it is the one that answers -- the split
+        // [`Self::seek_to_sync_at_or_before`] makes, for its reason.
+        if !self.sync_display.is_empty() {
+            return self
+                .sync_display
+                .iter()
+                .filter_map(|&(display, _)| display.checked_sub(self.first_display))
+                .collect();
+        }
+        self.sync_samples
+            .iter()
+            .filter_map(|&id| id.checked_sub(self.first_sample))
+            .collect()
+    }
 }
 
 /// One Matroska block of an indexed track: where its bytes are, whether a
@@ -1504,15 +1529,18 @@ pub struct CodedBlock<'a> {
 /// ([`crate::export::planned_seats`] is the same question asked of a whole
 /// timeline).
 ///
-/// Empty for anything that is not Matroska, which is exactly the set of files
-/// the copy path refuses anyway, and for a file whose clusters cannot be walked.
+/// Empty for a file that will not open, and for a Matroska one whose clusters
+/// cannot be walked.
 ///
-/// Costs that walk, once per file (6.7 s on a 12.9 GB film, then a sidecar read
-/// of a few milliseconds -- [`MkvDemuxer::is_sync`]): ask it off a render
-/// thread.
+/// An mp4 answers off its `stss` table for nothing; Matroska costs the walk,
+/// once per file (6.7 s on a 12.9 GB film, then a sidecar read of a few
+/// milliseconds -- [`MkvDemuxer::is_sync`]): ask it off a render thread.
 pub fn sync_points(path: &Path) -> Vec<u32> {
     if !is_matroska(path) {
-        return Vec::new();
+        return match Demuxer::open(path) {
+            Ok((_, Demuxer::Mp4(mp4))) => mp4.sync_frames(),
+            _ => Vec::new(),
+        };
     }
     let Ok((_, Demuxer::Mkv(mut demuxer))) = Demuxer::open(path) else {
         return Vec::new();
@@ -2839,7 +2867,11 @@ impl IndexKey {
     /// picture track) and the directory is the user's own cache to delete, but a
     /// size-capped LRU sweep at open is the upgrade path if it ever matters.
     fn sidecar(&self) -> Option<PathBuf> {
-        let dir = index_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))?;
+        let dir = cache_dir(
+            std::env::var_os("XDG_CACHE_HOME"),
+            std::env::var_os("HOME"),
+            "mkvindex",
+        )?;
         Some(dir.join(format!(
             "{:016x}-{}.idx",
             fnv1a(self.path.as_os_str().as_encoded_bytes()),
@@ -2848,25 +2880,31 @@ impl IndexKey {
     }
 }
 
-/// The path rule, with the environment handed in so it can be checked, as
-/// `keymap::config_path_in` is on the config side. An empty `XDG_CACHE_HOME` is
-/// one the spec says to ignore; with no `HOME` either there is nowhere to put a
-/// cache, and `None` -- always walk -- beats littering the working directory.
-fn index_dir(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+/// The path rule for one of this engine's cache directories -- `sub` names
+/// which (`mkvindex` here, `proxies` for [`crate::proxy`]) -- with the
+/// environment handed in so it can be checked, as `keymap::config_path_in` is
+/// on the config side. An empty `XDG_CACHE_HOME` is one the spec says to
+/// ignore; with no `HOME` either there is nowhere to put a cache, and `None` --
+/// always walk -- beats littering the working directory.
+pub(crate) fn cache_dir(
+    xdg: Option<OsString>,
+    home: Option<OsString>,
+    sub: &str,
+) -> Option<PathBuf> {
     xdg.filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             home.filter(|v| !v.is_empty())
                 .map(|h| PathBuf::from(h).join(".cache"))
         })
-        .map(|dir| dir.join("edith").join("mkvindex"))
+        .map(|dir| dir.join("edith").join(sub))
 }
 
 /// FNV-1a, 64-bit: what names a sidecar and what checks it. Not a cryptographic
 /// hash and not asked to be -- nothing here is adversarial. It is the guard that
 /// turns a half-written or scrambled file into a miss; a *name* collision is
 /// caught by the key inside the file, which is compared field by field.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &b in bytes {
         hash ^= u64::from(b);
@@ -4362,7 +4400,7 @@ mod tests {
     #[test]
     fn the_index_directory_follows_xdg() {
         let dir = |xdg: Option<&str>, home: Option<&str>| {
-            index_dir(xdg.map(OsString::from), home.map(OsString::from))
+            cache_dir(xdg.map(OsString::from), home.map(OsString::from), "mkvindex")
         };
         assert_eq!(
             dir(Some("/x/cache"), Some("/home/u")),
