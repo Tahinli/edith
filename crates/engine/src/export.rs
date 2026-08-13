@@ -3163,9 +3163,42 @@ enum ClipDecoder {
 
 /// The receiving half of a decode thread, plus the picture it last handed out
 /// -- which is what lets `next` keep lending planes rather than moving them.
+///
+/// The first two fields are in this order on purpose, and it is the order
+/// [`crate::decode::FrameStream`] states for the same pair: Rust drops fields as
+/// they are declared, so the receiver disconnects *first* -- the only thing that
+/// wakes a decoder parked in a full `send` -- and the join inside
+/// [`DecodeThread::drop`] runs second. The other way round is a hang and not a
+/// slow path.
 struct Streamed {
-    frames: Receiver<crate::Result<Yuv>>,
+    frames: Receiver<crate::Result<Option<Yuv>>>,
+    /// Held only to be dropped: joining is all it does, and it must happen
+    /// after the receiver above (`_lib` in `crate::hw` is kept the same way).
+    _thread: DecodeThread,
     current: Option<Yuv>,
+    /// Whether the thread has said "no more pictures" in as many words. What
+    /// separates a stream that ended from a thread that vanished: after this,
+    /// the channel is disconnected because the decoder is *done*, and a further
+    /// ask is end of stream rather than a failure.
+    ended: bool,
+}
+
+/// A decode thread, joined when its span's decoder is dropped -- the rule
+/// [`crate::decode::Worker`] is written for: a thread abandoned mid
+/// `vaInitialize` outlives the process, and Mesa's `atexit` handlers then free
+/// the state it is still reading, which is a SIGSEGV at exit long after the
+/// export succeeded.
+struct DecodeThread(Option<thread::JoinHandle<()>>);
+
+impl Drop for DecodeThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            // The receiver is already gone (see `Streamed`'s field order), so a
+            // decoder blocked on `send` has been woken and this waits only for
+            // the thread to unwind its VA-API session.
+            let _ = handle.join();
+        }
+    }
 }
 
 /// One picture, owned, on its way from a decode thread to the encoder.
@@ -3187,12 +3220,14 @@ impl ClipDecoder {
         }
         let path = path.to_path_buf();
         let (tx, frames) = sync_channel(2);
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("export-decode".into())
             .spawn(move || decode_stream(&path, start_frame, &tx))?;
         Ok(Self::Streamed(Streamed {
             frames,
+            _thread: DecodeThread(Some(handle)),
             current: None,
+            ended: false,
         }))
     }
 
@@ -3200,8 +3235,9 @@ impl ClipDecoder {
     fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
         match self {
             Self::Still(still) => Ok(Some(still.picture())),
+            Self::Streamed(stream) if stream.ended => Ok(None),
             Self::Streamed(stream) => match stream.frames.recv() {
-                Ok(Ok(frame)) => {
+                Ok(Ok(Some(frame))) => {
                     let frame = stream.current.insert(frame);
                     Ok(Some((
                         &frame.y,
@@ -3211,13 +3247,21 @@ impl ClipDecoder {
                         frame.height,
                     )))
                 }
+                // The decoder said end of stream in as many words -- a source
+                // shorter than the clip that names it, which the span loop ends
+                // gracefully on.
+                Ok(Ok(None)) => {
+                    stream.ended = true;
+                    Ok(None)
+                }
                 Ok(Err(e)) => Err(e),
-                // The thread closed the channel: end of stream, and the only
-                // clean way it ends. Every failure came through as an `Err`
-                // above -- including the open's, which is why a file the
-                // plugin refuses still fails the export rather than looking
-                // like a clip that ran out.
-                Err(_) => Ok(None),
+                // The channel went quiet without either: the thread panicked.
+                // Read as end of stream that would truncate the export at this
+                // frame and *report success*, which is the one outcome an
+                // export must never have -- before the decode moved onto a
+                // thread the same panic took the whole export down, and it
+                // still does.
+                Err(_) => Err("the decoder stopped without a picture or a reason".into()),
             },
         }
     }
@@ -3230,7 +3274,12 @@ impl ClipDecoder {
 /// Unlike playback there is no mid-clip fallback to software: a hardware decode
 /// that fails after the first picture fails the export, which then deletes the
 /// half-written file.
-fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Yuv>>) {
+///
+/// Every way this returns says which way it was, down the channel: a picture, an
+/// error, or the `Ok(None)` that *is* end of stream. Closing the channel is not
+/// one of them -- a silent close is a panicked thread, and the receiver treats
+/// it as the failure it is rather than as a source that ran out.
+fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Option<Yuv>>>) {
     let opened = match forced("VE_SW") {
         false => HwSession::open_at(path, start_frame).map(Pictures::Hw),
         true => None,
@@ -3257,7 +3306,10 @@ fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Yu
                 width,
                 height,
             },
-            Ok(None) => return,
+            Ok(None) => {
+                let _ = tx.send(Ok(None));
+                return;
+            }
             Err(e) => {
                 let _ = tx.send(Err(e));
                 return;
@@ -3265,7 +3317,7 @@ fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Yu
         };
         // The consumer went away: the span ended early, or the export was
         // cancelled. Either way there is nothing left to decode for.
-        if tx.send(Ok(frame)).is_err() {
+        if tx.send(Ok(Some(frame))).is_err() {
             return;
         }
     }
@@ -3354,6 +3406,47 @@ impl SwDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How a decode thread ended is never guessed from the channel being shut.
+    /// A source that genuinely ran out says so, and the span ends on it; a
+    /// thread that died without a word is a failure, because reading it as end
+    /// of stream would truncate the picture and *report the export finished*.
+    #[test]
+    fn a_decoder_that_dies_without_a_word_is_not_end_of_stream() {
+        let streamed = |handle, frames| {
+            ClipDecoder::Streamed(Streamed {
+                frames,
+                _thread: DecodeThread(Some(handle)),
+                current: None,
+                ended: false,
+            })
+        };
+
+        let (tx, frames) = sync_channel::<crate::Result<Option<Yuv>>>(2);
+        // Said its piece, then finished: the span walks on to its next clip.
+        let handle = thread::spawn(move || {
+            tx.send(Ok(None)).expect("the receiver is alive");
+        });
+        let mut ended = streamed(handle, frames);
+        assert!(ended.next().expect("a clean end is not an error").is_none());
+        // ...and asking again is the same answer and not a disconnect error.
+        assert!(ended.next().expect("still not an error").is_none());
+
+        let (tx, frames) = sync_channel::<crate::Result<Option<Yuv>>>(2);
+        // Died holding the sender: the channel shuts with nothing said.
+        let handle = thread::spawn(move || {
+            let _tx = tx;
+            panic!("decoder died");
+        });
+        let mut died = streamed(handle, frames);
+        let e = died
+            .next()
+            .expect_err("a silent death must fail the export, not end the clip");
+        assert!(
+            e.to_string().contains("without a picture or a reason"),
+            "{e}"
+        );
+    }
 
     /// Three seconds of two tones, one per channel, interleaved: enough shape
     /// that a correlation says something and enough length that the encoder
