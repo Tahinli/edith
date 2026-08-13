@@ -104,18 +104,19 @@ mod tests {
         assert!(hw_line(None).starts_with("none —"));
         // A driver that answers with nothing is its own sentence.
         assert!(hw_line(Some(VhCaps::default())).starts_with("none —"));
-        // This project's own GPU as `vainfo` lists it: H.264 both ways, HEVC
-        // and VP9 decode with their 10-bit profiles, AV1 both ways. HEVC has a
-        // VA encode entrypoint here and is *not* an encode seat: the plugin has
-        // no HEVC encoder, so the line must not offer one.
+        // This project's own GPU as `vainfo` lists it: H.264, HEVC and AV1 both
+        // ways, VP9 decode only, and the 10-bit profiles on three of the four.
+        // HEVC is an encode seat here as of the plugin's `vh_enc_hevc_open` --
+        // the 10-bit note beside it stays a *decode* claim, that seat coding
+        // 8-bit Main whatever the source was.
         let radeonsi = VhCaps {
             decode: CAP_H264 | CAP_HEVC | CAP_VP9 | CAP_AV1,
-            encode: CAP_H264 | CAP_AV1,
+            encode: CAP_H264 | CAP_HEVC | CAP_AV1,
             decode_10bit: CAP_HEVC | CAP_VP9 | CAP_AV1,
         };
         assert_eq!(
             hw_line(Some(radeonsi)),
-            "H.264 dec+enc · HEVC dec (10-bit) · VP9 dec (10-bit) · AV1 dec+enc (10-bit)"
+            "H.264 dec+enc · HEVC dec+enc (10-bit) · VP9 dec (10-bit) · AV1 dec+enc (10-bit)"
         );
         // A codec the driver has neither seat for is left out rather than
         // listed as a refusal: this line is what the machine *can* do.
