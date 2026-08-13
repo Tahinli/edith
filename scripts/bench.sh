@@ -19,7 +19,10 @@
 #     before the measurement -- no root, nothing else on the machine evicted,
 #     and advisory, so it is the optimistic end of cold.
 #   * warm = the same call repeated straight after, cache as the cold run left it.
-#   * medians of 5 for open and seek, 20 steps for a scrub, and for export as
+#   * medians of 5 for open and seek, 50 seeded random seeks for a seek storm,
+#     $BENCH_PLAYLOOP_SECS (30) of playing with a jump every 5 s for a play
+#     loop -- both drawn from $BENCH_SEED (1), so a rerun seeks the same
+#     places -- 20 steps for a scrub, and for export as
 #     many reps as $BENCH_EXPORT_CAP seconds leave room for (at least one,
 #     which is then marked CAPPED if it did not finish).
 #   * every metric runs as its own process: a decoder that panics costs one
@@ -41,7 +44,13 @@ LOG="$OUT_DIR/bench.log"
 # Absolute, because $CARGO_TARGET_DIR may already be one and the plugin path
 # below must not become "$PWD/$HOME/...".
 TARGET=$(realpath -m "${CARGO_TARGET_DIR:-target}")
-cargo build --release -p engine -p engine-hw --example bench || exit 1
+# The plugins are their own build: `--example` selects example targets in every
+# package it is given, and a cdylib is not one, so `-p engine-hw --example
+# bench` built no plugin at all and every run measured software while the line
+# below said otherwise. engine-audio is here for the same reason -- the play
+# loop's underruns come from the device, and with no plugin there is no device.
+cargo build --release -p engine-hw -p engine-audio || exit 1
+cargo build --release -p engine --example bench || exit 1
 BENCH="$TARGET/release/examples/bench"
 # The plugin is looked for beside the running executable, and an example binary
 # lives one directory below the plugin: without this, hardware decode and
@@ -98,6 +107,10 @@ for file in "${files[@]}"; do
         run 1800 "seek_ttff_${t}s" "$file" seek "$t"
     done
     run 3600 scrub "$file" scrub
+    # The two random metrics: same seed both sides of a change, or the "before"
+    # and the "after" are different seeks and the comparison means nothing.
+    run 3600 seekstorm "$file" seekstorm "${BENCH_SEED:-1}"
+    run 1800 playloop "$file" playloop "${BENCH_PLAYLOOP_SECS:-30}" "${BENCH_SEED:-1}"
     for seat in h264sw h264hw av1 hevc hevchw; do
         run "$export_limit" "export_fps_$seat" "$file" export "$seat" "$OUT_DIR"
     done
