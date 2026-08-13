@@ -149,6 +149,12 @@ struct Player {
     /// the key is inserted the moment the decode is *started*: presence means
     /// "asked", so a repaint mid-decode cannot ask again.
     waves: HashMap<(PathBuf, usize), Wave>,
+    /// What each source's stand-in is up to ([`engine::proxy`]), filled like
+    /// `waves`: presence means "asked", so the encode is started once per file
+    /// however many times the library is drawn. The switch that decides whether
+    /// they are *played* is the session's own -- it is the project's and is
+    /// saved with it, where this map is this window's view of the cache.
+    proxies: HashMap<PathBuf, Proxy>,
     /// Which audio streams each imported file has, as its header describes
     /// them: one library row per entry. Keyed and filled like `waves` --
     /// presence means "asked" -- and an empty list is a silent file, which is
@@ -602,6 +608,7 @@ fn main() {
                     selected_asset: None,
                     library_tab: LibraryTab::Media,
                     waves: HashMap::new(),
+                    proxies: HashMap::new(),
                     streams: HashMap::new(),
                     bitrates: HashMap::new(),
                     sizes: HashMap::new(),
