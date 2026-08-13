@@ -98,6 +98,12 @@ const Y_TILE_WIDTH: usize = Y_TILE_WIDTH_IN_SUBTILES * Y_SUBTILE_WIDTH;
 const Y_TILE_HEIGHT: usize = Y_TILE_HEIGHT_IN_SUBTILES * Y_SUBTILE_HEIGHT;
 const Y_TILE_SIZE: usize = Y_TILE_WIDTH * Y_TILE_HEIGHT;
 
+/// LOCAL PATCH (see /Cargo.toml [patch.crates-io]): what one `CLFLUSH` covers,
+/// and therefore the stride the unmap below walks a buffer with. 64 bytes on
+/// every x86-64 part this runs on.
+#[cfg(target_arch = "x86_64")]
+const CACHE_LINE: usize = 64;
+
 fn detile_y_tile(dst: &mut [u8], src: &[u8], width: usize, height: usize) {
     let tiles_per_row = width / Y_TILE_WIDTH;
     for y in 0..height {
@@ -123,6 +129,11 @@ fn detile_y_tile(dst: &mut [u8], src: &[u8], width: usize, height: usize) {
 pub struct DmaMapping<'a> {
     dma_handles: Vec<BorrowedFd<'a>>,
     addrs: Vec<NonNull<libc::c_void>>,
+    /// LOCAL PATCH (see /Cargo.toml [patch.crates-io]): what `mmap` actually
+    /// returned and how much of it, which is what `munmap` has to be handed --
+    /// `addrs` above are those bases plus a plane offset that is not required
+    /// to be page aligned, so unmapping *them* is EINVAL.
+    maps: Vec<(NonNull<libc::c_void>, usize)>,
     detiled_bufs: Vec<Vec<u8>>,
     lens: Vec<usize>,
     is_writable: bool,
@@ -171,12 +182,14 @@ impl<'a> DmaMapping<'a> {
         // Offsets aren't guaranteed to page aligned, so we have to map the entire FD and then
         // do pointer arithmetic to get the right buffer.
         let mut addrs: Vec<NonNull<libc::c_void>> = vec![];
+        let mut maps: Vec<(NonNull<libc::c_void>, usize)> = vec![];
         if borrowed_dma_handles.len() > 1 {
             for i in 0..offsets.len() {
                 // SAFETY: This assumes that fd is a valid DMA buffer and that our lens and offsets
                 // are correct.
+                let plane_size = lens[i] + offsets[i];
                 addrs.push(unsafe {
-                    mmap(
+                    let base = mmap(
                         None,
                         NonZeroUsize::new(lens[i] + offsets[i])
                             .ok_or("Attempted to map plane of length 0!")?,
@@ -189,8 +202,9 @@ impl<'a> DmaMapping<'a> {
                         borrowed_dma_handles[i].as_fd(),
                         0,
                     )
-                    .map_err(|err| format!("Error mapping plane {err}"))?
-                    .add(offsets[i])
+                    .map_err(|err| format!("Error mapping plane {err}"))?;
+                    maps.push((base, plane_size));
+                    base.add(offsets[i])
                 });
             }
         } else {
@@ -212,6 +226,7 @@ impl<'a> DmaMapping<'a> {
                     0,
                 )
                 .map_err(|err| format!("Error mapping plane {err}"))?;
+                maps.push((base_addr, total_size.get()));
                 for i in 0..offsets.len() {
                     addrs.push(base_addr.add(offsets[i]));
                 }
@@ -245,6 +260,7 @@ impl<'a> DmaMapping<'a> {
         Ok(DmaMapping {
             dma_handles: borrowed_dma_handles.clone(),
             addrs: addrs,
+            maps: maps,
             detiled_bufs: detiled_bufs,
             lens: lens.clone(),
             is_writable: is_writable,
@@ -313,12 +329,22 @@ impl<'a> Drop for DmaMapping<'a> {
                 _mm_mfence();
 
                 for (addr, len) in zip(self.addrs.iter(), self.lens.iter()) {
-                    // TODO: We shouldn't actually have to flush every address, we should just
-                    // flush the address at the beginning of each cache line. But, during testing
-                    // this caused a race condition.
-                    for offset in 0..*len {
-                        _mm_clflush((addr.as_ptr() as *const u8).offset(offset as isize));
+                    // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): a cache
+                    // line at a time, which is the granularity CLFLUSH has --
+                    // flushing every byte issued 64 instructions per line and
+                    // cost 6.2 ms per 1080p picture on radeonsi (measured
+                    // 2026-08-13), four fifths of a hardware export's whole
+                    // per-frame budget. The upstream TODO says exactly this and
+                    // reports a race when it was tried; the mfence pair either
+                    // side is what orders the flushes, and the sixty-four
+                    // redundant flushes per line were never what did.
+                    let base = addr.as_ptr() as *const u8;
+                    for offset in (0..*len).step_by(CACHE_LINE) {
+                        _mm_clflush(base.offset(offset as isize));
                     }
+                    // ...and the last line, where the length is not a multiple
+                    // of one.
+                    _mm_clflush(base.offset(len.saturating_sub(1) as isize));
                 }
 
                 _mm_mfence();
@@ -326,7 +352,13 @@ impl<'a> Drop for DmaMapping<'a> {
 
             fence(Ordering::SeqCst);
 
-            let _ = zip(self.addrs.iter(), self.lens.iter()).map(|x| munmap(*x.0, *x.1).unwrap());
+            // LOCAL PATCH: `map` on an iterator is lazy, so the unmap upstream
+            // writes here never ran -- every mapping leaked its address space
+            // (3 MB a picture through an encode session, 2.2 GB of VSZ over a
+            // 719-frame export, measured 2026-08-13).
+            for (addr, len) in self.maps.iter() {
+                let _ = munmap(*addr, *len);
+            }
         }
     }
 }
