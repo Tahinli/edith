@@ -81,8 +81,23 @@ rusty_mp3 = "0.6"
 # packet. This one does the whole pipeline. Its quirks are measured and worked
 # around in [`crate::export::write_ogg`] -- read that before touching this line.
 rusty_vorbis = "0.1.1"
-# The Opus decoder: pure Rust, MIT, no C and no FFI, and no dependencies at all
-# without its default features (`spectrograms` is for its own analysis tools).
+# The Opus decoder: pure Rust, MIT, no C and no FFI.
+#
+# `spectrograms` is not, as this line long claimed, "for its own analysis tools":
+# it is the crate's *FFT backend*, and it is default-on because CELT synthesis is
+# an N/4 complex FFT per block. Turned off -- which is what asking for `std`
+# alone did -- `celt/mdct.rs` falls back to an O(n²) DFT evaluated in f64, and a
+# 5.1 film soundtrack decodes at **0.95x realtime**: slower than playing it.
+# With the backend on, the same file decodes at **104x** (7.1: 0.93x -> 112x,
+# stereo: 10.4x -> 135x). The cost is fifteen pure-Rust crates (`spectrograms` ->
+# `realfft`/`rustfft`, `ndarray`, `regex`), still no C and no `build.rs`.
+# The output is *not* bit-identical to the DFT build -- FFT summation order
+# differs -- but the two agree to 144 dB SNR (max |Δ| 3.7e-8, half an LSB at
+# 24-bit) while *both* sit 93 dB from ffmpeg's own libopus decode of the same
+# file. The change is 40 dB below the decoder's existing distance to the
+# reference, i.e. inside float noise, and upstream says as much: Opus conformance
+# is a quality threshold (`opus_compare`), not bit-exactness, and every
+# bitstream-affecting computation stays exact either way.
 # Symphonia has no Opus at any version -- its feature list stops at vorbis and
 # there is no `symphonia-codec-opus` crate -- while both of its containers *read*
 # the format already: `A_OPUS` and `OpusHead` have always mapped to
@@ -99,7 +114,7 @@ rusty_vorbis = "0.1.1"
 # where the film is silent. This one matches ffmpeg's own decode of the same file to a
 # correlation of 1.0000 on all six channels. Pinned exactly, like `oxideav-ac3`
 # below, because a decoder is a bit-exactness dependency.
-ruopus = { version = "=0.1.2", default-features = false, features = ["std"] }
+ruopus = { version = "=0.1.2", default-features = false, features = ["std", "spectrograms"] }
 # The Opus *encoder*, the other half of that pair: a pure-Rust port of libopus
 # 1.6, BSD-3, `build.rs`-less and with **no dependencies at all** -- checked, not
 # taken from the README (`cargo tree` is two lines; there is not one `.c`, `.h`
