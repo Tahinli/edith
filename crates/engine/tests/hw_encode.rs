@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use engine::hw::{HwEncoder, HwSession};
+use engine::hw::{HwEncoder, HwPicture, HwSession};
 
 const FPS: u32 = 30;
 const BITRATE: u64 = 4_000_000;
@@ -138,6 +138,82 @@ fn round_trips_unaligned_dimensions() {
         (width as usize, height as usize),
         "padding must be cropped away again"
     );
+}
+
+/// The zero-copy path: a picture the hardware decoder wrote goes into the
+/// hardware encoder as the buffer it was decoded into, never read back and never
+/// written out again -- which is what makes an export of an untouched clip cost
+/// no `vaGetImage`, no colour conversion and no upload per frame.
+///
+/// Two things are checked and the second is the one that matters. That the
+/// buffers are handed over *at all* (a driver whose export the plugin refuses
+/// falls back to pixels, silently and correctly, which would make a speed claim
+/// a lie). And that what came out is what went in: the encoded stream is decoded
+/// in software and compared against the same file decoded through the read-back
+/// path, so a wrong plane offset, a swapped object or an unsynchronised surface
+/// -- the ways an imported buffer goes wrong -- fails here instead of shipping
+/// as a garbled export.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with H.264 decode and encode"]
+fn a_decoded_buffer_is_encoded_without_ever_being_read_back() {
+    const FRAMES: usize = 24;
+    let asset =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/test_baseline.mp4");
+    let (width, height) = (1280u32, 720u32);
+    let Some(mut encoder) = HwEncoder::open(width, height, FPS, 1, BITRATE) else {
+        println!("no hardware encoder here -- skipping");
+        return;
+    };
+    let Some(want) = encoder.dma_want(width, height) else {
+        panic!("a hardware encoder that takes no imported buffer at all");
+    };
+    let mut session = HwSession::open(&asset).expect("hardware decode of the fixture");
+
+    let mut stream = Vec::new();
+    let mut buffers = 0;
+    for index in 0..FRAMES {
+        match session.next_frame_dma(want).expect("hardware decode") {
+            Some(HwPicture::Dma(dma)) => {
+                assert_eq!((dma.width(), dma.height()), (width, height), "frame {index}");
+                buffers += 1;
+                if let Some(au) = encoder.encode_dma(&dma, false).expect("encode") {
+                    stream.extend_from_slice(au);
+                }
+            }
+            Some(HwPicture::Pixels(..)) => panic!("frame {index} was read back after all"),
+            None => panic!("the fixture ran out at frame {index}"),
+        }
+    }
+    while let Some(au) = encoder.drain().expect("drain") {
+        stream.extend_from_slice(au);
+    }
+    assert_eq!(buffers, FRAMES, "every picture came over as a buffer");
+
+    // The same file down the path this one exists to avoid, which is the only
+    // honest reference for "the encoder read the right pixels".
+    let mut reference = HwSession::open(&asset).expect("hardware decode of the fixture");
+    let coded = decode(&stream);
+    assert_eq!(coded.len(), FRAMES, "decoded picture count");
+    for (index, frame) in coded.iter().enumerate() {
+        let (y, u, v, w, h) = reference
+            .next_frame()
+            .expect("read-back decode")
+            .expect("the fixture is longer than this");
+        assert_eq!((w, h), (width, height), "frame {index}");
+        for (plane, (got, want)) in [(&frame.y, y), (&frame.u, u), (&frame.v, v)]
+            .iter()
+            .enumerate()
+        {
+            // Lossy CBR against the source picture: the same tolerance the
+            // synthetic round trip above uses, and nowhere near what a swapped
+            // plane or a stale surface would cost.
+            let diff = mean_abs_diff(got, want);
+            assert!(
+                diff < 6.0,
+                "frame {index} plane {plane} drifted by {diff:.2}"
+            );
+        }
+    }
 }
 
 /// Decode and encode resolve through two independent symbol tables, so an
