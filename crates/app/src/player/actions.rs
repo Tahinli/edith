@@ -1,0 +1,382 @@
+//! Every action arrives here: the one dispatch, the notice queue, and the
+//! delegations to the oracle that say whether an action can be asked for.
+
+use crate::*;
+
+impl Player {
+    /// What an action does, wherever it was asked for -- a stroke, or the clip
+    /// menu item that names the same action. One table, so the two can never
+    /// come to mean different things.
+    pub(crate) fn act(&mut self, action: ActionId, cx: &mut Context<Self>) {
+        // Two doors, one oracle. This used to be the asymmetry the whole
+        // toolbar was built on: the buttons dimmed themselves off
+        // [`enable`] while the keyboard walked straight past it, so with no
+        // file open `s` toggled the snap and `v` added a track while the very
+        // same controls sat dim and *dead* to the pointer. Whatever refuses the
+        // button refuses the key, in the oracle's own words -- and a refusal
+        // that is silent from the keyboard is a bug the same size.
+        match self.enable(action, None) {
+            Enable::Yes => {}
+            // A state refusal is spoken: the thing exists and cannot happen
+            // *now*, which is exactly what a silent key press fails to say.
+            Enable::No(why) => {
+                self.notify_user(format!("{} — {why}", action.label()).into());
+                cx.notify();
+                return;
+            }
+            // A class refusal is not: the action does not exist for what is in
+            // front of the user, and `esc` with nothing exporting must not
+            // answer with a line about exports.
+            Enable::Hidden(_) => return,
+        }
+        match action {
+            ActionId::Play => self.toggle_or_restart(cx),
+            ActionId::StepBack => self.step(-1, cx),
+            ActionId::StepForward => self.step(1, cx),
+            // A second is however many frames this timeline runs at.
+            ActionId::JumpBack => self.step(-(self.fps.round() as i64), cx),
+            ActionId::JumpForward => self.step(self.fps.round() as i64, cx),
+            // The ends, as a step nothing can be far enough from.
+            ActionId::GoStart => self.step(i64::MIN, cx),
+            ActionId::GoEnd => self.step(i64::MAX, cx),
+            // Not a step at all: the grid these land on is the *source's*, and
+            // where the next one is depends on the file rather than on the rate.
+            ActionId::PrevSyncPoint => self.jump_sync(false, cx),
+            ActionId::NextSyncPoint => self.jump_sync(true, cx),
+            ActionId::Export => self.open_export(cx),
+            ActionId::Save => self.save_project(cx),
+            ActionId::Copy => self.copy_selected(),
+            ActionId::Paste => self.paste(cx),
+            ActionId::Cut => self.cut(cx),
+            ActionId::Regroup => self.regroup(cx),
+            ActionId::Detach => self.detach(cx),
+            ActionId::Group => self.group(cx),
+            ActionId::Select => self.select_under_playhead(cx),
+            ActionId::SelectNext => self.select_step(true, cx),
+            ActionId::SelectPrev => self.select_step(false, cx),
+            ActionId::Delete => self.delete_selected(cx),
+            ActionId::Lift => self.lift_selected(cx),
+            ActionId::Color => self.open_color(cx),
+            ActionId::Fit => self.cycle_fit(cx),
+            ActionId::Resolution => self.cycle_resolution(cx),
+            // The playhead is what a key zoom is aimed at: it is the one place
+            // on the timeline the user is certainly looking at, and keeping it
+            // still is what every editor does.
+            ActionId::ZoomIn => self.zoom(ZOOM_STEP, None, cx),
+            ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
+            ActionId::ZoomFit => self.zoom_fit(cx),
+            ActionId::Undo => self.undo(cx),
+            ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
+            ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
+            // The last track of that kind: the one the add key put there, so the
+            // two strokes undo each other press for press. Any other track goes
+            // through the × in its own header.
+            ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
+            ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
+            // The same chooser the + S button opens, and the picked row -- the
+            // one the panel draws highlighted -- for the removal: the × on any
+            // other row is that row's own door, and both doors are one call.
+            ActionId::AddSubtitleTrack => self.pick_and_add_subtitles(cx),
+            ActionId::RemoveSubtitleTrack => self.remove_subtitle_track(self.sub_track, cx),
+            ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
+            ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
+            ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
+            ActionId::Equalizer => self.open_eq(cx),
+            ActionId::Speed => self.open_speed(cx),
+            ActionId::Silence => self.open_silence(cx),
+            ActionId::Mix => self.open_mix(None, cx),
+            ActionId::ToggleSnap => self.toggle_snap(cx),
+            ActionId::ToggleSubtitles => self.toggle_subtitles(cx),
+            // The keyboard's door to the same list the toolbar button opens.
+            // At the window's corner, since a stroke names no place -- and
+            // [`menu_at`] keeps it on screen from there.
+            ActionId::Theme => self.open_picker(Pick::Theme, Point::default(), cx),
+            // Nothing to cancel while nothing is exporting; the export guard in
+            // the key handler is what answers this one while there is.
+            ActionId::CancelExport => {}
+            ActionId::ShowActions => self.show_actions(cx),
+        }
+    }
+
+    /// Says something to the user. The one door: every message in this editor
+    /// comes through here, so "queued rather than overwritten" is a property of
+    /// the field and not of seventy call sites remembering to be polite.
+    ///
+    /// A repeat of what is already at the back is dropped -- holding a key that
+    /// refuses would otherwise fill the queue with one sentence, and the count
+    /// on the bar would be a count of how long the key was held.
+    pub(crate) fn notify_user(&mut self, message: SharedString) {
+        push_notice(&mut self.notices, message);
+    }
+
+    /// Answers the message on the bar and brings up the next one. Whether there
+    /// was one to answer, because a key that dismissed a notice owes a repaint
+    /// and a key that dismissed nothing does not.
+    pub(crate) fn dismiss_notice(&mut self) -> bool {
+        self.notices.pop_front().is_some()
+    }
+
+    /// The magnet off and on again, in words: a snap that stops working
+    /// silently reads as a bug, and one that starts working silently reads as
+    /// one too. The line goes with it -- nothing is being promised any more.
+    pub(crate) fn toggle_snap(&mut self, cx: &mut Context<Self>) {
+        self.snap = !self.snap;
+        self.snap_cue = None;
+        self.ghost = None;
+        self.notify_user(match self.snap {
+            true => "SNAP ON — drags land on clip edges, the playhead and the start".into(),
+            false => "SNAP OFF — drags land exactly where the hand leaves them".into(),
+        });
+        cx.notify();
+    }
+
+    /// The actions card, from its key, from the panel button, or from its own
+    /// row: open, with an empty search box -- a card that opens showing the
+    /// last search would hide most of the list for a reason nobody remembers.
+    pub(crate) fn show_actions(&mut self, cx: &mut Context<Self>) {
+        self.keys_open = true;
+        self.keys_search.clear();
+        self.scroll_keys(None);
+        self.rebinding = None;
+        // One card at a time, the rule the other cards follow.
+        self.export_open = false;
+        cx.notify();
+    }
+
+    /// Moves the actions card's row list by `by` pixels, or puts it back at the
+    /// top (`None`). Back to the top after every keystroke that changes the
+    /// search: a filtered list is shorter than the offset a scrolled one left
+    /// behind, and a card showing the empty space past its last row reads as a
+    /// search that found nothing.
+    ///
+    /// Clamped to what there is to scroll, so the list cannot be pushed off
+    /// either end -- `max_offset` is what the last paint measured, which is the
+    /// only place that number exists.
+    pub(crate) fn scroll_keys(&self, by: Option<f32>) {
+        let at = match by {
+            Some(by) => (f32::from(self.keys_scroll.offset().y) + by)
+                .clamp(-f32::from(self.keys_scroll.max_offset().height), 0.),
+            None => 0.,
+        };
+        self.keys_scroll.set_offset(point(px(0.), px(at)));
+    }
+
+    /// The cues over the picture, off and on. Says which it is now *and* what is
+    /// on screen while they are on: a toggle whose answer is invisible when the
+    /// playhead happens to sit between two cues would read as broken.
+    pub(crate) fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
+        self.subs_on = !self.subs_on;
+        // Named with its film here too: a notice saying "SUBTITLES ON — eng"
+        // over a timeline holding two films' eng tracks names neither.
+        let label = self
+            .session
+            .as_ref()
+            .and_then(|session| sub_pick_name(session.subtitles(), self.sub_track))
+            .unwrap_or_else(|| "nothing imported".to_string());
+        self.notify_user(
+            match self.subs_on {
+                true => format!("SUBTITLES ON — {label}"),
+                false => format!("SUBTITLES OFF — {label} is still on the timeline"),
+            }
+            .into(),
+        );
+        cx.notify();
+    }
+
+    /// The subtitle track the overlay and the strip are showing: the one a
+    /// library row picked, or the first there is. `None` with no timeline and
+    /// for an index left over from one that is gone.
+    pub(crate) fn subtitle_track(&self) -> Option<&engine::subtitle::SubtitleTrack> {
+        self.session.as_ref()?.subtitles().get(self.sub_track)
+    }
+
+    /// Whether the editor can be asked for `action` right now, and why not when
+    /// it cannot. `on` is the clip the question is about -- the one a clip menu
+    /// was opened on -- and `None` asks about the marked clip instead, which is
+    /// what a menu that hangs over no clip in particular means by "this one".
+    ///
+    /// The player's half of [`enable`]: it reads the state, the table decides.
+    pub(crate) fn enable(&self, action: ActionId, on: Option<(Lane, usize)>) -> Enable {
+        enable(action, self.ctx(on))
+    }
+
+    /// The state every one of those questions is asked against, read off the
+    /// player once: [`menu_items`] filters a whole menu with it, so the rows a
+    /// menu draws and the answers it dims them by come from the same reading.
+    pub(crate) fn ctx(&self, on: Option<(Lane, usize)>) -> Ctx {
+        let Some(session) = &self.session else {
+            return Ctx::default();
+        };
+        let clip = on
+            .or(self.selected)
+            .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
+        Ctx {
+            clip,
+            image: clip.is_some_and(|(clip, _)| {
+                session
+                    .sources()
+                    .get(clip.source)
+                    .is_some_and(|s| engine::is_image(&s.path))
+            }),
+            playhead: frame_at(session.now(), self.fps),
+            timeline: true,
+            clipboard: self.clipboard.is_some(),
+            subtitles: !session.subtitles().is_empty(),
+            playable: !nothing_to_play(Some(session)),
+            exporting: self.exporting().is_some(),
+        }
+    }
+
+    /// The same reading for a library row: whether this file can join this
+    /// timeline -- the very answer the list greys the row by, so the menu over a
+    /// row and the row under it cannot disagree -- and how many clips play it.
+    /// [`Player::ctx`] for the other panel.
+    pub(crate) fn row_ctx(&self, path: &Path, stream: usize) -> RowCtx {
+        let placed = self.session.as_ref().map_or(0, |session| {
+            let of_row = session
+                .sources()
+                .iter()
+                .position(|s| s.path == path && s.audio_stream == stream);
+            of_row.map_or(0, |idx| {
+                session
+                    .lanes()
+                    .into_iter()
+                    .flat_map(|lane| session.lane_clips(lane))
+                    .filter(|c| c.source == idx)
+                    .count()
+            })
+        });
+        let sources = self
+            .session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources);
+        RowCtx {
+            timeline: self.session.is_some(),
+            exporting: self.exporting().is_some(),
+            usable: library_rows(
+                sources,
+                &self.streams,
+                &self.decoders,
+                self.timeline_audio(),
+                |path| {
+                    self.session
+                        .as_ref()
+                        .map_or(0, |session| session.file_frames(path))
+                },
+            )
+            .iter()
+            .any(|row| row.path == path && row.stream == stream && row.unusable.is_none()),
+            placed,
+        }
+    }
+
+    /// Which of [`Repeat`]'s three the window is in, for the hold gate at the
+    /// top of the key handler. Not [`Player::modal`]: that asks whether an
+    /// overlay is up at all, and here the cards with sliders in them are
+    /// exactly the ones that answer differently from the keys menu and the
+    /// export card.
+    pub(crate) fn repeat_scope(&self) -> Repeat {
+        // A number being typed is a value under the arrows, exactly as a card's
+        // slider is -- so a held arrow runs it. Asked before the export card
+        // below, which otherwise repeats nothing.
+        if self.mbps_edit.is_some() {
+            Repeat::Card
+        } else if self.rebinding.is_some()
+            || self.keys_open
+            || self.export_open
+            || self.exporting().is_some()
+        {
+            Repeat::Nothing
+        } else if self.eq_open.is_some()
+            || self.color_open.is_some()
+            || self.speed_open.is_some()
+            || self.silence_open.is_some()
+            || self.mix_open
+        {
+            Repeat::Card
+        } else {
+            Repeat::Keymap
+        }
+    }
+
+    /// One item of a library row's menu, done. Every one of them closes the
+    /// menu first -- the list under it is about to be rebuilt -- except the one
+    /// that turns the card over.
+    pub(crate) fn act_on_row(&mut self, item: RowItem, cx: &mut Context<Self>) {
+        let Some(menu) = self.library_menu.clone() else {
+            return;
+        };
+        match item {
+            RowItem::Properties => {
+                if let Some(open) = &mut self.library_menu {
+                    open.details = true;
+                }
+            }
+            RowItem::Add => {
+                self.library_menu = None;
+                self.insert_source(&menu.path, menu.stream, None, None, cx);
+            }
+            RowItem::Remove => {
+                self.library_menu = None;
+                self.remove_source(&menu.path, menu.stream, cx);
+            }
+            RowItem::Reveal => {
+                self.library_menu = None;
+                // Another process starting: off the UI thread, exactly as the
+                // export notice's own click starts it.
+                cx.background_executor()
+                    .spawn(async move { show_in_file_manager(&menu.path) })
+                    .detach();
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.session.as_mut().is_some_and(PlaybackSession::undo) {
+            self.reset_after_reseek();
+        }
+        self.selected = None;
+        cx.notify();
+    }
+
+    /// The stroke a waiting row was after: it becomes the whole of what reaches
+    /// that action, which is what the row was showing. A chord another action
+    /// already holds is refused by the keymap and the row keeps waiting, so the
+    /// next stroke is another try rather than a lost one. A binding that took
+    /// holds either way:
+    /// what a failed write costs is only the next run, which is what the notice
+    /// is for.
+    pub(crate) fn capture(&mut self, action: ActionId, key: &str, ctrl: bool) {
+        let chord = keymap::Chord {
+            key: key.to_string(),
+            ctrl,
+        };
+        // Only a stroke the file can spell and read back as itself: gpui reports
+        // "+" for shift+=, which is the chord grammar's separator, so binding it
+        // would write a line the next load would have to drop. Refused here, in
+        // front of the user, rather than silently costing that binding later.
+        // The row keeps waiting, as it does for a stroke already taken.
+        if !chord.bindable() {
+            let text = format!("THAT KEY CANNOT BE BOUND — {}", chord.pretty());
+            eprintln!("{text}");
+            self.notify_user(text.into());
+            return;
+        }
+        let text = match self.keymap.rebind_action(action, chord.clone()) {
+            Ok(()) => {
+                self.rebinding = None;
+                match self.keymap.save() {
+                    Ok(()) => return,
+                    Err(e) => format!(
+                        "KEYBINDINGS NOT SAVED — {}: {e}",
+                        Keymap::config_path().display()
+                    ),
+                }
+            }
+            Err(holder) => format!("ALREADY BOUND — {} is {}", chord.pretty(), holder.label()),
+        };
+        eprintln!("{text}");
+        self.notify_user(text.into());
+    }
+}
