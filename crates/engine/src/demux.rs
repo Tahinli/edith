@@ -129,6 +129,40 @@ fn mp4_codec(fourcc: &[u8; 4]) -> Option<Codec> {
         .map(|&(codec, ..)| codec)
 }
 
+/// The one refusal that is an **answer**: this file carries no picture at all
+/// that this engine reads -- a song in a video container, an audio-only mp4 or
+/// Matroska, a `.mka` under any name.
+///
+/// A type rather than a sentence, because two callers want two different things
+/// from it. A front-end shows its `Display`, which is the words it always was,
+/// and refuses the import by them. [`crate::proxy`] wants to tell it from *"this
+/// file is broken"*: a song is not a film to stand in for and saying "NO PROXY"
+/// about one is a refusal nobody asked for, while a film that will not open is
+/// worth a line. Neither could tell them apart by matching on prose, and prose
+/// is the one thing in this engine that is free to be reworded.
+///
+/// A file whose picture is in a codec nothing here decodes is **not** this: it
+/// has a video track, the refusal names the codec, and that stays loud.
+#[derive(Debug)]
+pub struct NoVideoTrack(String);
+
+impl std::fmt::Display for NoVideoTrack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoVideoTrack {}
+
+impl NoVideoTrack {
+    /// Whether `error` is one of these, however deep in a `Box` it is: the
+    /// question [`crate::proxy`] asks, in one place so no caller downcasts by
+    /// hand.
+    pub fn is_it(error: &crate::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoMeta {
     pub width: u32,
@@ -943,10 +977,14 @@ impl MkvDemuxer {
                         None => format!(
                             "{codec} video in a Matroska file is not supported — AV1, HEVC, H.264 and VP9 are"
                         ),
-                    },
-                    None => "this Matroska file has no video track".to_string(),
-                }
-                .into());
+                    }
+                    .into(),
+                    // No picture in it *at all*, which is a fact about the file
+                    // and not a fault: [`NoVideoTrack`] says why that is a type.
+                    None => crate::Error::from(NoVideoTrack(
+                        "this Matroska file has no video track".to_string(),
+                    )),
+                });
             }
         };
         // A picture nothing here can put back together is a refusal at the door,
@@ -2372,10 +2410,15 @@ fn mp4_no_video<R>(path: &Path, reader: &Mp4Reader<R>) -> crate::Error {
             None => {
                 format!("{kind} video in this mp4 is not supported — H.264, HEVC, VP9 and AV1 are")
             }
-        },
-        None => "no H.264, HEVC, VP9 or AV1 video track in file".to_string(),
+        }
+        .into(),
+        // Nothing with a picture in it that this reads -- an audio-only mp4,
+        // which is a thing a person really does hand an editor. The Matroska
+        // door's own answer, and the same type for the same reason.
+        None => crate::Error::from(NoVideoTrack(
+            "no H.264, HEVC, VP9 or AV1 video track in file".to_string(),
+        )),
     }
-    .into()
 }
 
 /// Bits per luma sample out of a VP9 keyframe's uncompressed header (VP9

@@ -34,7 +34,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::demux::{Codec, Demuxer, VideoMeta};
+use crate::demux::{Codec, Demuxer, NoVideoTrack, VideoMeta};
 use crate::export::{ExportHandle, ExportSettings, Format};
 use crate::project::{Clip, LaneKind, Project, Source, Speed};
 use crate::scale::FitPolicy;
@@ -51,10 +51,36 @@ pub const LONG_EDGE: u32 = 1280;
 /// ~11.5 GB at ~1.37 MB per second of film), or a dozen of an ordinary length.
 ///
 /// A cap is not a nicety here. Proxies are written *without being asked for*,
-/// on import, two at a time -- so without one the answer to "how much of his
-/// disk does this take" is "all of it, eventually". Over the cap, the least
-/// recently used are deleted until it fits ([`sweep`]).
+/// on import, [`AT_ONCE`] at a time -- so without one the answer to "how much
+/// of his disk does this take" is "all of it, eventually". Over the cap, the
+/// least recently used are deleted until it fits ([`sweep`]).
+///
+/// **What this really bounds.** A sweep runs before each new stand-in and
+/// leaves room for the ones about to be written ([`reserve`]), so what is
+/// *finished* is held to `CACHE_CAP - reserve` and the encodes in flight have
+/// the reserve to grow into. The directory therefore sits at about the cap
+/// rather than at the cap plus a film per encode, which is what it did when the
+/// sweep aimed at the bare number. It can still pass the cap where an encode
+/// outruns its own estimate -- a stand-in cannot be deleted while it is being
+/// written -- and the next sweep takes that back.
 pub const CACHE_CAP: u64 = 20 * 1024 * 1024 * 1024;
+
+/// How many stand-ins may be made at once. Two, not one per core: each is a
+/// whole film through a decoder and an encoder, and the hardware seat they
+/// queue on is a single one -- more of them at once is the same work done
+/// later, with the editor slower while it happens.
+///
+/// It lives here rather than in the front-end that does the fanning out because
+/// the cache's own arithmetic needs it ([`reserve`]): the number of encodes in
+/// flight is exactly how much room the sweep has to leave, and two places
+/// holding that number separately is one place for them to disagree.
+pub const AT_ONCE: usize = 2;
+
+/// What the hardware seat really writes against what it was asked for: 1.25,
+/// measured 2026-08-13 (8.3 Mbit/s out of a 6.6 Mbit/s request on radeonsi).
+/// Folded into [`reserve`] so the room left for an encode is the room it will
+/// actually take, not the room it was told to.
+const RATE_OVERSHOOT: f64 = 1.25;
 
 /// Bits per pixel per second a proxy is coded at, [`crate::export`]'s own rate
 /// rule at three times the number: every frame being an IDR means no frame
@@ -112,6 +138,29 @@ pub fn path_for(source: &Path) -> Option<PathBuf> {
         "proxies",
     )?;
     Some(dir.join(format!("{:016x}.mp4", crate::demux::fnv1a(&bytes))))
+}
+
+/// How much of [`CACHE_CAP`] the sweep leaves free for the stand-ins that are
+/// about to be written into the directory: [`AT_ONCE`] of them, each about the
+/// size of the one being started now.
+///
+/// The estimate is the file's own arithmetic and not a guess: the picture is
+/// coded at [`BITS_PER_PIXEL`] bits per pixel per second and the frame rate
+/// cancels out, so it is `width * height * frames * bpp / 8` -- times
+/// [`RATE_OVERSHOOT`], because the hardware seat writes over the rate it is
+/// asked for.
+///
+/// Held to half the cap, whatever that comes to. A single 4K feature estimates
+/// at over the whole cap, and reserving that would empty the cache to make room
+/// for one film -- deleting stand-ins that are in use, for a bound that cannot
+/// be met anyway while two of them are being written. Half is the compromise:
+/// what is *finished* stays under half the cap, so the two in flight have the
+/// other half to grow into before the disk carries more than [`CACHE_CAP`].
+fn reserve(width: u32, height: u32, frames: u32) -> u64 {
+    let bytes = f64::from(width) * f64::from(height) * f64::from(frames) * BITS_PER_PIXEL / 8.0;
+    ((bytes * RATE_OVERSHOOT) as u64)
+        .saturating_mul(AT_ONCE as u64)
+        .min(CACHE_CAP / 2)
 }
 
 /// Deletes least-recently-used stand-ins until the directory holds at most
@@ -254,16 +303,26 @@ pub fn generate(source: &Path) -> crate::Result<Job> {
 /// cluster walk, so asking `wanted` and then `generate` separately would pay
 /// for it twice.
 ///
-/// A song and a still are not films and are answered before that read: neither
-/// has a picture stream to stand in for, and a demuxer opened on one fails --
-/// which used to reach a front-end as "no proxy" on a `.wav`, a refusal about
-/// something nobody had asked for. `Ok(None)` is the true answer, and it is the
-/// same one a 1080p H.264 film gets.
+/// A file with no picture in it is not a film and is answered `Ok(None)`, the
+/// same answer a 1080p H.264 film gets -- it is not a failure, and reporting it
+/// as one put "NO PROXY for tone.wav" in front of somebody who had imported a
+/// song.
+///
+/// Twice, because there are two ways to know. A name this engine already reads
+/// as sound or as a still is answered before anything is opened, which is the
+/// cheap half. The other half is the honest one: **an audio-only `.mp4`, `.mkv`
+/// or `.mov` is a video container with no video track in it**, and only its
+/// header says so -- so the demuxer's own [`NoVideoTrack`] answer is taken here
+/// as the same quiet `None`. A film that *has* a picture and will not open is a
+/// different thing and stays loud.
 pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
     if crate::is_audio(source) || crate::is_image(source) {
         return Ok(None);
     }
-    started(source, wanted)
+    match started(source, wanted) {
+        Err(e) if NoVideoTrack::is_it(&e) => Ok(None),
+        other => other,
+    }
 }
 
 /// Both doors: the cache is looked at, the header is read once, and `only_if`
@@ -284,10 +343,11 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
         // Before the write, which is the only thing that makes this directory
-        // bigger: what is already there is brought under the cap first, so the
-        // disk never carries more stand-ins than [`CACHE_CAP`] plus the one
-        // being written.
-        sweep(dir, CACHE_CAP);
+        // bigger -- and with room left for what is *about* to be written into
+        // it: sweeping to the bare cap left the finished ones filling it and
+        // then [`AT_ONCE`] encodes adding gigabytes on top, which is a cap that
+        // is over by a whole film's worth by construction ([`reserve`]).
+        sweep(dir, CACHE_CAP.saturating_sub(reserve(width, height, meta.frame_count)));
     }
     // What a killed editor left behind: the export worker deletes its own part
     // file when it is cancelled or fails, but nothing can delete it for a
@@ -401,6 +461,31 @@ mod tests {
         assert_eq!(size_for(&meta(1, 1, Codec::H264)), (2, 2), "never zero");
     }
 
+    /// What the sweep leaves free for the encodes that are about to run: two
+    /// of them, at what this one is really going to cost. Without it the cap
+    /// was soft by a whole film per encode -- 20 GB of finished stand-ins and
+    /// then two 4K ones writing gigabytes on top of it.
+    #[test]
+    fn the_cap_keeps_room_for_what_is_about_to_be_written() {
+        // A 2h20 4K film, at the size a stand-in of it is coded: 1280x536 for
+        // 201536 frames. Its own arithmetic says ~2.6 GB, and two of them is
+        // over the cap's half, so the reserve is that half.
+        let big = reserve(1280, 536, 201_536);
+        assert_eq!(big, CACHE_CAP / 2, "a feature film asks for more than half");
+        // A short clip asks for what it costs and no more: 1280x720 for 300
+        // frames is 1280*720*300*0.3/8 * 1.25 * 2 encodes.
+        let small = reserve(1280, 720, 300);
+        let one = 1280.0 * 720.0 * 300.0 * BITS_PER_PIXEL / 8.0 * RATE_OVERSHOOT;
+        assert_eq!(small, one as u64 * AT_ONCE as u64);
+        assert!(small < CACHE_CAP / 2, "and it is nowhere near the ceiling");
+        // The reserve is what a sweep aims below, so what is *finished* is held
+        // under the cap by at least the room the encodes will take.
+        assert!(CACHE_CAP.saturating_sub(big) <= CACHE_CAP / 2);
+        // Nothing overflows on a picture nobody would code.
+        assert_eq!(reserve(0, 0, 0), 0);
+        assert_eq!(reserve(u32::MAX, u32::MAX, u32::MAX), CACHE_CAP / 2);
+    }
+
     /// The cap keeps the directory a cache and not a second copy of his
     /// library: over it, the least recently used go until it fits, and a
     /// half-written one is never taken (it is being written *now*) though its
@@ -448,6 +533,12 @@ mod tests {
     ///
     /// Real files, because the point is that nothing reads them: a demuxer
     /// opened on a WAV is exactly what used to raise the refusal.
+    ///
+    /// ...and one **audio-only mp4**, which is the same class arriving the
+    /// other way: its name says video, so no extension can answer it and the
+    /// header is what tells. That one is a real, well-formed mp4 with an AAC
+    /// track and no video track at all -- a thing a person really does hand an
+    /// editor, and what a name-shaped gate walks straight past.
     #[test]
     fn a_song_and_a_still_are_never_stood_in_for() {
         let dir = crate::scratch::Scratch::dir("proxy-not-a-film");
@@ -462,6 +553,60 @@ mod tests {
             );
             assert_eq!(cached(&file), None, "{name} left nothing in the cache");
         }
+
+        let silent_film = dir.join("audio-only.mp4");
+        write_audio_only_mp4(&silent_film);
+        // It really is an mp4 nothing here finds a picture in -- the demuxer
+        // says so by name, which is what makes the answer below a *class* and
+        // not a guess about the extension.
+        let opened = Demuxer::open(&silent_film);
+        let refusal = opened.err().expect("an mp4 with no picture will not open");
+        assert!(
+            crate::demux::NoVideoTrack::is_it(&refusal),
+            "not the no-picture answer: {refusal}"
+        );
+        let answer = generate_if_wanted(&silent_film);
+        assert!(
+            matches!(answer, Ok(None)),
+            "an audio-only mp4 is not a film to stand in for: {:?}",
+            answer.err().map(|e| e.to_string())
+        );
+        assert_eq!(cached(&silent_film), None);
+    }
+
+    /// A well-formed mp4 carrying one AAC track and no video track: what an
+    /// `ffmpeg -vn` or a music file in the wrong box looks like. Written with
+    /// the same crate the exporter's muxer uses, so it is the file that reader
+    /// really parses and not a hand-made approximation.
+    fn write_audio_only_mp4(path: &Path) {
+        use mp4::{
+            AacConfig, AudioObjectType, ChannelConfig, FourCC, MediaConfig, Mp4Config, Mp4Writer,
+            SampleFreqIndex, TrackConfig, TrackType,
+        };
+        let mut writer = Mp4Writer::write_start(
+            std::io::BufWriter::new(std::fs::File::create(path).expect("create")),
+            &Mp4Config {
+                major_brand: FourCC::from(*b"isom"),
+                minor_version: 512,
+                compatible_brands: vec![FourCC::from(*b"isom"), FourCC::from(*b"mp41")],
+                timescale: 44_100,
+            },
+        )
+        .expect("start an mp4");
+        writer
+            .add_track(&TrackConfig {
+                track_type: TrackType::Audio,
+                timescale: 44_100,
+                language: "und".to_string(),
+                media_conf: MediaConfig::AacConfig(AacConfig {
+                    bitrate: 0,
+                    profile: AudioObjectType::AacLowComplexity,
+                    freq_index: SampleFreqIndex::Freq44100,
+                    chan_conf: ChannelConfig::Stereo,
+                }),
+            })
+            .expect("an audio track");
+        writer.write_end().expect("finish the mp4");
     }
 
     /// The staleness rule *is* the name: touch the source and the old proxy is
