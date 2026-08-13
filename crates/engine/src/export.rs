@@ -74,7 +74,7 @@ use oxideav_core::Muxer as _;
 use crate::audio::{AudioMeta, AudioSession};
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::demux::{Codec, Demuxer, MkvDemuxer, VideoMeta};
-use crate::hw::{HwEncoder, HwSession};
+use crate::hw::{DmaFrame, DmaWant, HwEncoder, HwPicture, HwSession};
 use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
 };
@@ -1918,16 +1918,24 @@ fn run(
                     .get(source)
                     .ok_or_else(|| format!("clip names source {source} of {}", sources.len()))?;
                 let (rate, color, _peak) = rates[source];
+                let mapper = tone[source].as_ref();
+                // Nothing on the way from this span's decoder to the encoder
+                // touches a sample: no tone map, no matrix remap, no grade --
+                // which is what lets the *decoded buffer itself* be encoded,
+                // never read back and never written out again. The canvas is
+                // the fourth thing that would touch it, and the decoder answers
+                // that one: a picture of another size than this file's is one
+                // the plugin hands back as pixels ([`HwSession::next_frame_dma`]).
+                let untouched = mapper.is_none()
+                    && remap_into(Some(color), false, out_color.matrix).is_none()
+                    && project
+                        .composite_color_at(span.start)
+                        .is_none_or(|params| params.is_identity());
+                let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
-                let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame))?;
-                (
-                    Some(pictures),
-                    rate,
-                    in_frame,
-                    Some(color),
-                    tone[source].as_ref(),
-                )
+                let pictures = ClipDecoder::open(&entry.path, rate.source_at(in_frame), want)?;
+                (Some(pictures), rate, in_frame, Some(color), mapper)
             }
             // A gap's black is 16/128/128, which is black in every matrix here
             // and on every curve: nothing to remap and nothing to tone-map,
@@ -2028,50 +2036,46 @@ fn run(
                         }
                     }
                 }
-                None => Some(black.picture()),
-            };
-            let Some((y, u, v, width, height)) = picture else {
-                break; // source ran out early; the clip list outlives the file
-            };
-            // The planes are borrowed from the decoder (and `Black::picture`
-            // hands the same slice as both u and v), so a grade cannot be
-            // applied in place: it goes onto a copy, which the encoder then
-            // reads instead.
-            let params = grade.filter(|p| !p.is_identity());
-            let (y, u, v) = match (params, remap, mapper) {
-                (None, None, None) => (y, u, v),
-                (params, remap, mapper) => {
-                    let (gy, gu, gv) = &mut graded;
-                    gy.clear();
-                    gy.extend_from_slice(y);
-                    gu.clear();
-                    gu.extend_from_slice(u);
-                    gv.clear();
-                    gv.extend_from_slice(v);
-                    // Tone-map first, so the grade is applied to the SDR picture
-                    // the canvas showed and not to HDR codes; then remap the
-                    // graded result. The order playback renders in, and the
-                    // only order in which preview and export agree.
-                    if let Some(mapper) = mapper {
-                        mapper.map(gy, gu, gv, width as usize, height as usize);
-                    }
-                    if let Some(params) = params {
-                        crate::color::apply_yuv(&params, gy, gu, gv);
-                    }
-                    if let Some((from, to)) = remap {
-                        crate::colorspace::remap(from, to, gy, gu, gv, width as usize);
-                    }
-                    (&gy[..], &gu[..], &gv[..])
+                None => {
+                    let (y, u, v, width, height) = black.picture();
+                    Some(Frame::Pixels(y, u, v, width, height))
                 }
             };
-            // Grade first, place second: the grade is the clip's own pixels
-            // and the bars around them are not the clip (see `scale::Composer`).
-            let (y, u, v, width, height) = canvas.place(y, u, v, width, height);
+            let Some(frame) = picture else {
+                break; // source ran out early; the clip list outlives the file
+            };
+            // A picture still on the GPU has nothing waiting for it here: the
+            // span was opened that way only where none of what follows would
+            // have touched a sample of it, so it is placed by nobody and goes
+            // into the encoder as the buffer the decoder wrote.
+            let placed = match frame {
+                Frame::Dma(_) => None,
+                Frame::Pixels(y, u, v, width, height) => Some(place_picture(
+                    y,
+                    u,
+                    v,
+                    width,
+                    height,
+                    grade,
+                    remap,
+                    mapper,
+                    &mut graded,
+                    &mut canvas,
+                )),
+            };
             // Once per timeline frame this source frame covers: one at real time
             // and faster, more when the clip is slowed -- the picture is already
             // graded and placed, so a held frame costs an encode and no decode.
             for _ in 0..repeats {
-                if let Some((au, key)) = encoder.encode(y, u, v, width, height)? {
+                let coded = match &frame {
+                    Frame::Dma(dma) => encoder.encode_dma(dma)?,
+                    Frame::Pixels(..) => {
+                        let (y, u, v, width, height) =
+                            placed.expect("a picture with pixels was placed");
+                        encoder.encode(y, u, v, width, height)?
+                    }
+                };
+                if let Some((au, key)) = coded {
                     write_video(
                         &mut muxer,
                         out,
@@ -2155,6 +2159,60 @@ fn run(
     muxer.finish()?;
     shared.progress.store(PROGRESS_SCALE, Ordering::Relaxed);
     Ok(())
+}
+
+/// One decoded picture graded, tone-mapped, remapped and placed on the canvas
+/// -- everything between a source's own samples and the ones an encoder is fed,
+/// which is exactly the work a zero-copy span has none of.
+///
+/// `graded` and `canvas` are the span's scratch: the planes come back borrowed
+/// from one of them, or from the picture itself where not a byte was touched.
+#[expect(clippy::too_many_arguments, reason = "one span's whole picture path")]
+fn place_picture<'a>(
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+    width: u32,
+    height: u32,
+    grade: Option<crate::color::ColorParams>,
+    remap: Option<(Matrix, Matrix)>,
+    mapper: Option<&ToneMapper>,
+    graded: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
+    canvas: &'a mut Composer,
+) -> (&'a [u8], &'a [u8], &'a [u8], u32, u32) {
+    // The planes are borrowed from the decoder (and `Black::picture` hands the
+    // same slice as both u and v), so a grade cannot be applied in place: it
+    // goes onto a copy, which the encoder then reads instead.
+    let params = grade.filter(|p| !p.is_identity());
+    let (y, u, v) = match (params, remap, mapper) {
+        (None, None, None) => (y, u, v),
+        (params, remap, mapper) => {
+            let (gy, gu, gv) = graded;
+            gy.clear();
+            gy.extend_from_slice(y);
+            gu.clear();
+            gu.extend_from_slice(u);
+            gv.clear();
+            gv.extend_from_slice(v);
+            // Tone-map first, so the grade is applied to the SDR picture the
+            // canvas showed and not to HDR codes; then remap the graded result.
+            // The order playback renders in, and the only order in which
+            // preview and export agree.
+            if let Some(mapper) = mapper {
+                mapper.map(gy, gu, gv, width as usize, height as usize);
+            }
+            if let Some(params) = params {
+                crate::color::apply_yuv(&params, gy, gu, gv);
+            }
+            if let Some((from, to)) = remap {
+                crate::colorspace::remap(from, to, gy, gu, gv, width as usize);
+            }
+            (&gy[..], &gu[..], &gv[..])
+        }
+    };
+    // Grade first, place second: the grade is the clip's own pixels and the
+    // bars around them are not the clip (see `scale::Composer`).
+    canvas.place(y, u, v, width, height)
 }
 
 /// Which matrix pair a span's samples are rewritten by on the way into a file
@@ -3119,6 +3177,36 @@ impl Enc {
         }
     }
 
+    /// What a decoded buffer must look like to reach this seat without ever
+    /// being read back -- `None` for every seat that reads bytes, which is both
+    /// software encoders and the intra HEVC one.
+    ///
+    /// The AV1 hardware seat is left out on purpose: it is opt-in behind
+    /// `VE_HW_AV1` because the vendored encoder reset this project's GPU
+    /// ([`Enc::open_av1`]), and a path that cannot be measured is not one to
+    /// widen.
+    fn dma_want(&self, meta: &VideoMeta) -> Option<crate::hw::DmaWant> {
+        match self {
+            Self::Hw(hw) | Self::HevcHw(hw) => hw.dma_want(meta.width, meta.height),
+            _ => None,
+        }
+    }
+
+    /// One picture the decoder left on the GPU in, at most one access unit out.
+    /// Same answer as [`Enc::encode`], including which units a decoder may be
+    /// started from, because it is the same encoder -- only the picture took
+    /// another way in.
+    fn encode_dma(&mut self, dma: &DmaFrame) -> crate::Result<Option<(&[u8], bool)>> {
+        match self {
+            Self::Hw(hw) => Ok(hw.encode_dma(dma, false)?.map(|au| (au, false))),
+            // Every picture an IDR here, exactly as in [`Enc::encode`].
+            Self::HevcHw(hw) => Ok(hw.encode_dma(dma, true)?.map(|au| (au, true))),
+            // Unreachable through [`Enc::dma_want`], which is the only thing
+            // that puts a span's decoder on this path.
+            _ => Err("this encoder takes pictures as bytes, not as buffers".into()),
+        }
+    }
+
     /// End of stream; call until it returns `None`.
     fn drain(&mut self) -> crate::Result<Option<(&[u8], bool)>> {
         match self {
@@ -3395,17 +3483,46 @@ impl Drop for DecodeThread {
     }
 }
 
-/// One picture, owned, on its way from a decode thread to the encoder.
-struct Yuv {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    width: u32,
-    height: u32,
+/// One picture on its way from a decode thread to the encoder: its bytes, or
+/// the GPU buffer they are still in.
+enum Yuv {
+    Pixels {
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// Never read back and never copied: a DRM-PRIME handle the encoder imports
+    /// on the other side of the channel. Sending it is sending an integer, and
+    /// what keeps the buffer from being decoded over is the channel's own depth
+    /// (see [`crate::hw::HwSession::next_frame_dma`]).
+    Dma(DmaFrame),
+}
+
+impl Yuv {
+    /// The decoder's own buffer copied out, which is what it costs to hand a
+    /// picture to another thread when the pixels have to travel.
+    fn pixels(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32) -> Self {
+        Self::Pixels {
+            y: y.to_vec(),
+            u: u.to_vec(),
+            v: v.to_vec(),
+            width,
+            height,
+        }
+    }
+}
+
+/// One picture as the export loop sees it: planes to grade and place, or a
+/// buffer that goes straight into the encoder.
+enum Frame<'a> {
+    Pixels(&'a [u8], &'a [u8], &'a [u8], u32, u32),
+    Dma(&'a DmaFrame),
 }
 
 impl ClipDecoder {
-    fn open(path: &Path, start_frame: u32) -> crate::Result<Self> {
+    fn open(path: &Path, start_frame: u32, want: Option<DmaWant>) -> crate::Result<Self> {
         // Before either decoder: an image is not a stream, so `start_frame`
         // means nothing to it -- every frame of a still span is the same
         // picture, which is what playback shows for it too.
@@ -3416,7 +3533,7 @@ impl ClipDecoder {
         let (tx, frames) = sync_channel(2);
         let handle = thread::Builder::new()
             .name("export-decode".into())
-            .spawn(move || decode_stream(&path, start_frame, &tx))?;
+            .spawn(move || decode_stream(&path, start_frame, want, &tx))?;
         Ok(Self::Streamed(Streamed {
             frames,
             _thread: DecodeThread(Some(handle)),
@@ -3425,22 +3542,26 @@ impl ClipDecoder {
         }))
     }
 
-    /// The next picture as tightly packed I420, borrowed until the call after.
-    fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
+    /// The next picture, borrowed until the call after -- as tightly packed
+    /// I420, or as the GPU buffer the decoder wrote it into.
+    fn next(&mut self) -> crate::Result<Option<Frame<'_>>> {
         match self {
-            Self::Still(still) => Ok(Some(still.picture())),
+            Self::Still(still) => {
+                let (y, u, v, width, height) = still.picture();
+                Ok(Some(Frame::Pixels(y, u, v, width, height)))
+            }
             Self::Streamed(stream) if stream.ended => Ok(None),
             Self::Streamed(stream) => match stream.frames.recv() {
-                Ok(Ok(Some(frame))) => {
-                    let frame = stream.current.insert(frame);
-                    Ok(Some((
-                        &frame.y,
-                        &frame.u,
-                        &frame.v,
-                        frame.width,
-                        frame.height,
-                    )))
-                }
+                Ok(Ok(Some(frame))) => Ok(Some(match stream.current.insert(frame) {
+                    Yuv::Pixels {
+                        y,
+                        u,
+                        v,
+                        width,
+                        height,
+                    } => Frame::Pixels(y, u, v, *width, *height),
+                    Yuv::Dma(dma) => Frame::Dma(dma),
+                })),
                 // The decoder said end of stream in as many words -- a source
                 // shorter than the clip that names it, which the span loop ends
                 // gracefully on.
@@ -3473,7 +3594,12 @@ impl ClipDecoder {
 /// error, or the `Ok(None)` that *is* end of stream. Closing the channel is not
 /// one of them -- a silent close is a panicked thread, and the receiver treats
 /// it as the failure it is rather than as a source that ran out.
-fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Option<Yuv>>>) {
+fn decode_stream(
+    path: &Path,
+    start_frame: u32,
+    want: Option<DmaWant>,
+    tx: &SyncSender<crate::Result<Option<Yuv>>>,
+) {
     let opened = match forced("VE_SW") {
         false => HwSession::open_at(path, start_frame).map(Pictures::Hw),
         true => None,
@@ -3489,17 +3615,8 @@ fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Op
         },
     };
     loop {
-        // Copied out of the decoder's own buffer, which it reuses for the next
-        // picture: one 3 MB memcpy per frame against the decode and the encode
-        // it lets overlap.
-        let frame = match decoder.next() {
-            Ok(Some((y, u, v, width, height))) => Yuv {
-                y: y.to_vec(),
-                u: u.to_vec(),
-                v: v.to_vec(),
-                width,
-                height,
-            },
+        let frame = match decoder.next(want) {
+            Ok(Some(frame)) => frame,
             Ok(None) => {
                 let _ = tx.send(Ok(None));
                 return;
@@ -3524,15 +3641,29 @@ enum Pictures {
 }
 
 impl Pictures {
-    fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
-        match self {
-            Self::Hw(hw) => hw.next_frame(),
-            Self::Sw(sw) => {
+    /// The next picture, owned, ready to cross the channel. `want` is what the
+    /// export's encoder can read straight off the GPU: where the hardware
+    /// decoder can hand such a buffer over there is no copy here at all, and
+    /// everything else is the 3 MB memcpy out of the decoder's own buffer that
+    /// buys the decode and the encode their overlap.
+    fn next(&mut self, want: Option<DmaWant>) -> crate::Result<Option<Yuv>> {
+        match (self, want) {
+            (Self::Hw(hw), Some(want)) => Ok(match hw.next_frame_dma(want)? {
+                Some(HwPicture::Dma(dma)) => Some(Yuv::Dma(dma)),
+                Some(HwPicture::Pixels(y, u, v, width, height)) => {
+                    Some(Yuv::pixels(y, u, v, width, height))
+                }
+                None => None,
+            }),
+            (Self::Hw(hw), None) => Ok(hw
+                .next_frame()?
+                .map(|(y, u, v, width, height)| Yuv::pixels(y, u, v, width, height))),
+            (Self::Sw(sw), _) => {
                 if !sw.advance()? {
                     return Ok(None);
                 }
                 let frame = sw.frame.as_ref().expect("advance stored a picture");
-                Ok(Some((
+                Ok(Some(Yuv::pixels(
                     &frame.y,
                     &frame.u,
                     &frame.v,
@@ -3633,9 +3764,9 @@ mod tests {
             panic!("decoder died");
         });
         let mut died = streamed(handle, frames);
-        let e = died
-            .next()
-            .expect_err("a silent death must fail the export, not end the clip");
+        let Err(e) = died.next() else {
+            panic!("a silent death must fail the export, not end the clip")
+        };
         assert!(
             e.to_string().contains("without a picture or a reason"),
             "{e}"
