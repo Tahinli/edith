@@ -3999,6 +3999,16 @@ impl Player {
         }
     }
 
+    /// The line taken back down again, by the row that drew it and by no other:
+    /// the pointer has been carried off `lane`, so the slot it was promising is
+    /// no longer the one a release would commit to.
+    fn forget_lane_drop(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        if self.lane_drop.is_some_and(|d| d.lane == lane) {
+            self.lane_drop = None;
+            cx.notify();
+        }
+    }
+
     /// The same shadow for a library row: its head at [`Player::place_frame`],
     /// which is where the drop inserts it, and the file's own length for its
     /// width -- the length the library row already reports. A file this lane
