@@ -257,7 +257,14 @@ impl Player {
         let gate = self.session.as_ref().map(PlaybackSession::import_gate);
         let read = cx.background_executor().spawn({
             let (path, stage) = (path.clone(), Arc::clone(&stage));
-            async move { open_ahead(what, &path, &stage, gate) }
+            let cancelled = Arc::clone(&cancelled);
+            // The Cancel beside the line reaches the *walk* this way: every
+            // cluster the reads below step over checks this flag, so a stopped
+            // import stops the disk rather than only the landing
+            // ([`engine::demux::with_cancel`]).
+            async move {
+                engine::demux::with_cancel(&cancelled, || open_ahead(what, &path, &stage, gate))
+            }
         });
         let now = Instant::now();
         self.importing = Some(Import {
@@ -311,9 +318,10 @@ impl Player {
     /// leaving five to start themselves would be the same wait under another
     /// name.
     ///
-    /// The read in flight is *not* stopped, for the reason [`Import::cancelled`]
-    /// gives, and the notice says as much rather than promising the disk went
-    /// quiet.
+    /// The read in flight is stopped too, where the container lets it be: a
+    /// Matroska walk checks this flag between clusters and gives up there
+    /// ([`engine::demux::with_cancel`]). See [`Import::cancelled`] for what an
+    /// mp4 header still costs.
     pub(crate) fn cancel_import(&mut self, cx: &mut Context<Self>) {
         let Some(import) = self.importing.take() else {
             return;
@@ -328,7 +336,7 @@ impl Player {
             n => format!(" — {n} more dropped from the queue"),
         };
         let text = format!(
-            "IMPORT CANCELLED: {}{tail} — the read already running finishes unheeded",
+            "IMPORT CANCELLED: {}{tail} — the read stops where the container lets it",
             file_name(&import.path)
         );
         eprintln!("{text}");

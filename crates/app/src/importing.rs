@@ -81,12 +81,16 @@ pub(crate) struct Import {
     /// the landing: what the worker read is dropped instead of joining the
     /// timeline.
     ///
-    /// corner-cut: the *read* is not stopped -- a demuxer walk polls nothing, so
-    /// the worker finishes into a result nobody takes, and the window is given
-    /// back at the click either way. Ceiling: a cancelled cold 24 GB import
-    /// still costs the disk its twenty seconds. Upgrade: a flag
-    /// `engine::demux::Demuxer::open` polls between clusters, which is where an
-    /// export's own cancel already lives ([`engine::ExportHandle::cancel`]).
+    /// ...and the read with it: the worker installs this as its thread's cancel
+    /// ([`engine::demux::with_cancel`]) and every Matroska cluster walk under it
+    /// -- the header index and the subtitle pass, the twenty seconds of a cold
+    /// 24 GB remux -- gives up at the next element.
+    ///
+    /// corner-cut: an mp4's header is one read inside `mp4::Mp4Reader`, which
+    /// has no flag to poll, so a cancelled mp4 import still finishes its own
+    /// header before the worker returns. Ceiling: the disk stays busy for that
+    /// read, though nothing waits on it. Upgrade path is our own `moov` parse,
+    /// which is a demuxer rewrite rather than a cancel.
     pub(crate) cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 

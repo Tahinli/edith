@@ -201,6 +201,14 @@ pub struct MixControls {
     state: Mutex<(Vec<f32>, Limiter)>,
     /// A mixer thread has these; see the type docs.
     live: AtomicBool,
+    /// The open these were handed to finished without a mixer: a silent
+    /// timeline, or a source that would not open. Set by whoever ran that open
+    /// ([`PlaybackSession::start_audio`] does it from the feeder), because
+    /// [`Self::live`] alone cannot tell "no mixer will ever read this" from
+    /// "the mixer is still being opened" -- and a caller that cannot tell those
+    /// apart either rebuilds the sound under a cold open, once per fader nudge,
+    /// or hands a mix to nobody and never notices.
+    detached: AtomicBool,
 }
 
 impl MixControls {
@@ -209,6 +217,7 @@ impl MixControls {
             version: AtomicU64::new(0),
             state: Mutex::new((gains, limiter)),
             live: AtomicBool::new(false),
+            detached: AtomicBool::new(false),
         })
     }
 
@@ -222,6 +231,17 @@ impl MixControls {
     /// Whether a mixer thread is reading this at all.
     pub fn is_live(&self) -> bool {
         self.live.load(Ordering::Acquire)
+    }
+
+    /// Says the open is over and left no mixer behind; see [`Self::detached`].
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::Release);
+    }
+
+    /// Whether anything can still hear a [`set`](Self::set): a mixer reading
+    /// these, or an open still on its way to being one.
+    pub fn is_reachable(&self) -> bool {
+        !self.detached.load(Ordering::Acquire)
     }
 
     /// The mix, if it has moved since `seen`. `None` -- the every-block case --

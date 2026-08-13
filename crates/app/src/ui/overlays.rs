@@ -58,8 +58,8 @@ impl Player {
                             BG_RAISED(),
                             None,
                             "Cancel",
-                            "stops this file and anything queued behind it; the read already \
-                             running finishes unheeded"
+                            "stops this file and anything queued behind it, and the read with \
+                             them where the container lets it stop"
                                 .to_string(),
                             true,
                             cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_import(cx)),

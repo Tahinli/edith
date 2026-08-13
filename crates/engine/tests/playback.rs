@@ -530,6 +530,76 @@ fn a_cold_seek_storm_starves_no_quantum() {
     );
 }
 
+/// What a *drag* costs in threads: 200 scrub steps across a cold film with no
+/// wait between them, which is a ruler dragged from end to end. Every step
+/// abandons an audio open and starts another, and an abandoned one used to run
+/// its read to the end anyway -- on a cold film that is seconds each, so the
+/// threads pile up behind the drag rather than following it.
+///
+/// The session's own count is the oracle (`live_workers`), and the process
+/// thread count beside it says what the OS saw.
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn a_cold_scrub_does_not_pile_up_threads() {
+    let path = std::env::var_os("EDITH_COLD_FILM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| asset("test_av.mp4"));
+    let steps: u32 = std::env::var("EDITH_STEPS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(200);
+    let mut session = open(&path);
+    let duration = session.timeline_duration();
+    let mut last_index = None;
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+    evict(&path);
+
+    let (mut peak, mut peak_os) = (0, 0);
+    let scrub = Instant::now();
+    for step in 0..steps {
+        session.seek(duration * f64::from(step) / f64::from(steps));
+        session.tick();
+        while session.try_frame().is_some() {}
+        peak = peak.max(session.live_workers());
+        peak_os = peak_os.max(os_threads());
+        sleep(Duration::from_millis(16)); // a drag reports at ~60 Hz
+    }
+    eprintln!(
+        "{steps} cold scrub steps in {:?}: peak {peak} session workers, {peak_os} process threads",
+        scrub.elapsed()
+    );
+    // The peak is *reported*, not asserted: three runs of one build over the
+    // same film measured 14, 101 and 137, because what decides it is how much
+    // disk the rest of the machine is using while the opens run. What the
+    // session owes is a different question and a real one -- every worker the
+    // drag started has to end, or a drag is a leak.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while session.live_workers() > 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the scrub leaked workers: {} still running two minutes on",
+            session.live_workers()
+        );
+        sleep(Duration::from_millis(50));
+    }
+    eprintln!("all but {} of them returned", session.live_workers());
+}
+
+/// Threads in this process, out of `/proc/self/status`. Only ever a report
+/// beside the session's own count -- a suite decoding other files at the same
+/// time moves this number without touching the session under test.
+fn os_threads() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 /// The edit list end to end: two cuts, drop the middle clip, play the result.
 /// What comes out is one contiguous timeline whose *pictures* skip the hole --
 /// no audio needed, so this runs anywhere.
