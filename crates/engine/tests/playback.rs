@@ -481,7 +481,7 @@ fn a_cold_seek_storm_starves_no_quantum() {
     run_for(&mut session, &mut last_index, Duration::from_millis(300));
     // Only a machine with the plugin *and* a daemon can starve at all; without
     // one the session plays wall-paced and there is nothing to measure.
-    let Some(before) = session.audio_underruns() else {
+    let Some((before, _)) = session.audio_underruns() else {
         eprintln!("no audio device: seek storm not measured");
         return;
     };
@@ -517,9 +517,11 @@ fn a_cold_seek_storm_starves_no_quantum() {
         // ...and then plays for a moment, which is where a late decoder shows.
         run_for(&mut session, &mut landed, Duration::from_millis(300));
     }
-    let underruns = session.audio_underruns().expect("device still open") - before;
+    let (now, last) = session.audio_underruns().expect("device still open");
+    let underruns = now - before;
     eprintln!(
-        "{seeks} cold seeks into {} in {:?}: {underruns} underruns ({before} before the storm)",
+        "{seeks} cold seeks into {} in {:?}: {underruns} underruns ({before} before the storm, \
+         last at {last:?})",
         path.display(),
         storm.elapsed()
     );
