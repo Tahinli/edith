@@ -450,6 +450,86 @@ fn a_cold_audio_open_does_not_block_the_seek() {
     );
 }
 
+/// The seek storm the *ear* is in: 20 random seeks into a cold file, each
+/// resuming playback, and not one starved quantum out of the device.
+///
+/// The device is started by the feeder's first real sample, never by the intent
+/// to play ([`PlaybackSession::play`] and the seek's own resume), because an
+/// audio open is not free -- seconds, on a cold film -- and a stream made active
+/// over an empty ring plays its own silence and counts every quantum of it as
+/// an underrun. It sounds identical either way; what it destroys is the meaning
+/// of the count, which is the only thing that says the decoder is keeping up.
+/// This is the regression guard for that: cold storm, count must be nil.
+///
+/// `assets/test_av.mp4` by default; `EDITH_COLD_FILM=<a big film>` and
+/// `EDITH_SEEKS=<n>` make it the measurement (the rubric's floor is 50 seeks
+/// into a two-hour film).
+#[test]
+#[ignore = "needs a running PipeWire daemon"]
+fn a_cold_seek_storm_starves_no_quantum() {
+    let path = std::env::var_os("EDITH_COLD_FILM")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| asset("test_av.mp4"));
+    let seeks: u32 = std::env::var("EDITH_SEEKS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(20);
+    let mut session = open(&path);
+    let duration = session.timeline_duration();
+    let mut last_index = None;
+    session.play();
+    run_for(&mut session, &mut last_index, Duration::from_millis(300));
+    // Only a machine with the plugin *and* a daemon can starve at all; without
+    // one the session plays wall-paced and there is nothing to measure.
+    let Some(before) = session.audio_underruns() else {
+        eprintln!("no audio device: seek storm not measured");
+        return;
+    };
+    evict(&path);
+
+    // xorshift64 off a fixed seed: the same storm every run, so two runs of
+    // this are comparable without a dependency to draw the numbers from.
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let storm = Instant::now();
+    for i in 0..seeks {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        // Off the end of the timeline is a seek with nothing to play; keep the
+        // storm inside the film.
+        let target = duration * 0.98 * (rng >> 11) as f64 / (1u64 << 53) as f64;
+        session.seek(target);
+        // The sound has to *come back*, which is the other half of this: a
+        // device that never plays starves no quantum either, so the count below
+        // means nothing unless every seek resumed. The clock is held at the
+        // target until the first real sample is queued, so it moving is the
+        // sound arriving ([`PlaybackSession::tick`]).
+        let mut landed = None;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while session.now() <= target + 0.05 {
+            pump(&mut session, &mut landed);
+            assert!(
+                Instant::now() < deadline,
+                "seek {i} to {target:.1}s never resumed: the clock stood still"
+            );
+            sleep(Duration::from_millis(8));
+        }
+        // ...and then plays for a moment, which is where a late decoder shows.
+        run_for(&mut session, &mut landed, Duration::from_millis(300));
+    }
+    let underruns = session.audio_underruns().expect("device still open") - before;
+    eprintln!(
+        "{seeks} cold seeks into {} in {:?}: {underruns} underruns ({before} before the storm)",
+        path.display(),
+        storm.elapsed()
+    );
+    assert_eq!(
+        underruns, 0,
+        "the device starved during the storm: {underruns} quanta of silence it \
+         counted as a late decoder"
+    );
+}
+
 /// The edit list end to end: two cuts, drop the middle clip, play the result.
 /// What comes out is one contiguous timeline whose *pictures* skip the hole --
 /// no audio needed, so this runs anywhere.
