@@ -10707,6 +10707,26 @@ mod tests {
             }),
             (0., 0.)
         );
+        // The picker is the same card and the longest list in it is the palette
+        // family list, which grows every time somebody asks for more colours.
+        // Twelve of them still stand on screen *whole* at the floor -- so the
+        // list's `overflow_y_scroll` is a safety net rather than something a
+        // person has to find. The day a family makes this fail is the day the
+        // card owes the affordance line the inspector and the cards carry
+        // ("more below — scroll the …"): a row nobody knows is under the fold
+        // is a row that is not there, and no scroll bar says it.
+        let families = crate::ui::theme::PaletteId::ALL.len();
+        assert_eq!(
+            menu_rows_h(families, floor),
+            families as f32 * MENU_ROW_H,
+            "{families} palettes no longer fit 640x360 -- the picker now needs \
+             the 'more below' line and a keyboard cursor that scrolls into view"
+        );
+        // ...and the detail beside each one is short enough to survive the
+        // right-hand column at that width instead of being truncated mid-word.
+        for id in crate::ui::theme::PaletteId::ALL {
+            assert!(id.detail().len() <= 30, "{id:?}: {:?}", id.detail());
+        }
     }
 
     /// Both menus, at the two things they can be opened on, and the box each
