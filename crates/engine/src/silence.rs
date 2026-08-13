@@ -2,11 +2,15 @@
 //! waveform takes, and the stretches of them nobody wants to watch.
 //!
 //! Three steps, kept apart so only the first one costs a decode: [`levels`]
-//! turns a file into one loudness number per 20 ms window, [`regions`] turns
-//! those numbers plus a [`Settings`] into silent stretches of *source* seconds,
-//! and [`timeline_regions`] puts those on the timeline through one clip's own
-//! range and rate. A card tweaking a threshold re-runs the last two and decodes
-//! nothing.
+//! turns a *stretch* of a file into one loudness number per 20 ms window,
+//! [`regions`] turns those numbers plus a [`Settings`] into silent stretches of
+//! seconds from where that read began, and [`timeline_regions`] puts those on
+//! the timeline through one clip's own range and rate. A card tweaking a
+//! threshold re-runs the last two and decodes nothing.
+//!
+//! The stretch is the *clip's*, not the file's: a take cut in half is half a
+//! decode, and the half nobody is looking at is never read (which is what a
+//! person means by "scan this clip").
 //!
 //! Loudness in **dBFS**, which is the unit every tool that does this speaks
 //! (ffmpeg's `silencedetect` noise floor, auto-editor's threshold) -- and RMS
@@ -31,7 +35,7 @@ pub const WINDOWS_PER_SEC: u32 = 50;
 pub const SILENT_DB: f32 = -120.;
 
 /// What counts as a silence worth cutting. Seconds, not frames: detection runs
-/// on the *source*, whose sample rate is its own business, and the frame grid
+/// on the *sound*, whose sample rate is its own business, and the frame grid
 /// is applied once at the end ([`timeline_regions`]).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Settings {
@@ -64,17 +68,26 @@ impl Default for Settings {
 }
 
 /// One RMS level in dBFS per [`WINDOWS_PER_SEC`]th of a second of `stream` of
-/// `path`, from media time 0 -- the same decode [`crate::waveform::peaks`] runs
-/// and with the same contract: channels folded together, `Ok(None)` for a file
-/// with **no audio track at all**, which is a source to refuse by name rather
-/// than one long silence to cut.
+/// `path`, over the half-open `range` of **source seconds** -- the same decode
+/// [`crate::waveform::peaks`] runs and with the same contract: channels folded
+/// together, `Ok(None)` for a file with **no audio track at all**, which is a
+/// source to refuse by name rather than one long silence to cut.
 ///
-/// Linear in source length at ~1700x realtime, so a ten-minute take scans in
-/// well under a second; a caller caches it per source and stream, because the
-/// settings above are all applied to the result and none of them needs a second
-/// decode.
-pub fn levels(path: impl AsRef<Path>, stream: usize) -> crate::Result<Option<Vec<f32>>> {
-    levels_with_progress(path, stream, &Progress::default())
+/// `levels[0]` is the window at `range.0`, never the window at media time 0:
+/// what is read is what is asked for, so a clip that plays a minute of a film
+/// costs a minute of decode and the rest of the file is never touched. Whole
+/// file is `(0., f64::INFINITY)`.
+///
+/// Linear in the range's length at ~1700x realtime, so a ten-minute take scans
+/// in well under a second; a caller caches it per source, stream and range,
+/// because the settings above are all applied to the result and none of them
+/// needs a second decode.
+pub fn levels(
+    path: impl AsRef<Path>,
+    stream: usize,
+    range: (f64, f64),
+) -> crate::Result<Option<Vec<f32>>> {
+    levels_with_progress(path, stream, range, &Progress::default())
 }
 
 /// What a running [`levels_with_progress`] says about itself while it runs, and
@@ -106,22 +119,32 @@ pub struct Progress {
 pub fn levels_with_progress(
     path: impl AsRef<Path>,
     stream: usize,
+    range: (f64, f64),
     progress: &Progress,
 ) -> crate::Result<Option<Vec<f32>>> {
+    let from = range.0.max(0.);
     let sources = [(path.as_ref().to_path_buf(), stream)];
-    let Some((meta, rx)) =
-        AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])?
+    let Some((meta, rx)) = AudioSession::open_multi_streams(&sources, &[(Some(0), from, range.1)])?
     else {
         return Ok(None);
     };
     let rate = f64::from(meta.sample_rate).max(1.);
     if let Some(total) = meta.total_samples {
-        progress.total.store((total as f64 / rate * 10.) as u64, Relaxed);
+        // What is left to read, not what the file is: the line has to count out
+        // of the stretch the scan actually decodes or it stalls at a third.
+        let secs = (total as f64 / rate).min(range.1) - from;
+        progress.total.store((secs.max(0.) * 10.) as u64, Relaxed);
     }
     // Fractional for `peaks`'s reason: 44100 / 50 is whole, 44100 / 30 is not,
     // and a rounded window drifts a bucket every few seconds over a long take.
     let per_window = f64::from(meta.sample_rate) / f64::from(WINDOWS_PER_SEC);
     let channels = (meta.channels as usize).max(1);
+    // Chunks are stamped in the source's own samples, counted from where the
+    // segment starts reading -- so a scan of a clip an hour in would otherwise
+    // build an hour of empty windows in front of it, and every one of those
+    // reads as digital silence and would fuse with the first real quiet of the
+    // clip. The window the range begins at is window zero here instead.
+    let base = (from * f64::from(WINDOWS_PER_SEC)) as usize;
     // Sum of squares and how many samples went into it -- the two halves of a
     // mean square, kept in f64 because a loud minute is millions of terms.
     let mut sums: Vec<(f64, u64)> = Vec::new();
@@ -131,11 +154,13 @@ pub fn levels_with_progress(
         if progress.cancel.load(Relaxed) {
             break;
         }
-        progress
-            .scanned
-            .store((chunk.start_sample as f64 / rate * 10.) as u64, Relaxed);
+        progress.scanned.store(
+            ((chunk.start_sample as f64 / rate - from).max(0.) * 10.) as u64,
+            Relaxed,
+        );
         for (frame, values) in chunk.samples.chunks(channels).enumerate() {
-            let window = ((chunk.start_sample + frame as u64) as f64 / per_window) as usize;
+            let at = ((chunk.start_sample + frame as u64) as f64 / per_window) as usize;
+            let window = at.saturating_sub(base);
             if window >= sums.len() {
                 sums.resize(window + 1, (0., 0));
             }
@@ -162,8 +187,8 @@ fn dbfs(square_sum: f64, samples: u64) -> f32 {
     (20. * rms.log10()).max(f64::from(SILENT_DB)) as f32
 }
 
-/// The silent stretches of a `levels` track, as half-open `(from, to)` *source*
-/// seconds, in order and never overlapping.
+/// The silent stretches of a `levels` track, as half-open `(from, to)` seconds
+/// **from where the read began**, in order and never overlapping.
 ///
 /// Pure arithmetic: this is what a card re-runs on every keystroke. The three
 /// settings are applied in the order a person means them -- quiet runs first,
@@ -208,9 +233,12 @@ pub fn regions(levels: &[f32], cfg: Settings) -> Vec<(f64, f64)> {
 /// pairs of the lane `clip` is on -- what a preview marks and what
 /// [`crate::Project::cut_regions`] cuts.
 ///
-/// Only the part of each region the clip actually plays: the scan reads the
-/// whole file and the clip is a range of it, so a silence outside `[in, out)`
-/// is not on the timeline at all. Positions go through the clip's **own rate**
+/// `regions` are seconds from the clip's **in point**, which is where
+/// [`levels`] was asked to start reading; they land at `in_frame` plus that.
+/// Only the part of each region the clip actually plays survives -- a region
+/// running past `out_frame` is trimmed to it and one starting beyond it is
+/// dropped, so a short read or a rounding at the tail cannot mark a frame the
+/// clip does not have. Positions go through the clip's **own rate**
 /// ([`Speed::timeline_at`]), so a silence in a 2x clip marks the frames it is
 /// really on.
 ///
@@ -228,8 +256,11 @@ pub fn timeline_regions(clip: &Clip, fps: f64, regions: &[(f64, f64)]) -> Vec<(u
     regions
         .iter()
         .filter_map(|&(from, to)| {
-            let first = frame(from, f64::ceil).max(clip.in_frame);
-            let last = frame(to, f64::floor).min(clip.out_frame);
+            let first = clip.in_frame.saturating_add(frame(from, f64::ceil));
+            let last = clip
+                .in_frame
+                .saturating_add(frame(to, f64::floor))
+                .min(clip.out_frame);
             if last <= first {
                 return None;
             }
@@ -304,7 +335,7 @@ mod tests {
     /// peaks instead of RMS, would not line up second after second.
     #[test]
     fn the_dips_of_the_1hz_pulse_are_where_the_silences_are() {
-        let levels = levels(asset("test_av.mp4"), 0)
+        let levels = levels(asset("test_av.mp4"), 0, (0., f64::INFINITY))
             .expect("open")
             .expect("test_av.mp4 has an audio track");
         // A short forgiveness, because each dip of a sine is brief.
@@ -346,10 +377,12 @@ mod tests {
         use super::{Progress, levels_with_progress};
         use std::sync::atomic::Ordering::Relaxed;
         let progress = Progress::default();
-        let watched = levels_with_progress(asset("test_av.mp4"), 0, &progress)
+        let watched = levels_with_progress(asset("test_av.mp4"), 0, (0., f64::INFINITY), &progress)
             .expect("open")
             .expect("test_av.mp4 has an audio track");
-        let plain = levels(asset("test_av.mp4"), 0).expect("open").expect("audio");
+        let plain = levels(asset("test_av.mp4"), 0, (0., f64::INFINITY))
+            .expect("open")
+            .expect("audio");
         assert_eq!(watched, plain, "a watched scan must find the same levels");
         // Five seconds of fixture, in tenths, from the header and from the last
         // chunk the loop saw.
@@ -360,10 +393,61 @@ mod tests {
         // receiver is dropped and the decoder behind it stops with it.
         let stopped = Progress::default();
         stopped.cancel.store(true, Relaxed);
-        let partial = levels_with_progress(asset("test_av.mp4"), 0, &stopped)
+        let partial = levels_with_progress(asset("test_av.mp4"), 0, (0., f64::INFINITY), &stopped)
             .expect("open")
             .expect("audio");
         assert!(partial.len() < plain.len(), "{} windows", partial.len());
+    }
+
+    /// A clip cut in half costs half a decode, and the half it reads is its
+    /// own: asked for `[2, 4)` seconds the scan hands back two seconds of
+    /// windows, starting at the *second* second -- the fixture's dips at 2.75
+    /// and 3.75 land at 0.75 and 1.75 of what comes back, and the three dips
+    /// outside the range are not in it at all.
+    #[test]
+    fn a_range_is_read_from_its_own_start_and_nothing_outside_it_is() {
+        let cfg = Settings {
+            threshold_db: -40.,
+            min_silence: 0.08,
+            padding: 0.,
+            min_keep: 0.,
+        };
+        let whole = levels(asset("test_av.mp4"), 0, (0., f64::INFINITY))
+            .expect("open")
+            .expect("audio");
+        let half = levels(asset("test_av.mp4"), 0, (2., 4.))
+            .expect("open")
+            .expect("audio");
+        // Two seconds of windows for two seconds asked, give or take the one a
+        // packet boundary rounds -- not the five the file is.
+        assert!(
+            (half.len() as i64 - 100).abs() <= 2 && half.len() < whole.len(),
+            "{} windows for [2, 4) of {} for the file",
+            half.len(),
+            whole.len()
+        );
+        let found = regions(&half, cfg);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for (nth, &(from, to)) in found.iter().enumerate() {
+            let dip = nth as f64 + 0.75;
+            assert!(
+                (from..to).contains(&dip),
+                "dip {nth}: {from}..{to} does not cover {dip}"
+            );
+        }
+        // ...and on the timeline they are where the clip plays them: a clip
+        // reading from source frame 60 at 30 fps, laid at frame 500.
+        let placed = clip(500, 60, 120, Speed::NORMAL);
+        let marks = timeline_regions(&placed, 30., &found);
+        assert_eq!(marks.len(), 2, "{marks:?}");
+        for (nth, &(start, len)) in marks.iter().enumerate() {
+            let dip = 500. + (nth as f64 + 0.75) * 30.;
+            assert!(
+                (f64::from(start)..f64::from(start + len)).contains(&dip),
+                "dip {nth}: [{start}, {}) is not the dip at {dip}",
+                start + len
+            );
+        }
     }
 
     /// The three settings, each one visible on its own: a quiet run shorter
@@ -409,33 +493,37 @@ mod tests {
         near(&merged, &[(2., 5.)]);
     }
 
-    /// Where a region lands on the timeline is the clip's business: its range
-    /// clips what was scanned, its placement offsets it, and its rate divides
-    /// it. A 2x clip's silences mark half as many frames, at the right place.
+    /// Where a region lands on the timeline is the clip's business: seconds
+    /// counted from its in point, its placement offsets them, its end trims
+    /// them and its rate divides them. A 2x clip's silences mark half as many
+    /// frames, at the right place.
     #[test]
     fn regions_map_through_the_clips_range_and_rate() {
         let secs = [(1., 2.), (3., 3.5)];
-        // Whole file, real time, placed at the start: source seconds are
-        // timeline frames at 30 fps.
+        // Whole file, real time, placed at the start: seconds read are timeline
+        // frames at 30 fps.
         let whole = clip(0, 0, 300, Speed::NORMAL);
         assert_eq!(
             timeline_regions(&whole, 30., &secs),
             vec![(30, 30), (90, 15)]
         );
         // The same clip placed at frame 100 and reading from source frame 45:
-        // the first region is only the half of it the clip still plays, and it
-        // lands at the clip's own start.
+        // the scan began at 45, so a region a second in is source frame 75 --
+        // and it lands 30 frames after the clip's own start.
         let placed = clip(100, 45, 300, Speed::NORMAL);
         assert_eq!(
             timeline_regions(&placed, 30., &secs),
-            vec![(100, 15), (145, 15)]
+            vec![(130, 30), (190, 15)]
         );
         // At 2x every timeline frame is two source frames, so both regions are
         // half as wide and sit half as far along.
         let fast = clip(0, 0, 300, Speed::from_permille(2000));
         assert_eq!(timeline_regions(&fast, 30., &secs), vec![(15, 15), (45, 7)]);
-        // A region entirely outside what the clip plays is not on the timeline.
-        assert!(timeline_regions(&clip(0, 200, 300, Speed::NORMAL), 30., &[(1., 2.)]).is_empty());
+        // A read that ran past the clip's end is trimmed to it, and a region
+        // wholly past it is not on the timeline at all.
+        let short = clip(0, 0, 45, Speed::NORMAL);
+        assert_eq!(timeline_regions(&short, 30., &[(1., 2.)]), vec![(30, 15)]);
+        assert!(timeline_regions(&short, 30., &[(2., 3.)]).is_empty());
     }
 
     /// Rounded inward at both ends: a region whose seconds fall between frames
