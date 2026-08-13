@@ -25,6 +25,9 @@ struct Plugin {
     /// many quanta it starved for. Rejecting the whole plugin over that would
     /// trade the sound for the diagnostic.
     underruns: Option<unsafe extern "C" fn(*mut c_void) -> i64>,
+    /// Optional for [`Plugin::underruns`]'s reason: without it a plugin plays
+    /// exactly as it did, it only counts the tail of a stream as lateness.
+    stream_ended: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
@@ -69,6 +72,7 @@ fn load() -> Option<Plugin> {
                     set_volume: *lib.get(b"ao_set_volume\0").ok()?,
                     flush: *lib.get(b"ao_flush\0").ok()?,
                     underruns: lib.get(b"ao_underruns\0").ok().map(|f| *f),
+                    stream_ended: lib.get(b"ao_stream_ended\0").ok().map(|f| *f),
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
                 })
@@ -125,6 +129,16 @@ impl AoSession {
         match unsafe { (self.plugin.position)(self.handle) } {
             n if n < 0 => None,
             n => Some(n),
+        }
+    }
+
+    /// Says the last sample of this stream has been queued: the ring plays out
+    /// as it is, and the silence after it is not counted against a decoder that
+    /// has already finished. Nothing at all on a plugin without the symbol.
+    pub fn stream_ended(&self) {
+        if let Some(ended) = self.plugin.stream_ended {
+            // SAFETY: `handle` came from `ao_open` and is still open.
+            unsafe { ended(self.handle) };
         }
     }
 
