@@ -11,7 +11,7 @@
 //! Drift policy stays with the caller -- this type answers "what time is it",
 //! the renderer decides which frame that means.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -311,6 +311,16 @@ pub struct PlaybackSession {
     /// of a restart is never counted as timeline time. See
     /// [`Audio::content_at`].
     priming: bool,
+    /// Whether the picture is decoded from the stand-ins rather than from the
+    /// films ([`crate::proxy`]). One switch for the whole project, saved with
+    /// it, and *only* the picture: the sound is always the film's own, and so
+    /// is everything an export reads.
+    ///
+    /// Which sources have a stand-in is not kept here -- it is asked of the
+    /// cache when a span opens ([`Self::picture_path`]), one `stat` against a
+    /// file open that already costs milliseconds, so a proxy made (or deleted)
+    /// mid-session is picked up at the next seek and nothing can go stale.
+    proxies: bool,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -423,6 +433,8 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            // A file just opened is a project nobody has picked stand-ins for.
+            proxies: false,
         })
     }
 
@@ -533,6 +545,8 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            // A file just opened is a project nobody has picked stand-ins for.
+            proxies: false,
         })
     }
 
@@ -607,6 +621,8 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            // A file just opened is a project nobody has picked stand-ins for.
+            proxies: false,
         })
     }
 
@@ -898,6 +914,9 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            // What the file says, and `false` for every dialect before v12:
+            // a project cut on the films themselves opens on them.
+            proxies: doc.proxy,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1149,6 +1168,10 @@ impl PlaybackSession {
             // reason: a picked look that vanished on a reload is a look nobody
             // could keep.
             self.project.tone(),
+            // ...and whether it is cut on the stand-ins, for the same reason.
+            // *Which* files have one is not saved: [`crate::proxy`] finds that
+            // out from the film itself, so nothing here can go stale.
+            self.proxies,
             self.project.limiter(),
             playhead,
         )
@@ -1328,7 +1351,11 @@ impl PlaybackSession {
                 from: Some((source, in_frame)),
                 ..
             }) => Ok(DecodeSession::open_worker_deferred(
-                &self.project.sources()[source].path,
+                // The stand-in where there is one and the switch is on, the
+                // film itself otherwise -- the one place the picture's file is
+                // decided ([`Self::picture_path`]). The sound is opened
+                // elsewhere and is always the film's.
+                &self.picture_path(source),
                 // The file's own frames, which is the only place they exist:
                 // a clip counts the timeline's ([`Rate`]).
                 self.span_rate.source_at(in_frame),
@@ -1741,6 +1768,50 @@ impl PlaybackSession {
     fn file_rate(&self, path: &Path) -> Rate {
         self.source_of(path)
             .map_or(Rate::REAL_TIME, |i| self.rates[i])
+    }
+
+    /// Which file this source's **picture** is decoded from: its stand-in when
+    /// the project is cut on stand-ins and one has been made for it, and the
+    /// film itself in every other case ([`crate::proxy`]).
+    ///
+    /// One `stat` per span open, against a decoder open that costs milliseconds
+    /// -- so a proxy that appeared (or was deleted) since the last seek is
+    /// picked up at this one, and no table of attachments exists to disagree
+    /// with the cache.
+    ///
+    /// The sound never comes through here: [`open_audio`] is given the
+    /// project's own source path, so a mix is the film's however this answers.
+    pub fn picture_path(&self, source: usize) -> PathBuf {
+        let path = &self.project.sources()[source].path;
+        let Some(proxy) = self.proxies.then(|| crate::proxy::cached(path)).flatten() else {
+            return path.clone();
+        };
+        // Said out loud, once per span opened, because "the picture came off
+        // the stand-in and the delivery did not" is a claim somebody has to be
+        // able to check: `export` prints the file *it* reads by the same rule.
+        eprintln!("picture: proxy {}", proxy.display());
+        proxy
+    }
+
+    /// Whether the picture comes off the stand-ins ([`Self::set_proxies`]).
+    pub fn proxies(&self) -> bool {
+        self.proxies
+    }
+
+    /// Cut on the stand-ins, or on the films themselves. Reseeks, so the very
+    /// next picture comes from the other file -- which is what makes this a
+    /// switch a person can flip while watching.
+    ///
+    /// Says nothing about *which* films have one: a source with no stand-in
+    /// keeps playing its own pictures either way, and one made while this is on
+    /// is picked up at the next seek.
+    pub fn set_proxies(&mut self, on: bool) {
+        if self.proxies == on {
+            return;
+        }
+        self.proxies = on;
+        let now = self.now();
+        self.seek(now);
     }
 
     /// Which source `path` is, canonicalising only if it has to: a source's own
