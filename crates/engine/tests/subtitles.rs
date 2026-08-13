@@ -259,7 +259,7 @@ fn a_project_keeps_its_subtitles_across_a_save() {
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 11\n"), "{text}");
+    assert!(text.starts_with("edith 12\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the reference is written relative, and no cue is: {text}"
