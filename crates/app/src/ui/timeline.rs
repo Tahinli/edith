@@ -43,7 +43,7 @@ impl Player {
         // Built from the same playhead pixel the lanes are, and before the
         // export takes `filled` over below: the strip is a picture of the
         // timeline, not of an export's progress.
-        let strip = self.subtitle_strip(filled);
+        let strip = self.subtitle_strip(filled, cx);
         let strip_h = subtitle_strip_h(strip.is_some());
         let (hint, filled) = if let Some(export) = self.exporting() {
             let progress = export.progress();
@@ -590,7 +590,11 @@ impl Player {
     ///
     /// `None` with no track picked, so a timeline without subtitles is the panel
     /// it has always been.
-    pub(crate) fn subtitle_strip(&self, filled: f32) -> Option<impl IntoElement + use<>> {
+    pub(crate) fn subtitle_strip(
+        &self,
+        filled: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
         let track = self.subtitle_track()?;
         let scale = self.scale;
         // The pick with its film on it, not the raw tag: two films' "eng"
@@ -670,6 +674,15 @@ impl Player {
                         .rounded(px(3.))
                         .bg(rgb(BG_TIMELINE()))
                         .overflow_hidden()
+                        // The same bed under the same [`Scale`] answers the same
+                        // wheel ([`Player::timeline_wheel`]): ctrl zooms about
+                        // the pointer, bare scrolls the view along. A hand that
+                        // wants a cue closer aims at the cue, and a timeline
+                        // surface that ignores the wheel is a dead one.
+                        .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.timeline_wheel(event, cx);
+                        }))
                         .children(cues.into_iter().map(|(left, width)| {
                             div()
                                 .absolute()
