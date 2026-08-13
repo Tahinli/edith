@@ -95,6 +95,11 @@ struct Plugin {
     /// missing: a plugin built before it exports the four above and not this,
     /// which costs a front-end the listing and never a decode.
     caps: Option<unsafe extern "C" fn(*mut VhCaps) -> i32>,
+    /// Repositioning an open session, and optional for the reason `caps` is: a
+    /// plugin built before it decodes exactly as it did, and a caller that
+    /// cannot reposition closes the session and opens another -- which is what
+    /// every seek did before this symbol existed.
+    seek: Option<unsafe extern "C" fn(*mut c_void, u32) -> i32>,
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
 }
@@ -131,6 +136,7 @@ fn load() -> Option<Plugin> {
                     next_frame: *lib.get(b"vh_next_frame\0").ok()?,
                     close: *lib.get(b"vh_close\0").ok()?,
                     caps: lib.get(b"vh_caps\0").ok().map(|s| *s),
+                    seek: lib.get(b"vh_seek\0").ok().map(|s| *s),
                     _lib: lib,
                 })
             })()
@@ -192,6 +198,27 @@ impl HwSession {
             return None;
         }
         Some(Self { plugin, handle })
+    }
+
+    /// Repositions this very session so the next [`HwSession::next_frame`]
+    /// returns display index `start_frame` -- the same landing
+    /// [`HwSession::open_at`] gives, without the VA-API initialisation (~90 ms),
+    /// the render node probe and the container parse that opening one again
+    /// costs. What lets a decode worker outlive the seeks its caller makes.
+    ///
+    /// `false` when the plugin cannot do it -- too old to export the symbol, or
+    /// a decoder that would not flush -- and the caller then opens a new session
+    /// exactly as it always did. The session is left untouched either way, so a
+    /// `false` is never a half-moved decoder.
+    pub fn seek(&mut self, start_frame: u32) -> bool {
+        let Some(seek) = self.plugin.seek else {
+            return false;
+        };
+        // Sample ids are 1-based, frame indices 0-based -- as in `open_at`.
+        let target_sample = start_frame.saturating_add(1);
+        // SAFETY: `handle` came from `vh_open_at` and is still open; the plugin
+        // writes nothing through it and the call cannot unwind (it catches).
+        unsafe { seek(self.handle, target_sample) == 0 }
     }
 
     pub fn meta(&self) -> Option<VhMeta> {

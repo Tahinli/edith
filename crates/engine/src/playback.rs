@@ -374,6 +374,10 @@ pub struct PlaybackSession {
     /// of a restart is never counted as timeline time. See
     /// [`Audio::content_at`].
     priming: bool,
+    /// Whether the decode worker may drop a picture whose moment has already
+    /// passed ([`Self::drop_late_pictures`]). Off unless a caller says it is
+    /// watching this in real time.
+    drop_late: bool,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -488,6 +492,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -600,6 +605,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -676,6 +682,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -969,6 +976,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1237,6 +1245,7 @@ impl PlaybackSession {
     /// big film, seconds off a cold cache). End of stream is
     /// [`PlaybackSession::is_eos`].
     pub fn try_frame(&mut self) -> Option<Frame> {
+        self.publish_playhead();
         loop {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
@@ -1292,6 +1301,32 @@ impl PlaybackSession {
         self.eos
     }
 
+    /// Tells the decode worker which frame of its *file* the clock has reached,
+    /// so the pictures it is holding that are already behind the playhead are
+    /// dropped where they are cheap to drop -- before the conversion and before
+    /// the queue -- instead of being converted, queued and thrown away by the
+    /// caller one repaint later. The whole of the late-frame policy: a decoder
+    /// that has fallen behind catches up by not painting what nobody can see,
+    /// rather than by being restarted every two seconds (`Player::pump`).
+    ///
+    /// The stamp is the exact inverse of the one [`try_frame`](Self::try_frame)
+    /// puts on a decoded frame: timeline frame -> the clip's own frames
+    /// ([`Span::speed`]) -> the file's ([`Rate`]). A gap and the emptied
+    /// timeline have no file to be inside of, and publish nothing.
+    fn publish_playhead(&self) {
+        if !self.drop_late {
+            return;
+        }
+        let Some(span) = self.span else { return };
+        let Some((_, in_frame)) = span.from else {
+            return;
+        };
+        let now = secs_to_frame(self.clock.now(), self.meta.frame_rate);
+        let offset = now.saturating_sub(span.start).min(span.len);
+        self.worker
+            .playhead(self.span_rate.source_at(in_frame + span.speed.source_at(offset)));
+    }
+
     /// Installs `replacement` as the decode worker, parking the outgoing one in
     /// [`retired`](Self::retired) rather than joining it here, and reaping the
     /// parked ones that have already returned.
@@ -1301,9 +1336,20 @@ impl PlaybackSession {
     /// (plus whatever VA-API init it was inside), so a scrub reaps last seek's
     /// worker on this seek and the list stays a handful long. Nothing waits.
     fn retire(&mut self, replacement: Worker) {
+        // A *replacement*, which is now the narrow case: a seek onto the file
+        // the worker already has open steers it instead ([`Worker::reseek`])
+        // and never comes here, so this count is the picture restarts that
+        // really cost a thread and a decoder open -- which is what makes it
+        // worth counting.
         self.restarts += 1;
-        self.retired
-            .push(std::mem::replace(&mut self.worker, replacement));
+        let mut outgoing = std::mem::replace(&mut self.worker, replacement);
+        // Terminal, unlike the [`Worker::abandon`] a seek does: this worker is
+        // being replaced rather than steered, so its thread has to end -- and
+        // the cancel is what drops its command channel, without which a worker
+        // parked between spans would sit in `recv` forever, never reaped here
+        // and never joined in any bounded time at exit.
+        outgoing.cancel();
+        self.retired.push(outgoing);
         self.retired.retain(|w| !w.is_finished());
     }
 
@@ -1357,9 +1403,11 @@ impl PlaybackSession {
         let Some(span) = self.project.composite_span_at(next) else {
             return false;
         };
-        // We only get here on a disconnect, so the old worker has already
-        // returned; cancel anyway, so `retire` treats every path alike.
-        self.worker.cancel();
+        // We only get here on a disconnect, so the old span is already done;
+        // abandon anyway, so `start_span` treats every path alike -- and the
+        // *worker* is kept, because the next clip is very often the same file
+        // (a split cuts one clip in two) and it already has it open.
+        self.worker.abandon();
         self.start_span(Some(span));
         true
     }
@@ -1419,36 +1467,58 @@ impl PlaybackSession {
                 start,
                 from: Some((source, in_frame)),
                 ..
-            }) => Ok(DecodeSession::open_worker_deferred(
-                &self.project.sources()[source].path,
-                // The file's own frames, which is the only place they exist:
-                // a clip counts the timeline's ([`Rate`]).
-                self.span_rate.source_at(in_frame),
+            }) => {
+                let path = &self.project.sources()[source].path;
+                // The file's own frames, which is the only place they exist: a
+                // clip counts the timeline's ([`Rate`]).
+                let start_frame = self.span_rate.source_at(in_frame);
                 // Source frames, which a speed makes more (or fewer) than the
                 // timeline frames the span covers -- and which a file shot at
                 // another rate makes fewer (or more) again. One past the last
                 // frame this span shows, not one past its length: at another
                 // rate those are two different frames.
-                self.span_rate.source_at(
+                let end_frame = self.span_rate.source_at(
                     in_frame + span.expect("matched above").source_len().saturating_sub(1),
-                ) + 1,
-                self.project
+                ) + 1;
+                let color = self
+                    .project
                     .composite_color_at(start)
                     .copied()
-                    .unwrap_or_default(),
+                    .unwrap_or_default();
                 // ...and the canvas it is placed on: the project's resolution
                 // and this clip's own fit policy, constant across the span for
-                // the reason the grade is.
-                Composer::new(
-                    self.meta.width,
-                    self.meta.height,
-                    self.project.composite_fit_at(start),
-                ),
+                // the reason the grade is. Built where it is handed over rather
+                // than kept in a local, because a `Composer` owns the scratch
+                // buffers it places through -- the value is not copied about.
+                let fit = self.project.composite_fit_at(start);
+                let canvas = || Composer::new(self.meta.width, self.meta.height, fit);
                 // ...and the rendition an HDR source among them is mapped to,
-                // the project's own and constant across the span for that reason
-                // too.
-                self.project.tone(),
-            )),
+                // the project's own and constant across the span for that
+                // reason too.
+                let tone = self.project.tone();
+                // The worker already decoding this very file takes the new span
+                // itself: no thread, no container parse, no VA-API init -- the
+                // whole of what a seek used to cost. It answers `None` for any
+                // other file (and for a worker whose thread has ended), and the
+                // deferred opener below is then exactly the path it always was.
+                if let Some((frames, backend)) =
+                    self.worker
+                        .reseek(path, start_frame, end_frame, color, canvas(), tone)
+                {
+                    self.frames = frames;
+                    self.backend = backend;
+                    self.span = span;
+                    return;
+                }
+                Ok(DecodeSession::open_worker_deferred(
+                    &self.project.sources()[source].path,
+                    start_frame,
+                    end_frame,
+                    color,
+                    canvas(),
+                    tone,
+                ))
+            }
             // A gap: black for as long as it runs. An emptied timeline has no
             // span at all and gets one frame of it -- enough to put black on
             // screen, and it ends where the timeline does, at once.
@@ -1467,8 +1537,9 @@ impl PlaybackSession {
             // [`decode_backend`](Self::decode_backend) describing a worker that
             // is no longer feeding anything). A dead receiver instead, which is
             // what carries the session on to the next span. The old worker stays
-            // parked in `self.worker` where the caller already cancelled it; the
-            // next span retires it.
+            // parked in `self.worker`, where the caller has already abandoned
+            // the span it was decoding ([`Worker::abandon`]) without ending the
+            // thread; the next span reseeks it or retires it.
             self.frames = std::sync::mpsc::channel().1;
             self.backend = BackendCell::new(Backend::Gap);
             self.span = span;
@@ -2584,6 +2655,31 @@ impl PlaybackSession {
         Some((tap, audio.sample_rate))
     }
 
+    /// Says that this session is being **watched in real time**, so a picture
+    /// whose moment has passed is worth nothing and the decode worker may drop
+    /// it where it is cheap to drop -- before the conversion (a full BGRA pass
+    /// over 8 MB at 1080p) and before the queue.
+    ///
+    /// Off by default, and that is the contract every *pull* consumer relies on:
+    /// an export, the file-level [`DecodeSession`] API and a test draining as
+    /// fast as it can all ask for a range of frames and must be given every one
+    /// of them, in order. Only a viewer has a moment for a picture to be past.
+    ///
+    /// A front-end that turns this on was dropping those very frames itself, one
+    /// repaint later (`Player::pump` takes everything due and shows the last):
+    /// what changes is where the work stops, and therefore how quickly a decoder
+    /// that fell behind catches up.
+    ///
+    /// It does not replace [`resync_picture`](Self::resync_picture): both
+    /// mechanisms are live and this one is the first line. It catches up without
+    /// restarting anything, which is why the front-end's resync -- a picture
+    /// restart, once per `RESYNC_GAP` -- now fires only where dropping was not
+    /// enough (a decoder so far behind that even one picture in nine
+    /// ([`crate::decode`]'s `LATE_RUN`) cannot close the gap).
+    pub fn drop_late_pictures(&mut self, on: bool) {
+        self.drop_late = on;
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
@@ -2629,12 +2725,15 @@ impl PlaybackSession {
     /// keeps playing out of the same stream, the clock keeps running, and a
     /// grade dragged during playback is therefore silent.
     fn start_picture(&mut self, target: u32) {
-        // Cancel first, drop second: the old worker may be parked in `send` on
+        // Abandon first, drop second: the old worker may be parked in `send` on
         // the bounded channel, where only the disconnect wakes it -- and it
-        // then finds the flag already set. It is then parked, not joined; see
-        // [`retire`](Self::retire), which is what keeps a scrub off the price
-        // of a VA-API init.
-        self.worker.cancel();
+        // then finds the span already superseded. The *thread* is kept, and
+        // with it the open file and the open decoder, so a seek onto the same
+        // source costs a demuxer seek and a decoder flush rather than the
+        // VA-API init (98 ms) a new worker would pay; a worker that cannot take
+        // the new span is retired by [`retire`](Self::retire) instead, and
+        // nothing on this thread joins either way.
+        self.worker.abandon();
         // The span runs from `target` to the end of whatever it landed in -- a
         // clip, or a gap, which starts a black-frame worker instead. `None` is
         // the emptied timeline, black too, and `start_span` says so.
@@ -2847,6 +2946,12 @@ impl PlaybackSession {
     /// Moves the clock forward; the caller runs this once per rendered frame.
     /// Costs an atomic load, and once per session a mode switch.
     pub fn tick(&mut self) {
+        // Before every early return below: where the playhead stands is what the
+        // decode worker drops its stale pictures against, and a front-end that
+        // repaints without draining (a slow frame, a busy render thread) must
+        // still be moving it -- otherwise the queue fills with pictures whose
+        // moment passed while nobody was taking them.
+        self.publish_playhead();
         let Some(audio) = &self.audio else {
             return; // wall time from the start, nothing to poll
         };
