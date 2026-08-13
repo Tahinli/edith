@@ -1179,6 +1179,15 @@ struct Player {
     /// and nowhere else: every frame-to-pixel answer in the panel comes out of
     /// it, so the boxes, the playhead and the pointer cannot disagree.
     scale: Scale,
+    /// A hand has moved the view itself -- a wheel scroll, a zoom about the
+    /// pointer -- and until the playhead runs back into what it chose to look
+    /// at, the view is the hand's and the follow keeps off it. Without this a
+    /// notch during playback was undone by the very next frame: the follow
+    /// centres a playhead that has left the bed, and a scroll away from it is
+    /// exactly a playhead leaving the bed. Given back by [`Render`] the moment
+    /// the head is on screen again, and by every transport ask (a seek, a
+    /// play/pause) outright -- those are a person saying where to look.
+    panned: bool,
     /// Which clip the edit keys act on: the lane it is in and its index there.
     /// The *clicked* half, not the group -- a group is what gets marked on
     /// screen, but Lift has to know which half it was aimed at. Indices move
@@ -1719,6 +1728,9 @@ impl Player {
         // Restarted on every reseek, not only on the first: what it measures is
         // the open now standing, which is what a person is waiting on.
         self.seek_since = Some(Instant::now());
+        // A seek is a person saying where to look, so it takes the view back
+        // from an earlier scroll: the frame asked for is the one to be shown.
+        self.panned = false;
         // An edit moves the indices a drag in flight is holding -- a stroke
         // during one is exactly that -- and an edge committed against a moved
         // index would trim a clip nobody grabbed. Dropping it is the whole fix:
@@ -2131,6 +2143,10 @@ impl Player {
         let at = self.playhead(view.duration);
         let anchor = anchor.unwrap_or_else(|| self.scale.px_at(at).clamp(0., view.bed));
         self.scale = view.zoomed(factor, anchor);
+        // The view a hand chose. A zoom about the playhead leaves it on the
+        // bed, so this is given back on the very next frame and only a zoom
+        // that took the head off screen -- ctrl+wheel away from it -- holds.
+        self.panned = true;
         cx.notify();
     }
 
@@ -2154,6 +2170,10 @@ impl Player {
             return;
         }
         self.scale = view.scrolled(notches * view.bed * SCROLL_NOTCH_SHARE);
+        // The one gesture whose whole purpose is to look away from the
+        // playhead: while playing it wins over the follow, which is what every
+        // editor does with a scroll during playback.
+        self.panned = true;
         cx.notify();
     }
 
@@ -5455,6 +5475,9 @@ impl Player {
             cx.notify();
             return;
         }
+        // Pressing play is asking to watch, so a view scrolled away while
+        // paused comes back to the head with it -- as a seek's does.
+        self.panned = false;
         match self.transport() {
             // Nothing open: the button is dimmed and the key says nothing.
             Transport::Stopped => {}
@@ -5859,10 +5882,19 @@ impl Render for Player {
         // is what a moving one does, during playback and through a seek. A view
         // yanked back to a playhead nobody moved is a hand's own scroll undone
         // by the very next frame, which is what made the wheel look dead.
-        self.scale = match state.is_playing() || self.seek_since.is_some() {
+        // ...and a hand that scrolled the view away from the head keeps it
+        // ([`Player::panned`]): a follow that centres the head again would undo
+        // the notch before it was seen, which is what made the wheel look dead
+        // while playing. It is given straight back below, the moment the head
+        // is on the bed a person chose to look at -- so the scroll wins now and
+        // the follow resumes by itself, with nothing to press.
+        self.scale = match (state.is_playing() || self.seek_since.is_some()) && !self.panned {
             true => self.view().following(position),
             false => self.view().settled(),
         };
+        if self.panned && self.view().shows(position) {
+            self.panned = false;
+        }
 
         div()
             .track_focus(&self.focus)
@@ -9238,19 +9270,32 @@ impl View {
             return self.scale;
         }
         let scale = self.settled();
-        let span = f64::from(self.bed) / scale.pps;
-        if at < scale.start || at > scale.start + span {
-            View {
-                scale: Scale {
-                    start: at - span / 2.,
-                    ..scale
-                },
-                ..self
-            }
-            .settled()
-        } else {
-            scale
+        if self.shows(at) {
+            return scale;
         }
+        let span = f64::from(self.bed) / scale.pps;
+        View {
+            scale: Scale {
+                start: at - span / 2.,
+                ..scale
+            },
+            ..self
+        }
+        .settled()
+    }
+
+    /// Whether the moment `at` is on the bed as it is drawn now. The one
+    /// question both halves of the follow ask -- [`View::following`] to decide
+    /// whether to chase a head that has run off, and the render to decide when
+    /// a hand's own scroll ([`Player::panned`]) has been caught up with and the
+    /// follow may have the view back -- so the two can never disagree about
+    /// where the edge of the bed is.
+    fn shows(self, at: f64) -> bool {
+        if self.bed <= 0. {
+            return false;
+        }
+        let scale = self.settled();
+        at >= scale.start && at <= scale.start + f64::from(self.bed) / scale.pps
     }
 }
 
@@ -12603,6 +12648,60 @@ mod tests {
                 "the fit never scrolls"
             );
         }
+    }
+
+    /// The wheel during playback. A scroll away from the playing head used to
+    /// be undone by the follow on the very next frame -- with a second, longer
+    /// media on the timeline making it scrollable at all, one notch in five
+    /// reached the screen and the wheel looked dead. The hand keeps the view
+    /// now, and the follow takes it back by itself when the head runs into what
+    /// the hand is looking at.
+    #[test]
+    fn a_scroll_during_playback_wins_until_the_head_catches_up() {
+        let duration = 80.;
+        let mut scale = test_view(Scale { pps: 40., start: 0. }, duration).settled();
+        // The render's arbitration, in the two lines it is there: a panned view
+        // is left where the hand put it, and the pan ends where the head is
+        // back on the bed.
+        let frame = |scale: Scale, panned: &mut bool, at: f64| {
+            let scale = match *panned {
+                true => test_view(scale, duration).settled(),
+                false => test_view(scale, duration).following(at),
+            };
+            if *panned && test_view(scale, duration).shows(at) {
+                *panned = false;
+            }
+            scale
+        };
+        // Playing at second one, five notches of the wheel: every one of them
+        // moves the view, and none is taken back by the head being off the bed.
+        let notch = f64::from(TEST_BED * SCROLL_NOTCH_SHARE);
+        let mut panned = false;
+        for n in 1..=5 {
+            scale = test_view(scale, duration).scrolled(TEST_BED * SCROLL_NOTCH_SHARE);
+            panned = true;
+            scale = frame(scale, &mut panned, 1.);
+            // ...and the pan is only *held* while the head is off the bed: the
+            // first notches still show it, so the follow has the view back for
+            // free and would not have moved anything anyway.
+            assert_eq!(panned, scale.start > 1., "held while the head is off");
+            assert!(
+                (scale.start - notch * f64::from(n) / 40.).abs() < 1e-6,
+                "notch {n} reached the screen: {scale:?}"
+            );
+        }
+        // The head runs into it: the pan is given back with nothing pressed...
+        let span = test_view(scale, duration).span();
+        let start = frame(scale, &mut panned, scale.start + span / 2.).start;
+        assert!(!panned, "the follow has the view back");
+        assert_eq!(start, scale.start, "and it did not jump to take it");
+        // ...and the next head that runs off the bed pulls the view again.
+        let ran_off = frame(scale, &mut panned, start + span + 1.);
+        assert!(ran_off.start > start, "the follow follows again: {ran_off:?}");
+        // A paused hand is untouched by any of this: with no follow asking,
+        // `shows` is the only thing the pan is ever released by.
+        assert!(test_view(scale, duration).shows(scale.start));
+        assert!(!test_view(scale, duration).shows(scale.start + span + 0.5));
     }
 
     /// The bug this mapping exists for: the first import used to fill the whole
@@ -16273,6 +16372,9 @@ fn main() {
                     // zooms or asks for the fit: a project opens at a scale, not
                     // at whatever its first import happens to be long.
                     scale: Scale::default(),
+                    // Nobody has scrolled anything yet, so the follow has the
+                    // view: the first frame is drawn where the head is.
+                    panned: false,
                     selected: None,
                     context_menu: None,
                     picker: None,
