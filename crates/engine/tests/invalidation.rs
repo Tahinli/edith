@@ -218,6 +218,50 @@ fn a_fader_during_playback_stops_restarting_the_sound() {
     eprintln!("20 fader nudges and 8 limiter moves: not one restart");
 }
 
+/// The same rule on the timeline that has **no mixer at all**: one audio lane
+/// at unity with the limiter off is the bit-exact single-stream path, and a
+/// ceiling dragged while the limiter is *off* changes not one sample of it.
+/// That drag used to reopen the sound at every nudge -- there was no mixer to
+/// hand the number to, so the rebuild was the only way to apply a setting that
+/// did not apply to anything.
+///
+/// The device queue is the oracle, as above; the worker count is the second
+/// one, because a rebuild is a feeder thread per nudge whether the ear catches
+/// it or not.
+#[test]
+fn a_ceiling_dragged_with_the_limiter_off_rebuilds_nothing() {
+    let mut session = open(&asset("test_av.mp4"));
+    let filled = play_until_heard(&mut session);
+    let workers = session.live_workers();
+
+    for step in 1..=20 {
+        // Off throughout: this is the setting nobody can hear yet. Every step a
+        // different ceiling, since setting the one already in force is refused
+        // and would measure nothing.
+        let limiter = Limiter {
+            on: false,
+            ..Limiter::default()
+        }
+        .with_ceiling(-1.0 - step as f32 * 0.25);
+        assert!(session.set_limiter(limiter), "ceiling {step}");
+        assert_eq!(
+            heard(&session),
+            filled,
+            "nudge {step} emptied the device queue -- a silent setting restarted the stream"
+        );
+        assert!(
+            session.live_workers() <= workers,
+            "nudge {step} started a worker: {} against {workers} before the drag",
+            session.live_workers()
+        );
+    }
+
+    // ...and turning it *on* is the one move that has to open a mixer, which is
+    // a rebuild and is allowed to be one.
+    assert!(session.set_limiter(Limiter::default().with_ceiling(-1.0)), "limiter on");
+    eprintln!("20 ceiling nudges with the limiter off: not one rebuild");
+}
+
 /// The other half of the rule, and the one that makes it a *classification*
 /// rather than a blanket "never rebuild": an equalizer really is a change to
 /// the samples, so it does restart the audio -- and must leave the picture
