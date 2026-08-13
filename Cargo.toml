@@ -34,7 +34,19 @@ edition = "2024"
 #                 writer's emulation-prevention fix that shares that code) are
 #                 applied here verbatim -- upstream work carried early, not a
 #                 local invention, and the H.265 half of what makes edith's
-#                 HEVC export run on the GPU
+#                 HEVC export run on the GPU.
+#                 And `video_frame/generic_dma_video_frame.rs` unmapped a DMA
+#                 buffer by issuing one `CLFLUSH` per *byte* -- 64 per cache
+#                 line, 3.1 million per 1080p picture, 6.2 ms of the 8.4 ms a
+#                 hardware export spent per frame (measured on radeonsi
+#                 2026-08-13; upstream's own TODO asks for exactly this and
+#                 reports a race that the mfence pair, not the redundancy, was
+#                 always ordering). The same `drop` wrote its `munmap` as an
+#                 unconsumed `.map()`, so no mapping was ever released and an
+#                 encode session leaked 3 MB of address space per frame
+#                 (2.2 GB over a 719-frame export). Both are fixed in place
+#                 and marked LOCAL PATCH
+
 #   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
 #                 term (the fast path in the same file serves the encoder only),
 #                 which is 4x slower than real time for 5.1 and therefore not
