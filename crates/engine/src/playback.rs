@@ -2797,6 +2797,16 @@ impl PlaybackSession {
         if audio.played_out(position) {
             // Audio EOF. Wall time carries the same timeline on from here, with
             // no jump, and this branch cannot be reached again.
+            //
+            // The device is stopped with it: nothing will ever be queued for
+            // this stream again, so every quantum it would go on playing is
+            // silence counted as a decoder that fell behind -- the tail of a
+            // stream, where [`crate::ao`]'s own `primed` covers the head of
+            // one. A seek from here starts it again like any other
+            // ([`resume`](Self::resume)), which is why the stamp goes with it:
+            // there is no sample of *this* stream left to start on.
+            audio.set_playing(false);
+            audio.content_at.store(-1, Ordering::Release);
             self.clock.switch_to_wall();
             return;
         }
@@ -3080,7 +3090,20 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
         if pending.is_empty() {
             match rx.recv() {
                 Ok(chunk) => pending = chunk.samples,
-                Err(_) => return, // decoder finished or went away
+                Err(_) => {
+                    // Decoder finished or went away. What is in the ring still
+                    // plays out; what comes after it is the end of the timeline
+                    // and not a decoder that fell behind, so the device is told
+                    // to stop counting it. Under the lock and past the epoch,
+                    // like every other word this thread has with the device: a
+                    // superseded feeder must not say this about the stream that
+                    // replaced it.
+                    let ao = audio.ao.lock().unwrap();
+                    if audio.epoch.load(Ordering::Acquire) == epoch {
+                        ao.stream_ended();
+                    }
+                    return;
+                }
             }
         }
         let accepted = {

@@ -123,11 +123,17 @@ fn scale(dst: &mut [u8], gain: f32) {
 /// seek) the next callback would then drain the new stream's head along with
 /// the stale tail. Refuse instead; the writer's retry loop parks until the
 /// RT thread consumes the flag.
-fn accept(flush: &AtomicBool, ring: &Ring, samples: &[f32]) -> usize {
+fn accept(flush: &AtomicBool, ring: &Ring, primed: &AtomicBool, samples: &[f32]) -> usize {
     if flush.load(Ordering::Acquire) {
         return 0;
     }
-    ring.push(samples)
+    let pushed = ring.push(samples);
+    if pushed > 0 {
+        // There is something to play from here on, so a starved callback means
+        // what it says again (`Shared::primed`).
+        primed.store(true, Ordering::Release);
+    }
+    pushed
 }
 
 fn consume(flush: &AtomicBool, ring: &Ring, dst: &mut [u8], want: usize) -> usize {
@@ -477,13 +483,12 @@ pub unsafe extern "C" fn ao_write(session: *mut c_void, samples: *const f32, n: 
             return -1;
         }
         let samples = unsafe { std::slice::from_raw_parts(samples, n) };
-        let accepted = accept(&session.shared.flush, &session.shared.ring, samples);
-        if accepted > 0 {
-            // There is something to play from here on, so a starved callback
-            // means what it says again (`Shared::primed`).
-            session.shared.primed.store(true, Ordering::Release);
-        }
-        accepted as isize
+        accept(
+            &session.shared.flush,
+            &session.shared.ring,
+            &session.shared.primed,
+            samples,
+        ) as isize
     }))
     .unwrap_or(-1)
 }
@@ -501,6 +506,28 @@ pub unsafe extern "C" fn ao_position(session: *mut c_void) -> i64 {
         // SAFETY: caller-guaranteed live session.
         let session = unsafe { &*(session as *const Session) };
         session.shared.position.load(Ordering::Relaxed)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Says the caller has queued the last sample this stream will ever have.
+/// What is still in the ring plays out untouched -- this is not a flush and not
+/// a pause -- but the silence *after* it stops being counted as a late decoder:
+/// there is no decoder left to be late ([`Shared::primed`]). The next accepted
+/// write is a stream again and counts again. 0 on success.
+///
+/// # Safety
+/// `session` must come from [`ao_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_stream_ended(session: *mut c_void) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        session.shared.primed.store(false, Ordering::Release);
+        0
     }))
     .unwrap_or(-1)
 }
@@ -655,24 +682,61 @@ mod tests {
     fn pending_flush_refuses_writes_until_consumed() {
         let ring = Ring::new(4);
         let flush = AtomicBool::new(false);
+        let primed = AtomicBool::new(false);
         let mut out = [0u8; 16];
 
         // Stale pre-seek audio sits in the ring; a flush is requested while
         // paused (no callback runs yet).
-        assert_eq!(accept(&flush, &ring, &[1.0, 2.0]), 2);
+        assert_eq!(accept(&flush, &ring, &primed, &[1.0, 2.0]), 2);
         flush.store(true, Ordering::Release);
 
         // The new stream's feeder tries to write: refused, ring untouched.
-        assert_eq!(accept(&flush, &ring, &[3.0, 4.0]), 0);
+        assert_eq!(accept(&flush, &ring, &primed, &[3.0, 4.0]), 0);
 
         // First post-resume callback consumes the flag and drains the stale
         // tail -- and ONLY the stale tail, because nothing was queued behind it.
         assert_eq!(consume(&flush, &ring, &mut out, 2), 0);
 
         // Writer unparks; the new audio flows intact.
-        assert_eq!(accept(&flush, &ring, &[3.0, 4.0]), 2);
+        assert_eq!(accept(&flush, &ring, &primed, &[3.0, 4.0]), 2);
         assert_eq!(consume(&flush, &ring, &mut out, 2), 2);
         assert_eq!(&out[..4], &3.0f32.to_le_bytes());
+    }
+
+    /// What the underrun count is allowed to mean: a starved callback is a late
+    /// decoder only while a decoder is actually behind the ring. The head of a
+    /// restart (nothing queued since the flush) and the tail of a stream (the
+    /// decoder is done) are silence nobody is late for, and counting them made
+    /// the number say "a seek happened" instead.
+    #[test]
+    fn only_a_started_stream_can_be_late() {
+        let ring = Ring::new(4);
+        let flush = AtomicBool::new(false);
+        let primed = AtomicBool::new(false);
+
+        // The open: callbacks may run before the first write, and there is
+        // nothing to be late for yet.
+        assert!(!primed.load(Ordering::Acquire), "primed before a sample");
+        assert_eq!(accept(&flush, &ring, &primed, &[1.0, 2.0]), 2);
+        assert!(
+            primed.load(Ordering::Acquire),
+            "a queued sample is a stream that can fall behind"
+        );
+
+        // A seek: `ao_flush` unprimes, and the head of the new stream -- the
+        // decoder open, seconds on a cold film -- is not counted...
+        primed.store(false, Ordering::Release);
+        flush.store(true, Ordering::Release);
+        let mut out = [0u8; 16];
+        assert_eq!(consume(&flush, &ring, &mut out, 2), 0, "the flush landed");
+        assert!(!primed.load(Ordering::Acquire), "the restart counts as late");
+
+        // ...until its own first sample lands, from where it counts again --
+        // which is also what makes the tail work: `ao_stream_ended` unprimes
+        // the same flag when the decoder is done, and only a write can prime it
+        // again.
+        assert_eq!(accept(&flush, &ring, &primed, &[3.0, 4.0]), 2);
+        assert!(primed.load(Ordering::Acquire), "the new stream is running");
     }
 
     #[test]
