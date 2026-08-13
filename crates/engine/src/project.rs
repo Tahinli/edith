@@ -650,17 +650,6 @@ pub struct Project {
     /// it, and it is saved as a *reference* to the file the cues came out of
     /// ([`crate::subtitle`]).
     subtitles: Vec<SubtitleTrack>,
-    /// What [`Project::remove_subtitles`] took off, oldest first, cues and all
-    /// -- the bin [`Project::restore_subtitles`] puts one back from. A removal
-    /// keeps the track rather than dropping it because the cues cost a walk of
-    /// the whole container to read (210 ms on a 25 GB remux) and re-reading the
-    /// file is the one thing a person who removed a row by mistake should not
-    /// have to do.
-    ///
-    /// Not saved and not on the history's snapshots: a `.edith` is what the
-    /// timeline *has* ([`crate::edith`]), so the bin is the session's, exactly
-    /// as a clipboard is.
-    removed_subs: Vec<SubtitleTrack>,
     /// The master limiter every lane's sound is summed *through*
     /// ([`Project::limiter`]). Off by default, and not in the lane list, which
     /// is what the history snapshots hold: it is a setting on the mix, like the
@@ -700,7 +689,6 @@ impl Project {
             history: Vec::new(),
             next_link: 1,
             subtitles: Vec::new(),
-            removed_subs: Vec::new(),
             limiter: Limiter::default(),
             tone: crate::tonemap::Preset::default(),
         }
@@ -811,7 +799,6 @@ impl Project {
             history: Vec::new(),
             next_link,
             subtitles: Vec::new(),
-            removed_subs: Vec::new(),
             limiter: Limiter::default(),
             tone: crate::tonemap::Preset::default(),
         })
@@ -1250,54 +1237,19 @@ impl Project {
     /// [`crate::export::ExportSettings::subtitles`]) has to fix it up or drop
     /// it, or it names a different track afterwards.
     ///
-    /// Not an undo step, for the reason the limiter is not -- the history
-    /// snapshots hold the lane list and subtitles are not on it
-    /// ([`Project::subtitles`]). The way back is
-    /// [`restore_subtitles`](Project::restore_subtitles) and not a re-import:
-    /// the track goes to [`removed_subtitles`](Project::removed_subtitles) with
-    /// its cues, so nothing that was read has to be read again.
+    /// ponytail: not an undo step, for the reason the limiter is not -- the
+    /// history snapshots hold the lane list and subtitles are not on it
+    /// ([`Project::subtitles`]). The inverse is putting the file's tracks back
+    /// on -- [`crate::PlaybackSession::import_subtitles`], the panel's own
+    /// door, which reads the subtitles of a file and nothing else -- and not a
+    /// ctrl+z; the upgrade path is the same one the limiter has: a history
+    /// entry holding the project's own settings beside the lanes.
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         if idx >= self.subtitles.len() {
             return Err(format!("there is no subtitle track {idx} to remove").into());
         }
-        self.removed_subs.push(self.subtitles.remove(idx));
+        self.subtitles.remove(idx);
         Ok(())
-    }
-
-    /// The tracks removed so far, oldest first: what a front-end lists beside
-    /// the live ones so a removal can be taken back
-    /// ([`restore_subtitles`](Project::restore_subtitles) indexes into this).
-    pub fn removed_subtitles(&self) -> &[SubtitleTrack] {
-        &self.removed_subs
-    }
-
-    /// Puts the `idx`th removed track back on the timeline, cues and all, and
-    /// hands back which row it is now. The inverse of
-    /// [`remove_subtitles`](Project::remove_subtitles) and the same thing a
-    /// re-import of that file would have added -- minus the walk of the
-    /// container, which is the whole point.
-    ///
-    /// Refused by name for a bin this project does not have that many entries
-    /// in, exactly as a bad removal index is: a front-end holding a stale index
-    /// has picked the wrong row and needs to hear it.
-    ///
-    /// ponytail: it lands at the *end* of the list rather than where it was,
-    /// which is where a re-import would have put it too. What that costs is the
-    /// row order after a restore; the upgrade path is remembering the index
-    /// beside the track in the bin and inserting there.
-    pub fn restore_subtitles(&mut self, idx: usize) -> crate::Result<usize> {
-        if idx >= self.removed_subs.len() {
-            return Err(format!("there is no removed subtitle track {idx} to bring back").into());
-        }
-        let track = self.removed_subs.remove(idx);
-        // `false` when the very same (file, track) was imported again while it
-        // sat in the bin: it is already back, and the row it is already on is
-        // the answer -- which the lookup below gives either way.
-        self.add_subtitles(&track);
-        self.subtitles
-            .iter()
-            .position(|t| t.path == track.path && t.track == track.track)
-            .ok_or_else(|| format!("{} did not go back on the timeline", track.label).into())
     }
 
     /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
@@ -2788,9 +2740,6 @@ impl Project {
             history: Vec::new(),
             next_link: self.next_link,
             subtitles: self.subtitles.clone(),
-            // An export renders what is on the timeline: the bin is a way back
-            // for the window, and no render reads it.
-            removed_subs: Vec::new(),
             limiter: self.limiter,
             tone: self.tone,
         }
