@@ -26,6 +26,57 @@ use crate::colorspace::{ColorDescription, ContentLight, Tags, bitstream_tags};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
+/// What a cancelled read fails with. A message rather than a variant because
+/// [`crate::Error`] is a boxed error and always was; [`is_cancelled`] is what
+/// tells this apart from a file that really would not open, so an abandoned
+/// read is never reported to anyone as a broken file.
+const CANCELLED: &str = "read cancelled";
+
+thread_local! {
+    /// The flag the read running on *this* thread is abandoned by, installed by
+    /// [`with_cancel`].
+    ///
+    /// Thread-scoped rather than passed down, and deliberately: a read is a
+    /// thread here -- an import worker, an audio feeder, a decode worker -- and
+    /// the walk that has to be stopped sits five frames under an `open` with a
+    /// dozen callers, none of which have anything to cancel. This way the two
+    /// that do say so at the top of their own thread and every loop below them
+    /// obeys, at the price of one thread-local load per cluster.
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `read` with `flag` as this thread's cancel: setting it abandons the
+/// walks inside at their next element, with [`CANCELLED`] rather than a verdict
+/// about the file. Restores whatever was installed before, so a nested read is
+/// not silently un-cancelled.
+pub fn with_cancel<T>(
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    read: impl FnOnce() -> T,
+) -> T {
+    let previous = CANCEL.with(|cell| cell.borrow_mut().replace(flag.clone()));
+    let out = read();
+    CANCEL.with(|cell| *cell.borrow_mut() = previous);
+    out
+}
+
+/// Whether the read on this thread has been abandoned; `false` where nobody
+/// installed a flag, which is every caller that has nothing to cancel.
+fn cancelled() -> bool {
+    CANCEL.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    })
+}
+
+/// Whether `error` is a read that was abandoned rather than a file that could
+/// not be read: what keeps a cancelled import off the notice bar and a
+/// superseded audio open off stderr.
+pub fn is_cancelled(error: &crate::Error) -> bool {
+    error.to_string() == CANCELLED
+}
+
 /// What the video track is coded with. Not a decoder choice by itself: only
 /// H.264 has a software decoder here, which is what [`Codec::needs_plugin`]
 /// says for the others.
@@ -2641,6 +2692,13 @@ fn mkv_walk_blocks(file: &mut File, segment: (u64, u64), number: u64) -> crate::
     let mut laced: Vec<(usize, usize)> = Vec::new();
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        // The whole segment is the walk a cancel exists for -- twenty seconds of
+        // disk on a cold 25 GB remux -- and this is where a Cancel beside an
+        // import, or a scrub step that superseded this open two hundred steps
+        // ago, stops the *read* instead of dropping its answer.
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         at = stop;
         if id != CLUSTER {
             continue;
@@ -3929,6 +3987,10 @@ fn mkv_subtitle_blocks(
     let us = |ticks: i64| ticks * timestamp_scale as i64 / 1_000;
     let mut at = segment.0;
     while let Some((id, body, stop)) = ebml_element(file, at, segment.1)? {
+        // The import's second walk, stopped by the same Cancel as its first.
+        if cancelled() {
+            return Err(CANCELLED.into());
+        }
         at = stop;
         if id != CLUSTER {
             continue;
@@ -4025,6 +4087,39 @@ mod tests {
             .collect();
         found.sort();
         found
+    }
+
+    /// **A cancelled walk stops walking.** The flag the import's Cancel and a
+    /// superseded audio open both set ([`with_cancel`]) is read by the segment
+    /// walk itself, so the answer is an abandoned read rather than a verdict
+    /// about the file -- and the same walk without it still opens.
+    #[test]
+    fn a_cancelled_walk_gives_up_and_says_so() {
+        let Some(path) = matroska_fixtures().into_iter().next() else {
+            eprintln!("no Matroska fixture: the cancel walk is not measured");
+            return;
+        };
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let (_, lazy) = MkvDemuxer::open(&path).expect(&name);
+        let (segment, number) = (lazy.segment, lazy.number);
+        let mut file = File::open(&path).expect(&name);
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopped = with_cancel(&flag, || mkv_walk_blocks(&mut file, segment, number));
+        let error = stopped.err().expect("a cancelled walk must not answer");
+        assert!(
+            is_cancelled(&error),
+            "{name}: a cancelled walk reported {error} -- a verdict about the file"
+        );
+
+        // ...and nothing is cancelled by having been near a flag: the walk that
+        // was not asked to stop is the walk it always was.
+        flag.store(false, Ordering::Release);
+        let walked = with_cancel(&flag, || mkv_walk_blocks(&mut file, segment, number));
+        assert!(
+            walked.is_ok_and(|(blocks, ..)| !blocks.is_empty()),
+            "{name}: the uncancelled walk found nothing"
+        );
     }
 
     /// **The lazy index is the same index.** For every Matroska fixture, the
