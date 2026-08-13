@@ -12,7 +12,7 @@
 //! the renderer decides which frame that means.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -116,6 +116,11 @@ struct Audio {
     /// is not the device's own callback -- the plugin's RT thread never sees
     /// this lock, and the feeder holds it for one memcpy per write.
     tap: Arc<Mutex<Vec<f32>>>,
+    /// Feeder threads started and not yet returned. They are detached, so there
+    /// is no handle to count instead, and a scrub leaves dozens of them exiting
+    /// at once -- which is precisely what
+    /// [`live_workers`](PlaybackSession::live_workers) is asked about.
+    feeders: Arc<AtomicUsize>,
 }
 
 /// How much of the played signal the tap keeps. A power of two, because what
@@ -174,24 +179,35 @@ impl Audio {
     ) -> bool {
         let me = self.clone();
         let epoch = self.epoch.load(Ordering::Acquire);
-        thread::Builder::new()
+        // Counted before the spawn, so the count is never behind the thread.
+        self.feeders.fetch_add(1, Ordering::Release);
+        let started = thread::Builder::new()
             .name("audio-feed".into())
             .spawn(move || {
                 // Superseded before this thread was even scheduled: do not open
                 // anything at all. A scrub leaves all but the last one here.
-                if me.epoch.load(Ordering::Acquire) != epoch {
-                    return;
-                }
-                if let Some(rx) = open() {
-                    feed(rx, &me, epoch);
-                }
-                // Only the current feeder gets to declare the end of the audio:
-                // a superseded one is finished, the stream is not.
                 if me.epoch.load(Ordering::Acquire) == epoch {
-                    me.fed_all.store(true, Ordering::Release);
+                    if let Some(rx) = open() {
+                        feed(rx, &me, epoch);
+                    }
+                    // Only the current feeder gets to declare the end of the
+                    // audio: a superseded one is finished, the stream is not.
+                    if me.epoch.load(Ordering::Acquire) == epoch {
+                        me.fed_all.store(true, Ordering::Release);
+                    }
                 }
+                me.feeders.fetch_sub(1, Ordering::Release);
             })
-            .is_ok()
+            .is_ok();
+        if !started {
+            self.feeders.fetch_sub(1, Ordering::Release);
+        }
+        started
+    }
+
+    /// Feeder threads still running; see [`Self::feeders`].
+    fn live_feeders(&self) -> usize {
+        self.feeders.load(Ordering::Acquire)
     }
 }
 
@@ -1217,6 +1233,21 @@ impl PlaybackSession {
         self.retired
             .push(std::mem::replace(&mut self.worker, replacement));
         self.retired.retain(|w| !w.is_finished());
+    }
+
+    /// How many threads this session still has running of its own: the decode
+    /// worker, every retired one that has not returned yet, and the audio
+    /// feeders still in the air. One for a session playing along quietly.
+    ///
+    /// The oracle a seek storm is judged by. `/proc/self/status` counts the
+    /// *process*, and a suite decoding twenty files at once moves that number
+    /// under a test that never touched them -- this counts only what the
+    /// session in hand owns, so it says the same thing alone and in a crowd.
+    #[doc(hidden)]
+    pub fn live_workers(&self) -> usize {
+        usize::from(!self.worker.is_finished())
+            + self.retired.iter().filter(|w| !w.is_finished()).count()
+            + self.audio.as_ref().map_or(0, Audio::live_feeders)
     }
 
     /// Starts feeding whatever follows the current span on the timeline --
@@ -2942,6 +2973,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         epoch: Arc::new(AtomicU64::new(0)),
         content_at: Arc::new(AtomicI64::new(-1)),
         tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
+        feeders: Arc::new(AtomicUsize::new(0)),
     };
     (audio.spawn_feeder(rx).then_some(audio), None)
 }
