@@ -311,6 +311,10 @@ pub struct PlaybackSession {
     /// of a restart is never counted as timeline time. See
     /// [`Audio::content_at`].
     priming: bool,
+    /// Whether the decode worker may drop a picture whose moment has already
+    /// passed ([`Self::drop_late_pictures`]). Off unless a caller says it is
+    /// watching this in real time.
+    drop_late: bool,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -423,6 +427,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -533,6 +538,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -607,6 +613,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         })
     }
 
@@ -898,6 +905,7 @@ impl PlaybackSession {
             eos: false,
             mix: None,
             priming: false,
+            drop_late: false,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1166,6 +1174,7 @@ impl PlaybackSession {
     /// big film, seconds off a cold cache). End of stream is
     /// [`PlaybackSession::is_eos`].
     pub fn try_frame(&mut self) -> Option<Frame> {
+        self.publish_playhead();
         loop {
             match self.frames.try_recv() {
                 Ok(mut frame) => {
@@ -1219,6 +1228,32 @@ impl PlaybackSession {
     /// next press restarts from the top with them, which is what `Ended` means.
     pub fn is_eos(&self) -> bool {
         self.eos
+    }
+
+    /// Tells the decode worker which frame of its *file* the clock has reached,
+    /// so the pictures it is holding that are already behind the playhead are
+    /// dropped where they are cheap to drop -- before the conversion and before
+    /// the queue -- instead of being converted, queued and thrown away by the
+    /// caller one repaint later. The whole of the late-frame policy: a decoder
+    /// that has fallen behind catches up by not painting what nobody can see,
+    /// rather than by being restarted every two seconds (`Player::pump`).
+    ///
+    /// The stamp is the exact inverse of the one [`try_frame`](Self::try_frame)
+    /// puts on a decoded frame: timeline frame -> the clip's own frames
+    /// ([`Span::speed`]) -> the file's ([`Rate`]). A gap and the emptied
+    /// timeline have no file to be inside of, and publish nothing.
+    fn publish_playhead(&self) {
+        if !self.drop_late {
+            return;
+        }
+        let Some(span) = self.span else { return };
+        let Some((_, in_frame)) = span.from else {
+            return;
+        };
+        let now = secs_to_frame(self.clock.now(), self.meta.frame_rate);
+        let offset = now.saturating_sub(span.start).min(span.len);
+        self.worker
+            .playhead(self.span_rate.source_at(in_frame + span.speed.source_at(offset)));
     }
 
     /// Installs `replacement` as the decode worker, parking the outgoing one in
@@ -2473,6 +2508,25 @@ impl PlaybackSession {
         Some((tap, audio.sample_rate))
     }
 
+    /// Says that this session is being **watched in real time**, so a picture
+    /// whose moment has passed is worth nothing and the decode worker may drop
+    /// it where it is cheap to drop -- before the conversion (a full BGRA pass
+    /// over 8 MB at 1080p) and before the queue.
+    ///
+    /// Off by default, and that is the contract every *pull* consumer relies on:
+    /// an export, the file-level [`DecodeSession`] API and a test draining as
+    /// fast as it can all ask for a range of frames and must be given every one
+    /// of them, in order. Only a viewer has a moment for a picture to be past.
+    ///
+    /// A front-end that turns this on was dropping those very frames itself, one
+    /// repaint later (`Player::pump` takes everything due and shows the last):
+    /// what changes is where the work stops, and therefore how quickly a decoder
+    /// that fell behind catches up -- without the restart-every-two-seconds that
+    /// was the only way back before ([`Self::resync_picture`]).
+    pub fn drop_late_pictures(&mut self, on: bool) {
+        self.drop_late = on;
+    }
+
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
     /// workers are replaced rather than steered: a fresh channel cannot hold a
     /// stale frame, and it works just as well after EOF, where the old workers
@@ -2732,6 +2786,12 @@ impl PlaybackSession {
     /// Moves the clock forward; the caller runs this once per rendered frame.
     /// Costs an atomic load, and once per session a mode switch.
     pub fn tick(&mut self) {
+        // Before every early return below: where the playhead stands is what the
+        // decode worker drops its stale pictures against, and a front-end that
+        // repaints without draining (a slow frame, a busy render thread) must
+        // still be moving it -- otherwise the queue fills with pictures whose
+        // moment passed while nobody was taking them.
+        self.publish_playhead();
         let Some(audio) = &self.audio else {
             return; // wall time from the start, nothing to poll
         };
