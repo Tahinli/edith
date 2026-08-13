@@ -156,6 +156,18 @@ struct Shared {
     /// Output gain as f32 bits, 1.0 until the caller says otherwise. Read once
     /// per callback on the RT thread, so it is an atomic rather than a lock.
     gain: AtomicU32,
+    /// Whether the ring has been given a sample to play since it was last
+    /// emptied *on purpose*: `false` from the open and from every `ao_flush`
+    /// until the next accepted write.
+    ///
+    /// A callback that finds nothing to play while this is false is the silence
+    /// of a stream that has not started yet -- the head of a seek, whose decoder
+    /// is still being opened -- and not a decoder that fell behind. Counting it
+    /// made the number below say "a seek happened" (1721 of them over a scripted
+    /// cold play-seek-scrub, against 5 warm) instead of the one thing it is for.
+    /// The wait itself is not hidden by this: it is the clock's business, and
+    /// the clock holds still through it (`Audio::content_at`).
+    primed: AtomicBool,
     underruns: AtomicU64,
 }
 
@@ -250,7 +262,12 @@ fn run(
                             // the clock below keeps running -- the device plays
                             // that silence, so it really is elapsed time.
                             slice[got * 4..want * 4].fill(0);
-                            shared.underruns.fetch_add(1, Ordering::Relaxed);
+                            // ...but only a *started* stream can be late; see
+                            // `Shared::primed`. One relaxed load on the RT
+                            // thread, which is what this branch can afford.
+                            if shared.primed.load(Ordering::Relaxed) {
+                                shared.underruns.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         // After the fill, so the silence stays silent whatever
                         // the gain is, and the underrun count keeps meaning
@@ -409,6 +426,9 @@ pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
             flush: AtomicBool::new(false),
             resumed: AtomicBool::new(false),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            // Nothing has been queued yet, so the callbacks between the connect
+            // and the caller's first write have nothing to be late for.
+            primed: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -457,7 +477,13 @@ pub unsafe extern "C" fn ao_write(session: *mut c_void, samples: *const f32, n: 
             return -1;
         }
         let samples = unsafe { std::slice::from_raw_parts(samples, n) };
-        accept(&session.shared.flush, &session.shared.ring, samples) as isize
+        let accepted = accept(&session.shared.flush, &session.shared.ring, samples);
+        if accepted > 0 {
+            // There is something to play from here on, so a starved callback
+            // means what it says again (`Shared::primed`).
+            session.shared.primed.store(true, Ordering::Release);
+        }
+        accepted as isize
     }))
     .unwrap_or(-1)
 }
@@ -475,6 +501,28 @@ pub unsafe extern "C" fn ao_position(session: *mut c_void) -> i64 {
         // SAFETY: caller-guaranteed live session.
         let session = unsafe { &*(session as *const Session) };
         session.shared.position.load(Ordering::Relaxed)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Quanta the device had to fill with silence because the ring was empty --
+/// "the decoder was late", counted since the stream opened and never reset.
+/// The same number [`Session::drop`] prints, readable while the stream runs so
+/// a benchmark can attribute it to the seek it followed rather than to a whole
+/// session. -1 on a null session; an inactive stream has no callbacks and so
+/// cannot underrun at all.
+///
+/// # Safety
+/// `session` must come from [`ao_open`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_underruns(session: *mut c_void) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        session.shared.underruns.load(Ordering::Relaxed) as i64
     }))
     .unwrap_or(-1)
 }
@@ -545,6 +593,10 @@ pub unsafe extern "C" fn ao_flush(session: *mut c_void) -> i32 {
         }
         // SAFETY: caller-guaranteed live session.
         let session = unsafe { &*(session as *const Session) };
+        // Unprimed first, so the callback that consumes the flag below cannot
+        // find an empty ring and count the head of the restart as a late
+        // decoder (`Shared::primed`).
+        session.shared.primed.store(false, Ordering::Release);
         session.shared.flush.store(true, Ordering::Release);
         0
     }))
