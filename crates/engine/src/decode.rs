@@ -877,7 +877,13 @@ fn hw_decodes(path: &PathBuf, start_frame: u32, codec: Codec) -> Result<(), Stri
     let Some(mut hw) = open_hw(path, start_frame) else {
         return Err(codec.needs_plugin());
     };
-    hw.next_frame().map(|_| ()).map_err(|_| codec.undecodable())
+    // End of stream counts as a refusal, not as a pass: a session that hands
+    // back no picture at all is exactly the black-frame-and-instant-eof this
+    // probe exists to catch, and `Ok(None)` is how the plugin says it.
+    match hw.next_frame() {
+        Ok(Some(_)) => Ok(()),
+        _ => Err(codec.undecodable()),
+    }
 }
 
 /// Returns whether the session was handled; `false` only when hardware decode
