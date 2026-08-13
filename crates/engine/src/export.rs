@@ -107,6 +107,14 @@ const BITS_PER_PIXEL: f64 = 0.1;
 const MIN_BITRATE: u64 = 1_000_000;
 const MAX_BITRATE: u64 = 20_000_000;
 
+/// The ceiling on a bitrate somebody *asked* for, which is a different question
+/// from where the derived one stops: [`MAX_BITRATE`] is the top of the automatic
+/// figure's sane range, and a rate a person typed is not that program's guess to
+/// bound. Nothing in either encoder objects to it -- the VA-API seat takes a
+/// `u64` and the software ones a `u32`/`i32`, all of which hold this with room
+/// -- so the old shared ceiling was only ever the auto range wearing two hats.
+const MAX_EXPLICIT_BITRATE: u64 = 50_000_000;
+
 /// The rates the sound may be coded at, smallest first -- what a front-end
 /// offers and what [`ExportSettings::audio_kbps`] is clamped into. Every one of
 /// them is a legal MPEG-1 Layer III value, so the MP3 path writes the figure it
@@ -456,12 +464,14 @@ fn mastered(project: &Project) -> bool {
     project.limiter().is_active() || project.audio_gains().iter().any(|&g| g != 1.0)
 }
 
-/// The bitrate an export codes at: the caller's number through the same clamp
-/// as the computed one, for the reason [`Enc::open`] states.
+/// The bitrate an export codes at: the caller's number clamped into what an
+/// asked-for rate may be ([`MAX_EXPLICIT_BITRATE`]), the derived one where there
+/// was none. Clamped rather than refused, for the reason [`Enc::open`] states.
 fn bitrate_of(meta: &VideoMeta, settings: &ExportSettings) -> u64 {
-    settings
-        .bitrate
-        .map_or_else(|| bitrate_for(meta), |b| b.clamp(MIN_BITRATE, MAX_BITRATE))
+    settings.bitrate.map_or_else(
+        || bitrate_for(meta),
+        |b| b.clamp(MIN_BITRATE, MAX_EXPLICIT_BITRATE),
+    )
 }
 
 /// The rate the sound codes at: the caller's pick clamped into the offered
@@ -3817,6 +3827,22 @@ mod tests {
         assert_eq!(bitrate_for(&meta(1280, 720, 30.0)), 2_764_800);
         assert_eq!(bitrate_for(&meta(320, 240, 30.0)), MIN_BITRATE, "tiny");
         assert_eq!(bitrate_for(&meta(3840, 2160, 60.0)), MAX_BITRATE, "huge");
+        // A rate somebody typed goes through untouched to its own ceiling, which
+        // is above where the derived one stops: the card offers 50 Mbps, and a
+        // second clamp here would write a file at a bitrate nobody picked.
+        let asked = |bps| {
+            bitrate_of(
+                &meta(1920, 1080, 30.0),
+                &ExportSettings {
+                    bitrate: Some(bps),
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(asked(50_000_000), 50_000_000, "the card's ceiling travels");
+        assert_eq!(asked(21_000_000), 21_000_000, "past the derived range");
+        assert_eq!(asked(999_000_000), MAX_EXPLICIT_BITRATE, "still bounded");
+        assert_eq!(asked(1), MIN_BITRATE, "and floored");
     }
 
     fn meta(width: u32, height: u32) -> VideoMeta {
