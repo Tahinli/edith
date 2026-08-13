@@ -259,6 +259,9 @@ struct EncPlugin {
     /// plugin keeps one session type for both codecs, so the codec is decided
     /// once, at the open, exactly as the H.264 seat's parameters are.
     open_av1: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
+    /// The HEVC seat, missing from an older plugin for the same reason and at
+    /// the same cost: an HEVC export then runs on the software intra encoder.
+    open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
     frame:
         unsafe extern "C" fn(*mut c_void, *const VhFrame, i32, *mut *const u8, *mut usize) -> i32,
     drain: unsafe extern "C" fn(*mut c_void, *mut *const u8, *mut usize) -> i32,
@@ -285,6 +288,7 @@ fn load_enc() -> Option<EncPlugin> {
                 Some(EncPlugin {
                     open: *lib.get(b"vh_enc_open\0").ok()?,
                     open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
+                    open_hevc: lib.get(b"vh_enc_hevc_open\0").ok().map(|s| *s),
                     frame: *lib.get(b"vh_enc_frame\0").ok()?,
                     drain: *lib.get(b"vh_enc_drain\0").ok()?,
                     close: *lib.get(b"vh_enc_close\0").ok()?,
@@ -342,6 +346,28 @@ impl HwEncoder {
     ) -> Option<Self> {
         let plugin = enc_plugin()?;
         let open = plugin.open_av1?;
+        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
+    }
+
+    /// The same, coding HEVC. Unlike the AV1 seat this is **not** behind an
+    /// opt-in: it is the default for an HEVC export, and what makes that safe is
+    /// that the pictures it codes are intra-only, which is the same file the
+    /// software seat writes ([`crate::export::Enc::open_hevc`]) and not the
+    /// GPU-resetting inter path AV1's opt-in exists for.
+    ///
+    /// `None` on everything [`HwEncoder::open`] answers `None` to, on a plugin
+    /// too old to export the symbol, on a GPU with no HEVC encode entrypoint,
+    /// and below 384x384 -- the driver's own floor, stated in the plugin. The
+    /// caller then takes the software intra encoder without a word about it.
+    pub fn open_hevc(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        bitrate: u64,
+    ) -> Option<Self> {
+        let plugin = enc_plugin()?;
+        let open = plugin.open_hevc?;
         Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
     }
 
