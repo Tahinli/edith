@@ -1,0 +1,1093 @@
+//! What is drawn and where: the toolbar, the theme, the notices, the lanes
+//! and their marks, the tints, the subtitle rows and the sliders.
+
+use super::*;
+
+/// The edit toolbar against the 640x360 floor the whole editor is measured
+/// at. It does not fit and cannot be made to -- so what it may never do is
+/// *hide* the tail: the row scrolls, and the door to everything scrolled
+/// off it is pinned outside the scrolling box.
+#[test]
+fn toolbar_fits_the_smallest_window() {
+    let toolbar = src_text("ui/toolbar.rs");
+    let row = &toolbar[toolbar.find("pub(crate) fn toolbar(").expect("the toolbar")..];
+    // Every button in the row is a hit target, so none of them is narrower
+    // than `HIT_MIN`, and they sit in 8 px gaps inside the row's own 12 px
+    // padding.
+    let buttons = row.matches("action_control(").count();
+    assert!(buttons >= 11, "the row's buttons moved; this scan is blind");
+    // The row is shorter than it was -- the project's own settings (size,
+    // rate, HDR) are the inspector's now and the transport is the
+    // picture's -- so whether it fits at 640 px depends on the words in it
+    // and is not something this scan can measure. What it can hold to is
+    // the rule: "it scrolls" is not "it can be found", so the door to
+    // whatever is off the right edge is pinned outside the scrolling box
+    // and the card it opens carries every action there is
+    // (`every_action_is_on_the_actions_card`).
+    assert!(
+        row.contains("\"controls-more\""),
+        "nothing pinned beside the scrolling row: the tail is unreachable at 640 px"
+    );
+    assert_eq!(row.matches("overflow_x_scroll").count(), 1);
+    assert!(
+        row.find("\"controls-more\"") > row.find("overflow_x_scroll"),
+        "the pinned door is inside the row it is meant to outlive"
+    );
+    // ...and nothing in the row decides for itself whether it can act: the
+    // oracle does, once, for the key and the button alike. A raw `control(`
+    // in here is a button that can go dead while its stroke still fires --
+    // the bug this redesign was called in for.
+    assert_eq!(
+        row.matches("\n                    .child(control(").count(),
+        0,
+        "a toolbar button bypassing the availability oracle"
+    );
+}
+
+/// The whole reason `ui/theme.rs` exists: a colour written anywhere else is
+/// a colour the next palette sweep will miss, which is exactly how 186 grey
+/// calls survived every previous attempt at this.
+#[test]
+fn no_colour_is_written_outside_the_theme() {
+    let source = ui_source();
+    let stray: Vec<&str> = source
+        .lines()
+        .filter(|l| l.contains("rgb(0x") || l.contains("rgba(0x"))
+        .collect();
+    assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
+}
+
+/// "It scrolls" is not "it can be found": at the 640x360 floor the timeline
+/// takes its share and no more, so a third track is behind a scroll -- and
+/// the line that says so has to keep telling the truth *while* the column is
+/// being scrolled, or it is an instruction nobody can carry out.
+#[test]
+fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
+    // The timeline is a region and not the window: its chrome and one whole
+    // lane fit the share it may take at the floor.
+    let floor = 360. * TIMELINE_SHARE;
+    assert!(
+        TIMELINE_FIXED_H + LANE_H <= floor,
+        "{TIMELINE_FIXED_H} px of chrome and a lane will not fit {floor} px"
+    );
+    // What is left over is measured in whole lanes, at least one.
+    assert_eq!(lanes_shown(LANE_H), 1);
+    assert_eq!(lanes_shown(LANE_H - 10.), 1);
+    assert_eq!(lanes_shown(2. * LANE_H + 8.), 2);
+
+    // Four tracks in a two-lane box: two are below, and each row scrolled
+    // past takes one off that count until none is left. This is the bug the
+    // graft fixes -- the count used to be `total - shown` forever, so the
+    // line still said "2 more below" with the last track on screen.
+    let box_h = 2. * LANE_H + 8.;
+    assert_eq!(rows_below(4, box_h, 0.), 2);
+    assert_eq!(rows_below(4, box_h, LANE_H + 8.), 1);
+    assert_eq!(rows_below(4, box_h, 2. * (LANE_H + 8.)), 0);
+    // Past the end (gpui clamps, but the arithmetic must not wrap).
+    assert_eq!(rows_below(4, box_h, 900.), 0);
+    // A project that fits says nothing at all.
+    assert_eq!(rows_below(2, box_h, 0.), 0);
+
+    // The inspector's rows are not one height, so its own line is measured
+    // in pixels off the scroll instead: gpui keeps the offset negative going
+    // down, and at the bottom the two cancel out exactly.
+    assert_eq!(px_below(120., 0.), 120.);
+    assert_eq!(px_below(120., -40.), 80.);
+    assert_eq!(px_below(120., -120.), 0.);
+    assert_eq!(px_below(0., 0.), 0.);
+}
+
+/// The failure a user never learns about is the one that was answered by
+/// another failure: two imports failing back to back are two messages, in
+/// the order they happened, and the second does not overwrite the first
+/// before a frame has drawn it.
+#[test]
+fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
+    let mut q = std::collections::VecDeque::new();
+    push_notice(&mut q, "NOTHING ADDED — no video stream".into());
+    push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
+    assert_eq!(q.len(), 2);
+    assert_eq!(q.front().map(|n: &gpui::SharedString| n.as_ref()), Some("NOTHING ADDED — no video stream"));
+
+    // A held key that refuses says its one sentence once: the count on the
+    // bar is a count of messages, not of how long the key was held.
+    push_notice(&mut q, "NOTHING ADDED — the file is not there".into());
+    assert_eq!(q.len(), 2);
+
+    // ...and the ceiling drops the oldest rather than the newest: the thing
+    // that just happened is the thing worth reading.
+    for i in 0..NOTICES_MAX + 3 {
+        push_notice(&mut q, format!("SCAN FAILED: {i}").into());
+    }
+    assert_eq!(q.len(), NOTICES_MAX);
+    assert_eq!(q.back().map(|n: &gpui::SharedString| n.as_ref()), Some("SCAN FAILED: 10"));
+
+    // Answering the bar brings the next one up, oldest first.
+    let front = q.pop_front();
+    assert_ne!(front, q.front().cloned());
+}
+
+/// The bar colours itself off the words the message already opens with, so
+/// the tone cannot disagree with the sentence it labels.
+#[test]
+fn a_message_wears_the_colour_its_own_words_say() {
+    assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR());
+    assert_eq!(notice_tone(&format!("{EXPORT_DONE}out.mp4")), STATUS_SUCCESS());
+    assert_eq!(notice_tone("NOTHING DETACHED — not grouped"), STATUS_WARNING());
+    assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY());
+}
+
+/// The cards are sections of the inspector, not sheets over the timeline:
+/// adjusting a clip must never hide the clip. Structural, because that is
+/// where the rule lives -- a card rendered from the root again would be an
+/// overlay again, whatever it looked like on the day it was written.
+#[test]
+fn an_inspector_section_occludes_no_timeline() {
+    let inspector = src_text("ui/inspector.rs");
+    // Whichever file the root render has come to live in, from the impl to the
+    // end of it -- found rather than named, so moving the root does not quietly
+    // leave this rule reading a file the render is no longer in.
+    let render = source_files()
+        .iter()
+        .map(|path| std::fs::read_to_string(path).expect("a source file"))
+        .find_map(|text| text.find("impl Render for Player").map(|at| text[at..].to_string()))
+        .expect("the root render");
+    for card in [
+        "eq_card", "color_card", "speed_card", "silence_card", "mix_card",
+    ] {
+        assert!(
+            inspector.contains(&format!("self.{card}(")),
+            "{card} is not a section of the inspector"
+        );
+        assert!(
+            !render.contains(&format!("self.{card}(")),
+            "{card} is drawn from the root again -- it is an overlay over the timeline"
+        );
+    }
+    // The docked cards are placed against the inspector's own box, which is
+    // what turns `scrim()` (`absolute().inset_0()`) from a window-wide sheet
+    // into this column.
+    assert!(
+        inspector.contains(".relative()"),
+        "the inspector is not a positioning context: its cards would cover the window"
+    );
+}
+
+/// MUST 1, on the two named offenders: the button that relabels itself
+/// mid-export and the one that used to read "Muted 80%". Both live in a
+/// rect that is reserved once, so the words change and the box does not.
+#[test]
+fn a_stateful_button_keeps_its_rect() {
+    use crate::ui::toolbar::{EXPORT_SLOT_W, SNAP_SLOT_W, VOLUME_SLOT_W};
+    // Widest word each slot can hold, at the 12 px text this window is set
+    // in -- ~7 px a character plus the 16 px of padding.
+    let fits = |slot: f32, word: &str| slot >= word.chars().count() as f32 * 7. + 16.;
+    for word in ["Export", "Cancel"] {
+        assert!(fits(EXPORT_SLOT_W, word), "{word} overflows its rect");
+    }
+    for word in ["Snap on", "Snap off", "No subs", "Subs off"] {
+        assert!(fits(SNAP_SLOT_W, word), "{word} overflows its rect");
+    }
+    for word in ["100%", "× 100%"] {
+        assert!(fits(VOLUME_SLOT_W, word), "{word} overflows its rect");
+    }
+    // And the rect is passed, not hoped for: every stateful control in the
+    // three chrome rows names its width.
+    let toolbar = src_text("ui/toolbar.rs");
+    for (id, slot) in [
+        ("\"export\"", "EXPORT_SLOT_W"),
+        ("\"snap\"", "SNAP_SLOT_W"),
+        ("\"subs\"", "SNAP_SLOT_W"),
+        ("\"volume\"", "VOLUME_SLOT_W"),
+        ("\"zoom-fit\"", "ZOOM_SLOT_W"),
+    ] {
+        let at = toolbar.find(id).unwrap_or_else(|| panic!("no {id} button"));
+        assert!(
+            toolbar[at..at + 120].contains(slot),
+            "{id} does not reserve {slot}"
+        );
+    }
+}
+
+#[test]
+fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
+    // Every hit target in the panel, including the scrub strip -- whose bar
+    // is 6 px to look at and whose click area must not be.
+    assert!(CONTROL_H >= HIT_MIN);
+    assert!(RULER_HIT_H >= HIT_MIN);
+    assert!(LANE_H >= HIT_MIN);
+    // A clip box is a hit target too, and its two trim strips occlude it:
+    // on a box narrower than the pair there is no body left to press, so
+    // the clip cannot be selected, dragged or menued at all -- which is
+    // every clip a jumpcut leaves at a normal zoom. Below three handles
+    // there are no strips.
+    assert!(!trims(0.));
+    assert!(!trims(EDGE_W));
+    assert!(!trims(2. * EDGE_W), "a box that is all handle and no clip");
+    assert!(!trims(3. * EDGE_W - 0.1));
+    // And where they are drawn, what is left between them is a hit target
+    // in its own right -- a whole handle's width of clip.
+    for width in [3. * EDGE_W, 24., 100., 4000.] {
+        assert!(trims(width));
+        assert!(
+            width - 2. * EDGE_W >= EDGE_W,
+            "{width} px of box leaves no middle"
+        );
+    }
+}
+
+#[test]
+fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
+    // The header column is what the ruler is offset by as well, so both
+    // numbers are shared rather than repeated per row (A-MUST1/A-MUST2).
+    assert!(HEADER_W > 0. && HEADER_GAP >= 0.);
+    // Two lanes, a ruler, a button row and the timecode line, inside the
+    // panel the window is sized for.
+    assert!(
+        CONTROL_H + RULER_HIT_H + 2. * LANE_H + 17. + 4. * 8. + 16. <= PANEL_H,
+        "the second lane does not fit the panel"
+    );
+    // Headers and clip boxes are as tall as the lane, and the lane is a
+    // click target (WCAG 2.5.8).
+    assert!(LANE_H >= HIT_MIN);
+    // A label row that ate the whole lane would leave no waveform.
+    assert!(LABEL_H < LANE_H / 2.);
+    // An added track adds its own row to the panel, and the two a project
+    // starts with leave it exactly the height it has always been.
+    assert_eq!(panel_h(2), PANEL_H);
+    assert_eq!(panel_h(1), PANEL_H);
+    assert_eq!(panel_h(3), PANEL_H + LANE_H + 8.);
+    assert_eq!(
+        panel_h(LANES_MAX),
+        PANEL_H + lanes_h(LANES_MAX) - lanes_h(2)
+    );
+    // Past the cap the column scrolls instead: the panel stops growing, so
+    // no number of tracks can push the picture off the window.
+    assert_eq!(panel_h(LANES_MAX + 1), panel_h(LANES_MAX));
+    assert_eq!(panel_h(50), panel_h(LANES_MAX));
+    assert_eq!(lanes_h(0), 0.);
+    assert_eq!(lanes_h(1), LANE_H);
+    assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
+}
+
+#[test]
+fn a_click_marks_the_whole_group_and_nothing_else() {
+    let (v, a) = ((Lane::V1, 0), (Lane::A1, 0));
+    // Clicking the video half of group 1 marks the audio half with it.
+    assert!(marked(v, Some(1), Some(v), Some(1)));
+    assert!(marked(a, Some(1), Some(v), Some(1)));
+    // Another group's clips stay unmarked, in either lane.
+    assert!(!marked((Lane::V1, 1), Some(2), Some(v), Some(1)));
+    assert!(!marked((Lane::A1, 1), Some(2), Some(v), Some(1)));
+    // A half a lift left behind has no group: it marks itself only, which
+    // is what makes it separately deletable. Two ungrouped clips must not
+    // mark each other by both being ungrouped.
+    assert!(marked(a, None, Some(a), None));
+    assert!(!marked(v, None, Some(a), None));
+    // Nothing selected marks nothing.
+    assert!(!marked(v, Some(1), None, None));
+}
+
+#[test]
+fn a_name_is_dropped_rather_than_smeared_across_a_thin_clip() {
+    assert!(show_label(LABEL_MIN_W));
+    assert!(show_label(400.));
+    assert!(!show_label(LABEL_MIN_W - 0.1));
+    // The label test is the box's own width in pixels now, which is what
+    // the scale hands it -- no bed width, and so nothing to be zero.
+    let scale = Scale::default();
+    assert!(show_label(scale.width_px(LABEL_MIN_W as f64 / PPS_DEFAULT)));
+    assert!(!show_label(scale.width_px(0.)));
+}
+
+#[test]
+fn an_envelope_stays_inside_the_box_it_is_drawn_in() {
+    // A ramp: silence at the start, full scale at the end.
+    let peaks: Vec<(f32, f32)> = (0..40)
+        .map(|i| (-(i as f32) / 39., i as f32 / 39.))
+        .collect();
+    let (w, h) = (100., 30.);
+    let cols = envelope(&peaks, 0., 1., w, h);
+    assert_eq!(cols.len(), (w / WAVE_COL) as usize + 1);
+    for &(x, top, bottom) in &cols {
+        assert!((0. ..=w).contains(&x), "x {x} outside 0..{w}");
+        assert!((0. ..=h).contains(&top), "top {top} outside 0..{h}");
+        assert!(
+            (0. ..=h).contains(&bottom),
+            "bottom {bottom} outside 0..{h}"
+        );
+        // Never inverted, and never a polygon with no area: silence has to
+        // read as a line rather than as nothing at all.
+        assert!(
+            bottom - top >= 1.,
+            "column {top}..{bottom} is thinner than a pixel"
+        );
+    }
+    // The ramp is drawn as a ramp: the last column is taller than the first.
+    let height = |&(_, top, bottom): &(f32, f32, f32)| bottom - top;
+    assert!(height(cols.last().unwrap()) > height(cols.first().unwrap()) + 5.);
+    // Degenerate inputs draw nothing rather than panicking.
+    assert!(envelope(&[], 0., 1., w, h).is_empty());
+    assert!(envelope(&peaks, 0., 1., 0., h).is_empty());
+    // A clip whose range runs past the peaks clamps to the last bucket.
+    assert!(!envelope(&peaks, 0., 99., w, h).is_empty());
+}
+
+/// A box laid out wider than any screen -- a long clip at a deep zoom -- is
+/// still one screen's worth of columns: the path a repaint has to build is
+/// bounded by what can be seen, not by what the layout says the box is.
+/// Unbounded, a 5 s clip zoomed to the frame is a path of millions of points
+/// per frame, and the repaint that stalls on it is the waveform that
+/// "disappeared".
+#[test]
+fn an_envelope_never_costs_more_points_than_a_screen_can_show() {
+    let peaks: Vec<(f32, f32)> = (0..200).map(|i| (-(i as f32) / 199., 1.)).collect();
+    // The width a 5 s clip is laid out at when the bed shows 8 frames of it.
+    let huge = 5. * 30. / 8. * 1200.;
+    let cols = envelope(&peaks, 0., 5., huge, 30.);
+    assert!(
+        cols.len() <= WAVE_COLS_MAX + 1,
+        "{} columns for a {huge} px box",
+        cols.len()
+    );
+    // ...and the slice actually painted is the part of the box on the bed,
+    // which is where that width stops mattering: a column per two visible
+    // pixels, at every zoom.
+    let (x, w) = visible_slice(-huge / 2., huge, 1200.);
+    assert_eq!((x, w), (huge / 2., 1200.));
+    assert_eq!(envelope(&peaks, 0., 5., w, 30.).len(), 601);
+    // A box entirely off the bed has no slice, and one that has never been
+    // measured is drawn whole -- what was drawn before there was a bed.
+    assert_eq!(visible_slice(2000., 500., 1200.), (0., 0.));
+    assert_eq!(visible_slice(-3000., 500., 1200.), (500., 0.));
+    assert_eq!(visible_slice(-40., 500., 0.), (0., 500.));
+    // Half on, at either edge.
+    assert_eq!(visible_slice(-100., 500., 1200.), (100., 400.));
+    assert_eq!(visible_slice(1000., 500., 1200.), (0., 200.));
+}
+
+/// The box a trim draws is the box its release commits, at every speed. The
+/// preview used to hand the *timeline* frame count to a source-frame field:
+/// at 2x a tail moved twice as fast as the pointer and snapped back on
+/// release, and a head drag moved the clip's other edge.
+#[test]
+fn a_trim_preview_lands_where_the_release_commits() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    for permille in SPEED_PRESETS {
+        // Live, so the loop owes it no undo step: the speeds are the axis
+        // this walks, and the trims below are what is undone.
+        session
+            .set_speed_live(Lane::V1, 0, Speed::from_permille(permille))
+            .expect("a clip alone on its lane may be speeded");
+        for edge in [Edge::Start, Edge::End] {
+            let clip = session.lane_clips(Lane::V1)[0];
+            let (lo, hi) = session
+                .trim_room(Lane::V1, 0, edge)
+                .expect("clip 0 is there");
+            // Both walls and the middle of the room: the whole range a
+            // pointer can be clamped to.
+            for to in [lo, (lo + hi) / 2, hi] {
+                let preview = trimmed_clip(clip, edge, to, false);
+                // The drag is one edit and one undo step, so the next `to`
+                // is measured from the same clip this one was.
+                if session.trim_clip(Lane::V1, 0, edge, to) {
+                    assert_eq!(
+                        preview,
+                        session.lane_clips(Lane::V1)[0],
+                        "{edge:?} to {to} at {permille} per mille"
+                    );
+                    assert!(session.undo(), "the trim is one undo step");
+                } else {
+                    // An edge already where it was asked to go is not an
+                    // edit, and the preview draws the clip unchanged.
+                    assert_eq!(preview, clip, "{edge:?} to {to} at {permille} per mille");
+                }
+                assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+            }
+        }
+    }
+}
+
+/// A still trims the same way, and the preview knows it: its head grows
+/// forward from source frame 0 -- every frame of it is the same picture --
+/// so the box stretches instead of sliding left.
+#[test]
+fn a_stills_trim_preview_grows_forward_like_the_commit() {
+    let mut session = PlaybackSession::open(asset("test_still.png")).expect("a picture opens");
+    for edge in [Edge::Start, Edge::End] {
+        let clip = session.lane_clips(Lane::V1)[0];
+        let (lo, hi) = session
+            .trim_room(Lane::V1, 0, edge)
+            .expect("clip 0 is there");
+        for to in [lo, (lo + hi) / 2, hi] {
+            let preview = trimmed_clip(clip, edge, to, true);
+            match session.trim_clip(Lane::V1, 0, edge, to) {
+                true => {
+                    assert_eq!(
+                        preview,
+                        session.lane_clips(Lane::V1)[0],
+                        "a still {edge:?} to {to}"
+                    );
+                    assert!(session.undo(), "the trim is one undo step");
+                }
+                false => assert_eq!(preview, clip, "a still {edge:?} to {to}"),
+            }
+            assert_eq!(session.lane_clips(Lane::V1)[0], clip, "back where it was");
+        }
+    }
+}
+
+/// gpui freezes a drag's payload for the whole gesture, and nothing stops a
+/// stroke from editing the lane under it: the drop has to find the clip that
+/// was picked up, not whatever slid into its index.
+#[test]
+fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
+    let at = |start: u32| Clip {
+        start,
+        in_frame: 0,
+        out_frame: 30,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::Fit,
+        speed: Speed::NORMAL,
+    };
+    let lane = [at(0), at(30), at(60)];
+    let dragged = lane[2];
+    assert_eq!(live_idx(&lane, 2, dragged), Some(2), "nothing moved");
+    // A delete in front of it: the clip is now index 1, and the index the
+    // drag froze names a clip nobody grabbed.
+    let after = [at(0), at(60)];
+    assert_eq!(live_idx(&after, 2, dragged), Some(1));
+    assert_eq!(live_idx(&after, 1, dragged), Some(1));
+    // Deleted mid-drag: there is nothing to move, and moving its neighbour
+    // instead is exactly the bug this exists for.
+    assert_eq!(live_idx(&[at(0)], 2, dragged), None);
+    assert_eq!(live_idx(&[], 0, dragged), None);
+}
+
+#[test]
+fn a_quiet_source_still_draws_as_a_shape() {
+    // An eighth of full scale, which is about where the fixtures sit.
+    let quiet: Vec<(f32, f32)> = vec![(-0.125, 0.125), (-0.0625, 0.0625)];
+    let loud = normalise(quiet.clone());
+    assert_eq!(loud[0], (-1., 1.));
+    assert_eq!(loud[1], (-0.5, 0.5));
+    // Digital silence has no loudest sample to scale to; it must not divide
+    // by zero and must stay flat.
+    assert_eq!(normalise(vec![(0., 0.)]), vec![(0., 0.)]);
+    assert!(normalise(Vec::new()).is_empty());
+}
+
+/// The whole waveform path, from the file on disk to the columns that get
+/// painted: what no screenshot can assert about the shape.
+#[test]
+fn the_fixtures_waveform_reaches_the_lane_as_a_shape() {
+    let asset = |name: &str| {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(name)
+    };
+    let peaks = normalise(
+        engine::waveform::peaks(asset("test_av.mp4"), 0, WAVE_BPS)
+            .expect("open the fixture")
+            .expect("test_av.mp4 has audio"),
+    );
+    // 5 s of source at the rate the lane asks for.
+    assert!(peaks.len().abs_diff(5 * WAVE_BPS as usize) <= WAVE_BPS as usize);
+    let cols = envelope(&peaks, 0., 5., 600., 30.);
+    let height = |&(_, top, bottom): &(f32, f32, f32)| bottom - top;
+    let tallest = cols.iter().map(height).fold(0., f32::max);
+    let flattest = cols.iter().map(height).fold(f32::MAX, f32::min);
+    // The fixture's 1 Hz pulse: a full-scale peak and a near-silent dip in
+    // every second, so the drawn envelope is a shape and not a bar.
+    assert!(tallest > 25., "loudest column only {tallest} px of 30");
+    assert!(
+        flattest < 8.,
+        "quietest column {flattest} px -- no dips drawn"
+    );
+    // A video-only source draws no waveform at all rather than a flat fake.
+    assert!(
+        engine::waveform::peaks(asset("test_baseline.mp4"), 0, WAVE_BPS)
+            .expect("open the fixture")
+            .is_none()
+    );
+}
+
+#[test]
+fn every_mark_on_a_clip_is_legible_on_it() {
+    // The body a name and a waveform are drawn on is the clip's kind
+    // ([`clip_kind`]); the source tint is the border and the library
+    // swatch, and is measured for telling itself apart rather than for
+    // carrying text.
+    // Every palette a person can pick, not merely the one in force.
+    for id in crate::ui::theme::PaletteId::ALL {
+        let p = id.palette();
+        for (i, tint) in [p.CLIP_VIDEO, p.CLIP_AUDIO, p.CLIP_IMAGE, p.CLIP_TEXT]
+            .iter()
+            .enumerate()
+        {
+            // WCAG 1.4.3: the clip's name is body text on its tint.
+            assert!(
+                contrast(p.FG_PRIMARY, *tint) >= 4.5,
+                "{id:?} source {i}: label contrast {:.2}",
+                contrast(p.FG_PRIMARY, *tint)
+            );
+            // WCAG 1.4.11: the waveform is a non-text graphic on it.
+            assert!(
+                contrast(p.FG_SECONDARY, *tint) >= 3.,
+                "{id:?} source {i}: waveform contrast {:.2}",
+                contrast(p.FG_SECONDARY, *tint)
+            );
+        }
+        // A selected clip's bed is the same two marks on a different colour.
+        assert!(contrast(p.FG_PRIMARY, p.BG_SELECTED) >= 4.5, "{id:?}");
+        assert!(contrast(p.FG_SECONDARY, p.BG_SELECTED) >= 3., "{id:?}");
+        // The bed a gap shows through has to read as a hole in the lane --
+        // the clip is the object, the bed is the hole -- and the playhead
+        // has to be findable on both.
+        assert!(contrast(p.CLIP_VIDEO, p.BG_TIMELINE) >= 1.5, "{id:?}");
+        assert!(contrast(p.ACCENT_PLAYHEAD, p.BG_TIMELINE) >= 3., "{id:?}");
+        assert!(contrast(p.ACCENT_PLAYHEAD, p.CLIP_VIDEO) >= 3., "{id:?}");
+    }
+    // The sanity check on the ratio itself: black on white is 21:1.
+    assert!((contrast(0xffffff, 0x000000) - 21.).abs() < 0.01);
+}
+
+#[test]
+fn source_tints_differ_per_source_and_cycle() {
+    // The bug: the first entry *was* `BG_RAISED`, so the first file imported
+    // -- the one every session has -- wore the panel's own background and
+    // had no visible swatch at all.
+    assert_ne!(source_tint(0), BG_RAISED());
+    // ...in every family, since the swatch is drawn on whichever panel is
+    // in force (`ui::theme`) and a tint that vanished into one of them is a
+    // file with no colour at all.
+    for id in crate::ui::theme::PaletteId::ALL {
+        let p = id.palette();
+        for (i, &tint) in p.SOURCE_TINTS.iter().enumerate() {
+            assert_ne!(tint, p.BG_RAISED, "{id:?} tint {i} is the panel");
+        }
+    }
+    // Neighbouring sources must not share one, or an import is invisible.
+    assert_ne!(source_tint(0), source_tint(1));
+    assert_ne!(source_tint(1), source_tint(2));
+    assert_ne!(source_tint(2), source_tint(3));
+    // Past the palette it wraps -- never an index panic.
+    assert_eq!(source_tint(4), source_tint(0));
+    assert_eq!(source_tint(9), source_tint(1));
+    assert_eq!(source_tint(usize::MAX), SOURCE_TINTS()[usize::MAX % 4]);
+}
+
+/// Not "they are different numbers" -- different *enough to see*, against
+/// each other and against the surface a swatch is drawn on. The palette is
+/// deliberately dark and low-saturation, so the margin is thin and a new
+/// tint picked by eye can land inside it without anyone noticing.
+#[test]
+fn source_tints_are_all_discernible() {
+    // Summed channel distance: `BG_RAISED` to the warm tint is 18, and that
+    // step is the one already accepted as readable on a lane.
+    let apart = |a: u32, b: u32| {
+        (0..3)
+            .map(|i| {
+                let shift = i * 8;
+                ((a >> shift) & 0xff).abs_diff((b >> shift) & 0xff)
+            })
+            .sum::<u32>()
+    };
+    // Every family, not the one in force: a palette is picked at runtime
+    // now, and four tints tuned by eye on one ground are exactly where a
+    // pair lands inside the margin on another.
+    for id in crate::ui::theme::PaletteId::ALL {
+        let p = id.palette();
+        for (i, &tint) in p.SOURCE_TINTS.iter().enumerate() {
+            assert!(
+                apart(tint, p.BG_RAISED) >= 16,
+                "{id:?} tint {i} is {} from the panel it sits on",
+                apart(tint, p.BG_RAISED)
+            );
+            for (j, &other) in p.SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+                assert!(
+                    apart(tint, other) >= 16,
+                    "{id:?} tints {i} and {j} are only {} apart",
+                    apart(tint, other)
+                );
+            }
+        }
+        // The two a person sees side by side first must be further apart
+        // than the floor: source 0 and source 1 are the first import and
+        // the second.
+        assert!(apart(p.SOURCE_TINTS[0], p.SOURCE_TINTS[1]) >= 32, "{id:?}");
+    }
+}
+
+/// A `.srt` dropped on the window is nobody's stream: it has no source
+/// entry, and the lookup that used to fall back to index 0 painted it with
+/// the first file's colour -- a swatch saying it came out of a film it
+/// never touched.
+#[test]
+fn a_standalone_subtitle_wears_no_file_tint() {
+    let sources = [
+        Source {
+            path: PathBuf::from("/films/a.mkv"),
+            audio_stream: 0,
+        },
+        Source {
+            path: PathBuf::from("/films/b.mp4"),
+            audio_stream: 0,
+        },
+        // A second stream of the first file is a second source and the
+        // same colour.
+        Source {
+            path: PathBuf::from("/films/a.mkv"),
+            audio_stream: 1,
+        },
+    ];
+    assert_eq!(
+        file_tint(&sources, Path::new("/films/a.mkv")),
+        Some(source_tint(0))
+    );
+    assert_eq!(
+        file_tint(&sources, Path::new("/films/b.mp4")),
+        Some(source_tint(1))
+    );
+    assert_eq!(file_tint(&sources, Path::new("/subs/a.eng.srt")), None);
+    assert_eq!(file_tint(&[], Path::new("/films/a.mkv")), None);
+    // The same file under two spellings is one file and one colour: a
+    // source is stored symlink-resolved, everything else as it was typed.
+    let here = std::fs::canonicalize(".").expect("the crate directory");
+    let sources = [Source {
+        path: here.join("Cargo.toml"),
+        audio_stream: 0,
+    }];
+    assert_eq!(
+        file_tint(&sources, Path::new("Cargo.toml")),
+        Some(source_tint(0)),
+        "a relative spelling of the source file wears the source's colour"
+    );
+}
+
+/// His film's two ASS tracks with the timeline trimmed to twenty seconds:
+/// one of them still has cues there and one has none, and the card said
+/// nothing whatever about the second while the Subtitles list went on
+/// showing it with its eighty-three cues.
+///
+/// And the 25 GB remux's thirty-five: naming those wrapped the row to ten
+/// lines and pushed Destination under the fold, so past the value box's
+/// three lines the same line counts instead.
+#[test]
+fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
+    let film = "/films/An Episode 01.mkv";
+    let two = [
+        sub(film, Some(1), "[ASS]"),
+        sub(film, Some(2), "[ASS] [FOR DUB]"),
+    ];
+    // What the engine answers about the one pick that reached it, and what
+    // this side knows about the row that did not.
+    let named = subtitle_plan("[ASS] → embedded".to_string(), &two, &[0]);
+    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — no cues here");
+    assert!(
+        named.chars().count() <= SUB_PLAN_CHARS,
+        "two tracks fit the value box: {named}"
+    );
+    // Thirty-five off one file: twenty-two carry cues here, nine are
+    // pictures, one could not be read, three have nothing on this timeline.
+    let many: Vec<_> = (0..35)
+        .map(|i| {
+            let mut track = sub("/films/A Remux.mkv", Some(i), "eng — Subtitles");
+            track.bitmap = (22..31).contains(&i);
+            track.refused = (i == 31).then(|| "VobSub is pictures".to_string());
+            track
+        })
+        .collect();
+    // The picks are every track with a cue on the timeline: the twenty-two
+    // and the nine picture ones, which the engine drops itself.
+    let picks: Vec<usize> = (0..31usize).collect();
+    let counted = subtitle_plan("22 tracks → embedded (…)".to_string(), &many, &picks);
+    assert_eq!(counted, "22 of 35 → embedded; 9 pictures; 1 unread; 3 no cues here");
+    assert!(
+        counted.chars().count() <= SUB_PLAN_CHARS,
+        "thirty-five tracks still fit the value box: {counted}"
+    );
+    // Nothing on the timeline at all is still the engine's word for it.
+    assert_eq!(subtitle_plan("none".to_string(), &[], &[]), "none");
+}
+
+/// The list is in the order tracks were added, which is not the order a
+/// person reads it in: importing a second film puts its tracks after the
+/// first film's, and importing a third `.srt` for the first film puts that
+/// one last of all. The rows still read as three sources.
+#[test]
+fn subtitle_rows_group_a_source_however_they_were_added() {
+    let tracks = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+        sub("/subs/late.srt", None, "late.srt"),
+        sub("/films/b.mkv", Some(3), "ger"),
+    ];
+    let groups = subtitle_rows(&tracks);
+    assert_eq!(
+        groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+        ["a", "b", "late"],
+        "one group per file, in the order the files first appear"
+    );
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| g.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [vec!["eng", "fre"], vec!["eng", "ger"], vec!["late.srt"]],
+        "a file's tracks are contiguous and in add order"
+    );
+    // Numbered within the file, the way `row_name` numbers audio streams:
+    // two tracks that both say "eng" are told apart by nothing else.
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| g.rows.iter().map(|r| r.number).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        [vec![1, 2], vec![1, 2], vec![1]]
+    );
+    // The swatch key is the file, so a group and that file's media rows
+    // wear one colour -- and the standalone one has none.
+    let sources = [Source {
+        path: PathBuf::from("/films/a.mkv"),
+        audio_stream: 0,
+    }];
+    assert_eq!(
+        file_tint(&sources, &groups[0].path),
+        Some(source_tint(0)),
+        "the group carries the path the tint is asked by"
+    );
+    assert_eq!(file_tint(&sources, &groups[2].path), None);
+}
+
+/// What the strip header, the section heading and the toggle's notice all
+/// say. Two films each carrying an "eng" track are one word apart until the
+/// film is in the name; a film carrying two is one word apart from itself.
+#[test]
+fn the_picked_subtitle_is_named_with_the_film_it_came_out_of() {
+    let tracks = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "eng"),
+        sub("/films/b.mkv", Some(2), "und"),
+        sub("/subs/late.srt", None, "late.srt"),
+    ];
+    let name = |track| sub_pick_name(&tracks, track).expect("a track that is there");
+    // The two "eng"s of two films: one file gave several so its tracks are
+    // numbered, the other gave one so it is not.
+    assert_eq!(name(0), "eng 1 — a");
+    assert_eq!(name(2), "eng 2 — a");
+    assert_eq!(name(1), "eng 1 — b");
+    assert_ne!(name(0), name(1), "two films' eng tracks read apart");
+    for picked in [name(0), name(1), name(2)] {
+        assert!(picked.contains(" — a") || picked.contains(" — b"));
+    }
+    // "und" is the tag for "nobody said", humanised once by
+    // `subtitle_rows` and not again here.
+    assert_eq!(name(3), "unknown language 2 — b");
+    // A standalone `.srt` is its own file and its label already says so:
+    // one track, so no number, and no stem after it saying it again.
+    assert_eq!(name(4), "late.srt");
+    // The silence `subtitle_track` gives at the same moment.
+    assert_eq!(sub_pick_name(&tracks, 5), None);
+    assert_eq!(sub_pick_name(&[], 0), None);
+}
+
+/// The door this editor answers "don't make me import the film again" with,
+/// and it is in the panel where the tracks it adds are listed: the Text
+/// tab's own button reads a file's subtitle tracks onto the open timeline
+/// -- a release's `.mkv`, an `.srt` beside it -- while the file itself
+/// joins nothing. It is the *action* and not a second implementation of it,
+/// so the button, the stroke and the actions card cannot drift apart, and
+/// it is oracle-gated like every other action button, so with no timeline
+/// open it dims and says why instead of opening a chooser for nothing.
+#[test]
+fn the_text_tab_carries_the_add_subtitles_door() {
+    let library = src_text("ui/library.rs");
+    let at = library
+        .find("\"add-subtitles\"")
+        .expect("no add-subtitles control in the library column");
+    let block = &library[at..(at + 1400).min(library.len())];
+    assert!(
+        block.contains("ActionId::AddSubtitleTrack"),
+        "the button is a door of its own rather than the action: {block}"
+    );
+    assert!(
+        block.contains("pick_and_add_subtitles"),
+        "the button does not open the subtitle chooser: {block}"
+    );
+    // `action_control` is the oracle-gated one: dimmed with the refusal in
+    // the oracle's own words. `control` alone would be lit with no timeline.
+    assert!(
+        library[..at].ends_with("self.action_control(\n                    "),
+        "the add-subtitles button is not oracle-gated"
+    );
+    // ...and the empty tab names that button, rather than pointing at a
+    // toolbar the person is not looking at.
+    assert!(
+        crate::LibraryTab::Text.empty().contains("Add subtitles"),
+        "{}",
+        crate::LibraryTab::Text.empty()
+    );
+}
+
+/// The one thing regrouping must not break: `sub_track` is a flat index
+/// into the add-order list, a click sets it and a save writes it into the
+/// `.edith`. Every row must still name the track it was made from -- rows
+/// for refused tracks included, because they take a number in that list
+/// whether or not anyone can pick them.
+#[test]
+fn a_subtitle_row_names_the_flat_track_it_was_made_from() {
+    let mut tracks = vec![
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+    ];
+    // Track 1 of b is pictures: still a row, still index 1 of the list.
+    tracks[1].bitmap = true;
+    tracks[1].refused = Some("PGS subtitles are pictures".to_string());
+    let groups = subtitle_rows(&tracks);
+    let flat: Vec<(usize, &str)> = groups
+        .iter()
+        .flat_map(|g| g.rows.iter().map(|r| (r.track, r.label.as_str())))
+        .collect();
+    assert_eq!(flat, [(0, "eng"), (2, "fre"), (1, "eng")]);
+    for (track, label) in flat {
+        assert_eq!(
+            tracks[track].label, label,
+            "row {track} picks the track it names"
+        );
+    }
+    // (c) The refused one is here, saying why, and greyable by that alone.
+    let refused = &groups[1].rows[0];
+    assert_eq!(
+        refused.refused.as_deref(),
+        Some("PGS subtitles are pictures")
+    );
+    assert_eq!(refused.detail, "PGS subtitles are pictures");
+    assert!(refused.bitmap);
+    // ...and it was counted: the row after it in add order is still 2.
+    assert_eq!(groups[0].rows[1].track, 2);
+}
+
+/// The × on a row shifts every track after it down one, and the pick is
+/// what an export writes into the file -- so a pick that stayed put would
+/// silently change which track the next export carries. Every relation
+/// between the pick and the row that went, on a list of three.
+#[test]
+fn removing_a_subtitle_row_carries_the_pick_with_it() {
+    // A row *before* the pick: the same track stays picked, one index down.
+    assert_eq!(sub_pick_after_removal(2, 0, 2), 1);
+    assert_eq!(sub_pick_after_removal(2, 1, 2), 1);
+    // A row *after* it: the pick has not moved and neither has its index.
+    assert_eq!(sub_pick_after_removal(0, 2, 2), 0);
+    assert_eq!(sub_pick_after_removal(1, 2, 2), 1);
+    // The picked row itself: the one that slid into its place...
+    assert_eq!(sub_pick_after_removal(1, 1, 2), 1);
+    // ...and the last row when the picked one was the last, since there is
+    // nothing after it to slide.
+    assert_eq!(sub_pick_after_removal(2, 2, 2), 1);
+    // The last row of all: an emptied list is legal for subtitles, and the
+    // section is not drawn at all at that point.
+    assert_eq!(sub_pick_after_removal(0, 0, 0), 0);
+}
+
+/// The same claim from the click's end, on the order imports actually
+/// arrive in: two films opened one after the other and an `.srt` dropped
+/// last interleave in the flat list, and the display reorders them. What a
+/// click sets is the row's own `track`, so the *n*th row on screen has to
+/// pick the track it shows and the echoes have to name that same file.
+#[test]
+fn a_click_on_a_regrouped_row_picks_the_track_that_row_shows() {
+    let tracks = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+        sub("/subs/late.srt", None, "late.srt"),
+        sub("/films/b.mkv", Some(3), "ger"),
+    ];
+    let rows: Vec<_> = subtitle_rows(&tracks)
+        .into_iter()
+        .flat_map(|group| {
+            group
+                .rows
+                .into_iter()
+                .map(move |row| (group.path.clone(), row))
+        })
+        .collect();
+    // Read top to bottom, the rows are no longer in add order...
+    assert_eq!(
+        rows.iter().map(|(_, row)| row.track).collect::<Vec<_>>(),
+        [0, 2, 1, 4, 3]
+    );
+    for (path, row) in &rows {
+        // ...and what the click writes into `sub_track` -- and a save into
+        // the `.edith` -- still lands on the track the row is showing.
+        let picked = &tracks[row.track];
+        assert_eq!(&picked.path, path, "row {} picks another file", row.track);
+        assert_eq!(lang_human(&picked.label), row.label);
+        // And the heading, the strip and the notice name that same file
+        // back, so a click cannot leave the echoes pointing elsewhere.
+        let echo = sub_pick_name(&tracks, row.track).expect("the row's own track");
+        let stem = path.file_stem().expect("a fixture path").to_string_lossy();
+        assert!(
+            echo.contains(&*stem),
+            "picked {}, echoed {echo}",
+            path.display()
+        );
+    }
+}
+
+/// "und" is what a muxer writes when nobody said what the language is. A
+/// row showing it verbatim names a language nobody speaks.
+#[test]
+fn an_untagged_language_says_it_is_unknown() {
+    assert_eq!(lang_human("und"), "unknown language");
+    assert_eq!(lang_human("eng"), "eng");
+    assert_eq!(lang_human("fre — Commentary"), "fre — Commentary");
+    // Reaching the subtitle rows too: a track whose only name was the tag.
+    let groups = subtitle_rows(&[sub("/films/a.mkv", Some(1), "und")]);
+    assert_eq!(groups[0].rows[0].label, "unknown language");
+    // The pair, read as the pair: the row title comes off `language` and
+    // `name` and never out of the flattened label, which is what let an
+    // "und" beside a title through as a language nobody speaks. A refused
+    // track states neither and keeps its label.
+    let titled = |language: &str, name: &str, label: &str| engine::subtitle::SubtitleTrack {
+        path: PathBuf::from("/films/a.mkv"),
+        track: Some(1),
+        language: language.into(),
+        name: name.into(),
+        label: label.into(),
+        cues: Vec::new(),
+        bitmap: false,
+        refused: None,
+    };
+    for (language, name, label, title) in [
+        ("fra", "Signs", "fra — Signs", "fra — Signs"),
+        ("und", "Signs", "Signs", "Signs"),
+        ("und", "", "und", "unknown language"),
+        ("", "late.srt", "late.srt", "late.srt"),
+        ("", "", "eng", "eng"),
+    ] {
+        let rows = subtitle_rows(&[titled(language, name, label)]);
+        assert_eq!(rows[0].rows[0].label, title, "{language:?} {name:?}");
+    }
+}
+
+/// The bug: an empty timeline is end-of-stream from its one black frame
+/// onward, so the pump had `done` set before anything was ever pressed --
+/// and the transport's restart branch read that as "played out, start from
+/// the top". It started a clock against a zero-length timeline, which was
+/// `done` again by the next repaint, so every further press restarted it
+/// too: the button read "Pause" and no press of it ever paused.
+///
+/// What holds it now is one predicate, checked here against real sessions
+/// on both sides -- the emptied one refuses, a timeline with clips on it
+/// does not.
+#[test]
+fn an_empty_timeline_has_nothing_to_play() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    // Silent like the engine suite: this opens the real device.
+    session.set_gain(0.0);
+    // A timeline with clips on it plays, and always did: the guard must not
+    // touch that side.
+    assert!(!session.is_empty());
+    assert!(!nothing_to_play(Some(&session)));
+
+    // Every clip taken off, which is a state and not a failure.
+    while session.delete_clip(Lane::V1, 0) {}
+    while session.delete_clip(Lane::A1, 0) {}
+    assert!(session.is_empty(), "the timeline is empty");
+    assert_eq!(session.timeline_duration(), 0.0);
+
+    // What the pump does every render, and what set `done` before the fix:
+    // the black frame goes by and the session is at its end at once.
+    for _ in 0..40 {
+        while session.try_frame().is_some() {}
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        session.is_eos(),
+        "an empty timeline is done before it starts"
+    );
+
+    // So the press is refused rather than sent down the restart branch --
+    // and with no session at all it is the same refusal.
+    assert!(nothing_to_play(Some(&session)));
+    assert!(nothing_to_play(None));
+    assert!(!session.is_playing(), "and nothing was started");
+}
+
+/// The slider writes the same numbers the keys do, and mute is not one of
+/// them: dragging while muted picks the level unmuting comes back to.
+#[test]
+fn the_slider_lands_on_the_grid_the_keys_move_on() {
+    let mut volume = Volume::default();
+    // Both ends exactly, and clamped past them.
+    volume.set_along(0.);
+    assert_eq!(volume.gain(), 0.0);
+    assert_eq!(volume.label(), "Vol 0%");
+    volume.set_along(1.5);
+    assert_eq!(volume.gain(), 1.0);
+    assert_eq!(volume.along(), 1.0);
+
+    // Halfway is 50%, and a key press from there is 5% -- the same step
+    // count as before, on a finer grid.
+    volume.set_along(0.5);
+    assert_eq!(volume.label(), "Vol 50%");
+    volume.step(true);
+    assert_eq!(volume.label(), "Vol 55%");
+    volume.step(false);
+    assert_eq!(volume.gain(), 0.5);
+
+    // A number no step lands on comes back as the nearest one, so the label
+    // and the fill are the same value the device was handed.
+    volume.set_along(0.333);
+    assert_eq!(volume.label(), "Vol 33%");
+    assert_eq!(volume.along(), 0.33);
+
+    // Muted, the drag moves the level and nothing comes out.
+    volume.muted = true;
+    volume.set_along(0.8);
+    assert_eq!(volume.gain(), 0.0);
+    assert_eq!(volume.label(), "Muted 80%");
+    volume.muted = false;
+    assert_eq!(volume.gain(), 0.8);
+}
+
+/// The slider lands where it paints: the arithmetic `Player::drag_volume`
+/// runs over the bar's own painted width, which is the one thing a test of
+/// it can share without re-deriving it.
+#[test]
+fn the_volume_slider_lands_where_it_paints() {
+    let bar = Bounds {
+        origin: point(px(420.), px(508.)),
+        size: size(px(VOLUME_W), px(CONTROL_H)),
+    };
+    let at = |x: f32| {
+        let mut volume = Volume::default();
+        volume.set_along(frac_along(px(x), bar));
+        volume
+    };
+    assert_eq!(at(420.).gain(), 0.0, "the left end is silence");
+    assert_eq!(at(420. + VOLUME_W).gain(), 1.0, "the right end is full");
+    assert_eq!(at(-4000.).gain(), 0.0, "off the left clamps");
+    assert_eq!(at(9999.).gain(), 1.0, "off the right clamps");
+    // Every pixel along it: a level the keys could also reach, painted back
+    // where the hand pressed to within the half step the rounding costs.
+    for step in 0..=(VOLUME_W as u32) {
+        let along = step as f32 / VOLUME_W;
+        let volume = at(420. + along * VOLUME_W);
+        let painted = volume.along();
+        let slack = 0.5 / f32::from(Volume::MAX_STEPS) + 1e-4;
+        assert!(
+            (painted - along).abs() <= slack,
+            "pressed at {along}, paints at {painted}"
+        );
+    }
+}
