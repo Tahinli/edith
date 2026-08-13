@@ -496,11 +496,15 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
     let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate).ok()?;
     let bitrate = bitrate_of(meta, settings);
     match settings.format {
-        // The HEVC pair is software only, and not for want of a GPU: the plugin
-        // has no HEVC *encode* entry point at all (`hw::HwEncoder` opens H.264
-        // and AV1), so there is no seat to probe. Said here rather than left to
-        // a failed open, which would read as a driver refusal.
-        format if format.is_hevc() => None,
+        // Both HEVC formats sit on the plugin's HEVC seat, and it is the
+        // default: what it codes is intra-only, the very file the software seat
+        // writes, so preferring the GPU changes how long an export takes and
+        // not what comes out of it. `None` here is the plugin's own "no" --
+        // no entrypoint, or a picture under the driver's 384x384 floor -- and
+        // the software intra encoder takes the file.
+        format if format.is_hevc() => {
+            HwEncoder::open_hevc(meta.width, meta.height, fps_num, fps_den, bitrate)
+        }
         // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
         // AV1 formats sit on it: the container is not the encoder's business.
         format if format.is_av1() && !forced("VE_HW_AV1") => None,
@@ -2627,6 +2631,9 @@ enum Enc {
     },
     /// AV1 on the GPU, through the same plugin the H.264 seat uses.
     Av1Hw(HwEncoder),
+    /// HEVC on the GPU, through that same plugin -- and intra-only there too,
+    /// so this and [`Enc::Hevc`] write the same kind of file.
+    HevcHw(HwEncoder),
     Av1Sw {
         context: rav1e::Context<u8>,
         /// Temporal units the encoder has finished but the caller has not
@@ -2687,6 +2694,7 @@ impl Enc {
             Self::Sw { .. } => video_label(Format::Mp4, false),
             Self::Av1Hw(_) => video_label(Format::Av1, true),
             Self::Av1Sw { .. } => video_label(Format::Av1, false),
+            Self::HevcHw(_) => video_label(Format::Hevc, true),
             Self::Hevc(_) => video_label(Format::Hevc, false),
         }
     }
@@ -2810,11 +2818,14 @@ impl Enc {
         })
     }
 
-    /// The intra HEVC seat, software and frame-parallel. There is no hardware
-    /// half: the plugin encodes H.264 and AV1 and nothing else, which
-    /// [`hw_seat`] says by refusing to probe one.
+    /// The HEVC pair: the plugin's VA-API seat where the GPU has one, and the
+    /// frame-parallel software encoder everywhere else -- below the driver's
+    /// 384x384 floor, on a plugin too old to carry the symbol, on a GPU with no
+    /// HEVC encode entrypoint. Silent either way, because both write the same
+    /// kind of file.
     ///
-    /// **Intra-only, deliberately.** The vendored encoder's inter modes code
+    /// **Intra-only, deliberately, on both seats.** The software encoder's inter
+    /// modes code
     /// 1080p at 0.81 fps across 12 cores (measured 2026-08-11) -- a minute of
     /// timeline in half an hour, which is not an export anybody waits for --
     /// while the intra path does 4.30 fps on the same picture and the same
@@ -2838,6 +2849,10 @@ impl Enc {
                 meta.width, meta.height
             )
             .into());
+        }
+        if let Some(hw) = hw_seat(meta, settings) {
+            eprintln!("export encoder: hardware HEVC intra (VA-API plugin)");
+            return Ok(Self::HevcHw(hw));
         }
         let (width, height) = (
             (meta.width as usize).next_multiple_of(CTB),
@@ -2900,6 +2915,12 @@ impl Enc {
                 collect_av1(context, ready)?;
                 Ok(pop_av1(ready, au))
             }
+            // Every unit this seat hands back is an IDR carrying its own
+            // parameter sets (the plugin codes HEVC intra-only), so every one of
+            // them is a sync point -- said as a constant rather than parsed back
+            // out of the bitstream, because it is this encoder's configuration
+            // and not a driver's choice.
+            Self::HevcHw(hw) => Ok(hw.encode(y, u, v, width, height, true)?.map(|au| (au, true))),
             Self::Hevc(hevc) => {
                 hevc.pending.push(pad_to_ctb(
                     y,
@@ -2956,6 +2977,7 @@ impl Enc {
                 }
                 Ok(pop_av1(ready, au))
             }
+            Self::HevcHw(hw) => Ok(hw.drain()?.map(|au| (au, true))),
             Self::Hevc(hevc) => {
                 // The tail batch: fewer frames than lanes, coded on as many
                 // cores as there are frames left.
