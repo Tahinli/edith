@@ -62,12 +62,17 @@ fn the_session_maps_a_pgs_track_onto_the_timeline_and_draws_it() {
     let drawn = Instant::now();
     let image = cues[0].image.as_ref().expect("a picture cue");
     let rgba = image.rgba().expect("the first display set decodes");
+    let took = drawn.elapsed();
     eprintln!(
-        "cue 0 decoded to {}x{} in {:?}",
-        image.width,
-        image.height,
-        drawn.elapsed()
+        "cue 0 decoded to {}x{} in {took:?}",
+        image.width, image.height,
     );
+    // The run-length walk is paid once per cue *change* -- the window keeps the
+    // picture while it is up ([`Player::sub_picture`]) -- so what this holds is
+    // the cost of the one frame a new line appears on: 247 µs measured on this
+    // remux, a sixty-eighth of that frame's budget. A whole repaint's worth
+    // would mean the cache above it had stopped mattering.
+    assert!(took.as_millis() < 16, "a frame's worth of decode: {took:?}");
     assert_eq!(rgba.len(), (image.width * image.height * 4) as usize);
     let opaque = rgba.chunks_exact(4).filter(|px| px[3] > 0).count();
     assert!(opaque > 0, "the block decoded to an empty canvas");
