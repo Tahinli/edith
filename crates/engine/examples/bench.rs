@@ -49,6 +49,7 @@ fn main() {
         "open" => open_bench(&path),
         "seek" => seek_bench(&path, arg_f64(args.next(), "seconds")),
         "scrub" => scrub_bench(&path),
+        "waveform" => waveform_bench(&path),
         "export" => {
             let seat = args.next().unwrap_or_else(|| usage());
             let out_dir = PathBuf::from(args.next().unwrap_or_else(|| usage()));
@@ -61,7 +62,8 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "usage: bench open <file>\n       bench seek <file> <secs>\n       \
-         bench scrub <file>\n       bench export <file> <h264sw|h264hw|av1|hevc> <out_dir>"
+         bench scrub <file>\n       bench waveform <file>\n       \
+         bench export <file> <h264sw|h264hw|av1|hevc> <out_dir>"
     );
     std::process::exit(2)
 }
@@ -245,6 +247,38 @@ fn seek_bench(path: &Path, secs: f64) {
         )
     };
     row(path, &format!("seek_ttff_{secs:.0}s"), "ms", &samples, &note);
+}
+
+// ---------------------------------------------------------------- waveform
+
+/// What a lane waits for before it has an envelope: one whole
+/// [`engine::waveform::peaks`] of the file's first audio stream, at the app's
+/// own ten buckets a second. Cold once, then warm -- the mkv sidecar index is
+/// written on the first open, so the two are different questions.
+fn waveform_bench(path: &Path) {
+    const BPS: u32 = 10;
+    evict(path);
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    let mut note = String::new();
+    for i in 0..3 {
+        let t = Instant::now();
+        match engine::waveform::peaks(path, 0, BPS) {
+            Ok(peaks) => {
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                if i == 0 { cold.push(ms) } else { warm.push(ms) }
+                if note.is_empty() {
+                    note = format!("{} buckets", peaks.map_or(0, |p| p.len()));
+                }
+            }
+            Err(e) => {
+                row(path, "waveform_cold", "ms", &[], &format!("FAIL({e})"));
+                return;
+            }
+        }
+    }
+    row(path, "waveform_cold", "ms", &cold, &note);
+    row(path, "waveform_warm", "ms", &warm, &note);
 }
 
 // ------------------------------------------------------------------- scrub
