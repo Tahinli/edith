@@ -21,7 +21,10 @@
 //! - **Derived, never authoritative.** A proxy is named after the source's
 //!   path, length and modification time ([`path_for`]), so a re-encoded or
 //!   re-cut original simply misses the cache and a stale proxy can never be
-//!   found. Deleting the cache directory costs time and nothing else.
+//!   found. Deleting the cache directory costs time and nothing else -- which
+//!   is what lets this cap itself: over [`CACHE_CAP`] the least recently used
+//!   stand-ins are deleted to make room ([`sweep`]), because a file written
+//!   without being asked for must not be able to fill a disk.
 //!
 //! Generation is [`crate::export`]'s own decode -> scale -> encode walk, given
 //! a one-clip project and a smaller canvas: the hardware seat where the GPU has
@@ -42,6 +45,16 @@ use crate::scale::FitPolicy;
 /// shipped proxy preset (Resolve's half-res, kdenlive's 640/1000-wide
 /// defaults).
 pub const LONG_EDGE: u32 = 1280;
+
+/// How much disk the stand-ins may hold between them, in bytes: 20 GB, which
+/// is one of his 4K feature films and most of a second (a 2h20 one measures
+/// ~11.5 GB at ~1.37 MB per second of film), or a dozen of an ordinary length.
+///
+/// A cap is not a nicety here. Proxies are written *without being asked for*,
+/// on import, two at a time -- so without one the answer to "how much of his
+/// disk does this take" is "all of it, eventually". Over the cap, the least
+/// recently used are deleted until it fits ([`sweep`]).
+pub const CACHE_CAP: u64 = 20 * 1024 * 1024 * 1024;
 
 /// Bits per pixel per second a proxy is coded at, [`crate::export`]'s own rate
 /// rule at three times the number: every frame being an IDR means no frame
@@ -79,10 +92,9 @@ pub fn size_for(meta: &VideoMeta) -> (u32, u32) {
 /// cache directory at all, which is a source that gets no proxy rather than one
 /// littering the working directory.
 ///
-/// corner-cut: nothing evicts, exactly as the Matroska index cache beside it
-/// states. A proxy of a feature film is hundreds of megabytes and a re-encoded
-/// source leaves its old one behind; the upgrade path is a size-capped sweep of
-/// the directory at open. It is the user's own cache to delete meanwhile.
+/// A re-encoded source therefore leaves its old stand-in behind, and a proxy of
+/// a feature film is gigabytes: [`sweep`] is what keeps that from being the
+/// whole disk, and it runs before every new one is written.
 pub fn path_for(source: &Path) -> Option<PathBuf> {
     let meta = std::fs::metadata(source).ok()?;
     let mtime = match meta.modified().ok()?.duration_since(UNIX_EPOCH) {
@@ -100,6 +112,60 @@ pub fn path_for(source: &Path) -> Option<PathBuf> {
         "proxies",
     )?;
     Some(dir.join(format!("{:016x}.mp4", crate::demux::fnv1a(&bytes))))
+}
+
+/// Deletes least-recently-used stand-ins until the directory holds at most
+/// `cap` bytes, and reports what it holds afterwards.
+///
+/// Run before a new one is written, which is the only moment this directory
+/// grows. Nothing else evicts, and nothing else can: a proxy is derived, so
+/// deleting one costs the time to make it again and no more -- which is exactly
+/// what makes a cap safe to apply behind the user's back where an eviction of
+/// anything he *authored* would not be.
+///
+/// Least recently *used* is read off the access time, with the modification
+/// time where a filesystem reports none. On a `relatime` mount -- which is the
+/// default, and is what this machine's `/home` is -- an access time moves at
+/// most once a day, so this is a daily-granularity LRU rather than an exact
+/// one. That is the right accuracy for a thing whose eviction costs a
+/// re-encode, and it is why the order is by *time* and not by a hit counter
+/// nothing would persist.
+///
+/// A `.part` is never deleted -- it is being written right now, by this process
+/// or another -- but its bytes *are* counted: they are on the disk, and a
+/// half-written 11 GB proxy is exactly when the finished ones should make room.
+fn sweep(dir: &Path, cap: u64) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    let mut evictable: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        total += meta.len();
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "mp4") {
+            let used = meta.accessed().or_else(|_| meta.modified());
+            evictable.push((used.unwrap_or(UNIX_EPOCH), meta.len(), path));
+        }
+    }
+    if total <= cap {
+        return total;
+    }
+    evictable.sort_by_key(|(used, ..)| *used);
+    for (_, len, path) in evictable {
+        if total <= cap {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            eprintln!("proxy cache: evicted {}", path.display());
+        }
+    }
+    total
 }
 
 /// The proxy of `source` if one has already been made, `None` otherwise. The
@@ -187,7 +253,16 @@ pub fn generate(source: &Path) -> crate::Result<Job> {
 /// The header is read *once* for both questions: on a Matroska that read is the
 /// cluster walk, so asking `wanted` and then `generate` separately would pay
 /// for it twice.
+///
+/// A song and a still are not films and are answered before that read: neither
+/// has a picture stream to stand in for, and a demuxer opened on one fails --
+/// which used to reach a front-end as "no proxy" on a `.wav`, a refusal about
+/// something nobody had asked for. `Ok(None)` is the true answer, and it is the
+/// same one a 1080p H.264 film gets.
 pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
+    if crate::is_audio(source) || crate::is_image(source) {
+        return Ok(None);
+    }
     started(source, wanted)
 }
 
@@ -208,6 +283,11 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
     let (width, height) = size_for(&meta);
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
+        // Before the write, which is the only thing that makes this directory
+        // bigger: what is already there is brought under the cap first, so the
+        // disk never carries more stand-ins than [`CACHE_CAP`] plus the one
+        // being written.
+        sweep(dir, CACHE_CAP);
     }
     // What a killed editor left behind: the export worker deletes its own part
     // file when it is cancelled or fails, but nothing can delete it for a
@@ -319,6 +399,69 @@ mod tests {
             "already small: its own size, never upscaled"
         );
         assert_eq!(size_for(&meta(1, 1, Codec::H264)), (2, 2), "never zero");
+    }
+
+    /// The cap keeps the directory a cache and not a second copy of his
+    /// library: over it, the least recently used go until it fits, and a
+    /// half-written one is never taken (it is being written *now*) though its
+    /// bytes count towards what has to be freed.
+    #[test]
+    fn the_cache_evicts_its_oldest_until_it_fits() {
+        let dir = crate::scratch::Scratch::dir("proxy-sweep");
+        let write = |name: &str, len: usize, ago: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; len]).expect("write");
+            // Stamped by hand: three files written in one millisecond have no
+            // order of their own, and the order is what is under test. `atime`
+            // is what `sweep` reads and `set_times` is the one door to it
+            // without a dependency.
+            let file = std::fs::File::options().write(true).open(&path).expect("open");
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(ago);
+            file.set_times(std::fs::FileTimes::new().set_accessed(when).set_modified(when))
+                .expect("stamp");
+            path
+        };
+        let old = write("old.mp4", 400, 300);
+        let middle = write("middle.mp4", 400, 200);
+        let fresh = write("fresh.mp4", 400, 100);
+        let part = write("busy.mp4.part", 400, 400);
+
+        // 1600 bytes there, 900 allowed: the oldest two `.mp4`s go, and that is
+        // as far as it gets -- the part file is 400 of the remaining bytes and
+        // is not the sweep's to take.
+        let left = sweep(&dir, 900);
+        assert!(!old.exists(), "the oldest stand-in survived the sweep");
+        assert!(!middle.exists(), "the next oldest survived it");
+        assert!(fresh.exists(), "the freshest was taken");
+        assert!(part.exists(), "a half-written proxy was deleted under its writer");
+        assert_eq!(left, 800, "what is left is the fresh one and the part file");
+
+        // Under the cap, nothing is touched at all.
+        assert_eq!(sweep(&dir, 900), 800);
+        assert!(fresh.exists());
+    }
+
+    /// A song and a still are not films: they are answered `None` -- the same
+    /// answer a 1080p H.264 film gets -- rather than opened, failed on and
+    /// reported. The bug this pins said "NO PROXY for tone.wav" to a person who
+    /// had imported a song, and put "no proxy" on its library row.
+    ///
+    /// Real files, because the point is that nothing reads them: a demuxer
+    /// opened on a WAV is exactly what used to raise the refusal.
+    #[test]
+    fn a_song_and_a_still_are_never_stood_in_for() {
+        let dir = crate::scratch::Scratch::dir("proxy-not-a-film");
+        for name in ["tone.wav", "song.mp3", "track.mka", "still.png", "shot.jpg"] {
+            let file = dir.join(name);
+            std::fs::write(&file, b"not a film, and never read").expect("write");
+            let answer = generate_if_wanted(&file);
+            assert!(
+                matches!(answer, Ok(None)),
+                "{name} is not a film to stand in for: {:?}",
+                answer.err().map(|e| e.to_string())
+            );
+            assert_eq!(cached(&file), None, "{name} left nothing in the cache");
+        }
     }
 
     /// The staleness rule *is* the name: touch the source and the old proxy is
