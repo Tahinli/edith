@@ -147,11 +147,7 @@ fn an_inspector_section_occludes_no_timeline() {
     // Whichever file the root render has come to live in, from the impl to the
     // end of it -- found rather than named, so moving the root does not quietly
     // leave this rule reading a file the render is no longer in.
-    let render = source_files()
-        .iter()
-        .map(|path| std::fs::read_to_string(path).expect("a source file"))
-        .find_map(|text| text.find("impl Render for Player").map(|at| text[at..].to_string()))
-        .expect("the root render");
+    let render = source_from("impl Render for Player");
     for card in [
         "eq_card", "color_card", "speed_card", "silence_card", "mix_card",
     ] {
