@@ -111,6 +111,51 @@ impl Player {
             })
             .detach();
         }
+        // A stand-in for every film this machine cannot cut at speed, started
+        // the moment the file arrives and made while the editor keeps running
+        // ([`engine::proxy`]). Off the render thread for the reason the sync
+        // walk above is -- the decision reads the same header -- and the encode
+        // itself is the engine's own worker, so what comes back here is a
+        // handle to poll and not a wait.
+        for path in unseen_paths(session.sources(), &self.proxies) {
+            // Two at a time, and the rest at the next repaint: a stand-in is a
+            // whole film re-encoded, and a library of ten dropped at once would
+            // otherwise start ten encodes fighting over the one hardware seat.
+            // The unstarted ones simply stay out of the map, which is what
+            // brings them back here ([`unseen_paths`]).
+            if self.in_flight_proxies() >= PROXIES_AT_ONCE {
+                break;
+            }
+            self.proxies.insert(path.clone(), Proxy::Asked);
+            let started = cx.background_executor().spawn({
+                let path = path.clone();
+                async move { engine::proxy::generate_if_wanted(&path) }
+            });
+            cx.spawn(async move |this, cx| {
+                let started = started.await;
+                this.update(cx, |this, cx| {
+                    let state = match started {
+                        Ok(Some(job)) => Proxy::Making(job),
+                        // A film that needs none keeps the state it was
+                        // inserted with, which is what it is.
+                        Ok(None) => Proxy::Native,
+                        Err(e) => {
+                            let text = format!(
+                                "NO PROXY for {} — {e} — the film itself is what plays",
+                                file_name(&path)
+                            );
+                            eprintln!("{text}");
+                            this.notify_user(text.into());
+                            Proxy::Failed
+                        }
+                    };
+                    this.proxies.insert(path, state);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         for key in unseen_sources(session.sources(), &self.waves) {
             self.waves.insert(key.clone(), Wave::Loading);
             let decoded = cx.background_executor().spawn({

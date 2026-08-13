@@ -112,6 +112,16 @@ impl Player {
                     &timecode(f64::from(row.frames) / self.fps, self.fps),
                 ),
             };
+            // ...and what this file's stand-in is up to, after its length: a
+            // percentage while one is being made, the word while there is one,
+            // and nothing at all for a film that wants none ([`Proxy::detail`]).
+            let under = join_detail(
+                &under,
+                &self
+                    .proxies
+                    .get(&row.path)
+                    .map_or_else(String::new, Proxy::detail),
+            );
             let usable = row.unusable.is_none();
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);

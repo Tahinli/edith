@@ -178,18 +178,45 @@ impl Job {
 /// back through [`Job::outcome`], so a caller has two places to look and not
 /// twenty.
 pub fn generate(source: &Path) -> crate::Result<Job> {
+    Ok(started(source, |_| true)?.expect("nothing was filtered out"))
+}
+
+/// The same, for a file that is worth standing in for and nobody else
+/// ([`wanted`]) -- `Ok(None)` is a film this machine already cuts at speed.
+///
+/// The header is read *once* for both questions: on a Matroska that read is the
+/// cluster walk, so asking `wanted` and then `generate` separately would pay
+/// for it twice.
+pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
+    started(source, wanted)
+}
+
+/// Both doors: the cache is looked at, the header is read once, and `only_if`
+/// decides off that header whether there is anything to do.
+fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Option<Job>> {
     let out = path_for(source).ok_or("no cache directory to keep a proxy in")?;
     if out.is_file() {
-        return Ok(Job { out, handle: None });
+        return Ok(Some(Job { out, handle: None }));
     }
     // The source's own header: its rate and length are the proxy's (a stand-in
     // that ran at another rate or stopped early would put every cut on another
     // frame), and only its picture size changes.
     let (meta, _) = Demuxer::open(source)?;
+    if !only_if(&meta) {
+        return Ok(None);
+    }
     let (width, height) = size_for(&meta);
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // What a killed editor left behind: the export worker deletes its own part
+    // file when it is cancelled or fails, but nothing can delete it for a
+    // process that was killed -- and a proxy of a feature film is hundreds of
+    // megabytes of cache nothing would ever look at again. The key is the same,
+    // so this is that same film's own leftover and not somebody else's.
+    let mut part = out.clone().into_os_string();
+    part.push(".part");
+    let _ = std::fs::remove_file(PathBuf::from(part));
     // One video lane, one clip, the whole file -- and *no* audio lane, which is
     // what makes the proxy picture-only: the export walk codes the lanes it is
     // given and there is no sound among them.
@@ -232,10 +259,10 @@ pub fn generate(source: &Path) -> crate::Result<Job> {
             ..Default::default()
         },
     );
-    Ok(Job {
+    Ok(Some(Job {
         out,
         handle: Some(handle),
-    })
+    }))
 }
 
 #[cfg(test)]
