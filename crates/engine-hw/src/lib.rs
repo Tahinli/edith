@@ -6,7 +6,7 @@
 //! negative code: the caller's contract is "any failure means use the software
 //! codec".
 //!
-//! ponytail: that guarantee rests on `panic = "unwind"`. Building this crate with
+//! corner-cut: that guarantee rests on `panic = "unwind"`. Building this crate with
 //! `panic = "abort"` would turn a driver bug into a killed app; the upgrade path
 //! is running the decoder in a child process instead of in-process.
 
@@ -64,7 +64,7 @@ type Handle = <Dec<H264> as StatelessVideoDecoder>::Handle;
 /// A 10-bit stream decodes into a P010 pool and is read back down to the 8-bit
 /// I420 every frame here is ([`Session::emit`]).
 ///
-/// ponytail: 10-bit is *carried* 8-bit, because [`VhFrame`] is a byte-per-sample
+/// corner-cut: 10-bit is *carried* 8-bit, because [`VhFrame`] is a byte-per-sample
 /// interface all the way to the renderer. That costs the low two bits of a Main
 /// 10 source; the upgrade path is a 16-bit `VhFrame`, which is a change to every
 /// stage between here and the texture upload, not to this file.
@@ -729,7 +729,7 @@ fn align16(v: u32) -> u32 {
 /// write the header (Intel's, which is what cros-codecs was built against) fall
 /// straight through this.
 ///
-/// ponytail: the real fix is a `VAEncPackedHeaderH264_Slice` buffer in the
+/// corner-cut: the real fix is a `VAEncPackedHeaderH264_Slice` buffer in the
 /// vendored cros-codecs backend, which means synthesizing the entire slice
 /// header there rather than correcting two fields here.
 fn fix_slice_nal_headers(au: &mut [u8]) {
@@ -841,7 +841,7 @@ impl EncSession {
                 // value. The caller's bitrate therefore does not reach this
                 // seat -- it reaches `rav1e`, which is the other one.
                 //
-                // ponytail: bitrate-driven AV1 on the GPU needs `VA_RC_CBR`
+                // corner-cut: bitrate-driven AV1 on the GPU needs `VA_RC_CBR`
                 // wired through that backend, which is a change in the vendored
                 // crate rather than here.
                 let config = Av1Config {

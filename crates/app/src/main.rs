@@ -67,7 +67,7 @@ const LABEL_MIN_W: f32 = 36.;
 /// influence is an allocation bomb -- and 40 is already finer than the pixels a
 /// clip is ever given.
 ///
-/// ponytail: "finer than the pixels" stops being true once the timeline is
+/// corner-cut: "finer than the pixels" stops being true once the timeline is
 /// zoomed -- past ~25 ms per bucket the envelope reads as steps rather than as
 /// a shape. Ceiling: [`View::max_zoom`]'s 8 frames across the bed. The upgrade
 /// is a second, finer pass over the visible span only, cached like `waves` is.
@@ -385,7 +385,7 @@ struct Import {
     /// the landing: what the worker read is dropped instead of joining the
     /// timeline.
     ///
-    /// ponytail: the *read* is not stopped -- a demuxer walk polls nothing, so
+    /// corner-cut: the *read* is not stopped -- a demuxer walk polls nothing, so
     /// the worker finishes into a result nobody takes, and the window is given
     /// back at the click either way. Ceiling: a cancelled cold 24 GB import
     /// still costs the disk its twenty seconds. Upgrade: a flag
@@ -1653,7 +1653,7 @@ impl Player {
         // moves. Never on a frame a seek owed: that one is late by however long
         // its own reopen took, and answering it with another reopen is a loop.
         //
-        // ponytail: on a machine that cannot decode the file in real time at
+        // corner-cut: on a machine that cannot decode the file in real time at
         // all this settles into one restart per `RESYNC_GAP` -- in sync, and
         // stuttering, which is the honest picture of what that machine can do.
         // The upgrade path is dropping late frames *inside* the worker (skip
@@ -3845,7 +3845,7 @@ impl Player {
     /// there is no such clip to move. The engine has the last word on where it
     /// may actually go -- this is the ask, not the answer.
     ///
-    /// ponytail: the bed now runs past the last frame whenever the timeline is
+    /// corner-cut: the bed now runs past the last frame whenever the timeline is
     /// shorter than the view ([`Scale::time_at`] clamps at the head only), so a
     /// clip *can* be dragged out there. Zoomed in against the far end it cannot:
     /// the scroll clamp pins the bed's right edge to the duration, and the
@@ -4435,7 +4435,7 @@ impl Player {
         // The picture goes with it, or the empty window would keep showing the
         // last frame of a timeline that no longer exists.
         //
-        // ponytail: its atlas tile is not released -- `window.drop_image` wants
+        // corner-cut: its atlas tile is not released -- `window.drop_image` wants
         // a `&mut Window` this door has no other reason to take. One tile per
         // emptied library, against one per displayed frame in `pump`; the
         // upgrade path is threading the window through `act_on_row`.
@@ -5027,7 +5027,7 @@ impl Player {
                 // The drawn cue is keyed by that index ([`Player::sub_picture`])
                 // and the index now stands for another track.
                 //
-                // ponytail: its atlas tile is not released -- `close_session`'s
+                // corner-cut: its atlas tile is not released -- `close_session`'s
                 // note, for its reason and with its upgrade path.
                 self.sub_image = None;
                 format!(
@@ -6980,7 +6980,7 @@ fn subtitle_detail(track: &engine::subtitle::SubtitleTrack) -> String {
 /// pictures, then no cues), with the last asked of the timeline instead of the
 /// track.
 ///
-/// ponytail: that split reads the same public fields the list rows read
+/// corner-cut: that split reads the same public fields the list rows read
 /// (`refused`, [`engine::subtitle::SubtitleTrack::is_bitmap`]) rather than the
 /// engine's decision, so a *new* reason to drop a track would be counted here as
 /// embedded until this follows it -- the named line, which is the engine's
@@ -7850,7 +7850,7 @@ const MB_FLOOR: u64 = 10_000;
 /// an 18-file sweep of his library was 0.13 Mb/s -- kilobits for the sub-32x32
 /// encodes below that.
 ///
-/// ponytail: one unit for the whole line, so a file mixing a multi-megabit
+/// corner-cut: one unit for the whole line, so a file mixing a multi-megabit
 /// picture with a sub-10 kb/s sound track prints the picture as four or five
 /// digits of kilobits and loses the line's tail to `MENU_W`. No such file
 /// exists in his library, and both units at once ("0.01 Mb/s · 1.2 kb/s video ·
@@ -9760,7 +9760,7 @@ fn fft(re: &mut [f32], im: &mut [f32]) {
 /// Empty -- nothing to draw -- for a tap too short to transform, which is what
 /// a session has just after a seek.
 ///
-/// ponytail: one transform length for the whole axis, so the bass end is a bin
+/// corner-cut: one transform length for the whole axis, so the bass end is a bin
 /// (47 Hz at 48 kHz) wide however many columns are drawn across it -- a 60 Hz
 /// hum and an 80 Hz one are the same hump down there. Upgrade path is the
 /// analyser every mastering EQ uses: two or three transforms of different
@@ -9841,7 +9841,7 @@ fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
 /// either -- and it is what makes a boost sitting inside a cut visible at all,
 /// where the sum alone would draw a flat line and say nothing.
 ///
-/// ponytail: bands that overlap can sum past the ±`EQ_GAIN_LIMIT` axis and the
+/// corner-cut: bands that overlap can sum past the ±`EQ_GAIN_LIMIT` axis and the
 /// curve then rides the edge of the box; upgrade = a wider dB axis with the
 /// handles and [`Player::drag_band`] rescaled to it.
 fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {

@@ -998,7 +998,7 @@ impl Project {
     /// different file. [`PlaybackSession::remove_source`] hands back the index
     /// that went for exactly that.
     ///
-    /// ponytail: this retires the undo stack. `history` holds lanes alone, so a
+    /// corner-cut: this retires the undo stack. `history` holds lanes alone, so a
     /// snapshot older than the removal can name the very source being removed
     /// (delete a file's clips, then remove the file) and restoring it would
     /// point a clip at an entry that is gone. The upgrade path is snapshotting
@@ -1185,7 +1185,7 @@ impl Project {
     /// Sets it. `false` for the one already in force, which is what keeps a
     /// re-pick of the current rendition from costing a reseek.
     ///
-    /// ponytail: not an undo step, for the reason the limiter and the project
+    /// corner-cut: not an undo step, for the reason the limiter and the project
     /// resolution are not -- it is not in the lane list the history snapshots.
     /// Upgrade path is the same one: a history entry holding the project's own
     /// settings beside the lanes.
@@ -1237,7 +1237,7 @@ impl Project {
     /// [`crate::export::ExportSettings::subtitles`]) has to fix it up or drop
     /// it, or it names a different track afterwards.
     ///
-    /// ponytail: not an undo step, for the reason the limiter is not -- the
+    /// corner-cut: not an undo step, for the reason the limiter is not -- the
     /// history snapshots hold the lane list and subtitles are not on it
     /// ([`Project::subtitles`]). The inverse is putting the file's tracks back
     /// on -- [`crate::PlaybackSession::import_subtitles`], the panel's own
@@ -1273,7 +1273,7 @@ impl Project {
     /// Sets it, with the ceiling clamped to what [`Limiter`] allows. `false`
     /// for a setting already in force.
     ///
-    /// ponytail: not an undo step, for the reason the project resolution is not
+    /// corner-cut: not an undo step, for the reason the project resolution is not
     /// one ([`crate::PlaybackSession::set_resolution`]) -- it is not in the
     /// lane list the history snapshots. Upgrade path is a history entry that
     /// holds the mix settings beside the lanes.
@@ -1313,7 +1313,7 @@ impl Project {
                 }
                 Some(match self.eq.iter().position(|p| *p == params) {
                     Some(at) => at as u16,
-                    // ponytail: the table is append-only within a session (see
+                    // corner-cut: the table is append-only within a session (see
                     // the module docs) and `Clip::eq` is a u16, so the 65535th
                     // *distinct* setting of one session is refused rather than
                     // silently aliased. Upgrade path if a UI ever drags a slider
@@ -1374,7 +1374,7 @@ impl Project {
                 }
                 Some(match self.color.iter().position(|p| *p == params) {
                     Some(at) => at as u16,
-                    // ponytail: the 65535th *distinct* grade of one session is
+                    // corner-cut: the 65535th *distinct* grade of one session is
                     // refused rather than silently aliased, exactly as `set_eq`
                     // refuses the 65535th curve; same upgrade path.
                     None if self.color.len() >= usize::from(u16::MAX) => return false,
@@ -1526,7 +1526,7 @@ impl Project {
     /// below is the backstop for the one case that could: a slow clip so short
     /// that no source range fits its new room at all).
     ///
-    /// ponytail: not exact both ways. Each rate change re-rounds every boundary
+    /// corner-cut: not exact both ways. Each rate change re-rounds every boundary
     /// onto the new grid, so a rate picked, unpicked and picked again is within
     /// a frame of where it started rather than back at it. Upgrade path is
     /// keeping the edit list at one reference rate and conforming on the way
@@ -1654,7 +1654,7 @@ impl Project {
     /// from that frame on a different lane wins; that is what makes walking
     /// [`composite_spans_from`](Project::composite_spans_from) correct.
     ///
-    /// ponytail: alpha, opacity or any blend mode makes this untrue -- two
+    /// corner-cut: alpha, opacity or any blend mode makes this untrue -- two
     /// lanes would then be visible in one frame and the caller needs a decoder
     /// per lane plus a compositor. Upgrade path is a `Vec<Span>` per frame
     /// (this same walk, per lane) feeding N decoders.
@@ -4557,7 +4557,7 @@ mod tests {
         Project::from_parts(sources, lanes, eq, color).expect("from_parts");
     }
 
-    /// The two edges of a removal: it retires the undo stack (the ponytail on
+    /// The two edges of a removal: it retires the undo stack (the corner-cut on
     /// [`Project::remove_source`]), and the last entry goes like any other
     /// once nothing plays it -- a project may name no file at all.
     #[test]

@@ -209,7 +209,7 @@ pub fn probe_bitrate(path: &Path) -> MediaBitrate {
     // A standalone audio file's length is not a frame count; it is what the
     // audio header says, exactly as `PlaybackSession::import` reads it.
     //
-    // ponytail: `duration_secs` falls back to a decode for a stream whose
+    // corner-cut: `duration_secs` falls back to a decode for a stream whose
     // header states no length (a bare mp3 with no Xing header), which is the
     // one input here that is not header-only -- ~0.5 ms per source second, the
     // same cost import already pays for that file. Upgrade path is a
@@ -990,7 +990,7 @@ impl MkvDemuxer {
         // `DefaultDuration` reaches it, and such a file was walked whole just
         // above -- the span is the window's, and the window is the file.
         //
-        // ponytail: a genuinely variable-rate file is averaged to one rate here,
+        // corner-cut: a genuinely variable-rate file is averaged to one rate here,
         // because a timeline frame is a fixed slice of a second everywhere else
         // in this engine. Per-frame durations are the upgrade path, and they are
         // a project-wide change, not a demuxer one.
@@ -2413,7 +2413,7 @@ fn vp9_bit_depth(au: &[u8]) -> crate::Result<Option<u8>> {
 /// needs: H.264 and HEVC cap `max_num_reorder_frames` at 16, and what a muxer
 /// actually writes is two or three.
 ///
-/// ponytail: a stream that reorders further than this would have its blocks
+/// corner-cut: a stream that reorders further than this would have its blocks
 /// numbered a frame or two off. The upgrade path is the bitstream's own
 /// `max_num_reorder_frames` out of the SPS, which this demuxer does not parse;
 /// [`MkvDemuxer::cues_agree`] is what stands between that file and a wrong seek
@@ -2835,7 +2835,7 @@ impl IndexKey {
     /// entry instead of leaving the old one behind, which is what keeps the
     /// directory one file per track of every Matroska file ever opened.
     ///
-    /// ponytail: nothing evicts. That is bounded (a few MB for a feature film's
+    /// corner-cut: nothing evicts. That is bounded (a few MB for a feature film's
     /// picture track) and the directory is the user's own cache to delete, but a
     /// size-capped LRU sweep at open is the upgrade path if it ever matters.
     fn sidecar(&self) -> Option<PathBuf> {
@@ -3290,7 +3290,7 @@ fn fps_from_stts(entries: impl IntoIterator<Item = (u32, u32)>, timescale: u32) 
 /// (`test_high.mp4` loses two, and so did the film this bug came from). What is
 /// left over after the delay is the genuine trim.
 ///
-/// ponytail: empty edits are ignored and `media_time` is otherwise taken at face
+/// corner-cut: empty edits are ignored and `media_time` is otherwise taken at face
 /// value, which is exactly what [`crate::audio::edit_media_time`] gives the audio
 /// track -- symmetry between the two is the point, not a full edit-list engine.
 /// Their *empty* edits can differ (83 ms of video against 62 ms of audio in that

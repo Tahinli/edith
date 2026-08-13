@@ -932,7 +932,7 @@ pub(crate) struct ExportAudio {
 /// The copy is still the default and still bit-exact: a timeline nobody has
 /// touched leaves as the very packets its source holds.
 ///
-/// ponytail: this holds the whole exported AAC track in memory (~3 kB per
+/// corner-cut: this holds the whole exported AAC track in memory (~3 kB per
 /// 23 ms packet, so ~500 MB for an hour). Upgrade path is a streaming
 /// `copy_segments` that yields packets instead of collecting them.
 fn copy_audio(
@@ -1058,7 +1058,7 @@ fn copy_audio(
 /// being written as pictures that cannot decode. The region still starts at the
 /// timeline frame it owns, so the sound never drifts.
 ///
-/// ponytail: mp4 is not copied (its `hvc1` sample entry forbids in-band
+/// corner-cut: mp4 is not copied (its `hvc1` sample entry forbids in-band
 /// parameter sets, and the mp4 muxer here writes its sample table from a frame
 /// counter), and neither is H.264, which this project only writes into mp4. The
 /// upgrade path for both is a sample-table writer that takes explicit
@@ -1268,7 +1268,7 @@ impl CopyPlan {
 /// and [`crate::mux::Mp4Muxer`] writes none): the first packet is that delay, so
 /// the sound starts at timeline frame 0 as a copied track's does.
 ///
-/// ponytail: the mix sits in memory as f32 before it is encoded (~46 MB a
+/// corner-cut: the mix sits in memory as f32 before it is encoded (~46 MB a
 /// minute of 48 kHz stereo), for [`run_audio`]'s reason -- `rusty_aac` buffers
 /// the whole stream anyway, since it encodes its frames in parallel. Upgrade
 /// path is a chunked push once that encoder streams.
@@ -1427,7 +1427,7 @@ const OPUS_FRAME: usize = 960;
 /// it is written ([`opus_fidelity`]), because a cliff whose edge moves with the
 /// material is not something a constant can be safe against on its own.
 ///
-/// ponytail: the ceiling is this encoder's, not the format's. Upgrade path is a
+/// corner-cut: the ceiling is this encoder's, not the format's. Upgrade path is a
 /// released `opus-rs` that survives its own high rates -- the unit test pins the
 /// failure, so it fails the day the bug is fixed and this can be raised.
 pub(crate) const OPUS_MAX_KBPS: u32 = 128;
@@ -1503,7 +1503,7 @@ fn encode_opus(samples: &[f32], kbps: u32) -> crate::Result<Option<(Vec<crate::A
     // falls through to AAC, which is exactly where it stood before this seat
     // existed -- a worse codec is a fair trade for a track that is the sound.
     //
-    // ponytail: this costs one Opus decode of the whole track (a minute of
+    // corner-cut: this costs one Opus decode of the whole track (a minute of
     // sound in a few hundred milliseconds, against a video encode that is
     // minutes). Upgrade path is deleting it, the day this encoder can be
     // trusted at the rate it is asked for.
@@ -1542,7 +1542,7 @@ const FIDELITY_FLOOR: f64 = 1e-9;
 /// `pre_skip` frames dropped: 1.0 is the same waveform, and this codec's failure
 /// mode lands near 0.1. Streamed packet by packet -- the decode is never held,
 /// only three running sums -- because the mix behind it is already the biggest
-/// thing in an export ([`encode_audio`]'s ponytail).
+/// thing in an export ([`encode_audio`]'s corner-cut).
 ///
 /// A packet the decoder refuses is 0.0 and no argument: a track this project
 /// cannot read is exactly what this is here to catch.
@@ -2101,7 +2101,7 @@ fn run_audio(
         * f64::from(audio.sample_rate))
     .round() as u64;
     let total = frames as usize * channels;
-    // ponytail: the whole export sits in memory (4 bytes a sample, so ~23 MB
+    // corner-cut: the whole export sits in memory (4 bytes a sample, so ~23 MB
     // per minute of 48 kHz stereo). `flacenc::MemSource` wants it that way and
     // the mp4 path already collects its copied AAC track the same. Upgrade path
     // is hound's incremental writer plus flacenc's `Source` trait.
@@ -2166,7 +2166,7 @@ fn write_wav(out: &Path, samples: &[i32], audio: &AudioMeta) -> crate::Result<()
 /// (anything but 8-48 kHz) is refused there by name rather than written as
 /// something else.
 ///
-/// ponytail: CBR only -- the card offers rates and not a quality index. Upgrade
+/// corner-cut: CBR only -- the card offers rates and not a quality index. Upgrade
 /// path is `Mp3EncoderConfig::vbr_quality` behind a setting of its own.
 fn write_mp3(out: &Path, samples: &[i32], audio: &AudioMeta, kbps: u32) -> crate::Result<()> {
     let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
@@ -2254,7 +2254,7 @@ const VORBIS_HOP: usize = 1024;
 /// source is opened -- but it is refused by name rather than left to the
 /// library's own message.
 ///
-/// ponytail: one quality, [`VORBIS_QUALITY`], with no user control -- the Sound
+/// corner-cut: one quality, [`VORBIS_QUALITY`], with no user control -- the Sound
 /// row is refused for this format because the rates it offers are not rates
 /// Vorbis reaches. Upgrade path is a quality picker of its own, worth building
 /// the day the card has a control that speaks in quality rather than kbps.
@@ -2651,7 +2651,7 @@ enum Enc {
 /// 12 lanes against 0.55 fps on one, measured 2026-08-11), and an export whose
 /// frames came back shuffled would be no export at all.
 ///
-/// ponytail: a batch of padded planes sits in memory (~3 MB a frame at 1080p,
+/// corner-cut: a batch of padded planes sits in memory (~3 MB a frame at 1080p,
 /// so ~37 MB at 12 lanes) and the tail of a timeline is coded on fewer lanes
 /// than the middle. Upgrade path is a pipeline that keeps every lane fed from a
 /// decoder running ahead of the encoder rather than a batch barrier.
@@ -2746,7 +2746,7 @@ impl Enc {
     /// the plugin's AV1 seat is wired, kept and only entered when `VE_HW_AV1=1`
     /// asks for it by name.
     ///
-    /// ponytail: the upgrade path is a driver this was reproduced against (or a
+    /// corner-cut: the upgrade path is a driver this was reproduced against (or a
     /// cros-codecs release that fixes it) plus a probe encode of one frame at
     /// open, after which this can prefer hardware the way H.264 does.
     fn open_av1(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
@@ -2862,7 +2862,7 @@ impl Enc {
     /// a decoder may be started from -- which only the Matroska muxer asks, the
     /// mp4 one reading its own sync flag off the IDR slice.
     ///
-    /// ponytail: `rusty_h264` buffers a whole GOP and returns it in one buffer
+    /// corner-cut: `rusty_h264` buffers a whole GOP and returns it in one buffer
     /// when its lookahead is active, which would make this "one access unit"
     /// a lie and every sample duration with it. It is inactive here because
     /// lookahead needs a zero bitrate and this path is always CBR; a future

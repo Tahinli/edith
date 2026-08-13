@@ -3,7 +3,7 @@
 //! catches unwinds and reports failure as a null pointer or a negative code:
 //! the caller's contract is "any failure means the app runs muted".
 //!
-//! ponytail: that guarantee rests on `panic = "unwind"`. Building this crate with
+//! corner-cut: that guarantee rests on `panic = "unwind"`. Building this crate with
 //! `panic = "abort"` would turn a PipeWire bug into a killed app; the upgrade
 //! path is running the output in a child process instead of in-process.
 
@@ -35,7 +35,7 @@ const POLL: Duration = Duration::from_millis(10);
 /// that coarseness straight in the A/V sync. 1024 frames is ~23 ms, comfortably
 /// inside a video frame; measured granularity is then one graph quantum.
 ///
-/// ponytail: a graph running a quantum longer than this would consume more per
+/// corner-cut: a graph running a quantum longer than this would consume more per
 /// cycle than we deliver and starve. The fix is the crate's `v0_3_49` feature,
 /// whose `pw_buffer.requested` says exactly how many frames the graph wants --
 /// a Cargo.toml change, so not this slice.

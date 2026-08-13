@@ -107,7 +107,7 @@ fn peaks_over(
 /// more than the decode they would save, and never more than the machine has —
 /// nor more than a handful, since an import asks this of every source at once.
 ///
-/// ponytail: that last clause is a ceiling and not a bound — a library import of
+/// corner-cut: that last clause is a ceiling and not a bound — a library import of
 /// twenty films runs as many of these as the background executor has threads,
 /// each with eight of its own. The upgrade path is one pool the waveforms share,
 /// which is also where a "visible range first" order would live.

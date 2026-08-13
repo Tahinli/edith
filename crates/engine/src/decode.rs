@@ -657,7 +657,7 @@ impl Render {
             color,
             desc,
             canvas,
-            // ponytail: the ceiling is that the map reads limited-range codes
+            // corner-cut: the ceiling is that the map reads limited-range codes
             // (`tonemap`'s input contract), so a full-range PQ file -- which
             // no encoder writes and no camera produces -- is mapped as if it
             // were limited and comes out slightly crushed. The upgrade is a
@@ -768,7 +768,7 @@ impl Still {
     /// composes one picture per frame (topmost lane wins), so there is nothing
     /// for a blend to blend with.
     ///
-    /// ponytail: the ceiling is a logo with a transparent background, which
+    /// corner-cut: the ceiling is a logo with a transparent background, which
     /// lands as a rectangle. Upgrade path is keeping the alpha plane here and
     /// giving `scale::Composer` a blend over the lane below.
     pub(crate) fn open(path: &Path) -> crate::Result<Self> {
@@ -1074,7 +1074,7 @@ fn run(
     // what the file's edit list trims, i.e. *before* frame 0.
     let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
 
-    // ponytail: emits pictures in decode order. Fine for Baseline (no B-frames);
+    // corner-cut: emits pictures in decode order. Fine for Baseline (no B-frames);
     // reordering streams need POC-sorted output before display.
     loop {
         if cancel.load(Ordering::Relaxed) {

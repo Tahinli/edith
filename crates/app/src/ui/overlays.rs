@@ -318,7 +318,7 @@ impl Player {
                                 }),
                         )
                         .child(
-                            // ponytail: the column is as wide as the stroke it
+                            // corner-cut: the column is as wide as the stroke it
                             // prints, so a one-character chord gives this half a
                             // hit area under the 24px WCAG 2.5.8 floor -- tall
                             // enough, narrow. Upgrade: a min_w of HIT_MIN here.
