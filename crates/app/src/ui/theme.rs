@@ -7,30 +7,202 @@
 //! can be swapped whole without touching a single element.
 //!
 //! Which is what the two modules below are for. Both families carry the same
-//! role names, so the switch between them is one `use` and no call site knows
-//! it happened -- and a role missing from either is a compile error rather than
-//! a region that quietly kept the old colour.
+//! role names, so the switch between them is one field lookup and no call site
+//! knows it happened -- and a role missing from either is a compile error
+//! rather than a region that quietly kept the old colour.
 //!
 //! * `cool` (default) -- near-black ground, cool neutral chrome, one cyan accent.
-//! * `warm` (`--features warm`) -- a deep neutral warmed towards brown so no
-//!   surface reads as office grey, with one coral accent.
+//! * `warm` -- a deep neutral warmed towards brown so no surface reads as
+//!   office grey, with one coral accent.
 //!
 //! Both take the clip bodies from the cross-NLE kind convention (video blue,
 //! audio green, image teal, text purple) instead of four greys that differ by a
 //! hair, and both are held to the same measured floors: the contrast guards in
-//! `main.rs` run against whichever one is compiled.
+//! `main.rs` run against *every* palette in [`PaletteId::ALL`], so a third one
+//! lands gated rather than untested.
 //!
-//! ponytail: a compile switch, because every token is a `const` and a runtime
-//! palette means a lookup at every paint. Ceiling: the day the palette has to
-//! change without a restart, these two modules become two `struct Palette`
-//! values and the consts become fields on the one the window holds.
+//! Which family is in force is the user's, picked from the toolbar's Theme
+//! button or its stroke and kept in `~/.config/edith/theme` beside the
+//! keybindings -- it used to be a compile feature, which is a choice only
+//! whoever built the binary could make. A token is a call now
+//! ([`BG_PANEL()`]): one relaxed load and one field read off a `'static`
+//! table, which is what "the palette can be swapped whole" costs at paint time.
 
 use engine::project::LaneKind;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-#[cfg(not(feature = "warm"))]
-pub use cool::*;
-#[cfg(feature = "warm")]
-pub use warm::*;
+/// The whole table, once: every role, its type, and the two families' numbers
+/// read out of the modules below. One list, so a role added to [`Palette`]
+/// without a value in both families is a compile error and a role read at a
+/// paint cannot come from anywhere but the palette in force.
+macro_rules! palette {
+    ($($name:ident: $ty:ty),+ $(,)?) => {
+        /// One family's numbers, in a struct so the set can be swapped whole.
+        /// Field names are the role names the whole editor already paints by,
+        /// which is why they shout.
+        #[allow(non_snake_case)]
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        pub struct Palette { $(pub $name: $ty,)+ }
+
+        /// The families in [`PaletteId::ALL`]'s order, so the index the atomic
+        /// holds is the id itself.
+        static PALETTES: [Palette; 2] = [
+            Palette { $($name: cool::$name,)+ },
+            Palette { $($name: warm::$name,)+ },
+        ];
+
+        $(
+            #[allow(non_snake_case)]
+            #[inline]
+            pub fn $name() -> $ty { palette().$name }
+        )+
+    };
+}
+
+palette! {
+    BG_CANVAS: u32,
+    BG_PANEL: u32,
+    BG_RAISED: u32,
+    BG_TIMELINE: u32,
+    BG_HOVER: u32,
+    BG_HOVER_DIM: u32,
+    BG_SELECTED: u32,
+    SCRIM: u32,
+    SCRIM_LIGHT: u32,
+    STROKE_DIVIDER: u32,
+    STROKE_FOCUS: u32,
+    STROKE_SELECTED: u32,
+    FG_PRIMARY: u32,
+    FG_SECONDARY: u32,
+    FG_DISABLED: u32,
+    ACCENT_PRIMARY: u32,
+    ACCENT_HOVER: u32,
+    ACCENT_PLAYHEAD: u32,
+    ACCENT_WASH: u32,
+    CLIP_VIDEO: u32,
+    CLIP_AUDIO: u32,
+    CLIP_IMAGE: u32,
+    CLIP_TEXT: u32,
+    SOURCE_TINTS: [u32; 4],
+    STATUS_ERROR: u32,
+    STATUS_WARNING: u32,
+    STATUS_SUCCESS: u32,
+    STATUS_PROGRESS: u32,
+    DROP_REFUSE: u32,
+    SUB_FG: u32,
+    SUB_SHADE: u32,
+    EQ_GRID: u32,
+    EQ_SPECTRUM_INK: u32,
+    EQ_FILL_INK: u32,
+    EQ_BELL_INK: u32,
+    HIST_INK: [u32; 3],
+}
+
+/// Which family a person picked. An enum and not a bool: two today, and the
+/// door in the toolbar is a list rather than a toggle because the third one
+/// must cost a line here and nothing anywhere else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaletteId {
+    Cool,
+    Warm,
+}
+
+impl PaletteId {
+    /// Display order -- the picker lists them in it, and the index into
+    /// [`PALETTES`] *is* the position in it.
+    pub const ALL: [PaletteId; 2] = [PaletteId::Cool, PaletteId::Warm];
+
+    /// What the button and the picker row call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            PaletteId::Cool => "Cool",
+            PaletteId::Warm => "Warm",
+        }
+    }
+
+    /// The small print beside the row: what the family actually looks like, so
+    /// the choice is made before the click rather than after it.
+    pub fn detail(self) -> &'static str {
+        match self {
+            PaletteId::Cool => "near-black ground, cyan accent",
+            PaletteId::Warm => "warm ground, coral accent",
+        }
+    }
+
+    /// What the file calls it: one word, never the label, which is free to be
+    /// reworded ([`crate::keymap`]'s rule for the same reason).
+    pub fn name(self) -> &'static str {
+        match self {
+            PaletteId::Cool => "cool",
+            PaletteId::Warm => "warm",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    /// The numbers themselves, for anything that has to measure a family that
+    /// is not the one in force -- which is what the contrast guards do.
+    pub fn palette(self) -> &'static Palette {
+        &PALETTES[self as usize]
+    }
+}
+
+/// The family in force, as an index into [`PALETTES`]. An atomic because a
+/// token is read from whatever thread happens to be painting and the value is
+/// one `usize`; relaxed because nothing is published *with* it -- the next
+/// repaint reads it, and the swap asks for that repaint itself.
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The numbers every token function reads. One load, one bounds-checked index
+/// into a `'static` table: no allocation, no hashing, no lock.
+#[inline]
+pub fn palette() -> &'static Palette {
+    PALETTES.get(ACTIVE.load(Relaxed)).unwrap_or(&PALETTES[0])
+}
+
+/// Which family is in force -- what the button says and the picker marks.
+pub fn active() -> PaletteId {
+    PaletteId::ALL
+        .get(ACTIVE.load(Relaxed))
+        .copied()
+        .unwrap_or(PaletteId::Cool)
+}
+
+/// Puts `id` in force. Every paint after this reads the new numbers; asking for
+/// the repaint is the caller's, since only it holds the window.
+pub fn set(id: PaletteId) {
+    ACTIVE.store(id as usize, Relaxed);
+}
+
+/// Where the pick lives: one word in a file beside the keybindings, so a
+/// desktop that names an XDG directory is obeyed for both.
+pub fn config_path() -> PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("theme")
+}
+
+/// The pick from the last session, if there was one. Anything unreadable or
+/// unknown leaves the default in force: a theme file is not the user's work,
+/// so a bad one is worth no message at startup.
+pub fn load() {
+    if let Ok(text) = std::fs::read_to_string(config_path())
+        && let Some(id) = PaletteId::from_name(text.trim())
+    {
+        set(id);
+    }
+}
+
+/// Writes the pick. One word, written whole -- a torn write costs the theme and
+/// nothing else, and [`load`] falls back to the default on one.
+pub fn save(id: PaletteId) -> std::io::Result<()> {
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, format!("{}\n", id.name()))
+}
 
 /// Family B: near-black ground, cool neutral chrome, one cyan accent.
 pub mod cool {
@@ -195,11 +367,11 @@ pub const GHOST_ALPHA: u32 = 0x66;
 
 /// What a clip on `kind` is painted: the timeline's whole colour language in
 /// one call, so a lane added later cannot invent a shade of its own.
-pub const fn clip_kind(kind: LaneKind, image: bool) -> u32 {
+pub fn clip_kind(kind: LaneKind, image: bool) -> u32 {
     match kind {
-        LaneKind::Audio => CLIP_AUDIO,
-        LaneKind::Video if image => CLIP_IMAGE,
-        LaneKind::Video => CLIP_VIDEO,
+        LaneKind::Audio => CLIP_AUDIO(),
+        LaneKind::Video if image => CLIP_IMAGE(),
+        LaneKind::Video => CLIP_VIDEO(),
     }
 }
 
@@ -215,13 +387,13 @@ pub const fn clip_kind(kind: LaneKind, image: bool) -> u32 {
 pub fn notice_tone(message: &str) -> u32 {
     let has = |word: &str| message.contains(word);
     if has("FAILED") || has("ERROR") || has("REFUSED") || has("CANNOT") || has("COULD NOT") {
-        STATUS_ERROR
+        STATUS_ERROR()
     } else if message.starts_with(crate::EXPORT_DONE) || has("SAVED") || has("DONE") {
-        STATUS_SUCCESS
+        STATUS_SUCCESS()
     } else if has("NOTHING") || has("NO ") || has("EMPTY") {
-        STATUS_WARNING
+        STATUS_WARNING()
     } else {
-        ACCENT_PRIMARY
+        ACCENT_PRIMARY()
     }
 }
 
