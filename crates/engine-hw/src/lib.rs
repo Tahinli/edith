@@ -840,11 +840,19 @@ fn fix_slice_nal_headers(au: &mut [u8]) {
 
 /// One hardware H.264 encode session.
 ///
-/// Input goes through a single reusable NV12 buffer object: the caller's I420
-/// planes are interleaved into it and the encoder imports it as a VA surface.
-/// Reuse is safe because the encoder runs in blocking mode and every entry
-/// point polls it before returning, so the GPU is finished with the buffer
-/// before the next picture is written into it.
+/// Input goes through [`enc_depth`] reusable NV12 buffer objects: the caller's
+/// I420 planes are interleaved into the next one and the encoder imports it as a
+/// VA surface. Reuse is safe because a buffer is only written again once the
+/// access unit coded *from* it has been polled back -- the encoder runs in
+/// blocking mode and a coded unit in hand means the GPU has finished reading its
+/// input -- and [`EncSession::encode`] holds exactly that many pictures in
+/// flight, no more.
+///
+/// **Why more than one.** With a single buffer the picture had to be coded
+/// before the next one could be written into it, so a frame cost the CPU's
+/// interleave *plus* the GPU's encode end to end (6.7 ms + 2.5 ms at 1080p on
+/// radeonsi, measured 2026-08-13). With two, the interleave of the next picture
+/// runs while the GPU codes this one and the frame costs the longer of them.
 struct EncSession {
     /// Boxed because the three codecs are three types and everything past
     /// `encode` is the same trait: one session type serves them all, which is
@@ -855,9 +863,18 @@ struct EncSession {
     /// differs: the H.264 driver leaves a *NAL* header byte at zero, and
     /// neither an HEVC access unit nor an AV1 temporal unit has that one.
     codec: EncCodec,
-    /// Owns the DRM node the buffer object below was allocated from.
+    /// Owns the DRM node the buffer objects below were allocated from.
     _gbm: gbm::Device<std::fs::File>,
-    frame: GenericDmaVideoFrame,
+    /// [`enc_depth`] input buffers, used round-robin.
+    frames: Vec<GenericDmaVideoFrame>,
+    /// How many of them there are, which is how many pictures may be in the
+    /// encoder at once.
+    depth: usize,
+    /// Which of them the next picture is written into.
+    slot: usize,
+    /// Pictures submitted whose access unit has not been polled back yet, which
+    /// is what says whether the buffer about to be written is free.
+    in_flight: usize,
     layout: FrameLayout,
     /// Macroblock-aligned surface size; `width`/`height` are what is encoded.
     coded: Resolution,
@@ -870,6 +887,34 @@ struct EncSession {
     ready: VecDeque<Vec<u8>>,
     /// The access unit currently handed out, kept alive until the next call.
     out: Vec<u8>,
+    /// One padded output row, staged in ordinary memory and copied across whole
+    /// -- [`EncSession::upload`] says why.
+    row: Vec<u8>,
+}
+
+/// How many pictures may be in the encoder at once. Two is what it takes to
+/// overlap the CPU's interleave with the GPU's encode; more would buy nothing,
+/// since the interleave is the longer of the two and a third buffer would only
+/// hold a picture waiting for a lane that is never idle.
+const ENC_DEPTH: usize = 2;
+
+/// How many pictures *this* seat may hold, which is [`ENC_DEPTH`] for H.264 and
+/// one for the other two.
+///
+/// Depth 2 means a submitted picture must hand its access unit back on the next
+/// poll, and [`EncSession::encode`] treats a seat that does not as an error --
+/// it cannot write into a buffer the GPU may still be reading. That contract
+/// was measured on the H.264 seat and only there. HEVC and AV1 on this plugin
+/// are intra-only and go through the same driver, so they very probably behave
+/// the same way; "very probably" is not what a hard error should rest on, and
+/// the GPU has been unavailable since the measurement was possible. They keep
+/// the old one-buffer behaviour -- the picture coded before the next is
+/// written, exactly as every seat did before -- until someone measures them.
+fn enc_depth(codec: EncCodec) -> usize {
+    match codec {
+        EncCodec::H264 => ENC_DEPTH,
+        EncCodec::Hevc | EncCodec::Av1 => 1,
+    }
 }
 
 /// Which codec an [`EncSession`] was opened for. Decided once, at the open, the
@@ -1049,13 +1094,20 @@ impl EncSession {
         };
         // Allocated at the aligned size, so the buffer's pitch is never smaller
         // than a padded row.
-        let frame = alloc_nv12(&gbm, coded, false).ok()?;
-        let layout = nv12_layout(coded, frame.get_plane_pitch()[0], false);
+        let depth = enc_depth(codec);
+        let frames: Vec<_> = (0..depth)
+            .map(|_| alloc_nv12(&gbm, coded, false))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let layout = nv12_layout(coded, frames[0].get_plane_pitch()[0], false);
         Some(Self {
             encoder,
             codec,
             _gbm: gbm,
-            frame,
+            frames,
+            depth,
+            slot: 0,
+            in_flight: 0,
             layout,
             coded,
             width: width as usize,
@@ -1064,21 +1116,38 @@ impl EncSession {
             drained: false,
             ready: VecDeque::new(),
             out: Vec::new(),
+            row: Vec::new(),
         })
     }
 
-    /// Interleaves one packed I420 picture into the NV12 input buffer.
+    /// Interleaves one packed I420 picture into the NV12 input buffer `slot`.
+    ///
+    /// **Row at a time, through ordinary memory.** The mapping below is the
+    /// GPU's own buffer, which is write-combining: a store of a byte or two
+    /// costs a partial-buffer flush, while one `memcpy` of a whole row costs a
+    /// burst. Interleaving the chroma directly into it was 8.2 ms a picture at
+    /// 1080p against 6.7 ms staged (measured 2026-08-13 on radeonsi, alternating
+    /// the two paths frame by frame inside one export so the machine's load
+    /// weighed on both), and the picture is four fifths of what a hardware
+    /// export spends per frame. The padding is written the same way and for the
+    /// same reason: it used to be a four-byte second store per row.
     ///
     /// # Safety
     /// `src`'s planes must cover `height` (resp. `height / 2`) rows of their
     /// declared stride.
-    unsafe fn upload(&mut self, src: &VhFrame) -> Result<(), String> {
+    unsafe fn upload(&mut self, src: &VhFrame, slot: usize) -> Result<(), String> {
         let (w, h) = (self.width, self.height);
         let (cw, ch) = (w / 2, h / 2);
         let (aw, ah) = (self.coded.width as usize, self.coded.height as usize);
-        let pitch = self.frame.get_plane_pitch();
-        let mapping = self.frame.map_mut()?;
+        // Two fields at once: the buffer is mapped for writing while the staging
+        // row is written into, and they are not the same field.
+        let Self { frames, row, .. } = self;
+        let frame = &mut frames[slot];
+        let pitch = frame.get_plane_pitch();
+        let mapping = frame.map_mut()?;
         let planes = mapping.get();
+        row.resize(aw, 0);
+        let row_buf = &mut row[..];
         {
             let mut dst = planes[0].borrow_mut();
             for row in 0..ah {
@@ -1086,11 +1155,11 @@ impl EncSession {
                 let s = unsafe {
                     std::slice::from_raw_parts(src.y.add(row.min(h - 1) * src.y_stride), w)
                 };
-                let dst = &mut dst[row * pitch[0]..row * pitch[0] + aw];
-                dst[..w].copy_from_slice(s);
+                row_buf[..w].copy_from_slice(s);
                 // Macroblock padding: replicate the edge rather than leave the
                 // buffer's garbage there, which would cost bitrate for nothing.
-                dst[w..].fill(s[w - 1]);
+                row_buf[w..].fill(s[w - 1]);
+                dst[row * pitch[0]..row * pitch[0] + aw].copy_from_slice(row_buf);
             }
         }
         let mut dst = planes[1].borrow_mut();
@@ -1103,14 +1172,14 @@ impl EncSession {
                     std::slice::from_raw_parts(src.v.add(src_row * src.v_stride), cw),
                 )
             };
-            let dst = &mut dst[row * pitch[1]..row * pitch[1] + aw];
             for x in 0..cw {
-                dst[2 * x] = u[x];
-                dst[2 * x + 1] = v[x];
+                row_buf[2 * x] = u[x];
+                row_buf[2 * x + 1] = v[x];
             }
             for x in w..aw {
-                dst[x] = dst[x - 2];
+                row_buf[x] = row_buf[x - 2];
             }
+            dst[row * pitch[1]..row * pitch[1] + aw].copy_from_slice(row_buf);
         }
         Ok(())
     }
@@ -1118,8 +1187,15 @@ impl EncSession {
     /// # Safety
     /// As [`EncSession::upload`].
     unsafe fn encode(&mut self, src: &VhFrame, force_keyframe: bool) -> Result<(), String> {
+        // The buffer this picture is written into is the one whose own access
+        // unit is already in hand -- `in_flight` is held below `depth` at the
+        // end of every call, so the round-robin never catches the GPU up. At
+        // depth 1 that is the picture just coded, which is the one-buffer
+        // behaviour every seat had before ([`enc_depth`]).
+        let slot = self.slot;
         // SAFETY: caller contract, forwarded.
-        unsafe { self.upload(src)? };
+        unsafe { self.upload(src, slot)? };
+        self.slot = (self.slot + 1) % self.depth;
         let meta = FrameMetadata {
             timestamp: self.timestamp,
             layout: self.layout.clone(),
@@ -1127,21 +1203,42 @@ impl EncSession {
         };
         self.timestamp += 1;
         self.encoder
-            .encode(meta, self.frame.clone())
+            .encode(meta, self.frames[slot].clone())
             .map_err(|e| e.to_string())?;
-        self.collect()
+        self.in_flight += 1;
+        // ...and the picture before it is collected here rather than this one:
+        // that is the whole overlap, the GPU coding what was just submitted
+        // while the caller decodes and interleaves the next picture.
+        while self.in_flight >= self.depth {
+            if !self.pull()? {
+                // Blocking mode: a picture accepted and no coded unit for the
+                // one before it means the encoder is not answering, and the
+                // next upload would overwrite a buffer the GPU still reads.
+                return Err("the encoder took a picture and returned nothing coded".into());
+            }
+        }
+        Ok(())
     }
 
     /// Moves every access unit the encoder has finished into `ready`.
     fn collect(&mut self) -> Result<(), String> {
-        while let Some(coded) = self.encoder.poll().map_err(|e| e.to_string())? {
-            let mut au = coded.bitstream;
-            if self.codec == EncCodec::H264 {
-                fix_slice_nal_headers(&mut au);
-            }
-            self.ready.push_back(au);
-        }
+        while self.pull()? {}
         Ok(())
+    }
+
+    /// One finished access unit into `ready`; `false` where the encoder has
+    /// none to give.
+    fn pull(&mut self) -> Result<bool, String> {
+        let Some(coded) = self.encoder.poll().map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        let mut au = coded.bitstream;
+        if self.codec == EncCodec::H264 {
+            fix_slice_nal_headers(&mut au);
+        }
+        self.ready.push_back(au);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        Ok(true)
     }
 
     /// Hands the oldest finished access unit to the caller, or reports that

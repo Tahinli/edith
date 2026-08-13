@@ -303,6 +303,17 @@ pub struct ExportSettings {
 }
 
 struct Shared {
+    /// Fraction of the job done, in [`PROGRESS_SCALE`]ths.
+    ///
+    /// **Every stage that can run beside another writes this with `fetch_max`,
+    /// never `store`.** The sound and the picture are two threads publishing
+    /// two bands of one bar ([`AUDIO_BAND`]): a `store` from the lower band
+    /// pulls the bar backwards every time the other thread has already moved
+    /// it on, which is what a person sees as a progress bar that stutters
+    /// backwards -- 5,458 backward steps over one film export before this rule
+    /// was written down. A `store` is only correct where nothing else can be
+    /// publishing at all, which now means the terminal [`PROGRESS_SCALE`] and
+    /// the audio-only export ([`run_audio`]) that has no second thread.
     progress: AtomicU32,
     cancel: AtomicBool,
     finished: AtomicBool,
@@ -1325,10 +1336,21 @@ fn encode_audio(
         * channels;
     let mut samples: Vec<f32> = Vec::with_capacity(total);
     for chunk in chunks {
+        // The only place a cancelled export can be answered before the whole
+        // timeline has been mixed. This pass runs on a thread of its own now
+        // ([`run`]), so without this a cancel left it mixing a feature film
+        // for minutes behind a job nobody is waiting for any more, writing
+        // into a `Shared` whose outcome was already settled.
+        cancelled(shared)?;
         samples.extend(chunk.samples);
         // The bar's first third of [`AUDIO_BAND`]: the mix is the longest of
         // the three stages and the only one that can be counted as it goes.
-        shared.progress.store(
+        //
+        // `fetch_max` and not `store`, for the reason [`Shared::progress`]
+        // states: this runs on the audio thread while the picture publishes
+        // numbers above [`AUDIO_BAND`] from the other, and a `store` of this
+        // small one pulled the bar backwards 5,458 times over one film export.
+        shared.progress.fetch_max(
             (samples.len().min(total) * (AUDIO_BAND / 3) as usize / total.max(1)) as u32,
             Ordering::Relaxed,
         );
@@ -1351,6 +1373,10 @@ fn encode_audio(
     // there is no resampler on this path, and inventing one to reach 48 kHz
     // would resample a whole timeline to satisfy a codec, which is a bigger
     // change to the sound than the codec is.
+    // ...and again before either encoder is entered: both of them run to the
+    // end of the mix without a checkpoint of their own, so this is the last
+    // moment a cancel costs seconds rather than the whole encode.
+    cancelled(shared)?;
     if mkv
         && audio.sample_rate == OPUS_RATE
         && channels == 2
@@ -1380,6 +1406,7 @@ fn encode_audio(
     // `next_packet` after `finish` yields packets until `Eof` and nothing else,
     // so the loop ends on the only error it can see.
     while let Ok(packet) = encoder.next_packet() {
+        cancelled(shared)?;
         packets.push(crate::AacPacket {
             bytes: packet.data,
             samples: packet.duration,
@@ -1657,11 +1684,54 @@ fn window_fidelity(
     (da / counted.max(1) as f64 > FIDELITY_FLOOR).then(|| num / (da.sqrt() * db.sqrt()).max(1e-12))
 }
 
+/// The audio pass, running beside the picture: what [`run`] holds while it
+/// encodes and joins where the file it is writing needs the track.
+type AudioJob = thread::JoinHandle<crate::Result<Option<ExportAudio>>>;
+
+/// The pass's answer, or the failure that is the export's failure. A panicked
+/// audio thread reads as an error rather than as silence: an export that wrote
+/// its picture and quietly no sound is the one outcome this must not have.
+fn join_audio(job: AudioJob) -> crate::Result<Option<ExportAudio>> {
+    job.join()
+        .map_err(|_| crate::Error::from("the audio pass stopped without a picture or a reason"))?
+}
+
+/// The encoder line a running export shows: the seat the picture is really
+/// being written by, and what the sound is -- or that the sound is still being
+/// worked out, which an overlapped audio pass is until it is collected.
+fn publish_seats(
+    shared: &Shared,
+    seat: &str,
+    project: &Project,
+    settings: &ExportSettings,
+    sound: Option<bool>,
+    opus: bool,
+    waiting: bool,
+) {
+    let audio = match waiting {
+        // Still mixing on the other thread. The same half-line the copied-
+        // picture path has always shown, and for the same reason: what is
+        // published is never a codec that did not run.
+        true => "working out the sound…",
+        false => measured_audio_label(project, settings.format, sound, opus),
+    };
+    *shared.encoders.lock().unwrap() = Some(format!("{seat} · {audio}"));
+}
+
+fn params_of(track: &ExportAudio) -> AudioParams {
+    AudioParams {
+        freq_index: track.params.freq_index,
+        chan_conf: track.params.chan_conf,
+        sample_rate: track.params.sample_rate,
+        opus_pre_skip: track.opus_pre_skip,
+    }
+}
+
 fn run(
     project: &Project,
     meta: &VideoMeta,
     out: &Path,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     settings: &ExportSettings,
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
@@ -1678,43 +1748,80 @@ fn run(
         eprintln!("export video: copy (source packets)");
         *shared.encoders.lock().unwrap() = Some("copy · working out the sound…".into());
     }
-    // ...then the audio: a track has to be declared when the muxer is created,
-    // which happens as soon as the first coded picture arrives -- and the
-    // Matroska muxer wants the packets themselves that early too, because it
-    // interleaves them into the clusters as it writes. Every video format gets
-    // the same track: none of them is picture-only any more.
-    let audio = copy_audio(
-        project,
-        meta,
-        audio_kbps_of(settings),
-        settings.format.is_mkv(),
-        shared,
-    )?;
-    let audio_params = audio.as_ref().map(|track| AudioParams {
-        freq_index: track.params.freq_index,
-        chan_conf: track.params.chan_conf,
-        sample_rate: track.params.sample_rate,
-        opus_pre_skip: track.opus_pre_skip,
-    });
+    // ...then the audio, on a thread of its own, started before anything is
+    // opened for the picture.
+    //
+    // Where it is *waited* for is the whole of this: a Matroska file interleaves
+    // its audio into the clusters from the header on, so that path needs every
+    // packet before the first coded picture and there is nothing to overlap. An
+    // mp4 writes its audio track after the whole picture -- and now declares it
+    // there too ([`MkvMuxer`]'s opposite, `Mp4Muxer::add_audio_track`) -- so the
+    // picture's loop needs nothing at all from this until it has finished, and
+    // the mix, its encode and the encode of every frame run at once. An export
+    // used to cost the sound *plus* the picture; an mp4 one now costs the longer
+    // of the two. On this project's own film that is 168 s of AC-3 that no
+    // longer stands in front of 733 s of hardware H.264.
+    let audio_job = {
+        let (project, meta, settings, shared) = (
+            project.clone(),
+            *meta,
+            settings.clone(),
+            Arc::clone(shared),
+        );
+        thread::Builder::new()
+            .name("export-audio".into())
+            .spawn(move || {
+                copy_audio(
+                    &project,
+                    &meta,
+                    audio_kbps_of(&settings),
+                    settings.format.is_mkv(),
+                    &shared,
+                )
+            })?
+    };
+    // A Matroska file (and a copied one, whose muxer is the same) collects it
+    // here; an mp4 leaves it running and collects it under the picture below.
+    let mut audio_job = Some(audio_job);
+    // The condition is the *format*, and the copied-picture path below relies
+    // on that covering it too: `plan` hands its packets straight to a Matroska
+    // muxer, so it may only exist where this has already collected them --
+    // which holds because [`CopyPlan::of`] returns `None` for every format
+    // that is not `Hevc` or `Av1`, both of which are `is_mkv`. Said out loud
+    // because a copy plan for an mp4 would otherwise reach `plan.run` with the
+    // sound still being mixed on the other thread.
+    debug_assert!(
+        settings.format.is_mkv() || plan.is_none(),
+        "a copy plan outside Matroska would run before its sound is collected"
+    );
+    let audio = match settings.format.is_mkv() {
+        true => join_audio(audio_job.take().expect("the job was just made"))?,
+        false => None,
+    };
+    let audio_params = audio.as_ref().map(params_of);
     // What the track *is*, kept before the packets are handed to a muxer: the
     // encoder line names a copy or an encode and only `copy_audio` knows which.
-    let sound = audio.as_ref().map(|track| track.copied);
+    // `None` on the mp4 path until the pass is collected -- the line says it is
+    // still working the sound out, which is what it is doing.
+    let mut sound = audio.as_ref().map(|track| track.copied);
     // ...and *which* encoder, for the same line: the card predicts Opus from the
     // format alone and cannot know the mix's rate or width ([`audio_label`]),
     // while this is after the mix was opened, so it is the measured answer.
-    let opus = audio
+    let mut opus = audio
         .as_ref()
         .is_some_and(|track| track.opus_pre_skip.is_some());
     // Taken by the Matroska muxer at creation; the mp4 one writes its track
-    // after the picture, so for that path this is still `Some` at the end.
+    // after the picture, so for that path this is filled in at the end.
     let mut packets = audio.map(|track| track.packets);
     // ...and the cues with them, for the same reason: the subtitle track is
     // declared in the header and its blocks are interleaved into the clusters,
     // so the muxer needs the lot before the first picture is written.
     let mut subs = export_subtitles(project, meta, settings);
-    // The sound is done, whichever way it went: the bar stands at the head of
-    // the picture's own share ([`AUDIO_BAND`]).
-    shared.progress.store(AUDIO_BAND, Ordering::Relaxed);
+    // Whatever the sound has reached, the picture's share starts here
+    // ([`AUDIO_BAND`]) -- and the bar only ever moves forwards, which is what
+    // `fetch_max` below keeps true while an audio pass is still publishing its
+    // own third of that band from the other thread.
+    shared.progress.fetch_max(AUDIO_BAND, Ordering::Relaxed);
 
     // Before an encoder is opened at all: a timeline nobody has touched, whose
     // sources this file can hold as they are, is written by copying their coded
@@ -1781,12 +1888,17 @@ fn run(
     // Published *after* the seat is open, so a hardware encoder the driver
     // refused reads as the software one that took over rather than as the hope
     // it replaced -- and the sound says whether it was copied or encoded, which
-    // `copy_audio` decided a few lines up.
-    *shared.encoders.lock().unwrap() = Some(format!(
-        "{} · {}",
-        encoder.label(),
-        measured_audio_label(project, settings.format, sound, opus)
-    ));
+    // only `copy_audio` knows and, on the overlapped path, does not know yet.
+    let seat = encoder.label();
+    publish_seats(shared, seat, project, settings, sound, opus, audio_job.is_some());
+    // When the picture started, so the stage line below can say where under it
+    // the sound landed -- the one number that says whether the two passes
+    // really overlapped, in the same voice as `encode_audio`'s own timers.
+    let picture_started = std::time::Instant::now();
+    // The sound, once the pass beside this one has finished with it: an mp4
+    // declares its audio track and writes its packets after the picture, so
+    // this is where they arrive.
+    let mut late: Option<ExportAudio> = None;
     let mut muxer = None;
     let mut done = 0u32;
     let black = Black::new(meta);
@@ -1873,6 +1985,27 @@ fn run(
             |offset: u32| rate.source_at(in_frame + span.speed.source_at(offset)) - opened_at;
         while done_here < span.len {
             cancelled(shared)?;
+            // The sound's failure is the export's, and it is heard the moment
+            // it happens rather than after the last frame: a mix this engine
+            // cannot decode used to refuse in seconds, before any picture was
+            // encoded, and an overlapped pass that reported only at the end
+            // would spend the whole encode first. Also where its measured
+            // codec reaches the line on screen.
+            if audio_job
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
+            {
+                late = join_audio(audio_job.take().expect("just seen to be there"))?;
+                sound = late.as_ref().map(|track| track.copied);
+                opus = late
+                    .as_ref()
+                    .is_some_and(|track| track.opus_pre_skip.is_some());
+                publish_seats(shared, seat, project, settings, sound, opus, false);
+                eprintln!(
+                    "export audio: done {:.1} s into the picture",
+                    picture_started.elapsed().as_secs_f64()
+                );
+            }
             let want = source_at(done_here);
             // How many timeline frames from here show that same picture: one at
             // real time, more when the clip is slowed or its file is slower
@@ -1952,9 +2085,13 @@ fn run(
                     )?;
                 }
                 done += 1;
+                // Forwards only: an audio pass still running beside this one
+                // publishes its own share of [`AUDIO_BAND`], and a bar that
+                // went backwards every time it did would be worse than one
+                // that stood still.
                 shared
                     .progress
-                    .store(picture_progress(done, total), Ordering::Relaxed);
+                    .fetch_max(picture_progress(done, total), Ordering::Relaxed);
             }
             done_here += repeats;
         }
@@ -1985,7 +2122,28 @@ fn run(
     // turned out to be.
     let muxer = match muxer {
         Muxer::Mp4(mut mp4) => {
-            for packet in packets.into_iter().flatten() {
+            // The sound, collected where this file first needs it: it has been
+            // mixing and encoding under the whole picture, and an mp4 declares
+            // its audio track here rather than at the open precisely so that
+            // could happen ([`Mp4Muxer::add_audio_track`]).
+            let track = match audio_job.take() {
+                Some(job) => {
+                    let track = join_audio(job)?;
+                    // The picture finished first and this waited for the
+                    // sound: the pair of stage lines is what says which of the
+                    // two an export is really bounded by.
+                    eprintln!(
+                        "export audio: waited for after {:.1} s of picture",
+                        picture_started.elapsed().as_secs_f64()
+                    );
+                    track
+                }
+                None => late,
+            };
+            if let Some(track) = &track {
+                mp4.add_audio_track(&params_of(track))?;
+            }
+            for packet in track.into_iter().flat_map(|track| track.packets) {
                 mp4.write_audio_packet(&packet.bytes)?;
             }
             mp4.write_subtitles(&subs)?;
