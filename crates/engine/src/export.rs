@@ -402,6 +402,15 @@ pub fn start(
     part.push(".part");
     let part = PathBuf::from(part);
     let spawned = thread::Builder::new().name("export".into()).spawn(move || {
+        // Every file this export will read, named before a byte of one is.
+        // These are the project's own sources and can be nothing else: a
+        // stand-in ([`crate::proxy`]) is a substitution playback makes when it
+        // opens a span, and nothing here knows such a thing exists. Printed so
+        // that "the delivery came off the film itself" is a grep rather than a
+        // belief.
+        for source in project.sources() {
+            eprintln!("export source: {}", source.path.display());
+        }
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
