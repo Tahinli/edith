@@ -20,6 +20,7 @@ struct Plugin {
     set_active: unsafe extern "C" fn(*mut c_void, u32) -> i32,
     set_volume: unsafe extern "C" fn(*mut c_void, f32) -> i32,
     flush: unsafe extern "C" fn(*mut c_void) -> i32,
+    underruns: unsafe extern "C" fn(*mut c_void, *mut i64) -> i64,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
@@ -63,6 +64,11 @@ fn load() -> Option<Plugin> {
                     // with no sound at all, which at least says so.
                     set_volume: *lib.get(b"ao_set_volume\0").ok()?,
                     flush: *lib.get(b"ao_flush\0").ok()?,
+                    // Required on the same terms as the two above: the plugin
+                    // ships from this build, and a measurement that silently
+                    // reads zero underruns is worse than a run that says the
+                    // plugin is the wrong one.
+                    underruns: *lib.get(b"ao_underruns\0").ok()?,
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
                 })
@@ -142,6 +148,17 @@ impl AoSession {
     pub fn flush(&self) -> bool {
         // SAFETY: `handle` came from `ao_open` and is still open.
         unsafe { (self.plugin.flush)(self.handle) == 0 }
+    }
+
+    /// Starved callbacks so far, and the device position (samples per channel)
+    /// the last of them was seen at -- `None` for a stream that has never run
+    /// dry. Two atomic loads inside the plugin, so it is cheap enough to poll
+    /// and it never touches the RT thread's path.
+    pub fn underruns(&self) -> (u64, Option<i64>) {
+        let mut last = -1i64;
+        // SAFETY: `handle` came from `ao_open`, and `last` is a live i64 of ours.
+        let count = unsafe { (self.plugin.underruns)(self.handle, &raw mut last) };
+        (count.max(0) as u64, (last >= 0).then_some(last))
     }
 }
 
