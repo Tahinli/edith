@@ -195,13 +195,9 @@ fn chirp_second(meta: &engine::audio::AudioMeta, samples: impl Iterator<Item = f
 /// library cannot be made by a machine that does not have it.
 #[test]
 fn a_seek_into_his_film_lands_on_the_second_it_asked_for() {
-    let film = PathBuf::from(
-        "/path/to/a-real-av1-opus-5.1-film.mkv",
-    );
-    if !film.exists() {
-        eprintln!("skipped: {} is not on this machine", film.display());
+    let Some(film) = engine::real_library::film("av1_opus_51") else {
         return;
-    }
+    };
     if std::process::Command::new("ffmpeg")
         .arg("-version")
         .stdout(std::process::Stdio::null())

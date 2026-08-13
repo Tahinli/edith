@@ -348,13 +348,9 @@ fn seven_one_opus_folds_to_the_stereo_the_timeline_carries() {
 /// test that cannot make it must say nothing rather than something false.
 #[test]
 fn his_seven_one_remux_imports_and_plays() {
-    let film = PathBuf::from(
-        "/path/to/a-real-av1-opus-7.1-film.mkv",
-    );
-    if !film.exists() {
-        eprintln!("skipped: {} is not on this machine", film.display());
+    let Some(film) = engine::real_library::film("av1_opus_71") else {
         return;
-    }
+    };
     // The import gate itself: this is the call whose `Err` the app printed.
     let probe = AudioSession::probe(&film, 0)
         .expect("the 7.1 track no longer refuses the import")
