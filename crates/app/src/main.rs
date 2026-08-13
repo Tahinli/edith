@@ -15255,6 +15255,15 @@ mod tests {
         // -- the one every session has -- wore the panel's own background and
         // had no visible swatch at all.
         assert_ne!(source_tint(0), BG_RAISED());
+        // ...in every family, since the swatch is drawn on whichever panel is
+        // in force (`ui::theme`) and a tint that vanished into one of them is a
+        // file with no colour at all.
+        for id in crate::ui::theme::PaletteId::ALL {
+            let p = id.palette();
+            for (i, &tint) in p.SOURCE_TINTS.iter().enumerate() {
+                assert_ne!(tint, p.BG_RAISED, "{id:?} tint {i} is the panel");
+            }
+        }
         // Neighbouring sources must not share one, or an import is invisible.
         assert_ne!(source_tint(0), source_tint(1));
         assert_ne!(source_tint(1), source_tint(2));
@@ -15281,23 +15290,30 @@ mod tests {
                 })
                 .sum::<u32>()
         };
-        for (i, &tint) in SOURCE_TINTS().iter().enumerate() {
-            assert!(
-                apart(tint, BG_RAISED()) >= 16,
-                "tint {i} is {} from the panel it sits on",
-                apart(tint, BG_RAISED())
-            );
-            for (j, &other) in SOURCE_TINTS().iter().enumerate().skip(i + 1) {
+        // Every family, not the one in force: a palette is picked at runtime
+        // now, and four tints tuned by eye on one ground are exactly where a
+        // pair lands inside the margin on another.
+        for id in crate::ui::theme::PaletteId::ALL {
+            let p = id.palette();
+            for (i, &tint) in p.SOURCE_TINTS.iter().enumerate() {
                 assert!(
-                    apart(tint, other) >= 16,
-                    "tints {i} and {j} are only {} apart",
-                    apart(tint, other)
+                    apart(tint, p.BG_RAISED) >= 16,
+                    "{id:?} tint {i} is {} from the panel it sits on",
+                    apart(tint, p.BG_RAISED)
                 );
+                for (j, &other) in p.SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        apart(tint, other) >= 16,
+                        "{id:?} tints {i} and {j} are only {} apart",
+                        apart(tint, other)
+                    );
+                }
             }
+            // The two a person sees side by side first must be further apart
+            // than the floor: source 0 and source 1 are the first import and
+            // the second.
+            assert!(apart(p.SOURCE_TINTS[0], p.SOURCE_TINTS[1]) >= 32, "{id:?}");
         }
-        // The two a person sees side by side first must be further apart than
-        // the floor: source 0 and source 1 are the first import and the second.
-        assert!(apart(SOURCE_TINTS()[0], SOURCE_TINTS()[1]) >= 32);
     }
 
     /// A `.srt` dropped on the window is nobody's stream: it has no source
