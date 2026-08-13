@@ -38,11 +38,11 @@ pub(crate) const LABEL_MIN_W: f32 = 36.;
 /// a shape. Ceiling: [`View::max_zoom`]'s 8 frames across the bed. The upgrade
 /// is a second, finer pass over the visible span only, cached like `waves` is.
 pub(crate) const WAVE_BPS: u32 = 40;
-/// How many stand-ins ([`engine::proxy`]) may be in flight at once. Two, not
-/// one per core: each is a whole film through a decoder and an encoder, and the
-/// hardware seat they queue on is a single one -- more of them at once is the
-/// same work done later, with the editor slower while it happens.
-pub(crate) const PROXIES_AT_ONCE: usize = 2;
+/// How many stand-ins may be in flight at once -- the engine's own number, not
+/// a second one that happens to agree: the proxy cache sweeps with room left
+/// for exactly this many encodes ([`engine::proxy::reserve`]), so a front-end
+/// that started more would put the disk past the cap by whatever it added.
+pub(crate) const PROXIES_AT_ONCE: usize = engine::proxy::AT_ONCE;
 /// Pixels per envelope column. Coarser than a pixel: the eye reads the shape,
 /// and a path with a point per pixel is a path per repaint.
 pub(crate) const WAVE_COL: f32 = 2.;
