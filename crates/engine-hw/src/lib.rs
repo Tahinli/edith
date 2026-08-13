@@ -104,6 +104,13 @@ type Av1Encoder = Av1StatelessEncoder<
 /// exists so a misbehaving driver returns an error instead of hanging the app.
 const STALL_LIMIT: u32 = 10_000;
 
+/// How many undecodable access units a seek may drop before the session gives
+/// up and calls the stream broken. An open GOP's leading pictures are a handful
+/// (a Blu-ray remux's are 8-16); a file that keeps failing past this is not one
+/// we restarted in the middle of, so the error is real and the caller still
+/// hears it.
+const LEADING_LIMIT: u32 = 64;
+
 struct Session {
     decoder: Decoder,
     /// NV12 (or, for a 10-bit stream, P010) descriptor for `vaGetImage`,
@@ -122,6 +129,11 @@ struct Session {
     flushed: bool,
     /// Pictures still to be decoded and thrown away to land on a seek target.
     skip: u32,
+    /// Access units dropped because they referenced pictures this session never
+    /// decoded -- see [`Session::pump`]. Counted rather than flagged so the
+    /// tolerance ends somewhere, and raised to [`LEADING_LIMIT`] the moment a
+    /// picture is handed out, which is where the window closes.
+    leading: u32,
     /// Tightly packed I420 handed out through [`VhFrame`]; reused every frame,
     /// which is exactly why the pointers are only valid until the next call.
     out: Vec<u8>,
@@ -260,6 +272,12 @@ impl Session {
             timestamp: 0,
             flushed: false,
             skip: 0,
+            // A stream read from its own beginning has no missing references
+            // and therefore no leading pictures to forgive: the window opens
+            // only for a session positioned somewhere else ([`Session::open_at`]),
+            // so a file whose first picture will not decode is still refused at
+            // the door rather than opening onto nothing.
+            leading: LEADING_LIMIT,
             out: Vec::new(),
             luma: 0,
             chroma: 0,
@@ -277,6 +295,9 @@ impl Session {
         let target_frame = target_sample.saturating_sub(1);
         let first = session.demuxer.seek_to_sync_at_or_before(target_frame);
         session.skip = (i64::from(target_frame) - first).max(0) as u32;
+        if target_frame > 0 {
+            session.leading = 0;
+        }
         Some(session)
     }
 
@@ -309,6 +330,9 @@ impl Session {
                     continue;
                 }
                 self.emit(handle);
+                // Past the random access point's leading pictures: a decode
+                // error from here on is a real one again.
+                self.leading = LEADING_LIMIT;
                 return Ok(true);
             }
             if self.flushed {
@@ -332,6 +356,7 @@ impl Session {
                 pool,
                 pending,
                 timestamp,
+                leading,
                 ..
             } = self;
             match decoder
@@ -352,6 +377,21 @@ impl Session {
                     if stalls > STALL_LIMIT {
                         return Err("decoder stalled waiting for output buffers".into());
                     }
+                }
+                // A picture that references pictures we never decoded, which is
+                // what an open GOP's leading pictures are after a seek: they
+                // display *before* the random access point we restarted at, so
+                // they are not ours to show and the stream is not broken. Drop
+                // the rest of the access unit (they are picture-aligned) and
+                // walk on -- failing here is what used to make a Blu-ray remux
+                // fall back to software on 17 seeks out of 20.
+                Err(e) if *leading < LEADING_LIMIT => {
+                    if *leading == 0 {
+                        eprintln!("engine_hw: skipping leading pictures after seek ({e})");
+                    }
+                    *leading += 1;
+                    pending.clear();
+                    *timestamp += 1;
                 }
                 Err(e) => return Err(e.to_string()),
             }

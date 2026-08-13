@@ -20,7 +20,12 @@ edition = "2024"
 #   cros-libva  - fails to build against libva >= 1.23 headers
 #   cros-codecs - probes VA-API with a 16x16 context that Mesa radeonsi refuses;
 #                 and creates every decode context as 8-bit 4:2:0, which no HEVC
-#                 Main 10 stream can decode into (its own TODO, its own answer)
+#                 Main 10 stream can decode into (its own TODO, its own answer);
+#                 and refuses an H.264 frame_num gap outright unless the stream
+#                 declared one, which fails every seek into an open-GOP Blu-ray
+#                 remux -- the gap is the *editor's*, made by restarting at a
+#                 random access point, so the patch fills it with the §8.2.5.2
+#                 non-existing frames the loop right below it already builds
 #   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
 #                 term (the fast path in the same file serves the encoder only),
 #                 which is 4x slower than real time for 5.1 and therefore not
