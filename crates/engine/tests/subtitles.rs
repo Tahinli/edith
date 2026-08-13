@@ -412,6 +412,82 @@ fn a_subtitle_row_can_be_removed_and_the_survivors_round_trip() {
     assert_eq!(session.subtitles().len(), 2, "and nothing moved");
 }
 
+/// The removal's inverse, which is the whole complaint: a row taken off is *in
+/// hand*, not gone, and one call puts it back with the cues it left with. The
+/// proof that nothing is re-read is the file itself -- it is deleted from disk
+/// before the restore, and the cues still come back whole. A re-import at that
+/// point could only have refused.
+#[test]
+fn a_removed_subtitle_row_comes_back_without_a_reimport() {
+    let dir = scratch("restore");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    for name in ["a.srt", "b.srt"] {
+        std::fs::copy(data("test_subs.srt"), dir.join(name)).expect("copy the subtitle fixture");
+    }
+
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    for name in ["a.srt", "b.srt"] {
+        session
+            .import_subtitles(&dir.join(name))
+            .expect("the .srt imports");
+    }
+    assert!(session.removed_subtitles().is_empty(), "nothing removed yet");
+
+    session.remove_subtitles(0).expect("the first row goes");
+    assert_eq!(session.subtitles().len(), 1, "one row left on the timeline");
+    let bin: Vec<&str> = session
+        .removed_subtitles()
+        .iter()
+        .map(|t| t.label.as_str())
+        .collect();
+    assert_eq!(bin, vec!["a.srt"], "and the removed one is listed as removed");
+    assert_eq!(
+        session.removed_subtitles()[0].cues,
+        expected(),
+        "with its cues, so bringing it back costs no walk of the file"
+    );
+
+    // The file is gone: a re-import is not even possible from here, which is
+    // exactly the state a person who removed the wrong row must not be in.
+    std::fs::remove_file(dir.join("a.srt")).expect("delete the source file");
+
+    let track = session.restore_subtitles(0).expect("the row comes back");
+    assert_eq!(track, 1, "back on the timeline, where a re-import would land");
+    assert!(
+        session.removed_subtitles().is_empty(),
+        "and out of the removed list"
+    );
+    let names: Vec<String> = session
+        .subtitles()
+        .iter()
+        .map(|t| t.label.clone())
+        .collect();
+    assert_eq!(names, vec!["b.srt", "a.srt"]);
+    assert_eq!(
+        session.subtitles()[track].cues,
+        expected(),
+        "cues and all, off a file that is not there any more"
+    );
+
+    // A save writes it like any other row, and a load reads it back -- the
+    // restore is a track on the timeline, not a session-only ghost. (Its file
+    // is gone, so the load lists it refused by name, which is what a missing
+    // subtitle has always been.)
+    let project = dir.join("back.edith");
+    session.save_project(&project).expect("save");
+    let text = std::fs::read_to_string(&project).expect("read the project back");
+    assert!(text.contains("\nsubtitle - a.srt\n"), "{text}");
+
+    // A bin index nobody has says so, naming it, exactly as a bad removal does.
+    let why = session
+        .restore_subtitles(0)
+        .expect_err("the bin is empty")
+        .to_string();
+    assert!(why.contains('0') && why.contains("subtitle"), "{why}");
+}
+
 /// A bitmap track survives a save the same way a text one does, and for the
 /// same reason: a `.edith` holds the file and the track number, never a cue, so
 /// what comes back is what the file still says. The pictures are read out of
