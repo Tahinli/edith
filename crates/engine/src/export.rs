@@ -496,12 +496,15 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
     let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate).ok()?;
     let bitrate = bitrate_of(meta, settings);
     match settings.format {
-        // Both HEVC formats sit on the plugin's HEVC seat, and it is the
-        // default: what it codes is intra-only, the very file the software seat
-        // writes, so preferring the GPU changes how long an export takes and
-        // not what comes out of it. `None` here is the plugin's own "no" --
-        // no entrypoint, or a picture under the driver's 384x384 floor -- and
-        // the software intra encoder takes the file.
+        // Both HEVC formats sit on the plugin's HEVC seat, and it is opt-in
+        // while its pixels are under repair: on real 1080p and 4K material the
+        // GPU's file decodes frame-for-frame and *looks* wrong -- a garbled
+        // band over flat green, one `CABAC_MAX_BIN` notice per frame. Until
+        // that is found and proven gone, the software intra encoder takes the
+        // file and `VE_HW_HEVC=1` is what asks for the GPU.
+        format if format.is_hevc() && !forced("VE_HW_HEVC") => None,
+        // `None` here is the plugin's own "no" -- no entrypoint, or a picture
+        // under the driver's 384x384 floor -- and the software seat takes it.
         format if format.is_hevc() => {
             HwEncoder::open_hevc(meta.width, meta.height, fps_num, fps_den, bitrate)
         }
