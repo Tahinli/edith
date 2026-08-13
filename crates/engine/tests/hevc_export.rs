@@ -4,12 +4,15 @@
 //! (the inter modes code 1080p at 0.81 fps across 12 cores; the intra path does
 //! 4.30 fps on the same picture).
 //!
-//! Two things are under test here and neither of them is the encoder's picture
-//! quality: that the *containers* say HEVC in the words their readers expect
-//! (this project's own demuxer, and ffprobe where it is installed), and that a
-//! picture whose height is not a multiple of the 16-sample coding tree block --
-//! 1080, the resolution -- comes back out at its own size, coded padded to 1088
-//! and cropped by the SPS conformance window.
+//! Three things are under test here: that the *containers* say HEVC in the
+//! words their readers expect (this project's own demuxer, and ffprobe where it
+//! is installed); that a picture whose height is not a multiple of the 64-sample
+//! coding tree block -- 1080, the resolution -- comes back out at its own size,
+//! coded padded to 1088 and cropped by the SPS conformance window; and, for the
+//! hardware seat only, that what it codes is the *picture that went in* rather
+//! than a stream that merely decodes. That last one is not a nicety: a seat
+//! whose parameter sets disagree with its coded syntax hands back the right
+//! number of frames and the wrong pixels, and nothing else here would see it.
 //!
 //! ```text
 //! cargo test -p engine --release --test hevc_export -- --test-threads=1
@@ -210,7 +213,7 @@ fn an_hevc_export_decodes_back_into_pictures_through_edith() {
 /// parameter sets have to declare. The two-frame fixtures above are flat and
 /// pass either way, which is exactly how the defect got through.
 #[test]
-#[ignore = "needs libengine_hw.so, VE_HW_HEVC=1 and a driver with an HEVC encode entrypoint"]
+#[ignore = "needs libengine_hw.so and a driver with an HEVC encode entrypoint"]
 fn a_1080p_hardware_export_leaves_a_decoder_with_nothing_to_say() {
     let Some(source) = fixture_1080p() else {
         eprintln!("no ffmpeg: skipping the 1080p hardware twin");
@@ -224,7 +227,7 @@ fn a_1080p_hardware_export_leaves_a_decoder_with_nothing_to_say() {
     let planned = engine::export::planned_video(session.meta(), &settings);
     assert!(
         planned.is_some_and(|seat| seat.contains("HW encode")),
-        "this twin is the GPU's, and this box named {planned:?} (VE_HW_HEVC=1?)"
+        "this twin is the GPU's, and this box named {planned:?}"
     );
 
     let out = out_path("1080p_hw", "mkv");
