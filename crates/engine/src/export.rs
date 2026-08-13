@@ -58,6 +58,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -3142,12 +3143,38 @@ fn pop_av1<'a>(
 /// software: a hardware decode that fails after the first picture fails the
 /// export, which then deletes the half-written file.
 enum ClipDecoder {
-    Hw(HwSession),
-    Sw(SwDecoder),
+    /// A stream, decoded on a thread of its own: the encode of picture *n* and
+    /// the decode of picture *n + 1* are the two halves an export used to do in
+    /// turns, each idle while the other worked. The channel is two pictures
+    /// deep, so the decoder runs no further ahead than that (a 1080p I420
+    /// picture is 3.1 MB) and a slow encoder still stops it.
+    ///
+    /// The thread is also where the plugin is *opened*: a VA-API session is not
+    /// ours to hand between threads ([`crate::decode::open_worker_deferred`]
+    /// keeps the same rule), which is why the open's error comes back down the
+    /// channel rather than out of [`ClipDecoder::open`].
+    Streamed(Streamed),
     /// A still image: one picture, handed out for as long as the span runs.
     /// It is decoded here rather than in `run`'s loop for the same reason the
-    /// other two are opened there -- the span's pictures come from one place.
+    /// other two are opened there -- the span's pictures come from one place,
+    /// and no thread can make one picture arrive sooner.
     Still(crate::decode::Still),
+}
+
+/// The receiving half of a decode thread, plus the picture it last handed out
+/// -- which is what lets `next` keep lending planes rather than moving them.
+struct Streamed {
+    frames: Receiver<crate::Result<Yuv>>,
+    current: Option<Yuv>,
+}
+
+/// One picture, owned, on its way from a decode thread to the encoder.
+struct Yuv {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 impl ClipDecoder {
@@ -3158,18 +3185,101 @@ impl ClipDecoder {
         if crate::is_image(path) {
             return Ok(Self::Still(crate::decode::Still::open(path)?));
         }
-        if !forced("VE_SW")
-            && let Some(hw) = HwSession::open_at(path, start_frame)
-        {
-            return Ok(Self::Hw(hw));
-        }
-        Ok(Self::Sw(SwDecoder::open(path, start_frame)?))
+        let path = path.to_path_buf();
+        let (tx, frames) = sync_channel(2);
+        thread::Builder::new()
+            .name("export-decode".into())
+            .spawn(move || decode_stream(&path, start_frame, &tx))?;
+        Ok(Self::Streamed(Streamed {
+            frames,
+            current: None,
+        }))
     }
 
     /// The next picture as tightly packed I420, borrowed until the call after.
     fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
         match self {
             Self::Still(still) => Ok(Some(still.picture())),
+            Self::Streamed(stream) => match stream.frames.recv() {
+                Ok(Ok(frame)) => {
+                    let frame = stream.current.insert(frame);
+                    Ok(Some((
+                        &frame.y,
+                        &frame.u,
+                        &frame.v,
+                        frame.width,
+                        frame.height,
+                    )))
+                }
+                Ok(Err(e)) => Err(e),
+                // The thread closed the channel: end of stream, and the only
+                // clean way it ends. Every failure came through as an `Err`
+                // above -- including the open's, which is why a file the
+                // plugin refuses still fails the export rather than looking
+                // like a clip that ran out.
+                Err(_) => Ok(None),
+            },
+        }
+    }
+}
+
+/// One span's decode, on its own thread: open the file (hardware if the plugin
+/// will have it, software otherwise) and send every picture until the encoder
+/// stops taking them.
+///
+/// Unlike playback there is no mid-clip fallback to software: a hardware decode
+/// that fails after the first picture fails the export, which then deletes the
+/// half-written file.
+fn decode_stream(path: &Path, start_frame: u32, tx: &SyncSender<crate::Result<Yuv>>) {
+    let opened = match forced("VE_SW") {
+        false => HwSession::open_at(path, start_frame).map(Pictures::Hw),
+        true => None,
+    };
+    let mut decoder = match opened {
+        Some(hw) => hw,
+        None => match SwDecoder::open(path, start_frame) {
+            Ok(sw) => Pictures::Sw(sw),
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        },
+    };
+    loop {
+        // Copied out of the decoder's own buffer, which it reuses for the next
+        // picture: one 3 MB memcpy per frame against the decode and the encode
+        // it lets overlap.
+        let frame = match decoder.next() {
+            Ok(Some((y, u, v, width, height))) => Yuv {
+                y: y.to_vec(),
+                u: u.to_vec(),
+                v: v.to_vec(),
+                width,
+                height,
+            },
+            Ok(None) => return,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        // The consumer went away: the span ended early, or the export was
+        // cancelled. Either way there is nothing left to decode for.
+        if tx.send(Ok(frame)).is_err() {
+            return;
+        }
+    }
+}
+
+/// The two stream decoders, on the thread that opened them.
+enum Pictures {
+    Hw(HwSession),
+    Sw(SwDecoder),
+}
+
+impl Pictures {
+    fn next(&mut self) -> crate::Result<Option<(&[u8], &[u8], &[u8], u32, u32)>> {
+        match self {
             Self::Hw(hw) => hw.next_frame(),
             Self::Sw(sw) => {
                 if !sw.advance()? {
