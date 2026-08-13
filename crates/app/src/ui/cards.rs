@@ -240,7 +240,21 @@ impl Player {
                         },
                     ));
                     if quality == Quality::Custom {
-                        r = r.child(self.mbps_steppers(cx));
+                        // The wheel anywhere over the row moves the number, the
+                        // buttons being one step each: the range is fifty wide
+                        // now, and a number only a repeated press can walk to is
+                        // a number nobody walks to. Swallowed, so the notch that
+                        // moved the bitrate does not scroll the list under it as
+                        // well -- one gesture, one thing changed.
+                        r = r
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    this.wheel_mbps(event);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                },
+                            ))
+                            .child(self.mbps_steppers(cx));
                     }
                     list.push(r.into_any_element());
                 }

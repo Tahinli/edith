@@ -2167,17 +2167,7 @@ impl Player {
     /// because that probe *is* the bed's x-to-time mapping ([`HEADER_W`]) and
     /// every lane is drawn through the same one.
     fn timeline_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
-        let (dx, dy) = match event.delta {
-            ScrollDelta::Lines(d) => (d.x, d.y),
-            ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
-        };
-        // A tilt wheel's own axis counts as the same gesture: it is the
-        // sideways scroll a mouse that has one sends, and this panel's sideways
-        // is the only direction it has.
-        let d = match dy == 0. {
-            true => dx,
-            false => dy,
-        };
+        let d = wheel_delta(event);
         if d == 0. {
             return;
         }
@@ -5583,12 +5573,33 @@ impl Player {
 
     /// The custom bitrate by pointer: the typed digits were the only control in
     /// this card a mouse could not reach. Clamped to the range the row states
-    /// (the engine's own 1..20 Mbps), and picking the row is part of the step --
+    /// (the engine's own 1..50 Mbps), and picking the row is part of the step --
     /// a stepper that moves a number nobody is using would move nothing.
     fn nudge_mbps(&mut self, step: i32) {
         self.custom_mbps =
             (self.custom_mbps as i32 + step).clamp(MBPS_MIN as i32, MBPS_MAX as i32) as u32;
         self.quality = Quality::Custom;
+    }
+
+    /// The same number under the wheel, one step a notch, up for more: fifty
+    /// presses of a stepper is not a way to reach the top of this range, and the
+    /// wheel is what this editor already moves a value with (the timeline's
+    /// zoom and scroll are the same gesture). Hold-to-run stays the keyboard's,
+    /// as it is on every other card here -- a button that repeats while held is
+    /// not a thing this program has.
+    ///
+    /// It moves the *field* while one is open, exactly as ↑↓ do, so the two
+    /// ways in never disagree about which number is being changed.
+    fn wheel_mbps(&mut self, event: &ScrollWheelEvent) {
+        let by = wheel_delta(event);
+        if by == 0. {
+            return;
+        }
+        let by = by.signum() as i32;
+        match &mut self.mbps_edit {
+            Some(edit) => edit.step(by),
+            None => self.nudge_mbps(by),
+        }
     }
 
     /// Opens the custom bitrate's field on the number the row is carrying, and
@@ -8070,7 +8081,7 @@ impl Quality {
         match self {
             Quality::Auto => "from the picture size and frame rate".to_string(),
             Quality::Custom => {
-                format!("{custom_mbps} Mbps — n types a number, {MBPS_MIN}–{MBPS_MAX}")
+                format!("{custom_mbps} Mbps — wheel or ± steps, n types one, {MBPS_MIN}–{MBPS_MAX}")
             }
             other => format!(
                 "{} Mbps",
@@ -8616,7 +8627,7 @@ fn retarget(path: &std::path::Path, format: Format) -> PathBuf {
 /// The card's rows as the engine takes them. `Auto` leaves the bitrate to the
 /// exporter, which derives it from the picture; the fixed rows are figures that
 /// hold from 720p to 1080p, and a typed one is passed exactly as typed -- the
-/// engine clamps every explicit bitrate to 1..20 Mbps (export.rs:290), so this
+/// engine clamps every explicit bitrate to 1..50 Mbps (`MAX_EXPLICIT_BITRATE`), so this
 /// must not clamp it a second time and disagree about where the edge is.
 ///
 /// The bitrate travels even for an audio format, where the engine ignores it:
@@ -8652,12 +8663,17 @@ fn export_settings(
 }
 
 /// What the engine will code an explicit bitrate at, in whole Mbps: outside
-/// this it clamps (`export.rs` `MIN_BITRATE`/`MAX_BITRATE`), so a number typed
-/// past either end would be written as a different one. The field refuses it
-/// instead of clamping quietly -- a card that changes the user's number without
-/// saying so is the one thing a field like this must never do.
+/// this it clamps (`export.rs` `MIN_BITRATE`/`MAX_EXPLICIT_BITRATE`), so a
+/// number typed past either end would be written as a different one. The field
+/// refuses it instead of clamping quietly -- a card that changes the user's
+/// number without saying so is the one thing a field like this must never do.
+///
+/// The ceiling was 20, which was never a limit of any encoder here: it was the
+/// top of the range the exporter *derives* an automatic bitrate in, borrowed as
+/// the cap on a typed one. A 1080p master or a 4K edit wants more than that, so
+/// the asked-for rate has its own ceiling now and this is it.
 const MBPS_MIN: u32 = 1;
-const MBPS_MAX: u32 = 20;
+const MBPS_MAX: u32 = 50;
 
 /// How many digits the field takes. Two reach the ceiling; the third is there so
 /// a number *past* it can be typed whole and refused in its own words, rather
@@ -9484,6 +9500,22 @@ fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
 /// painted reads as its start.
 fn px_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     f32::from(x - bounds.left()).clamp(0., f32::from(bounds.size.width).max(0.))
+}
+
+/// One turn of the wheel as a single number, positive for a turn *up*, in
+/// whatever units the device sends (a mouse counts lines, a touchpad pixels).
+/// A tilt wheel's own axis counts as the same gesture: it is the sideways
+/// scroll a mouse that has one sends, and the controls this drives have one
+/// direction each, so the two axes are one answer here.
+fn wheel_delta(event: &ScrollWheelEvent) -> f32 {
+    let (dx, dy) = match event.delta {
+        ScrollDelta::Lines(d) => (d.x, d.y),
+        ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
+    };
+    match dy == 0. {
+        true => dx,
+        false => dy,
+    }
 }
 
 /// The frame a dropped clip's head lands on: `raw`, unless one of `marks` is
@@ -13460,13 +13492,16 @@ mod tests {
                 format
             );
         }
-        // Every fixed row sits inside the engine's clamp (export.rs:290), so no
-        // row can promise a bitrate the exporter silently changes.
+        // Every fixed row sits inside the engine's clamp
+        // (`MAX_EXPLICIT_BITRATE`), so no row can promise a bitrate the exporter
+        // silently changes -- the ceiling row included, which is the one a
+        // raised cap could have walked out past.
         for quality in Quality::ALL {
-            let settings = export_settings(quality, 7, mp4, DEFAULT_AUDIO_KBPS);
+            let settings = export_settings(quality, MBPS_MAX, mp4, DEFAULT_AUDIO_KBPS);
             if let Some(bitrate) = settings.bitrate {
                 assert!(
-                    (1_000_000..=20_000_000).contains(&bitrate),
+                    (u64::from(MBPS_MIN) * 1_000_000..=u64::from(MBPS_MAX) * 1_000_000)
+                        .contains(&bitrate),
                     "{quality:?} outside the engine clamp"
                 );
             }
@@ -13539,29 +13574,29 @@ mod tests {
         assert_eq!(NumberEdit::new(0).text, "");
 
         // Out of range is refused *in words* and the digits stay put: clamping
-        // 45 to 20 would write a bitrate the user never typed.
+        // 55 to 50 would write a bitrate the user never typed.
         let mut edit = NumberEdit::new(0);
-        for digit in [4, 5] {
+        for digit in [5, 5] {
             edit.digit(digit);
         }
         assert_eq!(edit.commit(), None);
-        assert_eq!(edit.text, "45", "a refusal keeps what was typed");
+        assert_eq!(edit.text, "55", "a refusal keeps what was typed");
         let refusal = edit.refusal.clone().expect("a refusal says why");
-        assert!(refusal.contains("20"), "{refusal}");
-        assert!(edit.detail().starts_with("45▏"), "{}", edit.detail());
+        assert!(refusal.contains(&MBPS_MAX.to_string()), "{refusal}");
+        assert!(edit.detail().starts_with("55▏"), "{}", edit.detail());
         assert!(edit.detail().contains(&refusal));
         // And is fixable in place, which is the whole point of a field.
         edit.backspace();
         assert_eq!(edit.refusal, None, "the reason went with the digit");
-        assert_eq!(edit.commit(), Some(4));
+        assert_eq!(edit.commit(), Some(5));
 
         // Empty, zero, and past the digit cap: each its own reason, none of
         // them silent.
         assert!(commit_mbps("").is_err());
         assert!(commit_mbps("0").unwrap_err().contains("not a rate"));
         assert_eq!(commit_mbps("1"), Ok(MBPS_MIN));
-        assert_eq!(commit_mbps("20"), Ok(MBPS_MAX));
-        assert!(commit_mbps("21").is_err());
+        assert_eq!(commit_mbps("50"), Ok(MBPS_MAX));
+        assert!(commit_mbps("51").is_err());
         let mut edit = NumberEdit::new(0);
         for digit in [9, 9, 9, 9] {
             edit.digit(digit);
@@ -13587,7 +13622,7 @@ mod tests {
         assert_eq!(edit.text, (MBPS_MAX - 1).to_string());
         // A step past a refused number clears the refusal with it.
         let mut edit = NumberEdit::new(0);
-        edit.digit(4);
+        edit.digit(5);
         edit.digit(5);
         assert_eq!(edit.commit(), None);
         edit.step(-1);
