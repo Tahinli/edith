@@ -930,6 +930,48 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     let session = PlaybackSession::open(&made).expect("play the proxy");
     assert_eq!(session.meta().frame_count, source_meta.frame_count);
 
+    // ...and a session on the *film* plays it instead once the switch is on,
+    // while the film is still the only thing the project names -- which is what
+    // an export reads and why an export can never come off a stand-in.
+    let mut session = PlaybackSession::open(&source).expect("open the film");
+    // The film as the project names it: canonical ([`Source::new`]), which the
+    // proxy key resolves to as well -- the same file under two names is one
+    // stand-in.
+    let film = session.sources()[0].path.clone();
+    assert_eq!(session.picture_path(0), film, "off: the film itself");
+    session.set_proxies(true);
+    assert!(session.proxies());
+    assert_eq!(session.picture_path(0), made, "on: the stand-in");
+    assert_eq!(
+        session.sources()[0].path,
+        film,
+        "the project still names the film, and that is what an export reads"
+    );
+    // A frame really arrives from it: the switch reseeks, so the picture after
+    // it is the proxy's.
+    let started = Instant::now();
+    while session.try_frame().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no picture after switching to the stand-in"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    session.set_proxies(false);
+    assert_eq!(session.picture_path(0), film, "and back again");
+
+    // The switch survives a save and a load, and a project written before there
+    // were stand-ins opens on its films.
+    let project = Scratch::file("ve_proxy_switch", "edith");
+    session.set_proxies(true);
+    session.save_project(&project).expect("save");
+    let text = std::fs::read_to_string(&project).expect("read the project back");
+    assert!(text.starts_with("edith 12\n"), "{text}");
+    assert!(text.contains("\nproxy on\n"), "{text}");
+    let reopened = PlaybackSession::open_project(&project).expect("load");
+    assert!(reopened.proxies(), "the switch came back on");
+    assert_eq!(reopened.picture_path(0), made, "and it is substituting");
+
     // Asked again, it is the file already there: no second encode.
     let again = engine::proxy::generate(&source).expect("ask again");
     assert!(again.is_finished(), "a cached proxy is done on the spot");
