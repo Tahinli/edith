@@ -110,6 +110,11 @@ actions! {
     Mix,
     ToggleSnap,
     ToggleSubtitles,
+    /// Cut on the stand-ins or on the films themselves
+    /// ([`engine::proxy`]): what the picture is decoded from, and nothing
+    /// else -- the sound and every export stay the film's whichever way it
+    /// is set.
+    ToggleProxies,
     /// The window's own colours, which belong to the person looking at them and
     /// not to the project: a list of the palettes, opened here and from the
     /// toolbar's Theme button. It was a build feature once, which made it a
@@ -173,6 +178,7 @@ impl ActionId {
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
+            ActionId::ToggleProxies => "Proxies on / off for the picture",
             ActionId::Theme => "Theme: the window's colours…",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
@@ -227,6 +233,7 @@ impl ActionId {
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
+            ActionId::ToggleProxies => "toggle-proxies",
             ActionId::Theme => "theme",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
@@ -279,6 +286,10 @@ impl ActionId {
             | ActionId::ZoomOut
             | ActionId::ZoomFit
             | ActionId::ToggleSubtitles
+            // ...and which file the picture is decoded from, which changes
+            // nothing that is saved and nothing that is exported: a stand-in
+            // is what one watches while cutting, not what one delivers.
+            | ActionId::ToggleProxies
             // ...and what the whole window is painted in: it edits nothing at
             // all, it is what one is looking *with*.
             | ActionId::Theme => Category::View,
@@ -811,6 +822,11 @@ impl Keymap {
                 // the rest of the things one *looks* at, and nowhere near the
                 // two keys that delete.
                 b(ActionId::ToggleSubtitles, "t", false),
+                // The stand-ins take ctrl+p, the p of the word: the unshifted
+                // one is the fit policy, and a ctrl chord is right for a switch
+                // thrown once for a whole session rather than one wanted under
+                // a hand -- the theme takes ctrl+h for that reason.
+                b(ActionId::ToggleProxies, "p", true),
                 // The theme takes ctrl+h -- the h of the word, since "t" is the
                 // subtitles and ctrl+t takes one off -- and a ctrl chord because
                 // it is a preference set once, not a stroke wanted under a hand
@@ -1085,7 +1101,8 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 49);
+        assert_eq!(k.entries().len(), 50);
+        assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
