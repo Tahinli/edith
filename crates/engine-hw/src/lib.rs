@@ -308,6 +308,49 @@ impl Session {
         Some(session)
     }
 
+    /// Repositions an **open** session, exactly as [`Session::open_at`] positions
+    /// a new one: the next [`Session::pump`] hands back sample `target_sample`.
+    ///
+    /// This is what a seek costs when the session is kept: a demuxer seek and a
+    /// decoder flush, and *not* the VA-API initialisation (~90 ms measured), the
+    /// render node probe, the container parse and the surface pool that opening
+    /// one again pays for.
+    ///
+    /// The flush is the whole of the decoder's reset: cros-codecs finishes what
+    /// is in flight and goes to `Reset`, from where it resumes on the next
+    /// parameter set or key frame -- and every sync sample this demuxer hands
+    /// out carries the parameter sets in front of it (`demux`'s `is_sync`
+    /// re-injection), which is exactly where a seek lands. The pictures the
+    /// flush makes ready are dropped with `ready`: they belong to where the
+    /// session *was*.
+    fn seek_to(&mut self, target_sample: u32) -> Result<(), String> {
+        self.decoder.get().flush().map_err(|e| e.to_string())?;
+        // Drain what the flush completed, dropping every handle: each one holds
+        // a pool buffer out of circulation, and none of them is ours to show.
+        while let Some(event) = self.decoder.get().next_event() {
+            if let DecoderEvent::FormatChanged = event {
+                let info = self
+                    .decoder
+                    .get()
+                    .stream_info()
+                    .ok_or("format changed without stream info")?
+                    .clone();
+                self.pool.resize(&info);
+            }
+        }
+        self.ready.clear();
+        self.pending.clear();
+        self.flushed = false;
+        // The same arithmetic `open_at` does, for the same reason.
+        let target_frame = target_sample.saturating_sub(1);
+        let first = self.demuxer.seek_to_sync_at_or_before(target_frame);
+        self.skip = (i64::from(target_frame) - first).max(0) as u32;
+        // ...and the same open-GOP window: a session positioned anywhere but the
+        // start may meet leading pictures that reference what it never decoded.
+        self.leading = if target_frame > 0 { 0 } else { LEADING_LIMIT };
+        Ok(())
+    }
+
     /// Pumps the decoder until one picture is ready. `Ok(false)` is clean EOF.
     fn pump(&mut self) -> Result<bool, String> {
         let mut stalls = 0u32;
@@ -592,6 +635,32 @@ pub unsafe extern "C" fn vh_next_frame(session: *mut c_void, out: *mut VhFrame) 
             Ok(false) => 0,
             Err(e) => {
                 eprintln!("engine_hw: {e}");
+                -2
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Repositions an open session so the next [`vh_next_frame`] returns sample
+/// `target_sample` (1-based, as [`vh_open_at`]). 0 on success, negative on
+/// failure -- and a caller that gets one closes the session and opens another,
+/// which is what it did for every seek before this symbol existed.
+///
+/// # Safety
+/// `session` must come from [`vh_open_at`] and still be open.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vh_seek(session: *mut c_void, target_sample: u32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &mut *(session as *mut Session) };
+        match session.seek_to(target_sample) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("engine_hw: seek failed: {e}");
                 -2
             }
         }
