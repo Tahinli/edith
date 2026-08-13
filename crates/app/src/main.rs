@@ -1552,6 +1552,9 @@ struct Player {
     titled: String,
     displayed: u32,
     dropped: u32,
+    /// When the picture was last restarted at the clock for falling behind it
+    /// ([`should_resync`]). The cool-down's only state.
+    resynced: Option<Instant>,
     /// Wall clock of the first displayed frame -- the real-speed measurement.
     started: Option<Instant>,
     focus: FocusHandle,
@@ -1560,7 +1563,9 @@ struct Player {
 impl Player {
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
-    /// drop-when-behind policy. A frame that is not due yet waits in `held`.
+    /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
+    /// while the clock is paused *nothing* is due -- a repaint re-presents the
+    /// frame already on screen, whatever asked for the repaint.
     fn pump(&mut self, window: &mut Window) {
         // Where the transport was before this drain, so the crossing into
         // `Ended` can be recognised as the one transition it is.
@@ -1572,7 +1577,20 @@ impl Player {
         };
         let target = session.now() * self.fps;
         let mut newest: Option<Frame> = None;
-        loop {
+        // A frame the screen is owed: a seek's landing, and the one readiness
+        // signal there is ([`Player::reset_after_reseek`]).
+        let owed = self.seek_since.is_some();
+        // Paused, the clock is frozen and *nothing new is due*. Whatever the
+        // decoder is still handing over is the backlog it was behind by when
+        // the pause landed -- frames at a position the transport has already
+        // left -- and taking one per repaint is what walked the picture on
+        // after the sound had stopped, at exactly the rate the pointer was
+        // moved over the timeline. Gated here, at the one place a frame ever
+        // reaches the screen, rather than in the handlers that repaint: a
+        // hover, a notice, a resize and a vsync are all the same event to this.
+        // An owed frame is still taken, playing or not -- a scrub is paused by
+        // definition, and its landing is the whole point of it.
+        while session.is_playing() || owed {
             let frame = match self.held.take() {
                 Some(frame) => frame,
                 // Nothing waiting means either a clip boundary being rebuilt or
@@ -1591,6 +1609,15 @@ impl Player {
                 break;
             }
         }
+
+        // How far behind the master clock the picture just handed over is, in
+        // seconds. Measured off a frame that really arrived and nothing else: a
+        // clip boundary being reopened delivers nothing at all for hundreds of
+        // milliseconds, and restarting *that* would only cancel the open it is
+        // waiting on.
+        let late = newest
+            .as_ref()
+            .map_or(0., |f| (target - f64::from(f.index)) / self.fps);
 
         if let Some(frame) = newest {
             self.displayed += 1;
@@ -1613,6 +1640,30 @@ impl Player {
                 // without this the sprite atlas grows for the whole video.
                 let _ = window.drop_image(old);
             }
+        }
+
+        // Audio is the master clock and a decoder that cannot keep up with it
+        // never gets back on its own: it hands over every frame in order,
+        // whether or not its moment has passed, so what it is behind by only
+        // grows -- a minute in, the picture is seconds behind what is being
+        // heard, and that is the whole of "the video can't catch the audio".
+        // Past `LATE_RESYNC` the backlog is abandoned and the picture restarted
+        // at the clock, which touches neither the sound nor the clock
+        // (`PlaybackSession::resync_picture`), so nothing the ear is following
+        // moves. Never on a frame a seek owed: that one is late by however long
+        // its own reopen took, and answering it with another reopen is a loop.
+        //
+        // ponytail: on a machine that cannot decode the file in real time at
+        // all this settles into one restart per `RESYNC_GAP` -- in sync, and
+        // stuttering, which is the honest picture of what that machine can do.
+        // The upgrade path is dropping late frames *inside* the worker (skip
+        // the convert and the send for anything already past due), which needs
+        // the deadline shared with it.
+        if !owed && session.is_playing() && should_resync(late, self.resynced) {
+            eprintln!("picture {late:.3}s behind the clock: restarting it there");
+            session.resync_picture();
+            self.held = None;
+            self.resynced = Some(Instant::now());
         }
 
         if self.transport() == Transport::Ended {
@@ -6365,6 +6416,21 @@ fn scrub_due(target: u32, last_target: u32, since: Duration) -> bool {
     target != last_target && since >= SCRUB_GAP
 }
 
+/// How far the picture may fall behind the sound before it is restarted at the
+/// clock instead of left to crawl after it. Past what an eye reads as lip sync
+/// (a tenth of a second or so) and above what a single reopen costs to fix, so a
+/// picture that is merely a reopen behind is not answered with another one.
+const LATE_RESYNC: f64 = 0.4;
+/// The least time between two such restarts: the decoder that cannot keep up is
+/// the one this fires for, and it will still be behind straight afterwards.
+const RESYNC_GAP: Duration = Duration::from_secs(2);
+
+/// Whether a picture `late` seconds behind the master clock is restarted at it,
+/// given when the last restart was ([`Player::pump`]).
+fn should_resync(late: f64, last: Option<Instant>) -> bool {
+    late > LATE_RESYNC && last.is_none_or(|t| t.elapsed() >= RESYNC_GAP)
+}
+
 /// The gate a live drag sample goes through. With the worker still owing a
 /// frame (`busy`), writing now would only cancel the open the picture is already
 /// waiting for -- the sample is held in `stash` instead, and the frame that
@@ -10084,6 +10150,7 @@ mod tests {
         frame_rate_ladder, histogram,
         inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
         marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
+        LATE_RESYNC, RESYNC_GAP, should_resync,
         retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
         SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
         EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, TIMELINE_FIXED_H, TIMELINE_SHARE, lanes_shown,
@@ -12038,6 +12105,23 @@ mod tests {
         assert!(!scrub_due(30, 30, fast));
         // Exactly at the gap counts, and a long stall never blocks.
         assert!(scrub_due(1, 0, Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn the_picture_is_restarted_only_when_it_is_really_behind_and_not_twice() {
+        // A quantum's worth of lateness is what every playing frame has; only a
+        // gap an eye reads as out of sync answers with a reopen.
+        assert!(!should_resync(0., None));
+        assert!(!should_resync(LATE_RESYNC, None));
+        assert!(should_resync(LATE_RESYNC + 0.1, None));
+        // ...and a decoder that is still behind right after a restart -- the
+        // usual case, since it was too slow to begin with -- waits out the gap
+        // instead of reopening at every repaint.
+        assert!(!should_resync(9., Some(Instant::now())));
+        assert!(should_resync(
+            9.,
+            Some(Instant::now() - RESYNC_GAP - Duration::from_millis(1))
+        ));
     }
 
     #[test]
@@ -16112,6 +16196,7 @@ fn main() {
                     // poster frame to the screen is asked for when it lands
                     // (`open_media` -> `reset_after_reseek`).
                     seek_since: None,
+                    resynced: None,
                     session: None,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
