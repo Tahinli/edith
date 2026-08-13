@@ -473,6 +473,25 @@ struct ClipDrag {
     clip: Clip,
 }
 
+/// A track *header* being dragged: which track the hand took hold of, to be
+/// let go over the header of the one whose place it is to take
+/// ([`Player::reorder_lane`]). The lane alone -- a track carries its own clips
+/// wherever it goes, so unlike a [`ClipDrag`] there is nothing else to name.
+#[derive(Clone, Copy)]
+struct LaneDrag(Lane);
+
+/// Where a header drag in flight would leave the track in the hand: the lane
+/// whose slot it is about to take, and whether the line is drawn at that lane's
+/// top edge (it is coming up from below) or its bottom one. The drop indicator
+/// every editor draws between two tracks, and the header answer to the ghost a
+/// clip drag lays on a lane ([`Ghost`]) -- stale between gestures, which costs
+/// nothing because it is drawn only while one is live.
+#[derive(Clone, Copy, PartialEq)]
+struct LaneDrop {
+    lane: Lane,
+    above: bool,
+}
+
 /// Where the drag in flight would leave what it is carrying: the lane the
 /// pointer is over, the snapped head the release will commit ([`landing`]), and
 /// how long the thing is. Drawn on that lane as a translucent box the size of
@@ -1315,6 +1334,11 @@ struct Player {
     /// line above does not answer -- and drawn only while a drag is live, for
     /// [`Player::snap_cue`]'s reason.
     ghost: Option<Ghost>,
+    /// The slot a track header being dragged is about to drop into, or `None`
+    /// while the pointer is over no lane: the line drawn between two headers,
+    /// for the reason [`Player::ghost`] draws a shadow -- where a gesture lands
+    /// is seen before the release. Drawn only while a drag is live.
+    lane_drop: Option<LaneDrop>,
     last_scrub: Instant,
     last_target: u32,
     /// The running export. While it owns the UI the editor is read-only.
@@ -3948,6 +3972,33 @@ impl Player {
         self.set_ghost(ghost, cx);
     }
 
+    /// The line the track in the hand would drop into, on the row the pointer
+    /// is over: at that row's top edge when the header is coming up from below
+    /// and at its bottom edge when it is going down, which is the slot
+    /// [`Player::reorder_lane`] commits to at the release. Nothing at all over
+    /// its own row, where a release changes nothing.
+    fn preview_lane_drop(&mut self, from: Lane, onto: Lane, cx: &mut Context<Self>) {
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, PlaybackSession::lanes);
+        let at = |lane: Lane| lanes.iter().position(|&l| l == lane);
+        let next = match (at(from), at(onto)) {
+            (Some(i), Some(j)) if i != j => Some(LaneDrop {
+                lane: onto,
+                above: j < i,
+            }),
+            _ => None,
+        };
+        // Only when it has actually changed: a drag move fires on every painted
+        // frame, and a redraw per frame that draws the same line is a redraw
+        // for nothing.
+        if self.lane_drop != next {
+            self.lane_drop = next;
+            cx.notify();
+        }
+    }
+
     /// The same shadow for a library row: its head at [`Player::place_frame`],
     /// which is where the drop inserts it, and the file's own length for its
     /// width -- the length the library row already reports. A file this lane
@@ -5203,6 +5254,58 @@ impl Player {
             None => "NO TRACK REMOVED — open a file first".to_string(),
         };
         self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// A header let go over another header: the track in the hand takes that
+    /// one's place in the stack, clips and all
+    /// ([`engine::Project::move_lane`]), one undo step. The gesture every
+    /// editor reorders tracks with, and the only way the order is ever changed
+    /// -- there is no second list of it to keep in step.
+    ///
+    /// Display order is the stack, so moving a video track past another video
+    /// track changes which picture wins, here and in an export alike; audio is
+    /// summed and does not care, which is what makes `A1` above `V1` a purely
+    /// visual arrangement. A label is a position among the tracks of its kind,
+    /// so a track that crossed one of its own kind comes back under a different
+    /// name -- and everything holding a `(lane, idx)` is dropped exactly then,
+    /// for [`Player::remove_lane`]'s reason: those handles now name another
+    /// track's clip. A move that crossed only the other kind renames nothing
+    /// and keeps the selection.
+    fn reorder_lane(&mut self, lane: Lane, onto: Lane, cx: &mut Context<Self>) {
+        self.lane_drop = None;
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let Some(to) = session.lanes().iter().position(|&l| l == onto) else {
+            return;
+        };
+        // Picked up and put back down where it was is a click, and a click says
+        // nothing -- `move_lane` refuses it and every other no-op.
+        let Some(moved) = session.move_lane(lane, to) else {
+            cx.notify();
+            return;
+        };
+        if moved != lane {
+            self.selected = None;
+            self.context_menu = None;
+            self.eq_open = None;
+            self.color_open = None;
+            self.speed_open = None;
+            self.close_silence();
+        }
+        self.notify_user(
+            format!(
+                "{} IS TRACK {} NOW — {} puts it back",
+                moved.label(),
+                to + 1,
+                self.keymap.display(ActionId::Undo)
+            )
+            .into(),
+        );
         cx.notify();
     }
 
@@ -16398,6 +16501,7 @@ fn main() {
                     sub_track: 0,
                     snap_cue: None,
                     ghost: None,
+                    lane_drop: None,
                     last_scrub: Instant::now(),
                     last_target: 0,
                     export: None,

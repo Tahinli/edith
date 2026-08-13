@@ -901,6 +901,41 @@ impl Project {
         Ok(())
     }
 
+    /// Moves `lane` to display position `to` -- an index into
+    /// [`Project::lanes`], the slot the lane there gives up -- and hands back
+    /// the handle it answers to from now on. `None`, changing nothing and
+    /// snapshotting nothing, for a lane that is not there, a position that is
+    /// not, and a lane already standing in it.
+    ///
+    /// The whole track travels: its clips, its gain, its kind. Nothing is
+    /// remapped, so no take changes lane and no group is broken -- this is the
+    /// *order* of the lanes and nothing else, which is why one call is one undo
+    /// step like an add or a removal.
+    ///
+    /// Display order **is** the stack: [`Project::composite_span_at`] shows the
+    /// last video lane covering a frame, so moving one video lane past another
+    /// changes which picture wins, in the preview and in an export alike. The
+    /// audio lanes are summed and their sum does not care about order, so an
+    /// audio track moved among the video ones is a rearrangement of the screen
+    /// alone.
+    ///
+    /// A label is a *position* ([`Lane::label`] reads `ord`, which is the
+    /// position among the lanes of that kind), so a lane that crosses one of
+    /// its own kind swaps names with it -- `V2` dragged above `V1` becomes
+    /// `V1`, clips and all -- while one that crosses only lanes of the other
+    /// kind keeps its name. That is the returned handle: unchanged means every
+    /// handle a caller holds still names the track it named before.
+    pub fn move_lane(&mut self, lane: Lane, to: usize) -> Option<Lane> {
+        let i = self.index(lane)?;
+        if to >= self.lanes.len() || to == i {
+            return None;
+        }
+        self.snapshot();
+        let data = self.lanes.remove(i);
+        self.lanes.insert(to, data);
+        Some(handles(&self.lanes)[to])
+    }
+
     /// Where `lane` sits in [`Project::lanes`], or `None` for a lane that is
     /// not there. The one place a handle becomes a position.
     fn index(&self, lane: Lane) -> Option<usize> {
@@ -5705,6 +5740,86 @@ mod tests {
         assert_eq!(p.lane_count(LaneKind::Video), 3);
         assert!(p.lane(v2).is_empty(), "back where it stood, still empty");
         assert_eq!(p.lane_spans(v3), vec![(0, 3)]);
+    }
+
+    /// A track dragged to another place in the stack: the whole lane travels --
+    /// clips, gain and kind -- nothing is remapped, an audio track may sit above
+    /// a video one, a lane that crosses one of its own kind swaps names with it
+    /// (and swaps the composite with it), one undo puts the order back, and a
+    /// save carries it.
+    #[test]
+    fn a_track_is_dragged_to_another_place_in_the_stack() {
+        let mut p = three();
+        assert!(p.set_lane_gain_db(Lane::A1, -6.0));
+        let before = shape(&p);
+        let history = p.history.len();
+
+        // A1 over V1: the screen is rearranged and nothing else is. Both keep
+        // their names -- neither crossed a lane of its own kind -- so every
+        // handle a front-end holds still names the track it named before.
+        assert_eq!(p.move_lane(Lane::A1, 0), Some(Lane::A1));
+        assert_eq!(p.lanes(), vec![Lane::A1, Lane::V1], "A1 is on top now");
+        assert_eq!(
+            shape(&p),
+            vec![before[1].clone(), before[0].clone()],
+            "each lane's clips travelled with it, and none was remapped"
+        );
+        assert_eq!(p.lane_gain_db(Lane::A1), -6.0, "so did its gain");
+        assert_eq!(p.history.len(), history + 1, "one snapshot per move");
+        invariants_hold(&p, "A1 over V1");
+
+        // Nothing moves for a lane that is not there, a slot that is not, or a
+        // lane already standing in the one it was pointed at.
+        assert_eq!(p.move_lane(Lane::new(LaneKind::Video, 9), 0), None);
+        assert_eq!(p.move_lane(Lane::V1, 2), None, "there is no third slot");
+        assert_eq!(p.move_lane(Lane::A1, 0), None, "already there");
+        assert_eq!(p.history.len(), history + 1, "and none of those snapshot");
+
+        // ...and one stroke puts the order back.
+        assert!(p.undo());
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1]);
+        assert_eq!(shape(&p), before);
+
+        // A second video lane over the first: display order *is* the stack, so
+        // the last video lane covering a frame is the picture that shows.
+        let v2 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v2, 0, clip(0, 0, 5, 0)));
+        let over = shape(&p)[2].clone();
+        assert_eq!(
+            p.composite_span_at(0).map(|s| s.len),
+            Some(5),
+            "V2's five frames are what frame 0 shows"
+        );
+
+        // V2 dragged to the top takes V1's slot -- and V1's name, a label being
+        // a position among the lanes of its kind. The picture that wins changes
+        // with it: the take that was covering is the covered one now.
+        assert_eq!(p.move_lane(v2, 0), Some(Lane::V1), "a label is a position");
+        assert_eq!(p.lanes(), vec![Lane::V1, v2, Lane::A1]);
+        assert_eq!(
+            shape(&p),
+            vec![over.clone(), before[0].clone(), before[1].clone()],
+            "V2's clips answer to V1 now, the old V1's to V2, and A1 kept its own"
+        );
+        assert_eq!(
+            p.composite_span_at(0).map(|s| s.len),
+            Some(3),
+            "the lower video lane wins, and it is the old V1 now"
+        );
+        invariants_hold(&p, "V2 over V1");
+
+        // A save writes that order and a load takes it back.
+        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        assert_eq!(
+            lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            [LaneKind::Video, LaneKind::Video, LaneKind::Audio]
+        );
+        let back = Project::from_parts(sources, lanes, eq, color).expect("three lanes load");
+        assert_eq!(back.lanes(), p.lanes());
+        assert_eq!(shape(&back), shape(&p), "the same lane is still on top");
+
+        assert!(p.undo(), "and the stack goes back to how it stood");
+        assert_eq!(shape(&p), vec![before[0].clone(), before[1].clone(), over]);
     }
 
     /// The grouping rule across more than two lanes: a link id is one *span*,

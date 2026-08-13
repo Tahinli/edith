@@ -761,6 +761,18 @@ impl Player {
         let name = lane.label();
         let row_id: SharedString = format!("{name}-clip").into();
         let remove_id: SharedString = format!("{name}-remove").into();
+        let header_id: SharedString = format!("{name}-header").into();
+        let header_tip: SharedString =
+            format!("{name} — drag this header onto another to reorder the tracks").into();
+        // The header ghost, the same shape a clip's is: the track's own name
+        // under the pointer, so what is in the hand is legible while it moves.
+        let header_ghost: SharedString = name.clone().into();
+        // The line this row draws between itself and its neighbour while a
+        // header is being carried -- and, like every other drag cue here, only
+        // while the gesture is still in flight.
+        let drop = self
+            .lane_drop
+            .filter(|d| d.lane == lane && cx.has_active_drag());
         let remove_tip: SharedString = format!(
             "Remove {name} — it must be empty first, and {} brings it back",
             self.keymap.display(ActionId::Undo)
@@ -800,10 +812,35 @@ impl Player {
             .h(px(LANE_H))
             .flex()
             .gap(px(HEADER_GAP))
+            // A header let go anywhere along this row lands the track in the
+            // hand in this row's place: the whole width is the target, not the
+            // 40 px column, because a slot is what is being aimed at. The bed's
+            // own drops carry other payloads and never see this one.
+            .relative()
+            .on_drop(cx.listener(move |this, drag: &LaneDrag, _, cx| {
+                this.reorder_lane(drag.0, lane, cx);
+            }))
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<LaneDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    this.preview_lane_drop(event.drag(cx).0, lane, cx);
+                },
+            ))
             // The fixed column the ruler above is offset by as well. Full lane
             // height, so it reads as the bed continuing rather than as a chip.
             .child(
                 div()
+                    // Dragged, the whole track moves in the stack -- the
+                    // gesture every editor reorders tracks with, and the reason
+                    // the column is a handle rather than a caption.
+                    .id(header_id)
+                    .cursor(CursorStyle::OpenHand)
+                    .tooltip(move |_, cx| cx.new(|_| Tip(header_tip.clone())).into())
+                    .on_drag(LaneDrag(lane), move |_, _, _, cx| {
+                        cx.new(|_| Tip(header_ghost.clone()))
+                    })
                     .flex_none()
                     .w(px(HEADER_W))
                     .h_full()
@@ -1326,5 +1363,24 @@ impl Player {
                             .bg(rgb(ACCENT_PLAYHEAD())),
                     ),
             )
+            // The drop indicator, last of all so it is over the header and the
+            // bed both: a line along the edge the track in the hand comes in
+            // at, which is the slot the release commits to. *Inside* the row
+            // rather than in the gutter between two, because the lane column
+            // scrolls ([`Player::lanes_scroll`]) and anything drawn past the
+            // first row's top edge is clipped away by it -- an indicator that
+            // vanished on exactly the drop everybody tries first.
+            .children(drop.map(|d| {
+                let line = div()
+                    .absolute()
+                    .left_0()
+                    .w_full()
+                    .h(px(3.))
+                    .bg(rgb(ACCENT_PRIMARY()));
+                match d.above {
+                    true => line.top_0(),
+                    false => line.bottom_0(),
+                }
+            }))
     }
 }
