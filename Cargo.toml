@@ -25,7 +25,16 @@ edition = "2024"
 #                 declared one, which fails every seek into an open-GOP Blu-ray
 #                 remux -- the gap is the *editor's*, made by restarting at a
 #                 random access point, so the patch fills it with the §8.2.5.2
-#                 non-existing frames the loop right below it already builds
+#                 non-existing frames the loop right below it already builds.
+#                 It also has no HEVC *encoder* at all in 0.0.6: the seven
+#                 commits behind cros-codecs' own `hevc-vaapi-encoder` branch
+#                 (`codec/h265/{nalu_writer,synthesizer}`, the VPS/SPS/PPS
+#                 builders in `codec/h265/parser.rs`, `encoder/stateless/h265`
+#                 with its predictor and VA-API backend, and the H.264 NALU
+#                 writer's emulation-prevention fix that shares that code) are
+#                 applied here verbatim -- upstream work carried early, not a
+#                 local invention, and the H.265 half of what makes edith's
+#                 HEVC export run on the GPU
 #   rusty_aac   - its *decoder* runs the direct O(N²) IMDCT with a `cos` call per
 #                 term (the fast path in the same file serves the encoder only),
 #                 which is 4x slower than real time for 5.1 and therefore not
