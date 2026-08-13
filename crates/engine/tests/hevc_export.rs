@@ -195,6 +195,69 @@ fn an_hevc_export_decodes_back_into_pictures_through_edith() {
     }
 }
 
+/// The same 1080p picture, coded by the **GPU**, and the test that would have
+/// caught what shipped: the hardware seat's file decoded frame for frame while
+/// every frame of it was a band of noise over flat green, because the parameter
+/// sets promised coding tools the driver was not using. Nothing that counts
+/// frames sees that. Three things do, and all three are asserted here --
+/// ffmpeg's decoder saying *nothing at all* on its error channel, the coded
+/// size still cropping back to 1920x1080, and the picture being the source's
+/// rather than a fill (SSIM against the very frames that went in; a desynced
+/// stream scores about 0.2, this one about 0.98).
+///
+/// `testsrc2` is what makes it bite: 1080p of it splits transform trees deep
+/// enough and pushes the rate controller hard enough to need the syntax the
+/// parameter sets have to declare. The two-frame fixtures above are flat and
+/// pass either way, which is exactly how the defect got through.
+#[test]
+#[ignore = "needs libengine_hw.so, VE_HW_HEVC=1 and a driver with an HEVC encode entrypoint"]
+fn a_1080p_hardware_export_leaves_a_decoder_with_nothing_to_say() {
+    let Some(source) = fixture_1080p() else {
+        eprintln!("no ffmpeg: skipping the 1080p hardware twin");
+        return;
+    };
+    let session = PlaybackSession::open(&source).expect("open the 1080p fixture");
+    let settings = ExportSettings {
+        format: Format::Hevc,
+        ..Default::default()
+    };
+    let planned = engine::export::planned_video(session.meta(), &settings);
+    assert!(
+        planned.is_some_and(|seat| seat.contains("HW encode")),
+        "this twin is the GPU's, and this box named {planned:?} (VE_HW_HEVC=1?)"
+    );
+
+    let out = out_path("1080p_hw", "mkv");
+    export(&session, &out, Format::Hevc);
+
+    let probed = probe(&out);
+    assert_eq!(
+        probed.as_deref(),
+        Some("hevc,1920,1080"),
+        "ffprobe reads the cropped size out of the bitstream"
+    );
+
+    let decoded = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&out)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let complaints = String::from_utf8_lossy(&decoded.stderr);
+    assert!(
+        decoded.status.success() && complaints.is_empty(),
+        "a decoder complained about the GPU's stream: {complaints}"
+    );
+
+    let ssim = ssim(&source, &out).expect("ffmpeg reports an SSIM");
+    assert!(
+        ssim >= 0.90,
+        "the GPU coded the source's picture, not a fill (SSIM {ssim:.4})"
+    );
+    std::fs::remove_file(&out).unwrap();
+    let _ = std::fs::remove_file(&source);
+}
+
 /// An audio-only timeline has no picture to code, and an HEVC export says so by
 /// name exactly as the mp4 and AV1 ones do -- and writes nothing.
 #[test]
@@ -268,6 +331,27 @@ fn probe(path: &Path) -> Option<String> {
         .output()
         .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Mean SSIM of `out` against `source`, over the frames the two have in common,
+/// as ffmpeg's own filter measures it. `None` where ffmpeg is not installed or
+/// said nothing -- the caller decides whether that is a skip or a failure.
+fn ssim(source: &Path, out: &Path) -> Option<f64> {
+    let measured = Command::new("ffmpeg")
+        .args(["-v", "info", "-i"])
+        .arg(source)
+        .arg("-i")
+        .arg(out)
+        .args(["-filter_complex", "ssim", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&measured.stderr)
+        .rsplit("All:")
+        .next()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// A two-second 1920x1080 H.264 fixture in the temp directory -- the assets are
