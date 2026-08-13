@@ -11243,11 +11243,11 @@ mod tests {
         let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
         session.set_gain(0.0);
         let v2 = session.add_lane(LaneKind::Video);
-        let path = session.sources()[0].path.clone();
+        // A bare layer, through the one-lane door: a *drop* on V2 brings the
+        // file's sound down with it and would put a third clip over this span.
+        let whole = session.lane_clips(Lane::V1)[0];
         assert!(
-            session
-                .place_stream_at(0.0, &path, 0, Some(v2))
-                .expect("its own file is on this timeline"),
+            session.place_at(v2, 0.0, whole),
             "a layer covering the same frames as the take"
         );
 
@@ -11679,30 +11679,50 @@ mod tests {
         );
         assert_eq!(session.lane_clips(v2).len(), 1, "the drop landed on V2");
         assert_eq!(session.lane_clips(v2)[0].start, 30, "at the playhead");
+        // ...with the sound it came with, on the row of its own the drop added:
+        // a file with audio dropped on a layer used to land silent.
+        let a2 = Lane::new(LaneKind::Audio, 1);
+        assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1, v2, a2]);
+        assert_eq!(session.lane_clips(a2), session.lane_clips(v2), "same take");
+        assert_eq!(
+            session.lane_clips(v2)[0].link,
+            session.lane_clips(a2)[0].link,
+            "grouped, so a drag moves both"
+        );
         // And nowhere else: the first pair is exactly as it was, one take each.
         assert_eq!(session.lane_clips(Lane::V1).len(), 1);
         assert_eq!(session.lane_clips(Lane::A1).len(), 1);
+        // ...and it is a project that saves and opens again as it stands: a
+        // grouped pair on a further row is what the file has to carry.
+        let dir = engine::scratch::Scratch::dir("ve_layer");
+        let file = dir.join("layer.edith");
+        session.save_project(&file).expect("save the project");
+        let back = PlaybackSession::open_project(&file).expect("it loads as it stands");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(back.lanes(), session.lanes());
+        for lane in back.lanes() {
+            assert_eq!(back.lane_clips(lane), session.lane_clips(lane), "{lane:?}");
+        }
         // Delete on the layer is a lift: it is laid over the timeline, so
         // closing a hole under it would drag the take beneath out of step with
         // it. The take on the first pair is still a take, and still ripples.
         assert!(!whole_take(&session, v2, 0));
         assert!(whole_take(&session, Lane::V1, 0));
         assert!(whole_take(&session, Lane::A1, 0));
+        assert_eq!(a2.label(), "A2");
         assert!(session.lift_clip(v2, 0));
         assert!(session.lane_clips(v2).is_empty());
         assert_eq!(session.lane_clips(Lane::V1).len(), 1, "V1 stayed put");
+        assert_eq!(
+            session.lane_clips(a2).len(),
+            1,
+            "a lift takes the half it names: the sound is still there to lift"
+        );
+        assert!(session.lift_clip(a2, 0));
 
         // A second audio lane used to be what an mp4 export could not write --
         // it copied one AAC track and a mix is not a copy. It mixes now
         // (`export::copy_audio`), so no row is greyed by a count of lanes.
-        assert_eq!(format_refusal(&session, Format::Mp4), None);
-        let a2 = session.add_lane(LaneKind::Audio);
-        assert_eq!(a2.label(), "A2");
-        assert!(
-            session
-                .place_stream_at(0.0, &path, 0, Some(a2))
-                .expect("its own file is on this timeline")
-        );
         for format in [Format::Mp4, Format::Av1, Format::Av1Mp4] {
             assert_eq!(
                 format_refusal(&session, format),
@@ -11711,10 +11731,10 @@ mod tests {
             );
         }
 
-        // Undo, one edit at a time and backwards: the drop on A2, the lane A2
-        // itself, the lift, the drop on V2, and last the lane V2 -- an added
-        // track is one step like every other edit.
-        for lanes in [4, 3, 3, 3, 2] {
+        // Undo, one edit at a time and backwards: the lift of the sound, the
+        // lift of the picture, the drop on V2 with the lane A2 it added, and
+        // last the lane V2 -- an added track is one step like every other edit.
+        for lanes in [4, 4, 3, 2] {
             assert!(session.undo());
             assert_eq!(session.lanes().len(), lanes);
         }
