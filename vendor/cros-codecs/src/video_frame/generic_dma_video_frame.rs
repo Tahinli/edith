@@ -338,6 +338,13 @@ impl<'a> Drop for DmaMapping<'a> {
                     // reports a race when it was tried; the mfence pair either
                     // side is what orders the flushes, and the sixty-four
                     // redundant flushes per line were never what did.
+                    // A plane of no bytes has no line to flush, and the last-line
+                    // flush below would touch the byte after the mapping.
+                    // Upstream's byte loop flushed nothing at all for `0..0`,
+                    // and this keeps that.
+                    if *len == 0 {
+                        continue;
+                    }
                     let base = addr.as_ptr() as *const u8;
                     for offset in (0..*len).step_by(CACHE_LINE) {
                         _mm_clflush(base.offset(offset as isize));
