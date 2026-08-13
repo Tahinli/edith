@@ -77,11 +77,42 @@ use std::time::{Duration, Instant};
 /// and a scan that names its files passes a rule by simply not looking where
 /// the code went. So the files are found rather than listed: every `.rs` under
 /// `src/`, read at run time.
+///
+/// For asking *whether* a line is written anywhere. Never slice it: the files
+/// are joined end to end, so a cut that runs to "the next `fn`" runs out of
+/// the file it started in and reads the following one as more of the same
+/// ([`source_from`]).
 fn ui_source() -> String {
     source_files()
         .iter()
         .map(|path| std::fs::read_to_string(path).expect("a source file"))
         .collect()
+}
+
+/// The one file `needle` is written in, from the needle to the end of *that*
+/// file. Every scan that slices starts here, because the alternative is
+/// slicing [`ui_source()`]: 42 files with 42 seams between them, and the last
+/// fn of any of them -- `silence_card` in `ui/cards.rs` -- read as running on
+/// into the file that happens to follow it. The file is found and not named,
+/// so the code may move house without this going blind.
+fn source_from(needle: &str) -> String {
+    source_files()
+        .iter()
+        .map(|path| std::fs::read_to_string(path).expect("a source file"))
+        .find_map(|text| text.find(needle).map(|at| text[at..].to_string()))
+        .unwrap_or_else(|| panic!("no {needle} in the window's source"))
+}
+
+/// One method's body: from its `fn` line to the `    }` that closes it. The
+/// brace at the impl's own indent is where a method ends and nothing inside
+/// one is written that far out -- which the old cut, "up to the next
+/// `\n    fn `", was not: these methods are `pub(crate) fn`, so it matched
+/// none of them and read every card's body as running to the end of the
+/// window instead.
+fn fn_body(name: &str) -> String {
+    let text = source_from(&format!("fn {name}("));
+    let end = text.find("\n    }\n").map_or(text.len(), |at| at + "\n    }\n".len());
+    text[..end].to_string()
 }
 
 /// One named file of that source, for the scans about a single region.
