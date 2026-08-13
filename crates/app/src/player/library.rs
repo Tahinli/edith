@@ -475,8 +475,13 @@ impl Player {
         place: bool,
     ) -> String {
         match opened {
-            Ok((session, subs)) => {
+            Ok((mut session, subs)) => {
                 self.fps = session.meta().frame_rate;
+                // This window *is* the real-time viewer: a picture already past
+                // the clock is one `pump` takes off the channel and throws away,
+                // so the worker stops paying for it instead
+                // ([`PlaybackSession::drop_late_pictures`]).
+                session.drop_late_pictures(true);
                 // Read before the session moves: a file that plays silent says
                 // so here or nowhere.
                 let silent = audio_notice(&session);
@@ -737,8 +742,10 @@ impl Player {
             return;
         }
         let text = match opened {
-            Ok(session) => {
+            Ok(mut session) => {
                 self.fps = session.meta().frame_rate;
+                // As at the file door above: the window watches in real time.
+                session.drop_late_pictures(true);
                 let silent = audio_notice(&session);
                 // A project is named after itself but still exports beside its
                 // media: that is the only place an export has ever landed.

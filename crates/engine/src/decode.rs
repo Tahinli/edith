@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 
 use rusty_h264::Decoder;
@@ -136,15 +136,171 @@ pub(crate) struct Worker {
     /// `None` once detached, and for a range with nothing to decode: either way
     /// there is no thread left to wait for.
     handle: Option<thread::JoinHandle<()>>,
+    /// How a *later* span reaches this same thread ([`Worker::reseek`]), for the
+    /// workers that decode a file: the still, the gap and a detached worker have
+    /// no such door and are the one-span threads they always were.
+    reuse: Option<Reuse>,
+}
+
+/// The door a persistent decode worker is steered through: the file it has open,
+/// the channel its next span arrives on, and the generation counter that tells
+/// the span it is decoding *now* that nobody is waiting for it any more.
+///
+/// The point of all three is that a seek onto the same file costs a demuxer
+/// seek and a decoder flush ([`crate::hw::HwSession::seek`]) rather than a
+/// thread, a container parse and a VA-API initialisation (98 ms measured).
+struct Reuse {
+    path: PathBuf,
+    spans: std::sync::mpsc::Sender<SpanCmd>,
+    /// Bumped by every reseek and by [`Worker::abandon`]; the decode loop stops
+    /// the moment it no longer matches the span it was handed.
+    generation: Arc<AtomicU64>,
+    /// The worker's decoder, published once and read across every span it
+    /// decodes -- so a reseek onto a file already open says "hardware" from the
+    /// first repaint instead of going back through `opening`.
+    backend: BackendCell,
+    /// Where the caller's playhead stands, in this file's own frames
+    /// ([`Worker::playhead`]): the worker converts and sends nothing behind it.
+    /// Rewritten to the target by every reseek, so it can never carry one span's
+    /// position into the next.
+    floor: Arc<AtomicU32>,
+}
+
+/// One span asked of a persistent worker: the range in the file's own frames,
+/// everything a picture is graded, placed and mapped by, and the channel the
+/// pictures go down. Carries its generation, so a command already superseded on
+/// its way through the queue is dropped rather than decoded.
+struct SpanCmd {
+    generation: u64,
+    start: u32,
+    end: u32,
+    color: ColorParams,
+    canvas: Composer,
+    tone: tonemap::Preset,
+    tx: SyncSender<Frame>,
+}
+
+/// What stops a decode loop: the worker's terminal flag (the thread itself is
+/// going away) and the generation of the span it was handed (only *this* span is
+/// going away). One check, so every loop treats them alike.
+///
+/// ...and where the playhead has reached ([`Abort::late`]), which is the same
+/// question one picture at a time: a frame due before it is a frame nobody can
+/// be shown any more.
+struct Abort<'a> {
+    cancel: &'a AtomicBool,
+    generation: &'a AtomicU64,
+    mine: u64,
+    floor: &'a AtomicU32,
+}
+
+impl Abort<'_> {
+    fn hit(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.generation.load(Ordering::Acquire) != self.mine
+    }
+
+    /// Whether the picture at source frame `index` is already past due: the
+    /// caller's playhead has gone by it, so converting it (a full BGRA pass over
+    /// 8 MB at 1080p) and queueing it would only push a picture nobody sees in
+    /// front of the one they are waiting for.
+    ///
+    /// It is still *decoded* -- the pictures after it reference it -- and the
+    /// floor only ever moves with the playhead the session publishes, so a
+    /// paused session (and every seek, which republishes its own target) drops
+    /// nothing at all.
+    fn late(&self, index: u32) -> bool {
+        self.floor.load(Ordering::Relaxed) > index
+    }
 }
 
 impl Worker {
-    /// Stops the worker at its next check without waiting. Callers that replace
-    /// a worker should do this first and drop the receiver second: a worker
-    /// parked in `send` only wakes on the disconnect, so the join below would
-    /// otherwise wait for a consumer that is never coming.
-    pub(crate) fn cancel(&self) {
+    /// Stops the worker *and its thread* at their next check, without waiting.
+    /// Callers that replace a worker should do this first and drop the receiver
+    /// second: a worker parked in `send` only wakes on the disconnect, so the
+    /// join below would otherwise wait for a consumer that is never coming.
+    ///
+    /// The command channel goes with it, which is what wakes a persistent worker
+    /// parked between spans -- without that it would sit in `recv` forever and a
+    /// retired worker would never be reaped (nor joined at exit in any bounded
+    /// time, which is the Mesa `atexit` hazard this whole type exists for).
+    pub(crate) fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Release);
+        self.reuse = None;
+    }
+
+    /// Stops the span the worker is decoding, keeping the *thread* -- and with
+    /// it the open file and the open decoder -- for the span that follows. What
+    /// a seek does, since the next thing it says is [`Worker::reseek`].
+    ///
+    /// Falls back to [`cancel`](Self::cancel) for a worker with nothing to
+    /// reuse (a still, a gap, a detached one), where the two mean the same
+    /// thing: this worker has no next span.
+    pub(crate) fn abandon(&mut self) {
+        match &self.reuse {
+            Some(reuse) => {
+                reuse.generation.fetch_add(1, Ordering::Release);
+            }
+            None => self.cancel(),
+        }
+    }
+
+    /// Tells the worker where the caller's playhead stands, in the file's own
+    /// frames: it converts and queues nothing behind that, because a picture
+    /// whose moment has passed cannot be shown and would only delay the one that
+    /// can (see [`Abort::late`]). A worker with no reuse door -- a still, a gap
+    /// -- has nothing to tell, and this costs it nothing to say.
+    pub(crate) fn playhead(&self, source_frame: u32) {
+        if let Some(reuse) = &self.reuse {
+            reuse.floor.store(source_frame, Ordering::Relaxed);
+        }
+    }
+
+    /// Points this worker at another range of the file it already has open,
+    /// handing back the channel the new span's pictures arrive on and the cell
+    /// that says what is decoding them. `None` when this worker cannot take the
+    /// job -- another file, no reuse door, or a thread that has already returned
+    /// -- and the caller then opens a worker of its own, exactly as it always
+    /// did.
+    ///
+    /// The pictures of the *old* span are left in their own channel, which the
+    /// caller drops: that disconnect is what wakes this worker if it is parked
+    /// in `send`, and only then does it reach the command below. So the order at
+    /// the call site is unchanged -- install the new receiver, and the old
+    /// worker finds out by losing its consumer.
+    pub(crate) fn reseek(
+        &mut self,
+        path: &Path,
+        start: u32,
+        end: u32,
+        color: ColorParams,
+        canvas: Composer,
+        tone: tonemap::Preset,
+    ) -> Option<(Receiver<Frame>, BackendCell)> {
+        let reuse = self.reuse.as_ref()?;
+        if reuse.path != path || self.is_finished() {
+            return None;
+        }
+        let (tx, rx) = sync_channel(canvas.queue_depth());
+        // The new span's own playhead, before its first picture is decoded: a
+        // floor left over from where the timeline *was* would drop every
+        // picture of a seek that went backwards.
+        reuse.floor.store(start, Ordering::Relaxed);
+        // Bumped before the command is queued, so the span running now stops at
+        // its next picture whatever order the two threads are scheduled in.
+        let generation = reuse.generation.fetch_add(1, Ordering::Release) + 1;
+        reuse
+            .spans
+            .send(SpanCmd {
+                generation,
+                start,
+                end,
+                color,
+                canvas,
+                tone,
+                tx,
+            })
+            .ok()?;
+        Some((rx, reuse.backend.clone()))
     }
 
     /// Whether the thread has already returned, i.e. dropping this would not
@@ -158,8 +314,14 @@ impl Worker {
 
     /// Lets the worker run on unwatched -- what the public API does, since it
     /// hands out the flag alone.
+    ///
+    /// The reuse door goes with the handle: nothing can steer a worker nobody
+    /// holds, and dropping the command channel is what makes such a thread end
+    /// at its span rather than park waiting for a next one it can never be
+    /// given -- with a VA-API session open, into Mesa's `atexit`.
     fn detach(mut self) -> Arc<AtomicBool> {
         self.handle = None;
+        self.reuse = None;
         Arc::clone(&self.cancel)
     }
 }
@@ -167,6 +329,8 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
+            // `cancel` drops the command channel too, so a worker parked between
+            // spans wakes on the disconnect and this join is bounded.
             self.cancel();
             let _ = handle.join();
         }
@@ -258,6 +422,7 @@ impl DecodeSession {
                 worker: Worker {
                     cancel,
                     handle: None,
+                    reuse: None,
                 },
                 backend: BackendCell::new(Backend::Gap),
             };
@@ -287,7 +452,11 @@ impl DecodeSession {
             .ok();
         FrameStream {
             frames: rx,
-            worker: Worker { cancel, handle },
+            worker: Worker {
+                cancel,
+                handle,
+                reuse: None,
+            },
             backend: BackendCell::new(Backend::Gap),
         }
     }
@@ -317,6 +486,7 @@ impl DecodeSession {
                 worker: Worker {
                     cancel,
                     handle: None,
+                    reuse: None,
                 },
                 backend: BackendCell::new(Backend::Still),
             });
@@ -369,7 +539,11 @@ impl DecodeSession {
             .ok();
         Ok(FrameStream {
             frames: rx,
-            worker: Worker { cancel, handle },
+            worker: Worker {
+                cancel,
+                handle,
+                reuse: None,
+            },
             backend: BackendCell::new(Backend::Still),
         })
     }
@@ -414,57 +588,34 @@ impl DecodeSession {
             hw_decodes(&path, start_frame, meta.codec)?;
         }
         let end_frame = end_frame.min(meta.frame_count);
-        // Small bound: a 720p BGRA frame is ~3.5 MB, so we must not let the
-        // decoder run ahead of the display without limit.
-        let (tx, rx) = sync_channel(2);
-        let cancel = Arc::new(AtomicBool::new(false));
-        // Written by the worker below the moment it knows, so a caller reading
-        // it sees what opened rather than what was hoped for.
-        let backend = BackendCell::default();
         if end_frame <= start_frame {
-            // Nothing to decode: dropping `tx` here closes the channel cleanly,
+            // Nothing to decode: a disconnected receiver and no thread at all,
             // so the caller sees an immediate end of stream rather than an error.
+            let (_, rx) = sync_channel(1);
             return Ok((
                 meta,
                 FrameStream {
                     frames: rx,
                     worker: Worker {
-                        cancel,
+                        cancel: Arc::new(AtomicBool::new(false)),
                         handle: None,
+                        reuse: None,
                     },
-                    backend,
+                    backend: BackendCell::default(),
                 },
             ));
         }
-        let worker_cancel = Arc::clone(&cancel);
-        let worker_backend = backend.clone();
-        let handle = thread::Builder::new()
-            .name("decode".into())
-            .spawn(move || {
-                decode_span(
-                    &path,
-                    demuxer,
-                    meta,
-                    start_frame,
-                    end_frame,
-                    color,
-                    canvas,
-                    tone,
-                    tx,
-                    &worker_cancel,
-                    &worker_backend,
-                )
-            })?;
         Ok((
             meta,
-            FrameStream {
-                frames: rx,
-                worker: Worker {
-                    cancel,
-                    handle: Some(handle),
-                },
-                backend,
-            },
+            span_worker(
+                path,
+                Some(Source::demuxed(demuxer, meta)),
+                start_frame,
+                end_frame,
+                color,
+                canvas,
+                tone,
+            ),
         ))
     }
 
@@ -488,120 +639,312 @@ impl DecodeSession {
         canvas: Composer,
         tone: tonemap::Preset,
     ) -> FrameStream {
-        let path = path.as_ref().to_path_buf();
-        let (tx, rx) = sync_channel(2);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let backend = BackendCell::default();
-        let worker_cancel = Arc::clone(&cancel);
-        let worker_backend = backend.clone();
-        let handle = thread::Builder::new()
-            .name("decode".into())
-            .spawn(move || {
-                // Cancelled before this thread was even scheduled: do not open
-                // the file at all. A scrub abandons workers by the dozen and
-                // this is where all but the last of them stop.
-                if worker_cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let (meta, demuxer) = match Demuxer::open(&path) {
-                    Ok(opened) => opened,
-                    Err(e) => {
-                        eprintln!("video open failed: {e}");
-                        // Dropping `tx` disconnects the receiver, which is the
-                        // session's "walk on to the next span".
-                        worker_backend.set(Backend::Gap);
-                        return;
-                    }
-                };
-                decode_span(
-                    &path,
-                    demuxer,
-                    meta,
-                    start_frame,
-                    // The clamp the sync opener does with the metadata it read
-                    // on the caller's thread; here the metadata arrives first.
-                    end_frame.min(meta.frame_count),
-                    color,
-                    canvas,
-                    tone,
-                    tx,
-                    &worker_cancel,
-                    &worker_backend,
-                )
-            })
-            .ok();
-        FrameStream {
-            frames: rx,
-            worker: Worker { cancel, handle },
-            backend,
-        }
+        span_worker(
+            path.as_ref().to_path_buf(),
+            None,
+            start_frame,
+            end_frame,
+            color,
+            canvas,
+            tone,
+        )
     }
 }
 
-/// One worker thread's whole job, on that thread: pick the decoder, decode
-/// `[start_frame, end_frame)`, send the pictures. Both openers end here -- the
-/// sync one, which demuxed on the caller's thread, and the deferred one, which
-/// demuxed on this one -- so there is exactly one description of what a decode
-/// worker does, whoever opened the file.
+/// Spawns a decode worker over `path` and gives it its first span. The thread
+/// **outlives that span**: it parks on its command channel afterwards, so the
+/// next seek onto the same file reaches it through [`Worker::reseek`] and costs
+/// a demuxer seek and a decoder flush instead of a thread, a container parse and
+/// a VA-API initialisation (98 ms measured worst case).
+///
+/// `opened` is the file when the caller already read it (the sync opener, which
+/// demuxes on the caller's thread to have metadata to return); `None` is the
+/// deferred one, where the worker opens it and nothing here touches the disk.
 #[allow(clippy::too_many_arguments)]
-fn decode_span(
-    path: &PathBuf,
-    demuxer: Demuxer,
-    meta: VideoMeta,
+fn span_worker(
+    path: PathBuf,
+    opened: Option<Source>,
     start_frame: u32,
     end_frame: u32,
     color: ColorParams,
     canvas: Composer,
     tone: tonemap::Preset,
-    tx: SyncSender<Frame>,
-    cancel: &AtomicBool,
+) -> FrameStream {
+    // The depth is the size of the pictures this worker will *emit*, which for a
+    // pass-through canvas is the stream's own -- and the sync opener has already
+    // read that on the caller's thread. Asking the canvas alone is how the file
+    // door came up with 2: every session opens pass-through (a freshly opened
+    // file *is* the project resolution), so a whole file would play at the
+    // decode-ahead this engine had before there was one, until the first seek
+    // built a real canvas.
+    let depth = match (&opened, canvas.places_nothing()) {
+        (Some(source), true) => crate::scale::queue_depth(source.meta.width, source.meta.height),
+        _ => canvas.queue_depth(),
+    };
+    let (tx, rx) = sync_channel(depth);
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Written by the worker the moment it knows, so a caller reading it sees
+    // what opened rather than what was hoped for -- and kept across the spans
+    // that follow, since they are decoded by that very decoder.
+    let backend = BackendCell::default();
+    let generation = Arc::new(AtomicU64::new(0));
+    // The playhead starts where the span does: nothing is behind it yet.
+    let floor = Arc::new(AtomicU32::new(start_frame));
+    let (spans, commands) = std::sync::mpsc::channel();
+    let first = SpanCmd {
+        generation: 0,
+        start: start_frame,
+        end: end_frame,
+        color,
+        canvas,
+        tone,
+        tx,
+    };
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_backend = backend.clone();
+    let worker_generation = Arc::clone(&generation);
+    let worker_floor = Arc::clone(&floor);
+    let worker_path = path.clone();
+    let handle = thread::Builder::new()
+        .name("decode".into())
+        .spawn(move || {
+            let mut source = opened;
+            let mut cmd = first;
+            loop {
+                let abort = Abort {
+                    cancel: &worker_cancel,
+                    generation: &worker_generation,
+                    mine: cmd.generation,
+                    floor: &worker_floor,
+                };
+                // Superseded (or cancelled) before this thread was even
+                // scheduled: do not open the file, and do not enter VA-API
+                // initialisation, which is the one stretch a cancel cannot
+                // interrupt. A scrub abandons spans by the dozen and this is
+                // where all but the last of them stop.
+                if !abort.hit() {
+                    run_span(&worker_path, &mut source, cmd, &abort, &worker_backend);
+                }
+                // Parked between spans. A seek and a clip boundary arrive in
+                // milliseconds and find the decoder still open, which is the
+                // whole point of this thread -- but a session nobody comes back
+                // to (the timeline played out, the window was left alone) must
+                // not sit on the driver: it would hold a live libva thread into
+                // whatever exit path the process takes, which is the SIGSEGV in
+                // Mesa's `atexit` the retired pool exists to prevent, and
+                // holding it *while idle* would widen that from "quit during a
+                // decode" to "quit any time after opening a file".
+                //
+                // So the wait is in two halves: the fast one keeps everything,
+                // and past [`IDLE`] the hardware session is closed. The demuxer
+                // stays -- it is a file handle and an index, not driver state,
+                // and rebuilding it is what costs seconds on a big Matroska --
+                // so the reseek after a long pause pays one VA-API init and
+                // nothing else.
+                match commands.recv_timeout(IDLE) {
+                    Ok(next) => cmd = next,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(source) = &mut source
+                            && source.hw.take().is_some()
+                        {
+                            eprintln!("decode worker idle: hardware session closed");
+                        }
+                        // The session dropped the command channel: this worker
+                        // is retired (or was detached), so the file goes now.
+                        match commands.recv() {
+                            Ok(next) => cmd = next,
+                            Err(_) => return,
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        })
+        .ok();
+    FrameStream {
+        frames: rx,
+        worker: Worker {
+            cancel,
+            handle,
+            reuse: Some(Reuse {
+                path,
+                spans,
+                generation,
+                backend: backend.clone(),
+                floor,
+            }),
+        },
+        backend,
+    }
+}
+
+/// How long a parked worker keeps its hardware session before closing it. Long
+/// enough that a seek, a scrub step and a clip boundary all find the decoder
+/// where they left it; short enough that a session left alone is not holding
+/// libva when the process exits.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many pictures in a row a worker may drop for being late before it hands
+/// one over regardless. The policy needs a floor of its own: a machine that
+/// cannot decode a file in real time is late on *every* picture, and dropping
+/// every picture is a black screen rather than a stutter -- so the slowest seat
+/// still gets one in nine, which is roughly what it could paint before (the
+/// front-end restarted the decoder once every two seconds to the same effect,
+/// and paid a VA-API init for each restart).
+const LATE_RUN: u32 = 8;
+
+/// What a decode worker keeps **between** the spans it is asked for: the
+/// container it read, what the stream says about itself, and the hardware
+/// session -- the three things a seek used to throw away and buy again.
+struct Source {
+    meta: VideoMeta,
+    /// What the film says its brightest picture is ([`Demuxer::light`]): the
+    /// tone map's assumed peak on the reference rendition, so a 1759 cd/m^2
+    /// grade is converted at 1759 rather than at the 1000 a file that declared
+    /// nothing is assumed at. A property of the stream, read once with it.
+    peak: Option<f32>,
+    demuxer: Demuxer,
+    /// The plugin's session, opened on this thread (its VA-API state is not
+    /// `Send`-safe across a hand-off) and *kept*. `None` for software: forced by
+    /// `VE_SW`, refused by the plugin, or handed back by a session that opened
+    /// and then decoded nothing.
+    hw: Option<HwSession>,
+}
+
+impl Source {
+    /// The file as the sync opener already read it.
+    fn demuxed(demuxer: Demuxer, meta: VideoMeta) -> Self {
+        Self {
+            meta,
+            peak: demuxer.light().peak(),
+            demuxer,
+            hw: None,
+        }
+    }
+
+    /// ...and as the deferred opener reads it, on the worker. `None` is a file
+    /// that would not open: the caller drops the sender, and the disconnected
+    /// receiver is the session's "walk on to the next span".
+    fn open(path: &Path) -> Option<Self> {
+        match Demuxer::open(path) {
+            Ok((meta, demuxer)) => Some(Self::demuxed(demuxer, meta)),
+            Err(e) => {
+                eprintln!("video open failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Puts the hardware decoder at `start`, keeping the session open where the
+    /// plugin can reposition it. `None` when there is no hardware here at all;
+    /// otherwise whether the session was **reused** -- which is what lets the
+    /// caller tell a driver that cannot decode this stream from one that merely
+    /// did not follow a reseek.
+    fn position_hw(&mut self, path: &Path, start: u32) -> Option<bool> {
+        if let Some(hw) = &mut self.hw {
+            if hw.seek(start) {
+                eprintln!("decode backend: hardware (VA-API plugin, session kept, seek to {start})");
+                return Some(true);
+            }
+            // A plugin too old to reposition, or a decoder that would not
+            // flush: closed and opened again, which is what every seek did.
+            self.hw = None;
+        }
+        self.hw = open_hw(path, start);
+        self.hw.as_ref().map(|_| {
+            eprintln!("decode backend: hardware (VA-API plugin)");
+            false
+        })
+    }
+}
+
+/// One span on a worker's thread: position the decoder, decode
+/// `[start, end)`, send the pictures. Every opener ends here -- the sync one,
+/// which demuxed on the caller's thread, the deferred one, which demuxes on
+/// this one, and every reseek after them -- so there is exactly one description
+/// of what a decode worker does.
+fn run_span(
+    path: &Path,
+    source: &mut Option<Source>,
+    cmd: SpanCmd,
+    abort: &Abort,
     backend: &BackendCell,
 ) {
+    let SpanCmd {
+        start,
+        end,
+        color,
+        canvas,
+        tone,
+        tx,
+        ..
+    } = cmd;
+    let opened = match source {
+        Some(opened) => opened,
+        None => {
+            let Some(fresh) = Source::open(path) else {
+                backend.set(Backend::Gap);
+                return;
+            };
+            source.insert(fresh)
+        }
+    };
+    // The clamp the sync opener does with the metadata it read on the caller's
+    // thread; here the metadata arrives first.
+    let end = end.min(opened.meta.frame_count);
     // An empty range decodes nothing and must send nothing: `run_hw` counts a
     // frame *out* before it compares, so without this a zero-length span would
-    // emit one picture. The sync opener never even spawns for this case.
-    if end_frame <= start_frame {
+    // emit one picture.
+    if end <= start {
         return;
     }
-    // Cancelled before this thread was even scheduled -- do not enter VA-API
-    // initialisation at all, because that is the one stretch a cancel cannot
-    // interrupt (~65-90 ms of driver setup that would then have to be torn
-    // down again).
-    if cancel.load(Ordering::Relaxed) {
-        return;
-    }
-    // The stream's own colour, and with it what the film says its brightest
-    // picture is ([`Demuxer::light`]): the tone map's assumed peak on the
-    // reference rendition, so a 1759 cd/m^2 grade is converted at 1759 rather
-    // than at the 1000 a file that declared nothing is assumed at. Both are
-    // properties of the stream, so neither can change while one range decodes.
-    let mut render = Render::new(color, meta.color, canvas, tone, demuxer.light().peak());
-    // The plugin has to be opened on the thread that uses it: its VA-API state
-    // is not `Send`-safe across a later hand-off.
-    if let Some(hw) = open_hw(path, start_frame) {
-        // Cancelled *during* init: close the session (dropping `hw` does it)
-        // and leave without decoding anything.
-        if cancel.load(Ordering::Relaxed) {
+    // The stream's own colour and peak brightness: properties of the stream, so
+    // neither can change while one range decodes -- but the grade, the canvas
+    // and the rendition are the *span's*, so this is built per span.
+    let mut render = Render::new(color, opened.meta.color, canvas, tone, opened.peak);
+    if let Some(reused) = opened.position_hw(path, start) {
+        // Cancelled during the init (or the seek): leave without decoding.
+        if abort.hit() {
             return;
         }
-        eprintln!("decode backend: hardware (VA-API plugin)");
         backend.set(Backend::Hardware);
-        if run_hw(hw, &tx, start_frame, end_frame, &mut render, cancel) {
+        let mut decoded = run_hw(
+            opened.hw.as_mut().expect("positioned above"),
+            &tx,
+            start,
+            end,
+            &mut render,
+            abort,
+        );
+        // A *reused* session that produced nothing may simply be one this
+        // reseek left where the driver would not follow; a session opened fresh
+        // at the same frame is the honest second question, and only its silence
+        // is a software fallback. Without this a single unfollowed seek would
+        // collapse the rest of the file to software.
+        if !decoded && reused {
+            eprintln!("hardware decode produced nothing after a reseek; reopening at frame {start}");
+            opened.hw = open_hw(path, start);
+            if let Some(hw) = opened.hw.as_mut() {
+                decoded = run_hw(hw, &tx, start, end, &mut render, abort);
+            }
+        }
+        if decoded {
             return;
         }
         // A driver that opens but cannot decode a single frame is still a
         // fallback case, not a dead session.
+        opened.hw = None;
         eprintln!("hardware decode failed before any frame, falling back to software");
     }
     // ...except where there is nothing to fall back to. Feeding HEVC or VP9
     // bytes to `rusty_h264` would be garbage, not a fallback.
-    if meta.codec != Codec::H264 {
-        eprintln!("{}", meta.codec.needs_plugin());
+    if opened.meta.codec != Codec::H264 {
+        eprintln!("{}", opened.meta.codec.needs_plugin());
         return;
     }
     eprintln!("decode backend: software (rusty_h264)");
     backend.set(Backend::Software);
-    run(demuxer, tx, start_frame, end_frame, &mut render, cancel)
+    run(&mut opened.demuxer, &tx, start, end, &mut render, abort)
 }
 
 /// One clip's pictures on their way to the renderer: graded, placed on the
@@ -856,7 +1199,7 @@ fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Ve
 
 /// `None` when the software path must be used: forced by `VE_SW=1`, or the
 /// plugin is absent/broken/unable to open this particular file.
-fn open_hw(path: &PathBuf, start_frame: u32) -> Option<HwSession> {
+fn open_hw(path: &Path, start_frame: u32) -> Option<HwSession> {
     if std::env::var_os("VE_SW").is_some_and(|v| v == "1") {
         return None;
     }
@@ -893,24 +1236,33 @@ fn hw_decodes(path: &PathBuf, start_frame: u32, codec: Codec) -> Result<(), Stri
 /// counted from there (a stream whose very first sample is not a sync sample
 /// cannot be decoded from its start at all, and is not accounted for).
 fn run_hw(
-    mut hw: HwSession,
+    hw: &mut HwSession,
     tx: &SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
     render: &mut Render,
-    cancel: &AtomicBool,
+    abort: &Abort,
 ) -> bool {
     let mut index = start_frame;
+    // Pictures dropped for being late since the last one handed over; see
+    // [`LATE_RUN`].
+    let mut skipped = 0;
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if abort.hit() {
             return true;
         }
         match hw.next_frame() {
             Ok(Some((y, u, v, width, height))) => {
-                let frame = render.frame(index, y, u, v, width, height);
+                let due = index;
                 index += 1;
-                if tx.send(frame).is_err() {
-                    return true; // consumer went away
+                if abort.late(due) && skipped < LATE_RUN {
+                    skipped += 1;
+                } else {
+                    skipped = 0;
+                    let frame = render.frame(due, y, u, v, width, height);
+                    if tx.send(frame).is_err() {
+                        return true; // consumer went away
+                    }
                 }
                 if index >= end_frame {
                     return true; // end of the requested range
@@ -1022,6 +1374,59 @@ mod tests {
         );
     }
 
+    /// The late-picture policy, at the one place it is decided. A worker told
+    /// the playhead is already at frame 20 must not spend a conversion and a
+    /// queue slot on the twenty pictures behind it -- they can never be shown --
+    /// and it must not go silent either, which is what [`LATE_RUN`] bounds: a
+    /// machine that cannot decode in real time is late on every picture, and one
+    /// in nine still reaches the screen.
+    ///
+    /// Deterministic on purpose: the floor is set by hand rather than by a clock
+    /// that would have to outrun a debug-build decoder to prove anything.
+    #[test]
+    fn a_worker_skips_the_pictures_the_playhead_has_gone_past() {
+        let take = |floor: u32| {
+            let stream = DecodeSession::open_worker_deferred(
+                asset("test_baseline.mp4"),
+                0,
+                u32::MAX,
+                ColorParams::default(),
+                Composer::passthrough(),
+                tonemap::Preset::default(),
+            );
+            stream.worker.playhead(floor);
+            let mut indices = Vec::new();
+            while indices.len() < 4 {
+                let frame = stream
+                    .frames
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a picture");
+                indices.push(frame.index);
+            }
+            indices
+        };
+
+        // Nobody has moved: every picture of the range is owed, in order.
+        assert_eq!(take(0), vec![0, 1, 2, 3]);
+
+        // The playhead is at 20, so the pictures before it are decoded (the ones
+        // after reference them) and dropped unconverted -- all but the one in
+        // nine [`LATE_RUN`] lets through, so the caller never goes blind.
+        let caught_up = take(20);
+        assert!(
+            caught_up[0] > 0 && caught_up.windows(2).any(|w| w[1] > w[0] + 1),
+            "nothing was skipped: {caught_up:?}"
+        );
+        assert!(
+            caught_up.iter().any(|&i| i >= 20),
+            "the playhead was never reached: {caught_up:?}"
+        );
+        assert!(
+            caught_up.len() >= 4,
+            "the worker went silent instead of dropping down to one in nine"
+        );
+    }
+
     /// Dropping a [`FrameStream`] whose frames nobody ever took must not wait.
     /// The channel is bounded, so such a worker is parked in `send` within a
     /// few frames, and the only thing that can wake it is its receiver going
@@ -1060,24 +1465,28 @@ mod tests {
 }
 
 fn run(
-    mut demuxer: Demuxer,
-    tx: SyncSender<Frame>,
+    demuxer: &mut Demuxer,
+    tx: &SyncSender<Frame>,
     start_frame: u32,
     end_frame: u32,
     render: &mut Render,
-    cancel: &AtomicBool,
+    abort: &Abort,
 ) {
+    // A decoder per span, and cheap: it is a parameter-set map and a picture
+    // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
+    // one this worker keeps.
     let mut decoder = Decoder::new();
     // Decoding has to restart at a sync sample, so pictures between it and
     // `start_frame` are decoded (the target frame references them) but never
     // converted or sent. Signed, because the landing sync sample can sit inside
     // what the file's edit list trims, i.e. *before* frame 0.
     let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
+    let mut skipped = 0;
 
     // corner-cut: emits pictures in decode order. Fine for Baseline (no B-frames);
     // reordering streams need POC-sorted output before display.
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if abort.hit() {
             break;
         }
         let au = match demuxer.next_access_unit() {
@@ -1100,17 +1509,23 @@ fn run(
             index += 1;
             continue;
         }
-        let frame = render.frame(
-            index as u32,
-            &yuv.y,
-            &yuv.u,
-            &yuv.v,
-            yuv.width as u32,
-            yuv.height as u32,
-        );
+        let due = index as u32;
         index += 1;
-        if tx.send(frame).is_err() {
-            break; // consumer went away
+        if abort.late(due) && skipped < LATE_RUN {
+            skipped += 1;
+        } else {
+            skipped = 0;
+            let frame = render.frame(
+                due,
+                &yuv.y,
+                &yuv.u,
+                &yuv.v,
+                yuv.width as u32,
+                yuv.height as u32,
+            );
+            if tx.send(frame).is_err() {
+                break; // consumer went away
+            }
         }
         if index >= i64::from(end_frame) {
             break; // end of the requested range
