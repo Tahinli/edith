@@ -1,0 +1,220 @@
+//! What a pointer is doing: the drags, the ghosts, the trims and the key repeat.
+
+use crate::*;
+
+/// A library row being dragged: the file and which of its audio streams that
+/// row is, which is the whole of what a row names. Where it lands does not
+/// change what is inserted.
+pub(crate) struct AssetDrag(pub(crate) PathBuf, pub(crate) usize);
+
+/// A clip already on the timeline being dragged: the lane it is on and its index
+/// there, which is how every other edit names a clip. Unlike an [`AssetDrag`]
+/// nothing is inserted -- the same clip changes lane and keeps the frames it
+/// plays -- but where along the bed it is let go is exactly where it lands, less
+/// the offset the hand grabbed it at ([`Player::grab`]).
+#[derive(Clone, Copy)]
+pub(crate) struct ClipDrag {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    /// The clip that was picked up, so the drop can find it again: gpui freezes
+    /// the payload for the whole gesture, and an edit made *during* one -- a
+    /// stroke deletes, undoes or pastes, none of which a drag blocks -- ripples
+    /// the indices under it. The index alone would then name a different take at
+    /// the release, and the drag would move a clip nobody touched (see
+    /// [`live_idx`]).
+    pub(crate) clip: Clip,
+}
+
+/// A track *header* being dragged: which track the hand took hold of, to be
+/// let go over the header of the one whose place it is to take
+/// ([`Player::reorder_lane`]). The lane alone -- a track carries its own clips
+/// wherever it goes, so unlike a [`ClipDrag`] there is nothing else to name.
+#[derive(Clone, Copy)]
+pub(crate) struct LaneDrag(pub(crate) Lane);
+
+/// Where a header drag in flight would leave the track in the hand: the lane
+/// whose slot it is about to take, and whether the line is drawn at that lane's
+/// top edge (it is coming up from below) or its bottom one. The drop indicator
+/// every editor draws between two tracks, and the header answer to the ghost a
+/// clip drag lays on a lane ([`Ghost`]) -- stale between gestures, which costs
+/// nothing because it is drawn only while one is live.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct LaneDrop {
+    pub(crate) lane: Lane,
+    pub(crate) above: bool,
+}
+
+/// Where the drag in flight would leave what it is carrying: the lane the
+/// pointer is over, the snapped head the release will commit ([`landing`]), and
+/// how long the thing is. Drawn on that lane as a translucent box the size of
+/// the take, so a landing is *seen* before the release rather than discovered
+/// after it -- the line ([`Player::snap_cue`]) marks the frame, this shows the
+/// body. `refused` is a drop the lane cannot take -- a picture over an audio
+/// track, a sound over a video one -- tinted rather than silent, because the
+/// refusal is coming at the release either way ([`lane_refuses`],
+/// [`Project::move_clip`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Ghost {
+    pub(crate) lane: Lane,
+    pub(crate) start: u32,
+    /// Timeline frames, which a speed has already been counted into: the box is
+    /// as wide as the clip is *long where it lands*. Zero for a library row of
+    /// unknown length, drawn as a head marker.
+    pub(crate) frames: u32,
+    /// The swatch of the file being carried ([`file_tint`]), so the
+    /// ghost reads as the thing in the hand.
+    pub(crate) tint: u32,
+    pub(crate) refused: bool,
+}
+
+/// A clip edge being dragged: which end of which clip, and the timeline frame
+/// the pointer has pulled it to. The box on screen is drawn from `to` while this
+/// is set and the engine hears about it once, at the release
+/// ([`Player::commit_trim`]) -- one edit, one undo step for the whole gesture,
+/// exactly as an equalizer drag works.
+#[derive(Clone, Copy)]
+pub(crate) struct Trim {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    pub(crate) edge: Edge,
+    /// Already clamped by `PlaybackSession::trim_room`, so the width drawn from
+    /// it is the width the release commits -- an edge stops under the pointer
+    /// rather than snapping back after the fact.
+    pub(crate) to: u32,
+    /// The dragged clip's group, so its other halves' boxes follow the edge on
+    /// screen exactly as the engine will move them.
+    pub(crate) link: Option<u32>,
+}
+
+/// How wide a clip's edge is as a *target*: the strip at each end where a press
+/// means "make this longer or shorter" instead of "move this to another lane".
+/// Wide enough to hit, narrow enough that the middle of even a small box is
+/// still the body.
+pub(crate) const EDGE_W: f32 = 6.;
+
+/// Whether a clip box this wide gets its two trim strips at all. Below three
+/// handles wide the pair would occlude the whole box: every press on it would
+/// trim, and the clip could not be selected, dragged to another lane or picked
+/// up by its middle -- which is exactly what a jumpcut leaves behind
+/// ([`Player::cut_silences`] manufactures a great many short clips). Above it,
+/// what is left between the two strips is a handle's width of body in its own
+/// right. A clip too short for its handles is trimmed by zooming in first: the
+/// bed is a magnifier, and the strip grows with the box.
+pub(crate) fn trims(width: f32) -> bool {
+    width >= 3. * EDGE_W
+}
+
+/// How wide a clip's box is *drawn*, given the width its own length is worth
+/// (`span`). Never under [`HIT_MIN`], even where that is wider than the clip is
+/// long: zoomed far out a short take is worth a fraction of a pixel, and a box
+/// nobody can put a pointer on is a clip that cannot be selected, dragged, given
+/// a menu or reached at all -- which is strictly worse than one drawn a few
+/// pixels too wide. The same call [`cue_box`] makes for a mark, and what every
+/// editor draws.
+///
+/// A drawing only: [`Scale::time_at`] still reads the bed, so a press inside the
+/// padding names the frame it points at, and the box's head is the clip's own.
+pub(crate) fn clip_width(span: f32) -> f32 {
+    span.max(HIT_MIN)
+}
+
+/// The sheet a card or a menu is painted on: the whole window, and the mouse
+/// stops at it. Occluding is what tells gpui that nothing under this sheet is
+/// hovered any more (`Hitbox::is_hovered`) -- without it the window carries on
+/// hovering behind an open menu and pops *its* tooltip over the menu's items,
+/// which is a card being painted over by the thing it covers.
+///
+/// Every card and every menu takes its sheet from here, so no surface can be
+/// drawn over the top of one by having been given a plain scrim.
+pub(crate) fn scrim() -> Div {
+    div().absolute().inset_0().occlude()
+}
+
+/// The sheet a card with a *slider* in it takes instead: the same scrim, with
+/// the window's own drag listeners on it as well.
+///
+/// A scrim occludes, and occluding is where gpui's hit test stops
+/// (`Hitbox::is_hovered`, window.rs:788) -- so while a card is up the root is
+/// not hovered anywhere behind it and its `on_mouse_move`/`on_mouse_up` hear
+/// nothing at all. Every drag in this window is tracked from the root, because
+/// each of them starts on a strip a few pixels wide that the pointer leaves at
+/// once ([`Player::drag_move`]), so a card's handles were set by the press and
+/// then frozen: the value never followed the hand and the release never wrote.
+/// The scrim is the one surface above the occluder that covers the whole card,
+/// so the same two listeners go here, and a drag that leaves the card is picked
+/// up by the root's copy of them without a seam.
+pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
+    scrim()
+        .on_mouse_move(cx.listener(Player::drag_move))
+        .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
+}
+
+/// A press that stops here. What every card's body hands its scrim: the scrim
+/// closes the card on a press, and the card is painted after it, so this listener
+/// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
+/// for a button never closes the card out from under its own click -- the rule
+/// the menus already follow ([`Player::library_card`]).
+pub(crate) fn swallow(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
+    cx.stop_propagation();
+}
+
+/// How close to an edge a dragged clip has to be let go for it to land *on* it:
+/// the snap every timeline has, in pixels rather than frames so that it feels
+/// the same at every zoom. Narrower than [`EDGE_W`] -- a hand aiming between two
+/// takes must still be able to leave a gap of a few frames there.
+pub(crate) const SNAP_PX: f64 = 5.;
+
+/// Where a held key would land, which is the whole of what auto-repeat has to
+/// know. [`Player::repeat_scope`] answers it from the same state the handler
+/// walks below itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Repeat {
+    /// A card with values in it owns the keyboard: equalizer, colour, speed or
+    /// silence. Its arrows are sliders.
+    Card,
+    /// Nobody does, so the keymap answers -- and only one pair of its actions
+    /// is a value being moved rather than a thing being done once.
+    Keymap,
+    /// A stroke is being captured, an export is running, or an overlay with no
+    /// value in it is up. Nothing there is worth a repeat.
+    Nothing,
+}
+
+/// Whether a *held* stroke means it again. One press is always one action; a
+/// hold is only ever a value running, so this is what tells the two apart.
+///
+/// The cards' arrows, because that is what every one of them moves a slider
+/// with -- and only the arrows, so the equalizer's `r` cannot flatten five
+/// bands forty times a second and the silence card's `enter` cannot cut forty
+/// places again on the next tick. Outside a card the volume pair and nothing
+/// else: play, cut, delete, save, export and every other binding is a one-shot,
+/// exactly as it was when the handler filtered every held key alike.
+pub(crate) fn repeats(scope: Repeat, key: &str, action: Option<ActionId>) -> bool {
+    match scope {
+        Repeat::Card => matches!(key, "up" | "down" | "left" | "right"),
+        Repeat::Keymap => matches!(
+            action,
+            Some(
+                ActionId::VolumeUp
+                    | ActionId::VolumeDown
+                    // A zoom is a value being moved as much as a level is:
+                    // held, it runs from the whole timeline down to a handful
+                    // of frames and stops there. The fit is one press.
+                    | ActionId::ZoomIn
+                    | ActionId::ZoomOut
+            )
+        ),
+        Repeat::Nothing => false,
+    }
+}
+
+/// The keys that are only ever half a chord. gpui delivers a lone modifier
+/// press as a keystroke of its own, and taking one as a binding would leave an
+/// action that fires the moment the user reaches for any chord that uses it --
+/// so a capture waits through them instead.
+pub(crate) fn is_bare_modifier(key: &str) -> bool {
+    matches!(
+        key,
+        "control" | "shift" | "alt" | "super" | "platform" | "function" | "fn" | "meta" | "command"
+    )
+}
