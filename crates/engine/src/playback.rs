@@ -998,7 +998,18 @@ impl PlaybackSession {
     /// [`crate::subtitle::open`] gives. Nothing else about the timeline moves:
     /// subtitles are not clips and land on no lane.
     pub fn import_subtitles(&mut self, path: &Path) -> crate::Result<usize> {
-        Ok(self.add_subtitle_tracks(Self::parse_subtitles(path)?))
+        let tracks = Self::parse_subtitles(path)?;
+        // A file that was walked and carries none is refused as *that*, because
+        // the alternative -- 0 added -- is the very sentence a file whose tracks
+        // are already on this timeline gets, and the two are opposite answers a
+        // person acts differently on. Said only after the walk actually looked
+        // ([`crate::subtitle::of_media`]); a *file* that is not a container at
+        // all never reaches here, [`parse_subtitles`](Self::parse_subtitles)
+        // refuses it in its own words.
+        if tracks.is_empty() {
+            return Err(Self::no_subtitles_in(path));
+        }
+        Ok(self.add_subtitle_tracks(tracks))
     }
 
     /// The reading half of [`import_subtitles`](Self::import_subtitles), with no
@@ -1037,6 +1048,16 @@ impl PlaybackSession {
             return Err(why.clone().into());
         }
         Ok(tracks)
+    }
+
+    /// What a file the walk found no subtitle track in is refused with,
+    /// wherever the refusal is worded: the engine's own door
+    /// ([`import_subtitles`](Self::import_subtitles)) and a front-end that
+    /// splits the walk from the push ([`parse_subtitles`](Self::parse_subtitles)
+    /// then [`add_subtitle_tracks`](Self::add_subtitle_tracks)) must not tell a
+    /// person two different stories about the same file.
+    pub fn no_subtitles_in(path: &Path) -> crate::Error {
+        format!("no subtitle tracks in {}", path.display()).into()
     }
 
     /// Puts tracks already read by [`parse_subtitles`](Self::parse_subtitles)
