@@ -1,0 +1,308 @@
+//! Where the playhead is and where it is going: the pump, the seeks, the
+//! volume and the one button that starts it.
+
+use crate::*;
+
+impl Player {
+    /// Catches the display up to the clock: everything already due is taken off
+    /// the channel and only the last of them is shown, which *is* the
+    /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
+    /// while the clock is paused *nothing* is due -- a repaint re-presents the
+    /// frame already on screen, whatever asked for the repaint.
+    pub(crate) fn pump(&mut self, window: &mut Window) {
+        // Where the transport was before this drain, so the crossing into
+        // `Ended` can be recognised as the one transition it is.
+        let was = self.transport();
+        // No timeline, nothing to catch up to: the window is showing its empty
+        // state and there is no decoder to drain.
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let target = session.now() * self.fps;
+        let mut newest: Option<Frame> = None;
+        // A frame the screen is owed: a seek's landing, and the one readiness
+        // signal there is ([`Player::reset_after_reseek`]).
+        let owed = self.seek_since.is_some();
+        // Paused, the clock is frozen and *nothing new is due*. Whatever the
+        // decoder is still handing over is the backlog it was behind by when
+        // the pause landed -- frames at a position the transport has already
+        // left -- and taking one per repaint is what walked the picture on
+        // after the sound had stopped, at exactly the rate the pointer was
+        // moved over the timeline. Gated here, at the one place a frame ever
+        // reaches the screen, rather than in the handlers that repaint: a
+        // hover, a notice, a resize and a vsync are all the same event to this.
+        // An owed frame is still taken, playing or not -- a scrub is paused by
+        // definition, and its landing is the whole point of it.
+        while session.is_playing() || owed {
+            let frame = match self.held.take() {
+                Some(frame) => frame,
+                // Nothing waiting means either a clip boundary being rebuilt or
+                // the real end of the timeline, and only the engine can tell
+                // them apart -- `frame.index` is already a timeline index.
+                None => match session.try_frame() {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
+            if f64::from(frame.index) <= target {
+                self.dropped += u32::from(newest.is_some());
+                newest = Some(frame);
+            } else {
+                self.held = Some(frame);
+                break;
+            }
+        }
+
+        // How far behind the master clock the picture just handed over is, in
+        // seconds. Measured off a frame that really arrived and nothing else: a
+        // clip boundary being reopened delivers nothing at all for hundreds of
+        // milliseconds, and restarting *that* would only cancel the open it is
+        // waiting on.
+        let late = newest
+            .as_ref()
+            .map_or(0., |f| (target - f64::from(f.index)) / self.fps);
+
+        if let Some(frame) = newest {
+            self.displayed += 1;
+            self.seek_since = None;
+            self.started.get_or_insert_with(|| {
+                eprintln!("first frame displayed (index {})", frame.index);
+                Instant::now()
+            });
+            let buf = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)
+                .expect("frame buffer sized width*height*4");
+            // Counted here rather than under `color_open`, because the card
+            // opens on a frame that was pumped before it: gating this on the
+            // card would leave its graph flat until something reseeked. A
+            // thousandth of the pixels, against a conversion that just touched
+            // all of them.
+            self.histogram = histogram(buf.as_raw());
+            let next = Arc::new(RenderImage::new(vec![image::Frame::new(buf)]));
+            if let Some(old) = self.image.replace(next) {
+                // Every RenderImage gets a fresh id and its own atlas tile:
+                // without this the sprite atlas grows for the whole video.
+                let _ = window.drop_image(old);
+            }
+        }
+
+        // Audio is the master clock and a decoder that cannot keep up with it
+        // never gets back on its own: it hands over every frame in order,
+        // whether or not its moment has passed, so what it is behind by only
+        // grows -- a minute in, the picture is seconds behind what is being
+        // heard, and that is the whole of "the video can't catch the audio".
+        // Past `LATE_RESYNC` the backlog is abandoned and the picture restarted
+        // at the clock, which touches neither the sound nor the clock
+        // (`PlaybackSession::resync_picture`), so nothing the ear is following
+        // moves. Never on a frame a seek owed: that one is late by however long
+        // its own reopen took, and answering it with another reopen is a loop.
+        //
+        // corner-cut: on a machine that cannot decode the file in real time at
+        // all this settles into one restart per `RESYNC_GAP` -- in sync, and
+        // stuttering, which is the honest picture of what that machine can do.
+        // The upgrade path is dropping late frames *inside* the worker (skip
+        // the convert and the send for anything already past due), which needs
+        // the deadline shared with it.
+        if !owed && session.is_playing() && should_resync(late, self.resynced) {
+            eprintln!("picture {late:.3}s behind the clock: restarting it there");
+            session.resync_picture();
+            self.held = None;
+            self.resynced = Some(Instant::now());
+        }
+
+        if self.transport() == Transport::Ended {
+            // A seek whose worker never produced a frame (vanished file) would
+            // otherwise repaint at vsync forever. Held clear for as long as the
+            // state does, not just on the crossing: nothing else is coming.
+            self.seek_since = None;
+            if was != Transport::Ended {
+                // Ended is a *stopped* transport, so the clock stops with it,
+                // on the out point the timecode and the playhead have been
+                // showing all along. Nothing else ever stopped it: past the
+                // last frame wall time takes over and `now()` walks off the end
+                // of the timeline for as long as the window is left open -- and
+                // the playhead is what a cut, a paste, an insert and the
+                // analyser all act at, so every one of them was aiming into
+                // empty space (measured: a 5 s timeline recognised its end at
+                // clock 17.5 s under a slow renderer). End of stream is left
+                // set, so this is still `Ended` and the next press restarts.
+                if let Some(session) = &mut self.session {
+                    session.halt_at_end();
+                }
+                let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+                eprintln!(
+                    "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
+                    self.displayed,
+                    self.dropped,
+                    self.session.as_ref().map_or(0., PlaybackSession::now)
+                );
+            }
+        }
+    }
+
+    /// Where the transport is, asked of the session rather than remembered:
+    /// end of stream is the engine's own flag (any seek clears it, which is why
+    /// an edit past the end revives the picture) and so is the clock. A held
+    /// frame is one still owed to the screen, so the end is not the end yet.
+    pub(crate) fn transport(&self) -> Transport {
+        let Some(session) = &self.session else {
+            return Transport::Stopped;
+        };
+        transport(
+            session.is_playing(),
+            session.is_eos() && self.held.is_none(),
+        )
+    }
+
+    /// A frame owed to the screen after a reseek, and the buffered one dropped:
+    /// what stops the picture from staying frozen on the old last frame. The
+    /// end-of-stream flag itself is the engine's and its own seek clears it --
+    /// edits reseek inside the engine and still owe this.
+    pub(crate) fn reset_after_reseek(&mut self) {
+        self.held = None;
+        // Restarted on every reseek, not only on the first: what it measures is
+        // the open now standing, which is what a person is waiting on.
+        self.seek_since = Some(Instant::now());
+        // A seek is a person saying where to look, so it takes the view back
+        // from an earlier scroll: the frame asked for is the one to be shown.
+        self.panned = false;
+        // An edit moves the indices a drag in flight is holding -- a stroke
+        // during one is exactly that -- and an edge committed against a moved
+        // index would trim a clip nobody grabbed. Dropping it is the whole fix:
+        // nothing has been written yet.
+        self.trim = None;
+        // ...and the shadow a drag is drawn under promises a landing on a lane
+        // this edit has just reshaped. The next move of the drag draws it
+        // again; until then it says nothing.
+        self.ghost = None;
+    }
+
+    /// Jumps the timeline.
+    pub(crate) fn seek(&mut self, t: f64, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        session.seek(t);
+        self.reset_after_reseek();
+        cx.notify();
+    }
+
+    /// The keyboard's seek: whole frames along the timeline, through the same
+    /// door a ruler click uses -- so a step while playing keeps playing, exactly
+    /// as a click does. It starts from the frame the transport is showing, which
+    /// past the end is the last one, and that is what lets a step back off EOS
+    /// revive the picture (the engine's seek leaves [`Transport::Ended`]). Both
+    /// ends clamp, so the two go-to actions are this same step asked for more
+    /// frames than the timeline has. Selection is untouched: a seek is not an
+    /// edit, and nothing it does moves a clip index.
+    pub(crate) fn step(&mut self, frames: i64, cx: &mut Context<Self>) {
+        let ended = self.transport() == Transport::Ended;
+        let Some(session) = &self.session else {
+            return;
+        };
+        let last = ((session.timeline_duration() * self.fps).round() as i64 - 1).max(0);
+        let now = match ended {
+            true => last,
+            false => i64::from(frame_at(session.now(), self.fps)),
+        };
+        let target = now.saturating_add(frames).clamp(0, last);
+        self.seek(target as f64 / self.fps, cx);
+    }
+
+    /// Seeks to where the pointer sits along the ruler. `commit` is the press
+    /// and the release, which must land exactly even when the throttle below
+    /// would have skipped them.
+    pub(crate) fn scrub_to(&mut self, x: Pixels, commit: bool, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        // Clamped to the timeline here rather than in the mapping: there is bed
+        // past the last frame now, and a seek out there is a seek to the end.
+        let t = self
+            .scale
+            .time_at(px_along(x, self.ruler.get()))
+            .clamp(0., session.timeline_duration());
+        let target = (t * self.fps) as u32;
+        if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
+            self.last_target = target;
+            self.last_scrub = Instant::now();
+            self.seek(t, cx);
+        }
+    }
+
+    /// The play binding and the transport button share it: once the timeline is finished
+    /// the only sensible "play" is from the top.
+    /// Pushes the current volume at the session, which is the only place it is
+    /// ever pushed: after a change here, and after a session arrives. A session
+    /// starts at full volume, so a file opened while muted has to be told --
+    /// that is the whole reason this is not just called from the key handler.
+    /// Silent no-op with no timeline, or with a run that has no audio device.
+    pub(crate) fn apply_volume(&self) {
+        if let Some(session) = &self.session {
+            session.set_gain(self.volume.gain());
+        }
+    }
+
+    /// The mute key and the two volume keys, and the click on the button. The
+    /// picture is not touched: silencing the output is not pausing it, so the
+    /// clock -- which the device still drives -- runs straight through.
+    pub(crate) fn set_volume(&mut self, change: impl FnOnce(&mut Volume), cx: &mut Context<Self>) {
+        change(&mut self.volume);
+        self.apply_volume();
+        cx.notify();
+    }
+
+    /// Where the pointer sits along the slider, as a level. The press and every
+    /// sample after it come here, so the sound follows the hand rather than the
+    /// release -- there is nothing to undo about a monitoring level, which is
+    /// why this writes live and keeps no gesture state beyond the flag.
+    pub(crate) fn drag_volume(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let along = frac_along(x, self.volume_bar.get());
+        self.set_volume(|volume| volume.set_along(along), cx);
+    }
+
+    pub(crate) fn toggle_or_restart(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        // Nothing to play is a message, not a transport state. An empty
+        // timeline is [`Transport::Ended`] from its one black frame onward, so
+        // the restart below would start a clock against a zero-length timeline
+        // -- and it is Ended again by the next repaint, so no later press could
+        // ever stop it: the button would read "Pause" and never pause. A delete
+        // can empty the timeline mid-play, and that press must still stop it.
+        if nothing_to_play(self.session.as_ref()) {
+            match self.session.as_mut().filter(|s| s.is_playing()) {
+                Some(session) => session.pause(),
+                None => self.notify_user(NOTHING_TO_PLAY.into()),
+            }
+            cx.notify();
+            return;
+        }
+        // Pressing play is asking to watch, so a view scrolled away while
+        // paused comes back to the head with it -- as a seek's does.
+        self.panned = false;
+        match self.transport() {
+            // Nothing open: the button is dimmed and the key says nothing.
+            Transport::Stopped => {}
+            // Back to the top and away, for the key and the button alike --
+            // whichever asked, the transport was showing Play.
+            state if state.restarts() => {
+                self.seek(0., cx);
+                if let Some(session) = &mut self.session {
+                    session.play();
+                }
+            }
+            _ => {
+                if let Some(session) = &mut self.session {
+                    session.toggle();
+                    // A paused timeline animates nothing; this is the repaint
+                    // that puts the new glyph up.
+                    cx.notify();
+                }
+            }
+        }
+    }
+}

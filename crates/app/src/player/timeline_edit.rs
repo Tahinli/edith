@@ -1,0 +1,895 @@
+//! Editing the timeline itself: the cuts, the clipboard, the drags, the
+//! snapping and the trims.
+
+use crate::*;
+
+impl Player {
+    /// Splits the clip under the playhead. Metadata only: the timeline->source
+    /// mapping is unchanged, so nothing reseeks and no flag is touched.
+    pub(crate) fn cut(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        // Snapped to the source's own grid where one is within reach
+        // ([`Player::cut_frame`]): a cut a third of a second off a sync point
+        // looks identical on the bed and turns an export that copies its
+        // picture in minutes into one that codes every frame of it for hours.
+        // The playhead goes with it -- what was cut has to be where the line
+        // is, or the next stroke acts a few frames from where it looks.
+        let Some(session) = &self.session else {
+            return;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let at = self.cut_frame(now);
+        if at != now {
+            self.seek(f64::from(at) / self.fps, cx);
+        }
+        if let Some(session) = &mut self.session {
+            session.cut_at(f64::from(at) / self.fps);
+        }
+        self.selected = None;
+        cx.notify();
+    }
+
+    /// Rejoins whatever meets under the playhead and puts it back in one group
+    /// -- the inverse of [`Player::cut`], and metadata only like it. The engine
+    /// decides what is joinable; a refusal is worded here, because `false` is
+    /// all it says and a key that looks broken is worse than one that explains
+    /// itself.
+    pub(crate) fn regroup(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        if let Some(session) = &mut self.session {
+            if session.regroup_at(session.now()) {
+                self.selected = None;
+            } else {
+                self.notify_user(
+                    "NOTHING TO REGROUP — put the playhead where two clips meet, on frames that were cut apart"
+                        .into(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    /// Takes the selected clip out of its group, so the picture and the sound
+    /// under it are edited apart from here on: each half selects, moves, trims
+    /// and is removed alone, and both draw outlined instead of tinted. The
+    /// selection stays -- the half that was clicked is still the half in hand.
+    pub(crate) fn detach(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match (&mut self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => {
+                if !session.ungroup(lane, idx) {
+                    self.notify_user(
+                        "NOTHING DETACHED — that clip is not grouped with another".into(),
+                    );
+                }
+            }
+            (Some(_), None) => {
+                self.notify_user("NOTHING DETACHED — click the take to take apart first".into())
+            }
+            (None, _) => {}
+        }
+        cx.notify();
+    }
+
+    /// Puts the selected clip back in a group with the clip covering exactly the
+    /// same frames on another track -- the way back from [`Player::detach`], and
+    /// the way to group a picture with sound it was never opened with. The
+    /// partner is not clicked because there is nothing to choose: a group id
+    /// names one span, so only a clip covering these very frames could join it,
+    /// and the engine words what to do when none does.
+    pub(crate) fn group(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let partner = match (&self.session, self.selected) {
+            (Some(session), Some((lane, idx))) => span_partner(session, lane, idx),
+            _ => None,
+        };
+        match (&mut self.session, self.selected, partner) {
+            (Some(session), Some((lane, idx)), Some((other, o_idx))) => {
+                if let Err(e) = session.group(lane, idx, other, o_idx) {
+                    self.notify_user(format!("NOT GROUPED — {e}").into());
+                }
+            }
+            (Some(_), Some(_), None) => {
+                self.notify_user(
+                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these frames"
+                        .into(),
+                )
+            }
+            (Some(_), None, _) => {
+                self.notify_user("NOTHING GROUPED — click one of the halves first".into())
+            }
+            (None, ..) => {}
+        }
+        cx.notify();
+    }
+
+    /// Drops the selected clip and closes the hole: a whole take goes, both
+    /// lanes of it, and everything after it moves up. A half with no take under
+    /// it in the video lane -- what a lift leaves behind -- has nothing to
+    /// ripple, so that one is lifted instead. The engine reseeks itself, so all
+    /// this owes is the flag reset.
+    pub(crate) fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let selected = self.selected.take();
+        // Whichever lane it was clicked in: the index is that lane's own, and
+        // the ripple cuts the clip's span out of every lane -- a group covers
+        // one span, so deleting a take by its audio half is the same edit as by
+        // its picture. What is not a whole take is lifted instead, which is what
+        // reaches a clip on an added track ([`whole_take`]).
+        let deleted = match (&mut self.session, selected) {
+            (Some(session), Some((lane, idx))) => match whole_take(session, lane, idx) {
+                true => session.delete_clip(lane, idx),
+                false => session.lift_clip(lane, idx),
+            },
+            _ => false,
+        };
+        if selected.is_some() && !deleted {
+            self.notify_user("NOTHING DELETED — that clip is no longer there".into());
+        }
+        if deleted {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// Lifts the selected half out and leaves the hole: black picture there if
+    /// it was the video lane, silence if it was the audio one, and nothing else
+    /// moves. What Delete is not.
+    pub(crate) fn lift_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        match (&mut self.session, self.selected.take()) {
+            (Some(session), Some((lane, idx))) => {
+                if session.lift_clip(lane, idx) {
+                    self.reset_after_reseek();
+                } else {
+                    self.notify_user("NOTHING LIFTED — that half is no longer there".into());
+                }
+            }
+            (Some(_), None) => {
+                self.notify_user("NOTHING LIFTED — click the half to remove first".into())
+            }
+            (None, _) => {}
+        }
+        cx.notify();
+    }
+
+    /// Copies the selected clip. Nothing on screen changes, so no notify.
+    pub(crate) fn copy_selected(&mut self) {
+        let session = self.session.as_ref();
+        // Out of the lane it was clicked in: the audio half of a group is a
+        // different clip from the video one, and copying the wrong lane's
+        // frames is a paste of the wrong thing.
+        if let Some(clip) = self
+            .selected
+            .and_then(|(lane, idx)| session?.lane_clips(lane).get(idx).copied())
+        {
+            self.clipboard = Some(clip);
+        }
+    }
+
+    /// The group id of the clicked clip, which is what marks the other half.
+    pub(crate) fn selected_link(&self) -> Option<u32> {
+        let (lane, idx) = self.selected?;
+        self.session.as_ref()?.lane_clips(lane).get(idx)?.link
+    }
+
+    /// Drops the copied clip in at the playhead. The engine reseeks itself, so
+    /// like a delete this owes the flag reset -- and the selection, whose index
+    /// the insert has just moved.
+    pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
+        let pasted = match (&mut self.session, self.clipboard) {
+            (Some(session), Some(clip)) => session.paste_at(session.now(), clip),
+            _ => false,
+        };
+        if pasted {
+            self.selected = None;
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// A clip let go at window `x` over lane `to`: it lands with its head where
+    /// the hand is carrying it ([`Player::drop_frame`]), on the track it was
+    /// dropped on, taking its whole take with it -- one undo step for the
+    /// gesture. Dropped back where it was picked up it is not an edit at all, so
+    /// nothing is said about it. The engine reseeks, so all this owes is the
+    /// flag reset -- and the selection, whose index was that lane's own and now
+    /// names a different clip there.
+    pub(crate) fn move_clip(&mut self, from: Lane, idx: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let (Some((start, _)), Some(was)) = (
+            self.drop_frame(from, idx, x),
+            self.session
+                .as_ref()
+                .and_then(|session| session.lane_clips(from).get(idx).map(|c| c.start)),
+        ) else {
+            return;
+        };
+        let moved = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.move_clip_to(from, idx, to, start));
+        let (kind, lanes) = match from.kind {
+            LaneKind::Video => ("picture", "video"),
+            LaneKind::Audio => ("sound", "audio"),
+        };
+        match moved {
+            true => {
+                self.selected = None;
+                self.reset_after_reseek();
+            }
+            // The three ways a drag is refused, told apart by what the
+            // front-end already knows: a lane's kind, and where the clip was.
+            // Everything else that could refuse (a clip that is not there)
+            // cannot be dragged.
+            false if from.kind != to.kind => {
+                self.notify_user(
+                    format!(
+                        "NOT ON {} — that is a {kind} clip; drop it on a {lanes} lane",
+                        to.label()
+                    )
+                    .into(),
+                )
+            }
+            // Picked up and put back down where it was: a click, and a click
+            // says nothing.
+            false if from == to && start == was => {}
+            false => {
+                self.notify_user(
+                    format!(
+                        "NOT MOVED — another clip already covers those frames on {}",
+                        to.label()
+                    )
+                    .into(),
+                )
+            }
+        }
+        cx.notify();
+    }
+
+    /// Where a clip let go at window `x` over lane `to` wants its head: the
+    /// frame under the pointer, less however far into the box the hand grabbed
+    /// it (so the clip does not jump under the pointer), pulled onto a
+    /// neighbouring edge when it lands within [`SNAP_PX`] of one. `None` when
+    /// there is no such clip to move. The engine has the last word on where it
+    /// may actually go -- this is the ask, not the answer.
+    ///
+    /// corner-cut: the bed now runs past the last frame whenever the timeline is
+    /// shorter than the view ([`Scale::time_at`] clamps at the head only), so a
+    /// clip *can* be dragged out there. Zoomed in against the far end it cannot:
+    /// the scroll clamp pins the bed's right edge to the duration, and the
+    /// pointer has no pixel past it. The upgrade is to let the scroll clamp
+    /// leave a screen of empty bed after the end, the way every NLE does.
+    pub(crate) fn drop_frame(&self, from: Lane, idx: usize, x: Pixels) -> Option<(u32, Option<u32>)> {
+        let clip = self.session.as_ref()?.lane_clips(from).get(idx).copied()?;
+        let marks = self.snap_targets(Some((from, idx)));
+        Some(landing(
+            self.frame_under(x),
+            self.grab,
+            clip.frames(),
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        ))
+    }
+
+    /// The same answer for a library row on its way down: nothing is in the hand
+    /// yet, so there is no grab offset to take off and no length to snap by --
+    /// the file's own is not known until the engine has placed it -- and only
+    /// its head lands. Asked by the line, by the ghost and by the drop itself
+    /// ([`Player::insert_source`]), so all three name one frame.
+    pub(crate) fn place_frame(&self, x: Pixels) -> (u32, Option<u32>) {
+        let marks = self.snap_targets(None);
+        landing(
+            self.frame_under(x),
+            0,
+            0,
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        )
+    }
+
+    /// Which index the clip in the hand is at *now*: [`live_idx`] against the
+    /// lane the drag named, since a stroke during the gesture moves the indices
+    /// gpui froze into the payload. Both halves of a drag ask it -- the line
+    /// drawn in flight and the drop that commits -- so the promise and the
+    /// landing are made about one clip.
+    pub(crate) fn dragged(&self, drag: &ClipDrag) -> Option<usize> {
+        let session = self.session.as_ref()?;
+        live_idx(session.lane_clips(drag.lane), drag.idx, drag.clip)
+    }
+
+    /// The line while the clip is still in the hand: the very answer
+    /// [`Player::drop_frame`] will commit, worked out on every move of the drag,
+    /// so what the eye was promised is where the release puts it. A pointer that
+    /// has wandered off the bed promises nothing.
+    pub(crate) fn preview_drop(&mut self, from: Lane, idx: usize, x: Pixels, cx: &mut Context<Self>) {
+        let cue = self.drop_frame(from, idx, x).and_then(|(_, cue)| cue);
+        self.set_cue(cue, x, cx);
+    }
+
+    /// The same line for a library row on its way to a lane: it goes down at
+    /// the frame it is let go on ([`Player::place_frame`]), so that frame is
+    /// what snaps and what is drawn.
+    pub(crate) fn preview_place(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let cue = self.place_frame(x).1;
+        self.set_cue(cue, x, cx);
+    }
+
+    /// The shadow the clip in the hand would fill, on the lane the pointer is
+    /// over: its head where [`Player::drop_frame`] says the release will put it
+    /// -- the same call the drop makes, so the box drawn and the box committed
+    /// are one answer -- and its own length at this zoom. A lane of the other
+    /// kind refuses the drop ([`Project::move_clip`]), and the shadow says so
+    /// before the release does.
+    pub(crate) fn preview_ghost(&mut self, drag: &ClipDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = self
+            .dragged(drag)
+            .and_then(|idx| self.drop_frame(drag.lane, idx, x))
+            .map(|(start, _)| Ghost {
+                lane: to,
+                start,
+                frames: drag.clip.frames(),
+                tint: self.clip_tint(drag.clip.source),
+                refused: drag.lane.kind != to.kind,
+            });
+        self.set_ghost(ghost, cx);
+    }
+
+    /// The line the track in the hand would drop into, on the row the pointer
+    /// is over: at that row's top edge when the header is coming up from below
+    /// and at its bottom edge when it is going down, which is the slot
+    /// [`Player::reorder_lane`] commits to at the release. Nothing at all over
+    /// its own row, where a release changes nothing.
+    pub(crate) fn preview_lane_drop(&mut self, from: Lane, onto: Lane, cx: &mut Context<Self>) {
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or_else(Vec::new, PlaybackSession::lanes);
+        let at = |lane: Lane| lanes.iter().position(|&l| l == lane);
+        let next = match (at(from), at(onto)) {
+            (Some(i), Some(j)) if i != j => Some(LaneDrop {
+                lane: onto,
+                above: j < i,
+            }),
+            _ => None,
+        };
+        // Only when it has actually changed: a drag move fires on every painted
+        // frame, and a redraw per frame that draws the same line is a redraw
+        // for nothing.
+        if self.lane_drop != next {
+            self.lane_drop = next;
+            cx.notify();
+        }
+    }
+
+    /// The line taken back down again, by the row that drew it and by no other:
+    /// the pointer has been carried off `lane`, so the slot it was promising is
+    /// no longer the one a release would commit to.
+    pub(crate) fn forget_lane_drop(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        if self.lane_drop.is_some_and(|d| d.lane == lane) {
+            self.lane_drop = None;
+            cx.notify();
+        }
+    }
+
+    /// The same shadow for a library row: its head at [`Player::place_frame`],
+    /// which is where the drop inserts it, and the file's own length for its
+    /// width -- the length the library row already reports. A file this lane
+    /// cannot hold ([`lane_refuses`]) is tinted as refused, which is the answer
+    /// the release would give in words.
+    pub(crate) fn preview_ghost_asset(&mut self, path: &Path, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = Ghost {
+            lane: to,
+            start: self.place_frame(x).0,
+            frames: self
+                .session
+                .as_ref()
+                .map_or(0, |session| session.file_frames(path)),
+            // A path with no source entry has no colour of its own, and the
+            // shadow wears the lane's own instead of borrowing another file's.
+            tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
+            refused: lane_refuses(path, to).is_some(),
+        };
+        self.set_ghost(Some(ghost), cx);
+    }
+
+    /// Sets the shadow, or takes it away, repainting only when it moved -- the
+    /// listeners below run it on every pointer sample of a drag. Cleared by the
+    /// root and set again by the lane under the pointer, in that order (gpui
+    /// runs the capture phase parent-first), so a pointer over no lane at all
+    /// leaves nothing drawn.
+    pub(crate) fn set_ghost(&mut self, ghost: Option<Ghost>, cx: &mut Context<Self>) {
+        if ghost != self.ghost {
+            self.ghost = ghost;
+            cx.notify();
+        }
+    }
+
+    /// The swatch a clip from source `n` wears: [`source_tint`] over the first
+    /// source entry naming that *file*, since two audio streams of one file are
+    /// two sources and one colour. Every box on a lane and every ghost a drag
+    /// draws asks this, so the shadow is recognisably the thing in the hand.
+    pub(crate) fn clip_tint(&self, source: usize) -> u32 {
+        self.sources()
+            .get(source)
+            .and_then(|entry| file_tint(self.sources(), &entry.path))
+            .unwrap_or_else(|| source_tint(source))
+    }
+
+    pub(crate) fn sources(&self) -> &[Source] {
+        self.session
+            .as_ref()
+            .map_or(&[][..], PlaybackSession::sources)
+    }
+
+    /// Sets the line, or takes it away, and repaints only when it moved: a
+    /// pointer dragged off the bed (up to the library, say) is not promising a
+    /// landing any more.
+    pub(crate) fn set_cue(&mut self, cue: Option<u32>, x: Pixels, cx: &mut Context<Self>) {
+        let bed = self.ruler.get();
+        let cue = cue.filter(|_| x >= bed.left() && x <= bed.right());
+        if cue != self.snap_cue {
+            self.snap_cue = cue;
+            cx.notify();
+        }
+    }
+
+    /// Every edge this timeline offers a gesture: [`snap_marks`] over all of its
+    /// lanes, so a clip meets a take one track over as readily as one beside it.
+    pub(crate) fn snap_targets(&self, skip: Option<(Lane, usize)>) -> Vec<u32> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let lanes = session.lanes();
+        let clips: Vec<&[Clip]> = lanes.iter().map(|&lane| session.lane_clips(lane)).collect();
+        let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
+        snap_marks(&clips, skip, frame_at(session.now(), self.fps))
+    }
+
+    /// Where a gesture at `raw` lands and the mark that pulled it there, with
+    /// the switch honoured: snapping off, nothing moves and no line is drawn.
+    pub(crate) fn snap_to(&self, raw: u32, len: u32, marks: &[u32]) -> (u32, Option<u32>) {
+        snap_cue(self.snap, raw, len, self.snap_frames(), marks)
+    }
+
+    /// Every timeline frame that is a *source* sync point: each clip's own
+    /// grid ([`Player::syncs`]), moved onto the frames the clip plays it at.
+    /// Ascending, because the clips are and each grid is.
+    ///
+    /// This is the difference between an export that copies its picture and one
+    /// that decodes and re-codes every frame of a feature film. A cut anywhere
+    /// else leaves the copy path with a region that begins between two sync
+    /// points -- pictures whose references are not in the file -- and the whole
+    /// export falls back to the encoder ([`engine::export`] states the rule).
+    ///
+    /// Only clips at their own speed, and only video lanes: a re-timed clip is
+    /// resampled pictures, which is not a copy at any cut, and a sound lane has
+    /// no groups of pictures to begin with.
+    pub(crate) fn sync_frames(&self) -> Vec<u32> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let sources = session.sources();
+        let mut marks = Vec::new();
+        for lane in session.lanes() {
+            if lane.kind != LaneKind::Video {
+                continue;
+            }
+            for clip in session.lane_clips(lane) {
+                let Some(keys) = sources
+                    .get(clip.source)
+                    .and_then(|entry| self.syncs.get(&entry.path))
+                    .filter(|_| clip.speed.is_normal())
+                else {
+                    continue;
+                };
+                marks.extend(
+                    keys.iter()
+                        .filter(|&&key| key >= clip.in_frame && key < clip.out_frame)
+                        .map(|&key| clip.start + (key - clip.in_frame)),
+                );
+            }
+        }
+        marks.sort_unstable();
+        marks
+    }
+
+    /// The frame a cut asked for at `raw` really lands on: the nearest source
+    /// sync point within the snap's own tolerance, or `raw` itself where the
+    /// magnet is off, where nothing is near enough, or where the source has no
+    /// grid to offer (the walk has not answered yet, or the file is not one
+    /// this project can copy at all).
+    ///
+    /// The same tolerance the clip-edge snap uses, so one switch and one
+    /// distance govern every landing on this timeline.
+    pub(crate) fn cut_frame(&self, raw: u32) -> u32 {
+        if !self.snap {
+            return raw;
+        }
+        let tol = self.snap_frames();
+        self.sync_frames()
+            .into_iter()
+            .filter(|mark| mark.abs_diff(raw) <= tol)
+            .min_by_key(|mark| mark.abs_diff(raw))
+            .unwrap_or(raw)
+    }
+
+    /// Whether the playhead is standing exactly on one: what the timeline's own
+    /// line says out loud, so "a cut here is copied" is on screen before the cut
+    /// rather than discovered in the export card afterwards.
+    ///
+    /// Asked every repaint, so it walks the *playhead* into each clip's source
+    /// and looks it up in that source's own sorted grid -- where
+    /// [`Player::sync_frames`] builds the whole list, which is a film's worth of
+    /// marks to allocate and sort sixty times a second.
+    pub(crate) fn on_sync_point(&self) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let sources = session.sources();
+        session.lanes().into_iter().any(|lane| {
+            lane.kind == LaneKind::Video
+                && session.lane_clips(lane).iter().any(|clip| {
+                    clip.speed.is_normal()
+                        && (clip.start..clip.start + (clip.out_frame - clip.in_frame))
+                            .contains(&now)
+                        && sources
+                            .get(clip.source)
+                            .and_then(|entry| self.syncs.get(&entry.path))
+                            .is_some_and(|keys| {
+                                keys.binary_search(&(clip.in_frame + (now - clip.start))).is_ok()
+                            })
+                })
+        })
+    }
+
+    /// Puts the playhead on the sync point before or after it -- the keyboard's
+    /// half of placing a cut where the export can copy it, and the only way to
+    /// reach one exactly on a timeline zoomed out to a whole film, where one
+    /// pixel is seconds.
+    pub(crate) fn jump_sync(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let now = frame_at(session.now(), self.fps);
+        let marks = self.sync_frames();
+        let mark = match forward {
+            true => marks.iter().find(|&&mark| mark > now).copied(),
+            false => marks.iter().rev().find(|&&mark| mark < now).copied(),
+        };
+        match mark {
+            Some(mark) => self.seek(f64::from(mark) / self.fps, cx),
+            // Said rather than swallowed: the two most likely reasons are a walk
+            // that has not answered yet and a source with no grid at all, and a
+            // key that does nothing looks broken either way.
+            None => self.notify_user(match marks.is_empty() {
+                true => "NO SYNC POINTS — this source has no keyframe grid to jump by (or it is \
+                         still being read)"
+                    .into(),
+                false => "NO SYNC POINT THAT WAY — the playhead is past the last one".into(),
+            }),
+        }
+    }
+
+    /// [`SNAP_PX`] in timeline frames at the scale the bed is drawn at: the bed's
+    /// own width drops out of it, since a pixel is now worth the same stretch of
+    /// timeline wherever the view sits.
+    pub(crate) fn snap_frames(&self) -> u32 {
+        self.scale.snap_frames(self.fps)
+    }
+
+    /// Opens the clip menu on the box under the pointer, from the right button
+    /// wherever it was pressed on that box -- its middle or one of its edge
+    /// strips, which cover the middle's own listener. Selecting first is part of
+    /// it: every item acts on the clip the menu names.
+    pub(crate) fn open_menu(&mut self, lane: Lane, idx: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.select((lane, idx), cx);
+        self.context_menu = Some(ContextMenu {
+            lane,
+            idx,
+            at,
+            details: false,
+        });
+        cx.notify();
+    }
+
+    /// A press on a clip's edge: the start of the drag that changes how much of
+    /// its source it plays. It selects the clip as a press anywhere else on the
+    /// box does -- the edge strip covers the box's own listener (`occlude`), so
+    /// this is the only one that fires there.
+    pub(crate) fn start_trim(&mut self, lane: Lane, idx: usize, edge: Edge, cx: &mut Context<Self>) {
+        if self.modal() || self.exporting().is_some() {
+            return;
+        }
+        let Some(clip) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+        else {
+            return;
+        };
+        self.select((lane, idx), cx);
+        self.trim = Some(Trim {
+            lane,
+            idx,
+            edge,
+            // Where the edge already is: a press that never moves is not an
+            // edit, and `Project::trim` refuses exactly that.
+            to: match edge {
+                Edge::Start => clip.start,
+                Edge::End => clip.end(),
+            },
+            link: clip.link,
+        });
+        cx.notify();
+    }
+
+    /// Where the pointer has pulled the edge to, clamped to the room the engine
+    /// says that edge has. Along the same bed the ruler is measured on and
+    /// against the same duration the boxes are drawn to, so the edge tracks the
+    /// pointer exactly.
+    pub(crate) fn trim_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(trim) = self.trim else {
+            return;
+        };
+        // The edge is pulled onto the same marks a whole clip is, by itself:
+        // there is no other end travelling with it, so it snaps at length zero.
+        let marks = self.snap_targets(Some((trim.lane, trim.idx)));
+        let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
+        let Some((lo, hi)) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.trim_room(trim.lane, trim.idx, trim.edge))
+        else {
+            return;
+        };
+        let to = at.clamp(lo, hi);
+        // The line only stands where the edge actually stopped: a mark the
+        // engine's own room clamped away was never reached.
+        self.set_cue(cue.filter(|_| to == at), x, cx);
+        self.trim = Some(Trim { to, ..trim });
+        cx.notify();
+    }
+
+    /// The timeline frame a pointer at window x is on: along the same bed the
+    /// ruler is measured on, through the same [`Scale`] every box is drawn
+    /// through, so a zoomed-in panel answers with the frame under the pointer
+    /// and not with the one that would have been there unzoomed. The one
+    /// question a trim, a grab and a drop all ask.
+    pub(crate) fn frame_under(&self, x: Pixels) -> u32 {
+        frame_at(
+            self.scale.time_at(px_along(x, self.ruler.get())),
+            self.fps,
+        )
+    }
+
+    /// The release: the whole drag reaches the engine as one edit, so it is one
+    /// undo step. The selection survives it -- a trim inserts and removes
+    /// nothing, so every index a lane had still names the clip it named.
+    pub(crate) fn commit_trim(&mut self, cx: &mut Context<Self>) {
+        let Some(trim) = self.trim.take() else {
+            return;
+        };
+        let trimmed = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.trim_clip(trim.lane, trim.idx, trim.edge, trim.to));
+        if trimmed {
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// The clip as the drag is showing it: an edge under the pointer moves its
+    /// own box, and the boxes of the halves linked to it, before anything is
+    /// committed. Display only -- the project is not touched until the release.
+    pub(crate) fn trimmed(&self, lane: Lane, idx: usize, clip: Clip) -> Clip {
+        let Some(trim) = self.trim.filter(|t| {
+            (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == clip.link)
+        }) else {
+            return clip;
+        };
+        let still = self.session.as_ref().is_some_and(|session| {
+            session
+                .sources()
+                .get(clip.source)
+                .is_some_and(|s| engine::is_image(&s.path))
+        });
+        trimmed_clip(clip, trim.edge, trim.to, still)
+    }
+
+    /// How long the timeline is *drawn* as: its own length, and while a tail is
+    /// being dragged the furthest that tail may reach. A bed that ends exactly
+    /// at the last frame has nowhere to put a pointer that means "longer", so
+    /// without this the last clip on the timeline could be pulled in and never
+    /// let back out.
+    ///
+    /// Scroll room only, now that a second is an absolute number of pixels
+    /// ([`Scale`]): the extra length loosens [`View::settled`]'s clamp, which is
+    /// where the pixels past the last frame come from, and moves no box by a
+    /// pixel. It is still the *only* headroom at the tail -- zoomed in against
+    /// the end, that clamp pins the bed's right edge to the duration and an
+    /// End-trim of the last clip would have nowhere to be dragged to. What it
+    /// must not do is be read as a length anyone is told: the timecode reads
+    /// `PlaybackSession::timeline_duration` for exactly that reason.
+    pub(crate) fn drawn_duration(&self) -> f64 {
+        let Some(session) = &self.session else {
+            return 0.;
+        };
+        let duration = session.timeline_duration();
+        match self.trim {
+            Some(trim) if trim.edge == Edge::End => {
+                let (_, hi) = session
+                    .trim_room(trim.lane, trim.idx, trim.edge)
+                    .unwrap_or((0, 0));
+                duration.max(f64::from(hi) / self.fps)
+            }
+            _ => duration,
+        }
+    }
+
+    /// Where the playhead is, as the panel draws it: pinned to the out point
+    /// once playback is done, and clamped to the drawn duration otherwise -- a
+    /// tail being dragged draws past the timeline it is about to become.
+    pub(crate) fn playhead(&self, duration: f64) -> f64 {
+        if self.transport() == Transport::Ended {
+            duration
+        } else {
+            self.session
+                .as_ref()
+                .map_or(0., PlaybackSession::now)
+                .clamp(0., duration)
+        }
+    }
+
+    /// One sample of whatever drag is in the hand: the equalizer's handle, a
+    /// clip's edge, a colour bar, the speed bar, the volume slider or the
+    /// playhead. Each of those starts on a strip a few pixels wide that the
+    /// pointer leaves immediately, so none of them can be tracked from the
+    /// element it started on -- the gesture is followed here instead, on a
+    /// hitbox that covers everything the hand can reach.
+    ///
+    /// Registered on the root *and* on the scrim of every card that holds a
+    /// slider ([`Player::drag_scrim`]). An occluding sheet ends gpui's hit test
+    /// where it sits (`Hitbox::is_hovered`, window.rs:788), so while a card is
+    /// up the root is not hovered anywhere under it and hears none of this: the
+    /// press set a value and the drag then froze on it.
+    pub(crate) fn drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A handle is 10 px across and the pointer leaves it at once, so
+        // the equalizer drag is tracked here for the ruler's reason.
+        if self.eq_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_band(event.position, cx);
+            } else {
+                // Released outside the window: the up below never came,
+                // so this is where the gesture ends -- and it still owes
+                // the one write the whole drag is worth.
+                self.eq_dragging = false;
+                self.commit_eq(cx);
+            }
+            return;
+        }
+        // A clip edge is 6 px wide and the pointer leaves it on the
+        // first drag, so the gesture is tracked here for the same
+        // reason -- and it ends here too when the button came up
+        // outside the window, still owing its one edit.
+        if self.trim.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.trim_to(event.position.x, cx),
+                _ => self.commit_trim(cx),
+            }
+            return;
+        }
+        // A colour slider is 4 px tall and the pointer leaves it just as
+        // fast; every sample is live, so the release owes no write of
+        // its own -- what the last sample set is what the clip carries.
+        if self.color_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_color(event.position.x, false, cx);
+            } else {
+                // The release happened outside the window, so this is
+                // where the gesture ends -- and it may not end on a
+                // sample the worker was too busy to take.
+                self.color_dragging = false;
+                self.flush_drag(cx);
+            }
+            return;
+        }
+        // The speed bar, the same 4 px and the same live writes: the
+        // press took the undo step and every sample since is live.
+        if self.speed_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_speed(event.position.x, false, cx);
+            } else {
+                self.speed_dragging = false;
+                self.flush_drag(cx);
+            }
+            return;
+        }
+        // The volume slider, the same live writes: what the hand is on
+        // is what the speakers are doing, and there is nothing to undo.
+        if self.volume_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_volume(event.position.x, cx);
+            } else {
+                self.volume_dragging = false;
+            }
+            return;
+        }
+        if !self.scrubbing {
+            return;
+        }
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.scrub_to(event.position.x, false, cx);
+        } else {
+            // A release outside the window never reaches the handler
+            // below, so the first button-up move is when we learn the
+            // drag is over. Without this the next hover would scrub.
+            self.scrubbing = false;
+        }
+    }
+
+    /// Where a drag ends: the release lands exactly, and whatever the gesture
+    /// owes -- one undo step for the equalizer and the trim, a flush for the
+    /// live-writing bars -- is paid here. On the root and on a card's scrim
+    /// both, for [`Player::drag_move`]'s reason: a release over an open card
+    /// never reaches the root.
+    pub(crate) fn drag_release(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.eq_dragging) {
+            // The release lands exactly, then the gesture is written
+            // once -- the append-only table's whole reason.
+            self.drag_band(event.position, cx);
+            self.commit_eq(cx);
+            return;
+        }
+        if self.trim.is_some() {
+            // The release lands exactly, then the gesture is
+            // written once -- one edit, one undo step.
+            self.trim_to(event.position.x, cx);
+            self.commit_trim(cx);
+            return;
+        }
+        if std::mem::take(&mut self.color_dragging) {
+            // The release lands exactly where the hand let go, and
+            // it is a live write like every other sample: the undo
+            // step the gesture rolls back to was the press's. The
+            // flush is what makes "exactly" true while the worker is
+            // still busy -- the sample above would only be held.
+            self.drag_color(event.position.x, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.speed_dragging) {
+            self.drag_speed(event.position.x, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.volume_dragging) {
+            self.drag_volume(event.position.x, cx);
+            return;
+        }
+        if std::mem::take(&mut self.scrubbing) {
+            self.scrub_to(event.position.x, true, cx);
+        }
+    }
+}

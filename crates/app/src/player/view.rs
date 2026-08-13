@@ -1,0 +1,204 @@
+//! What of the timeline is on the bed and what of it is picked: the zoom,
+//! the scroll and the selection.
+
+use crate::*;
+
+impl Player {
+    /// The one place a clip becomes *the* selected one: a click, a right-click
+    /// that opens the menu, and every selection key go through here, so what a
+    /// keyboard marks and what a pointer marks are the same state marked the
+    /// same way (group and all -- see [`marked`]).
+    pub(crate) fn select(&mut self, target: (Lane, usize), cx: &mut Context<Self>) {
+        self.selected = Some(target);
+        cx.notify();
+    }
+
+    /// Every clip the playhead is over, one per lane, in the order the lanes are
+    /// drawn -- video first, which is the order [`PlaybackSession::lanes`] comes
+    /// in. What the select key walks.
+    pub(crate) fn under_playhead(&self) -> Vec<(Lane, usize)> {
+        let Some(session) = &self.session else {
+            return Vec::new();
+        };
+        let now = session.now();
+        session
+            .lanes()
+            .into_iter()
+            .filter_map(|lane| Some((lane, session.lane_clip_at(lane, now)?)))
+            .collect()
+    }
+
+    /// Selects the clip under the playhead, and on a repeat press the next
+    /// lane's -- so one key reaches every clip the playhead is over, which is
+    /// what makes selection (and everything that acts on a selection: delete,
+    /// lift, the equalizer, the grade) reachable with no pointer at all.
+    pub(crate) fn select_under_playhead(&mut self, cx: &mut Context<Self>) {
+        let under = self.under_playhead();
+        let Some(&first) = under.first() else {
+            self.notify_user("NOTHING UNDER THE PLAYHEAD — move it onto a clip first".into());
+            cx.notify();
+            return;
+        };
+        // Where the current selection sits in that walk decides what "again"
+        // means; a selection off the playhead starts the walk over.
+        let next = self
+            .selected
+            .and_then(|sel| under.iter().position(|&clip| clip == sel))
+            .map_or(first, |at| under[(at + 1) % under.len()]);
+        self.select(next, cx);
+    }
+
+    /// Walks the selection along its own lane, wrapping at either end. Nothing
+    /// selected means nothing to walk from, so it selects under the playhead
+    /// exactly as the select key does: either key can start as well as continue.
+    pub(crate) fn select_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let clips = self
+            .selected
+            .zip(self.session.as_ref())
+            .map_or(0, |((lane, _), session)| session.lane_clips(lane).len());
+        match (self.selected, clips) {
+            // An empty lane is a selection nothing can be stepped from -- as is
+            // no selection at all, and the playhead answers both.
+            (Some((lane, idx)), len) if len > 0 => {
+                let next = if forward {
+                    (idx + 1) % len
+                } else {
+                    (idx + len - 1) % len
+                };
+                self.select((lane, next), cx);
+            }
+            _ => self.select_under_playhead(cx),
+        }
+    }
+
+    /// Cycles the fit policy of the clip the picture is coming from -- the
+    /// clicked one when it is a video clip, else the composite's own, exactly as
+    /// the colour card picks its target. A whole card for one four-valued
+    /// setting would be a card to close; a stroke that cycles it and says what
+    /// it landed on is the same setting with nothing to dismiss.
+    ///
+    /// Only means anything when the clip is not the project's size -- a clip
+    /// that already fills the canvas looks the same under all four -- so the
+    /// notice says the size it is placing, not just the word.
+    pub(crate) fn cycle_fit(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            self.notify_user("no timeline to fit — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let target = self
+            .selected
+            .filter(|(lane, _)| lane.kind == LaneKind::Video)
+            .or_else(|| session.video_clip_at(session.now()));
+        let Some((lane, idx)) = target else {
+            self.notify_user("no clip under the playhead to fit".into());
+            cx.notify();
+            return;
+        };
+        let next = next_fit(session.fit_of(lane, idx));
+        self.apply_fit(lane, idx, next, cx);
+    }
+
+    /// One clip's fit policy set, whichever asked: the stroke that steps to the
+    /// next one and the list that names one outright come through here, so they
+    /// cannot differ in what they do or in what they say they did.
+    pub(crate) fn apply_fit(&mut self, lane: Lane, idx: usize, fit: FitPolicy, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session
+            && session.set_fit(lane, idx, fit)
+        {
+            let (w, h) = session.resolution();
+            self.notify_user(format!("FIT POLICY: {} on {w}x{h}", fit_label(fit)).into());
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// The scale against the bed it is drawn on and the timeline it is drawn
+    /// from: every clamp, zoom and scroll is worked out through this, and the
+    /// bed is measured off the ruler's probe rather than remembered, so a
+    /// resized window is a resized view on the very next answer.
+    pub(crate) fn view(&self) -> View {
+        View {
+            scale: self.scale,
+            bed: f32::from(self.ruler.get().size.width),
+            duration: self.drawn_duration(),
+            fps: self.fps,
+        }
+    }
+
+    /// Magnifies the timeline about a point that stays put: `anchor` is how many
+    /// pixels along the bed to hold still (a ctrl+wheel holds the pointer), and
+    /// with none it is the playhead -- so the frame being worked on is still the
+    /// frame on screen after the zoom. Clamped at both ends by [`View`]: out
+    /// stops at the whole timeline on the bed, in at a handful of frames.
+    pub(crate) fn zoom(&mut self, factor: f32, anchor: Option<f32>, cx: &mut Context<Self>) {
+        let view = self.view();
+        let at = self.playhead(view.duration);
+        let anchor = anchor.unwrap_or_else(|| self.scale.px_at(at).clamp(0., view.bed));
+        self.scale = view.zoomed(factor, anchor);
+        // The view a hand chose. A zoom about the playhead leaves it on the
+        // bed, so this is given back on the very next frame and only a zoom
+        // that took the head off screen -- ctrl+wheel away from it -- holds.
+        self.panned = true;
+        cx.notify();
+    }
+
+    /// All the way back out: the whole timeline across the bed, and the one
+    /// thing that reads the timeline's own length to decide how wide a second
+    /// is drawn.
+    pub(crate) fn zoom_fit(&mut self, cx: &mut Context<Self>) {
+        self.scale = self.view().fit();
+        cx.notify();
+    }
+
+    /// Slides the view along the timeline by `notches` of the wheel, later in
+    /// time for a positive one and [`SCROLL_NOTCH_SHARE`] of the bed each. The
+    /// scale is untouched: this is the timeline's scrollbar, and the only thing
+    /// on the panel that moves what is on screen without magnifying it.
+    pub(crate) fn scroll_view(&mut self, notches: f32, cx: &mut Context<Self>) {
+        let view = self.view();
+        // Nothing painted yet: there is no bed to measure a notch against, and
+        // a start moved against a zero width would be a jump to the head.
+        if view.bed <= 0. {
+            return;
+        }
+        self.scale = view.scrolled(notches * view.bed * SCROLL_NOTCH_SHARE);
+        // The one gesture whose whole purpose is to look away from the
+        // playhead: while playing it wins over the follow, which is what every
+        // editor does with a scroll during playback.
+        self.panned = true;
+        cx.notify();
+    }
+
+    /// One notch of the wheel anywhere over the timeline -- the ruler or a
+    /// lane's bed alike, since a hand aims at the clip it is working on and not
+    /// at the strip above it. Ctrl zooms about the pointer, bare scrolls the
+    /// view along: the mapping Premiere, Movavi and CapCut share, and the one
+    /// the user named.
+    ///
+    /// The anchor is measured off the ruler's probe wherever the pointer is,
+    /// because that probe *is* the bed's x-to-time mapping ([`HEADER_W`]) and
+    /// every lane is drawn through the same one.
+    pub(crate) fn timeline_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let d = wheel_delta(event);
+        if d == 0. {
+            return;
+        }
+        let factor = match d > 0. {
+            true => ZOOM_STEP,
+            false => 1. / ZOOM_STEP,
+        };
+        match event.modifiers.control {
+            true => {
+                let anchor = px_along(event.position.x, self.ruler.get());
+                self.zoom(factor, Some(anchor), cx);
+            }
+            // Up is back towards the head of the timeline, the way a wheel up
+            // is back towards the top of a page.
+            false => self.scroll_view(-d.signum(), cx),
+        }
+    }
+}
