@@ -268,44 +268,65 @@ impl Mp4Muxer {
                 pic_param_set: video.pps.to_vec(),
             }),
         })?;
-        if let Some(audio) = audio {
-            // The one thing this writer must never do quietly: an `mp4a` sample
-            // entry declares AAC, so Opus packets in it would be a file that
-            // says one codec and holds another. `export` never asks -- Opus is
-            // written for Matroska alone -- and this is the backstop that keeps
-            // that true if a format is ever added on the other side.
-            if audio.opus_pre_skip.is_some() {
-                return Err("an Opus track in an mp4: this writer declares `mp4a` only".into());
-            }
-            let freq_index = SampleFreqIndex::try_from(audio.freq_index)?;
-            // The index's own rate, not `audio.sample_rate`: this is the clock
-            // an `stts` counts in and the `esds` states the index, so the two
-            // must not be able to disagree.
-            let sample_rate = freq_index.freq();
-            writer.add_track(&TrackConfig {
-                track_type: TrackType::Audio,
-                timescale: sample_rate,
-                language: "und".to_string(),
-                media_conf: MediaConfig::AacConfig(AacConfig {
-                    bitrate: 0,
-                    profile: AudioObjectType::AacLowComplexity,
-                    freq_index,
-                    chan_conf: ChannelConfig::try_from(audio.chan_conf)?,
-                }),
-            })?;
-        }
-
-        Ok(Self {
+        let mut muxer = Self {
             writer,
             frame_duration,
-            has_audio: audio.is_some(),
+            has_audio: false,
             entry,
             colr: colr_nclx(ColorDescription::output(video.height)),
             path: path.to_path_buf(),
             timescale,
             frames: 0,
             sub_names: Vec::new(),
-        })
+        };
+        if let Some(audio) = audio {
+            muxer.add_audio_track(audio)?;
+        }
+        Ok(muxer)
+    }
+
+    /// Declares the AAC track, which an mp4 may do at any point before its
+    /// first packet is written: the sample table is built from the samples as
+    /// they are handed over, and this file's audio is handed over after the
+    /// whole picture ([`write_audio_packet`](Mp4Muxer::write_audio_packet)).
+    ///
+    /// That is what lets an export mix and encode its sound *while* it encodes
+    /// the picture rather than before it: the picture's loop no longer needs to
+    /// know the track's shape to start. Declaring it at the open, which is what
+    /// a caller that already has the sound does, writes the same file --
+    /// `mp4 0.14` builds the movie box at `finish` from tracks in the order
+    /// they were added, and the samples themselves are written in the order the
+    /// caller writes them either way.
+    pub fn add_audio_track(&mut self, audio: &AudioParams) -> crate::Result<()> {
+        // The one thing this writer must never do quietly: an `mp4a` sample
+        // entry declares AAC, so Opus packets in it would be a file that says
+        // one codec and holds another. `export` never asks -- Opus is written
+        // for Matroska alone -- and this is the backstop that keeps that true
+        // if a format is ever added on the other side.
+        if audio.opus_pre_skip.is_some() {
+            return Err("an Opus track in an mp4: this writer declares `mp4a` only".into());
+        }
+        if self.has_audio {
+            return Err("an mp4 declares its audio track once".into());
+        }
+        let freq_index = SampleFreqIndex::try_from(audio.freq_index)?;
+        // The index's own rate, not `audio.sample_rate`: this is the clock an
+        // `stts` counts in and the `esds` states the index, so the two must not
+        // be able to disagree.
+        let sample_rate = freq_index.freq();
+        self.writer.add_track(&TrackConfig {
+            track_type: TrackType::Audio,
+            timescale: sample_rate,
+            language: "und".to_string(),
+            media_conf: MediaConfig::AacConfig(AacConfig {
+                bitrate: 0,
+                profile: AudioObjectType::AacLowComplexity,
+                freq_index,
+                chan_conf: ChannelConfig::try_from(audio.chan_conf)?,
+            }),
+        })?;
+        self.has_audio = true;
+        Ok(())
     }
 
     /// One coded picture, Annex-B framed. Parameter sets inside it are dropped

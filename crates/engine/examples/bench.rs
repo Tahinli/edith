@@ -27,7 +27,15 @@
 //! writing except the export destination it is handed.
 //!
 //! Env: `BENCH_TTFF_TIMEOUT` (s, default 180) how long a seek may wait for its
-//! first frame, `BENCH_EXPORT_CAP` (s, default 300) the wall clock any single
+//! first frame, `BENCH_EXPORT_SPAN` (s, default 60) how much timeline one
+//! export measurement covers, `BENCH_EXPORT_AUDIO` (unset) whether that
+//! timeline carries its source's sound as well -- the row is named `_av` when
+//! it does, because an export's wall clock is the audio pass plus the picture
+//! and a picture-only number is not the thing a person waits for --
+//! `BENCH_EXPORT_ASTREAM` (default 0) which of the file's audio streams that
+//! is, a film's second track often being the one no sample table can copy and
+//! therefore the one that measures a re-encode,
+//! `BENCH_EXPORT_CAP` (s, default 300) the wall clock any single
 //! export measurement may take, `BENCH_EXPORT_REPS` (default 5) how many times
 //! an export is repeated *if the cap leaves room* -- a 4K encode gets one
 //! capped rep, the small control gets five -- and `BENCH_KEEP` (unset) whether
@@ -620,7 +628,12 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         "hevchw" => (Format::Hevc, false),
         _ => usage(),
     };
-    let metric = format!("export_fps_{seat}");
+    // The sound is opt-in and named in the row, so an `_av` number is never
+    // compared against a picture-only one: what it measures is the *export* --
+    // audio pass, mux and all -- which is the only shape of the number a
+    // "twice real time" claim may be made from.
+    let with_audio = std::env::var_os("BENCH_EXPORT_AUDIO").is_some();
+    let metric = format!("export_fps_{seat}{}", if with_audio { "_av" } else { "" });
     let (meta, _) = match engine::demux::Demuxer::open(path) {
         Ok(opened) => opened,
         Err(e) => {
@@ -628,7 +641,8 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
             return;
         }
     };
-    let span = ((meta.frame_rate * 60.0) as u32).min(meta.frame_count.max(1));
+    let span = ((meta.frame_rate * env_f64("BENCH_EXPORT_SPAN", 60.0)) as u32)
+        .min(meta.frame_count.max(1));
     let in_frame = (meta.frame_count / 10).min(meta.frame_count.saturating_sub(span));
     let clip = Clip {
         start: 0,
@@ -641,9 +655,16 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         fit: engine::scale::FitPolicy::default(),
         speed: Speed::NORMAL,
     };
+    // The sound, where it was asked for, is the same clip on an audio lane:
+    // the very window the picture covers, so the two passes measure one export.
+    let mut lanes = vec![(LaneKind::Video, vec![clip.clone()])];
+    if with_audio {
+        lanes.push((LaneKind::Audio, vec![clip]));
+    }
+    let stream = env_f64("BENCH_EXPORT_ASTREAM", 0.0) as usize;
     let project = match Project::from_parts(
-        vec![Source::new(path, 0)],
-        vec![(LaneKind::Video, vec![clip])],
+        vec![Source::new(path, stream)],
+        lanes,
         Vec::new(),
         Vec::new(),
     ) {
@@ -669,7 +690,14 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         let handle = engine::export::start(project.clone(), meta, &out, &settings);
         let t = Instant::now();
         let mut capped = false;
+        // The highest the bar was ever seen at, not wherever it happens to
+        // stand when the clock stops: an export publishes one bar from two
+        // stages, and a capped run's rate is derived from this number. Taking
+        // the maximum over the poll loop means a single unlucky read cannot
+        // under-report the work that was really done.
+        let mut peak = 0.0f64;
         while !handle.is_finished() {
+            peak = peak.max(f64::from(handle.progress()));
             if t.elapsed() >= cap {
                 capped = true;
                 handle.cancel();
@@ -679,7 +707,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         }
         // A cancel is answered at the worker's next checkpoint; the rate is
         // read from the progress at the moment the clock stopped either way.
-        let progress = f64::from(handle.progress());
+        let progress = peak.max(f64::from(handle.progress()));
         let elapsed = t.elapsed().as_secs_f64();
         let done = Instant::now() + Duration::from_secs(60);
         while !handle.is_finished() && Instant::now() < done {

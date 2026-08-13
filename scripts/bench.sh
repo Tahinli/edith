@@ -47,11 +47,17 @@ TARGET=$(realpath -m "${CARGO_TARGET_DIR:-target}")
 # The plugins are their own build: `--example` selects example targets in every
 # package it is given, and a cdylib is not one, so `-p engine-hw --example
 # bench` built no plugin at all and every run measured software while the line
-# below said otherwise. engine-audio is here for the same reason -- the play
-# loop's underruns come from the device, and with no plugin there is no device.
+# below said otherwise (measured 2026-08-13: the film's hardware export read
+# 11.55 fps as silent software, 94.58 fps once the plugin was there).
+# engine-audio is here for the same reason -- the play loop's underruns come
+# from the device, and with no plugin there is no device.
 cargo build --release -p engine-hw -p engine-audio || exit 1
 cargo build --release -p engine --example bench || exit 1
 BENCH="$TARGET/release/examples/bench"
+[ -f "$TARGET/release/libengine_hw.so" ] || {
+    echo "no libengine_hw.so in $TARGET/release: every hardware row would be software" >&2
+    exit 1
+}
 # The plugin is looked for beside the running executable, and an example binary
 # lives one directory below the plugin: without this, hardware decode and
 # hardware encode silently fall back to software and the baseline is a lie.
