@@ -41,8 +41,19 @@ LOG="$OUT_DIR/bench.log"
 # Absolute, because $CARGO_TARGET_DIR may already be one and the plugin path
 # below must not become "$PWD/$HOME/...".
 TARGET=$(realpath -m "${CARGO_TARGET_DIR:-target}")
-cargo build --release -p engine -p engine-hw --example bench || exit 1
+# Two builds, and that is not tidiness: `--example bench` is a target filter,
+# and engine-hw has no example by that name, so one command builds the harness
+# and *not the plugin* -- a fresh target directory then benchmarks pure
+# software while every row says nothing about it (measured 2026-08-13: the
+# film's hardware export read 11.55 fps, and 94.58 fps once the plugin was
+# there).
+cargo build --release -p engine-hw || exit 1
+cargo build --release -p engine --example bench || exit 1
 BENCH="$TARGET/release/examples/bench"
+[ -f "$TARGET/release/libengine_hw.so" ] || {
+    echo "no libengine_hw.so in $TARGET/release: every hardware row would be software" >&2
+    exit 1
+}
 # The plugin is looked for beside the running executable, and an example binary
 # lives one directory below the plugin: without this, hardware decode and
 # hardware encode silently fall back to software and the baseline is a lie.
