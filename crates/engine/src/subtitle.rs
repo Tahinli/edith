@@ -41,7 +41,7 @@ pub struct Cue {
     /// Plain text, `\n` between the lines of a multi-line cue. The markup is
     /// resolved and dropped: `<i>` from an SRT, `{\an8}` and `\N` from an ASS.
     ///
-    /// ponytail: bold/italic/colour and ASS positioning are parsed by the crate
+    /// corner-cut: bold/italic/colour and ASS positioning are parsed by the crate
     /// and thrown away here, because nothing draws a cue yet. The upgrade path
     /// is to keep `oxideav_core::Segment` beside this string -- the parsers
     /// already hand it over -- and it belongs to whoever writes the renderer.
@@ -242,7 +242,7 @@ pub fn open_all(rows: &[(PathBuf, Option<u64>)]) -> Vec<SubtitleTrack> {
     // than doing it again. The whole walk is kept until the last row is served:
     // it is the tracks nobody asked for that are dropped at the end.
     //
-    // ponytail: a track is *moved* out of its walk, so two rows naming the same
+    // corner-cut: a track is *moved* out of its walk, so two rows naming the same
     // file and the same track leave the second refused by name rather than
     // holding the cues twice. No project edith saves has one -- a row is added
     // by (file, track) and only once ([`crate::Project::add_subtitles`]) -- and

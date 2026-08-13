@@ -34,7 +34,7 @@ fn tone() -> Vec<f32> {
 /// own position, which the gain does not touch: the frames are still consumed,
 /// only the last multiply before the speaker is zero.
 ///
-/// ponytail: it does mean the suite is deaf, so a plugin that shipped with the
+/// corner-cut: it does mean the suite is deaf, so a plugin that shipped with the
 /// gain stuck at zero would pass it. Nothing here could ever hear that -- the
 /// checks that can are `scale`'s unit test in engine-audio (unity leaves the
 /// bytes alone) and a person with the app open. The upgrade path is recording

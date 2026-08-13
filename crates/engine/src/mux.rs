@@ -148,7 +148,7 @@ impl Mp4Muxer {
     /// puts in `CodecPrivate`, which is what makes the two containers' AV1 one
     /// stream written twice rather than two.
     ///
-    /// ponytail: the ceiling is that one entry. A second video track, or an AV1
+    /// corner-cut: the ceiling is that one entry. A second video track, or an AV1
     /// track beside an H.264 one, would need the walk in [`patch_av01`] to be
     /// told *which* track it is patching; the upgrade path is passing the track
     /// id it already knows down that walk.
@@ -389,7 +389,7 @@ impl Mp4Muxer {
     /// one may show two blocks at once, and joining them is what keeps the words
     /// a viewer saw over the picture.
     ///
-    /// ponytail: the `tx3g` sample entry is the one `mp4 0.14` writes and there
+    /// corner-cut: the `tx3g` sample entry is the one `mp4 0.14` writes and there
     /// is no field to reach into it -- `MediaConfig::TtxtConfig` carries nothing
     /// -- so its `data_reference_index` is the crate's 0 where §8.5.2 says an
     /// index into `dref` counts from 1, and it holds no `ftab` font table.
@@ -475,7 +475,7 @@ impl Mp4Muxer {
 /// both lines -- the two things a track of samples has to say that a list of
 /// cues does not.
 ///
-/// ponytail: the active set is looked for from the front of the list at every
+/// corner-cut: the active set is looked for from the front of the list at every
 /// boundary, so this is quadratic in the cues of one track (a 5 000-cue film
 /// costs ~25 M compares once, at the end of an export that took minutes). The
 /// upgrade path is a sweep holding the open cues in a heap keyed on their end.
@@ -820,7 +820,7 @@ pub struct CopyParams<'a> {
     /// The source's own `Colour`: a copied HDR film leaves as the HDR film it
     /// is, because not one of its samples was touched.
     ///
-    /// ponytail: the `MasteringMetadata` and MaxCLL beside it are not carried --
+    /// corner-cut: the `MasteringMetadata` and MaxCLL beside it are not carried --
     /// this engine parses them ([`crate::demux::ContentLight`]) but has nowhere
     /// to write them yet, so a copied HDR file states its curve and not its
     /// grading display. Upgrade path is a `Colour` element written from that
@@ -922,7 +922,7 @@ impl MkvMuxer {
     /// single coded picture, and interleaving needs to look ahead of the frame
     /// being written.
     ///
-    /// ponytail: that is the copy path's own ceiling reappearing (the track sits
+    /// corner-cut: that is the copy path's own ceiling reappearing (the track sits
     /// in memory, ~500 MB an hour); the upgrade path is the same streaming
     /// `copy_segments` `export::copy_audio` names.
     pub fn create(

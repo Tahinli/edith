@@ -23,7 +23,7 @@ impl Player {
     /// canvas fitted over the picture region exactly as the picture itself is,
     /// which puts every cue where the disc put it relative to its own frame.
     ///
-    /// ponytail: exact only while the canvas and the encode are the same shape
+    /// corner-cut: exact only while the canvas and the encode are the same shape
     /// -- a 16:9 canvas over a 2.39:1 encode fits to the region's height and
     /// the film to its width, so a cue sits a little low on a scope film. The
     /// upgrade path is the picture's own rect, which wants `VideoMeta`'s aspect

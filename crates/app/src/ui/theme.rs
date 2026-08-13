@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// every family is a compile error, and a role read at a paint cannot come from
 /// anywhere but the palette in force.
 ///
-/// ponytail: the families are spelled out in [`PALETTES`] rather than derived
+/// corner-cut: the families are spelled out in [`PALETTES`] rather than derived
 /// from a second list -- `macro_rules!` cannot nest a repetition over families
 /// inside one over roles, and the escape hatch for that is unstable. Ceiling: a
 /// thirteenth family is one line there, one variant in [`PaletteId`], one
@@ -1104,7 +1104,7 @@ pub fn clip_kind(kind: LaneKind, image: bool) -> u32 {
 /// `tone` argument at seventy call sites is seventy chances to disagree with the
 /// sentence it labels.
 ///
-/// ponytail: prefix matching, so a message worded outside these families reads
+/// corner-cut: prefix matching, so a message worded outside these families reads
 /// as neutral rather than wrong. Ceiling: a `Notice { text, tone }` struct the
 /// day a message needs a colour its own words do not say.
 pub fn notice_tone(message: &str) -> u32 {
