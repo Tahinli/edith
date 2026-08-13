@@ -303,6 +303,17 @@ pub struct ExportSettings {
 }
 
 struct Shared {
+    /// Fraction of the job done, in [`PROGRESS_SCALE`]ths.
+    ///
+    /// **Every stage that can run beside another writes this with `fetch_max`,
+    /// never `store`.** The sound and the picture are two threads publishing
+    /// two bands of one bar ([`AUDIO_BAND`]): a `store` from the lower band
+    /// pulls the bar backwards every time the other thread has already moved
+    /// it on, which is what a person sees as a progress bar that stutters
+    /// backwards -- 5,458 backward steps over one film export before this rule
+    /// was written down. A `store` is only correct where nothing else can be
+    /// publishing at all, which now means the terminal [`PROGRESS_SCALE`] and
+    /// the audio-only export ([`run_audio`]) that has no second thread.
     progress: AtomicU32,
     cancel: AtomicBool,
     finished: AtomicBool,
@@ -1325,10 +1336,21 @@ fn encode_audio(
         * channels;
     let mut samples: Vec<f32> = Vec::with_capacity(total);
     for chunk in chunks {
+        // The only place a cancelled export can be answered before the whole
+        // timeline has been mixed. This pass runs on a thread of its own now
+        // ([`run`]), so without this a cancel left it mixing a feature film
+        // for minutes behind a job nobody is waiting for any more, writing
+        // into a `Shared` whose outcome was already settled.
+        cancelled(shared)?;
         samples.extend(chunk.samples);
         // The bar's first third of [`AUDIO_BAND`]: the mix is the longest of
         // the three stages and the only one that can be counted as it goes.
-        shared.progress.store(
+        //
+        // `fetch_max` and not `store`, for the reason [`Shared::progress`]
+        // states: this runs on the audio thread while the picture publishes
+        // numbers above [`AUDIO_BAND`] from the other, and a `store` of this
+        // small one pulled the bar backwards 5,458 times over one film export.
+        shared.progress.fetch_max(
             (samples.len().min(total) * (AUDIO_BAND / 3) as usize / total.max(1)) as u32,
             Ordering::Relaxed,
         );
@@ -1351,6 +1373,10 @@ fn encode_audio(
     // there is no resampler on this path, and inventing one to reach 48 kHz
     // would resample a whole timeline to satisfy a codec, which is a bigger
     // change to the sound than the codec is.
+    // ...and again before either encoder is entered: both of them run to the
+    // end of the mix without a checkpoint of their own, so this is the last
+    // moment a cancel costs seconds rather than the whole encode.
+    cancelled(shared)?;
     if mkv
         && audio.sample_rate == OPUS_RATE
         && channels == 2
@@ -1380,6 +1406,7 @@ fn encode_audio(
     // `next_packet` after `finish` yields packets until `Eof` and nothing else,
     // so the loop ends on the only error it can see.
     while let Ok(packet) = encoder.next_packet() {
+        cancelled(shared)?;
         packets.push(crate::AacPacket {
             bytes: packet.data,
             samples: packet.duration,
@@ -1756,6 +1783,17 @@ fn run(
     // A Matroska file (and a copied one, whose muxer is the same) collects it
     // here; an mp4 leaves it running and collects it under the picture below.
     let mut audio_job = Some(audio_job);
+    // The condition is the *format*, and the copied-picture path below relies
+    // on that covering it too: `plan` hands its packets straight to a Matroska
+    // muxer, so it may only exist where this has already collected them --
+    // which holds because [`CopyPlan::of`] returns `None` for every format
+    // that is not `Hevc` or `Av1`, both of which are `is_mkv`. Said out loud
+    // because a copy plan for an mp4 would otherwise reach `plan.run` with the
+    // sound still being mixed on the other thread.
+    debug_assert!(
+        settings.format.is_mkv() || plan.is_none(),
+        "a copy plan outside Matroska would run before its sound is collected"
+    );
     let audio = match settings.format.is_mkv() {
         true => join_audio(audio_job.take().expect("the job was just made"))?,
         false => None,
