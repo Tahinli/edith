@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 
 use rusty_h264::Decoder;
@@ -670,7 +670,18 @@ fn span_worker(
     canvas: Composer,
     tone: tonemap::Preset,
 ) -> FrameStream {
-    let (tx, rx) = sync_channel(canvas.queue_depth());
+    // The depth is the size of the pictures this worker will *emit*, which for a
+    // pass-through canvas is the stream's own -- and the sync opener has already
+    // read that on the caller's thread. Asking the canvas alone is how the file
+    // door came up with 2: every session opens pass-through (a freshly opened
+    // file *is* the project resolution), so a whole file would play at the
+    // decode-ahead this engine had before there was one, until the first seek
+    // built a real canvas.
+    let depth = match (&opened, canvas.places_nothing()) {
+        (Some(source), true) => crate::scale::queue_depth(source.meta.width, source.meta.height),
+        _ => canvas.queue_depth(),
+    };
+    let (tx, rx) = sync_channel(depth);
     let cancel = Arc::new(AtomicBool::new(false));
     // Written by the worker the moment it knows, so a caller reading it sees
     // what opened rather than what was hoped for -- and kept across the spans
@@ -714,12 +725,38 @@ fn span_worker(
                 if !abort.hit() {
                     run_span(&worker_path, &mut source, cmd, &abort, &worker_backend);
                 }
-                // The session dropped the command channel: this worker is
-                // retired (or was detached), so the file, the decoder and the
-                // VA-API session it holds go now -- before Mesa's `atexit`.
-                match commands.recv() {
+                // Parked between spans. A seek and a clip boundary arrive in
+                // milliseconds and find the decoder still open, which is the
+                // whole point of this thread -- but a session nobody comes back
+                // to (the timeline played out, the window was left alone) must
+                // not sit on the driver: it would hold a live libva thread into
+                // whatever exit path the process takes, which is the SIGSEGV in
+                // Mesa's `atexit` the retired pool exists to prevent, and
+                // holding it *while idle* would widen that from "quit during a
+                // decode" to "quit any time after opening a file".
+                //
+                // So the wait is in two halves: the fast one keeps everything,
+                // and past [`IDLE`] the hardware session is closed. The demuxer
+                // stays -- it is a file handle and an index, not driver state,
+                // and rebuilding it is what costs seconds on a big Matroska --
+                // so the reseek after a long pause pays one VA-API init and
+                // nothing else.
+                match commands.recv_timeout(IDLE) {
                     Ok(next) => cmd = next,
-                    Err(_) => return,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(source) = &mut source
+                            && source.hw.take().is_some()
+                        {
+                            eprintln!("decode worker idle: hardware session closed");
+                        }
+                        // The session dropped the command channel: this worker
+                        // is retired (or was detached), so the file goes now.
+                        match commands.recv() {
+                            Ok(next) => cmd = next,
+                            Err(_) => return,
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
         })
@@ -740,6 +777,12 @@ fn span_worker(
         backend,
     }
 }
+
+/// How long a parked worker keeps its hardware session before closing it. Long
+/// enough that a seek, a scrub step and a clip boundary all find the decoder
+/// where they left it; short enough that a session left alone is not holding
+/// libva when the process exits.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How many pictures in a row a worker may drop for being late before it hands
 /// one over regardless. The policy needs a floor of its own: a machine that
