@@ -111,6 +111,22 @@ struct Audio {
     /// seek counts it as such, which is a permanent offset between the picture
     /// and the sound, re-rolled by every edit made while playing.
     content_at: Arc<AtomicI64>,
+    /// The timeline is *meant* to be playing: what a play or a seek-while-playing
+    /// asks for, and what the feeder turns into a running device the moment it
+    /// has a real sample to play ([`Audio::set_playing`], [`feed`]).
+    ///
+    /// The device is not started by the intent, because an inactive stream has
+    /// no callbacks and therefore no starved quanta: between the flush of a seek
+    /// and the first sample of the new stream -- seconds, on a cold 25 GB film
+    /// whose decoder is opened on the feeder -- a device started here would play
+    /// its own silence and count every quantum of it as an underrun.
+    ///
+    /// Written and read under the device lock, beside the [`Audio::content_at`]
+    /// stamp, and that is the whole race: whichever of the two sides takes the
+    /// lock first, the other sees its half (a stamp already there, or an intent
+    /// already set), so the device is started exactly once and a pause landing
+    /// during an open can never be overtaken by a late activation.
+    wants_active: Arc<AtomicBool>,
     /// The last [`TAP_SAMPLES`] mono samples handed to the device, oldest
     /// first: what a meter or an analyser draws. Written by the feeder, which
     /// is not the device's own callback -- the plugin's RT thread never sees
@@ -134,6 +150,22 @@ impl Audio {
     fn played_out(&self, position: i64) -> bool {
         self.fed_all.load(Ordering::Acquire)
             && position as u64 * self.channels >= self.fed.load(Ordering::Relaxed)
+    }
+
+    /// Says whether the timeline is playing, and starts or stops the device for
+    /// it: `true` runs it *if there is already something to play*, and otherwise
+    /// leaves it to the feeder's first sample ([`Audio::wants_active`]). `false`
+    /// stops it at once -- a pause is never deferred, whatever an open in flight
+    /// is about to find.
+    fn set_playing(&self, playing: bool) {
+        // The lock, not the atomics, is what orders this against the feeder's
+        // stamp: the store below and the load after it are one critical section,
+        // and so is the feeder's pair.
+        let ao = self.ao.lock().unwrap();
+        self.wants_active.store(playing, Ordering::Release);
+        if !playing || self.content_at.load(Ordering::Acquire) >= 0 {
+            ao.set_active(playing);
+        }
     }
 
     /// Keeps the newest [`TAP_SAMPLES`] of what was just queued, downmixed to
@@ -2368,7 +2400,7 @@ impl PlaybackSession {
         // here too -- `clock.seek_to(t)` and then `set_active(true)`.
         self.clock.play();
         if let Some(audio) = &self.audio {
-            audio.ao.lock().unwrap().set_active(true);
+            audio.set_playing(true);
         }
     }
 
@@ -2377,7 +2409,7 @@ impl PlaybackSession {
             return;
         }
         if let Some(audio) = &self.audio {
-            audio.ao.lock().unwrap().set_active(false);
+            audio.set_playing(false);
         }
         self.clock.pause();
     }
@@ -2441,6 +2473,16 @@ impl PlaybackSession {
         let audio = self.audio.as_ref()?;
         let tap = audio.tap.lock().unwrap().clone();
         Some((tap, audio.sample_rate))
+    }
+
+    /// How many quanta the device has had to fill with silence for want of
+    /// samples since this session opened: the count that means "the decoder was
+    /// late", sampled live rather than printed at the end of the process, so a
+    /// caller can attribute it to the seek it followed
+    /// ([`AoSession::underruns`]). `None` with no device, and with a plugin too
+    /// old to carry the counter.
+    pub fn audio_underruns(&self) -> Option<u64> {
+        self.audio.as_ref()?.ao.lock().unwrap().underruns()
     }
 
     /// Repositions the timeline to `secs`, clamped to the *timeline*. Both decode
@@ -2526,23 +2568,17 @@ impl PlaybackSession {
     /// the clock held until the new stream is really audible (see
     /// [`Audio::content_at`]).
     ///
-    /// corner-cut: the device is made active here, before the new stream has been
-    /// opened ([`start_audio`](Self::start_audio) opens on the feeder now), so a
-    /// cold open leaves it playing its own silence with an empty ring -- audibly
-    /// the same silence as before, and counted: a scripted cold play-seek-scrub
-    /// session goes from 5 to 1721 `engine_audio: N underruns`, one per starved
-    /// quantum, while a warm one is unchanged (46 -> 53 over the suite's 11
-    /// sessions). Ceiling: the count stops meaning "the decoder was late" during
-    /// a cold seek. Upgrade path is a `wants_active` flag written here and read
-    /// by the feeder under the device lock beside the [`Audio::content_at`]
-    /// stamp, so the device is started by the first real sample rather than by
-    /// the intent to play -- it has to be the lock and the epoch check, or a
-    /// pause during the open would be overtaken by a late activation and the
-    /// timeline would play while it says it is paused.
+    /// Only the *intent* is set here: the open runs on the feeder
+    /// ([`start_audio`](Self::start_audio)), so the device is started by that
+    /// stream's first real sample instead ([`Audio::wants_active`]). A device
+    /// made active over an empty ring plays its own silence and counts one
+    /// underrun per starved quantum -- a scripted cold play-seek-scrub session
+    /// used to go from 5 to 1721 of them -- while the ear hears the same silence
+    /// either way, so nothing is gained for the count that is lost.
     fn resume(&mut self, was_playing: bool) {
         self.priming = true;
-        if was_playing && let Some(audio) = &self.audio {
-            audio.ao.lock().unwrap().set_active(true);
+        if let Some(audio) = &self.audio {
+            audio.set_playing(was_playing);
         }
     }
 
@@ -2988,6 +3024,7 @@ fn open_audio(path: &Path, stream: usize) -> (Option<Audio>, Option<String>) {
         died: Arc::new(AtomicBool::new(false)),
         epoch: Arc::new(AtomicU64::new(0)),
         content_at: Arc::new(AtomicI64::new(-1)),
+        wants_active: Arc::new(AtomicBool::new(false)),
         tap: Arc::new(Mutex::new(Vec::with_capacity(TAP_SAMPLES))),
         feeders: Arc::new(AtomicUsize::new(0)),
     };
@@ -3042,6 +3079,25 @@ fn feed(rx: Receiver<AudioChunk>, audio: &Audio, epoch: u64) {
                 audio
                     .fed
                     .store(at as u64 * audio.channels, Ordering::Relaxed);
+                // ...and *this* is where a playing timeline's device starts: on
+                // the first sample there is to play, under the same lock and
+                // past the same epoch check as the stamp, so the silence of the
+                // open was never played and never counted
+                // ([`Audio::wants_active`]).
+                if audio.wants_active.load(Ordering::Acquire) {
+                    ao.set_active(true);
+                }
+            } else if accepted == 0 && audio.content_at.load(Ordering::Acquire) < 0 {
+                // Nothing taken with nothing yet queued is the *flush* of the
+                // restart still standing: the ring refuses a write until a
+                // callback has consumed the flag (`engine_audio::accept`), and
+                // only a running device has callbacks. So the device is started
+                // here too -- there is a sample in hand, which is what the wait
+                // was for -- and the quantum or two of that handshake is the
+                // silence `Shared::primed` does not count.
+                if audio.wants_active.load(Ordering::Acquire) {
+                    ao.set_active(true);
+                }
             }
             accepted
         };

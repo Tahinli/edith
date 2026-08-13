@@ -20,6 +20,11 @@ struct Plugin {
     set_active: unsafe extern "C" fn(*mut c_void, u32) -> i32,
     set_volume: unsafe extern "C" fn(*mut c_void, f32) -> i32,
     flush: unsafe extern "C" fn(*mut c_void) -> i32,
+    /// Optional, unlike its neighbours: this one is a *counter*, and a plugin
+    /// too old to have it is a session that plays perfectly and cannot say how
+    /// many quanta it starved for. Rejecting the whole plugin over that would
+    /// trade the sound for the diagnostic.
+    underruns: Option<unsafe extern "C" fn(*mut c_void) -> i64>,
     close: unsafe extern "C" fn(*mut c_void),
     // Never dropped (lives in a static), so the fn pointers above stay valid.
     _lib: Library,
@@ -63,6 +68,7 @@ fn load() -> Option<Plugin> {
                     // with no sound at all, which at least says so.
                     set_volume: *lib.get(b"ao_set_volume\0").ok()?,
                     flush: *lib.get(b"ao_flush\0").ok()?,
+                    underruns: lib.get(b"ao_underruns\0").ok().map(|f| *f),
                     close: *lib.get(b"ao_close\0").ok()?,
                     _lib: lib,
                 })
@@ -120,6 +126,15 @@ impl AoSession {
             n if n < 0 => None,
             n => Some(n),
         }
+    }
+
+    /// Quanta the device filled with silence for want of samples, since the
+    /// stream opened: what a benchmark reads to say the decoder kept up.
+    /// `None` from a plugin that does not carry the counter.
+    pub fn underruns(&self) -> Option<u64> {
+        // SAFETY: `handle` came from `ao_open` and is still open.
+        let n = unsafe { (self.plugin.underruns?)(self.handle) };
+        (n >= 0).then_some(n as u64)
     }
 
     /// Pauses or resumes playback; while paused the position stays put.
