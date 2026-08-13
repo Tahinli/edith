@@ -547,6 +547,20 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
         format if format.is_av1() => {
             HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
         }
+        // An intra-only H.264 file is a *different seat*, not the same seat with
+        // a flag on the pictures: asking this one for a key frame every time
+        // gets I slices that are not IDRs and carry no parameter sets, which is
+        // a file with one starting point in it however many I pictures it holds
+        // (measured: a 60-frame hardware proxy, 1 sync point of 60). `None`
+        // where the plugin is older than that seat, and then the software
+        // encoder takes the file -- its `gop_size = 1` writes what was asked
+        // for, slowly, which is the only honest fallback here.
+        //
+        // Only H.264 reaches this arm: the two arms above take every HEVC and
+        // AV1 format, and the HEVC seat is intra-only already.
+        _ if settings.intra_only => {
+            HwEncoder::open_intra(meta.width, meta.height, fps_num, fps_den, bitrate)
+        }
         _ => HwEncoder::open(meta.width, meta.height, fps_num, fps_den, bitrate),
     }
 }
@@ -1697,15 +1711,21 @@ fn run(
     settings: &ExportSettings,
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
-    // Only the mp4 pair carries a colour of its own back out
-    // ([`write_video`] tags it there), so asking any other container for a
-    // source-space file would write pictures one space and a header another.
+    // The two preview switches are the H.264 mp4 pair's alone. Only that
+    // container carries a colour of its own back out ([`write_video`] tags it
+    // there), so asking any other for a source-space file would write pictures
+    // in one space and a header in another; and only that codec's seats honour
+    // `intra_only` -- the HEVC pair is intra whatever it says, and an AV1 one
+    // would quietly write the long-GOP file it always did.
     if settings.keep_source_colour && settings.format != Format::Mp4 {
         return Err(format!(
             "{} cannot be written in its source's colour space",
             settings.format.name()
         )
         .into());
+    }
+    if settings.intra_only && settings.format != Format::Mp4 {
+        return Err(format!("{} cannot be written intra-only", settings.format.name()).into());
     }
     let sources = project.sources();
     // The picture's decision first, before a sample of sound is touched: it is
