@@ -1,5 +1,6 @@
 //! The baseline every later decode/encode change is measured against: open,
-//! seek, scrub and export, timed on the real library rather than on a fixture.
+//! seek, seek storm, play loop, scrub and export, timed on the real library
+//! rather than on a fixture.
 //!
 //! `cargo run --release -p engine --example bench -- <metric> <file> [args]`
 //!
@@ -9,7 +10,10 @@
 //! failure down as data.
 //!
 //! Every row is one TSV line -- `file, metric, unit, n, median, min, max, note`
-//! -- so the whole baseline is `cat`ted together and diffed later.
+//! -- so the whole baseline is `cat`ted together and diffed later. The note is
+//! where the tail percentile and the **decode backend** live: a row that does
+//! not say `backend hw` was measured in software, and a baseline that does not
+//! say which is not a baseline (see `scripts/bench.sh` on `LD_LIBRARY_PATH`).
 //!
 //! **Cold and warm.** Cold means the file's pages are dropped from the page
 //! cache immediately before the measurement, with `posix_fadvise(DONTNEED)` on
@@ -49,6 +53,8 @@ fn main() {
     match metric.as_str() {
         "open" => open_bench(&path),
         "seek" => seek_bench(&path, arg_f64(args.next(), "seconds")),
+        "seekstorm" => seekstorm_bench(&path, arg_seed(args.next())),
+        "playloop" => playloop_bench(&path, arg_f64(args.next(), "seconds"), arg_seed(args.next())),
         "scrub" => scrub_bench(&path),
         "waveform" => waveform_bench(&path),
         "export" => {
@@ -63,6 +69,8 @@ fn main() {
 fn usage() -> ! {
     eprintln!(
         "usage: bench open <file>\n       bench seek <file> <secs>\n       \
+         bench seekstorm <file> [seed]\n       \
+         bench playloop <file> <secs> [seed]\n       \
          bench scrub <file>\n       bench waveform <file>\n       \
          bench export <file> <h264sw|h264hw|av1|hevc|hevchw> <out_dir>"
     );
@@ -72,6 +80,12 @@ fn usage() -> ! {
 fn arg_f64(arg: Option<String>, what: &str) -> f64 {
     arg.and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("missing {what}"))
+}
+
+/// The seed the random metrics draw their positions from: same seed, same
+/// seeks, so a before and an after are the same measurement.
+fn arg_seed(arg: Option<String>) -> u64 {
+    arg.and_then(|s| s.parse().ok()).unwrap_or(1)
 }
 
 // ---------------------------------------------------------------- reporting
@@ -123,6 +137,34 @@ fn threads() -> usize {
 
 fn ttff_timeout() -> Duration {
     Duration::from_secs_f64(env_f64("BENCH_TTFF_TIMEOUT", 180.0))
+}
+
+/// The p'th percentile of `samples`, nearest rank on the sorted copy. The
+/// median is [`row`]'s business; this is for the tail, which is the number a
+/// dropped frame and a starved ring both live in.
+fn pct(samples: &[f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[((sorted.len() - 1) as f64 * p).round() as usize]
+}
+
+/// A seeded LCG, so "random" seeks are the same random seeks tomorrow. Sixteen
+/// lines of a crate would do the same thing and none of the quality a real
+/// generator has matters to a list of positions in a film.
+struct Lcg(u64);
+
+impl Lcg {
+    /// The next position, in `0.0..1.0`.
+    fn next(&mut self) -> f64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
@@ -248,6 +290,220 @@ fn seek_bench(path: &Path, secs: f64) {
         )
     };
     row(path, &format!("seek_ttff_{secs:.0}s"), "ms", &samples, &note);
+}
+
+// -------------------------------------------------------------- seek storm
+
+/// Seeks a film opens with none of: fifty positions nobody chose, drawn from a
+/// seed so the same fifty come back tomorrow. `seek` measures one point five
+/// times over; this measures the spread across the whole file, which is where
+/// an index lookup, a keyframe distance and a decoder reopen all vary.
+///
+/// Cold is the first pass over a freshly evicted file, warm the same fifty
+/// again straight after -- the same two questions the other metrics ask, and
+/// the audio underruns each pass cost are counted with it
+/// ([`engine::PlaybackSession::audio_underruns`]), because a seek that lands
+/// fast and starves the ring is not a seek that worked.
+const STORM_SEEKS: usize = 50;
+
+fn seekstorm_bench(path: &Path, seed: u64) {
+    evict(path);
+    let mut session = match engine::PlaybackSession::open(path) {
+        Ok(session) => session,
+        Err(e) => {
+            row(path, "seekstorm_ttff_cold", "ms", &[], &format!("FAIL({e})"));
+            return;
+        }
+    };
+    // Playing throughout, because the underruns are the point: a paused device
+    // runs no callbacks and can never starve, so a storm measured paused would
+    // report zero however badly the seeks fed it. This is the complaint's own
+    // shape -- a film that is playing, jumped around in.
+    session.play();
+    let duration = session.timeline_duration();
+    let mut rng = Lcg(seed);
+    // Short of the very end: a landing with no picture after it is a different
+    // measurement (end of stream), and every seek here is meant to be one.
+    let targets: Vec<f64> = (0..STORM_SEEKS)
+        .map(|_| rng.next() * duration * 0.95)
+        .collect();
+
+    for pass in ["cold", "warm"] {
+        let before = session.audio_underruns().map_or(0, |(n, _)| n);
+        let mut samples = Vec::new();
+        let mut missed = Vec::new();
+        let mut peak = threads();
+        for &secs in &targets {
+            match seek_ttff(&mut session, secs, &mut peak) {
+                Ok(ms) => samples.push(ms),
+                Err(why) => missed.push(why),
+            }
+        }
+        let audio = session.audio_underruns();
+        let backend = session.decode_backend().label();
+        let mut note = format!(
+            "backend {backend}, p95 {:.2}ms, peak {peak} threads, seed {seed}",
+            pct(&samples, 0.95)
+        );
+        if !missed.is_empty() {
+            note += &format!(", {}/{STORM_SEEKS} NO-FRAME({})", missed.len(), missed[0]);
+        }
+        row(path, &format!("seekstorm_ttff_{pass}"), "ms", &samples, &note);
+        row(
+            path,
+            &format!("seekstorm_underruns_{pass}"),
+            "count",
+            &[audio.map_or(0, |(n, _)| n).saturating_sub(before) as f64],
+            &match audio {
+                None => "no audio device".into(),
+                Some((total, last)) => format!(
+                    "backend {backend}, {total} since open, {}",
+                    last.map_or_else(|| "none yet".into(), |t| format!("last at {t:.1}s device"))
+                ),
+            },
+        );
+    }
+}
+
+// --------------------------------------------------------------- play loop
+
+/// How long a picture waits between frames while the sound runs: the app's own
+/// pump (`crates/app/src/player/transport.rs`), driven here for `secs` with a
+/// seek to a random point every five seconds -- the shape of the complaint,
+/// which is a film played and jumped around in rather than a seek measured on
+/// its own.
+///
+/// Three numbers come out: the gap between frames (p50 and p99, the tail being
+/// the jump a person sees), the audio underruns over the whole run, and how
+/// many times the picture worker was restarted -- by a seek, by a clip
+/// boundary, or by the late-picture resync, which is counted separately in the
+/// note.
+///
+/// The resync rule is the app's, repeated here (`LATE_RESYNC`, `RESYNC_GAP` in
+/// `crates/app/src/transport.rs`) because an engine example cannot depend on
+/// the binary. Repeated only: nothing in this file changes how playback runs.
+const PLAYLOOP_SEEK_GAP: Duration = Duration::from_secs(5);
+const LATE_RESYNC: f64 = 0.4;
+const RESYNC_GAP: Duration = Duration::from_secs(2);
+
+fn playloop_bench(path: &Path, secs: f64, seed: u64) {
+    evict(path);
+    let mut session = match engine::PlaybackSession::open(path) {
+        Ok(session) => session,
+        Err(e) => {
+            row(path, "playloop_frame_gap", "ms", &[], &format!("FAIL({e})"));
+            return;
+        }
+    };
+    let fps = session.meta().frame_rate;
+    let duration = session.timeline_duration();
+    let mut rng = Lcg(seed);
+
+    let mut gaps = Vec::new();
+    let mut held: Option<engine::Frame> = None;
+    let (mut shown, mut dropped, mut seeks, mut resyncs) = (0u64, 0u64, 0u64, 0u64);
+    let mut last_resync: Option<Instant> = None;
+    // The first frame of the run is owed exactly as a seek's landing is.
+    let mut owed = true;
+
+    session.play();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs_f64(secs);
+    let mut last_frame = start;
+    let mut next_seek = start + PLAYLOOP_SEEK_GAP;
+    while Instant::now() < deadline {
+        session.tick();
+        let target = session.now() * fps;
+        let mut newest = None;
+        while session.is_playing() || owed {
+            let frame = match held.take() {
+                Some(frame) => frame,
+                None => match session.try_frame() {
+                    // Timed here and only here: a frame taken back out of
+                    // `held` cost no decode, and counting it would report a
+                    // zero gap for a frame nobody waited for.
+                    Some(frame) => {
+                        let now = Instant::now();
+                        gaps.push((now - last_frame).as_secs_f64() * 1000.0);
+                        last_frame = now;
+                        frame
+                    }
+                    None => break,
+                },
+            };
+            if f64::from(frame.index) <= target {
+                dropped += u64::from(newest.is_some());
+                newest = Some(frame);
+            } else {
+                held = Some(frame);
+                break;
+            }
+        }
+        let late = newest
+            .as_ref()
+            .map_or(0.0, |f| (target - f64::from(f.index)) / fps);
+        if newest.is_some() {
+            shown += 1;
+            owed = false;
+        }
+        if !owed
+            && session.is_playing()
+            && late > LATE_RESYNC
+            && last_resync.is_none_or(|t| t.elapsed() >= RESYNC_GAP)
+        {
+            session.resync_picture();
+            held = None;
+            last_resync = Some(Instant::now());
+            resyncs += 1;
+        }
+        // End of stream inside a five-second stretch is the same jump early:
+        // the loop is here to keep playing, not to stop at whatever it landed
+        // near.
+        if Instant::now() >= next_seek || session.is_eos() {
+            session.seek(rng.next() * duration * 0.95);
+            held = None;
+            owed = true;
+            seeks += 1;
+            next_seek = Instant::now() + PLAYLOOP_SEEK_GAP;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    session.pause();
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let backend = session.decode_backend().label();
+    let audio = session.audio_underruns();
+    row(
+        path,
+        "playloop_frame_gap",
+        "ms",
+        &gaps,
+        &format!(
+            "backend {backend}, p99 {:.2}ms, {shown} shown, {dropped} dropped, \
+             {seeks} seeks in {elapsed:.0}s, seed {seed}",
+            pct(&gaps, 0.99)
+        ),
+    );
+    row(
+        path,
+        "playloop_underruns",
+        "count",
+        &[audio.map_or(0, |(n, _)| n) as f64],
+        &match audio {
+            None => "no audio device".into(),
+            Some((_, last)) => format!(
+                "backend {backend}, {}",
+                last.map_or_else(|| "none".into(), |t| format!("last at {t:.1}s device"))
+            ),
+        },
+    );
+    row(
+        path,
+        "playloop_restarts",
+        "count",
+        &[session.restarts() as f64],
+        &format!("backend {backend}, {resyncs} late-picture resyncs, {seeks} seeks"),
+    );
 }
 
 // ---------------------------------------------------------------- waveform

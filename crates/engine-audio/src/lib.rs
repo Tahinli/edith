@@ -157,6 +157,11 @@ struct Shared {
     /// per callback on the RT thread, so it is an atomic rather than a lock.
     gain: AtomicU32,
     underruns: AtomicU64,
+    /// Device position (samples per channel) read at the most recent underrun,
+    /// `-1` until one happens: what says whether the count in hand is old news
+    /// or is still growing. Written on the RT thread, and only on the starved
+    /// path, so the ordinary callback pays nothing for it.
+    last_underrun: AtomicI64,
 }
 
 enum Ctl {
@@ -251,6 +256,12 @@ fn run(
                             // that silence, so it really is elapsed time.
                             slice[got * 4..want * 4].fill(0);
                             shared.underruns.fetch_add(1, Ordering::Relaxed);
+                            // The position this callback is about to compute is
+                            // not known yet; the previous one is a quantum
+                            // (~23 ms) behind and needs no clock call here.
+                            shared
+                                .last_underrun
+                                .store(shared.position.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
                         // After the fill, so the silence stays silent whatever
                         // the gain is, and the underrun count keeps meaning
@@ -410,6 +421,7 @@ pub extern "C" fn ao_open(sample_rate: u32, channels: u32) -> *mut c_void {
             resumed: AtomicBool::new(false),
             gain: AtomicU32::new(1.0f32.to_bits()),
             underruns: AtomicU64::new(0),
+            last_underrun: AtomicI64::new(-1),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
         let (ctl_tx, ctl_rx) = mpsc::channel();
@@ -475,6 +487,34 @@ pub unsafe extern "C" fn ao_position(session: *mut c_void) -> i64 {
         // SAFETY: caller-guaranteed live session.
         let session = unsafe { &*(session as *const Session) };
         session.shared.position.load(Ordering::Relaxed)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Starved callbacks since the stream opened -- one per quantum the decoder was
+/// late for -- and, through `last_at`, the device position the newest of them
+/// was seen at (`-1` if there has been none). The same number the drop print
+/// reports, asked for while the session is still running: a caller measuring a
+/// seek reads it before and after and the difference is that seek's cost.
+///
+/// Two relaxed atomic loads, nothing else: the RT thread writes both and must
+/// never wait on a reader.
+///
+/// # Safety
+/// `session` must come from [`ao_open`]; `last_at` is either null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ao_underruns(session: *mut c_void, last_at: *mut i64) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return -1;
+        }
+        // SAFETY: caller-guaranteed live session.
+        let session = unsafe { &*(session as *const Session) };
+        if !last_at.is_null() {
+            // SAFETY: caller-guaranteed writable, and it is a plain i64.
+            unsafe { *last_at = session.shared.last_underrun.load(Ordering::Relaxed) };
+        }
+        session.shared.underruns.load(Ordering::Relaxed) as i64
     }))
     .unwrap_or(-1)
 }
