@@ -833,6 +833,13 @@ impl Player {
                                     div()
                                         .mt(px(4.))
                                         .flex()
+                                        // The row of numbers above wraps for this
+                                        // reason and so does this one: four buttons
+                                        // are wider than the column at the floor,
+                                        // and the one that ran off the edge --
+                                        // the spectrum switch -- was then reachable
+                                        // by its key alone.
+                                        .flex_wrap()
                                         .gap(px(4.))
                                         .child(
                                             div()
