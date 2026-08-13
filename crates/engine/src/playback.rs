@@ -270,6 +270,17 @@ pub struct PlaybackSession {
     /// not -- with the single exception `sources` itself has,
     /// [`Self::remove_source`], which takes the same entry out of both.
     counts: Vec<u32>,
+    /// Audio headers already read, by the `(path, stream)` they were read for.
+    /// Every door that checks a file against the timeline asks the same two
+    /// questions -- what this file's sound is, and what the timeline's first
+    /// source's is ([`audio_matches`], [`first_audio_of`]) -- and each answer is
+    /// a container open. Warm that is 5-10 ms; on a film whose pages have been
+    /// evicted it is **1.7 s** (measured, 3.1 GB HEVC mkv), and both of those
+    /// are spent on the thread that draws, because placing and importing are
+    /// what a drag lands on. A header does not change while a session holds the
+    /// file, so it is read once and remembered. Errors are not kept: a file that
+    /// failed to open is asked again next time.
+    probes: std::collections::HashMap<(std::path::PathBuf, usize), Option<crate::AudioProbe>>,
     /// What each source's own frame rate is against this timeline's, indexed
     /// and grown exactly as [`Self::counts`] is (and shortened with it by
     /// [`Self::remove_source`]). [`Rate::REAL_TIME`] for a file shot at the
@@ -416,6 +427,7 @@ impl PlaybackSession {
             audio_disabled,
             project,
             counts: vec![meta.frame_count],
+            probes: std::collections::HashMap::new(),
             // Source 0 *is* the timeline's rate: it defined it.
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
@@ -526,6 +538,7 @@ impl PlaybackSession {
             audio_disabled,
             project,
             counts: vec![meta.frame_count],
+            probes: std::collections::HashMap::new(),
             // Source 0 *is* the timeline's rate: it defined it.
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
@@ -600,6 +613,7 @@ impl PlaybackSession {
             audio_disabled: None,
             project,
             counts: vec![meta.frame_count],
+            probes: std::collections::HashMap::new(),
             // Source 0 *is* the timeline's rate: it defined it.
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
@@ -892,6 +906,7 @@ impl PlaybackSession {
             audio_disabled,
             project,
             counts,
+            probes: std::collections::HashMap::new(),
             rates,
             span_rate: Rate::REAL_TIME,
             span,
@@ -2024,7 +2039,7 @@ impl PlaybackSession {
         let image = crate::is_image(path);
         if !image {
             let first = self.first_audio()?;
-            audio_matches(&wanted, &first)?;
+            self.audio_matches_cached(&wanted, &first)?;
         }
         let rate = self.file_rate(&wanted.path);
         let source = self.project.import(path, stream);
@@ -2136,8 +2151,44 @@ impl PlaybackSession {
     /// What the timeline's audio *is*: the chosen stream of the first source
     /// that could have any ([`audio_source_of`]), probed. Every other source is
     /// held to it.
-    fn first_audio(&self) -> crate::Result<Option<crate::AudioProbe>> {
-        first_audio_of(self.project.sources())
+    ///
+    /// Through the session's own memo ([`probes`](Self::probes)), because this
+    /// is asked on the render thread: the free [`first_audio_of`] is the one a
+    /// worker with no session to reach for calls.
+    fn first_audio(&mut self) -> crate::Result<Option<crate::AudioProbe>> {
+        match audio_source_of(self.project.sources()) {
+            Some(first) => {
+                let (path, stream) = (first.path.clone(), first.audio_stream);
+                self.probe_cached(&path, stream)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One audio header, read at most once per session per `(path, stream)`.
+    fn probe_cached(
+        &mut self,
+        path: &Path,
+        stream: usize,
+    ) -> crate::Result<Option<crate::AudioProbe>> {
+        let key = (path.to_path_buf(), stream);
+        if let Some(probe) = self.probes.get(&key) {
+            return Ok(*probe);
+        }
+        let probe = AudioSession::probe(path, stream)?;
+        self.probes.insert(key, probe);
+        Ok(probe)
+    }
+
+    /// [`audio_matches`] with this session's memo behind the new file's own
+    /// header too -- the second of the two opens a place or an import pays.
+    fn audio_matches_cached(
+        &mut self,
+        source: &Source,
+        first: &Option<crate::AudioProbe>,
+    ) -> crate::Result<()> {
+        let probe = self.probe_cached(&source.path, source.audio_stream)?;
+        audio_matches_probed(probe, first)
     }
 
     /// Places `clip` on `lane` alone at the playhead, overwriting what it lands
@@ -2289,7 +2340,7 @@ impl PlaybackSession {
         // Stream 0, and there is no other: a standalone audio file carries one
         // track (`AudioSession::probe_streams`), so nothing here has a stream
         // to pick the way `place_stream_at` does for an mp4.
-        audio_matches(&Source::new(path, 0), &first)?;
+        self.audio_matches_cached(&Source::new(path, 0), &first)?;
         let frames = audio_frames(path, self.meta.frame_rate)?;
         let source = self.project.import(path, 0);
         self.note_frames(source, frames, Rate::REAL_TIME);
@@ -2881,12 +2932,22 @@ fn audio_source_of(sources: &[Source]) -> Option<&Source> {
 }
 
 fn audio_matches(source: &Source, first: &Option<crate::AudioProbe>) -> crate::Result<()> {
+    let probe = AudioSession::probe(&source.path, source.audio_stream)?;
+    audio_matches_probed(probe, first)
+}
+
+/// The verdict alone, once the file's own header is in hand: the half a session
+/// with a memo behind it ([`PlaybackSession::audio_matches_cached`]) does not
+/// have to open the file for.
+fn audio_matches_probed(
+    probe: Option<crate::AudioProbe>,
+    first: &Option<crate::AudioProbe>,
+) -> crate::Result<()> {
     // The layout, which the audio worker holds every source to anyway -- and not
     // the rate any more: a file written at another one is resampled to the
     // timeline's at the decoder's door ([`crate::audio::Resample`]), exactly as
     // a file shot at another frame rate is read through [`Rate`]. Both silent is
     // a match.
-    let probe = AudioSession::probe(&source.path, source.audio_stream)?;
     if probe.map(|p| p.channels) == first.map(|p| p.channels) {
         return Ok(());
     }
@@ -3154,6 +3215,53 @@ mod tests {
             .expect("it may come back");
         assert_eq!(session.counts, vec![short, long]);
         assert_eq!(session.sources().len(), session.counts.len());
+    }
+
+    /// The two headers a place reads are read *once*: an mp4 dropped on a lane
+    /// used to open its own container and the timeline's first source every
+    /// time, both on the thread that draws, and a film whose pages have gone
+    /// cold is 1.7 s of that.
+    ///
+    /// Proved by answering, not by timing: the memo is filled with a layout the
+    /// file does not have, and the place is refused. Only a door that read the
+    /// remembered header rather than the disk can refuse it.
+    #[test]
+    fn a_place_reads_each_audio_header_once() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        session.set_gain(0.0);
+        session.import(&asset("test_av2.mp4")).expect("av2 matches");
+        let end = session.timeline_duration();
+        assert!(
+            session
+                .place_stream_at(end, &asset("test_av2.mp4"), 0, None)
+                .expect("a file just imported is on this timeline")
+        );
+        assert_eq!(
+            session.probes.len(),
+            2,
+            "the timeline's first source and the file placed, once each"
+        );
+
+        // Now say av2 is 5.1. Nothing on disk changed, so a door that opens the
+        // file still matches; one that trusts the memo refuses by layout.
+        // Keyed exactly as a [`Source`] names a file -- canonical, symlinks
+        // resolved -- which is the key the doors look up.
+        let av2 = Source::new(asset("test_av2.mp4"), 0).path;
+        session.probes.insert(
+            (av2, 0),
+            Some(crate::AudioProbe {
+                sample_rate: 48_000,
+                channels: 6,
+            }),
+        );
+        let refused = session
+            .place_stream_at(end, &asset("test_av2.mp4"), 0, None)
+            .expect_err("the remembered layout disagrees with the timeline's");
+        assert!(
+            refused.to_string().contains("6 ch"),
+            "refused in the layout's own words: {refused}"
+        );
+        assert_eq!(session.probes.len(), 2, "and nothing was opened to say so");
     }
 
     #[test]
