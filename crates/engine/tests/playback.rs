@@ -1516,3 +1516,29 @@ fn a_watched_session_still_lands_on_the_frame_a_seek_asked_for() {
         (1.0 * fps) as u32
     );
 }
+
+/// The pixels a *reused* decoder hands back are the pixels a fresh one does.
+/// One session takes three seeks -- forwards, backwards, forwards again -- and
+/// the worker survives all of them (`Worker::reseek`: the file stays open, the
+/// hardware session is repositioned rather than reopened), so a decoder left
+/// holding one span references while another span is asked for would show here
+/// as a smear and nowhere else. The reference is the file-level API, which
+/// opens a decoder of its own per frame.
+#[test]
+fn a_reseek_decodes_the_same_picture_a_fresh_decoder_does() {
+    let path = asset("test_baseline.mp4");
+    let mut session = open(&path);
+    let fps = session.meta().frame_rate;
+    // Small targets on purpose: the fixture's only sync sample is frame 0, so
+    // every one of these decodes from the start of the file and a debug-build
+    // software decoder is what runs the suite.
+    for target in [20u32, 5, 35] {
+        session.seek(f64::from(target) / fps);
+        let frame = next_frame(&mut session, "a seek onto a worker already open");
+        assert_eq!(frame.index, target, "the seek landed elsewhere");
+        assert!(
+            frame.bgra == source_frame(&path, target),
+            "frame {target} off the reused decoder is not the picture a fresh one decodes"
+        );
+    }
+}
