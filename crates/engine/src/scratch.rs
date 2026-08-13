@@ -7,7 +7,8 @@
 //! what cleans up, which is the whole point: unwinding runs it, so a *failing*
 //! test leaves nothing behind either. The suites used to litter `/tmp` with a
 //! fresh `ve_*` directory per run and never take one back; on this machine that
-//! reached 2907 of them.
+//! reached 2907 of them. A test the kernel *aborts* never unwinds and so never
+//! drops anything; [`reap_orphans`] takes those on the next run instead.
 //!
 //! Nothing outside a test has any use for this. It lives in the library rather
 //! than in a test file because the integration suites, the unit tests here and
@@ -35,6 +36,8 @@ pub struct Scratch {
 /// handed.
 fn fresh(name: &str) -> PathBuf {
     static NTH: AtomicU64 = AtomicU64::new(0);
+    static REAP: std::sync::Once = std::sync::Once::new();
+    REAP.call_once(reap_orphans);
     let dir = std::env::temp_dir().join(format!(
         "{name}_{}_{}",
         std::process::id(),
@@ -43,6 +46,39 @@ fn fresh(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     std::fs::canonicalize(&dir).expect("canonical scratch dir")
+}
+
+/// The one leak `Drop` cannot reach: a test the kernel *aborts* -- the AV1
+/// hardware encoder does it whenever the driver's ring hangs -- never unwinds,
+/// so its directory outlives it. The name carries the process id that made it,
+/// so a later run can tell an orphan from a directory a live sibling suite is
+/// still writing into, and takes only the orphans. Once per process, before the
+/// first scratch directory of it: the suites are what fills `/tmp`, and they all
+/// come through here.
+fn reap_orphans() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    if !Path::new("/proc").is_dir() {
+        return; // No way to ask whether the owner is still running: take nothing.
+    }
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // `ve_<what>_<pid>_<nth>`, and nothing else, ever.
+        let mut tail = name.rsplitn(3, '_');
+        let (Some(nth), Some(pid), Some(head)) = (tail.next(), tail.next(), tail.next()) else {
+            continue;
+        };
+        if !head.starts_with("ve_") || nth.parse::<u64>().is_err() {
+            continue;
+        }
+        let Ok(pid) = pid.parse::<u64>() else { continue };
+        if Path::new("/proc").join(pid.to_string()).exists() {
+            continue; // Still running: its own `Drop` will do this.
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 impl Scratch {
@@ -95,7 +131,31 @@ impl Drop for Scratch {
 
 #[cfg(test)]
 mod tests {
-    use super::Scratch;
+    use super::{Scratch, reap_orphans};
+
+    /// What an aborted test leaves goes on the next run's account: its
+    /// directory is taken, a live process's is not, and nothing that is not
+    /// ours is touched whatever it is named.
+    #[test]
+    fn the_next_run_takes_what_an_aborted_one_left() {
+        let tmp = std::env::temp_dir();
+        // No process has this id: `pid_max` is an exclusive bound everywhere.
+        let orphan = tmp.join("ve_scratch_orphan_4294967295_0");
+        let mine = tmp.join(format!("ve_scratch_live_{}_9999", std::process::id()));
+        let theirs = tmp.join("someone_elses_4294967295_0");
+        for dir in [&orphan, &mine, &theirs] {
+            std::fs::create_dir_all(dir).expect("a directory to reap");
+        }
+
+        reap_orphans();
+
+        assert!(!orphan.exists(), "the aborted run's directory is gone");
+        assert!(mine.is_dir(), "a running suite's own directory is left alone");
+        assert!(theirs.is_dir(), "and so is everything that is not ours");
+        for dir in [&mine, &theirs] {
+            std::fs::remove_dir_all(dir).expect("cleanup");
+        }
+    }
 
     /// The guard's whole job, both shapes: what it hands back is usable, and
     /// what it made is gone once it is -- including when a test panicked, which
