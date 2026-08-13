@@ -1944,9 +1944,11 @@ impl PlaybackSession {
     /// Which lane it lands on is decided here, from the file and from `onto` --
     /// the lane it was let go over, if it was let go over one at all: a file
     /// with a picture asked for by no lane, or for one of the first pair, is
-    /// pasted across `V1` and `A1` as a grouped take; asked for by any further
-    /// lane it is *placed* there alone, overwriting what it lands on and
-    /// rippling nothing. A file with no picture ([`crate::is_audio`]) is placed
+    /// pasted across `V1` and `A1` as a grouped take; asked for by a further
+    /// *video* lane it is *placed* there with its sound on that lane's own audio
+    /// row (`V2` -> `A2`, added if it is not there yet), overwriting what the two
+    /// halves land on and rippling nothing; asked for by a further audio lane it
+    /// is that file's sound alone. A file with no picture ([`crate::is_audio`]) is placed
     /// on the audio lane it was asked for, or on `A1`, and never on a video
     /// lane. A still image ([`crate::is_image`]) is its mirror: the video lane
     /// it was asked for or `V1`, never an audio one, and it goes down
@@ -2019,11 +2021,20 @@ impl PlaybackSession {
             // A picture: the lane it was let go over, unless that is one of the
             // first pair. Those two are the grouped take a paste spans, and a
             // further lane is a layer of its own -- its picture on `V2`, its
-            // sound on `A2`.
+            // sound on `A2` (below).
             (false, Some(lane)) if lane.ord > 0 => Some(lane),
             (false, _) => None,
         };
         Ok(match onto {
+            // A picture let go over a further *video* track lands there with the
+            // sound it came with -- `V2`'s picture, `A2`'s sound, one take and
+            // one undo step ([`Project::place_take`]). Dropped on a further
+            // audio lane it is the sound alone, which is what asking an audio
+            // row for an mp4 means.
+            Some(lane) if lane.kind == LaneKind::Video => {
+                let at = secs_to_frame(timeline_secs, self.meta.frame_rate);
+                self.edit(Dirty::Both, |p| p.place_take(lane, at, clip))
+            }
             Some(lane) => self.place_at(lane, timeline_secs, clip),
             // The grouped take, at the frame it was let go on -- past the last
             // clip included, where the bed is black and the ghost was drawn.

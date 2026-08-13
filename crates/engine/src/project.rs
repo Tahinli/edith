@@ -1995,12 +1995,61 @@ impl Project {
             link: None,
             ..clip
         };
-        let clips = self.lane_mut(lane).expect("checked above");
+        self.insert_over(lane, clip);
+        true
+    }
+
+    /// Place `clip` on `lane` **and its sound on that lane's own audio row** as
+    /// one grouped take -- what a picture let go over a further video track
+    /// means: `V2`'s picture plays on `V2` and its sound on `A2`, which is added
+    /// if it is not there yet (the `+ V` button adds a video row alone). Without
+    /// this half a file with sound landed on a layer silent, and the only way to
+    /// hear it was to drop it a second time on an audio lane.
+    ///
+    /// Both halves overwrite what they land on and neither ripples, exactly as
+    /// [`place`](Project::place) does -- a layer is laid *over* the timeline, so
+    /// nothing under it moves. One history snapshot for the pair, the added lane
+    /// included, so one [`Project::undo`] takes the whole placement back. The two
+    /// carry one link, which is what makes them one take to a drag, a trim and a
+    /// save.
+    ///
+    /// Refused, changing nothing, for an empty `clip` and for a lane that is not
+    /// there or is not a video lane: sound placed alone is
+    /// [`place`](Project::place)'s door, and a still has no sound to pair.
+    pub fn place_take(&mut self, lane: Lane, timeline_frame: u32, clip: Clip) -> bool {
+        if clip.out_frame <= clip.in_frame
+            || lane.kind != LaneKind::Video
+            || self.index(lane).is_none()
+        {
+            return false;
+        }
+        self.snapshot();
+        // `A2` for `V2` -- and the rows between it and the last audio lane, since
+        // an ord names a lane only while every ord below it does.
+        while self.lane_count(LaneKind::Audio) <= lane.ord {
+            self.lanes.push(LaneData::new(LaneKind::Audio, Vec::new()));
+        }
+        let clip = Clip {
+            start: timeline_frame,
+            link: Some(self.new_link()),
+            ..clip
+        };
+        for half in [lane, Lane::new(LaneKind::Audio, lane.ord)] {
+            self.insert_over(half, clip);
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        true
+    }
+
+    /// `clip` into `lane` at its own start, over whatever it lands on: the
+    /// insert both placement doors make, which is what keeps a lane sorted and
+    /// disjoint. The caller has checked that the lane is there.
+    fn insert_over(&mut self, lane: Lane, clip: Clip) {
+        let clips = self.lane_mut(lane).expect("the caller checked the lane");
         clear(clips, clip.start, clip.end());
         let idx = clips.partition_point(|c| c.start < clip.start);
         clips.insert(idx, clip);
         debug_assert!(sorted_disjoint(clips));
-        true
     }
 
     /// Move the clip at `idx` of `from` onto `to` with its head at timeline
@@ -3882,6 +3931,53 @@ mod tests {
             })
         );
         assert!(!p.place(Lane::V1, 0, clip(0, 7, 7, 0)), "empty clip");
+    }
+
+    /// A file with sound let go over a further video track: both halves go down,
+    /// on the same frames, and the audio row is added when the `+ V` button left
+    /// the project without one. One undo takes the lane and both clips back.
+    #[test]
+    fn a_take_placed_on_a_layer_lands_with_its_sound() {
+        let mut p = three();
+        let v2 = p.add_lane(LaneKind::Video);
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2], "no A2 yet");
+
+        assert!(p.place_take(v2, 4, clip(0, 100, 102, 0)));
+        let a2 = Lane::new(LaneKind::Audio, 1);
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2, a2], "A2 was added");
+        assert_eq!(p.lane(v2), p.lane(a2), "same frames, same source");
+        assert_eq!(p.lane(v2)[0].start, 4);
+        assert_eq!(p.lane(v2)[0].end(), 6);
+        assert_eq!(
+            p.lane(v2)[0].link,
+            p.lane(a2)[0].link,
+            "one take, not two placements"
+        );
+        assert!(p.lane(v2)[0].link.is_some());
+        assert_eq!(shape(&p)[0], shape(&three())[0], "V1 untouched");
+        assert_eq!(shape(&p)[1], shape(&three())[1], "and A1 with it");
+
+        // The pair overwrites its own two lanes and nothing else, exactly as a
+        // one-lane place does.
+        assert!(p.place_take(v2, 5, clip(0, 200, 203, 0)));
+        assert_eq!(p.lane(v2), p.lane(a2));
+        assert_eq!(p.lane(v2).len(), 2, "the tail of the first is still there");
+        assert_eq!(shape(&p)[0], shape(&three())[0], "V1 still untouched");
+
+        assert!(p.undo(), "one step for the second pair");
+        assert_eq!(p.lane(v2).len(), 1);
+        assert!(p.undo(), "one step for the first pair *and* its lane");
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2]);
+        assert!(p.lane(v2).is_empty());
+
+        // Refusals cost nothing: sound placed alone is `place`'s door.
+        assert!(!p.place_take(Lane::A1, 0, clip(0, 100, 102, 0)), "audio lane");
+        assert!(!p.place_take(v2, 0, clip(0, 7, 7, 0)), "empty clip");
+        assert!(
+            !p.place_take(Lane::new(LaneKind::Video, 9), 0, clip(0, 1, 2, 0)),
+            "a lane that is not there"
+        );
+        assert_eq!(p.lanes(), vec![Lane::V1, Lane::A1, v2]);
     }
 
     /// The drag between tracks: let go at the frames it already covers the clip
