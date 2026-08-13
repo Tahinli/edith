@@ -47,10 +47,16 @@ fn pump(session: &mut PlaybackSession, last_index: &mut Option<u32>) {
     let target = session.now() * session.meta().frame_rate;
     while let Some(frame) = session.try_frame() {
         if let Some(previous) = *last_index {
-            assert_eq!(
-                frame.index,
-                previous + 1,
-                "frames must arrive in index order"
+            // Forwards, never twice and never backwards -- but not necessarily
+            // one at a time: a worker whose pictures have fallen behind the
+            // playhead drops them where they are cheap to drop rather than
+            // converting and queueing what nobody can be shown
+            // (`PlaybackSession::publish_playhead`), so a decoder that cannot
+            // keep real time skips instead of falling further behind.
+            assert!(
+                frame.index > previous,
+                "frames must arrive in index order: {} after {previous}",
+                frame.index
             );
         }
         *last_index = Some(frame.index);
@@ -1484,4 +1490,29 @@ fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
     assert!(!session.is_empty());
     assert!((session.timeline_duration() - whole).abs() < 1e-9);
     assert_eq!(session.clip_spans().len(), 1);
+}
+
+/// The session half of the late-frame policy: a *watched* session still lands
+/// exactly on the frame a seek asked for. The floor the worker drops against is
+/// the playhead mapped back into the file own frames, and a floor even one
+/// frame ahead of the landing would eat the very picture the seek exists to
+/// show ([`PlaybackSession::drop_late_pictures`]).
+#[test]
+fn a_watched_session_still_lands_on_the_frame_a_seek_asked_for() {
+    let mut session = open(asset("test_baseline.mp4"));
+    session.drop_late_pictures(true);
+    let fps = session.meta().frame_rate;
+    session.seek(3.0);
+    assert_eq!(
+        next_index(&mut session, "seek(3.0) on a watched session"),
+        (3.0 * fps) as u32,
+        "the landing frame was dropped as late"
+    );
+    // ...and again backwards: a floor left where the last span ended would drop
+    // every picture of a seek that went back.
+    session.seek(1.0);
+    assert_eq!(
+        next_index(&mut session, "seek(1.0) on a watched session"),
+        (1.0 * fps) as u32
+    );
 }

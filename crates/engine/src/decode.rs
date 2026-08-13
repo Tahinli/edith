@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
@@ -159,6 +159,11 @@ struct Reuse {
     /// decodes -- so a reseek onto a file already open says "hardware" from the
     /// first repaint instead of going back through `opening`.
     backend: BackendCell,
+    /// Where the caller's playhead stands, in this file's own frames
+    /// ([`Worker::playhead`]): the worker converts and sends nothing behind it.
+    /// Rewritten to the target by every reseek, so it can never carry one span's
+    /// position into the next.
+    floor: Arc<AtomicU32>,
 }
 
 /// One span asked of a persistent worker: the range in the file's own frames,
@@ -178,15 +183,33 @@ struct SpanCmd {
 /// What stops a decode loop: the worker's terminal flag (the thread itself is
 /// going away) and the generation of the span it was handed (only *this* span is
 /// going away). One check, so every loop treats them alike.
+///
+/// ...and where the playhead has reached ([`Abort::late`]), which is the same
+/// question one picture at a time: a frame due before it is a frame nobody can
+/// be shown any more.
 struct Abort<'a> {
     cancel: &'a AtomicBool,
     generation: &'a AtomicU64,
     mine: u64,
+    floor: &'a AtomicU32,
 }
 
 impl Abort<'_> {
     fn hit(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || self.generation.load(Ordering::Acquire) != self.mine
+    }
+
+    /// Whether the picture at source frame `index` is already past due: the
+    /// caller's playhead has gone by it, so converting it (a full BGRA pass over
+    /// 8 MB at 1080p) and queueing it would only push a picture nobody sees in
+    /// front of the one they are waiting for.
+    ///
+    /// It is still *decoded* -- the pictures after it reference it -- and the
+    /// floor only ever moves with the playhead the session publishes, so a
+    /// paused session (and every seek, which republishes its own target) drops
+    /// nothing at all.
+    fn late(&self, index: u32) -> bool {
+        self.floor.load(Ordering::Relaxed) > index
     }
 }
 
@@ -221,6 +244,17 @@ impl Worker {
         }
     }
 
+    /// Tells the worker where the caller's playhead stands, in the file's own
+    /// frames: it converts and queues nothing behind that, because a picture
+    /// whose moment has passed cannot be shown and would only delay the one that
+    /// can (see [`Abort::late`]). A worker with no reuse door -- a still, a gap
+    /// -- has nothing to tell, and this costs it nothing to say.
+    pub(crate) fn playhead(&self, source_frame: u32) {
+        if let Some(reuse) = &self.reuse {
+            reuse.floor.store(source_frame, Ordering::Relaxed);
+        }
+    }
+
     /// Points this worker at another range of the file it already has open,
     /// handing back the channel the new span's pictures arrive on and the cell
     /// that says what is decoding them. `None` when this worker cannot take the
@@ -246,7 +280,11 @@ impl Worker {
         if reuse.path != path || self.is_finished() {
             return None;
         }
-        let (tx, rx) = sync_channel(QUEUE);
+        let (tx, rx) = sync_channel(canvas.queue_depth());
+        // The new span's own playhead, before its first picture is decoded: a
+        // floor left over from where the timeline *was* would drop every
+        // picture of a seek that went backwards.
+        reuse.floor.store(start, Ordering::Relaxed);
         // Bumped before the command is queued, so the span running now stops at
         // its next picture whatever order the two threads are scheduled in.
         let generation = reuse.generation.fetch_add(1, Ordering::Release) + 1;
@@ -613,11 +651,6 @@ impl DecodeSession {
     }
 }
 
-/// How many decoded pictures a worker may run ahead of its consumer. Small on
-/// purpose: a 1080p BGRA frame is ~8 MB, so the decoder must not run ahead of
-/// the display without limit.
-const QUEUE: usize = 2;
-
 /// Spawns a decode worker over `path` and gives it its first span. The thread
 /// **outlives that span**: it parks on its command channel afterwards, so the
 /// next seek onto the same file reaches it through [`Worker::reseek`] and costs
@@ -637,13 +670,15 @@ fn span_worker(
     canvas: Composer,
     tone: tonemap::Preset,
 ) -> FrameStream {
-    let (tx, rx) = sync_channel(QUEUE);
+    let (tx, rx) = sync_channel(canvas.queue_depth());
     let cancel = Arc::new(AtomicBool::new(false));
     // Written by the worker the moment it knows, so a caller reading it sees
     // what opened rather than what was hoped for -- and kept across the spans
     // that follow, since they are decoded by that very decoder.
     let backend = BackendCell::default();
     let generation = Arc::new(AtomicU64::new(0));
+    // The playhead starts where the span does: nothing is behind it yet.
+    let floor = Arc::new(AtomicU32::new(start_frame));
     let (spans, commands) = std::sync::mpsc::channel();
     let first = SpanCmd {
         generation: 0,
@@ -657,6 +692,7 @@ fn span_worker(
     let worker_cancel = Arc::clone(&cancel);
     let worker_backend = backend.clone();
     let worker_generation = Arc::clone(&generation);
+    let worker_floor = Arc::clone(&floor);
     let worker_path = path.clone();
     let handle = thread::Builder::new()
         .name("decode".into())
@@ -668,6 +704,7 @@ fn span_worker(
                     cancel: &worker_cancel,
                     generation: &worker_generation,
                     mine: cmd.generation,
+                    floor: &worker_floor,
                 };
                 // Superseded (or cancelled) before this thread was even
                 // scheduled: do not open the file, and do not enter VA-API
@@ -697,11 +734,21 @@ fn span_worker(
                 spans,
                 generation,
                 backend: backend.clone(),
+                floor,
             }),
         },
         backend,
     }
 }
+
+/// How many pictures in a row a worker may drop for being late before it hands
+/// one over regardless. The policy needs a floor of its own: a machine that
+/// cannot decode a file in real time is late on *every* picture, and dropping
+/// every picture is a black screen rather than a stutter -- so the slowest seat
+/// still gets one in nine, which is roughly what it could paint before (the
+/// front-end restarted the decoder once every two seconds to the same effect,
+/// and paid a VA-API init for each restart).
+const LATE_RUN: u32 = 8;
 
 /// What a decode worker keeps **between** the spans it is asked for: the
 /// container it read, what the stream says about itself, and the hardware
@@ -1154,16 +1201,25 @@ fn run_hw(
     abort: &Abort,
 ) -> bool {
     let mut index = start_frame;
+    // Pictures dropped for being late since the last one handed over; see
+    // [`LATE_RUN`].
+    let mut skipped = 0;
     loop {
         if abort.hit() {
             return true;
         }
         match hw.next_frame() {
             Ok(Some((y, u, v, width, height))) => {
-                let frame = render.frame(index, y, u, v, width, height);
+                let due = index;
                 index += 1;
-                if tx.send(frame).is_err() {
-                    return true; // consumer went away
+                if abort.late(due) && skipped < LATE_RUN {
+                    skipped += 1;
+                } else {
+                    skipped = 0;
+                    let frame = render.frame(due, y, u, v, width, height);
+                    if tx.send(frame).is_err() {
+                        return true; // consumer went away
+                    }
                 }
                 if index >= end_frame {
                     return true; // end of the requested range
@@ -1275,6 +1331,59 @@ mod tests {
         );
     }
 
+    /// The late-picture policy, at the one place it is decided. A worker told
+    /// the playhead is already at frame 20 must not spend a conversion and a
+    /// queue slot on the twenty pictures behind it -- they can never be shown --
+    /// and it must not go silent either, which is what [`LATE_RUN`] bounds: a
+    /// machine that cannot decode in real time is late on every picture, and one
+    /// in nine still reaches the screen.
+    ///
+    /// Deterministic on purpose: the floor is set by hand rather than by a clock
+    /// that would have to outrun a debug-build decoder to prove anything.
+    #[test]
+    fn a_worker_skips_the_pictures_the_playhead_has_gone_past() {
+        let take = |floor: u32| {
+            let stream = DecodeSession::open_worker_deferred(
+                asset("test_baseline.mp4"),
+                0,
+                u32::MAX,
+                ColorParams::default(),
+                Composer::passthrough(),
+                tonemap::Preset::default(),
+            );
+            stream.worker.playhead(floor);
+            let mut indices = Vec::new();
+            while indices.len() < 4 {
+                let frame = stream
+                    .frames
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a picture");
+                indices.push(frame.index);
+            }
+            indices
+        };
+
+        // Nobody has moved: every picture of the range is owed, in order.
+        assert_eq!(take(0), vec![0, 1, 2, 3]);
+
+        // The playhead is at 20, so the pictures before it are decoded (the ones
+        // after reference them) and dropped unconverted -- all but the one in
+        // nine [`LATE_RUN`] lets through, so the caller never goes blind.
+        let caught_up = take(20);
+        assert!(
+            caught_up[0] > 0 && caught_up.windows(2).any(|w| w[1] > w[0] + 1),
+            "nothing was skipped: {caught_up:?}"
+        );
+        assert!(
+            caught_up.iter().any(|&i| i >= 20),
+            "the playhead was never reached: {caught_up:?}"
+        );
+        assert!(
+            caught_up.len() >= 4,
+            "the worker went silent instead of dropping down to one in nine"
+        );
+    }
+
     /// Dropping a [`FrameStream`] whose frames nobody ever took must not wait.
     /// The channel is bounded, so such a worker is parked in `send` within a
     /// few frames, and the only thing that can wake it is its receiver going
@@ -1329,6 +1438,7 @@ fn run(
     // converted or sent. Signed, because the landing sync sample can sit inside
     // what the file's edit list trims, i.e. *before* frame 0.
     let mut index = demuxer.seek_to_sync_at_or_before(start_frame);
+    let mut skipped = 0;
 
     // corner-cut: emits pictures in decode order. Fine for Baseline (no B-frames);
     // reordering streams need POC-sorted output before display.
@@ -1356,17 +1466,23 @@ fn run(
             index += 1;
             continue;
         }
-        let frame = render.frame(
-            index as u32,
-            &yuv.y,
-            &yuv.u,
-            &yuv.v,
-            yuv.width as u32,
-            yuv.height as u32,
-        );
+        let due = index as u32;
         index += 1;
-        if tx.send(frame).is_err() {
-            break; // consumer went away
+        if abort.late(due) && skipped < LATE_RUN {
+            skipped += 1;
+        } else {
+            skipped = 0;
+            let frame = render.frame(
+                due,
+                &yuv.y,
+                &yuv.u,
+                &yuv.v,
+                yuv.width as u32,
+                yuv.height as u32,
+            );
+            if tx.send(frame).is_err() {
+                break; // consumer went away
+            }
         }
         if index >= i64::from(end_frame) {
             break; // end of the requested range

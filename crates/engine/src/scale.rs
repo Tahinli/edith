@@ -386,6 +386,24 @@ impl Composer {
         Self::new(0, 0, FitPolicy::Fit)
     }
 
+    /// How many decoded pictures a worker over this canvas may keep ahead of
+    /// its consumer: a budget in *bytes*, so a 4K project runs a shallower queue
+    /// than a 1080p one instead of the same number of far bigger frames.
+    ///
+    /// The floor is 2 -- the bound this engine ran on everywhere before there
+    /// was a decode-ahead at all -- and it is also what a pass-through canvas
+    /// gets, since that one does not know what size the pictures will be (they
+    /// are the source's) and its callers pull frame by frame anyway.
+    pub(crate) fn queue_depth(&self) -> usize {
+        /// ~96 MB of BGRA in flight: eleven 1080p pictures, two 4K ones.
+        const BUDGET: usize = 96 << 20;
+        let bytes = self.width as usize * self.height as usize * 4;
+        if bytes == 0 {
+            return 2;
+        }
+        (BUDGET / bytes).clamp(2, 16)
+    }
+
     /// Whether a `src_w` x `src_h` picture is already the canvas, i.e. this
     /// composer would hand it back untouched. What lets a caller keep a fused
     /// fast path (the graded conversion) for the common case.
