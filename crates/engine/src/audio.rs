@@ -157,7 +157,7 @@ pub struct StreamInfo {
     pub index: usize,
     /// Container codec.
     ///
-    /// ponytail: mp4 0.14 parses `mp4a` sample entries and silently drops every
+    /// corner-cut: mp4 0.14 parses `mp4a` sample entries and silently drops every
     /// other kind (`stsd.rs` `_ => {}`), keeping no fourcc, so an AC-3/DTS/PCM
     /// stream can only be `"unknown"` here — enough to grey a row out, not
     /// enough to name the codec. Upgrade path is reading the sample entry's
@@ -965,7 +965,7 @@ impl AudioSession {
     ///
     /// `Ok(None)` for a file with no AAC track, and for an empty segment list.
     ///
-    /// ponytail: the first packet after an *interior* join decodes without its
+    /// corner-cut: the first packet after an *interior* join decodes without its
     /// MDCT overlap predecessor, so up to 23 ms there can alias. Upgrade path is
     /// re-encoding just the join packets, which needs an encoder we do not have.
     pub fn copy_segments(
@@ -1104,7 +1104,7 @@ impl AudioSession {
 /// unit tests, which is the only claim worth making about hand-written
 /// bitstream.
 ///
-/// ponytail: mono and stereo only, because `chan_conf` beyond 2 needs more
+/// corner-cut: mono and stereo only, because `chan_conf` beyond 2 needs more
 /// elements per block; the timeline refuses such a source at import today, so
 /// this `Err` is a backstop. Upgrade path is emitting `chan_conf` elements.
 fn silent_packet(chan_conf: u8) -> crate::Result<Vec<u8>> {
@@ -1159,7 +1159,7 @@ fn copy_track(path: &Path, stream: usize) -> crate::Result<Option<AacTrack>> {
         // rather than showing this, so a film's sound reaches an mp4 either way;
         // the words stay for a caller that copies and cannot re-encode.
         //
-        // ponytail: the ceiling is the copy path being written against the mp4
+        // corner-cut: the ceiling is the copy path being written against the mp4
         // reader, not anything about the bytes. Upgrade path is a
         // `copy_segments` that walks a Matroska track, which would make this a
         // copy again instead of a re-encode.
@@ -1815,7 +1815,7 @@ fn vorbis_to_film_order(samples: &mut [f32], from: usize) {
 /// C, L, R, Ls, Rs, LFE element order into it: `decode.rs:779`) and what the AC-3
 /// decoder's own passthrough uses.
 ///
-/// ponytail: a width past 7.1 (22.2, ambisonics) keeps its front pair and drops
+/// corner-cut: a width past 7.1 (22.2, ambisonics) keeps its front pair and drops
 /// the rest -- no table here places those, and inventing one silently would be
 /// worse than a fold that is merely narrow. Upgrade path is one more arm.
 fn fold_coeffs(from: usize) -> Vec<(f32, f32)> {
@@ -1845,7 +1845,7 @@ fn fold_coeffs(from: usize) -> Vec<(f32, f32)> {
 /// Both outputs are divided by the sum of their own coefficients
 /// ([`fold_coeffs`]), so a source at full scale cannot come out clipped.
 ///
-/// ponytail: that normalisation costs 7.7 dB at 5.1 (9.9 at 7.1) against what
+/// corner-cut: that normalisation costs 7.7 dB at 5.1 (9.9 at 7.1) against what
 /// ffmpeg's `-ac 2` hands out, which does not normalise and can overload -- so a
 /// film plays quieter here than in a player beside it. It is the loudness the
 /// AC-3 5.1 path already has (measured within 1.3 dB), so the two agree; the
@@ -2005,7 +2005,7 @@ struct MkvAc3Track {
     total_samples: Option<u64>,
     /// What the decoder is asked to hand out, from this track's own layout:
     /// `Some(2)` for anything with more than one front channel, `None` for a
-    /// mono track. The reason is [`ac3_decoder`]'s `ponytail`, not this file's.
+    /// mono track. The reason is [`ac3_decoder`]'s `corner-cut`, not this file's.
     requested: Option<u16>,
 }
 
@@ -2097,7 +2097,7 @@ impl MkvAc3Track {
 /// 5.1 track at all. Fresh per segment for the same reason every other decoder
 /// here is: a seek leaves overlap-add state belonging to the frames we skipped.
 ///
-/// ponytail: `Some(2)` on a **mono** (`acmod` 1/0) source decodes to digital
+/// corner-cut: `Some(2)` on a **mono** (`acmod` 1/0) source decodes to digital
 /// silence in oxideav-ac3 0.0.10 — measured, 5.1 and stereo are correct — so a
 /// mono track asks for no downmix at all and stays the mono source it is. The
 /// upgrade path is `Some(2)` unconditionally once the library duplicates the
@@ -2448,7 +2448,7 @@ pub(crate) fn stts_pairs(track: &Mp4Track) -> impl Iterator<Item = (u32, u32)> +
 /// Encoder delay in samples-per-channel: the edit list's first real entry says
 /// how far into the media the presentation starts.
 ///
-/// ponytail: an explicit `media_time` of 0 is taken at face value (no trim).
+/// corner-cut: an explicit `media_time` of 0 is taken at face value (no trim).
 /// Muxers that write a zero edit list despite a primed stream would leak the
 /// priming; upgrade path is preferring the codec delay when it disagrees.
 fn priming_samples(track: &Mp4Track, sample_rate: u32) -> u64 {
@@ -2461,7 +2461,7 @@ fn priming_samples(track: &Mp4Track, sample_rate: u32) -> u64 {
 /// timescale: where the presentation starts inside the media. `None` when there
 /// is no edit list, or only empty entries -- those shift the timeline rather
 /// than trim the media, and neither track honours that shift (see
-/// [`priming_samples`]'s ponytail). Shared with `demux`, which owes the video
+/// [`priming_samples`]'s corner-cut). Shared with `demux`, which owes the video
 /// track the same trim.
 pub(crate) fn edit_media_time(track: &Mp4Track) -> Option<u64> {
     track
@@ -2497,7 +2497,7 @@ fn unscale(samples: u64, sample_rate: u32, timescale: u32) -> u64 {
 /// private `sample_time` walk over stts (`track.rs:475`); its `SttsEntry` is
 /// unnameable outside the crate, hence the `(sample_count, sample_delta)` pairs.
 ///
-/// ponytail: the walk-back is clamped to the start of the containing stts entry
+/// corner-cut: the walk-back is clamped to the start of the containing stts entry
 /// rather than crossing into the previous one, so a target within `pre_roll`
 /// packets of an entry boundary gets less pre-roll. AAC packets are uniformly
 /// 1024 frames (one entry per track), so this cannot fire here; upgrade path is
@@ -3373,7 +3373,7 @@ mod tests {
         let entries = [(10u32, 1024u32), (10, 512)];
         assert_eq!(packet_at(entries, 12_500, 0), (15, 12_288));
         assert_eq!(packet_at(entries, 12_500, PRE_ROLL), (13, 11_264));
-        // The ponytail clamp: on the first packet of the second entry the
+        // The corner-cut clamp: on the first packet of the second entry the
         // walk-back stops there instead of stepping into the first entry.
         assert_eq!(packet_at(entries, 10_500, PRE_ROLL), (11, 10_240));
     }

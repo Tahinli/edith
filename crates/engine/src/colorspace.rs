@@ -734,7 +734,7 @@ fn scaling_list_data(b: &mut Bits) {
 /// holds: that count is what the *next* set spends a flag per picture on when
 /// it predicts from this one, so losing it loses the bit position.
 ///
-/// ponytail: the predicted case counts flags rather than deriving the POCs
+/// corner-cut: the predicted case counts flags rather than deriving the POCs
 /// (§7.4.8, (7-59)..(7-71)), so a set whose `deltaRps` cancels a reference's
 /// own delta exactly -- a picture at POC distance zero, which is the current
 /// picture and which no encoder emits -- would be counted one too high. The

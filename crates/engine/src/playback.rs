@@ -48,7 +48,7 @@ const FLUSH_WAIT: Duration = Duration::from_millis(1);
 /// honest; both are what a video imported onto such a timeline is held to
 /// ([`matches_timeline`]).
 ///
-/// ponytail: a 25 fps video imported onto an audio-only timeline it could have
+/// corner-cut: a 25 fps video imported onto an audio-only timeline it could have
 /// defined plays at 25 fps, correctly, but on a 30 fps timeline -- it is read
 /// through [`Rate`] like any other file shot at another rate rather than
 /// defining one. Upgrade path is adopting the first *picture's* rate and codec
@@ -67,7 +67,7 @@ const IMAGE_ONLY_RATE: f64 = 30.0;
 /// number -- a `u32::MAX` sentinel here would make [`Self::trim_room`] hand a
 /// drag a wall past what the timeline can hold.
 ///
-/// ponytail: a still cannot be held longer than this. Upgrade path is a
+/// corner-cut: a still cannot be held longer than this. Upgrade path is a
 /// per-source length the project file carries, which every `counts` reader
 /// would then have to take from the document rather than from the file.
 const IMAGE_MAX_SECS: f64 = 600.0;
@@ -1482,7 +1482,7 @@ impl PlaybackSession {
     /// worker keeps decoding through it ([`Dirty`]). `false` for a bad index or
     /// a non-finite band, and nothing changes.
     ///
-    /// ponytail: the audio rebuild is what makes it live, so the cost of a
+    /// corner-cut: the audio rebuild is what makes it live, so the cost of a
     /// change is a decoder restart -- inaudible at a drag's end, but too much to
     /// call once per pointer sample (a caller commits one change per gesture).
     /// Upgrade path is the per-segment twin of [`crate::audio::MixControls`],
@@ -1541,7 +1541,7 @@ impl PlaybackSession {
     /// ([`crate::limiter::LimiterState::retune`]), so its delay line keeps
     /// running and the sample count the master clock is made of does not move.
     ///
-    /// ponytail: not an undo step, and deliberately -- [`Project::undo`]
+    /// corner-cut: not an undo step, and deliberately -- [`Project::undo`]
     /// restores the lane list, and the limiter is not in it, so snapshotting
     /// here would push a step whose undo changes nothing a person can see or
     /// hear (the twin [`set_lane_gain_db`](Self::set_lane_gain_db) *is*
@@ -1794,7 +1794,7 @@ impl PlaybackSession {
     /// that is not a picture -- zero either way, or past 8K, which is where the
     /// per-frame buffers stop being a sane thing to allocate from a keystroke.
     ///
-    /// ponytail: not an undo step. The project resolution is not in the lane
+    /// corner-cut: not an undo step. The project resolution is not in the lane
     /// snapshots [`Project::undo`] restores, so cycling it back is one more
     /// keypress rather than a `z`. Upgrade path is snapshotting it beside the
     /// lanes, which every existing snapshot site would then have to carry.
@@ -1828,7 +1828,7 @@ impl PlaybackSession {
     /// tone map at all ([`crate::tonemap`]), so the reseek recomposes the very
     /// same bytes.
     ///
-    /// ponytail: not an undo step, for the reason the resolution is not
+    /// corner-cut: not an undo step, for the reason the resolution is not
     /// ([`Project::set_tone`]).
     pub fn set_tone(&mut self, preset: crate::tonemap::Preset) -> bool {
         if !self.project.set_tone(preset) {
@@ -1859,7 +1859,7 @@ impl PlaybackSession {
     /// ([`crate::mux::frame_timing`], the same wall a file of an unnameable rate
     /// is refused at).
     ///
-    /// ponytail: not an undo step, exactly as the project resolution is not --
+    /// corner-cut: not an undo step, exactly as the project resolution is not --
     /// and this one *moves the frame numbers*, so the way back is picking the
     /// old rate (or the media's, [`native_frame_rate`](Self::native_frame_rate))
     /// rather than a `z`, and it lands within a frame of where it started rather
@@ -2468,7 +2468,7 @@ impl PlaybackSession {
     /// the clock held until the new stream is really audible (see
     /// [`Audio::content_at`]).
     ///
-    /// ponytail: the device is made active here, before the new stream has been
+    /// corner-cut: the device is made active here, before the new stream has been
     /// opened ([`start_audio`](Self::start_audio) opens on the feeder now), so a
     /// cold open leaves it playing its own silence with an empty ring -- audibly
     /// the same silence as before, and counted: a scripted cold play-seek-scrub
@@ -2621,7 +2621,7 @@ impl PlaybackSession {
     /// Later edits do not reach a running export: it works from a snapshot of
     /// the edit list taken here.
     ///
-    /// ponytail: this defaults the settings; the app still calls it that way,
+    /// corner-cut: this defaults the settings; the app still calls it that way,
     /// and the export options card replaces the call with
     /// [`export_to_with`](PlaybackSession::export_to_with).
     pub fn export_to(&self, out: &Path) -> crate::ExportHandle {
@@ -2682,7 +2682,7 @@ impl PlaybackSession {
             // clock's own anchor is its first report ([`PlaybackClock`]), and
             // anchoring it here is what makes a mid-play edit cost no offset.
             //
-            // ponytail: `started` is the position when the sample was queued,
+            // corner-cut: `started` is the position when the sample was queued,
             // and it is heard at the next callback -- up to one quantum (5-21
             // ms) later, so that much of the restart is still counted. Upgrade
             // path is the position at the first *pop* of real audio, which only
