@@ -98,7 +98,7 @@ for file in "${files[@]}"; do
         run 1800 "seek_ttff_${t}s" "$file" seek "$t"
     done
     run 3600 scrub "$file" scrub
-    for seat in h264sw h264hw av1 hevc; do
+    for seat in h264sw h264hw av1 hevc hevchw; do
         run "$export_limit" "export_fps_$seat" "$file" export "$seat" "$OUT_DIR"
     done
 done

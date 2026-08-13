@@ -169,15 +169,6 @@ fn source_frame(path: &Path, index: u32) -> Vec<u8> {
     frame.bgra
 }
 
-fn threads() -> usize {
-    std::fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .find_map(|l| l.strip_prefix("Threads:"))
-        .and_then(|n| n.trim().parse().ok())
-        .expect("Threads: in /proc/self/status")
-}
-
 /// Wall-clock seek: no audio track, so this runs anywhere.
 #[test]
 fn seek_repositions_video_and_clock() {
@@ -250,7 +241,7 @@ fn rapid_seeks_settle_on_the_last_one() {
 
     session.play();
     run_for(&mut session, &mut last_index, Duration::from_millis(300));
-    let before = threads();
+    let before = session.live_workers();
 
     for t in [4.0, 1.0, 3.5, 0.5, 2.0] {
         session.seek(t);
@@ -261,11 +252,11 @@ fn rapid_seeks_settle_on_the_last_one() {
     );
 
     sleep(Duration::from_millis(500)); // abandoned workers exit within an AU
-    let after = threads();
-    eprintln!("rapid seeks: {before} threads -> {after}");
+    let after = session.live_workers();
+    eprintln!("rapid seeks: {before} workers -> {after}");
     assert!(
         after <= before + 3,
-        "workers piled up: {before} threads -> {after}"
+        "workers piled up: {before} workers -> {after}"
     );
 }
 
@@ -273,8 +264,8 @@ fn rapid_seeks_settle_on_the_last_one() {
 /// Each one abandons a worker and starts another, and since the open moved onto
 /// the worker (`DecodeSession::open_worker_deferred`) not one of them reads the
 /// file on this thread -- so the whole storm is 40 thread spawns, the parked
-/// workers are still reaped as they go (the thread count says so), and the last
-/// seek still decides what is on screen.
+/// workers are still reaped as they go (the session's own count says so), and
+/// the last seek still decides what is on screen.
 #[test]
 fn a_storm_of_seeks_stays_bounded_and_the_last_one_wins() {
     let mut session = open(asset("test_av.mp4"));
@@ -283,7 +274,7 @@ fn a_storm_of_seeks_stays_bounded_and_the_last_one_wins() {
 
     session.play();
     run_for(&mut session, &mut last_index, Duration::from_millis(300));
-    let before = threads();
+    let before = session.live_workers();
 
     let storm = Instant::now();
     for i in 0..39 {
@@ -291,7 +282,7 @@ fn a_storm_of_seeks_stays_bounded_and_the_last_one_wins() {
     }
     session.seek(2.0);
     let issued = storm.elapsed();
-    eprintln!("40 seeks issued in {issued:?} ({before} threads before)");
+    eprintln!("40 seeks issued in {issued:?} ({before} workers before)");
     assert!(
         issued < Duration::from_secs(1),
         "40 seeks cost the caller {issued:?} -- a seek is opening a file again"
@@ -303,11 +294,11 @@ fn a_storm_of_seeks_stays_bounded_and_the_last_one_wins() {
     );
 
     sleep(Duration::from_millis(500)); // abandoned workers exit within an AU
-    let after = threads();
-    eprintln!("seek storm: {before} threads -> {after}");
+    let after = session.live_workers();
+    eprintln!("seek storm: {before} workers -> {after}");
     assert!(
         after <= before + 3,
-        "the retired list grew with the storm: {before} threads -> {after}"
+        "the retired list grew with the storm: {before} workers -> {after}"
     );
 }
 
