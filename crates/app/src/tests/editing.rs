@@ -839,16 +839,6 @@ fn every_action_is_reachable_without_the_keyboard() {
 /// the day it is added, which is the only way the two stay in step.
 #[test]
 fn every_card_closes_without_the_keyboard() {
-    let source = ui_source();
-    let source = source.as_str();
-    // A fn's source, up to the next one: enough of a body to scan.
-    let body = |name: &str| -> &str {
-        let at = source
-            .find(&format!("fn {name}("))
-            .unwrap_or_else(|| panic!("no fn {name} in main.rs"));
-        let rest = &source[at..];
-        &rest[..rest[1..].find("\n    fn ").map_or(rest.len(), |e| e + 1)]
-    };
     for card in [
         "keys_overlay",
         "export_card",
@@ -858,7 +848,7 @@ fn every_card_closes_without_the_keyboard() {
         "mix_card",
         "silence_card",
     ] {
-        let src = body(card);
+        let src = fn_body(card);
         assert!(
             src.contains("this.close_card()"),
             "{card}'s scrim swallows the press without closing the card: \
@@ -873,8 +863,8 @@ fn every_card_closes_without_the_keyboard() {
     // ...and every state that makes the window modal is a state that press
     // clears. `exporting()` is not one of them: a running export is a job
     // with a cancel button, not a card with a scrim.
-    let close = body("close_card");
-    for field in body("modal").split("self.").skip(1).filter_map(|rest| {
+    let close = fn_body("close_card");
+    for field in fn_body("modal").split("self.").skip(1).filter_map(|rest| {
         let name: String = rest
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
