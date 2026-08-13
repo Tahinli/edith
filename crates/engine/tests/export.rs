@@ -859,3 +859,160 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
 
     std::fs::remove_file(&out).unwrap();
 }
+
+/// The stand-in a proxy really is, in one pass over the fixture: a picture-only
+/// file whose *every* frame is a decoder's starting point, playable through the
+/// ordinary session, and found in the cache the second time it is asked for.
+///
+/// Software seat, like every default test here ([`pin_software`]) -- what the
+/// hardware one buys is speed, and that is the ignored test below.
+#[test]
+fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
+    pin_software();
+    let source = asset("test_av.mp4");
+    let out = engine::proxy::path_for(&source).expect("a cache directory");
+    // A proxy left by an earlier run would make this test assert about a file
+    // it did not write -- and the cache-hit half below would be the only half
+    // that ran.
+    let _ = std::fs::remove_file(&out);
+
+    let job = engine::proxy::generate(&source).expect("start the proxy");
+    assert_eq!(job.path(), out, "the job writes where the key says");
+    let started = Instant::now();
+    while !job.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "the proxy did not finish: {:.0}% in",
+            job.progress() * 100.0
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let made = job
+        .outcome()
+        .expect("a finished job has an outcome")
+        .expect("the proxy");
+    assert_eq!(made, out);
+    assert_eq!(job.progress(), 1.0, "finished at full progress");
+
+    let (source_meta, _) = engine::demux::Demuxer::open(&source).expect("open the fixture");
+    let (meta, _) = engine::demux::Demuxer::open(&made).expect("open the proxy");
+    assert_eq!(
+        (meta.width, meta.height),
+        engine::proxy::size_for(&source_meta),
+        "the proxy is coded at the size the rule picked"
+    );
+    assert_eq!(meta.codec, engine::Codec::H264, "proxies are H.264");
+    assert_eq!(
+        meta.frame_count, source_meta.frame_count,
+        "a stand-in as long as the film, or every cut lands elsewhere"
+    );
+
+    // The whole point: every frame its own random-access point, so a seek never
+    // has to start earlier than it was asked to.
+    let syncs = engine::demux::sync_points(&made);
+    assert_eq!(
+        syncs.len() as u32,
+        meta.frame_count,
+        "{} of {} frames are starting points -- the proxy is not intra-only",
+        syncs.len(),
+        meta.frame_count
+    );
+
+    // ...and no sound in it at all: the mix is the original's, always.
+    assert!(
+        engine::AudioSession::open(&made)
+            .expect("probe the proxy for sound")
+            .is_none(),
+        "a proxy carries no audio track"
+    );
+
+    // It plays through the ordinary door, which is what substitution needs.
+    let session = PlaybackSession::open(&made).expect("play the proxy");
+    assert_eq!(session.meta().frame_count, source_meta.frame_count);
+
+    // Asked again, it is the file already there: no second encode.
+    let again = engine::proxy::generate(&source).expect("ask again");
+    assert!(again.is_finished(), "a cached proxy is done on the spot");
+    assert_eq!(
+        again.outcome().expect("cached outcome").expect("cached path"),
+        out
+    );
+    assert_eq!(engine::proxy::cached(&source), Some(out.clone()));
+
+    std::fs::remove_file(&out).expect("clean the cache entry up");
+    assert_eq!(engine::proxy::cached(&source), None);
+}
+
+/// His own 4K HEVC film, on the hardware seat: a proxy of it is made **faster
+/// than the film plays**, which is the whole promise -- and a cancel stops it
+/// dead and leaves nothing behind.
+///
+/// Measured over a window rather than to the end: the film is two hours and the
+/// number wanted is a rate, not a wall time.
+///
+/// ```text
+/// cargo build -p engine -p engine-hw --release
+/// LD_LIBRARY_PATH=target/release cargo test -p engine --release --test export \
+///   -- --ignored --nocapture --test-threads=1 proxy_of_his_4k
+/// ```
+#[test]
+#[ignore = "needs the VA-API plugin and his own library"]
+fn a_proxy_of_his_4k_film_is_made_faster_than_it_plays() {
+    pin_hardware();
+    let Some(film) = engine::real_library::film("hevc_4k_hdr") else {
+        return;
+    };
+    let out = engine::proxy::path_for(&film).expect("a cache directory");
+    let _ = std::fs::remove_file(&out);
+    let (meta, _) = engine::demux::Demuxer::open(&film).expect("open the film");
+    let duration = f64::from(meta.frame_count) / meta.frame_rate;
+    println!(
+        "film: {}x{} {:.3} fps, {duration:.0}s",
+        meta.width, meta.height, meta.frame_rate
+    );
+
+    let job = engine::proxy::generate(&film).expect("start the proxy");
+    let window = Duration::from_secs(60);
+    let started = Instant::now();
+    while started.elapsed() < window && !job.is_finished() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let made = f64::from(job.progress()) * duration;
+    let seat = job.encoder().unwrap_or_default();
+    println!(
+        "proxy: {made:.0}s of film in {elapsed:.0}s = {:.2}x realtime, seat {seat}",
+        made / elapsed
+    );
+    // The silent-software trap: a run without the plugin on the path measures
+    // the fallback and calls it hardware.
+    assert!(
+        seat.contains("HW encode"),
+        "not the hardware seat ({seat}): LD_LIBRARY_PATH must name the plugin"
+    );
+    assert!(
+        made / elapsed >= 1.0,
+        "{:.2}x realtime is slower than watching the film",
+        made / elapsed
+    );
+
+    // Cancel stops the reading, and a proxy that was not finished is not left
+    // lying around under the name a finished one would have.
+    job.cancel();
+    let stopped = Instant::now();
+    while !job.is_finished() {
+        assert!(
+            stopped.elapsed() < Duration::from_secs(30),
+            "the proxy did not stop when cancelled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(job.outcome().expect("an outcome").is_err(), "cancelled");
+    assert!(
+        !out.exists(),
+        "a cancelled proxy left {} behind",
+        out.display()
+    );
+    assert!(!part_path(&out).exists(), "a cancelled proxy left its .part");
+    assert_eq!(engine::proxy::cached(&film), None);
+}
