@@ -28,7 +28,7 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
             let mut path = PathBuilder::fill();
             path.add_polygon(&points, true);
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(FG_SECONDARY));
+                window.paint_path(path, rgb(FG_SECONDARY()));
             }
         },
     )
@@ -72,7 +72,7 @@ pub(crate) fn control(
         .when(w > 0., |d| d.w(px(w)).overflow_hidden())
         .rounded(px(4.))
         .bg(rgb(bg))
-        .when(bg == ACCENT_PRIMARY, |d| d.text_color(rgb(BG_CANVAS)))
+        .when(bg == ACCENT_PRIMARY(), |d| d.text_color(rgb(BG_CANVAS())))
         // A glyph sits in a box of its own width, never in the width it happens
         // to draw: the pause bars are 12 px wide and the play triangle is 11, so
         // pressing Play used to slide every button in the row one pixel left. A
@@ -95,9 +95,9 @@ pub(crate) fn control(
             // turning itself off.
             d.cursor_pointer()
                 .hover(move |s| {
-                    s.bg(rgb(match bg == ACCENT_PRIMARY {
-                        true => ACCENT_HOVER,
-                        false => BG_HOVER,
+                    s.bg(rgb(match bg == ACCENT_PRIMARY() {
+                        true => ACCENT_HOVER(),
+                        false => BG_HOVER(),
                     }))
                 })
                 .on_click(on_click)
@@ -146,13 +146,13 @@ pub(crate) fn volume_slider(
                 .w_full()
                 .h(px(4.))
                 .rounded(px(2.))
-                .bg(rgb(BG_RAISED))
+                .bg(rgb(BG_RAISED()))
                 .child(
                     div()
                         .h_full()
                         .w(relative(volume.along()))
                         .rounded(px(2.))
-                        .bg(rgb(if volume.muted { FG_SECONDARY } else { ACCENT_PRIMARY })),
+                        .bg(rgb(if volume.muted { FG_SECONDARY() } else { ACCENT_PRIMARY() })),
                 ),
         )
 }
@@ -165,7 +165,7 @@ pub(crate) fn group_label(name: &'static str) -> impl IntoElement {
     div()
         .flex_none()
         .text_size(px(10.))
-        .text_color(rgb(FG_SECONDARY))
+        .text_color(rgb(FG_SECONDARY()))
         .child(name)
 }
 
@@ -175,7 +175,7 @@ pub(crate) fn separator() -> impl IntoElement {
         .mx(px(4.))
         .w(px(1.))
         .h(px(18.))
-        .bg(rgb(BG_HOVER))
+        .bg(rgb(BG_HOVER()))
 }
 
 /// Whether a card or a menu is drawn over the window, as the hover labels see
@@ -209,9 +209,9 @@ impl Render for Tip {
             .py(px(3.))
             .rounded(px(3.))
             .border_1()
-            .border_color(rgb(BG_RAISED))
-            .bg(rgb(BG_PANEL))
-            .text_color(rgb(FG_PRIMARY))
+            .border_color(rgb(BG_RAISED()))
+            .bg(rgb(BG_PANEL()))
+            .text_color(rgb(FG_PRIMARY()))
             .text_size(px(12.))
             .child(self.0.clone())
     }
@@ -231,7 +231,7 @@ pub(crate) fn cut_glyph() -> impl IntoElement {
             path.move_to(point(o.x + s.width * 0.85, o.y + s.height));
             path.line_to(point(o.x + s.width * 0.1, o.y + s.height * 0.1));
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(FG_PRIMARY));
+                window.paint_path(path, rgb(FG_PRIMARY()));
             }
         },
     )
@@ -246,8 +246,8 @@ pub(crate) fn delete_glyph() -> impl IntoElement {
         .flex_col()
         .items_center()
         .gap(px(2.))
-        .child(div().w(px(13.)).h(px(2.)).bg(rgb(FG_PRIMARY)))
-        .child(div().w(px(9.)).h(px(9.)).bg(rgb(FG_PRIMARY)))
+        .child(div().w(px(13.)).h(px(2.)).bg(rgb(FG_PRIMARY())))
+        .child(div().w(px(9.)).h(px(9.)).bg(rgb(FG_PRIMARY())))
 }
 
 /// What a window with no file open is waiting for. Both ways in are already
@@ -259,7 +259,7 @@ pub(crate) fn empty_hint() -> impl IntoElement {
         .flex_col()
         .items_center()
         .gap(px(6.))
-        .text_color(rgb(FG_SECONDARY))
+        .text_color(rgb(FG_SECONDARY()))
         .child("Drop a video or an .edith project here")
         .child(
             div()
@@ -279,8 +279,8 @@ pub(crate) fn transport_glyph(state: Transport) -> impl IntoElement {
         .items_center()
         .gap(px(4.))
         .when(playing, |d| {
-            d.child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY)))
-                .child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY)))
+            d.child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY())))
+                .child(div().w(px(3.)).h(px(12.)).bg(rgb(FG_PRIMARY())))
         })
         .when(!playing, |d| {
             d.child(
@@ -294,7 +294,7 @@ pub(crate) fn transport_glyph(state: Transport) -> impl IntoElement {
                         path.line_to(point(o.x, o.y + s.height));
                         path.close();
                         if let Ok(path) = path.build() {
-                            window.paint_path(path, rgb(FG_PRIMARY));
+                            window.paint_path(path, rgb(FG_PRIMARY()));
                         }
                     },
                 )

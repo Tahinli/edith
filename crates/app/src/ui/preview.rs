@@ -84,9 +84,9 @@ impl Player {
                         .max_w(relative(0.9))
                         .px(px(6.))
                         .rounded(px(3.))
-                        .bg(rgba(SUB_SHADE))
+                        .bg(rgba(SUB_SHADE()))
                         .text_size(px(SUB_TEXT))
-                        .text_color(rgb(SUB_FG))
+                        .text_color(rgb(SUB_FG()))
                         .text_align(TextAlign::Center)
                         // A line of the cue is a line on screen: the break the
                         // parser kept is not whitespace to be re-flowed. What a

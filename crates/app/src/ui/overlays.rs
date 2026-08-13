@@ -41,7 +41,7 @@ impl Player {
                 .gap(px(4.))
                 .px(px(12.))
                 .py(px(6.))
-                .bg(rgb(BG_RAISED))
+                .bg(rgb(BG_RAISED()))
                 .child(
                     div()
                         .flex()
@@ -55,7 +55,7 @@ impl Player {
                             0.,
                             // The ordinary plane -- the accent is Export's, and
                             // a way out of a read is not the primary action.
-                            BG_RAISED,
+                            BG_RAISED(),
                             None,
                             "Cancel",
                             "stops this file and anything queued behind it; the read already \
@@ -70,7 +70,7 @@ impl Player {
                         .relative()
                         .w_full()
                         .h(px(2.))
-                        .bg(rgb(BG_HOVER))
+                        .bg(rgb(BG_HOVER()))
                         .child(
                             div()
                                 .absolute()
@@ -82,7 +82,7 @@ impl Player {
                                 // paint outside the track.
                                 .w(relative((at + SWEEP).min(1.) - at.max(0.)))
                                 .h(px(2.))
-                                .bg(rgb(ACCENT_PRIMARY)),
+                                .bg(rgb(ACCENT_PRIMARY())),
                         ),
                 ),
         )
@@ -99,7 +99,7 @@ impl Player {
                 .flex_none()
                 .px(px(12.))
                 .py(px(6.))
-                .bg(rgb(BG_RAISED))
+                .bg(rgb(BG_RAISED()))
                 .child(line),
         )
     }
@@ -159,14 +159,14 @@ impl Player {
                 .gap(px(12.))
                 .px(px(12.))
                 .py(px(6.))
-                .bg(rgb(BG_RAISED))
+                .bg(rgb(BG_RAISED()))
                 // The tone is a stripe down the leading edge rather than the
                 // whole bar's colour: a full red bar at every refusal is an
                 // alarm, and most of these are answers.
                 .border_l(px(3.))
                 .border_color(rgb(tone))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(|s| s.bg(rgb(BG_HOVER())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     // Another process starting: off the UI thread, and it
                     // outlives the notice it was asked from.
@@ -190,7 +190,7 @@ impl Player {
                     div()
                         .flex_none()
                         .text_size(px(11.))
-                        .text_color(rgb(FG_SECONDARY))
+                        .text_color(rgb(FG_SECONDARY()))
                         .child(hint),
                 ),
         )
@@ -266,7 +266,7 @@ impl Player {
                     .px(px(6.))
                     .pt(px(4.))
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(category.label())
                     .into_any_element(),
                 KeyRow::Act(action) => {
@@ -276,7 +276,7 @@ impl Player {
                     let refusal = self.enable(action, None);
                     let out = out.clone();
                     row()
-                        .when(capturing, |d| d.bg(rgb(BG_SELECTED)))
+                        .when(capturing, |d| d.bg(rgb(BG_SELECTED())))
                         .child(
                             div()
                                 .id(("do", i))
@@ -303,7 +303,7 @@ impl Player {
                                 })
                                 .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
                                 .when(refusal.yes(), |d| {
-                                    d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER))).on_click(
+                                    d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER()))).on_click(
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             // The card goes first: several of
                                             // these open a card of their own,
@@ -329,14 +329,14 @@ impl Player {
                                 .min_h(px(KEYS_ROW_H))
                                 .items_center()
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.rebinding = Some(action);
                                     cx.notify();
                                 }))
                                 .child(if capturing {
                                     div()
-                                        .text_color(rgb(FG_SECONDARY))
+                                        .text_color(rgb(FG_SECONDARY()))
                                         .child(format!("press a key — {out} cancels"))
                                 } else {
                                     div().child(self.keymap.display(action))
@@ -349,7 +349,7 @@ impl Player {
                     row()
                         .child(f.label)
                         // Dim, and no hover: this one is not a row you can click.
-                        .child(div().text_color(rgb(FG_SECONDARY)).child(f.chord.clone()))
+                        .child(div().text_color(rgb(FG_SECONDARY())).child(f.chord.clone()))
                         .into_any_element()
                 }
             });
@@ -363,7 +363,7 @@ impl Player {
                 // swallowed here so a button under the scrim cannot take it --
                 // and it closes the card on the way, which is the pointer's exit
                 // from every card here ([`Player::close_card`]).
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -381,7 +381,7 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         // Title and instruction are two children, never one
                         // wrapping line: a fixed-height slot whose text wrapped
                         // painted its second line over the first row.
@@ -399,7 +399,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(
                                     self.notices
                                         .front()
@@ -420,7 +420,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(search),
                         )
                         // Capped and scrolling rather than as tall as the action
@@ -440,7 +440,7 @@ impl Player {
                                 // list with more above it.
                                 .mt(px(4.))
                                 .border_t_1()
-                                .border_color(rgb(BG_PANEL))
+                                .border_color(rgb(BG_PANEL()))
                                 .pt(px(4.))
                                 .overflow_y_scroll()
                                 // The wheel's offset and the arrow keys' are
@@ -523,7 +523,7 @@ impl Player {
                                 // pair is 25 characters and has to fit beside
                                 // its label inside `MENU_W`.
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(value),
                         )
                         .into_any_element(),
@@ -563,16 +563,16 @@ impl Player {
                                 .min_w(px(0.))
                                 .truncate()
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(why),
                             None => div()
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(self.keymap.display(action)),
                         })
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                     // Closed first: the action moves the very
                                     // indices this menu is holding.
@@ -599,7 +599,7 @@ impl Player {
             rows.push(
                 row(rows.len())
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         if let Some(menu) = &mut this.context_menu {
                             menu.details = true;
@@ -609,7 +609,7 @@ impl Player {
                     .child("Properties")
                     // No stroke reaches this one, and a blank column would read
                     // as one that was forgotten.
-                    .child(div().text_color(rgb(FG_SECONDARY)).child("…"))
+                    .child(div().text_color(rgb(FG_SECONDARY())).child("…"))
                     .into_any_element(),
             );
         }
@@ -654,7 +654,7 @@ impl Player {
                         .flex_col()
                         .p(px(MENU_PAD))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         // Painted after the scrim, so this listener runs first
                         // (gpui bubbles mouse events in reverse, window.rs:3705)
                         // and a press meant for an item never closes the menu
@@ -716,12 +716,17 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     // The mark is a glyph as well as a highlight, like the
                     // export card's rows: a background alone is gone under a
                     // hover and invisible to anyone who cannot tell the two
                     // greys apart (WCAG 1.4.1).
-                    .when(picked, |d| d.bg(rgb(BG_SELECTED)))
+                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
+                    // Where the keyboard is, said after the mark so the cursor
+                    // is visible on the picked row too -- and as a background,
+                    // not a border, because a row that grew a stroke would move
+                    // every row under it.
+                    .when(n == picker.sel, |d| d.bg(rgb(BG_HOVER())))
                     .child(
                         div()
                             .flex()
@@ -742,8 +747,8 @@ impl Player {
                             // On the picked row the dim ink sits on the
                             // highlight, where it is only 3.3:1 (WCAG 1.4.3).
                             .text_color(rgb(match picked {
-                                true => FG_PRIMARY,
-                                false => FG_SECONDARY,
+                                true => FG_PRIMARY(),
+                                false => FG_SECONDARY(),
                             }))
                             .child(detail),
                     )
@@ -788,7 +793,7 @@ impl Player {
                         .flex_col()
                         .p(px(MENU_PAD))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         // Painted after the scrim, so this listener runs first
                         // and a press meant for a row never closes the list out
                         // from under its own click (`context_card`).

@@ -110,6 +110,11 @@ actions! {
     Mix,
     ToggleSnap,
     ToggleSubtitles,
+    /// The window's own colours, which belong to the person looking at them and
+    /// not to the project: a list of the palettes, opened here and from the
+    /// toolbar's Theme button. It was a build feature once, which made it a
+    /// choice only whoever compiled the binary could make.
+    Theme,
     CancelExport,
     /// Opens the actions card -- the list every other action is on. A door of
     /// its own, because a card reachable only by a button in the panel is one a
@@ -168,6 +173,7 @@ impl ActionId {
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
+            ActionId::Theme => "Theme: the window's colours…",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
         }
@@ -221,6 +227,7 @@ impl ActionId {
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
+            ActionId::Theme => "theme",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
         }
@@ -271,7 +278,10 @@ impl ActionId {
             | ActionId::ZoomIn
             | ActionId::ZoomOut
             | ActionId::ZoomFit
-            | ActionId::ToggleSubtitles => Category::View,
+            | ActionId::ToggleSubtitles
+            // ...and what the whole window is painted in: it edits nothing at
+            // all, it is what one is looking *with*.
+            | ActionId::Theme => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -388,7 +398,7 @@ fn codec_chord() -> String {
         .join(" / ")
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 28]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 29]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -404,6 +414,15 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 28]> = std::sync::LazyLock::new(||
             label: "Close this card or menu, or cancel a capture",
             category: Category::View,
             reach: Reach::Gesture,
+        },
+        // An open choice list is driven by the keyboard as well as clicked: the
+        // list is the door to a setting, and a door only a pointer opens is one
+        // half of this editor's users cannot use.
+        Fixed {
+            chord: "↑ ↓ enter".into(),
+            label: "Move through an open choice list, and take the row",
+            category: Category::View,
+            reach: Reach::Click("picker-row"),
         },
         Fixed {
             chord: "n".into(),
@@ -792,6 +811,11 @@ impl Keymap {
                 // the rest of the things one *looks* at, and nowhere near the
                 // two keys that delete.
                 b(ActionId::ToggleSubtitles, "t", false),
+                // The theme takes ctrl+h -- the h of the word, since "t" is the
+                // subtitles and ctrl+t takes one off -- and a ctrl chord because
+                // it is a preference set once, not a stroke wanted under a hand
+                // that is editing.
+                b(ActionId::Theme, "h", true),
                 b(ActionId::CancelExport, "escape", false),
                 // The help key, where every program's list of what it can do
                 // has always been. Free -- gpui names it "f1"
@@ -1061,8 +1085,9 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 48);
+        assert_eq!(k.entries().len(), 49);
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
+        assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
         // ends of the timeline.

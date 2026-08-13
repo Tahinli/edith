@@ -58,16 +58,16 @@ impl Player {
             .items_center()
             .gap(px(8.))
             .px(px(12.))
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(BG_PANEL()))
             .border_b_1()
-            .border_color(rgb(STROKE_DIVIDER))
+            .border_color(rgb(STROKE_DIVIDER()))
             .child(
                 div()
                     .flex_none()
                     .w(px(10.))
                     .h(px(10.))
                     .rounded(px(2.))
-                    .bg(rgb(ACCENT_PRIMARY)),
+                    .bg(rgb(ACCENT_PRIMARY())),
             )
             .child(
                 div()
@@ -79,7 +79,7 @@ impl Player {
             .child(self.action_control(
                 "save",
                 0.,
-                BG_RAISED,
+                BG_RAISED(),
                 None,
                 "Save",
                 "writes the project file",
@@ -98,7 +98,7 @@ impl Player {
                         // The one accented button in the window: the primary
                         // action of an editor, where every consumer editor puts
                         // it. Cancel keeps the rect and the accent both.
-                        ACCENT_PRIMARY,
+                        ACCENT_PRIMARY(),
                         None,
                         if exporting { "Cancel" } else { "Export" },
                         if exporting {
@@ -150,13 +150,13 @@ impl Player {
             .items_center()
             .gap(px(8.))
             .px(px(12.))
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(BG_PANEL()))
             .border_t_1()
-            .border_color(rgb(STROKE_DIVIDER))
+            .border_color(rgb(STROKE_DIVIDER()))
             .child(self.action_control(
                 "transport",
                 40.,
-                BG_RAISED,
+                BG_RAISED(),
                 Some(transport_glyph(state).into_any_element()),
                 "",
                 "plays and pauses the timeline",
@@ -171,7 +171,7 @@ impl Player {
                     .flex_none()
                     .w(px(clock_w))
                     .truncate()
-                    .text_color(rgb(FG_PRIMARY))
+                    .text_color(rgb(FG_PRIMARY()))
                     .child(format!(
                         "{} / {}",
                         timecode(position, self.fps),
@@ -190,7 +190,7 @@ impl Player {
             .child(self.action_control(
                 "volume",
                 VOLUME_SLOT_W,
-                BG_RAISED,
+                BG_RAISED(),
                 None,
                 // The level is the label either way and it lives in a fixed
                 // rect: muting adds a mark and changes the colour, where it
@@ -207,8 +207,8 @@ impl Player {
                 }),
             ))
             .text_color(rgb(match muted {
-                true => STATUS_WARNING,
-                false => FG_PRIMARY,
+                true => STATUS_WARNING(),
+                false => FG_PRIMARY(),
             }))
             .when(slider, |d| {
                 d.child(volume_slider(
@@ -237,9 +237,9 @@ impl Player {
             .items_center()
             .gap(px(8.))
             .px(px(12.))
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(BG_PANEL()))
             .border_t_1()
-            .border_color(rgb(STROKE_DIVIDER))
+            .border_color(rgb(STROKE_DIVIDER()))
             .child(
                 div()
                     .id("controls")
@@ -253,7 +253,7 @@ impl Player {
                     .child(self.action_control(
                         "cut",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         Some(cut_glyph().into_any_element()),
                         "Split",
                         "splits the clip under the playhead",
@@ -263,7 +263,7 @@ impl Player {
                     .child(self.action_control(
                         "delete",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         Some(delete_glyph().into_any_element()),
                         "Delete",
                         "takes the marked clip off the timeline",
@@ -273,7 +273,7 @@ impl Player {
                     .child(self.action_control(
                         "undo",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Undo",
                         "takes the last edit back",
@@ -285,7 +285,7 @@ impl Player {
                     .child(self.action_control(
                         "add-video-lane",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "+ V",
                         "adds a video track under the ones there",
@@ -297,7 +297,7 @@ impl Player {
                     .child(self.action_control(
                         "add-audio-lane",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "+ A",
                         "adds an audio track under the ones there",
@@ -309,7 +309,7 @@ impl Player {
                     .child(self.action_control(
                         "add-subtitle-track",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "+ S",
                         "adds every subtitle track in a file you pick",
@@ -326,7 +326,7 @@ impl Player {
                     .child(self.action_control(
                         "snap",
                         SNAP_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         if self.snap { "Snap on" } else { "Snap off" },
                         match self.snap {
@@ -339,7 +339,7 @@ impl Player {
                     .child(self.action_control(
                         "subs",
                         SNAP_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         match (self.subtitle_track().is_some(), self.subs_on) {
                             (false, _) => "No subs",
@@ -350,11 +350,23 @@ impl Player {
                         ActionId::ToggleSubtitles,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_subtitles(cx)),
                     ))
+                    .child(self.action_control(
+                        "theme",
+                        THEME_SLOT_W,
+                        BG_RAISED(),
+                        None,
+                        format!("Theme: {}", crate::ui::theme::active().label()),
+                        "the colours this window is painted in; kept in ~/.config/edith/theme",
+                        ActionId::Theme,
+                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.open_picker(Pick::Theme, event.position(), cx)
+                        }),
+                    ))
                     .child(separator())
                     .child(self.action_control(
                         "zoom-out",
                         CONTROL_H,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "−",
                         "show more of the timeline; stops with all of it on the bed",
@@ -366,7 +378,7 @@ impl Player {
                     .child(self.action_control(
                         "zoom-fit",
                         ZOOM_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         span_label(self.view().span()),
                         "fit the whole timeline on the bed",
@@ -376,7 +388,7 @@ impl Player {
                     .child(self.action_control(
                         "zoom-in",
                         CONTROL_H,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "+",
                         "magnify around the playhead; ctrl+wheel on the ruler zooms at the pointer",
@@ -386,7 +398,7 @@ impl Player {
                     .child(self.action_control(
                         "keys",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Actions",
                         "do any action, or change the key that does it",
@@ -406,7 +418,7 @@ impl Player {
             .child(control(
                 "controls-more",
                 CONTROL_H,
-                BG_RAISED,
+                BG_RAISED(),
                 None,
                 "⋯",
                 format!(
@@ -434,6 +446,10 @@ pub(crate) const ZOOM_SLOT_W: f32 = 76.;
 pub(crate) const VOLUME_SLOT_W: f32 = 76.;
 /// The HDR rendition's names are the longest words on any button here.
 pub(crate) const TONE_SLOT_W: f32 = 148.;
+/// "Theme: " and the longest palette name: a fixed rect like the two toggles
+/// beside it, so picking a palette repaints the button without moving the ones
+/// after it.
+pub(crate) const THEME_SLOT_W: f32 = 96.;
 
 /// The width the transport strip needs before the level's bar fits beside the
 /// clock: play + clock + the mute button + the bar, in their gaps.

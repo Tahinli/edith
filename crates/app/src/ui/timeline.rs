@@ -137,9 +137,9 @@ impl Player {
             .gap(px(8.))
             .px(px(12.))
             .py(px(8.))
-            .bg(rgb(BG_TIMELINE))
+            .bg(rgb(BG_TIMELINE()))
             .border_t_1()
-            .border_color(rgb(STROKE_DIVIDER))
+            .border_color(rgb(STROKE_DIVIDER()))
             .child(
                 div()
                     .flex_none()
@@ -169,7 +169,7 @@ impl Player {
                             .min_w(px(0.))
                             .truncate()
                             .text_size(px(11.))
-                            .text_color(rgb(FG_SECONDARY))
+                            .text_color(rgb(FG_SECONDARY()))
                             .child(hint),
                     ),
             )
@@ -197,7 +197,7 @@ impl Player {
                             .justify_center()
                             .rounded(px(3.))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER_DIM)))
+                            .hover(|s| s.bg(rgb(BG_HOVER_DIM())))
                             // The strip carries no text, so the tooltip is the only
                             // place it can say what it is.
                             .tooltip(|_, cx| {
@@ -238,14 +238,14 @@ impl Player {
                                     .w_full()
                                     .h(px(6.))
                                     .rounded(px(3.))
-                                    .bg(rgb(BG_RAISED))
+                                    .bg(rgb(BG_RAISED()))
                                     .child(bounds_probe(self.ruler.clone()))
                                     .child(
                                         div()
                                             .h_full()
                                             .w(px(filled))
                                             .rounded(px(3.))
-                                            .bg(rgb(ACCENT_PRIMARY)),
+                                            .bg(rgb(ACCENT_PRIMARY())),
                                     ),
                             ),
                     ),
@@ -288,8 +288,8 @@ impl Player {
                         .justify_end()
                         .text_size(px(10.))
                         .text_color(rgb(match below {
-                            0 => FG_SECONDARY,
-                            _ => ACCENT_PRIMARY,
+                            0 => FG_SECONDARY(),
+                            _ => ACCENT_PRIMARY(),
                         }))
                         .child(match below {
                             0 => "the last track — scroll up for the rest".to_string(),
@@ -400,10 +400,10 @@ impl Player {
                             .gap(px(6.))
                             .pr(px(6.))
                             .rounded(px(3.))
-                            .when(!usable, |d| d.text_color(rgb(FG_SECONDARY)).opacity(0.55))
+                            .when(!usable, |d| d.text_color(rgb(FG_SECONDARY())).opacity(0.55))
                             .when(usable, |d| {
                                 d.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.sub_track = track;
                                         // Picking a track is asking to see it: a
@@ -414,7 +414,7 @@ impl Player {
                                         cx.notify();
                                     }))
                             })
-                            .when(picked, |d| d.bg(rgb(BG_SELECTED)))
+                            .when(picked, |d| d.bg(rgb(BG_SELECTED())))
                             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                             // The media rows' bar, same width and hard against
                             // the same edge: one association across the panel
@@ -452,7 +452,7 @@ impl Player {
                                                         // still there, out of
                                                         // the way.
                                                         .when(headed, |d| {
-                                                            d.text_color(rgb(FG_SECONDARY))
+                                                            d.text_color(rgb(FG_SECONDARY()))
                                                         })
                                                         .child(format!("{prefix} · ")),
                                                 )
@@ -469,7 +469,7 @@ impl Player {
                                         div()
                                             .truncate()
                                             .text_size(px(10.))
-                                            .text_color(rgb(FG_SECONDARY))
+                                            .text_color(rgb(FG_SECONDARY()))
                                             .child(row.detail),
                                     ),
                             )
@@ -491,7 +491,7 @@ impl Player {
                                     .justify_center()
                                     .rounded(px(3.))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
                                     .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
                                     .on_click(cx.listener(
                                         move |this, _: &ClickEvent, _, cx| {
@@ -520,7 +520,7 @@ impl Player {
                                 .items_center()
                                 .gap(px(6.))
                                 .text_size(px(10.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .when_some(tint, |d, tint| {
                                     d.child(
                                         div()
@@ -547,7 +547,7 @@ impl Player {
                     div()
                         .truncate()
                         .text_size(px(11.))
-                        .text_color(rgb(FG_SECONDARY))
+                        .text_color(rgb(FG_SECONDARY()))
                         .child(match (self.subs_on, sub_pick_name(tracks, self.sub_track)) {
                             // Which of them is on screen, named by its film:
                             // the heading over a list of five is where the one
@@ -602,7 +602,7 @@ impl Player {
         // whose subtitles these are before the tooltip is asked. `None` for a
         // standalone `.srt` -- nobody's stream, and the first film's colour
         // would be a lie about where it came from.
-        let tint = file_tint(self.sources(), &track.path).unwrap_or(BG_RAISED);
+        let tint = file_tint(self.sources(), &track.path).unwrap_or(BG_RAISED());
         // The whole of what the row says in words, since a 40 px column can hold
         // three characters of it: which track of which file, how many cues, the
         // file itself in full -- one stem is two films when they are two cuts of
@@ -657,7 +657,7 @@ impl Player {
                         .rounded(px(3.))
                         .bg(rgb(tint))
                         .text_size(px(9.))
-                        .text_color(rgb(FG_SECONDARY))
+                        .text_color(rgb(FG_SECONDARY()))
                         .truncate()
                         .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                         .child(label),
@@ -669,7 +669,7 @@ impl Player {
                         .min_w(px(0.))
                         .h_full()
                         .rounded(px(3.))
-                        .bg(rgb(BG_TIMELINE))
+                        .bg(rgb(BG_TIMELINE()))
                         .overflow_hidden()
                         .children(cues.into_iter().map(|(left, width)| {
                             div()
@@ -679,7 +679,7 @@ impl Player {
                                 .left(px(left))
                                 .w(px(width))
                                 .rounded(px(2.))
-                                .bg(rgb(BG_SELECTED))
+                                .bg(rgb(BG_SELECTED()))
                         }))
                         // The playhead again, last and in the lanes' own colour:
                         // the strip is only worth anything beside them if it
@@ -691,7 +691,7 @@ impl Player {
                                 .h_full()
                                 .left(px(filled))
                                 .w(px(2.))
-                                .bg(rgb(ACCENT_PLAYHEAD)),
+                                .bg(rgb(ACCENT_PLAYHEAD())),
                         ),
                 ),
         )
@@ -800,9 +800,9 @@ impl Player {
                     .items_center()
                     .justify_center()
                     .rounded(px(3.))
-                    .bg(rgb(BG_RAISED))
+                    .bg(rgb(BG_RAISED()))
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(match audio {
                         // A button, not a label: the one setting a track has of
                         // its own used to be reachable from nowhere.
@@ -815,7 +815,7 @@ impl Player {
                             .justify_center()
                             .rounded(px(3.))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .hover(|s| s.bg(rgb(BG_HOVER())))
                             .tooltip(move |_, cx| cx.new(|_| Tip(gain_tip.clone())).into())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.open_mix(Some(lane), cx)
@@ -848,7 +848,7 @@ impl Player {
                             .justify_center()
                             .rounded(px(3.))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER)))
+                            .hover(|s| s.bg(rgb(BG_HOVER())))
                             .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.remove_lane(lane, cx)
@@ -866,7 +866,7 @@ impl Player {
                     .min_w(px(0.))
                     .h_full()
                     .rounded(px(3.))
-                    .bg(rgb(BG_TIMELINE))
+                    .bg(rgb(BG_TIMELINE()))
                     .overflow_hidden()
                     // A library row let go over a lane is the same insert the
                     // Add button makes, through the same call -- but where the
@@ -882,7 +882,7 @@ impl Player {
                         let at = this.place_frame(window.mouse_position().x).0;
                         this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                     }))
-                    .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM)))
+                    .drag_over::<AssetDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM())))
                     // The shadow of the row in flight, drawn by the lane the
                     // pointer is inside: `on_drag_move` fires on every painted
                     // element while a drag of its type is live, wherever the
@@ -913,7 +913,7 @@ impl Player {
                         };
                         this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                     }))
-                    .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM)))
+                    .drag_over::<ClipDrag>(|s, _, _, _| s.bg(rgb(BG_HOVER_DIM())))
                     // ...and the same shadow for the clip in the hand, seated on
                     // this lane when the pointer is inside it.
                     .on_drag_move(cx.listener(
@@ -1018,15 +1018,15 @@ impl Player {
                             .rounded(px(3.))
                             .border_1()
                             .border_color(rgb(if on {
-                                STROKE_SELECTED
+                                STROKE_SELECTED()
                             } else if grouped {
                                 tint
                             } else {
-                                FG_SECONDARY
+                                FG_SECONDARY()
                             }))
-                            .bg(rgb(if on { BG_SELECTED } else { kind }))
+                            .bg(rgb(if on { BG_SELECTED() } else { kind }))
                             .cursor_pointer()
-                            .hover(|s| s.border_color(rgb(ACCENT_PRIMARY)))
+                            .hover(|s| s.border_color(rgb(ACCENT_PRIMARY())))
                             .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                             // Dragged, it *moves*: to the frame it was let go on
                             // and to the lane it was let go over. The click that
@@ -1087,7 +1087,7 @@ impl Player {
                                             .w(px(EDGE_W))
                                             .occlude()
                                             .cursor(CursorStyle::ResizeLeftRight)
-                                            .hover(|s| s.bg(rgb(ACCENT_PRIMARY)))
+                                            .hover(|s| s.bg(rgb(ACCENT_PRIMARY())))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
@@ -1129,7 +1129,7 @@ impl Player {
                                         .h_full()
                                         .flex()
                                         .items_center()
-                                        .child(div().w_full().h(px(1.)).bg(rgb(BG_HOVER)))
+                                        .child(div().w_full().h(px(1.)).bg(rgb(BG_HOVER())))
                                         .into_any_element(),
                                     // No audio track: nothing, never a fake.
                                     Wave::Silent => return None,
@@ -1144,7 +1144,7 @@ impl Player {
                                         .justify_center()
                                         .truncate()
                                         .text_size(px(9.))
-                                        .text_color(rgb(FG_SECONDARY))
+                                        .text_color(rgb(FG_SECONDARY()))
                                         .child("audio unreadable")
                                         .into_any_element(),
                                 };
@@ -1184,9 +1184,9 @@ impl Player {
                                                 .flex_none()
                                                 .px(px(3.))
                                                 .rounded(px(3.))
-                                                .bg(rgb(ACCENT_PRIMARY))
+                                                .bg(rgb(ACCENT_PRIMARY()))
                                                 .text_size(px(9.))
-                                                .text_color(rgb(BG_RAISED))
+                                                .text_color(rgb(BG_RAISED()))
                                                 .child(format!("{}", clip.speed)),
                                         ),
                                 )
@@ -1232,7 +1232,7 @@ impl Player {
                                     .w(px(scale
                                         .width_px(f64::from(len) / self.fps)
                                         .max(SUB_CUE_MIN_W)))
-                                    .bg(rgba(ACCENT_WASH))
+                                    .bg(rgba(ACCENT_WASH()))
                             }),
                     )
                     // Where the thing in the hand would come to rest, at the size
@@ -1254,13 +1254,13 @@ impl Player {
                                 .max(GHOST_MIN)))
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(rgb(if g.refused { DROP_REFUSE } else { FG_PRIMARY }))
+                            .border_color(rgb(if g.refused { DROP_REFUSE() } else { FG_PRIMARY() }))
                             // The file's own swatch at a third of its weight, so
                             // the box beneath is still legible through it -- and
                             // the refusal red instead, for a lane that will not
                             // take this drop at all.
                             .bg(rgba(
-                                ((if g.refused { DROP_REFUSE } else { g.tint }) << 8) | GHOST_ALPHA,
+                                ((if g.refused { DROP_REFUSE() } else { g.tint }) << 8) | GHOST_ALPHA,
                             ))
                     }))
                     // What the gesture in flight is about to land on, drawn on
@@ -1275,7 +1275,7 @@ impl Player {
                             .h_full()
                             .left(px(x))
                             .w(px(1.))
-                            .bg(rgb(FG_PRIMARY))
+                            .bg(rgb(FG_PRIMARY()))
                     }))
                     // Last, so it is over the clips: the same fraction in both
                     // lanes, which is the playhead being one line.
@@ -1286,7 +1286,7 @@ impl Player {
                             .h_full()
                             .left(px(filled))
                             .w(px(2.))
-                            .bg(rgb(ACCENT_PLAYHEAD)),
+                            .bg(rgb(ACCENT_PLAYHEAD())),
                     ),
             )
     }
