@@ -1066,10 +1066,25 @@ impl PlaybackSession {
     /// unlike [`remove_source`](Self::remove_source) this does not reseek. Rows
     /// past `idx` move down by one: a caller holding a picked row (the export's
     /// subtitle pick) has to fix it up or drop it. Not an undo step, for the
-    /// reason [`Project::remove_subtitles`] gives -- the inverse is a
-    /// re-import.
+    /// reason [`Project::remove_subtitles`] gives -- and not a loss either: the
+    /// track keeps its cues in
+    /// [`removed_subtitles`](Self::removed_subtitles) and
+    /// [`restore_subtitles`](Self::restore_subtitles) puts it back.
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         self.project.remove_subtitles(idx)
+    }
+
+    /// The tracks removed from this timeline, oldest first: what a front-end
+    /// lists as the way back ([`Project::removed_subtitles`]).
+    pub fn removed_subtitles(&self) -> &[crate::subtitle::SubtitleTrack] {
+        self.project.removed_subtitles()
+    }
+
+    /// Brings the `idx`th removed track back, cues and all, and hands back
+    /// which row it is now ([`Project::restore_subtitles`]). Nothing is read
+    /// off disk: this is the removal undone, not the import repeated.
+    pub fn restore_subtitles(&mut self, idx: usize) -> crate::Result<usize> {
+        self.project.restore_subtitles(idx)
     }
 
     /// Writes the timeline to `path` as a `.edith`, atomically (see

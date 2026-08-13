@@ -333,7 +333,11 @@ impl Player {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let tracks = self.session.as_ref()?.subtitles();
-        if tracks.is_empty() {
+        // The rows a removal left behind: still a section, because a list that
+        // has just been emptied is exactly when the way back has to be on
+        // screen.
+        let gone = self.session.as_ref()?.removed_subtitles();
+        if tracks.is_empty() && gone.is_empty() {
             return None;
         }
         let groups = subtitle_rows(tracks);
@@ -385,7 +389,7 @@ impl Player {
                         // Named, because a × is the same glyph on every row and
                         // the tooltip is what says which track it takes off.
                         let remove_tip: SharedString =
-                            format!("Remove {title} — importing the file again brings it back")
+                            format!("Remove {title} — it drops to the list below, one click back")
                                 .into();
                         div()
                             // The *flat* index into the session's add-order
@@ -537,6 +541,99 @@ impl Player {
                     .children(rows)
             })
             .collect();
+        // What a removal left behind, under the live rows and dimmed: the same
+        // row shape with a `+` where the × was, so the way off the timeline and
+        // the way back on are one thing in one place. The cues are still in
+        // hand (`engine::PlaybackSession::removed_subtitles`), so this is a
+        // click and not a re-read of a 25 GB file.
+        let back = (!gone.is_empty()).then(|| {
+            let rows: Vec<_> = (0..gone.len())
+                .map(|bin| {
+                    let name = sub_pick_name(gone, bin).unwrap_or_else(|| format!("track {bin}"));
+                    let tint = file_tint(self.sources(), &gone[bin].path);
+                    let detail = subtitle_detail(&gone[bin]);
+                    let tip: SharedString =
+                        format!("Bring {name} back — the cues are still here, nothing is re-read")
+                            .into();
+                    let back_tip = tip.clone();
+                    div()
+                        .id(("subtitle-restore", bin))
+                        .flex_none()
+                        .h(px(ROW_H))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .pr(px(6.))
+                        .rounded(px(3.))
+                        .text_color(rgb(FG_SECONDARY()))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                        .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.restore_subtitle_track(bin, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(SWATCH_W))
+                                .h_full()
+                                .rounded(px(2.))
+                                .opacity(0.55)
+                                .when_some(tint, |d, tint| d.bg(rgb(tint))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(div().truncate().text_size(px(11.)).child(name))
+                                .child(div().truncate().text_size(px(10.)).child(detail)),
+                        )
+                        // The × 's own twin: a `HIT_MIN` target at the same
+                        // edge, and it stops the click there for the same
+                        // reason the × does -- the row under it does the same
+                        // thing, and a doubled restore would be a second
+                        // notice about a row that is already back.
+                        .child(
+                            div()
+                                .id(("subtitle-restore-button", bin))
+                                .flex_none()
+                                .w(px(HIT_MIN))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .tooltip(move |_, cx| cx.new(|_| Tip(back_tip.clone())).into())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.restore_subtitle_track(bin, cx);
+                                }))
+                                .child("+"),
+                        )
+                })
+                .collect();
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(SUB_HEAD_H))
+                        .flex()
+                        .items_center()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(rgb(FG_SECONDARY()))
+                        .child("Removed — click to bring one back"),
+                )
+                .children(rows)
+        });
         Some(
             div()
                 .flex_none()
@@ -568,7 +665,8 @@ impl Player {
                         .gap(px(2.))
                         .max_h(px(SUB_ROWS_H))
                         .overflow_y_scroll()
-                        .children(rows),
+                        .children(rows)
+                        .children(back),
                 ),
         )
     }
