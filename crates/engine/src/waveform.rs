@@ -2,9 +2,12 @@
 //! off the same read-only decode path playback uses. Path in, peaks out — no
 //! project model, so a lane rework cannot reach it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+use std::thread;
 
 use crate::AudioSession;
+use crate::audio::AudioChunk;
 
 /// `(min, max)` of every sample in each `1 / buckets_per_sec` window of
 /// `stream` of `path`'s audio, from media time 0 (priming already trimmed by
@@ -23,28 +26,141 @@ use crate::AudioSession;
 /// flat in it, though: chunks are consumed as they arrive and only the buckets
 /// are kept (2 hours at 10/s is 70k pairs).
 ///
-/// ponytail: that 50x is 2.4 minutes of background decode for a two-hour film
-/// before its lane has a waveform. The upgrade path is decoding the source in
-/// segments on several threads — `open_multi_streams` already takes a window per
-/// call — and stitching the buckets, which the fold to one envelope makes safe.
+/// A source long enough for it is decoded in **windows on several threads** and
+/// the buckets stitched, which is what that linear cost is divided by:
+/// `open_multi_streams` takes a window per call and seeks to it, and the fold to
+/// one envelope is what makes the join safe — a bucket two windows straddle is
+/// folded from both, and min/max cannot double-count. A film that cost 23 s of
+/// one core costs about a quarter of that; a clip short enough that the extra
+/// opens would outweigh the decode they save ([`jobs_for`]) is read exactly as
+/// it always was, on this thread.
 pub fn peaks(
     path: impl AsRef<Path>,
     stream: usize,
     buckets_per_sec: u32,
 ) -> crate::Result<Option<Vec<(f32, f32)>>> {
-    let sources = [(path.as_ref().to_path_buf(), stream)];
-    let Some((meta, rx)) =
-        AudioSession::open_multi_streams(&sources, &[(Some(0), 0.0, f64::INFINITY)])?
-    else {
+    peaks_over(path.as_ref(), stream, buckets_per_sec, None)
+}
+
+/// [`peaks`] with the split forced to `jobs` windows, which is how a test asks
+/// for the same envelope by both routes.
+fn peaks_over(
+    path: &Path,
+    stream: usize,
+    buckets_per_sec: u32,
+    jobs: Option<usize>,
+) -> crate::Result<Option<Vec<(f32, f32)>>> {
+    let Some((meta, rx)) = open_window(path, stream, 0.0, f64::INFINITY)? else {
         return Ok(None);
     };
     // Kept fractional: 44100 / 30 is not whole, and rounding it would drift a
     // bucket every few seconds over a long source.
     let per_bucket = f64::from(meta.sample_rate) / f64::from(buckets_per_sec.max(1));
     let channels = (meta.channels as usize).max(1);
-    let mut peaks: Vec<(f32, f32)> = Vec::new();
+    let rate = f64::from(meta.sample_rate.max(1));
+    // A track whose length the container does not state cannot be cut into
+    // windows at all: `secs` is 0 and the whole of it is read on this thread,
+    // exactly as it was before there was a split.
+    let secs = meta.total_samples.unwrap_or(0) as f64 / rate;
+    let jobs = jobs.unwrap_or_else(|| jobs_for(secs)).max(1);
+    if jobs == 1 {
+        return Ok(Some(fold(rx, per_bucket, channels, u64::MAX)));
+    }
+    let window = secs / jobs as f64;
+    // Every other window is spawned before this thread folds its own, so they
+    // all decode side by side; each carries its own error home rather than
+    // taking a worker down.
+    let rest: Vec<_> = (1..jobs)
+        .map(|k| {
+            let path = path.to_path_buf();
+            let start = window * k as f64;
+            // The last window runs to the end of the file: `total_samples` is
+            // the container's word for a length, and a tail past it must still
+            // be drawn.
+            let end = match k + 1 == jobs {
+                true => f64::INFINITY,
+                false => window * (k + 1) as f64,
+            };
+            thread::Builder::new()
+                .name("waveform".into())
+                .spawn(move || -> crate::Result<Vec<(f32, f32)>> {
+                    match open_window(&path, stream, start, end)? {
+                        Some((_, rx)) => Ok(fold(rx, per_bucket, channels, u64::MAX)),
+                        None => Ok(Vec::new()),
+                    }
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    // This window ends where the next one's decoder was told to start, by the
+    // same arithmetic, so the two meet with no gap; the chunk that straddles the
+    // joint is folded into both and min/max does not double-count.
+    let mut peaks = fold(rx, per_bucket, channels, (window * rate) as u64);
+    for handle in rest {
+        let part = handle.join().map_err(|_| "waveform worker panicked")??;
+        merge(&mut peaks, &part);
+    }
+    Ok(Some(peaks))
+}
 
+/// How many threads a source of `secs` is worth splitting across: one below two
+/// minutes of sound, where the extra opens (a Matroska's is a cluster walk) cost
+/// more than the decode they would save, and never more than the machine has —
+/// nor more than a handful, since an import asks this of every source at once.
+///
+/// ponytail: that last clause is a ceiling and not a bound — a library import of
+/// twenty films runs as many of these as the background executor has threads,
+/// each with eight of its own. The upgrade path is one pool the waveforms share,
+/// which is also where a "visible range first" order would live.
+fn jobs_for(secs: f64) -> usize {
+    const PER_JOB_SECS: f64 = 60.0;
+    const CEILING: usize = 8;
+    if !secs.is_finite() || secs < 2.0 * PER_JOB_SECS {
+        return 1;
+    }
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    ((secs / PER_JOB_SECS) as usize).min(cores).min(CEILING).max(1)
+}
+
+/// `part` folded into `peaks` bucket for bucket. Both are indexed absolutely,
+/// so this is a straight min/max: an empty bucket is `(0.0, 0.0)` and every
+/// value is clamped to `[-1.0, 1.0]`, which makes the empty pair the identity.
+fn merge(peaks: &mut Vec<(f32, f32)>, part: &[(f32, f32)]) {
+    if part.len() > peaks.len() {
+        peaks.resize(part.len(), (0.0, 0.0));
+    }
+    for (slot, &(lo, hi)) in peaks.iter_mut().zip(part) {
+        slot.0 = slot.0.min(lo);
+        slot.1 = slot.1.max(hi);
+    }
+}
+
+/// One window of one stream, opened the way playback opens it.
+fn open_window(
+    path: &Path,
+    stream: usize,
+    start_secs: f64,
+    end_secs: f64,
+) -> crate::Result<Option<(crate::AudioMeta, Receiver<AudioChunk>)>> {
+    let sources = [(PathBuf::from(path), stream)];
+    AudioSession::open_multi_streams(&sources, &[(Some(0), start_secs, end_secs)])
+}
+
+/// Min/max per bucket of everything `rx` carries, at absolute bucket positions:
+/// `start_sample` counts from the source's own first audible sample whatever
+/// window the session was opened at. Stops at the first chunk beginning at or
+/// past `stop_sample`, and dropping the receiver there is what stops that
+/// window's decoder.
+fn fold(
+    rx: Receiver<AudioChunk>,
+    per_bucket: f64,
+    channels: usize,
+    stop_sample: u64,
+) -> Vec<(f32, f32)> {
+    let mut peaks: Vec<(f32, f32)> = Vec::new();
     for chunk in rx {
+        if chunk.start_sample >= stop_sample {
+            break;
+        }
         for (frame, values) in chunk.samples.chunks(channels).enumerate() {
             let bucket = ((chunk.start_sample + frame as u64) as f64 / per_bucket) as usize;
             if bucket >= peaks.len() {
@@ -58,14 +174,14 @@ pub fn peaks(
             }
         }
     }
-    Ok(Some(peaks))
+    peaks
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::peaks;
+    use super::{peaks, peaks_over};
 
     const BPS: u32 = 10;
 
@@ -172,6 +288,35 @@ mod tests {
             assert!(
                 (0.02..2.0).contains(&(hi - lo)),
                 "bucket {i} is ({lo}, {hi})"
+            );
+        }
+    }
+
+    /// The split is an optimisation and nothing else: four windows decoded side
+    /// by side draw the very envelope the single-threaded walk draws, bucket for
+    /// bucket. The joints are where a window that started a sample late or
+    /// stopped a chunk early would show, so this is the check that a film's
+    /// waveform is still the film's.
+    #[test]
+    fn a_split_decode_draws_the_same_envelope() {
+        let file = asset("test_av.mp4");
+        let whole = peaks_over(&file, 0, BPS, Some(1))
+            .expect("open")
+            .expect("test_av.mp4 has an audio track");
+        let split = peaks_over(&file, 0, BPS, Some(4))
+            .expect("open")
+            .expect("test_av.mp4 has an audio track");
+        assert_eq!(whole.len(), split.len(), "the split lost or grew buckets");
+        // Not bit-equality: a window seeks into the middle of an AAC stream and
+        // its filterbank is primed from a preceding packet rather than carried
+        // over, so a bucket can land a ten-thousandth away. A lane is drawn a
+        // hundred pixels tall, where that is a thousandth of a pixel; a window
+        // that started late or stopped early is off by whole tenths and is what
+        // this catches.
+        for (i, (w, s)) in whole.iter().zip(&split).enumerate() {
+            assert!(
+                (w.0 - s.0).abs() < 1e-3 && (w.1 - s.1).abs() < 1e-3,
+                "bucket {i}: whole {w:?}, split {s:?}"
             );
         }
     }
