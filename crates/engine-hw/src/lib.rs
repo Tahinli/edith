@@ -727,6 +727,10 @@ fn align16(v: u32) -> u32 {
     v.div_ceil(16) * 16
 }
 
+fn align64(v: u32) -> u32 {
+    v.div_ceil(64) * 64
+}
+
 /// Fills in slice NAL header bytes the driver left at zero.
 ///
 /// Mesa's radeonsi encoder writes `forbidden_zero_bit`, `nal_ref_idc` and
@@ -838,9 +842,17 @@ impl EncSession {
             return None;
         }
         let (display, gbm) = open_devices()?;
+        // A macroblock is 16 wide; an HEVC coding tree block is 64, and that
+        // seat's parameter sets declare the picture at coding-tree size (see the
+        // vendored `h265/predictor.rs`), so the surface has to carry every row
+        // those sets promise.
+        let align = match codec {
+            EncCodec::Hevc => align64,
+            _ => align16,
+        };
         let coded = Resolution {
-            width: align16(width),
-            height: align16(height),
+            width: align(width),
+            height: align(height),
         };
         let framerate = ((fps_num as f64 / fps_den as f64).round() as i64).clamp(1, 240) as u32;
         let profile = match codec {
