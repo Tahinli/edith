@@ -434,7 +434,14 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         let handle = engine::export::start(project.clone(), meta, &out, &settings);
         let t = Instant::now();
         let mut capped = false;
+        // The highest the bar was ever seen at, not wherever it happens to
+        // stand when the clock stops: an export publishes one bar from two
+        // stages, and a capped run's rate is derived from this number. Taking
+        // the maximum over the poll loop means a single unlucky read cannot
+        // under-report the work that was really done.
+        let mut peak = 0.0f64;
         while !handle.is_finished() {
+            peak = peak.max(f64::from(handle.progress()));
             if t.elapsed() >= cap {
                 capped = true;
                 handle.cancel();
@@ -444,7 +451,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         }
         // A cancel is answered at the worker's next checkpoint; the rate is
         // read from the progress at the moment the clock stopped either way.
-        let progress = f64::from(handle.progress());
+        let progress = peak.max(f64::from(handle.progress()));
         let elapsed = t.elapsed().as_secs_f64();
         let done = Instant::now() + Duration::from_secs(60);
         while !handle.is_finished() && Instant::now() < done {
