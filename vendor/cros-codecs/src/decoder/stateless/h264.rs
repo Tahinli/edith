@@ -954,13 +954,16 @@ where
 
         debug!("frame_num gap detected.");
 
-        if !sps.gaps_in_frame_num_value_allowed_flag {
-            return Err(anyhow!(
-                "Invalid frame_num: {}. Assuming unintentional loss of pictures",
-                frame_num
-            ));
-        }
-
+        // LOCAL PATCH (see /Cargo.toml [patch.crates-io]): a gap is filled with
+        // the §8.2.5.2 non-existing frames whatever the flag says, instead of
+        // failing the stream. The flag means "this file has no intentional
+        // gaps", and it is right -- the gap is *ours*: an editor starts decoding
+        // at a random access point in the middle of a film, and the pictures
+        // between the previous reference and it were never decoded. Refusing
+        // here is what made every seek into an open-GOP Blu-ray remux fall back
+        // to a software decoder (17 of 20 in `bench scrub`), and the standing in
+        // frames this loop builds are exactly what the reference lists of the
+        // pictures after the gap look for.
         let mut unused_short_term_frame_num =
             (self.codec.prev_ref_pic_info.frame_num + 1) % sps.max_frame_num();
         while unused_short_term_frame_num != frame_num {
