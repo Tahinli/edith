@@ -47,6 +47,12 @@ fn pump(session: &mut PlaybackSession, last_index: &mut Option<u32>) {
     let target = session.now() * session.meta().frame_rate;
     while let Some(frame) = session.try_frame() {
         if let Some(previous) = *last_index {
+            // One at a time, in order. Every session here is a *pull* consumer
+            // -- `open` leaves `drop_late_pictures` off -- and such a caller is
+            // owed every frame of the range it asked for, which is the contract
+            // an export and the file-level API rest on. Only a session told it
+            // is being watched in real time may skip, and the two tests that
+            // turn that on take their frames through `next_index` instead.
             assert_eq!(
                 frame.index,
                 previous + 1,
@@ -1636,4 +1642,172 @@ fn an_emptied_timeline_plays_black_saves_loads_and_undoes() {
     assert!(!session.is_empty());
     assert!((session.timeline_duration() - whole).abs() < 1e-9);
     assert_eq!(session.clip_spans().len(), 1);
+}
+
+/// The session half of the late-frame policy: a *watched* session still lands
+/// exactly on the frame a seek asked for. The floor the worker drops against is
+/// the playhead mapped back into the file own frames, and a floor even one
+/// frame ahead of the landing would eat the very picture the seek exists to
+/// show ([`PlaybackSession::drop_late_pictures`]).
+#[test]
+fn a_watched_session_still_lands_on_the_frame_a_seek_asked_for() {
+    let mut session = open(asset("test_baseline.mp4"));
+    session.drop_late_pictures(true);
+    let fps = session.meta().frame_rate;
+    session.seek(3.0);
+    assert_eq!(
+        next_index(&mut session, "seek(3.0) on a watched session"),
+        (3.0 * fps) as u32,
+        "the landing frame was dropped as late"
+    );
+    // ...and again backwards: a floor left where the last span ended would drop
+    // every picture of a seek that went back.
+    session.seek(1.0);
+    assert_eq!(
+        next_index(&mut session, "seek(1.0) on a watched session"),
+        (1.0 * fps) as u32
+    );
+}
+
+/// The pixels a *reused* decoder hands back are the pixels a fresh one does.
+/// One session takes three seeks -- forwards, backwards, forwards again -- and
+/// the worker survives all of them (`Worker::reseek`: the file stays open, the
+/// hardware session is repositioned rather than reopened), so a decoder left
+/// holding one span references while another span is asked for would show here
+/// as a smear and nowhere else. The reference is the file-level API, which
+/// opens a decoder of its own per frame.
+#[test]
+fn a_reseek_decodes_the_same_picture_a_fresh_decoder_does() {
+    let path = asset("test_baseline.mp4");
+    let mut session = open(&path);
+    let fps = session.meta().frame_rate;
+    // Small targets on purpose: the fixture's only sync sample is frame 0, so
+    // every one of these decodes from the start of the file and a debug-build
+    // software decoder is what runs the suite.
+    for target in [20u32, 5, 35] {
+        session.seek(f64::from(target) / fps);
+        let frame = next_frame(&mut session, "a seek onto a worker already open");
+        assert_eq!(frame.index, target, "the seek landed elsewhere");
+        assert!(
+            frame.bgra == source_frame(&path, target),
+            "frame {target} off the reused decoder is not the picture a fresh one decodes"
+        );
+    }
+}
+
+/// What the drop policy must never do: thin a picture the decoder was keeping up
+/// with. `pump`'s own contiguity assert covers every *pull* consumer above;
+/// nothing there bounds what a **watched** session delivers, and a one-in-N
+/// regression inside the worker would pass the whole suite otherwise.
+///
+/// The fixture is the smallest one here (320x180) so the question can be asked
+/// on a debug build at the file's own rate -- no retime, because a retimed
+/// timeline legitimately shows only every n-th source frame and the sharp half
+/// of this test is that the indices arrive one at a time. A box too slow even
+/// for this says so and stops: thinning the picture there is the policy working
+/// (`LATE_RUN`), not a regression.
+#[test]
+fn a_watched_session_keeps_every_picture_its_decoder_keeps_up_with() {
+    let path = asset("test_speed_sync.mp4");
+
+    // What this box decodes, flat out, with nothing dropped: frames per second.
+    let mut measure = open(&path);
+    let fps = measure.meta().frame_rate;
+    measure.play();
+    let mut decoded = 0u32;
+    let taken = Instant::now();
+    while taken.elapsed() < Duration::from_millis(500) && !measure.is_eos() {
+        measure.tick();
+        while measure.try_frame().is_some() {
+            decoded += 1;
+        }
+        sleep(Duration::from_millis(2));
+    }
+    let capable = f64::from(decoded) / taken.elapsed().as_secs_f64();
+    drop(measure);
+    eprintln!("this box decodes the fixture at {capable:.1} fps, which plays at {fps:.1}");
+    if capable < fps * 1.2 {
+        eprintln!("SKIP: too slow to ask the question at all");
+        return;
+    }
+
+    // Watched, playing at its own rate, drained like a front-end that keeps up:
+    // every picture is due when it arrives and none of them may be dropped.
+    let mut session = open(&path);
+    session.drop_late_pictures(true);
+    session.play();
+    let mut delivered = 0u32;
+    let mut last: Option<u32> = None;
+    let watched = Instant::now();
+    while watched.elapsed() < Duration::from_millis(500) && !session.is_eos() {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            delivered += 1;
+            if let Some(previous) = last {
+                assert_eq!(
+                    frame.index,
+                    previous + 1,
+                    "a picture was dropped while the decoder was keeping up"
+                );
+            }
+            last = Some(frame.index);
+        }
+        sleep(Duration::from_millis(2));
+    }
+    // Frames the clock went over, which is what the timeline owed the screen.
+    let passed = session.now() * fps;
+    let density = f64::from(delivered) / passed.max(1.0);
+    eprintln!("watched: {delivered} delivered over {passed:.1} frames of clock");
+    assert!(
+        density >= 0.9,
+        "the worker thinned a picture it was keeping up with: {delivered} of \
+         {passed:.1} frames ({density:.2}), decoder measured at {capable:.1} fps"
+    );
+}
+
+/// The decode-ahead a **freshly opened** file gets. Every session opens its first
+/// worker pass-through -- a file just opened *is* the project resolution -- and
+/// asking a pass-through canvas how deep to queue answers 2, the bound this
+/// engine had before there was any decode-ahead: the whole file would then play
+/// at that depth until the first seek built a real canvas. The depth is taken
+/// from the stream instead (`scale::queue_depth`), and this is where that is
+/// visible from outside: a paused session left alone fills its queue, and the
+/// burst that comes off it is the depth plus the picture in the worker's hand.
+///
+/// 720p fixture: ~96 MB of BGRA is 16 pictures at that size (the ceiling), so
+/// the burst is 17 and the regression it guards against is a burst of 3.
+#[test]
+fn a_freshly_opened_file_queues_more_than_two_pictures() {
+    let mut session = open(asset("test_baseline.mp4"));
+    // Paused throughout: no seek, no play, nothing that would build a canvas.
+    // The best of three attempts, because filling the queue is the decoder's own
+    // work and this box shares itself with whatever else is running.
+    let mut burst = 0;
+    for _ in 0..3 {
+        sleep(Duration::from_millis(1500));
+        let mut n = 0;
+        while session.try_frame().is_some() {
+            n += 1;
+        }
+        burst = burst.max(n);
+    }
+    eprintln!("burst off a freshly opened file: {burst} pictures");
+    assert!(
+        burst > 8,
+        "a freshly opened file queued {burst} pictures: the first worker is \
+         still sizing its queue from a pass-through canvas"
+    );
+
+    // ...and the same worker still answers. Four and a half seconds parked is
+    // well past the idle mark at which it closes its hardware session
+    // (`decode`'s `IDLE`), so this is the seek that has to reopen one lazily --
+    // the one path that would have gone quiet if closing it left the worker
+    // holding a decoder it could no longer use.
+    let fps = session.meta().frame_rate;
+    session.seek(2.0);
+    assert_eq!(
+        next_index(&mut session, "a seek after the worker went idle"),
+        (2.0 * fps) as u32,
+        "the worker did not come back from its idle park"
+    );
 }
