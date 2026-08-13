@@ -4863,10 +4863,11 @@ impl Player {
     /// would name a *different* track -- and the pick is what an export writes
     /// into the file.
     ///
-    /// Not an undo step: subtitles are not on the history's snapshots. The way
-    /// back is the row the removal leaves behind under the list
-    /// ([`Player::restore_subtitle_track`]) -- a click, not a re-import -- and
-    /// the notice says so rather than promising a ctrl+z that would do nothing.
+    /// Not an undo step: subtitles are not on the history's snapshots, so the
+    /// way back is putting the file's subtitles on again -- which is a door of
+    /// its own ([`Player::pick_and_add_subtitles`]) and reads the subtitles
+    /// alone, never the media. The notice says that rather than promising a
+    /// ctrl+z that would do nothing.
     fn remove_subtitle_track(&mut self, track: usize, cx: &mut Context<Self>) {
         // The one availability oracle, for the same reason the × on a row and
         // the stroke are one call: an empty list is not a failure, it is an
@@ -4903,46 +4904,13 @@ impl Player {
                 // ponytail: its atlas tile is not released -- `close_session`'s
                 // note, for its reason and with its upgrade path.
                 self.sub_image = None;
-                format!("{name} REMOVED — it is under the list; click it to bring it back")
+                format!(
+                    "{name} REMOVED — {} puts a file's subtitles back on, the file itself stays off",
+                    self.keymap.display(ActionId::AddSubtitleTrack)
+                )
             }
             Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
             None => "NO SUBTITLES REMOVED — open a file first".to_string(),
-        };
-        eprintln!("{text}");
-        self.notify_user(text.into());
-        cx.notify();
-    }
-
-    /// The removed row's own way back: the `+` under the subtitle list, and the
-    /// row itself. The track goes back on the timeline with the cues it was
-    /// removed with ([`engine::PlaybackSession::restore_subtitles`]) -- no file
-    /// is read again, which is the whole complaint this answers.
-    ///
-    /// The restored track becomes the pick and the overlay goes on, for the
-    /// reason a click on a live row does: bringing a subtitle back is asking to
-    /// see it, and a restore that changed nothing on screen would read as a
-    /// dead row.
-    fn restore_subtitle_track(&mut self, removed: usize, cx: &mut Context<Self>) {
-        let name = self
-            .session
-            .as_ref()
-            .and_then(|session| sub_pick_name(session.removed_subtitles(), removed))
-            .unwrap_or_else(|| format!("subtitle track {removed}"));
-        let text = match self
-            .session
-            .as_mut()
-            .map(|session| session.restore_subtitles(removed))
-        {
-            Some(Ok(track)) => {
-                self.sub_track = track;
-                self.subs_on = true;
-                // The drawn cue is keyed by the pick, which has just moved --
-                // `remove_subtitle_track`'s note, for its reason.
-                self.sub_image = None;
-                format!("{name} IS BACK — showing over the picture")
-            }
-            Some(Err(e)) => format!("NOTHING BROUGHT BACK — {e}"),
-            None => "NOTHING BROUGHT BACK — open a file first".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -15525,31 +15493,6 @@ mod tests {
         // The silence `subtitle_track` gives at the same moment.
         assert_eq!(sub_pick_name(&tracks, 5), None);
         assert_eq!(sub_pick_name(&[], 0), None);
-    }
-
-    /// Whatever a removal took off can be put back from the panel, without the
-    /// file being imported again: the removed row and its `+` are things on
-    /// screen, which is what makes the way back an action and not a sentence in
-    /// a notice. The names on those rows come off the same
-    /// [`sub_pick_name`] the live ones do, so a removed track reads as the
-    /// track it was.
-    #[test]
-    fn a_removed_subtitle_row_has_its_way_back_in_the_panel() {
-        let source = ui_source();
-        for id in ["subtitle-restore", "subtitle-restore-button"] {
-            assert!(
-                source.contains(&format!("\"{id}\"")),
-                "{id} is on no row: a removed subtitle would need a re-import"
-            );
-        }
-        // What those rows are named by, off the removed list rather than the
-        // live one -- the bin's own indexes.
-        let gone = [
-            sub("/films/a.mkv", Some(1), "eng"),
-            sub("/subs/late.srt", None, "late.srt"),
-        ];
-        assert_eq!(sub_pick_name(&gone, 0).as_deref(), Some("eng — a"));
-        assert_eq!(sub_pick_name(&gone, 1).as_deref(), Some("late.srt"));
     }
 
     /// The one thing regrouping must not break: `sub_track` is a flat index
