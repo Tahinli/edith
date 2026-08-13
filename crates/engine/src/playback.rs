@@ -1435,6 +1435,22 @@ impl PlaybackSession {
         self.project.remove_lane(lane)
     }
 
+    /// Moves a whole track to display position `to`, clips and all
+    /// ([`Project::move_lane`]), and hands back the handle it answers to
+    /// afterwards -- `None` when nothing moved. One undo step.
+    ///
+    /// A *video* track that moves rebuilds the picture where the playhead
+    /// stands, because display order is the stack and the frame on screen may
+    /// be another lane's from here on; the sound plays on through it, untouched
+    /// -- a mix is a sum, and a lane's gain travelled with it.
+    pub fn move_lane(&mut self, lane: Lane, to: usize) -> Option<Lane> {
+        let moved = self.project.move_lane(lane, to)?;
+        if lane.kind == LaneKind::Video {
+            self.invalidate(Dirty::Picture);
+        }
+        Some(moved)
+    }
+
     /// Splits every lane at `timeline_secs`, so the two sides become two
     /// groups. Metadata only: a split never changes the timeline->source
     /// mapping, so the running decoder stays correct and playback does not
