@@ -617,6 +617,11 @@ struct LibraryMenu {
 struct Picker {
     of: Pick,
     at: Point<Pixels>,
+    /// Which row the keyboard is on, from the value in force when the list
+    /// opened. The list answers ↑↓ and enter as well as a click: a setting whose
+    /// only door is a pointer is a setting half this editor's users cannot
+    /// reach, which is the rule `FIXED` already writes down for every card.
+    sel: usize,
 }
 
 /// Which setting an open list is offering. The fit policy names the clip it is
@@ -634,6 +639,10 @@ enum Pick {
     /// ([`engine::tonemap::Preset`]). Opened from the panel, beside the two
     /// other settings that are the project's rather than the media's.
     Tone,
+    /// Which palette the window is painted in ([`ui::theme`]). The one setting
+    /// here that is nobody's project: it is the person's, so it outlives the
+    /// timeline and every file opened in it.
+    Theme,
 }
 
 /// One value a list offers, carrying everything picking it needs -- so a click
@@ -649,6 +658,7 @@ enum Choice {
     Fit(Lane, usize, FitPolicy),
     AudioRate(u32),
     Tone(Preset),
+    Theme(ui::theme::PaletteId),
 }
 
 /// One row of an open list: the value, its name, the small print beside it, and
@@ -1743,6 +1753,10 @@ impl Player {
             ActionId::Mix => self.open_mix(None, cx),
             ActionId::ToggleSnap => self.toggle_snap(cx),
             ActionId::ToggleSubtitles => self.toggle_subtitles(cx),
+            // The keyboard's door to the same list the toolbar button opens.
+            // At the window's corner, since a stroke names no place -- and
+            // [`menu_at`] keeps it on screen from there.
+            ActionId::Theme => self.open_picker(Pick::Theme, Point::default(), cx),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
@@ -2135,9 +2149,16 @@ impl Player {
     /// thing at a time: the click that opens it is the click that closes
     /// whatever menu it was opened from.
     fn open_picker(&mut self, of: Pick, at: Point<Pixels>, cx: &mut Context<Self>) {
+        // On the row that is in force, so the first ↑ or ↓ steps off the
+        // current value rather than off the top of the list.
+        let sel = self
+            .choices(of)
+            .iter()
+            .position(|(.., picked)| *picked)
+            .unwrap_or(0);
         self.context_menu = None;
         self.library_menu = None;
-        self.picker = Some(Picker { of, at });
+        self.picker = Some(Picker { of, at, sel });
         cx.notify();
     }
 
@@ -2151,6 +2172,21 @@ impl Player {
             Choice::Fps(fps) => self.apply_frame_rate(fps, cx),
             Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
             Choice::Tone(preset) => self.apply_tone(preset, cx),
+            // In force for the next paint -- every token is read through
+            // [`ui::theme::palette`], so one store repaints the whole window --
+            // and kept for the next launch. A file that could not be written is
+            // said out loud: the difference between "picked" and "picked for
+            // good" is the user's to know.
+            Choice::Theme(id) => {
+                ui::theme::set(id);
+                if let Err(e) = ui::theme::save(id) {
+                    let path = ui::theme::config_path();
+                    self.notify_user(
+                        format!("THEME COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+                    );
+                }
+                cx.notify();
+            }
             // The same field the row's key steps, set outright: a list picks a
             // value, it does not step to one.
             Choice::AudioRate(kbps) => {
@@ -2164,6 +2200,22 @@ impl Player {
     /// without a timeline, which is the state where nothing here has a value to
     /// offer -- and where the surfaces that open the list are dimmed anyway.
     fn choices(&self, of: Pick) -> Vec<ChoiceRow> {
+        // The palette is not the project's, so it is offered before the
+        // timeline is asked about: an empty window is painted too, and its
+        // Theme button is live there like the snap beside it.
+        if of == Pick::Theme {
+            return ui::theme::PaletteId::ALL
+                .into_iter()
+                .map(|id| {
+                    (
+                        Choice::Theme(id),
+                        id.label().into(),
+                        id.detail().into(),
+                        id == ui::theme::active(),
+                    )
+                })
+                .collect();
+        }
         let Some(session) = &self.session else {
             return Vec::new();
         };
@@ -2177,6 +2229,8 @@ impl Player {
             }
             Pick::AudioRate => audio_rate_choices(self.audio_kbps),
             Pick::Tone => tone_choices(session.tone()),
+            // Answered above, with or without a timeline.
+            Pick::Theme => Vec::new(),
         }
     }
 
@@ -3766,7 +3820,7 @@ impl Player {
                 .map_or(0, |session| session.file_frames(path)),
             // A path with no source entry has no colour of its own, and the
             // shadow wears the lane's own instead of borrowing another file's.
-            tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED),
+            tint: file_tint(self.sources(), path).unwrap_or(BG_RAISED()),
             refused: lane_refuses(path, to).is_some(),
         };
         self.set_ghost(Some(ghost), cx);
@@ -4809,9 +4863,10 @@ impl Player {
     /// would name a *different* track -- and the pick is what an export writes
     /// into the file.
     ///
-    /// Not an undo step: subtitles are not on the history's snapshots, so the
-    /// way back is importing the file again. The notice says that rather than
-    /// promising a ctrl+z that would do nothing.
+    /// Not an undo step: subtitles are not on the history's snapshots. The way
+    /// back is the row the removal leaves behind under the list
+    /// ([`Player::restore_subtitle_track`]) -- a click, not a re-import -- and
+    /// the notice says so rather than promising a ctrl+z that would do nothing.
     fn remove_subtitle_track(&mut self, track: usize, cx: &mut Context<Self>) {
         // The one availability oracle, for the same reason the × on a row and
         // the stroke are one call: an empty list is not a failure, it is an
@@ -4848,10 +4903,46 @@ impl Player {
                 // ponytail: its atlas tile is not released -- `close_session`'s
                 // note, for its reason and with its upgrade path.
                 self.sub_image = None;
-                format!("{name} REMOVED — importing the file again brings it back")
+                format!("{name} REMOVED — it is under the list; click it to bring it back")
             }
             Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
             None => "NO SUBTITLES REMOVED — open a file first".to_string(),
+        };
+        eprintln!("{text}");
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// The removed row's own way back: the `+` under the subtitle list, and the
+    /// row itself. The track goes back on the timeline with the cues it was
+    /// removed with ([`engine::PlaybackSession::restore_subtitles`]) -- no file
+    /// is read again, which is the whole complaint this answers.
+    ///
+    /// The restored track becomes the pick and the overlay goes on, for the
+    /// reason a click on a live row does: bringing a subtitle back is asking to
+    /// see it, and a restore that changed nothing on screen would read as a
+    /// dead row.
+    fn restore_subtitle_track(&mut self, removed: usize, cx: &mut Context<Self>) {
+        let name = self
+            .session
+            .as_ref()
+            .and_then(|session| sub_pick_name(session.removed_subtitles(), removed))
+            .unwrap_or_else(|| format!("subtitle track {removed}"));
+        let text = match self
+            .session
+            .as_mut()
+            .map(|session| session.restore_subtitles(removed))
+        {
+            Some(Ok(track)) => {
+                self.sub_track = track;
+                self.subs_on = true;
+                // The drawn cue is keyed by the pick, which has just moved --
+                // `remove_subtitle_track`'s note, for its reason.
+                self.sub_image = None;
+                format!("{name} IS BACK — showing over the picture")
+            }
+            Some(Err(e)) => format!("NOTHING BROUGHT BACK — {e}"),
+            None => "NOTHING BROUGHT BACK — open a file first".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
@@ -5983,6 +6074,28 @@ impl Render for Player {
                 // stroke exactly as the clip menu does.
                 // A choice list goes the same way and for the same reason: it
                 // names a clip index too, and escape is the way out of it.
+                // An open list is the innermost thing on screen, so it takes
+                // the keys before anything under it does: ↑↓ walk it, enter
+                // takes the row, and escape falls through to the close below --
+                // the same three strokes every list in this editor answers.
+                if let Some(mut picker) = this.picker {
+                    let rows = this.choices(picker.of);
+                    if !rows.is_empty() && matches!(key, "up" | "down" | "enter") {
+                        match key {
+                            "down" => picker.sel = (picker.sel + 1) % rows.len(),
+                            "up" => picker.sel = (picker.sel + rows.len() - 1) % rows.len(),
+                            _ => {
+                                let (choice, ..) = rows[picker.sel.min(rows.len() - 1)];
+                                this.choose(choice, cx);
+                                cx.notify();
+                                return;
+                            }
+                        }
+                        this.picker = Some(picker);
+                        cx.notify();
+                        return;
+                    }
+                }
                 let clip_menu = this.context_menu.take().is_some();
                 let row_menu = this.library_menu.take().is_some();
                 let list = this.picker.take().is_some();
@@ -6054,8 +6167,8 @@ impl Render for Player {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG_CANVAS))
-            .text_color(rgb(FG_PRIMARY))
+            .bg(rgb(BG_CANVAS()))
+            .text_color(rgb(FG_PRIMARY()))
             .text_size(px(12.))
             // Four regions, the arrangement every consumer editor shares:
             // library left, picture centre, inspector right, and the timeline
@@ -6093,7 +6206,7 @@ impl Render for Player {
                                     .flex()
                                     .justify_center()
                                     .items_center()
-                                    .bg(rgb(BG_CANVAS))
+                                    .bg(rgb(BG_CANVAS()))
                                     .children(
                                         self.image
                                             .clone()
@@ -7133,6 +7246,12 @@ fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // window has no clips and still has keys -- so this answers ahead of the
     // timeline question, and only an export shuts it (a waiting row would
     // swallow the escape the progress line promises cancels the export).
+    // The window's own colours: there is always a window, and repainting it
+    // touches no timeline -- so this one is live even while an export is
+    // reading one, which is the only state that dims the list above.
+    if action == ActionId::Theme {
+        return Enable::Yes;
+    }
     if action == ActionId::ShowActions {
         return match ctx.exporting {
             true => Enable::No("an export is running"),
@@ -7734,7 +7853,7 @@ fn window_title(name: &str) -> String {
 /// palette two sources share a colour, which is a smaller lie than a fifth tint
 /// bright enough to leave the family.
 fn source_tint(source: usize) -> u32 {
-    SOURCE_TINTS[source % SOURCE_TINTS.len()]
+    SOURCE_TINTS()[source % SOURCE_TINTS().len()]
 }
 
 /// The tint of a *file*, which is what a library row is named by: the first
@@ -9368,7 +9487,7 @@ fn hist_curves(bins: [[u32; HIST_BINS]; 3]) -> impl IntoElement {
                     }
                 }
                 if let Ok(path) = path.build() {
-                    window.paint_path(path, rgb(HIST_INK[channel]));
+                    window.paint_path(path, rgb(HIST_INK()[channel]));
                 }
             }
         },
@@ -9494,7 +9613,7 @@ fn eq_spectrum_curve(levels: Vec<f32>) -> impl IntoElement {
             path.line_to(point(o.x + s.width, o.y + s.height));
             path.close();
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgba(EQ_SPECTRUM_INK));
+                window.paint_path(path, rgba(EQ_SPECTRUM_INK()));
             }
         },
     )
@@ -9547,7 +9666,7 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
                     }
                 }
                 if let Ok(bell) = bell.build() {
-                    window.paint_path(bell, rgba(EQ_BELL_INK));
+                    window.paint_path(bell, rgba(EQ_BELL_INK()));
                 }
             }
             let points = line(&params);
@@ -9562,7 +9681,7 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
             area.line_to(point(o.x + s.width, o.y + s.height / 2.));
             area.close();
             if let Ok(area) = area.build() {
-                window.paint_path(area, rgba(EQ_FILL_INK));
+                window.paint_path(area, rgba(EQ_FILL_INK()));
             }
             let mut path = PathBuilder::stroke(px(2.));
             for (step, at) in points.into_iter().enumerate() {
@@ -9572,7 +9691,7 @@ fn eq_curve(params: EqParams, sample_rate: u32) -> impl IntoElement {
                 }
             }
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(ACCENT_PRIMARY));
+                window.paint_path(path, rgb(ACCENT_PRIMARY()));
             }
         },
     )
@@ -9975,7 +10094,7 @@ mod tests {
         // function -- what makes the panel and the lanes one association.
         for row in 0..rows.len() {
             assert_eq!(rows[row].tint, row);
-            assert_eq!(source_tint(row), SOURCE_TINTS[row % SOURCE_TINTS.len()]);
+            assert_eq!(source_tint(row), SOURCE_TINTS()[row % SOURCE_TINTS().len()]);
         }
     }
 
@@ -10451,9 +10570,14 @@ mod tests {
         };
         assert!(whole(ActionId::CancelExport, busy).yes());
         for action in ActionId::ALL {
+            // Nothing may touch the edit list while an export is reading it --
+            // and the palette does not: it repaints this window and writes one
+            // word to the user's own config file, which is why it is the one
+            // action besides the cancel that stays live here.
+            let allowed = action == ActionId::CancelExport || action == ActionId::Theme;
             assert_eq!(
                 whole(action, busy).yes(),
-                action == ActionId::CancelExport,
+                allowed,
                 "{action:?} while an export reads the edit list"
             );
         }
@@ -13466,21 +13590,27 @@ mod tests {
         // in its column -- is body text on `BG_RAISED` and WCAG 1.4.3 binds it.
         // A dimmed row is drawn in this ink rather than at an opacity, which is
         // what a refusal used to be readable through.
-        assert!(
-            contrast(FG_SECONDARY, BG_RAISED) >= 4.5,
-            "refusal ink {:.2}",
-            contrast(FG_SECONDARY, BG_RAISED)
-        );
+        // Every palette, not the one in force: a family is picked at runtime
+        // now (`ui::theme`), so a floor met by one of them and missed by the
+        // other is a window somebody is looking at.
+        for id in crate::ui::theme::PaletteId::ALL {
+            let p = id.palette();
+            assert!(
+                contrast(p.FG_SECONDARY, p.BG_RAISED) >= 4.5,
+                "{id:?}: refusal ink {:.2}",
+                contrast(p.FG_SECONDARY, p.BG_RAISED)
+            );
         // ...and on the picked row, where the highlight is the accent at
         // surface brightness. Both inks clear 4.5:1 on it now -- the row still
         // lifts its key and detail to `FG_PRIMARY`, as emphasis rather than as
         // the rescue it used to be.
-        assert!(contrast(FG_PRIMARY, BG_SELECTED) >= 4.5);
-        assert!(
-            contrast(FG_SECONDARY, BG_SELECTED) >= 4.5,
-            "refusal ink on the picked row {:.2}",
-            contrast(FG_SECONDARY, BG_SELECTED)
-        );
+            assert!(contrast(p.FG_PRIMARY, p.BG_SELECTED) >= 4.5, "{id:?}");
+            assert!(
+                contrast(p.FG_SECONDARY, p.BG_SELECTED) >= 4.5,
+                "{id:?}: refusal ink on the picked row {:.2}",
+                contrast(p.FG_SECONDARY, p.BG_SELECTED)
+            );
+        }
     }
 
     /// The progress line's two clocks, driven the way a repaint drives them:
@@ -14347,7 +14477,9 @@ mod tests {
         assert!(SUB_LINE_H >= SUB_TEXT);
         // White on the plate, not chrome on chrome: a cue is read against the
         // film, and this is the one pair here that has to survive any picture.
-        assert!(contrast(SUB_FG, 0x000000) >= 7.);
+        for id in crate::ui::theme::PaletteId::ALL {
+            assert!(contrast(id.palette().SUB_FG, 0x000000) >= 7., "{id:?}");
+        }
         // The strip is a picture and not a target -- nothing on it takes a
         // click -- which is the only reason it may be under `HIT_MIN`.
         assert!(SUB_LANE_H < HIT_MIN && SUB_LANE_H > 0.);
@@ -14711,10 +14843,10 @@ mod tests {
     /// the tone cannot disagree with the sentence it labels.
     #[test]
     fn a_message_wears_the_colour_its_own_words_say() {
-        assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR);
-        assert_eq!(notice_tone(&format!("{EXPORT_DONE}out.mp4")), STATUS_SUCCESS);
-        assert_eq!(notice_tone("NOTHING DETACHED — not grouped"), STATUS_WARNING);
-        assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY);
+        assert_eq!(notice_tone("SCAN FAILED: no audio"), STATUS_ERROR());
+        assert_eq!(notice_tone(&format!("{EXPORT_DONE}out.mp4")), STATUS_SUCCESS());
+        assert_eq!(notice_tone("NOTHING DETACHED — not grouped"), STATUS_WARNING());
+        assert_eq!(notice_tone("SNAP ON"), ACCENT_PRIMARY());
     }
 
     /// The cards are sections of the inspector, not sheets over the timeline:
@@ -15115,37 +15247,36 @@ mod tests {
         // ([`clip_kind`]); the source tint is the border and the library
         // swatch, and is measured for telling itself apart rather than for
         // carrying text.
-        for (i, tint) in [
-            crate::ui::theme::CLIP_VIDEO,
-            crate::ui::theme::CLIP_AUDIO,
-            crate::ui::theme::CLIP_IMAGE,
-            crate::ui::theme::CLIP_TEXT,
-        ]
-            .iter()
-            .enumerate()
-        {
-            // WCAG 1.4.3: the clip's name is body text on its tint.
-            assert!(
-                contrast(FG_PRIMARY, *tint) >= 4.5,
-                "source {i}: label contrast {:.2}",
-                contrast(FG_PRIMARY, *tint)
-            );
-            // WCAG 1.4.11: the waveform is a non-text graphic on it.
-            assert!(
-                contrast(FG_SECONDARY, *tint) >= 3.,
-                "source {i}: waveform contrast {:.2}",
-                contrast(FG_SECONDARY, *tint)
-            );
+        // Every palette a person can pick, not merely the one in force.
+        for id in crate::ui::theme::PaletteId::ALL {
+            let p = id.palette();
+            for (i, tint) in [p.CLIP_VIDEO, p.CLIP_AUDIO, p.CLIP_IMAGE, p.CLIP_TEXT]
+                .iter()
+                .enumerate()
+            {
+                // WCAG 1.4.3: the clip's name is body text on its tint.
+                assert!(
+                    contrast(p.FG_PRIMARY, *tint) >= 4.5,
+                    "{id:?} source {i}: label contrast {:.2}",
+                    contrast(p.FG_PRIMARY, *tint)
+                );
+                // WCAG 1.4.11: the waveform is a non-text graphic on it.
+                assert!(
+                    contrast(p.FG_SECONDARY, *tint) >= 3.,
+                    "{id:?} source {i}: waveform contrast {:.2}",
+                    contrast(p.FG_SECONDARY, *tint)
+                );
+            }
+            // A selected clip's bed is the same two marks on a different colour.
+            assert!(contrast(p.FG_PRIMARY, p.BG_SELECTED) >= 4.5, "{id:?}");
+            assert!(contrast(p.FG_SECONDARY, p.BG_SELECTED) >= 3., "{id:?}");
+            // The bed a gap shows through has to read as a hole in the lane --
+            // the clip is the object, the bed is the hole -- and the playhead
+            // has to be findable on both.
+            assert!(contrast(p.CLIP_VIDEO, p.BG_TIMELINE) >= 1.5, "{id:?}");
+            assert!(contrast(p.ACCENT_PLAYHEAD, p.BG_TIMELINE) >= 3., "{id:?}");
+            assert!(contrast(p.ACCENT_PLAYHEAD, p.CLIP_VIDEO) >= 3., "{id:?}");
         }
-        // A selected clip's bed is the same two marks on a different colour.
-        assert!(contrast(FG_PRIMARY, BG_SELECTED) >= 4.5);
-        assert!(contrast(FG_SECONDARY, BG_SELECTED) >= 3.);
-        // The bed a gap shows through has to read as a hole in the lane -- the
-        // clip is the object, the bed is the hole -- and the playhead has to be
-        // findable on both.
-        assert!(contrast(crate::ui::theme::CLIP_VIDEO, crate::ui::theme::BG_TIMELINE) >= 1.5);
-        assert!(contrast(crate::ui::theme::ACCENT_PLAYHEAD, crate::ui::theme::BG_TIMELINE) >= 3.);
-        assert!(contrast(crate::ui::theme::ACCENT_PLAYHEAD, crate::ui::theme::CLIP_VIDEO) >= 3.);
         // The sanity check on the ratio itself: black on white is 21:1.
         assert!((contrast(0xffffff, 0x000000) - 21.).abs() < 0.01);
     }
@@ -15155,7 +15286,7 @@ mod tests {
         // The bug: the first entry *was* `BG_RAISED`, so the first file imported
         // -- the one every session has -- wore the panel's own background and
         // had no visible swatch at all.
-        assert_ne!(source_tint(0), BG_RAISED);
+        assert_ne!(source_tint(0), BG_RAISED());
         // Neighbouring sources must not share one, or an import is invisible.
         assert_ne!(source_tint(0), source_tint(1));
         assert_ne!(source_tint(1), source_tint(2));
@@ -15163,7 +15294,7 @@ mod tests {
         // Past the palette it wraps -- never an index panic.
         assert_eq!(source_tint(4), source_tint(0));
         assert_eq!(source_tint(9), source_tint(1));
-        assert_eq!(source_tint(usize::MAX), SOURCE_TINTS[usize::MAX % 4]);
+        assert_eq!(source_tint(usize::MAX), SOURCE_TINTS()[usize::MAX % 4]);
     }
 
     /// Not "they are different numbers" -- different *enough to see*, against
@@ -15182,13 +15313,13 @@ mod tests {
                 })
                 .sum::<u32>()
         };
-        for (i, &tint) in SOURCE_TINTS.iter().enumerate() {
+        for (i, &tint) in SOURCE_TINTS().iter().enumerate() {
             assert!(
-                apart(tint, BG_RAISED) >= 16,
+                apart(tint, BG_RAISED()) >= 16,
                 "tint {i} is {} from the panel it sits on",
-                apart(tint, BG_RAISED)
+                apart(tint, BG_RAISED())
             );
-            for (j, &other) in SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+            for (j, &other) in SOURCE_TINTS().iter().enumerate().skip(i + 1) {
                 assert!(
                     apart(tint, other) >= 16,
                     "tints {i} and {j} are only {} apart",
@@ -15198,7 +15329,7 @@ mod tests {
         }
         // The two a person sees side by side first must be further apart than
         // the floor: source 0 and source 1 are the first import and the second.
-        assert!(apart(SOURCE_TINTS[0], SOURCE_TINTS[1]) >= 32);
+        assert!(apart(SOURCE_TINTS()[0], SOURCE_TINTS()[1]) >= 32);
     }
 
     /// A `.srt` dropped on the window is nobody's stream: it has no source
@@ -15394,6 +15525,31 @@ mod tests {
         // The silence `subtitle_track` gives at the same moment.
         assert_eq!(sub_pick_name(&tracks, 5), None);
         assert_eq!(sub_pick_name(&[], 0), None);
+    }
+
+    /// Whatever a removal took off can be put back from the panel, without the
+    /// file being imported again: the removed row and its `+` are things on
+    /// screen, which is what makes the way back an action and not a sentence in
+    /// a notice. The names on those rows come off the same
+    /// [`sub_pick_name`] the live ones do, so a removed track reads as the
+    /// track it was.
+    #[test]
+    fn a_removed_subtitle_row_has_its_way_back_in_the_panel() {
+        let source = ui_source();
+        for id in ["subtitle-restore", "subtitle-restore-button"] {
+            assert!(
+                source.contains(&format!("\"{id}\"")),
+                "{id} is on no row: a removed subtitle would need a re-import"
+            );
+        }
+        // What those rows are named by, off the removed list rather than the
+        // live one -- the bin's own indexes.
+        let gone = [
+            sub("/films/a.mkv", Some(1), "eng"),
+            sub("/subs/late.srt", None, "late.srt"),
+        ];
+        assert_eq!(sub_pick_name(&gone, 0).as_deref(), Some("eng — a"));
+        assert_eq!(sub_pick_name(&gone, 1).as_deref(), Some("late.srt"));
     }
 
     /// The one thing regrouping must not break: `sub_track` is a flat index
@@ -15661,6 +15817,11 @@ fn main() {
     if let Some(text) = &notice {
         eprintln!("{text}");
     }
+    // The palette the last session picked, before the first paint: a window that
+    // opened cool and turned warm a frame later would be the theme announcing
+    // itself. Silent on a missing or unreadable file -- the default is a whole
+    // answer, and nothing of the user's is lost by it.
+    ui::theme::load();
     // Nothing named on the command line is read here. The first file makes the
     // timeline -- a `.edith` restores a whole one, anything else *is* one --
     // and the rest are imports like any other: rows in the library, dragged

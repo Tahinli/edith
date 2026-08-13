@@ -55,9 +55,9 @@ impl Player {
         // an inapplicable item in the clip menu is: it still says its piece.
         let live = |d: Stateful<Div>, enabled: bool| {
             d.when(!enabled, |d| {
-                d.cursor_not_allowed().text_color(rgb(FG_SECONDARY))
+                d.cursor_not_allowed().text_color(rgb(FG_SECONDARY()))
             })
-            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER))))
+            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER()))))
         };
         // A row as this card writes them: the mark saying which one is picked,
         // the key that picks it, its name, and what the choice means. The mark
@@ -74,11 +74,11 @@ impl Player {
             // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
             // 1.4.3, and the fit test pins both numbers).
             let ink = match picked {
-                true => FG_PRIMARY,
-                false => FG_SECONDARY,
+                true => FG_PRIMARY(),
+                false => FG_SECONDARY(),
             };
             live(row(id), enabled)
-                .when(picked, |d| d.bg(rgb(BG_SELECTED)))
+                .when(picked, |d| d.bg(rgb(BG_SELECTED())))
                 .child(
                     div()
                         .flex()
@@ -116,7 +116,7 @@ impl Player {
                 .px(px(6.))
                 .pt(px(4.))
                 .text_size(px(10.))
-                .text_color(rgb(FG_SECONDARY))
+                .text_color(rgb(FG_SECONDARY()))
                 .child(text)
                 .into_any_element()
         };
@@ -366,7 +366,7 @@ impl Player {
                     .px(px(6.))
                     .py(px(2.))
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(format!("cannot write: {}", refusals.join(" · ")))
                     .into_any_element(),
             );
@@ -386,7 +386,7 @@ impl Player {
                 .px(px(6.))
                 .py(px(2.))
                 .text_size(px(11.))
-                .text_color(rgb(FG_SECONDARY))
+                .text_color(rgb(FG_SECONDARY()))
                 .child(text)
                 .into_any_element()
         };
@@ -450,7 +450,7 @@ impl Player {
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -469,7 +469,7 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(div().flex_none().px(px(6.)).child("Export"))
                         // The status line, where a refusal from the save dialog
                         // lands: the notice bar it would otherwise take is under
@@ -481,7 +481,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(match (&self.mbps_edit, self.notices.front()) {
                                     // A field being typed into says so here as
                                     // well as in its row: this line is outside
@@ -519,7 +519,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(tail),
                         )
                         .child(
@@ -532,11 +532,11 @@ impl Player {
                                 .justify_center()
                                 .rounded(px(3.))
                                 .bg(rgb(match blocked.is_some() {
-                                    true => BG_PANEL,
-                                    false => BG_SELECTED,
+                                    true => BG_PANEL(),
+                                    false => BG_SELECTED(),
                                 }))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                 .on_click(
                                     cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.start_export(cx)
@@ -562,9 +562,9 @@ impl Player {
                 .items_center()
                 .justify_center()
                 .rounded(px(3.))
-                .bg(rgb(BG_PANEL))
+                .bg(rgb(BG_PANEL()))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(|s| s.bg(rgb(BG_HOVER())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.nudge_mbps(by);
                     cx.notify();
@@ -637,8 +637,8 @@ impl Player {
                     .h(px(EQ_HANDLE))
                     .rounded(px(EQ_HANDLE / 2.))
                     .bg(rgb(match i == self.eq_band {
-                        true => ACCENT_PRIMARY,
-                        false => FG_SECONDARY,
+                        true => ACCENT_PRIMARY(),
+                        false => FG_SECONDARY(),
                     }))
             })
             .collect();
@@ -651,7 +651,7 @@ impl Player {
             .flex_none()
             .h(px(EQ_GRAPH_H))
             .rounded(px(3.))
-            .bg(rgb(BG_HOVER_DIM))
+            .bg(rgb(BG_HOVER_DIM()))
             .cursor_pointer()
             // The press picks the band under it *and* is already the first
             // sample of the drag, so a plain click sets a value. A second click
@@ -686,7 +686,7 @@ impl Player {
                             .left(relative(eq_x(*freq)))
                             .w(px(1.))
                             .h_full()
-                            .bg(rgb(EQ_GRID))
+                            .bg(rgb(EQ_GRID()))
                     })
                     .collect::<Vec<_>>(),
             )
@@ -698,14 +698,14 @@ impl Player {
                     .top(relative(eq_y(db)))
                     .w_full()
                     .h(px(1.))
-                    .bg(rgb(EQ_GRID))
+                    .bg(rgb(EQ_GRID()))
                     .child(
                         div()
                             .absolute()
                             .left(px(4.))
                             .top(px(-11.))
                             .text_size(px(9.))
-                            .text_color(rgb(FG_SECONDARY))
+                            .text_color(rgb(FG_SECONDARY()))
                             .child(format!("{db:+.0}")),
                     )
             }))
@@ -716,7 +716,7 @@ impl Player {
                     .top(relative(0.5))
                     .w_full()
                     .h(px(1.))
-                    .bg(rgb(BG_HOVER)),
+                    .bg(rgb(BG_HOVER())),
             )
             .child(eq_curve(self.eq_params.clone(), sample_rate))
             .children(handles)
@@ -731,7 +731,7 @@ impl Player {
                     .w(px(24.))
                     .text_align(TextAlign::Center)
                     .text_size(px(9.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(label)
             }))
             .child(
@@ -740,7 +740,7 @@ impl Player {
                     .top(px(2.))
                     .left(px(4.))
                     .text_size(px(9.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
         // The bottom of the axis is not named: -12 dB would land in the same
@@ -761,7 +761,7 @@ impl Player {
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -793,7 +793,7 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(
                             div()
                                 .id("eq-card-rows")
@@ -818,7 +818,7 @@ impl Player {
                                         .flex_none()
                                         .px(px(6.))
                                         .text_size(px(11.))
-                                        .text_color(rgb(FG_SECONDARY))
+                                        .text_color(rgb(FG_SECONDARY()))
                                         .child(self.notices.front().cloned().unwrap_or_else(|| {
                                             "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
                                         })),
@@ -850,9 +850,9 @@ impl Player {
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded(px(3.))
-                                                .bg(rgb(BG_SELECTED))
+                                                .bg(rgb(BG_SELECTED()))
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     for band in &mut this.eq_params.bands {
                                                         band.gain_db = 0.;
@@ -874,9 +874,9 @@ impl Player {
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded(px(3.))
-                                                .bg(rgb(BG_PANEL))
+                                                .bg(rgb(BG_PANEL()))
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     this.add_band(cx)
                                                 }))
@@ -891,9 +891,9 @@ impl Player {
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded(px(3.))
-                                                .bg(rgb(BG_PANEL))
+                                                .bg(rgb(BG_PANEL()))
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     this.remove_band(cx)
                                                 }))
@@ -913,11 +913,11 @@ impl Player {
                                                 .justify_center()
                                                 .rounded(px(3.))
                                                 .bg(rgb(match self.eq_spectrum {
-                                                    true => BG_SELECTED,
-                                                    false => BG_HOVER_DIM,
+                                                    true => BG_SELECTED(),
+                                                    false => BG_HOVER_DIM(),
                                                 }))
                                                 .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     this.eq_spectrum = !this.eq_spectrum;
                                                     cx.notify();
@@ -943,8 +943,8 @@ impl Player {
                                     .px(px(6.))
                                     .text_size(px(10.))
                                     .text_color(rgb(match below > 1. {
-                                        true => ACCENT_PRIMARY,
-                                        false => FG_SECONDARY,
+                                        true => ACCENT_PRIMARY(),
+                                        false => FG_SECONDARY(),
                                     }))
                                     .child(match below > 1. {
                                         true => "more below — scroll the card",
@@ -988,9 +988,9 @@ impl Player {
                 .items_center()
                 .justify_center()
                 .rounded(px(3.))
-                .bg(rgb(BG_PANEL))
+                .bg(rgb(BG_PANEL()))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(|s| s.bg(rgb(BG_HOVER())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.nudge_band(change, cx)
                 }))
@@ -1045,9 +1045,9 @@ impl Player {
                 .px(px(8.))
                 .items_center()
                 .rounded(px(3.))
-                .bg(rgb(BG_PANEL))
+                .bg(rgb(BG_PANEL()))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(|s| s.bg(rgb(BG_HOVER())))
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.nudge_band(|b| b.gain_db = 0., cx)
@@ -1088,8 +1088,8 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .cursor_pointer()
-                    .when(picked, |d| d.bg(rgb(BG_SELECTED)))
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.color_band = i;
                         cx.notify();
@@ -1124,13 +1124,13 @@ impl Player {
                                     .w_full()
                                     .h(px(4.))
                                     .rounded(px(2.))
-                                    .bg(rgb(BG_PANEL))
+                                    .bg(rgb(BG_PANEL()))
                                     .child(
                                         div()
                                             .h_full()
                                             .w(relative(frac))
                                             .rounded(px(2.))
-                                            .bg(rgb(ACCENT_PRIMARY)),
+                                            .bg(rgb(ACCENT_PRIMARY())),
                                     ),
                             ),
                     )
@@ -1138,7 +1138,7 @@ impl Player {
                         div()
                             .w(px(44.))
                             .text_size(px(11.))
-                            .text_color(rgb(FG_SECONDARY))
+                            .text_color(rgb(FG_SECONDARY()))
                             .child(format!("{value:.2}")),
                     )
             })
@@ -1148,7 +1148,7 @@ impl Player {
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1168,7 +1168,7 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(div().flex_none().px(px(6.)).child(format!(
                             "Colour — {} clip {}",
                             lane.label(),
@@ -1179,7 +1179,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(
                                     "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — a click away or esc closes",
                                 ),
@@ -1193,7 +1193,7 @@ impl Player {
                                 .flex_none()
                                 .h(px(HIST_H))
                                 .rounded(px(3.))
-                                .bg(rgb(BG_HOVER_DIM))
+                                .bg(rgb(BG_HOVER_DIM()))
                                 .relative()
                                 .child(hist_curves(self.histogram)),
                         )
@@ -1207,9 +1207,9 @@ impl Player {
                                 .items_center()
                                 .justify_center()
                                 .rounded(px(3.))
-                                .bg(rgb(BG_SELECTED))
+                                .bg(rgb(BG_SELECTED()))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.set_color(ColorParams::default(), cx);
                                 }))
@@ -1249,11 +1249,11 @@ impl Player {
                     .justify_center()
                     .rounded(px(3.))
                     .bg(rgb(match at == speed {
-                        true => BG_SELECTED,
-                        false => BG_PANEL,
+                        true => BG_SELECTED(),
+                        false => BG_PANEL(),
                     }))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.set_speed(at, cx);
                     }))
@@ -1265,7 +1265,7 @@ impl Player {
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1285,7 +1285,7 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(div().flex_none().px(px(6.)).child(format!(
                             "Speed (tape) — {} clip {}",
                             lane.label(),
@@ -1296,7 +1296,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(
                                     "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes",
                                 ),
@@ -1326,13 +1326,13 @@ impl Player {
                                         .w_full()
                                         .h(px(4.))
                                         .rounded(px(2.))
-                                        .bg(rgb(BG_PANEL))
+                                        .bg(rgb(BG_PANEL()))
                                         .child(
                                             div()
                                                 .h_full()
                                                 .w(relative(frac))
                                                 .rounded(px(2.))
-                                                .bg(rgb(ACCENT_PRIMARY)),
+                                                .bg(rgb(ACCENT_PRIMARY())),
                                         ),
                                 ),
                         )
@@ -1342,7 +1342,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 // What the choice *is*, in the numbers the
                                 // timeline is measured in: the source range
                                 // never moves, the room it takes does.
@@ -1414,16 +1414,16 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .bg(rgb(match n == self.mix_field {
-                        true => BG_SELECTED,
-                        false => BG_PANEL,
+                        true => BG_SELECTED(),
+                        false => BG_PANEL(),
                     }))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.mix_field = n;
                         cx.notify();
                     }))
-                    .child(div().text_color(rgb(FG_SECONDARY)).child(label))
+                    .child(div().text_color(rgb(FG_SECONDARY())).child(label))
                     .child(
                         div()
                             .flex()
@@ -1440,9 +1440,9 @@ impl Player {
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(3.))
-                                    .bg(rgb(BG_PANEL))
+                                    .bg(rgb(BG_PANEL()))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         // Picked as well as moved, the silence
                                         // card's rule: the row a press lands on
@@ -1463,7 +1463,7 @@ impl Player {
                 .flex()
                 .justify_center()
                 .items_center()
-                .bg(rgba(SCRIM))
+                .bg(rgba(SCRIM()))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1484,7 +1484,7 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(
                             div()
                                 .flex_none()
@@ -1496,7 +1496,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(
                                     "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; a click away or esc closes",
                                 ),
@@ -1515,7 +1515,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 // What the choice *is*: the limiter's own line,
                                 // because "on" alone says nothing about what it
                                 // does to a mix that never reaches the ceiling.
@@ -1601,16 +1601,16 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .bg(rgb(match n == self.silence_field {
-                        true => BG_SELECTED,
-                        false => BG_PANEL,
+                        true => BG_SELECTED(),
+                        false => BG_PANEL(),
                     }))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.silence_field = n;
                         cx.notify();
                     }))
-                    .child(div().text_color(rgb(FG_SECONDARY)).child(label))
+                    .child(div().text_color(rgb(FG_SECONDARY())).child(label))
                     // The value and the two steps that move it. Every other
                     // card has something to drag or press; this one had the
                     // arrow keys and nothing else, so a row was a setting a
@@ -1633,9 +1633,9 @@ impl Player {
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(3.))
-                                    .bg(rgb(BG_PANEL))
+                                    .bg(rgb(BG_PANEL()))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         // Picked as well as moved: the row a
                                         // press lands on is the row the arrows
@@ -1664,11 +1664,11 @@ impl Player {
                 .justify_center()
                 .rounded(px(3.))
                 .bg(rgb(match found {
-                    0 => BG_PANEL,
-                    _ => BG_SELECTED,
+                    0 => BG_PANEL(),
+                    _ => BG_SELECTED(),
                 }))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .hover(|s| s.bg(rgb(BG_HOVER())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| act(this, cx)))
                 .child(text)
         };
@@ -1680,7 +1680,7 @@ impl Player {
                 .pt(px(HEADER_H + 8.))
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
-                .bg(rgba(SCRIM_LIGHT))
+                .bg(rgba(SCRIM_LIGHT()))
                 // Click away closes it, as on every card here -- and the marks
                 // go with it, which is what makes this one a call and not a flag.
                 .on_mouse_down(
@@ -1701,7 +1701,7 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         .child(div().flex_none().px(px(6.)).child(format!(
                             "Silences — {} clip {}",
                             lane.label(),
@@ -1712,7 +1712,7 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(
                                     "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes",
                                 ),
@@ -1723,8 +1723,8 @@ impl Player {
                                 .flex_none()
                                 .px(px(6.))
                                 .text_color(rgb(match (&self.silence_scan, found) {
-                                    (None, 1..) => ACCENT_PRIMARY,
-                                    _ => FG_SECONDARY,
+                                    (None, 1..) => ACCENT_PRIMARY(),
+                                    _ => FG_SECONDARY(),
                                 }))
                                 .child(status),
                         )

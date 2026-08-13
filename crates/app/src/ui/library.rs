@@ -127,10 +127,10 @@ impl Player {
                 .rounded(px(3.))
                 // A row that cannot be placed takes no click and no drag, and
                 // reads as unavailable rather than merely unlucky.
-                .when(!usable, |d| d.text_color(rgb(FG_SECONDARY)).opacity(0.55))
+                .when(!usable, |d| d.text_color(rgb(FG_SECONDARY())).opacity(0.55))
                 .when(usable, |d| {
                     d.cursor_pointer()
-                        .hover(|s| s.bg(rgb(BG_HOVER)))
+                        .hover(|s| s.bg(rgb(BG_HOVER())))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.selected_asset = Some((path.clone(), stream));
                             cx.notify();
@@ -170,7 +170,7 @@ impl Player {
                         cx.notify();
                     }),
                 )
-                .when(picked, |d| d.bg(rgb(BG_SELECTED)).border_1())
+                .when(picked, |d| d.bg(rgb(BG_SELECTED())).border_1())
                 .tooltip(move |_, cx| cx.new(|_| Tip(tip.clone())).into())
                 // Full height and hard against the edge: the tint reads as
                 // the lane's colour continuing into the list, not as a chip
@@ -205,7 +205,7 @@ impl Player {
                             div()
                                 .truncate()
                                 .text_size(px(10.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(under),
                         ),
                 )
@@ -220,7 +220,7 @@ impl Player {
             .flex_col()
             .gap(px(6.))
             .p(px(8.))
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(BG_PANEL()))
             // The column itself scrolls at a short window. Its five stacked
             // things want 140 px and the 640x360 floor gives the region 136, so
             // the list -- the only child that may shrink -- was being squeezed to
@@ -258,19 +258,19 @@ impl Player {
                                     .rounded(px(3.))
                                     .text_size(px(11.))
                                     .text_color(rgb(match on {
-                                        true => FG_PRIMARY,
-                                        false => FG_SECONDARY,
+                                        true => FG_PRIMARY(),
+                                        false => FG_SECONDARY(),
                                     }))
                                     // One selection language everywhere: the
                                     // same stroke a picked clip and a picked
                                     // row wear.
                                     .when(on, |d| {
-                                        d.bg(rgb(BG_SELECTED))
+                                        d.bg(rgb(BG_SELECTED()))
                                             .border_b_2()
-                                            .border_color(rgb(STROKE_SELECTED))
+                                            .border_color(rgb(STROKE_SELECTED()))
                                     })
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER)))
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.library_tab = tab;
                                         cx.notify();
@@ -294,8 +294,8 @@ impl Player {
                         // the rest of the time, is dimmed until something is
                         // imported. One live accent in the window either way.
                         match rows.is_empty() {
-                            true => ACCENT_PRIMARY,
-                            false => BG_RAISED,
+                            true => ACCENT_PRIMARY(),
+                            false => BG_RAISED(),
                         },
                         None,
                         "Import",
@@ -321,7 +321,7 @@ impl Player {
                         d.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(self.library_tab.empty()),
                         )
                     })
@@ -336,7 +336,7 @@ impl Player {
             .child(control(
                 "add-asset",
                 0.,
-                BG_RAISED,
+                BG_RAISED(),
                 None,
                 "Add at playhead",
                 match self.selected_asset {
@@ -442,7 +442,7 @@ impl Player {
                                 .min_w(px(0.))
                                 .truncate()
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(value),
                         )
                         .into_any_element(),
@@ -463,13 +463,13 @@ impl Player {
                             div()
                                 .min_w(px(0.))
                                 .truncate()
-                                .text_color(rgb(FG_SECONDARY))
+                                .text_color(rgb(FG_SECONDARY()))
                                 .child(refusal.why().unwrap_or_else(|| item.hint())),
                         )
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
                             d.cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER)))
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.act_on_row(item, cx);
                                 }))
@@ -512,7 +512,7 @@ impl Player {
                         .flex_col()
                         .p(px(MENU_PAD))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED))
+                        .bg(rgb(BG_RAISED()))
                         // Painted after the scrim, so this listener runs first
                         // and a press meant for an item never closes the menu
                         // out from under its own click (`context_card`).

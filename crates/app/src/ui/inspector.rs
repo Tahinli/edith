@@ -42,9 +42,9 @@ impl Player {
             .relative()
             .flex()
             .flex_col()
-            .bg(rgb(BG_PANEL))
+            .bg(rgb(BG_PANEL()))
             .border_l_1()
-            .border_color(rgb(STROKE_DIVIDER))
+            .border_color(rgb(STROKE_DIVIDER()))
             .child(section_head("Inspector"))
             .child(
                 div()
@@ -71,8 +71,8 @@ impl Player {
                         .px(px(8.))
                         .text_size(px(10.))
                         .text_color(rgb(match below > 1. {
-                            true => ACCENT_PRIMARY,
-                            false => FG_SECONDARY,
+                            true => ACCENT_PRIMARY(),
+                            false => FG_SECONDARY(),
                         }))
                         .child(match below > 1. {
                             true => "more below — scroll the inspector",
@@ -124,14 +124,14 @@ impl Player {
             .gap(px(6.))
             .p(px(8.))
             .rounded(px(4.))
-            .bg(rgb(BG_HOVER_DIM))
+            .bg(rgb(BG_HOVER_DIM()))
             .child(
                 div()
                     .flex_none()
                     .truncate()
                     .text_color(rgb(match picked.is_some() {
-                        true => FG_PRIMARY,
-                        false => FG_SECONDARY,
+                        true => FG_PRIMARY(),
+                        false => FG_SECONDARY(),
                     }))
                     // The kind's own colour, the same one its clip wears on the
                     // timeline: the panel and the box are about the same thing.
@@ -146,7 +146,7 @@ impl Player {
                 div()
                     .flex_none()
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child(detail),
             )
             .child(
@@ -157,7 +157,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-speed",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Speed",
                         "how fast this clip and its group play",
@@ -167,7 +167,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-color",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Colour",
                         "exposure, contrast, saturation and temperature",
@@ -177,7 +177,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-eq",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Equalizer",
                         "the bands this clip's sound is filtered through",
@@ -187,7 +187,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-silence",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Silence",
                         "finds the quiet stretches and cuts or speeds them",
@@ -197,7 +197,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-fit",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Fit",
                         "how this picture is placed on the project canvas",
@@ -207,7 +207,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-delete",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Delete",
                         "takes this clip off the timeline",
@@ -229,12 +229,12 @@ impl Player {
             .gap(px(6.))
             .p(px(8.))
             .rounded(px(4.))
-            .bg(rgb(BG_HOVER_DIM))
+            .bg(rgb(BG_HOVER_DIM()))
             .child(
                 div()
                     .flex_none()
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY))
+                    .text_color(rgb(FG_SECONDARY()))
                     .child("PROJECT"),
             )
             .child(
@@ -245,7 +245,7 @@ impl Player {
                     .child(self.action_control(
                         "resolution",
                         ZOOM_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
                         "the canvas every clip is composed onto, and the size the export comes out at",
@@ -257,7 +257,7 @@ impl Player {
                     .child(self.action_control(
                         "fps",
                         ZOOM_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         match self.session.is_some() {
                             true => format!("{} fps", fps_label(self.fps)),
@@ -272,7 +272,7 @@ impl Player {
                     .child(self.action_control(
                         "tonemap",
                         TONE_SLOT_W,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         match &self.session {
                             Some(session) => format!("HDR {}", tone_label(session.tone())),
@@ -287,7 +287,7 @@ impl Player {
                     .child(self.action_control(
                         "inspect-mix",
                         0.,
-                        BG_RAISED,
+                        BG_RAISED(),
                         None,
                         "Mix",
                         "a fader per track and the limiter over the sum of them",
@@ -307,10 +307,10 @@ pub(crate) fn section_head(title: &'static str) -> impl IntoElement {
         .flex()
         .items_center()
         .px(px(8.))
-        .bg(rgb(BG_PANEL))
+        .bg(rgb(BG_PANEL()))
         .border_b_1()
-        .border_color(rgb(STROKE_DIVIDER))
+        .border_color(rgb(STROKE_DIVIDER()))
         .text_size(px(11.))
-        .text_color(rgb(FG_SECONDARY))
+        .text_color(rgb(FG_SECONDARY()))
         .child(title)
 }
