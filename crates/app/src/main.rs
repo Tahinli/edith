@@ -410,14 +410,21 @@ impl Import {
     }
 }
 
+/// What a scan is *of*: the source, which of its audio streams, and the clip's
+/// own `[in, out)` source frames. The range is part of the name because it is
+/// part of the read -- a clip cut in half is a different, shorter decode than
+/// the whole take was, and levels read for one are not the other's.
+type ScanKey = (PathBuf, usize, u32, u32);
+
 /// The silence scan a worker is running, as the card shows it. Same two clocks
 /// as an [`Import`] and for the same reason -- one proves the window answers,
 /// one says the read has stopped moving -- over a progress that *can* move:
 /// a decode knows how far into the sound it has come, so the card says so.
 struct SilenceScan {
-    /// Source and stream being scanned, which is the cache key the levels land
-    /// under and what tells a second open of the same clip from a new one.
-    key: (PathBuf, usize),
+    /// Source, stream and source range being scanned, which is the cache key
+    /// the levels land under and what tells a second open of the same clip from
+    /// a new one.
+    key: ScanKey,
     /// When the worker started, for the elapsed clock.
     started: Instant,
     /// Written by the worker, read here every repaint. The cancel flag in it is
@@ -1490,12 +1497,12 @@ struct Player {
     /// over and what an apply acts on -- *exactly* the previewed set, never a
     /// second scan at the moment of the press.
     silence_marks: Vec<(u32, u32)>,
-    /// The levels of every source scanned this session, kept so moving a
-    /// threshold is arithmetic rather than another decode. Keyed by source and
-    /// stream, and not one entry: two films on one timeline would otherwise
-    /// evict each other, and the decode being paid twice is the fifty seconds
-    /// this card exists to not spend.
-    silence_levels: HashMap<(PathBuf, usize), Arc<Vec<f32>>>,
+    /// The levels of every stretch scanned this session, kept so moving a
+    /// threshold is arithmetic rather than another decode. Keyed by
+    /// [`ScanKey`], and not one entry: two films on one timeline would
+    /// otherwise evict each other, and the decode being paid twice is the fifty
+    /// seconds this card exists to not spend.
+    silence_levels: HashMap<ScanKey, Arc<Vec<f32>>>,
     /// The scan a worker is running for the card, if one is. `None` means the
     /// card is drawing numbers it already has.
     silence_scan: Option<SilenceScan>,
@@ -2560,8 +2567,9 @@ impl Player {
     /// Opens the silence card on the clip to be scanned: the selected one, or
     /// -- with nothing selected -- the clip the picture is coming from, which is
     /// the rule the speed card follows and what a person means by "this shot".
-    /// Either half of a take will do: the scan reads the *source*, and both
-    /// halves of an A/V take name the same file.
+    /// Either half of a take will do: both halves of an A/V take name the same
+    /// file and play the same source frames, which is the whole of what a scan
+    /// is of ([`ScanKey`]).
     ///
     /// The card is up on the next frame whatever the file is: a still is
     /// refused by name here, where the answer costs a look at the path, and
@@ -2584,16 +2592,16 @@ impl Player {
             .map(|clip| audio_half(session, clip))
         {
             Some((lane, idx)) => {
-                let source = self.session.as_ref().and_then(|session| {
-                    let clip = session.lane_clips(lane).get(idx)?;
-                    session.sources().get(clip.source).cloned()
+                let found = self.session.as_ref().and_then(|session| {
+                    let clip = *session.lane_clips(lane).get(idx)?;
+                    Some((session.sources().get(clip.source)?.clone(), clip))
                 });
                 // A still is asked *before* the decoder is: handing a png to the
                 // mp4 demuxer answers "a box with a larger size than it", which
                 // is a true sentence about a container and nothing a person can
                 // act on. A picture has no sound for the same reason a silent
                 // video has none, so it is refused in the same words.
-                let Some(source) = source else {
+                let Some((source, clip)) = found else {
                     cx.notify();
                     return;
                 };
@@ -2611,7 +2619,15 @@ impl Player {
                 self.color_open = None;
                 self.speed_open = None;
                 self.context_menu = None;
-                let key = (source.path.clone(), source.audio_stream);
+                // The clip's own range, not the file's: the scan reads what this
+                // clip plays and nothing else, so a take cut in half costs half
+                // the decode and finds only what is still on the timeline.
+                let key = (
+                    source.path.clone(),
+                    source.audio_stream,
+                    clip.in_frame,
+                    clip.out_frame,
+                );
                 match scan_plan(
                     self.silence_levels.contains_key(&key),
                     self.silence_scan.as_ref().map(|scan| &scan.key),
@@ -2733,13 +2749,18 @@ impl Player {
     ///
     /// Whatever was scanning is cancelled first: one card, one scan, and the
     /// clip that has just been asked about is the one worth the disk.
-    fn start_silence_scan(&mut self, key: (PathBuf, usize), cx: &mut Context<Self>) {
+    ///
+    /// Only the clip's own `[in, out)` is read -- source frames over the
+    /// project's rate, the same seconds [`engine::Project`] hands the decoder
+    /// for playback -- so half a take is half a wait.
+    fn start_silence_scan(&mut self, key: ScanKey, cx: &mut Context<Self>) {
         self.cancel_silence_scan();
         self.silence_marks.clear();
         let progress = Arc::new(engine::silence::Progress::default());
+        let range = source_secs(&key, self.fps);
         let scan = cx.background_executor().spawn({
             let (key, progress) = (key.clone(), Arc::clone(&progress));
-            async move { engine::silence::levels_with_progress(&key.0, key.1, &progress) }
+            async move { engine::silence::levels_with_progress(&key.0, key.1, range, &progress) }
         });
         let now = Instant::now();
         self.silence_scan = Some(SilenceScan {
@@ -2819,7 +2840,12 @@ impl Player {
         // line. The marks arrive with the levels.
         let Some(levels) = self
             .silence_levels
-            .get(&(source.path.clone(), source.audio_stream))
+            .get(&(
+                source.path.clone(),
+                source.audio_stream,
+                clip.in_frame,
+                clip.out_frame,
+            ))
             .cloned()
         else {
             return;
@@ -9948,11 +9974,23 @@ enum ScanPlan {
 /// Which of the three [`ScanPlan`]s opening the card on `key` means. The whole
 /// of the cache policy, and the reason a second film does not cost the first
 /// one its levels: what is cached is asked per source, never "the last one".
-fn scan_plan(cached: bool, running: Option<&(PathBuf, usize)>, key: &(PathBuf, usize)) -> ScanPlan {
+fn scan_plan(cached: bool, running: Option<&ScanKey>, key: &ScanKey) -> ScanPlan {
     match (cached, running) {
         (true, _) => ScanPlan::Marks,
         (false, Some(at)) if at == key => ScanPlan::Wait,
         _ => ScanPlan::Start,
+    }
+}
+
+/// The half-open source seconds a [`ScanKey`]'s frames name, at the project's
+/// rate -- what [`engine::silence::levels`] is asked to read, and the same
+/// arithmetic playback puts a clip's `in_frame` through. A rate that is not a
+/// rate reads the whole file rather than an empty window: a scan of nothing is
+/// worse than a scan of too much.
+fn source_secs(key: &ScanKey, fps: f64) -> (f64, f64) {
+    match fps.is_finite() && fps > 0. {
+        true => (f64::from(key.2) / fps, f64::from(key.3) / fps),
+        false => (0., f64::INFINITY),
     }
 }
 
@@ -10059,9 +10097,9 @@ mod tests {
         ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
         fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
         note_progress, px_along,
-        IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanPlan, SilenceScan, import_line,
+        IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanKey, ScanPlan, SilenceScan, import_line,
         Landing, arrival, launch_queue,
-        read_ahead, scan_plan, seek_line, silence_line, stash_or_write,
+        read_ahead, scan_plan, seek_line, silence_line, source_secs, stash_or_write,
         repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
         clip_width, trimmed_clip, trims, unscannable, unusable,
         visible_slice,
@@ -14043,7 +14081,7 @@ mod tests {
         progress.total.store(7680, Relaxed);
         let started = Instant::now() - Duration::from_secs(9);
         let mut scan = SilenceScan {
-            key: (PathBuf::from("/films/A Film.mkv"), 0),
+            key: (PathBuf::from("/films/A Film.mkv"), 0, 0, 192_000),
             started,
             progress: Arc::clone(&progress),
             seen: 0,
@@ -14082,18 +14120,20 @@ mod tests {
         assert_eq!(scan.since, held, "an unchanged mark must not reset it");
     }
 
-    /// The cache is per source, which is what stops two films thrashing each
-    /// other's fifty seconds: A, then B, then A again is *one* decode of A.
-    /// And a source already being read is waited for rather than read twice --
-    /// both halves of an A/V take name the same file.
+    /// The cache is per scanned stretch, which is what stops two films
+    /// thrashing each other's fifty seconds: A, then B, then A again is *one*
+    /// decode of A. And a stretch already being read is waited for rather than
+    /// read twice -- both halves of an A/V take name the same file and the same
+    /// frames. A *trimmed* A is not A: it is a shorter read of its own, which
+    /// is the whole point of scanning the clip instead of the file.
     #[test]
     fn a_second_film_does_not_cost_the_first_one_its_levels() {
         let (a, b) = (
-            (PathBuf::from("/films/a.mkv"), 0),
-            (PathBuf::from("/films/b.mkv"), 0),
+            (PathBuf::from("/films/a.mkv"), 0, 0, 3000),
+            (PathBuf::from("/films/b.mkv"), 0, 0, 3000),
         );
-        let mut cache: std::collections::HashMap<(PathBuf, usize), ()> =
-            std::collections::HashMap::new();
+        let half = (PathBuf::from("/films/a.mkv"), 0, 0, 1500);
+        let mut cache: std::collections::HashMap<ScanKey, ()> = std::collections::HashMap::new();
         let mut started = Vec::new();
         // What a card open does, three times over, with the worker landing
         // between each: plan, and start what the plan says to start.
@@ -14117,6 +14157,18 @@ mod tests {
         assert_eq!(scan_plan(false, Some(&b), &a), ScanPlan::Start);
         // Levels in hand beat a worker either way: the marks are arithmetic.
         assert_eq!(scan_plan(true, Some(&a), &a), ScanPlan::Marks);
+        // The same file cut in half is a read of its own: neither A's levels
+        // nor A's worker answers for it.
+        assert_eq!(
+            scan_plan(cache.contains_key(&half), None, &half),
+            ScanPlan::Start
+        );
+        assert_eq!(scan_plan(false, Some(&a), &half), ScanPlan::Start);
+        // ...and the seconds asked for are the clip's, at the project's rate.
+        assert_eq!(source_secs(&half, 30.), (0., 50.));
+        assert_eq!(source_secs(&(half.0.clone(), 0, 900, 1500), 30.), (30., 50.));
+        // A rate that is not one reads the file rather than nothing.
+        assert_eq!(source_secs(&half, 0.), (0., f64::INFINITY));
     }
 
     /// The two halves a worker hands back for an import, unwrapped: every import

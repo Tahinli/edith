@@ -323,7 +323,14 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
     // is not an edit.
     assert!(!p.undo());
 
-    let levels = silence::levels(asset("test_av.mp4"), 0)
+    let audio = Lane::new(LaneKind::Audio, 0);
+    let clip = p.lane(audio)[0];
+    // The clip's own stretch of the file, which is what the card asks for.
+    let range = (
+        f64::from(clip.in_frame) / FPS,
+        f64::from(clip.out_frame) / FPS,
+    );
+    let levels = silence::levels(asset("test_av.mp4"), 0, range)
         .expect("scan")
         .expect("the fixture has audio");
     let cfg = Settings {
@@ -332,8 +339,6 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         padding: 0.02,
         min_keep: 0.,
     };
-    let audio = Lane::new(LaneKind::Audio, 0);
-    let clip = p.lane(audio)[0];
     let regions = silence::timeline_regions(&clip, FPS, &silence::regions(&levels, cfg));
     assert_eq!(regions.len(), 5, "{regions:?}");
     for (second, &(start, len)) in regions.iter().enumerate() {
