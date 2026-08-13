@@ -1,5 +1,5 @@
-//! VA-API decode (H.264, HEVC, VP9 and AV1) and encode (H.264, and AV1 where
-//! the GPU has an entrypoint for it), shipped as a
+//! VA-API decode (H.264, HEVC, VP9 and AV1) and encode (H.264 and HEVC, and AV1
+//! where the GPU has an entrypoint for it), shipped as a
 //! `dlopen`-able plugin so the main binary never gets a DT_NEEDED on
 //! libva/gbm/drm. Every entry point is
 //! `extern "C"`, catches unwinds and reports failure as a null pointer or a
@@ -20,6 +20,7 @@ use cros_codecs::backend::vaapi::decoder::VaapiBackend;
 use cros_codecs::backend::vaapi::encoder::VaapiBackend as VaapiEncBackend;
 use cros_codecs::codec::av1::parser::Profile as Av1Profile;
 use cros_codecs::codec::h264::parser::{Level, Profile as H264Profile};
+use cros_codecs::codec::h265::parser::{Level as H265Level, Profile as H265Profile};
 use cros_codecs::decoder::stateless::av1::Av1;
 use cros_codecs::decoder::stateless::h264::H264;
 use cros_codecs::decoder::stateless::h265::H265;
@@ -28,8 +29,10 @@ use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVi
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
 use cros_codecs::encoder::av1::EncoderConfig as Av1Config;
 use cros_codecs::encoder::h264::EncoderConfig as H264Config;
+use cros_codecs::encoder::h265::EncoderConfig as H265Config;
 use cros_codecs::encoder::stateless::av1::StatelessEncoder as Av1StatelessEncoder;
 use cros_codecs::encoder::stateless::h264::StatelessEncoder;
+use cros_codecs::encoder::stateless::h265::StatelessEncoder as H265StatelessEncoder;
 use cros_codecs::encoder::{
     FrameMetadata, PredictionStructure, RateControl, Tunings, VideoEncoder,
 };
@@ -95,6 +98,10 @@ type Encoder = StatelessEncoder<
     VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
 >;
 type Av1Encoder = Av1StatelessEncoder<
+    GenericDmaVideoFrame,
+    VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
+>;
+type HevcEncoder = H265StatelessEncoder<
     GenericDmaVideoFrame,
     VaapiEncBackend<GenericDmaVideoFrame, Surface<GenericDmaVideoFrame>>,
 >;
@@ -608,8 +615,8 @@ pub unsafe extern "C" fn vh_close(session: *mut c_void) {
 
 /// What each codec needs of the driver before this plugin can claim it: the
 /// 8-bit decode profiles, the 10-bit ones, and the profile the *encoder* here
-/// would open -- `None` for the two this plugin has no encoder for at all, so a
-/// GPU with an HEVC or VP9 encode entrypoint is never reported as one edith can
+/// would open -- `None` for the one this plugin has no encoder for at all, so a
+/// GPU with a VP9 encode entrypoint is never reported as one edith can
 /// reach. The encode profiles are the very ones [`EncSession::open_codec`]
 /// asks for, which is what keeps this a description of the plugin rather than a
 /// second opinion about it.
@@ -628,7 +635,11 @@ const CAP_TABLE: [(u32, &[VAProfile::Type], &[VAProfile::Type], Option<VAProfile
         CAP_HEVC,
         &[VAProfile::VAProfileHEVCMain],
         &[VAProfile::VAProfileHEVCMain10],
-        None,
+        // 8-bit Main only: the encoder here opens Main whatever the source was,
+        // so a Main 10 entrypoint is a *decode* claim on this line and nothing
+        // more. Main 10 encode would be a second profile here and a 10-bit input
+        // buffer in `EncSession`, neither of which exists yet.
+        Some(VAProfile::VAProfileHEVCMain),
     ),
     (
         CAP_VP9,
@@ -762,13 +773,15 @@ fn fix_slice_nal_headers(au: &mut [u8]) {
 /// point polls it before returning, so the GPU is finished with the buffer
 /// before the next picture is written into it.
 struct EncSession {
-    /// Boxed because the two codecs are two types and everything past `encode`
-    /// is the same trait: one session type serves both, which is what keeps the
-    /// C ABI at one new symbol (the open) instead of four.
+    /// Boxed because the three codecs are three types and everything past
+    /// `encode` is the same trait: one session type serves them all, which is
+    /// what keeps the C ABI at one new symbol per codec (the open) instead of
+    /// four.
     encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>>,
-    /// H.264 only: the byte the driver leaves at zero is a *NAL* header, and an
-    /// AV1 temporal unit has no such thing.
-    h264: bool,
+    /// Which codec the open picked, kept because one thing past it still
+    /// differs: the H.264 driver leaves a *NAL* header byte at zero, and
+    /// neither an HEVC access unit nor an AV1 temporal unit has that one.
+    codec: EncCodec,
     /// Owns the DRM node the buffer object below was allocated from.
     _gbm: gbm::Device<std::fs::File>,
     frame: GenericDmaVideoFrame,
@@ -786,9 +799,18 @@ struct EncSession {
     out: Vec<u8>,
 }
 
+/// Which codec an [`EncSession`] was opened for. Decided once, at the open, the
+/// way the H.264 seat's dimensions are -- everything after it is one trait.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EncCodec {
+    H264,
+    Hevc,
+    Av1,
+}
+
 impl EncSession {
     fn open(width: u32, height: u32, fps_num: u32, fps_den: u32, bitrate: u64) -> Option<Self> {
-        Self::open_codec(width, height, fps_num, fps_den, bitrate, false)
+        Self::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::H264)
     }
 
     fn open_codec(
@@ -797,11 +819,19 @@ impl EncSession {
         fps_num: u32,
         fps_den: u32,
         bitrate: u64,
-        av1: bool,
+        codec: EncCodec,
     ) -> Option<Self> {
         // NV12 chroma is half resolution, so odd dimensions have no packing;
         // and radeonsi refuses encode contexts below 64x64 (measured).
         if width < 64 || height < 64 || width % 2 != 0 || height % 2 != 0 {
+            return None;
+        }
+        // The HEVC entrypoint's own floor, which is a different number: the same
+        // driver that takes a 128x128 H.264 context answers `VaError(19)` to an
+        // HEVC one below 384x384 (measured 2026-08-13 on radeonsi). Said here so
+        // a small export falls back to software at the open rather than through
+        // a driver refusal, and so the C ABI never claims a seat it has not got.
+        if codec == EncCodec::Hevc && (width < 384 || height < 384) {
             return None;
         }
         if fps_num == 0 || fps_den == 0 || bitrate == 0 {
@@ -813,9 +843,10 @@ impl EncSession {
             height: align16(height),
         };
         let framerate = ((fps_num as f64 / fps_den as f64).round() as i64).clamp(1, 240) as u32;
-        let profile = match av1 {
-            true => VAProfile::VAProfileAV1Profile0,
-            false => VAProfile::VAProfileH264Main,
+        let profile = match codec {
+            EncCodec::Av1 => VAProfile::VAProfileAV1Profile0,
+            EncCodec::Hevc => VAProfile::VAProfileHEVCMain,
+            EncCodec::H264 => VAProfile::VAProfileH264Main,
         };
         // The driver's own answer to "can you encode this at all": a GPU with no
         // AV1 encode entrypoint is what makes the caller fall back to `rav1e`,
@@ -833,8 +864,8 @@ impl EncSession {
         let pred_structure = PredictionStructure::LowDelay {
             limit: (framerate * 2) as u16,
         };
-        let encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>> = match av1 {
-            true => {
+        let encoder: Box<dyn VideoEncoder<GenericDmaVideoFrame>> = match codec {
+            EncCodec::Av1 => {
                 // Constant quality, because that is the only rate control the
                 // vendored AV1 backend takes (`stateless/av1/vaapi.rs` refuses
                 // anything else outright); 128 of 255 is its own reference
@@ -867,7 +898,50 @@ impl EncSession {
                     .ok()?,
                 )
             }
-            false => {
+            EncCodec::Hevc => {
+                // **Every picture an IDR**, which is the one place this seat
+                // does not mirror the H.264 one. A GOP's P slices come out of
+                // this driver undecodable: the slice segment headers are the
+                // *driver's* to write (as they are for H.264) and radeonsi
+                // writes a constant picture order count into every one of them,
+                // so a decoder sees frame after frame claiming to be the same
+                // output picture. Measured 2026-08-13: with the default GOP,
+                // only the leading IDR of each group decodes.
+                //
+                // So the hardware seat is intra-only exactly as the software one
+                // is (`export::Enc::open_hevc`), and an HEVC export is an
+                // intraframe master either way -- the same file, coded by the
+                // GPU instead of by twelve cores.
+                //
+                // corner-cut: inter HEVC on this GPU needs the slice segment
+                // header written here rather than by the driver
+                // (`VAEncPackedHeaderSlice`), which is a change in the vendored
+                // backend; upgrade path is that, or a driver that writes a
+                // correct POC.
+                let config = H265Config {
+                    resolution: Resolution { width, height },
+                    profile: H265Profile::Main,
+                    level: H265Level::L4,
+                    pred_structure: PredictionStructure::LowDelay { limit: 1 },
+                    initial_tunings: Tunings {
+                        rate_control: RateControl::ConstantBitrate(bitrate),
+                        framerate,
+                        ..Default::default()
+                    },
+                };
+                Box::new(
+                    HevcEncoder::new_vaapi(
+                        display,
+                        config,
+                        Fourcc::from(b"NV12"),
+                        coded,
+                        low_power,
+                        BlockingMode::Blocking,
+                    )
+                    .ok()?,
+                )
+            }
+            EncCodec::H264 => {
                 let config = H264Config {
                     resolution: Resolution { width, height },
                     profile: H264Profile::Main,
@@ -898,7 +972,7 @@ impl EncSession {
         let layout = nv12_layout(coded, frame.get_plane_pitch()[0], false);
         Some(Self {
             encoder,
-            h264: !av1,
+            codec,
             _gbm: gbm,
             frame,
             layout,
@@ -981,7 +1055,7 @@ impl EncSession {
     fn collect(&mut self) -> Result<(), String> {
         while let Some(coded) = self.encoder.poll().map_err(|e| e.to_string())? {
             let mut au = coded.bitstream;
-            if self.h264 {
+            if self.codec == EncCodec::H264 {
                 fix_slice_nal_headers(&mut au);
             }
             self.ready.push_back(au);
@@ -1044,7 +1118,37 @@ pub extern "C" fn vh_enc_av1_open(
     bitrate: u64,
 ) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, true) {
+        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::Av1) {
+            Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
+            None => std::ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+/// The same, coding HEVC: null unless this GPU has an HEVC encode entrypoint and
+/// the picture is at least 384x384 ([`EncSession::open_codec`] states that floor
+/// and where it was measured), and the caller then encodes HEVC in software
+/// instead.
+///
+/// **Intra-only**: every picture it hands back is an IDR carrying its own VPS,
+/// SPS and PPS, which is what makes the file decodable at all on this driver --
+/// see the `EncCodec::Hevc` arm of [`EncSession::open_codec`]. `bitrate` is the
+/// constant bitrate the GPU codes at, as the H.264 seat's is.
+///
+/// The session it returns is fed, drained and closed through `vh_enc_frame`,
+/// `vh_enc_drain` and `vh_enc_close` exactly as an H.264 one is; what comes back
+/// out of them is Annex-B HEVC access units.
+#[unsafe(no_mangle)]
+pub extern "C" fn vh_enc_hevc_open(
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    bitrate: u64,
+) -> *mut c_void {
+    catch_unwind(AssertUnwindSafe(|| {
+        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::Hevc) {
             Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
             None => std::ptr::null_mut(),
         }
@@ -1160,9 +1264,13 @@ mod tests {
             return;
         };
         eprintln!("{caps:?}");
-        // Encode is this plugin's two seats and no others, whatever entrypoints
-        // the driver has: an HEVC or VP9 EncSlice is not an encoder here.
-        assert_eq!(caps.encode & !(CAP_H264 | CAP_AV1), 0, "{caps:?}");
+        // Encode is this plugin's three seats and no others, whatever
+        // entrypoints the driver has: a VP9 EncSlice is not an encoder here.
+        assert_eq!(
+            caps.encode & !(CAP_H264 | CAP_HEVC | CAP_AV1),
+            0,
+            "{caps:?}"
+        );
         // A 10-bit claim is a decode claim -- same profile family, read back
         // through P010 -- and there is no 10-bit encode path at all.
         assert_eq!(caps.decode_10bit & !caps.decode, 0, "{caps:?}");
