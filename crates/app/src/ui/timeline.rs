@@ -822,8 +822,15 @@ impl Player {
             }))
             .on_drag_move(cx.listener(
                 move |this, event: &DragMoveEvent<LaneDrag>, _, cx| {
+                    // Carried off this row, the line it was promising goes with
+                    // it: a cue left painted over a slot a release out here does
+                    // not commit is the drag saying one thing and the drop
+                    // doing another. Its *own* promise only -- gpui runs this on
+                    // every painted row, not just the one under the pointer, so
+                    // a row that cleared the cue outright would rub out the line
+                    // the hovered row had just drawn.
                     if !event.bounds.contains(&event.event.position) {
-                        return;
+                        return this.forget_lane_drop(lane, cx);
                     }
                     this.preview_lane_drop(event.drag(cx).0, lane, cx);
                 },
