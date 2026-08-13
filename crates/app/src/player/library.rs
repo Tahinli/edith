@@ -303,6 +303,117 @@ impl Player {
     /// ...and starts whatever is queued behind it, which is the one place the
     /// files argv named can begin: they are put in the queue before there is a
     /// context to spawn a worker from.
+    /// Takes each finished stand-in's verdict, once. Sampled here rather than
+    /// while drawing, for [`Player::poll_export`]'s reason -- and it is the one
+    /// place a proxy job's outcome is read, so "ready" on a row and the file in
+    /// the cache are the same fact.
+    ///
+    /// Nothing waits for it: until a proxy is ready the film itself is what
+    /// plays, switch or no switch ([`engine::PlaybackSession::picture_path`]),
+    /// so a failure costs a line and no more.
+    pub(crate) fn poll_proxies(&mut self, cx: &mut Context<Self>) {
+        let done: Vec<(PathBuf, engine::Result<PathBuf>)> = self
+            .proxies
+            .iter()
+            .filter_map(|(path, state)| match state {
+                Proxy::Making(job) => Some((path.clone(), job.outcome()?)),
+                _ => None,
+            })
+            .collect();
+        for (path, outcome) in done {
+            let text = match &outcome {
+                Ok(_) => format!(
+                    "PROXY READY for {} — Proxies on cuts on it",
+                    file_name(&path)
+                ),
+                Err(e) => format!(
+                    "PROXY FAILED for {} — {e} — the film itself is what plays",
+                    file_name(&path)
+                ),
+            };
+            eprintln!("{text}");
+            self.notify_user(text.into());
+            let state = match outcome {
+                Ok(_) => Proxy::Ready,
+                Err(_) => Proxy::Failed,
+            };
+            self.proxies.insert(path, state);
+            cx.notify();
+        }
+    }
+
+    /// What the Proxies button says after the state: how far the stand-ins
+    /// have got, since "on" with nothing made yet and "on" with the whole
+    /// library standing in are two different things to be looking at. Empty
+    /// where no film here wants one, which is the ordinary case.
+    pub(crate) fn proxy_tail(&self) -> String {
+        let making = self.proxies.values().filter_map(|p| match p {
+            Proxy::Making(job) => Some(job.progress()),
+            _ => None,
+        });
+        // The one furthest along would read as done while three others sit at
+        // nothing: the *least* finished is what the button reports.
+        match making.fold(f32::INFINITY, f32::min) {
+            least if least.is_finite() => format!(" · {}%", (least * 100.) as u32),
+            _ => String::new(),
+        }
+    }
+
+    /// Whether any stand-in is still being made -- what keeps the frame loop
+    /// alive while one is, so its percentage moves on screen.
+    pub(crate) fn making_proxies(&self) -> bool {
+        self.proxies
+            .values()
+            .any(|p| matches!(p, Proxy::Making(_)))
+    }
+
+    /// How many films are between "shall we?" and "done": the number the start
+    /// of another is held against ([`PROXIES_AT_ONCE`]). A header being read
+    /// counts, because the answer may be an encode.
+    pub(crate) fn in_flight_proxies(&self) -> usize {
+        self.proxies
+            .values()
+            .filter(|p| matches!(p, Proxy::Asked | Proxy::Making(_)))
+            .count()
+    }
+
+    /// Cuts on the stand-ins, or on the films themselves. The picture and only
+    /// the picture: the sound is the film's either way, and so is every frame
+    /// an export writes.
+    pub(crate) fn toggle_proxies(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let on = !session.proxies();
+        session.set_proxies(on);
+        // What is really under the switch, said in the same breath: a project
+        // whose films have no stand-in yet would otherwise read as a switch
+        // that does nothing.
+        let ready = self
+            .proxies
+            .values()
+            .filter(|p| matches!(p, Proxy::Ready))
+            .count();
+        let making = self
+            .proxies
+            .values()
+            .filter(|p| matches!(p, Proxy::Making(_)))
+            .count();
+        let text = match (on, ready, making) {
+            (false, ..) => "PROXIES OFF — the films themselves are what play".to_string(),
+            (true, 0, 0) => {
+                "PROXIES ON — no film here has one, so the films themselves play".to_string()
+            }
+            (true, 0, n) => format!("PROXIES ON — {n} still being made; the films play until then"),
+            (true, n, 0) => format!("PROXIES ON — cutting on {n}"),
+            (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),
+        };
+        eprintln!("{text}");
+        self.notify_user(text.into());
+        self.reset_after_reseek();
+        cx.notify();
+    }
+
     pub(crate) fn poll_import(&mut self, cx: &mut Context<Self>) {
         match &mut self.importing {
             Some(import) => {

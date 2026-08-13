@@ -23,6 +23,7 @@ impl Render for Player {
         self.poll_export();
         self.poll_import(cx);
         self.poll_silence();
+        self.poll_proxies(cx);
         // Every way a source can arrive -- argv, an import, a project load --
         // has been through a repaint by the time its clips are drawn, so this
         // is the one place that has to notice a new one.
@@ -57,6 +58,10 @@ impl Render for Player {
             // the screen on a repaint, and a still line is the very thing this
             // card was rewritten to disprove.
             || self.silence_scan.is_some()
+            // ...and a stand-in being made: its percentage on the library row
+            // only reaches the screen on a repaint, and a bar that never moves
+            // is exactly what a person reads as a hung encode.
+            || self.making_proxies()
         {
             window.request_animation_frame();
         }

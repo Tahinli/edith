@@ -645,6 +645,13 @@ pub(crate) fn export_settings(
         // caller that writes a file; the rest of them are asking about the
         // bitrate and the format.
         subtitles: Vec::new(),
+        // Neither is a delivery setting: both belong to the stand-ins
+        // [`engine::proxy`] writes -- every frame a key frame costs bits
+        // nobody delivering wants, and a file kept in its source's colour
+        // space is one for this editor to read back rather than to hand
+        // anybody.
+        intra_only: false,
+        keep_source_colour: false,
     }
 }
 

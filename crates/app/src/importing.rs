@@ -62,6 +62,43 @@ pub(crate) enum Wave {
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 
+/// What a source's stand-in is up to ([`engine::proxy`]). Kept per file and
+/// filled like every other library fact -- presence means "asked", so a repaint
+/// mid-encode cannot start a second one.
+pub(crate) enum Proxy {
+    /// The header is being read to find out whether this file wants one. Its
+    /// own state because it is what makes "how many are in flight" a number:
+    /// the answer comes back on a worker, and until it does this file may still
+    /// turn into an encode.
+    Asked,
+    /// A file this machine cuts at speed as it is: no stand-in, and none
+    /// wanted ([`engine::proxy::wanted`]).
+    Native,
+    /// Being made, in the background, while the film keeps playing.
+    Making(engine::proxy::Job),
+    /// There is one in the cache. What the switch actually plays.
+    Ready,
+    /// It could not be made: the film itself is what plays, and the row says
+    /// so rather than leaving a bar that never fills.
+    Failed,
+}
+
+impl Proxy {
+    /// What the library row says about it, or nothing at all for a file that
+    /// never wanted one -- a row per source is not the place to announce that
+    /// nothing is happening.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Self::Asked | Self::Native => String::new(),
+            // Rounded down: a bar that says 100% while the encoder is still
+            // writing is the one number a progress line must never show.
+            Self::Making(job) => format!("proxy {}%", (job.progress() * 100.) as u32),
+            Self::Ready => "proxy".to_string(),
+            Self::Failed => "no proxy".to_string(),
+        }
+    }
+}
+
 /// The import a worker is reading, as the line above the panel shows it. No
 /// fraction anywhere: neither read reports how far into the file it has come,
 /// so what is honest is the file's name, the stage, and two clocks -- one that

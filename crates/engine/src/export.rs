@@ -85,14 +85,14 @@ use crate::tonemap::{self, ToneMapper};
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
-const PROGRESS_SCALE: u32 = 1_000;
+pub(crate) const PROGRESS_SCALE: u32 = 1_000;
 
 /// The head of the bar the *sound* owns, before a picture is written at all.
 /// The mix is decoded, encoded and measured before the muxer exists ([`run`]
 /// says why), and on a feature film that is a minute or two in which a bar
 /// pinned at zero is the only thing on screen -- which reads as an export that
 /// has hung. Small, because the picture is still nearly all of the work.
-const AUDIO_BAND: u32 = PROGRESS_SCALE / 20;
+pub(crate) const AUDIO_BAND: u32 = PROGRESS_SCALE / 20;
 
 /// Where the bar stands with `done` of `total` pictures written: the sound's
 /// band is already behind it ([`AUDIO_BAND`]), so the picture fills what is
@@ -300,6 +300,29 @@ pub struct ExportSettings {
     /// name rather than truncated; an mp4 numbers its tracks in 32 bits and has
     /// no such ceiling.
     pub subtitles: Vec<usize>,
+    /// Code every picture as a key frame a decoder may be started from: no
+    /// frame references another, the file is an intraframe master in the shape
+    /// of ProRes, and a seek to any frame at all is one decode.
+    ///
+    /// Bigger files for that, so it is off for delivery and on for the
+    /// stand-ins [`crate::proxy`] makes, which exist precisely to be seeked
+    /// through. The HEVC seats are intra-only whatever this says
+    /// ([`Enc::open_hevc`]); this is the H.264 pair's switch.
+    pub intra_only: bool,
+    /// Write the picture in the space its **source** declares -- no tone map to
+    /// SDR, no matrix conversion -- and tag the file with it, instead of
+    /// converting everything into the space the output height implies.
+    ///
+    /// For a preview file and nothing else ([`crate::proxy`]): it makes the
+    /// stand-in a smaller copy of the film rather than a rendition of it, so
+    /// the screen tone-maps it live with whatever preset the project is set to
+    /// -- and it takes the per-frame conversion off the *source's* full
+    /// resolution, which on a 4K HDR film was 48 ms a frame and the whole of a
+    /// proxy's cost (measured 2026-08-13).
+    ///
+    /// A delivery export must leave it off: an mp4 in BT.2020 PQ is a file for
+    /// this editor to read back, not one to hand anybody.
+    pub keep_source_colour: bool,
 }
 
 struct Shared {
@@ -390,6 +413,15 @@ pub fn start(
     part.push(".part");
     let part = PathBuf::from(part);
     let spawned = thread::Builder::new().name("export".into()).spawn(move || {
+        // Every file this export will read, named before a byte of one is.
+        // These are the project's own sources and can be nothing else: a
+        // stand-in ([`crate::proxy`]) is a substitution playback makes when it
+        // opens a span, and nothing here knows such a thing exists. Printed so
+        // that "the delivery came off the film itself" is a grep rather than a
+        // belief.
+        for source in project.sources() {
+            eprintln!("export source: {}", source.path.display());
+        }
         // The rename is the last step and the only one that publishes a file
         // under the name the caller asked for; it stays on the same directory,
         // so it is atomic.
@@ -525,6 +557,20 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
         format if format.is_av1() && !forced("VE_HW_AV1") => None,
         format if format.is_av1() => {
             HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
+        }
+        // An intra-only H.264 file is a *different seat*, not the same seat with
+        // a flag on the pictures: asking this one for a key frame every time
+        // gets I slices that are not IDRs and carry no parameter sets, which is
+        // a file with one starting point in it however many I pictures it holds
+        // (measured: a 60-frame hardware proxy, 1 sync point of 60). `None`
+        // where the plugin is older than that seat, and then the software
+        // encoder takes the file -- its `gop_size = 1` writes what was asked
+        // for, slowly, which is the only honest fallback here.
+        //
+        // Only H.264 reaches this arm: the two arms above take every HEVC and
+        // AV1 format, and the HEVC seat is intra-only already.
+        _ if settings.intra_only => {
+            HwEncoder::open_intra(meta.width, meta.height, fps_num, fps_den, bitrate)
         }
         _ => HwEncoder::open(meta.width, meta.height, fps_num, fps_den, bitrate),
     }
@@ -1735,6 +1781,22 @@ fn run(
     settings: &ExportSettings,
 ) -> crate::Result<()> {
     let total = project.timeline_frames();
+    // The two preview switches are the H.264 mp4 pair's alone. Only that
+    // container carries a colour of its own back out ([`write_video`] tags it
+    // there), so asking any other for a source-space file would write pictures
+    // in one space and a header in another; and only that codec's seats honour
+    // `intra_only` -- the HEVC pair is intra whatever it says, and an AV1 one
+    // would quietly write the long-GOP file it always did.
+    if settings.keep_source_colour && settings.format != Format::Mp4 {
+        return Err(format!(
+            "{} cannot be written in its source's colour space",
+            settings.format.name()
+        )
+        .into());
+    }
+    if settings.intra_only && settings.format != Format::Mp4 {
+        return Err(format!("{} cannot be written intra-only", settings.format.name()).into());
+    }
     let sources = project.sources();
     // The picture's decision first, before a sample of sound is touched: it is
     // the answer that decides what the whole export *is*, it costs one header
@@ -1874,14 +1936,24 @@ fn run(
     let tone: Vec<Option<ToneMapper>> = rates
         .iter()
         .map(|(_, color, peak)| match color.transfer {
+            // A preview file keeps the film's own curve and is tone-mapped when
+            // it is *shown* ([`ExportSettings::keep_source_colour`]), which is
+            // both cheaper and the only way the preset can still be changed
+            // after the stand-in was made.
+            _ if settings.keep_source_colour => None,
             Transfer::Sdr => None,
             Transfer::Pq => Some(ToneMapper::new(tonemap::Transfer::Pq, preset, *peak)),
             Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset, *peak)),
         })
         .collect();
     // ...and the one space they are all written in, the same rule a reader with
-    // no tags to read would apply to this file's height.
-    let out_color = ColorDescription::output(meta.height);
+    // no tags to read would apply to this file's height -- or, for a preview
+    // file, the source's own, which is what makes every remap below the
+    // identity and the file's `colr` box its film's.
+    let out_color = match settings.keep_source_colour {
+        true => meta.color,
+        false => ColorDescription::output(meta.height),
+    };
 
     let mut encoder = Enc::open(meta, settings)?;
     // What this file is really being written by, for a progress line to name.
@@ -2068,11 +2140,11 @@ fn run(
             // graded and placed, so a held frame costs an encode and no decode.
             for _ in 0..repeats {
                 let coded = match &frame {
-                    Frame::Dma(dma) => encoder.encode_dma(dma)?,
+                    Frame::Dma(dma) => encoder.encode_dma(dma, settings.intra_only)?,
                     Frame::Pixels(..) => {
                         let (y, u, v, width, height) =
                             placed.expect("a picture with pixels was placed");
-                        encoder.encode(y, u, v, width, height)?
+                        encoder.encode(y, u, v, width, height, settings.intra_only)?
                     }
                 };
                 if let Some((au, key)) = coded {
@@ -2813,6 +2885,12 @@ fn write_video(
             )?)) else {
                 unreachable!("just inserted an mp4 muxer")
             };
+            // A file written in its source's own space says so, rather than
+            // claiming the space its height would imply
+            // ([`ExportSettings::keep_source_colour`]).
+            if settings.keep_source_colour {
+                mp4.set_colour(meta.color);
+            }
             mp4
         }
     };
@@ -2946,8 +3024,13 @@ impl Enc {
         cfg.framerate = meta.frame_rate as f32;
         cfg.bitrate = bitrate.min(u32::MAX as u64) as u32;
         // Two seconds between key frames, and no B-frames on either path: the
-        // muxer times everything by duration alone, which reordering would break.
-        cfg.gop_size = (meta.frame_rate * 2.0).round().max(1.0) as u32;
+        // muxer times everything by duration alone, which reordering would
+        // break. A proxy asks for one frame a GOP, which is every frame its own
+        // starting point ([`ExportSettings::intra_only`]).
+        cfg.gop_size = match settings.intra_only {
+            true => 1,
+            false => (meta.frame_rate * 2.0).round().max(1.0) as u32,
+        };
         cfg.bframes = 0;
         // S1 measured Fast at 1.30x realtime and Balanced at 0.46x for the same
         // bitrate, so Fast is what a fallback should be.
@@ -3109,6 +3192,7 @@ impl Enc {
         v: &[u8],
         width: u32,
         height: u32,
+        intra: bool,
     ) -> crate::Result<Option<(&[u8], bool)>> {
         match self {
             Self::Av1Hw(hw) => {
@@ -3158,9 +3242,13 @@ impl Enc {
                 // frame -- which is what an intraframe master means.
                 Ok(pop_hevc(hevc))
             }
+            // A key frame is asked for on every picture where the file is an
+            // intraframe one, and the flag says what was asked: the mp4 muxer
+            // reads its own sync marks off the IDR slices either way, so this
+            // is what a Matroska one would be told.
             Self::Hw(hw) => Ok(hw
-                .encode(y, u, v, width, height, false)?
-                .map(|au| (au, false))),
+                .encode(y, u, v, width, height, intra)?
+                .map(|au| (au, intra))),
             Self::Sw { encoder, au, .. } => {
                 let frame = YuvFrame {
                     width: width as usize,
@@ -3196,9 +3284,16 @@ impl Enc {
     /// Same answer as [`Enc::encode`], including which units a decoder may be
     /// started from, because it is the same encoder -- only the picture took
     /// another way in.
-    fn encode_dma(&mut self, dma: &DmaFrame) -> crate::Result<Option<(&[u8], bool)>> {
+    ///
+    /// `intra` therefore carries here too, and not for symmetry's sake: a proxy
+    /// of a file already small enough is coded at that file's own size
+    /// ([`crate::proxy::size_for`]), which is the one case where an intraframe
+    /// export's decoder and encoder agree on a surface and the buffer goes
+    /// straight across. An access unit marked as no sync point there would give
+    /// a stand-in whose whole reason to exist is that every frame is one.
+    fn encode_dma(&mut self, dma: &DmaFrame, intra: bool) -> crate::Result<Option<(&[u8], bool)>> {
         match self {
-            Self::Hw(hw) => Ok(hw.encode_dma(dma, false)?.map(|au| (au, false))),
+            Self::Hw(hw) => Ok(hw.encode_dma(dma, intra)?.map(|au| (au, intra))),
             // Every picture an IDR here, exactly as in [`Enc::encode`].
             Self::HevcHw(hw) => Ok(hw.encode_dma(dma, true)?.map(|au| (au, true))),
             // Unreachable through [`Enc::dma_want`], which is the only thing
