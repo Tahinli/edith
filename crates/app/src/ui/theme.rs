@@ -6,20 +6,27 @@
 //! *role*, never the shade -- `bg/panel`, not "the dark grey" -- so the palette
 //! can be swapped whole without touching a single element.
 //!
-//! Which is what the two modules below are for. Both families carry the same
-//! role names, so the switch between them is one field lookup and no call site
-//! knows it happened -- and a role missing from either is a compile error
-//! rather than a region that quietly kept the old colour.
+//! Which is what the modules below are for. Every family carries the same role
+//! names, so the switch between them is one field lookup and no call site knows
+//! it happened -- and a role missing from any of them is a compile error rather
+//! than a region that quietly kept the old colour.
 //!
 //! * `cool` (default) -- near-black ground, cool neutral chrome, one cyan accent.
 //! * `warm` -- a deep neutral warmed towards brown so no surface reads as
 //!   office grey, with one coral accent.
+//! * `forest` -- a green-tinted ground under one emerald accent.
+//! * `violet` -- an indigo ground under one lavender accent.
+//! * `rose` -- a neutral ground the accent alone warms, in rose.
+//! * `amber` -- a graphite ground under one gold accent.
 //!
-//! Both take the clip bodies from the cross-NLE kind convention (video blue,
-//! audio green, image teal, text purple) instead of four greys that differ by a
-//! hair, and both are held to the same measured floors: the contrast guards in
-//! `main.rs` run against *every* palette in [`PaletteId::ALL`], so a third one
-//! lands gated rather than untested.
+//! All six are dark: colour work is judged against its surround, and a light
+//! ground pushes every clip body and every graded frame the wrong way -- which
+//! is why no editor of this kind ships one. All six take the clip bodies from
+//! the cross-NLE kind convention (video blue, audio green, image teal, text
+//! purple) instead of four greys that differ by a hair, and all six are held to
+//! the same measured floors: the contrast and tint guards in `main.rs` run
+//! against *every* palette in [`PaletteId::ALL`], so the seventh lands gated
+//! rather than untested.
 //!
 //! Which family is in force is the user's, picked from the toolbar's Theme
 //! button or its stroke and kept in `~/.config/edith/theme` beside the
@@ -32,10 +39,15 @@ use engine::project::LaneKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-/// The whole table, once: every role, its type, and the two families' numbers
-/// read out of the modules below. One list, so a role added to [`Palette`]
-/// without a value in both families is a compile error and a role read at a
-/// paint cannot come from anywhere but the palette in force.
+/// The whole table, once: every role and its type, gathered from each family's
+/// module below. One list, so a role added to [`Palette`] without a value in
+/// every family is a compile error, and a role read at a paint cannot come from
+/// anywhere but the palette in force.
+///
+/// ponytail: the families are spelled out in [`PALETTES`] rather than derived
+/// from a second list -- `macro_rules!` cannot nest a repetition over families
+/// inside one over roles, and the escape hatch for that is unstable. Ceiling: a
+/// seventh family is one line there, one variant in [`PaletteId`], one module.
 macro_rules! palette {
     ($($name:ident: $ty:ty),+ $(,)?) => {
         /// One family's numbers, in a struct so the set can be swapped whole.
@@ -47,9 +59,13 @@ macro_rules! palette {
 
         /// The families in [`PaletteId::ALL`]'s order, so the index the atomic
         /// holds is the id itself.
-        static PALETTES: [Palette; 2] = [
+        static PALETTES: [Palette; PaletteId::ALL.len()] = [
             Palette { $($name: cool::$name,)+ },
             Palette { $($name: warm::$name,)+ },
+            Palette { $($name: forest::$name,)+ },
+            Palette { $($name: violet::$name,)+ },
+            Palette { $($name: rose::$name,)+ },
+            Palette { $($name: amber::$name,)+ },
         ];
 
         $(
@@ -99,34 +115,57 @@ palette! {
     HIST_INK: [u32; 3],
 }
 
-/// Which family a person picked. An enum and not a bool: two today, and the
-/// door in the toolbar is a list rather than a toggle because the third one
-/// must cost a line here and nothing anywhere else.
+/// Which family a person picked. An enum and not a bool: the door in the
+/// toolbar is a list rather than a toggle precisely because the next family
+/// must cost one variant here, one module below, and nothing anywhere else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaletteId {
     Cool,
     Warm,
+    Forest,
+    Violet,
+    Rose,
+    Amber,
 }
 
 impl PaletteId {
     /// Display order -- the picker lists them in it, and the index into
-    /// [`PALETTES`] *is* the position in it.
-    pub const ALL: [PaletteId; 2] = [PaletteId::Cool, PaletteId::Warm];
+    /// [`PALETTES`] *is* the position in it, so this order and that array are
+    /// the same order or every colour is wrong.
+    pub const ALL: [PaletteId; 6] = [
+        PaletteId::Cool,
+        PaletteId::Warm,
+        PaletteId::Forest,
+        PaletteId::Violet,
+        PaletteId::Rose,
+        PaletteId::Amber,
+    ];
 
     /// What the button and the picker row call it.
     pub fn label(self) -> &'static str {
         match self {
             PaletteId::Cool => "Cool",
             PaletteId::Warm => "Warm",
+            PaletteId::Forest => "Forest",
+            PaletteId::Violet => "Violet",
+            PaletteId::Rose => "Rose",
+            PaletteId::Amber => "Amber",
         }
     }
 
     /// The small print beside the row: what the family actually looks like, so
-    /// the choice is made before the click rather than after it.
+    /// the choice is made before the click rather than after it. Short enough
+    /// to sit in the list's right-hand column at the 640x360 floor -- past
+    /// thirty characters it is truncated mid-word, which is a description that
+    /// describes nothing.
     pub fn detail(self) -> &'static str {
         match self {
             PaletteId::Cool => "near-black ground, cyan accent",
             PaletteId::Warm => "warm ground, coral accent",
+            PaletteId::Forest => "green ground, emerald",
+            PaletteId::Violet => "indigo ground, lavender",
+            PaletteId::Rose => "neutral ground, rose",
+            PaletteId::Amber => "graphite ground, gold",
         }
     }
 
@@ -136,6 +175,10 @@ impl PaletteId {
         match self {
             PaletteId::Cool => "cool",
             PaletteId::Warm => "warm",
+            PaletteId::Forest => "forest",
+            PaletteId::Violet => "violet",
+            PaletteId::Rose => "rose",
+            PaletteId::Amber => "amber",
         }
     }
 
@@ -352,6 +395,258 @@ pub mod warm {
     pub const EQ_SPECTRUM_INK: u32 = 0xbdb1a866;
     pub const EQ_FILL_INK: u32 = 0xff7a4526;
     pub const EQ_BELL_INK: u32 = 0xff7a4566;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family C: the ground itself green, dark enough that a graded frame is still
+/// the brightest thing on screen, with one emerald accent. The playhead goes
+/// pink here for the same reason it is pink in `cool`: it crosses the emerald
+/// and every clip body, so it may belong to none of them.
+pub mod forest {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x080d0a;
+    pub const BG_PANEL: u32 = 0x121b16;
+    pub const BG_RAISED: u32 = 0x1e2c24;
+    pub const BG_TIMELINE: u32 = 0x0b1310;
+    pub const BG_HOVER: u32 = 0x2c4034;
+    pub const BG_HOVER_DIM: u32 = 0x1a2620;
+    /// Deeper than the accent it is made of: the dim ink on a picked row is held
+    /// to 4.5:1 like every other family's (WCAG 1.4.3), and emerald at surface
+    /// brightness will not carry it.
+    pub const BG_SELECTED: u32 = 0x14503a;
+    pub const SCRIM: u32 = 0x080d0acc;
+    pub const SCRIM_LIGHT: u32 = 0x080d0a55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x25362c;
+    pub const STROKE_FOCUS: u32 = 0xffd166;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xe7f3eb;
+    pub const FG_SECONDARY: u32 = 0xa8c4b4;
+    pub const FG_DISABLED: u32 = 0x6e8579;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0x34d399;
+    pub const ACCENT_HOVER: u32 = 0x6ee7b7;
+    pub const ACCENT_PLAYHEAD: u32 = 0xff9db0;
+    pub const ACCENT_WASH: u32 = 0x34d399aa;
+
+    // -- clip kinds (the cross-NLE convention, at this family's weight) ---------
+    pub const CLIP_VIDEO: u32 = 0x2b5fa8;
+    /// Darker than the other families' green: on a green ground a clip body has
+    /// to be the object and the bed the hole, and the dim ink on it still owes
+    /// 3:1 (WCAG 1.4.11).
+    pub const CLIP_AUDIO: u32 = 0x256b44;
+    pub const CLIP_IMAGE: u32 = 0x1a6a6a;
+    pub const CLIP_TEXT: u32 = 0x6b46c1;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0x5fd68f, 0xd6a45f, 0x5fa8d6, 0xc15fd6];
+
+    // -- feedback ---------------------------------------------------------------
+    /// Not the accent family: a success that wore the emerald would say "this is
+    /// live" in the same colour the whole window says it in.
+    pub const STATUS_ERROR: u32 = 0xf07171;
+    pub const STATUS_WARNING: u32 = 0xe3b341;
+    pub const STATUS_SUCCESS: u32 = 0x7bd88f;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x7a2a33;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x25362c;
+    pub const EQ_SPECTRUM_INK: u32 = 0xa8c4b466;
+    pub const EQ_FILL_INK: u32 = 0x34d39926;
+    pub const EQ_BELL_INK: u32 = 0x34d39966;
+    /// The three channel inks are the picture's own R, G and B: they mean the
+    /// same thing in every family, so they are the same numbers in every family.
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family D: an indigo ground with one lavender accent -- the cold end of the
+/// set, where `cool` is neutral-cold and this one is frankly blue. The playhead
+/// is the yellow that is furthest from everything in it.
+pub mod violet {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x0a0a12;
+    pub const BG_PANEL: u32 = 0x171827;
+    pub const BG_RAISED: u32 = 0x252842;
+    pub const BG_TIMELINE: u32 = 0x0e0f1b;
+    pub const BG_HOVER: u32 = 0x353a5e;
+    pub const BG_HOVER_DIM: u32 = 0x1f2138;
+    pub const BG_SELECTED: u32 = 0x3b2a78;
+    pub const SCRIM: u32 = 0x0a0a12cc;
+    pub const SCRIM_LIGHT: u32 = 0x0a0a1255;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x2e3150;
+    pub const STROKE_FOCUS: u32 = 0xfde68a;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xeceafb;
+    pub const FG_SECONDARY: u32 = 0xb6b4d8;
+    pub const FG_DISABLED: u32 = 0x7b79a0;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xa78bfa;
+    pub const ACCENT_HOVER: u32 = 0xc4b5fd;
+    pub const ACCENT_PLAYHEAD: u32 = 0xfacc15;
+    pub const ACCENT_WASH: u32 = 0xa78bfaaa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    /// A shade off the accent on purpose: a text clip and "press this" must not
+    /// be the same purple.
+    pub const CLIP_TEXT: u32 = 0x6d3fa8;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0x9b7fe8, 0xe8a97f, 0x7fc8e8, 0xe87fb4];
+
+    // -- feedback ---------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = 0xf87171;
+    pub const STATUS_WARNING: u32 = 0xfbbf24;
+    pub const STATUS_SUCCESS: u32 = 0x6ee7b7;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x7c2440;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x2e3150;
+    pub const EQ_SPECTRUM_INK: u32 = 0xb6b4d866;
+    pub const EQ_FILL_INK: u32 = 0xa78bfa26;
+    pub const EQ_BELL_INK: u32 = 0xa78bfa66;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family E: a ground with no cast at all -- the neutral one, for grading, where
+/// nothing but the accent has a hue. That accent is rose, and the playhead is
+/// the cyan on the other side of the wheel from it.
+pub mod rose {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x0c0b0c;
+    pub const BG_PANEL: u32 = 0x1a181a;
+    pub const BG_RAISED: u32 = 0x2a272a;
+    pub const BG_TIMELINE: u32 = 0x121012;
+    pub const BG_HOVER: u32 = 0x3d383d;
+    pub const BG_HOVER_DIM: u32 = 0x221f22;
+    pub const BG_SELECTED: u32 = 0x6b1f38;
+    pub const SCRIM: u32 = 0x0c0b0ccc;
+    pub const SCRIM_LIGHT: u32 = 0x0c0b0c55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x332f33;
+    pub const STROKE_FOCUS: u32 = 0xfcd34d;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xf3edef;
+    pub const FG_SECONDARY: u32 = 0xc0b4b8;
+    pub const FG_DISABLED: u32 = 0x8a7e82;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xfb7185;
+    pub const ACCENT_HOVER: u32 = 0xfda4af;
+    pub const ACCENT_PLAYHEAD: u32 = 0x67e8f9;
+    pub const ACCENT_WASH: u32 = 0xfb7185aa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    pub const CLIP_TEXT: u32 = 0x6b46c1;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0xe87f97, 0x7fc8e8, 0xe8c87f, 0x9b7fe8];
+
+    // -- feedback ---------------------------------------------------------------
+    /// Brighter and more saturated than the accent it sits near on the wheel: on
+    /// a rose window a failure has to be louder than "this is live", and the
+    /// message's own first word says which it is either way ([`super::notice_tone`]).
+    pub const STATUS_ERROR: u32 = 0xff4d4d;
+    pub const STATUS_WARNING: u32 = 0xfacc15;
+    pub const STATUS_SUCCESS: u32 = 0x4ade80;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x8f2740;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x332f33;
+    pub const EQ_SPECTRUM_INK: u32 = 0xc0b4b866;
+    pub const EQ_FILL_INK: u32 = 0xfb718526;
+    pub const EQ_BELL_INK: u32 = 0xfb718566;
+    pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+}
+
+/// Family F: a graphite ground -- neutral, a touch warm -- under one gold
+/// accent. The focus ring turns sky here: gold is the accent now, and the
+/// keyboard's ring is the one thing that may never be mistaken for it.
+pub mod amber {
+    // -- surfaces ---------------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x0d0d0c;
+    pub const BG_PANEL: u32 = 0x1b1b19;
+    pub const BG_RAISED: u32 = 0x2b2b27;
+    pub const BG_TIMELINE: u32 = 0x131311;
+    pub const BG_HOVER: u32 = 0x3e3e38;
+    pub const BG_HOVER_DIM: u32 = 0x232320;
+    /// Gold at surface brightness carries neither ink at 4.5:1, so the picked
+    /// row is the accent taken down to a bronze.
+    pub const BG_SELECTED: u32 = 0x5e3a0b;
+    pub const SCRIM: u32 = 0x0d0d0ccc;
+    pub const SCRIM_LIGHT: u32 = 0x0d0d0c55;
+
+    // -- strokes ----------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x35352f;
+    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
+    pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = 0xf2f0e9;
+    pub const FG_SECONDARY: u32 = 0xbdbaae;
+    pub const FG_DISABLED: u32 = 0x87857c;
+
+    // -- interaction ------------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = 0xfbbf24;
+    pub const ACCENT_HOVER: u32 = 0xfcd34d;
+    pub const ACCENT_PLAYHEAD: u32 = 0x93c5fd;
+    pub const ACCENT_WASH: u32 = 0xfbbf24aa;
+
+    // -- clip kinds -------------------------------------------------------------
+    pub const CLIP_VIDEO: u32 = 0x2f5a9e;
+    pub const CLIP_AUDIO: u32 = 0x2c6b49;
+    pub const CLIP_IMAGE: u32 = 0x1c6270;
+    pub const CLIP_TEXT: u32 = 0x6b46c1;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0xe8b45f, 0x5fa8e8, 0x7fd69b, 0xd68fc1];
+
+    // -- feedback ---------------------------------------------------------------
+    /// The warning steps to orange: amber *is* the accent here, and a warning
+    /// wearing it would be indistinguishable from every live control.
+    pub const STATUS_ERROR: u32 = 0xf05252;
+    pub const STATUS_WARNING: u32 = 0xfb923c;
+    pub const STATUS_SUCCESS: u32 = 0x4ade80;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = 0x7a2f24;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = 0xffffff;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram ----------------------------------
+    pub const EQ_GRID: u32 = 0x35352f;
+    pub const EQ_SPECTRUM_INK: u32 = 0xbdbaae66;
+    pub const EQ_FILL_INK: u32 = 0xfbbf2426;
+    pub const EQ_BELL_INK: u32 = 0xfbbf2466;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
 }
 
