@@ -6,10 +6,15 @@
 //! H.264 encode entrypoint, so they are `#[ignore]`d:
 //!
 //! ```text
-//! cargo build -p engine -p engine-hw --release
+//! cargo build -p engine-hw --release
 //! LD_LIBRARY_PATH=target/release \
 //!   cargo test -p engine --release --test export -- --ignored --nocapture --test-threads=1
 //! ```
+//!
+//! That build is its own step and stays its own step: `--tests` (or building
+//! `-p engine` alongside) does **not** rebuild the cdylib, so the plugin beside
+//! the test binary is whatever was there last time -- a stale one, silently, and
+//! every hardware claim measured against it is about code nobody edited.
 //!
 //! Both env pins are process-wide, hence `--test-threads=1` for the ignored run.
 
@@ -995,7 +1000,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
 /// no proxy at all. The seat that answers this is `vh_enc_open_intra`.
 ///
 /// ```text
-/// cargo build -p engine -p engine-hw --release
+/// cargo build -p engine-hw --release   # its own step: `--tests` leaves it stale
 /// LD_LIBRARY_PATH=target/release cargo test -p engine --release --test export \
 ///   -- --ignored --nocapture --test-threads=1 hardware_proxy
 /// ```
@@ -1048,7 +1053,7 @@ fn a_hardware_proxy_is_every_frame_a_starting_point_too() {
 /// number wanted is a rate, not a wall time.
 ///
 /// ```text
-/// cargo build -p engine -p engine-hw --release
+/// cargo build -p engine-hw --release   # its own step: `--tests` leaves it stale
 /// LD_LIBRARY_PATH=target/release cargo test -p engine --release --test export \
 ///   -- --ignored --nocapture --test-threads=1 proxy_of_his_4k
 /// ```
