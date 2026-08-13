@@ -345,6 +345,24 @@ pub fn compose_i420(
 /// lift the black frame around the picture. Callers therefore grade the source
 /// planes and place the result; the bars stay exactly [`black_i420`].
 ///
+/// How many `width` x `height` BGRA pictures a decode worker may keep ahead of
+/// its consumer: ~96 MB of them, so the queue is a memory budget rather than a
+/// frame count -- 16 at 720p (the ceiling), 12 at 1080p, 3 at 3840x2160, 2 at
+/// 4096x2160 (the floor), all measured. A worker holds one more than this in its
+/// hand, so a burst off a full queue is `queue_depth + 1`.
+///
+/// The floor of 2 is the bound this engine ran on everywhere before there was
+/// any decode-ahead; the ceiling keeps a small picture from queueing a second of
+/// video the consumer would have to walk through after a seek.
+pub(crate) fn queue_depth(width: u32, height: u32) -> usize {
+    const BUDGET: usize = 96 << 20;
+    let bytes = width as usize * height as usize * 4;
+    if bytes == 0 {
+        return 2;
+    }
+    (BUDGET / bytes).clamp(2, 16)
+}
+
 /// A canvas of the picture's own size is a pass-through: [`place`](Composer::place)
 /// hands the caller's own planes straight back, allocates nothing and touches no
 /// byte, which is what keeps a project at its media's resolution the byte-for-byte
@@ -386,22 +404,25 @@ impl Composer {
         Self::new(0, 0, FitPolicy::Fit)
     }
 
+    /// Whether this canvas is the one that places nothing
+    /// ([`passthrough`](Self::passthrough)) -- asked without a picture in hand,
+    /// unlike [`is_passthrough`](Self::is_passthrough), because the caller that
+    /// needs it is sizing a queue before anything has been decoded.
+    pub(crate) fn places_nothing(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
     /// How many decoded pictures a worker over this canvas may keep ahead of
     /// its consumer: a budget in *bytes*, so a 4K project runs a shallower queue
     /// than a 1080p one instead of the same number of far bigger frames.
     ///
-    /// The floor is 2 -- the bound this engine ran on everywhere before there
-    /// was a decode-ahead at all -- and it is also what a pass-through canvas
-    /// gets, since that one does not know what size the pictures will be (they
-    /// are the source's) and its callers pull frame by frame anyway.
+    /// A **pass-through** canvas has no size of its own -- the pictures come out
+    /// at the source's -- so it cannot answer, and the caller that knows the
+    /// stream asks [`queue_depth`] with those dimensions instead. Answering 2
+    /// here would be the pre-decode-ahead bound, which is exactly the bug this
+    /// pair exists to keep out of the file-open path.
     pub(crate) fn queue_depth(&self) -> usize {
-        /// ~96 MB of BGRA in flight: eleven 1080p pictures, two 4K ones.
-        const BUDGET: usize = 96 << 20;
-        let bytes = self.width as usize * self.height as usize * 4;
-        if bytes == 0 {
-            return 2;
-        }
-        (BUDGET / bytes).clamp(2, 16)
+        queue_depth(self.width, self.height)
     }
 
     /// Whether a `src_w` x `src_h` picture is already the canvas, i.e. this

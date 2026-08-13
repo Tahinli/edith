@@ -1491,8 +1491,9 @@ impl PlaybackSession {
             // [`decode_backend`](Self::decode_backend) describing a worker that
             // is no longer feeding anything). A dead receiver instead, which is
             // what carries the session on to the next span. The old worker stays
-            // parked in `self.worker` where the caller already cancelled it; the
-            // next span retires it.
+            // parked in `self.worker`, where the caller has already abandoned
+            // the span it was decoding ([`Worker::abandon`]) without ending the
+            // thread; the next span reseeks it or retires it.
             self.frames = std::sync::mpsc::channel().1;
             self.backend = BackendCell::new(Backend::Gap);
             self.span = span;
@@ -2608,8 +2609,14 @@ impl PlaybackSession {
     /// A front-end that turns this on was dropping those very frames itself, one
     /// repaint later (`Player::pump` takes everything due and shows the last):
     /// what changes is where the work stops, and therefore how quickly a decoder
-    /// that fell behind catches up -- without the restart-every-two-seconds that
-    /// was the only way back before ([`Self::resync_picture`]).
+    /// that fell behind catches up.
+    ///
+    /// It does not replace [`resync_picture`](Self::resync_picture): both
+    /// mechanisms are live and this one is the first line. It catches up without
+    /// restarting anything, which is why the front-end's resync -- a picture
+    /// restart, once per `RESYNC_GAP` -- now fires only where dropping was not
+    /// enough (a decoder so far behind that even one picture in nine
+    /// ([`crate::decode`]'s `LATE_RUN`) cannot close the gap).
     pub fn drop_late_pictures(&mut self, on: bool) {
         self.drop_late = on;
     }
