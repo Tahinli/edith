@@ -343,7 +343,9 @@ impl LibraryTab {
         match self {
             LibraryTab::Media => "No video or stills yet — Import, or drop a file on the window",
             LibraryTab::Audio => "No sound yet — Import, or drop a file on the window",
-            LibraryTab::Text => "No subtitles yet — drop an .srt on the window, or + S in the toolbar",
+            LibraryTab::Text => {
+                "No subtitles yet — Add subtitles from a file, or drop an .srt on the window"
+            }
         }
     }
 }
@@ -4808,7 +4810,7 @@ impl Player {
                 let added = this
                     .session
                     .as_mut()
-                    .map(|session| parsed.map(|tracks| session.add_subtitle_tracks(tracks)));
+                    .map(|session| parsed.and_then(|tracks| pushed(session, &path, tracks)));
                 this.landed_subtitles(&path, added, cx);
             })
             .ok();
@@ -4826,7 +4828,7 @@ impl Player {
         let added = self
             .session
             .as_mut()
-            .map(|session| subs.map(|tracks| session.add_subtitle_tracks(tracks)));
+            .map(|session| subs.and_then(|tracks| pushed(session, path, tracks)));
         self.landed_subtitles(path, added, cx);
     }
 
@@ -4842,7 +4844,10 @@ impl Player {
         cx: &mut Context<Self>,
     ) {
         let text = match added {
-            Some(Ok(0)) => format!("{} is already on the timeline", file_name(path)),
+            Some(Ok(0)) => format!(
+                "{}'s subtitles are on the timeline already",
+                file_name(path)
+            ),
             Some(Ok(n)) => format!(
                 "SUBTITLES {} — {n} track(s), showing over the picture, {} hides them",
                 file_name(path),
@@ -6747,6 +6752,33 @@ fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option<String> {
             n => Some(format!(" — {n} subtitle track(s) in the file")),
         },
         Err(e) => Some(format!(" — SUBTITLES UNREAD: {e}")),
+    }
+}
+
+/// The push both deliberate add-subtitles doors end on -- `+ S` and its key
+/// ([`Player::add_subtitles`]) and a dropped or argv'd subtitle file
+/// ([`Player::take_subtitles`]) -- so the two cannot come to word the same file
+/// differently.
+///
+/// The walk having found *nothing* is a refusal and not a count: a container
+/// with no subtitle track in it and a file whose tracks are all on the timeline
+/// already both push zero rows, and they are opposite answers -- one says look
+/// somewhere else, the other says you already have them. The engine's own door
+/// draws the same line in the same words
+/// ([`PlaybackSession::no_subtitles_in`], asked here because this route splits
+/// the walk from the push to keep the walk off the render thread).
+///
+/// The file itself joins nothing either way: no library row, no lane, no clip.
+/// Subtitles are a list the timeline carries, and this is the only thing that
+/// touches it.
+fn pushed(
+    session: &mut PlaybackSession,
+    path: &std::path::Path,
+    tracks: Vec<engine::subtitle::SubtitleTrack>,
+) -> engine::Result<usize> {
+    match tracks.is_empty() {
+        true => Err(PlaybackSession::no_subtitles_in(path)),
+        false => Ok(session.add_subtitle_tracks(tracks)),
     }
 }
 
@@ -15509,6 +15541,44 @@ mod tests {
         // The silence `subtitle_track` gives at the same moment.
         assert_eq!(sub_pick_name(&tracks, 5), None);
         assert_eq!(sub_pick_name(&[], 0), None);
+    }
+
+    /// The door this editor answers "don't make me import the film again" with,
+    /// and it is in the panel where the tracks it adds are listed: the Text
+    /// tab's own button reads a file's subtitle tracks onto the open timeline
+    /// -- a release's `.mkv`, an `.srt` beside it -- while the file itself
+    /// joins nothing. It is the *action* and not a second implementation of it,
+    /// so the button, the stroke and the actions card cannot drift apart, and
+    /// it is oracle-gated like every other action button, so with no timeline
+    /// open it dims and says why instead of opening a chooser for nothing.
+    #[test]
+    fn the_text_tab_carries_the_add_subtitles_door() {
+        let library = include_str!("ui/library.rs");
+        let at = library
+            .find("\"add-subtitles\"")
+            .expect("no add-subtitles control in the library column");
+        let block = &library[at..(at + 1400).min(library.len())];
+        assert!(
+            block.contains("ActionId::AddSubtitleTrack"),
+            "the button is a door of its own rather than the action: {block}"
+        );
+        assert!(
+            block.contains("pick_and_add_subtitles"),
+            "the button does not open the subtitle chooser: {block}"
+        );
+        // `action_control` is the oracle-gated one: dimmed with the refusal in
+        // the oracle's own words. `control` alone would be lit with no timeline.
+        assert!(
+            library[..at].ends_with("self.action_control(\n                    "),
+            "the add-subtitles button is not oracle-gated"
+        );
+        // ...and the empty tab names that button, rather than pointing at a
+        // toolbar the person is not looking at.
+        assert!(
+            crate::LibraryTab::Text.empty().contains("Add subtitles"),
+            "{}",
+            crate::LibraryTab::Text.empty()
+        );
     }
 
     /// The one thing regrouping must not break: `sub_track` is a flat index

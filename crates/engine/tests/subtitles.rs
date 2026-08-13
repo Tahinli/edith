@@ -412,6 +412,66 @@ fn a_subtitle_row_can_be_removed_and_the_survivors_round_trip() {
     assert_eq!(session.subtitles().len(), 2, "and nothing moved");
 }
 
+/// The whole point of the add-subtitles door: another release's subtitle
+/// tracks go onto the timeline that is already open, and the file they came out
+/// of joins *nothing* -- no source row, no lane, no clip. Nobody has to import a
+/// second copy of a film, or break the edit they have, to get its subtitles.
+///
+/// And a file the walk found no subtitle track in is refused as that, in words,
+/// rather than counted as zero: zero added is what a file whose tracks are here
+/// already answers, and the two are opposite instructions to the person reading
+/// them.
+#[test]
+fn subtitles_come_off_another_file_without_it_joining_the_timeline() {
+    let media = asset("test_av.mp4");
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    let sources: Vec<_> = session.sources().iter().map(|s| s.path.clone()).collect();
+    let lanes = session.lanes();
+    let clips: Vec<_> = lanes.iter().map(|&l| session.lane_clips(l).len()).collect();
+    assert_eq!(sources.len(), 1, "one file is open");
+
+    // A different file entirely, carrying two subtitle tracks.
+    let other = asset("test_subs.mkv");
+    assert_eq!(
+        session.import_subtitles(&other).expect("its subtitles come"),
+        2
+    );
+    assert_eq!(session.subtitles().len(), 2);
+    for track in session.subtitles() {
+        assert_eq!(track.path, other, "the rows name the file they came out of");
+        assert!(!track.cues.is_empty(), "with their cues read");
+    }
+    // ...and the timeline is exactly the timeline it was.
+    assert_eq!(
+        session.sources().iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
+        sources,
+        "the file whose subtitles these are did not join the library"
+    );
+    assert_eq!(session.lanes(), lanes, "no lane was added");
+    assert_eq!(
+        session.lanes().iter().map(|&l| session.lane_clips(l).len()).collect::<Vec<_>>(),
+        clips,
+        "and nothing was cut, moved or dropped on one"
+    );
+
+    // The same file again is the same two tracks, not four.
+    assert_eq!(session.import_subtitles(&other).expect("no error"), 0);
+    assert_eq!(session.subtitles().len(), 2);
+
+    // A container walked and carrying none says so, naming the file -- and the
+    // claim is only made after the walk looked.
+    let why = session
+        .import_subtitles(&media)
+        .expect_err("the fixture carries no subtitle track")
+        .to_string();
+    assert!(
+        why.contains("no subtitle tracks in") && why.contains("test_av.mp4"),
+        "{why}"
+    );
+    assert_eq!(session.subtitles().len(), 2, "and nothing changed over it");
+}
+
 /// A bitmap track survives a save the same way a text one does, and for the
 /// same reason: a `.edith` holds the file and the track number, never a cue, so
 /// what comes back is what the file still says. The pictures are read out of

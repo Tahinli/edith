@@ -280,13 +280,47 @@ impl Player {
                     )
                     ,
             )
-            .child(
-                div().flex_none().child(control(
+            // The tab says what the one full-width control is for. Text holds
+            // no rows of its own ([`LibraryTab::holds`]) -- it is the tracks
+            // under it -- and what a person opens it to do is put subtitles on
+            // this timeline: off a release's `.mkv`, off an `.srt` beside it,
+            // without the file itself joining the library or a lane. So that is
+            // the button there, where the tracks it adds are listed; media goes
+            // on getting in from the other two tabs, from a drop, and from the
+            // actions card.
+            .when(self.library_tab == LibraryTab::Text, |d| {
+                d.child(div().flex_none().child(self.action_control(
+                    "add-subtitles",
+                    width - 16.,
+                    match self.session.as_ref().is_some_and(|s| !s.subtitles().is_empty()) {
+                        // The primary action of this tab while it has nothing:
+                        // the same rule the Import button follows one tab over.
+                        false => ACCENT_PRIMARY(),
+                        true => BG_RAISED(),
+                    },
+                    None,
+                    // The column is 128 px at the 640x360 floor and the whole
+                    // name does not fit it: a centred label wider than its
+                    // button is clipped at *both* ends ("d subtitles from a
+                    // fil"), which is a button that says nothing. The short
+                    // form there; the full name is what the tooltip, the
+                    // actions card and the stroke go on saying either way.
+                    match (width - 16.) / LIST_CHAR_W >= 26. {
+                        true => "Add subtitles from a file…",
+                        false => "Add subtitles",
+                    },
+                    "reads a file's subtitle tracks onto this timeline — the file itself \
+                     joins nothing",
+                    ActionId::AddSubtitleTrack,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_add_subtitles(cx)),
+                )))
+            })
+            .when(self.library_tab != LibraryTab::Text, |d| {
+                d.child(div().flex_none().child(control(
                         "import",
                         // Full width of the column: the way media gets in is
-                        // the one affordance in this panel that is always
-                        // there, whatever tab is open and however narrow the
-                        // window is.
+                        // the one affordance of the tabs that hold media,
+                        // however narrow the window is.
                         width - 16.,
                         // Filled with the accent while there is nothing to work
                         // on, because with an empty library this *is* the
@@ -302,8 +336,8 @@ impl Player {
                         "adds a file to this list — or drop one on the window".to_string(),
                         !exporting,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
-                    )),
-            )
+                    )))
+            })
             .child(
                 div()
                     .id("library-rows")
