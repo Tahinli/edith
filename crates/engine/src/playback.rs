@@ -250,6 +250,12 @@ pub struct PlaybackSession {
     ///
     /// [`retire`]: PlaybackSession::retire
     retired: Vec<Worker>,
+    /// Picture workers that replaced another one, i.e. every restart the
+    /// session's first worker did not cost: a seek, a resync, a clip boundary.
+    /// Each carries a demuxer reopen and a VA-API init, so this is what a
+    /// playback measurement counts to say how often the picture was thrown away
+    /// ([`restarts`](Self::restarts)).
+    restarts: u64,
     clock: PlaybackClock,
     audio: Option<Audio>,
     /// Why this timeline is silent, when the file itself is not: an audio track
@@ -411,6 +417,7 @@ impl PlaybackSession {
             worker: stream.worker,
             backend: stream.backend,
             retired: Vec::new(),
+            restarts: 0,
             clock: PlaybackClock::new(source),
             audio,
             audio_disabled,
@@ -515,6 +522,7 @@ impl PlaybackSession {
             worker: stream.worker,
             backend: stream.backend,
             retired: Vec::new(),
+            restarts: 0,
             // The song keeps the clock, as a video's own sound does -- and wall
             // time keeps it on a machine with no device, where the picture
             // (black) still has to move at some rate.
@@ -595,6 +603,7 @@ impl PlaybackSession {
             worker: stream.worker,
             backend: stream.backend,
             retired: Vec::new(),
+            restarts: 0,
             clock: PlaybackClock::new(ClockSource::Wall),
             audio: None,
             audio_disabled: None,
@@ -884,6 +893,7 @@ impl PlaybackSession {
             worker: stream.worker,
             backend: stream.backend,
             retired: Vec::new(),
+            restarts: 0,
             clock: PlaybackClock::new(match audio {
                 Some(_) => ClockSource::Audio,
                 None => ClockSource::Wall,
@@ -1230,9 +1240,30 @@ impl PlaybackSession {
     /// (plus whatever VA-API init it was inside), so a scrub reaps last seek's
     /// worker on this seek and the list stays a handful long. Nothing waits.
     fn retire(&mut self, replacement: Worker) {
+        self.restarts += 1;
         self.retired
             .push(std::mem::replace(&mut self.worker, replacement));
         self.retired.retain(|w| !w.is_finished());
+    }
+
+    /// Picture restarts so far; see [`restarts`](Self::restarts). The one place
+    /// a worker is ever replaced counts them, so a seek, a resync and a clip
+    /// boundary all land here and a measurement need not guess which it saw.
+    #[doc(hidden)]
+    pub fn restarts(&self) -> u64 {
+        self.restarts
+    }
+
+    /// Starved audio callbacks since the device opened, and how far into the
+    /// device's own playback (seconds) the last of them was -- `None` for a
+    /// session with no device at all. The counter the plugin prints on drop,
+    /// readable while the session runs: read it either side of a seek and the
+    /// difference is what that seek cost the ear.
+    #[doc(hidden)]
+    pub fn audio_underruns(&self) -> Option<(u64, Option<f64>)> {
+        let audio = self.audio.as_ref()?;
+        let (count, last) = audio.ao.lock().unwrap().underruns();
+        Some((count, last.map(|p| p as f64 / f64::from(audio.sample_rate))))
     }
 
     /// How many threads this session still has running of its own: the decode
