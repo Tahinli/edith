@@ -205,6 +205,20 @@ impl Audio {
     /// The epoch is captured *here*, at the seek, not when the open returns: a
     /// scrub abandons opens by the dozen and every one of them must still be
     /// the stale stream it was started as, however late it lands.
+    ///
+    /// corner-cut: an abandoned open is not *cancelled*, though the machinery
+    /// for it exists ([`crate::demux::with_cancel`], which the import's Cancel
+    /// uses): it runs to the end and its answer is dropped. Tried, and left
+    /// out for want of evidence -- 200 cold scrub steps over the 25 GB HEVC
+    /// remux measured 101, 137 and 14 live workers on three runs of the *same*
+    /// build, so the machine decides that number and not this. There is a
+    /// reason to expect it to hurt, too: a Matroska walk writes its sidecar
+    /// index only when it finishes (`demux::mkv_blocks`), so a drag that
+    /// cancels every step's walk would never write one and every step would
+    /// walk the segment again from the top. Ceiling: an abandoned open keeps
+    /// reading, and the decoder threads it started live until it does. Upgrade
+    /// path is an index the walk publishes as it goes -- then cancelling costs
+    /// nothing and can be measured on an idle machine.
     fn spawn_feeder_deferred(
         &self,
         open: impl FnOnce() -> Option<Receiver<AudioChunk>> + Send + 'static,
@@ -1603,9 +1617,22 @@ impl PlaybackSession {
     fn push_mix(&mut self) {
         let gains = self.project.audio_gains();
         let limiter = self.project.limiter();
-        match &self.mix {
-            Some(mix) => mix.set(gains, limiter),
-            None => self.reseek_audio(),
+        // A mixer reading these, or an open on its way to being one: either way
+        // the number is heard without a rebuild, and *that* is what a handle
+        // left over from an open that found nothing cannot do
+        // ([`crate::audio::MixControls::is_reachable`]).
+        if let Some(mix) = self.mix.as_ref().filter(|mix| mix.is_reachable()) {
+            mix.set(gains, limiter);
+            return;
+        }
+        // Nothing to hand it to. Only a setting that *needs* a mixer is worth
+        // the flush and the re-open: a ceiling dragged with the limiter off, or
+        // a fader put back to unity, changes not one sample of the flat
+        // single-stream path the timeline is already playing
+        // ([`AudioSession::is_mixed`]), and reseeking per nudge was a hole in
+        // the sound for a change nobody could hear.
+        if crate::audio::AudioSession::is_mixed(gains.len(), &gains, limiter) {
+            self.reseek_audio();
         }
     }
 
@@ -2668,9 +2695,22 @@ impl PlaybackSession {
                     Ok(Some((_, rx))) => Some(rx),
                     // A silent timeline, and a source that will not open: both
                     // feed nothing, which the feeder itself reports by ending.
-                    Ok(None) => None,
+                    // The mix goes with them -- no mixer was started, so a fader
+                    // moved later must rebuild the sound rather than hand its
+                    // number to a thread that does not exist
+                    // ([`crate::audio::MixControls::detach`]).
+                    Ok(None) => {
+                        worker_controls.detach();
+                        None
+                    }
                     Err(e) => {
-                        eprintln!("timeline audio open failed: {e}");
+                        worker_controls.detach();
+                        // A read this session abandoned on purpose -- the seek
+                        // after it, or the session going away -- is not a file
+                        // that would not open, and says nothing.
+                        if !crate::demux::is_cancelled(&e) {
+                            eprintln!("timeline audio open failed: {e}");
+                        }
                         None
                     }
                 }
