@@ -771,7 +771,7 @@ fn fix_slice_nal_headers(au: &mut [u8]) {
 
 /// One hardware H.264 encode session.
 ///
-/// Input goes through [`ENC_DEPTH`] reusable NV12 buffer objects: the caller's
+/// Input goes through [`enc_depth`] reusable NV12 buffer objects: the caller's
 /// I420 planes are interleaved into the next one and the encoder imports it as a
 /// VA surface. Reuse is safe because a buffer is only written again once the
 /// access unit coded *from* it has been polled back -- the encoder runs in
@@ -796,8 +796,11 @@ struct EncSession {
     codec: EncCodec,
     /// Owns the DRM node the buffer objects below were allocated from.
     _gbm: gbm::Device<std::fs::File>,
-    /// [`ENC_DEPTH`] input buffers, used round-robin.
+    /// [`enc_depth`] input buffers, used round-robin.
     frames: Vec<GenericDmaVideoFrame>,
+    /// How many of them there are, which is how many pictures may be in the
+    /// encoder at once.
+    depth: usize,
     /// Which of them the next picture is written into.
     slot: usize,
     /// Pictures submitted whose access unit has not been polled back yet, which
@@ -825,6 +828,25 @@ struct EncSession {
 /// since the interleave is the longer of the two and a third buffer would only
 /// hold a picture waiting for a lane that is never idle.
 const ENC_DEPTH: usize = 2;
+
+/// How many pictures *this* seat may hold, which is [`ENC_DEPTH`] for H.264 and
+/// one for the other two.
+///
+/// Depth 2 means a submitted picture must hand its access unit back on the next
+/// poll, and [`EncSession::encode`] treats a seat that does not as an error --
+/// it cannot write into a buffer the GPU may still be reading. That contract
+/// was measured on the H.264 seat and only there. HEVC and AV1 on this plugin
+/// are intra-only and go through the same driver, so they very probably behave
+/// the same way; "very probably" is not what a hard error should rest on, and
+/// the GPU has been unavailable since the measurement was possible. They keep
+/// the old one-buffer behaviour -- the picture coded before the next is
+/// written, exactly as every seat did before -- until someone measures them.
+fn enc_depth(codec: EncCodec) -> usize {
+    match codec {
+        EncCodec::H264 => ENC_DEPTH,
+        EncCodec::Hevc | EncCodec::Av1 => 1,
+    }
+}
 
 /// Which codec an [`EncSession`] was opened for. Decided once, at the open, the
 /// way the H.264 seat's dimensions are -- everything after it is one trait.
@@ -1003,7 +1025,8 @@ impl EncSession {
         };
         // Allocated at the aligned size, so the buffer's pitch is never smaller
         // than a padded row.
-        let frames: Vec<_> = (0..ENC_DEPTH)
+        let depth = enc_depth(codec);
+        let frames: Vec<_> = (0..depth)
             .map(|_| alloc_nv12(&gbm, coded, false))
             .collect::<Result<_, _>>()
             .ok()?;
@@ -1013,6 +1036,7 @@ impl EncSession {
             codec,
             _gbm: gbm,
             frames,
+            depth,
             slot: 0,
             in_flight: 0,
             layout,
@@ -1095,12 +1119,14 @@ impl EncSession {
     /// As [`EncSession::upload`].
     unsafe fn encode(&mut self, src: &VhFrame, force_keyframe: bool) -> Result<(), String> {
         // The buffer this picture is written into is the one whose own access
-        // unit is already in hand -- `in_flight` is held below [`ENC_DEPTH`] at
-        // the end of every call, so the round-robin never catches the GPU up.
+        // unit is already in hand -- `in_flight` is held below `depth` at the
+        // end of every call, so the round-robin never catches the GPU up. At
+        // depth 1 that is the picture just coded, which is the one-buffer
+        // behaviour every seat had before ([`enc_depth`]).
         let slot = self.slot;
         // SAFETY: caller contract, forwarded.
         unsafe { self.upload(src, slot)? };
-        self.slot = (self.slot + 1) % ENC_DEPTH;
+        self.slot = (self.slot + 1) % self.depth;
         let meta = FrameMetadata {
             timestamp: self.timestamp,
             layout: self.layout.clone(),
@@ -1114,7 +1140,7 @@ impl EncSession {
         // ...and the picture before it is collected here rather than this one:
         // that is the whole overlap, the GPU coding what was just submitted
         // while the caller decodes and interleaves the next picture.
-        while self.in_flight >= ENC_DEPTH {
+        while self.in_flight >= self.depth {
             if !self.pull()? {
                 // Blocking mode: a picture accepted and no coded unit for the
                 // one before it means the encoder is not answering, and the
