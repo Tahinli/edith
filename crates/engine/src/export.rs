@@ -609,14 +609,7 @@ fn audio_kbps_of(settings: &ExportSettings) -> u32 {
 /// ([`Enc::open`] runs ahead of the muxer), which is what makes the refusal
 /// free.
 fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Option<HwEncoder>> {
-    // `VE_HW_TEST_FAKE` is the containment tests' stand-in seat -- a child that
-    // opens no driver at all -- and it is not what a software pin is pinning
-    // away: the pin says "do not use this machine's GPU", and that seat is not
-    // this machine's GPU. Without this the suite could only prove the fallback
-    // on a run with no other export test in it.
-    if settings.seat == EncoderSeat::Software
-        || (forced("VE_SW_ENC") && !crate::hwproc::faked())
-    {
+    if settings.seat == EncoderSeat::Software || forced("VE_SW_ENC") {
         return Ok(None);
     }
     let opened = open_hw_seat(meta, settings);

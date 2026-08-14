@@ -10,11 +10,13 @@
 //! reach whatever the panic strategy is: Mesa runs its own C worker threads and
 //! calls libc `abort()` from them when the video ring resets (measured
 //! 2026-08-13, `vcn_unified_0`, mesa 26.1.6). No `catch_unwind` can see a
-//! foreign thread's `abort`. So the *encode* half of this plugin is no longer
-//! loaded by the editor at all: it is `dlopen`ed by the `hw-encode-child`
-//! helper, one process per session, and a driver that aborts now costs an export
-//! its seat rather than costing a person their session
-//! ([`engine::hwproc`](../engine/hwproc/index.html)).
+//! foreign thread's `abort`. So no *encode* entry point of this plugin is
+//! called in the editor's process any more: the editor still `dlopen`s the
+//! library to see whether the `vh_enc_*` symbols are there at all, which opens
+//! no VA-API display and starts no driver thread, and every call through them is
+//! made by the `hw-encode-child` helper, one process per session. A driver that
+//! aborts now costs an export its seat rather than costing a person their
+//! session ([`engine::hwproc`](../engine/hwproc/index.html)).
 //!
 //! corner-cut: *decode* is still in the editor's own address space, where the
 //! same abort would still be fatal -- and the same ring hangs it (mmhub page
