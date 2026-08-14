@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
+use crate::colorspace::ColorDescription;
+
 const LIB_NAME: &str = "libengine_hw.so";
 
 /// Stream metadata, C layout. Mirrors [`crate::VideoMeta`].
@@ -443,7 +445,11 @@ struct EncPlugin {
     open_av1: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
     /// The HEVC seat, missing from an older plugin for the same reason and at
     /// the same cost: an HEVC export then runs on the software intra encoder.
-    open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64) -> *mut c_void>,
+    /// Four arguments more than the others: what the SPS says the samples mean
+    /// ([`HwEncoder::open_hevc`]), which is why the symbol is named apart from
+    /// the colourless `vh_enc_hevc_open` it replaced rather than sharing its
+    /// name with another signature.
+    open_hevc: Option<extern "C" fn(u32, u32, u32, u32, u64, u32, u32, u32, i32) -> *mut c_void>,
     /// The **intra-only** H.264 seat, missing from an older plugin for the same
     /// reason and at the same cost: a proxy then runs on the software encoder,
     /// which codes one frame a GOP and so writes the same kind of file.
@@ -480,7 +486,7 @@ fn load_enc() -> Option<EncPlugin> {
                 Some(EncPlugin {
                     open: *lib.get(b"vh_enc_open\0").ok()?,
                     open_av1: lib.get(b"vh_enc_av1_open\0").ok().map(|s| *s),
-                    open_hevc: lib.get(b"vh_enc_hevc_open\0").ok().map(|s| *s),
+                    open_hevc: lib.get(b"vh_enc_hevc_open_colour\0").ok().map(|s| *s),
                     open_intra: lib.get(b"vh_enc_open_intra\0").ok().map(|s| *s),
                     frame: *lib.get(b"vh_enc_frame\0").ok()?,
                     dma_geometry: lib.get(b"vh_enc_dma_geometry\0").ok().map(|s| *s),
@@ -575,16 +581,38 @@ impl HwEncoder {
     /// too old to export the symbol, on a GPU with no HEVC encode entrypoint,
     /// and below 384x384 -- the driver's own floor, stated in the plugin. The
     /// caller then takes the software intra encoder without a word about it.
+    ///
+    /// `colour` is what the SPS will say the samples mean, and it is taken at
+    /// the open because the parameter sets are written when the sequence starts.
+    /// libavcodec's HEVC decoder overwrites a container's colour with the
+    /// bitstream's, so a seat that signalled nothing hands a player
+    /// "unspecified" -- BT.601 -- however the file is tagged.
     pub fn open_hevc(
         width: u32,
         height: u32,
         fps_num: u32,
         fps_den: u32,
         bitrate: u64,
+        colour: ColorDescription,
     ) -> Option<Self> {
         let plugin = enc_plugin()?;
         let open = plugin.open_hevc?;
-        Self::opened(plugin, open, width, height, fps_num, fps_den, bitrate)
+        let (primaries, transfer, matrix) = colour.codes();
+        let handle = open(
+            width,
+            height,
+            fps_num,
+            fps_den,
+            bitrate,
+            u32::from(primaries),
+            u32::from(transfer),
+            u32::from(matrix),
+            i32::from(colour.full_range),
+        );
+        if handle.is_null() {
+            return None;
+        }
+        Some(Self { plugin, handle })
     }
 
     /// The null check both opens share, which is the plugin's whole way of

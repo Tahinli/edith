@@ -549,9 +549,18 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
         // (`hevc_export::a_1080p_hardware_export_leaves_a_decoder_with_nothing_to_say`).
         // `None` here is the plugin's own "no" -- no entrypoint, or a picture
         // under the driver's 384x384 floor -- and the software seat takes it.
-        format if format.is_hevc() => {
-            HwEncoder::open_hevc(meta.width, meta.height, fps_num, fps_den, bitrate)
-        }
+        // The colour goes in at the open, from the same [`ColorDescription::output`]
+        // rule the software seat's VUI and both containers' tags come from, so
+        // the file cannot say one thing in its bitstream and another in its
+        // header.
+        format if format.is_hevc() => HwEncoder::open_hevc(
+            meta.width,
+            meta.height,
+            fps_num,
+            fps_den,
+            bitrate,
+            ColorDescription::output(meta.height),
+        ),
         // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
         // AV1 formats sit on it: the container is not the encoder's business.
         format if format.is_av1() && !forced("VE_HW_AV1") => None,
@@ -2211,6 +2220,23 @@ fn run(
                     eprintln!(
                         "export audio: waited for after {:.1} s of picture",
                         picture_started.elapsed().as_secs_f64()
+                    );
+                    // ...and the line on screen finished with it. The loop above
+                    // publishes the measured codec the moment the pass lands
+                    // under the picture, but a picture that outran the mix never
+                    // reaches that branch -- and "working out the sound…" would
+                    // then be the last thing the card ever said about a track it
+                    // had long since written.
+                    publish_seats(
+                        shared,
+                        seat,
+                        project,
+                        settings,
+                        track.as_ref().map(|track| track.copied),
+                        track
+                            .as_ref()
+                            .is_some_and(|track| track.opus_pre_skip.is_some()),
+                        false,
                     );
                     track
                 }
