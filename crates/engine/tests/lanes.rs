@@ -508,7 +508,11 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
 
     // The lane's own life cycle, which is the machinery it *does* use.
     let held = project.remove_lane(s1).expect_err("it still holds a caption");
-    assert!(held.to_string().contains("still holds 1 subtitle(s)"), "{held}");
+    assert!(
+        held.to_string().contains("at frame 0")
+            && held.to_string().contains("drag them to another track"),
+        "the refusal names the caption and the way out: {held}"
+    );
     assert!(project.lift_sub(s1, 0), "the caption comes off");
     project.remove_lane(s1).expect("and then so does the lane");
     assert_eq!(project.lanes(), [Lane::V1, Lane::A1], "the last one may go");
