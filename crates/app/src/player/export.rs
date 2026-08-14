@@ -117,7 +117,19 @@ impl Player {
         // walk above is -- the decision reads the same header -- and the encode
         // itself is the engine's own worker, so what comes back here is a
         // handle to poll and not a wait.
-        for path in unseen_paths(session.sources(), &self.proxies) {
+        //
+        // ...unless this project makes none by itself
+        // ([`engine::PlaybackSession::auto_proxies`]), and then the Proxies
+        // switch is the ask: turning it on brings the films that want a
+        // stand-in through here at the next repaint, which is the only door
+        // there is. Left unseen meanwhile, so nothing is missed by having been
+        // imported while the switch was off.
+        for path in proxies_to_start(
+            session.auto_proxies(),
+            session.proxies(),
+            session.sources(),
+            &self.proxies,
+        ) {
             // Two at a time, and the rest at the next repaint: a stand-in is a
             // whole film re-encoded, and a library of ten dropped at once would
             // otherwise start ten encodes fighting over the one hardware seat.

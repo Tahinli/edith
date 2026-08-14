@@ -414,6 +414,29 @@ impl Player {
         cx.notify();
     }
 
+    /// Makes the stand-ins as the films arrive, or makes none until they are
+    /// asked for. The other half of the switch above: this one decides what is
+    /// *encoded*, that one what is *watched*.
+    ///
+    /// With it off nothing is started by an import at all -- turning Proxies on
+    /// is what asks for the ones this project needs ([`Player::cache_media`]),
+    /// which is said here because a switch whose only effect is elsewhere is a
+    /// switch that reads as doing nothing.
+    pub(crate) fn toggle_auto_proxies(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let on = !session.auto_proxies();
+        session.set_auto_proxies(on);
+        let text = match on {
+            true => "AUTO PROXIES ON — a film that wants a stand-in gets one as it arrives",
+            false => "AUTO PROXIES OFF — no import makes one; Proxies on is what asks for them",
+        };
+        eprintln!("{text}");
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
     pub(crate) fn poll_import(&mut self, cx: &mut Context<Self>) {
         match &mut self.importing {
             Some(import) => {

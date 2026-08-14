@@ -388,6 +388,12 @@ pub struct PlaybackSession {
     /// file open that already costs milliseconds, so a proxy made (or deleted)
     /// mid-session is picked up at the next seek and nothing can go stale.
     proxies: bool,
+    /// Whether a source that wants a stand-in gets one made for it as it
+    /// arrives ([`crate::proxy::wanted`]). On unless a project says otherwise,
+    /// which is what every project did before the switch existed. Saved with
+    /// the project like the one above it, and read by the front end: the engine
+    /// starts no encode of its own.
+    auto_proxies: bool,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -505,6 +511,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
+            auto_proxies: true,
         })
     }
 
@@ -620,6 +627,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
+            auto_proxies: true,
         })
     }
 
@@ -699,6 +707,7 @@ impl PlaybackSession {
             drop_late: false,
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
+            auto_proxies: true,
         })
     }
 
@@ -996,6 +1005,9 @@ impl PlaybackSession {
             // What the file says, and `false` for every dialect before v12:
             // a project cut on the films themselves opens on them.
             proxies: doc.proxy,
+            // ...and what it says about making them, which is "yes" for every
+            // dialect before v13 and for one that leaves the line out.
+            auto_proxies: doc.auto_proxy,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1251,6 +1263,10 @@ impl PlaybackSession {
             // *Which* files have one is not saved: [`crate::proxy`] finds that
             // out from the film itself, so nothing here can go stale.
             self.proxies,
+            // ...and whether it makes them by itself, which is a different
+            // question from whether it cuts on them and the only one an import
+            // asks ([`Self::auto_proxies`]).
+            self.auto_proxies,
             self.project.limiter(),
             playhead,
         )
@@ -1996,6 +2012,19 @@ impl PlaybackSession {
         self.proxies = on;
         let now = self.now();
         self.seek(now);
+    }
+
+    /// Whether an imported film that wants a stand-in gets one made for it
+    /// there and then ([`Self::set_auto_proxies`]).
+    pub fn auto_proxies(&self) -> bool {
+        self.auto_proxies
+    }
+
+    /// Make the stand-ins on import, or make none until asked. Nothing to
+    /// reseek: this decides what is *started*, never what is decoded -- a proxy
+    /// already in the cache is still cut on while [`Self::proxies`] is on.
+    pub fn set_auto_proxies(&mut self, on: bool) {
+        self.auto_proxies = on;
     }
 
     /// Which source `path` is, canonicalising only if it has to: a source's own
