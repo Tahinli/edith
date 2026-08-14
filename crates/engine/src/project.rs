@@ -2194,6 +2194,25 @@ impl Project {
             .unwrap_or(0)
     }
 
+    /// The same, counting the *media* alone: where the last picture or sound
+    /// runs out, with the captions over them ignored.
+    ///
+    /// What an export actually writes ends here -- the picture loop walks the
+    /// composite spans and the file stops with them -- so this is the length a
+    /// cue has to be inside of to be written at all (what
+    /// [`crate::export::planned_subtitles`] clips a lane's cues to). Equal to
+    /// [`timeline_frames`](Self::timeline_frames) on every timeline whose last
+    /// thing is a picture or a sound, which is every timeline that has no
+    /// caption hanging past the end of both.
+    pub fn media_frames(&self) -> u32 {
+        self.lanes
+            .iter()
+            .filter(|l| l.kind != LaneKind::Subtitle)
+            .filter_map(|l| l.clips.last().map(Clip::end))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// `(timeline_start, len)` per `V1` clip, in order -- what a UI lane needs
     /// to lay clips out. Gaps show up as the holes between consecutive entries.
     pub fn clip_spans(&self) -> Vec<(u32, u32)> {
