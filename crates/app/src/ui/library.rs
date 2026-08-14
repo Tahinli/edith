@@ -319,9 +319,9 @@ impl Player {
                         true => "Add subtitles from a file…",
                         false => "Add subtitles",
                     },
-                    "reads a file's subtitle tracks onto this timeline — the file itself \
-                     joins nothing",
-                    ActionId::AddSubtitleTrack,
+                    "reads a file's subtitle tracks into the palette below — drag one onto an S \
+                     track to place it; the file itself joins nothing",
+                    ActionId::ImportSubtitles,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_add_subtitles(cx)),
                 )))
             })

@@ -405,6 +405,82 @@ fn a_trim_preview_lands_where_the_release_commits() {
     }
 }
 
+/// The caption a drag is showing lands where the release commits -- the
+/// subtitle twin of the trim preview above -- and the two contracts the boxes
+/// on the lanes rest on: `place_sub`'s `at` wins over the placement's own
+/// `start`, and a gesture that changed nothing is `Ok` and not a refusal, so a
+/// front-end that toasted every `Ok` would toast a pick-up-put-back.
+#[test]
+fn a_caption_trim_preview_lands_where_the_release_commits() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let fps = session.meta().frame_rate;
+    let srt = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine/tests/data/test_subs.srt")
+        .canonicalize()
+        .expect("the subtitle fixture");
+    session.import_subtitles(&srt).expect("the .srt imports");
+    let lane = session.add_lane(LaneKind::Subtitle);
+    // The whole track as a placement, exactly as `Player::sub_of_track` builds
+    // one from a palette row.
+    let out_us = session.subtitles()[0]
+        .cues
+        .iter()
+        .map(|c| c.end_us)
+        .max()
+        .expect("the fixture has cues");
+    let whole = SubClip {
+        start: 0,
+        frames: frames_of_us(out_us, fps),
+        track: 0,
+        in_us: 0,
+        out_us,
+    };
+    session
+        .place_sub(lane, 30, whole)
+        .expect("an empty subtitle lane takes it");
+    assert_eq!(
+        session.sub_lane(lane)[0].start,
+        30,
+        "the frame the hand let go on wins over the placement's own start"
+    );
+    for edge in [Edge::Start, Edge::End] {
+        let (lo, hi) = session
+            .trim_sub_room(lane, 0, edge)
+            .expect("placement 0 is there");
+        for to in [lo, (lo + hi) / 2, hi] {
+            let placed = session.sub_lane(lane)[0];
+            let preview = trimmed_sub(placed, edge, to);
+            session
+                .trim_sub(lane, 0, edge, to)
+                .expect("an edge inside its own room is never refused");
+            let now = session.sub_lane(lane)[0];
+            assert_eq!(
+                (preview.start, preview.frames),
+                (now.start, now.frames),
+                "{edge:?} to {to}"
+            );
+            // One edit, one undo step -- and none at all where the edge was
+            // already there, which is the `Ok` that must stay silent.
+            if (now.start, now.frames) != (placed.start, placed.frames) {
+                assert!(session.undo(), "the trim is one undo step");
+            }
+        }
+    }
+    // Picked up and put back down: `Ok`, nothing moved, nothing to say.
+    let before = session.sub_lane(lane)[0];
+    session
+        .move_sub(lane, 0, lane, before.start)
+        .expect("a drop that changes nothing is not a refusal");
+    assert_eq!(session.sub_lane(lane)[0], before);
+    // ...and two captions over one frame are refused in words, which is what
+    // the notice shows verbatim.
+    let over = session
+        .place_sub(lane, before.start, whole)
+        .expect_err("two captions may not cover one frame");
+    assert!(over.to_string().contains("already covers"), "{over}");
+}
+
 /// A still trims the same way, and the preview knows it: its head grows
 /// forward from source frame 0 -- every frame of it is the same picture --
 /// so the box stretches instead of sliding left.
@@ -683,7 +759,7 @@ fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
     // What the engine answers about the one pick that reached it, and what
     // this side knows about the row that did not.
     let named = subtitle_plan("[ASS] → embedded".to_string(), &two, &[0]);
-    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — no cues here");
+    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — in the palette, on no track");
     assert!(
         named.chars().count() <= SUB_PLAN_CHARS,
         "two tracks fit the value box: {named}"
@@ -702,13 +778,30 @@ fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
     // and the nine picture ones, which the engine drops itself.
     let picks: Vec<usize> = (0..31usize).collect();
     let counted = subtitle_plan("22 tracks → embedded (…)".to_string(), &many, &picks);
-    assert_eq!(counted, "22 of 35 → embedded; 9 pictures; 1 unread; 3 no cues here");
+    assert_eq!(
+        counted,
+        "22 of 35 → embedded; 9 pictures; 1 unread; 3 in the palette, on no track"
+    );
     assert!(
         counted.chars().count() <= SUB_PLAN_CHARS,
         "thirty-five tracks still fit the value box: {counted}"
     );
     // Nothing on the timeline at all is still the engine's word for it.
     assert_eq!(subtitle_plan("none".to_string(), &[], &[]), "none");
+    // The lanes are what an export writes once anything is placed on one, and
+    // the engine words that whole ([`engine::export::planned_subtitles`]) --
+    // including the lanes it carries *nothing* of, which is a sentence with no
+    // pick behind it at all. That used to be dropped on the floor: the card said
+    // "[ASS] — no cues here" twice and never said what became of the lane.
+    let placed = "S1 [ASS] — past the last picture".to_string();
+    assert_eq!(
+        subtitle_plan(placed.clone(), &two, &[]),
+        "S1 [ASS] — past the last picture; [ASS] [FOR DUB] — in the palette, on no track"
+    );
+    // ...and the row that sentence speaks for gets no clause of its own: a line
+    // that names a lane's track and then calls the same track unplaced is the
+    // card contradicting itself in one breath.
+    assert!(!subtitle_plan(placed, &two[..1], &[]).contains("in the palette"));
 }
 
 /// The list is in the order tracks were added, which is not the order a
@@ -789,9 +882,31 @@ fn the_picked_subtitle_is_named_with_the_film_it_came_out_of() {
     // A standalone `.srt` is its own file and its label already says so:
     // one track, so no number, and no stem after it saying it again.
     assert_eq!(name(4), "late.srt");
-    // The silence `subtitle_track` gives at the same moment.
+    // The silence a row left over from a timeline that is gone gets.
     assert_eq!(sub_pick_name(&tracks, 5), None);
     assert_eq!(sub_pick_name(&[], 0), None);
+}
+
+/// What the toggle covers is what is *placed*, so what it says is a lane fact:
+/// naming the palette row the list happens to mark named a track the stroke
+/// never touched ("SUBTITLES OFF — one.srt is still on the timeline" for a
+/// one.srt nobody dragged anywhere).
+#[test]
+fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
+    for on in [true, false] {
+        let text = subtitle_toggle_notice(on, 2);
+        assert!(text.contains('2'), "{text} counts the captions placed");
+        assert!(
+            !text.contains("track(s)") && !text.contains(" — a"),
+            "{text} names no palette row"
+        );
+    }
+    // Off leaves them on the lanes; that is the half a person needs told.
+    assert!(subtitle_toggle_notice(false, 2).contains("still placed"));
+    // An empty timeline says the move instead of a count that reads as broken.
+    let none = subtitle_toggle_notice(true, 0);
+    assert!(!none.contains('0'), "{none} counts nothing at nothing");
+    assert!(none.contains("drag"), "{none} says the next move");
 }
 
 /// The door this editor answers "don't make me import the film again" with,
@@ -808,9 +923,9 @@ fn the_text_tab_carries_the_add_subtitles_door() {
     let at = library
         .find("\"add-subtitles\"")
         .expect("no add-subtitles control in the library column");
-    let block = &library[at..(at + 1400).min(library.len())];
+    let block = &library[at..(at + 1600).min(library.len())];
     assert!(
-        block.contains("ActionId::AddSubtitleTrack"),
+        block.contains("ActionId::ImportSubtitles"),
         "the button is a door of its own rather than the action: {block}"
     );
     assert!(

@@ -141,7 +141,7 @@ impl Render for Player {
                 // would change, so cancelling is the only one that means
                 // anything until it is over.
                 if this.exporting().is_some() {
-                    if cancels_export(key, action) {
+                    if cancels_export(key, ctrl, action) {
                         this.cancel_export();
                     }
                     cx.notify();
@@ -515,6 +515,22 @@ impl Render for Player {
                     this.set_ghost(None, cx);
                 }),
             )
+            // The same pair for the two subtitle gestures, for the same reason:
+            // a palette row starts up in the library and a caption starts on a
+            // lane, and both are let go somewhere else entirely.
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SubPick>, _, cx| {
+                this.preview_place(event.event.position.x, cx);
+                this.set_ghost(None, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<SubDrag>, _, cx| {
+                // The placement gpui froze into the payload, whose *length* is
+                // all the line needs; which caption it is is the drop's
+                // question ([`Player::dragged_sub`]).
+                let (drag, x) = (*event.drag(cx), event.event.position.x);
+                let cue = this.sub_drop_frame(drag.sub, x).1;
+                this.set_cue(cue, x, cx);
+                this.set_ghost(None, cx);
+            }))
             // Scrubbing is tracked on the root because the pointer leaves the
             // 6 px ruler on the first drag and its own listeners then stop
             // firing; the root's hitbox is the whole window.
@@ -645,6 +661,10 @@ impl Render for Player {
             // window.
             .children(self.keys_overlay(cx))
             .children(self.export_card(window.viewport_size(), cx))
+            // The same sheet once the card has been answered: the running
+            // export is the one state in this window where nothing may be
+            // edited, so it is drawn as what it is rather than as a strip.
+            .children(self.export_progress_card(cx))
             // Last, so it floats over whatever opened it -- an inspector row or
             // a clip menu -- rather than under it.
             .children(self.picker_card(window.viewport_size(), cx))
