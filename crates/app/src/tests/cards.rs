@@ -4,20 +4,27 @@
 use super::*;
 
 #[test]
-fn escape_gets_out_of_an_export_whatever_is_held_with_it() {
+fn only_a_chord_gets_out_of_an_export() {
     use keymap::ActionId;
-    // The regression this guards: looking the stroke up in the keymap made
-    // ctrl+escape mean nothing, and an export that a modifier could trap
-    // the user inside of is worse than an unbound chord.
-    assert!(cancels_export("escape", None));
-    assert!(cancels_export("escape", Some(ActionId::CancelExport)));
-    // A rebound cancel works as well -- it adds a way out, never replaces
-    // the one that always worked.
-    assert!(cancels_export("q", Some(ActionId::CancelExport)));
+    // What this guards: bare escape is the stroke a hand throws at anything on
+    // screen, and while an export ran it deleted the encode. The way out is the
+    // same key with control on it, and the card says so.
+    assert!(cancels_export("escape", true, Some(ActionId::CancelExport)));
+    assert!(!cancels_export("escape", false, None));
+    // Even if something else were ever bound to bare escape, it is not this.
+    assert!(!cancels_export("escape", false, Some(ActionId::Play)));
+    // A rebound cancel works as well -- it adds a way out, never replaces the
+    // chord, and the keymap is what decides whether that one carries control.
+    assert!(cancels_export("q", false, Some(ActionId::CancelExport)));
     // Nothing else does, whatever it means outside an export.
-    assert!(!cancels_export("e", Some(ActionId::Export)));
-    assert!(!cancels_export("space", Some(ActionId::Play)));
-    assert!(!cancels_export("q", None));
+    assert!(!cancels_export("e", false, Some(ActionId::Export)));
+    assert!(!cancels_export("space", false, Some(ActionId::Play)));
+    assert!(!cancels_export("q", false, None));
+    // The default keymap is what the handler feeds this: the chord reaches the
+    // action, the bare key reaches nothing.
+    let k = keymap::Keymap::defaults();
+    assert!(cancels_export("escape", true, k.lookup("escape", true)));
+    assert!(!cancels_export("escape", false, k.lookup("escape", false)));
 }
 
 #[test]

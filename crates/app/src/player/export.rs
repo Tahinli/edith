@@ -603,8 +603,12 @@ impl Player {
         // happens to notice it.
         self.export_started = Some(Instant::now());
         self.export_marks.clear();
-        // The card has been answered; the progress line takes the panel from
-        // here, and it is the running export's escape that matters now.
+        // A confirm left armed by the *previous* export would open this one on
+        // the pair, offering to cancel a job nobody has asked about yet.
+        self.cancel_armed = false;
+        // The card has been answered; the progress card takes the window from
+        // here ([`Player::export_progress_card`]), and it is the running
+        // export's chord that matters now.
         self.export_open = false;
         cx.notify();
     }
@@ -615,6 +619,7 @@ impl Player {
         if let Some(export) = &self.export {
             export.cancel();
             self.cancelling = true;
+            self.cancel_armed = false;
         }
     }
 
