@@ -1,7 +1,7 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 14
+//! edith 15
 //! playhead 90
 //! resolution 1920 1080
 //! fps 30.0
@@ -20,6 +20,8 @@
 //! audio 1 0 0 120 0 0 0 - fit 1000
 //! video 2 120 0 120 1 - - - fill 2000
 //! audio 2
+//! sub 1 0 60 0 500000 1500000
+//! sub 2
 //! gain audio 1 -3.0
 //! ```
 //!
@@ -127,7 +129,24 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 13** was this without the `encoder` line: an export of such a
+//! A subtitle lane is a lane like the other two and is written in its place
+//! among them, `sub` for its kind: `sub <lane> <start> <frames> <track>
+//! <in> <out>` ([`crate::project::SubClip`]) -- where the caption sits on the
+//! timeline and how many frames it covers, then which `subtitle` line's words
+//! it shows (by position, the first one is track 0) and the half-open window of
+//! that track it shows, in *microseconds*, which is the clock the cues
+//! themselves are timed in. Two clocks on one line because a subtitle has two:
+//! a placement is in timeline frames like everything else, and a window is in
+//! the file's own time whatever the timeline runs at. A lane holding nothing
+//! has the bare `sub <lane>` line for the reason a video one does, and the
+//! track a caption names has to be one the file declared -- a `sub` line naming
+//! track 3 of a two-track palette is refused here, as a clip naming a source
+//! that is not there is.
+//!
+//! **Version 14** was this without the `sub` lines: such a project holds no
+//! subtitle lane at all -- its `subtitle` lines are the palette, and where the
+//! words of it were shown was nowhere in the file.
+//! **Version 13** was that without the `encoder` line: an export of such a
 //! project takes the hardware seat where there is one and the software encoder
 //! everywhere else, which is the only choice those projects had.
 //! **Version 12** was that without the `autoproxy` line: such a project makes a
@@ -158,7 +177,8 @@
 //! what a v1 timeline meant, and an older file simply equalizes and grades
 //! nothing, and an older one plays everything at real time, and an older one
 //! mixes flat, and an older one shows no subtitles, and an older one is shown
-//! in the reference rendition -- and saving any of them writes v14. An older
+//! in the reference rendition, and an older one places none of the words it
+//! names -- and saving any of them writes v15. An older
 //! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -188,13 +208,14 @@ use std::path::{Path, PathBuf};
 use crate::color::ColorParams;
 use crate::eq::{Band, BandKind, EqParams};
 use crate::limiter::Limiter;
-use crate::project::{Clip, Lane, LaneKind, Source, Speed};
+use crate::project::{Clip, Lane, LaneKind, Source, Speed, SubClip};
 use crate::scale::FitPolicy;
 use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 14";
+const MAGIC: &[u8] = b"edith 15";
+const MAGIC_V14: &[u8] = b"edith 14";
 const MAGIC_V13: &[u8] = b"edith 13";
 const MAGIC_V12: &[u8] = b"edith 12";
 const MAGIC_V11: &[u8] = b"edith 11";
@@ -220,6 +241,11 @@ pub struct Document {
     /// [`crate::Project::from_parts`] takes them in. Exactly two -- `V1` then
     /// `A1` -- for every dialect before v4.
     pub lanes: Vec<(LaneKind, Vec<Clip>)>,
+    /// What is placed on each lane, in the order `lanes` is in and as long as
+    /// it -- the `sub` lines. Empty for every video and audio lane, which hold
+    /// no [`SubClip`], and for every lane of every dialect before v15, which
+    /// placed no words anywhere ([`crate::Project::with_subs`] takes it back).
+    pub subs: Vec<Vec<SubClip>>,
     /// The equalizer table [`Clip::eq`] indexes into, in file order. Empty for
     /// every dialect before v5.
     pub eq: Vec<EqParams>,
@@ -273,13 +299,15 @@ pub struct Document {
 /// Writes the project to `path`, atomically. `sources`, `eq` and `color` should
 /// already be orphan-free ([`crate::Project::without_orphan_sources`]);
 /// `gains` is one dB per lane in the same order the lanes are in
-/// ([`crate::Project::lane_gains`]).
+/// ([`crate::Project::lane_gains`]) and `subs` is one list of placements per
+/// lane in that same order ([`crate::Project::lane_subs`]).
 #[allow(clippy::too_many_arguments)]
 pub fn save(
     path: &Path,
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     gains: &[f32],
+    subs: &[Vec<SubClip>],
     subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
@@ -303,8 +331,8 @@ pub fn save(
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
             f.write_all(&emit(
-                &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, tone, proxy,
-                auto_proxy, encoder, limiter, playhead,
+                &dir, sources, lanes, gains, subs, subtitles, eq, color, resolution, fps, tone,
+                proxy, auto_proxy, encoder, limiter, playhead,
             ))?;
             f.sync_all()
         })
@@ -341,6 +369,7 @@ fn emit(
     sources: &[Source],
     lanes: &[(LaneKind, Vec<Clip>)],
     gains: &[f32],
+    subs: &[Vec<SubClip>],
     subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
@@ -448,8 +477,8 @@ fn emit(
     // Lane by lane rather than interleaved by time: a lane reads as a list, the
     // parser gets its sortedness check for free from the order it is in, and
     // the lanes come back out in the order they are displayed in.
-    let (mut video, mut audio) = (0, 0);
-    for (kind, clips) in lanes {
+    let (mut video, mut audio, mut subtitle) = (0, 0, 0);
+    for (at, (kind, clips)) in lanes.iter().enumerate() {
         let (keyword, ord) = match kind {
             LaneKind::Video => {
                 video += 1;
@@ -459,13 +488,31 @@ fn emit(
                 audio += 1;
                 ("audio", audio)
             }
-            // Unreachable by construction: `Project::without_orphan_sources`
-            // leaves the subtitle lanes out of the [`Parts`] it hands a save,
-            // because this format has no line to write a `SubClip` on yet and a
-            // reader that met the keyword would refuse the file. Skipped rather
-            // than emitted, and the corner-cut is named at the filter.
-            LaneKind::Subtitle => continue,
+            LaneKind::Subtitle => {
+                subtitle += 1;
+                ("sub", subtitle)
+            }
         };
+        // A subtitle lane holds no `Clip` at all ([`LaneKind::Subtitle`]): what
+        // is on it is in `subs`, one list per lane and in step with this one,
+        // and it is written here so the lane comes back in its place among the
+        // others.
+        if *kind == LaneKind::Subtitle {
+            let placed = subs.get(at).map_or(&[][..], Vec::as_slice);
+            if placed.is_empty() {
+                out.extend_from_slice(format!("{keyword} {ord}\n").as_bytes());
+            }
+            for s in placed {
+                out.extend_from_slice(
+                    format!(
+                        "{keyword} {ord} {} {} {} {} {}\n",
+                        s.start, s.frames, s.track, s.in_us, s.out_us
+                    )
+                    .as_bytes(),
+                );
+            }
+            continue;
+        }
         // A lane is declared by its clips; one holding nothing has to say so on
         // a line of its own, or the lane itself would not survive the round trip.
         if clips.is_empty() {
@@ -503,8 +550,10 @@ fn emit(
                 audio += 1;
                 ("audio", audio)
             }
-            // Never here, for the reason above -- and a subtitle lane has no
-            // volume to write anyway (`Project::set_lane_gain_db` refuses one).
+            // In the list -- the two are zipped, so it has to be -- and never
+            // written: a subtitle lane has no volume at all
+            // (`Project::set_lane_gain_db` refuses one), so its entry is the
+            // `0.0` no lane writes a line for.
             LaneKind::Subtitle => continue,
         };
         if db != 0.0 {
@@ -524,8 +573,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that says which encoder an export takes...
-    let v14 = first == MAGIC;
+    // The one that places the words it names...
+    let v15 = first == MAGIC;
+    // ...the ones that say which encoder an export takes...
+    let v14 = v15 || first == MAGIC_V14;
     // ...the ones that say whether the stand-ins are made by themselves...
     let v13 = v14 || first == MAGIC_V13;
     // ...the ones that say whether it is cut on stand-ins...
@@ -564,6 +615,11 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         } else {
             vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())]
         },
+        // Resized to the lanes as they arrive, and once more at the end, so a
+        // caller may zip the two exactly as it zips the gains. Nothing before
+        // v15 places a word anywhere: those projects have the palette and no
+        // subtitle lane to put any of it on.
+        subs: Vec::new(),
         // Nothing before v5 equalizes anything, and nothing before v6 grades.
         eq: Vec::new(),
         color: Vec::new(),
@@ -877,6 +933,66 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 doc.lanes[0].1.push(clip);
                 doc.lanes[1].1.push(clip);
             }
+            // A lane line like the two below it, in its place among them, and
+            // read into `subs` rather than into the clips: the lane holds
+            // words, and no media path may ever meet one
+            // ([`crate::project::LaneKind::Subtitle`]).
+            b"sub" if v15 => {
+                let at = rest.iter().position(|&b| b == b' ');
+                let ord = number(&rest[..at.unwrap_or(rest.len())], n)?;
+                let rest = &rest[at.map_or(rest.len(), |at| at + 1)..];
+                let at = lane_of(&mut doc.lanes, LaneKind::Subtitle, ord, n)?;
+                doc.subs.resize(doc.lanes.len(), Vec::new());
+                // The bare line is the empty lane's whole existence, exactly as
+                // it is for a video one.
+                if rest.is_empty() {
+                    continue;
+                }
+                let f = fields(rest, 5, "sub", n)?;
+                let sub = SubClip {
+                    start: number(f[0], n)?,
+                    frames: number(f[1], n)?,
+                    track: number(f[2], n)? as usize,
+                    in_us: micros(f[3], n)?,
+                    out_us: micros(f[4], n)?,
+                };
+                // The never-empty invariant at both clocks, which is what
+                // [`crate::Project::place_sub`] refuses on the live timeline.
+                if sub.frames == 0 || sub.out_us <= sub.in_us || sub.in_us < 0 {
+                    return Err(format!(
+                        "line {n}: caption at {} is empty: {} frames of [{}, {})",
+                        sub.start, sub.frames, sub.in_us, sub.out_us
+                    )
+                    .into());
+                }
+                // The palette bound, which is a clip's source bound for words:
+                // the `subtitle` lines are written before these and a caption
+                // names one of them by position.
+                if sub.track >= doc.subtitles.len() {
+                    return Err(format!(
+                        "line {n}: caption names subtitle track {} of {}",
+                        sub.track,
+                        doc.subtitles.len()
+                    )
+                    .into());
+                }
+                if sub.start.checked_add(sub.frames).is_none() {
+                    return Err(format!(
+                        "line {n}: caption at {} runs past the last frame there is",
+                        sub.start
+                    )
+                    .into());
+                }
+                let lane = &mut doc.subs[at];
+                if lane.last().is_some_and(|prev| prev.end() > sub.start) {
+                    return Err(format!(
+                        "line {n}: caption at {} overlaps the one before it, or comes before it",
+                        sub.start
+                    )
+                    .into());
+                }
+                lane.push(sub);
+            }
             b"video" | b"audio" if !v1 => {
                 let kind = match keyword {
                     b"video" => LaneKind::Video,
@@ -945,8 +1061,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
             }
         }
     }
-    // One per lane whatever the file said, so a caller may zip the two.
+    // One per lane whatever the file said, so a caller may zip the two -- and
+    // the same for the placements, whose lanes are the very same list.
     doc.gains.resize(doc.lanes.len(), 0.0);
+    doc.subs.resize(doc.lanes.len(), Vec::new());
     // A file whose lanes are all empty *is* a project -- the emptied timeline,
     // saved. What it may not be is laneless; [`crate::Project::from_parts`]
     // refuses that one, by the name it has there.
@@ -1163,6 +1281,21 @@ fn number(field: &[u8], line: usize) -> crate::Result<u32> {
     }
 }
 
+/// A `sub` line's window field: microseconds, which is the clock a cue is timed
+/// in ([`crate::subtitle::Cue`]) and the one thing in this format counted in
+/// something other than frames. Signed as the cues are, and the negative half
+/// is refused by the never-empty check at the line, not here.
+fn micros(field: &[u8], line: usize) -> crate::Result<i64> {
+    match std::str::from_utf8(field).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => Ok(n),
+        None => Err(format!(
+            "line {line}: {:?} is not a number",
+            String::from_utf8_lossy(field)
+        )
+        .into()),
+    }
+}
+
 /// The two bytes a line-based format cannot hold, and the escape byte itself.
 fn escape(path: &Path, out: &mut Vec<u8>) {
     for &b in path.as_os_str().as_bytes() {
@@ -1223,6 +1356,7 @@ mod tests {
             lanes,
             &[],
             &[],
+            &[],
             eq,
             color,
             resolution,
@@ -1268,6 +1402,7 @@ mod tests {
             &sources,
             &lanes,
             &[],
+            &[],
             &tracks,
             &[],
             &[],
@@ -1305,7 +1440,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 14\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 15\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1333,6 +1468,7 @@ mod tests {
                 &dir,
                 &sources,
                 &lanes,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1395,6 +1531,7 @@ mod tests {
                 &dir,
                 &sources,
                 &lanes,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1463,6 +1600,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 (1280, 720),
                 None,
                 crate::tonemap::Preset::default(),
@@ -1510,7 +1648,7 @@ mod tests {
         assert_eq!(mixed, "line 3: unknown keyword \"encoder\"");
         // Anything but the three names is a corrupt line, by name.
         for line in ["encoder\n", "encoder gpu\n", "encoder Hardware\n"] {
-            let file = format!("edith 14\nsource 0 a.mp4\n{line}");
+            let file = format!("edith 15\nsource 0 a.mp4\n{line}");
             assert!(
                 parse(file.as_bytes(), &dir).is_err(),
                 "{line:?} is not an encoder line"
@@ -1530,6 +1668,7 @@ mod tests {
                 &dir,
                 &sources,
                 &lanes,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -1634,7 +1773,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1671,7 +1810,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1779,7 +1918,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1883,7 +2022,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1948,7 +2087,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1986,7 +2125,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -2015,7 +2154,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -2053,6 +2192,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             (1280, 720),
             Some(23.976023976023978),
             crate::tonemap::Preset::default(),
@@ -2064,7 +2204,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 15\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -2096,7 +2236,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -2260,7 +2400,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -2313,7 +2453,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -2345,7 +2485,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 14\n"));
+        assert!(v5.starts_with(b"edith 15\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -2440,6 +2580,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             (1280, 720),
             None,
             crate::tonemap::Preset::default(),
@@ -2453,7 +2594,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 14\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 15\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2498,10 +2639,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 15\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 16\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 15");
+        assert_eq!(err, "line 1: unsupported version 16");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),

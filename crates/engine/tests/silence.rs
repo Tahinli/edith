@@ -370,6 +370,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         &sources,
         &lanes,
         &p.lane_gains(),
+        &p.lane_subs(),
         p.subtitles(),
         &eq,
         &color,
@@ -385,7 +386,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
     .expect("save");
     let text = std::fs::read_to_string(&file).expect("read it back");
     assert!(
-        text.starts_with("edith 13"),
+        text.starts_with("edith 15"),
         "{:?}",
         &text[..16.min(text.len())]
     );
