@@ -78,7 +78,7 @@ use crate::hw::{DmaFrame, DmaWant, HwEncoder, HwPicture, HwSession};
 use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
 };
-use crate::project::{LaneKind, Project, Rate};
+use crate::project::{Lane, LaneKind, Project, Rate};
 use crate::scale::Composer;
 use crate::subtitle::{Cue, SubtitleTrack};
 use crate::tonemap::{self, ToneMapper};
@@ -813,6 +813,21 @@ fn export_subtitles(
     if !settings.format.has_video() {
         return Vec::new();
     }
+    // A timeline with words *placed* on it writes those and nothing else: the
+    // lanes are the edit, and a pick list built from the palette would write the
+    // same track twice over.
+    //
+    // corner-cut, transitional: a project with no placement anywhere keeps the
+    // old behaviour, every picked track carried through the picture's spans,
+    // because nothing in the app can place one yet -- so every project that
+    // exists today takes that door and exports the file it always did. Ceiling:
+    // two maps for one question. Upgrade path: once the timeline places
+    // subtitles (T5/T6) and the format carries them, an import puts its tracks
+    // on lanes and this whole branch, `timeline_cues` and
+    // [`ExportSettings::subtitles`] go with it.
+    if !placed_lanes(project).is_empty() {
+        return lane_subtitles(project, meta.frame_rate);
+    }
     settings
         .subtitles
         .iter()
@@ -833,6 +848,76 @@ fn export_subtitles(
             (!cues.is_empty()).then(|| SubParams {
                 language: track.language.clone(),
                 name: track.name.clone(),
+                cues,
+            })
+        })
+        .collect()
+}
+
+/// The project's subtitle lanes in display order, and empty where **nothing is
+/// placed on any of them** -- an empty list is what the export and the card both
+/// read as "this project does not use lanes yet", so a project holding a bare
+/// `S1` nobody dropped a caption on still exports by the pick list.
+fn placed_lanes(project: &Project) -> Vec<Lane> {
+    let lanes = project.subtitle_lanes();
+    match lanes.iter().any(|&l| !project.sub_lane(l).is_empty()) {
+        true => lanes,
+        false => Vec::new(),
+    }
+}
+
+/// One track per subtitle *lane*, in lane order -- so the file declares them
+/// top-down as the timeline shows them and a player's subtitle menu lists them
+/// in that order.
+///
+/// The cues are [`Project::sub_lane_cues`]: each placement's window of its
+/// palette track, on the timeline's own clock. Clipped again here to what the
+/// export *writes*, which ends with the last picture or sound
+/// ([`Project::media_frames`]) -- a caption hanging past both holds the
+/// timeline open ([`Project::timeline_frames`]) but there is no picture under
+/// it to write, so a cue out there is dropped and one straddling the end keeps
+/// the half that is inside. [`planned_subtitles`] says so before the button is
+/// pressed.
+///
+/// A lane is dropped whole -- no track at all in the file -- where any
+/// placement on it is a picture ([`SubtitleTrack::is_bitmap`]), a track that
+/// could not be read, or a palette row that has since gone: the muxers write
+/// words, and half a lane's cues under the other half's name would be worse
+/// than none. Its language and title are the lane's *first* placement's track,
+/// which is the one thing the whole lane is named by.
+fn lane_subtitles(project: &Project, fps: f64) -> Vec<SubParams> {
+    let end = (f64::from(project.media_frames()) / fps * 1e6).round() as i64;
+    placed_lanes(project)
+        .into_iter()
+        .filter_map(|lane| {
+            let placed = project.sub_lane(lane);
+            let first = placed.first()?;
+            let writable = |track: usize| {
+                project
+                    .subtitles()
+                    .get(track)
+                    .filter(|t| t.refused.is_none() && !t.is_bitmap())
+            };
+            let named = writable(first.track)?;
+            if placed.iter().any(|s| writable(s.track).is_none()) {
+                return None;
+            }
+            let cues: Vec<Cue> = project
+                .sub_lane_cues(lane, fps)
+                .into_iter()
+                .filter_map(|cue| {
+                    let (start_us, end_us) = (cue.start_us.max(0), cue.end_us.min(end));
+                    (end_us > start_us).then(|| Cue {
+                        start_us,
+                        end_us,
+                        text: cue.text,
+                        image: cue.image,
+                    })
+                })
+                .collect();
+            (!cues.is_empty()).then(|| SubParams {
+                language: named.language.clone(),
+                name: named.name.clone(),
                 cues,
             })
         })
@@ -945,6 +1030,13 @@ pub fn planned_subtitles(
     let mut embedded: Vec<&str> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     let picks: Vec<usize> = picks.into_iter().collect();
+    // The lanes are the answer wherever anything is placed on one, exactly as
+    // [`export_subtitles`] writes them then -- the picks a front-end still hands
+    // are the palette's rows and say nothing about what the timeline holds.
+    let lanes = placed_lanes(project);
+    if !lanes.is_empty() {
+        return planned_lanes(project, format, &lanes);
+    }
     // One statement about the *file*, said before any about a track: a format
     // that is the sound alone has nowhere to put a single one of them, and the
     // reason a pick would not have travelled anyway (a picture track, no cues)
@@ -987,6 +1079,75 @@ pub fn planned_subtitles(
         n => vec![format!("{n} tracks → embedded ({})", embedded.join(", "))],
     };
     parts.extend(dropped);
+    match parts.is_empty() {
+        true => "none".into(),
+        false => parts.join("; "),
+    }
+}
+
+/// [`planned_subtitles`] for a timeline that *places* its words: one clause per
+/// subtitle lane, named by the lane and by the palette row it shows, in the
+/// order the file will declare them ([`lane_subtitles`]).
+///
+/// Every reason a lane does not travel is said here rather than found in the
+/// file: a picture track placed on it, a track that could not be read, a palette
+/// row that has since gone, a lane sitting entirely past the last picture, and
+/// -- before a byte is written -- more lanes than a Matroska block can number
+/// ([`crate::mux::MAX_SUB_TRACKS`], which the muxer refuses again).
+fn planned_lanes(project: &Project, format: Format, lanes: &[Lane]) -> String {
+    if !format.has_video() {
+        return "none — this format is the sound alone".into();
+    }
+    let end = project.media_frames();
+    let (mut embedded, mut dropped, mut trailing) = (Vec::new(), Vec::new(), false);
+    for &lane in lanes {
+        let placed = project.sub_lane(lane);
+        // An empty lane is a lane nobody has used yet, not a refusal.
+        let Some(first) = placed.first() else {
+            continue;
+        };
+        let row = |s: &crate::project::SubClip| project.subtitles().get(s.track);
+        let (label, head) = (lane.label(), row(first));
+        let name = head.map_or_else(String::new, |t| format!("{} ", t.label));
+        if let Some(gone) = placed.iter().find(|s| row(s).is_none()) {
+            dropped.push(format!("{label} — #{} is no longer a track", gone.track));
+        } else if let Some((t, why)) = placed
+            .iter()
+            .find_map(|s| row(s).and_then(|t| t.refused.as_ref().map(|why| (t, why))))
+        {
+            dropped.push(format!("{label} {} — {why}", t.label));
+        } else if let Some(t) = placed.iter().find_map(|s| row(s).filter(|t| t.is_bitmap())) {
+            // Drawn over the picture, written into no file -- the same sentence
+            // a picked track gets, because it is the track and not the lane that
+            // cannot be carried.
+            dropped.push(format!("{label} {} — pictures; drawn, not written", t.label));
+        } else if first.start >= end {
+            dropped.push(format!("{label} {name}— past the last picture"));
+        } else {
+            embedded.push(format!("{label} {}", name.trim_end()));
+            // Something on it hangs past the end of the media: the timeline is
+            // held open under it ([`Project::timeline_frames`]) but the file
+            // stops with the last picture, so those cues are cut off there.
+            trailing |= placed.last().is_some_and(|s| s.end() > end);
+        }
+    }
+    if format.is_mkv() && embedded.len() > crate::mux::MAX_SUB_TRACKS {
+        return format!(
+            "{} subtitle lanes: a Matroska block writes its track number in one byte, so one file \
+             carries at most {}",
+            embedded.len(),
+            crate::mux::MAX_SUB_TRACKS
+        );
+    }
+    let mut parts = match embedded.len() {
+        0 => Vec::new(),
+        1 => vec![format!("{} → embedded", embedded[0])],
+        n => vec![format!("{n} lanes → embedded ({})", embedded.join(", "))],
+    };
+    parts.extend(dropped);
+    if trailing {
+        parts.push("cues past the last picture are cut off there".into());
+    }
     match parts.is_empty() {
         true => "none".into(),
         false => parts.join("; "),
@@ -1462,7 +1623,7 @@ fn encode_audio(
     // whole samples on its own, so the sum can miss by a sample or two and a
     // source that ran out early would leave the track short under a picture
     // that is not. One resize settles both, as [`run_audio`]'s does.
-    let total = (f64::from(project.timeline_frames()) / meta.frame_rate
+    let total = (f64::from(project.media_frames()) / meta.frame_rate
         * f64::from(audio.sample_rate))
     .round() as usize
         * channels;
@@ -1866,7 +2027,14 @@ fn run(
     shared: &Arc<Shared>,
     settings: &ExportSettings,
 ) -> crate::Result<()> {
-    let total = project.timeline_frames();
+    // The media's length and not the timeline's: a caption placed past the last
+    // picture holds the *timeline* open ([`Project::timeline_frames`]) and there
+    // is nothing to write under it -- the picture loop walks the composite spans
+    // and stops with them, so a file padded to the caption's end would be
+    // trailing silence over a frozen last frame. The export ends with the last
+    // picture or sound, the cues are cut off there ([`lane_subtitles`]), and
+    // [`planned_subtitles`] says so before the button is pressed.
+    let total = project.media_frames();
     // The two preview switches are the H.264 mp4 pair's alone. Only that
     // container carries a colour of its own back out ([`write_video`] tags it
     // there), so asking any other for a source-space file would write pictures
@@ -2496,7 +2664,7 @@ fn run_audio(
     // by the line above, so this names the encoder writing it.
     *shared.encoders.lock().unwrap() = Some(audio_label(project, format, true, None).to_string());
     let channels = usize::from(audio.channels);
-    let frames = (f64::from(project.timeline_frames()) / meta.frame_rate
+    let frames = (f64::from(project.media_frames()) / meta.frame_rate
         * f64::from(audio.sample_rate))
     .round() as u64;
     let total = frames as usize * channels;

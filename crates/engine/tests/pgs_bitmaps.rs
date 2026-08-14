@@ -81,6 +81,35 @@ fn the_session_maps_a_pgs_track_onto_the_timeline_and_draws_it() {
         "a subtitle that covers the whole frame is not a subtitle"
     );
 
+    // ...and placed on a subtitle lane, that same real row is refused by name
+    // before any file exists: both muxers write *words* (`S_TEXT/UTF8`, `tx3g`)
+    // and neither has a path that could write a run-length picture, so the lane
+    // carries no track at all rather than the file coming out short
+    // (`export::planned_lanes`; `tests/export_subs.rs` pins the empty file it
+    // leaves).
+    let lane = session.add_lane(engine::project::LaneKind::Subtitle);
+    session
+        .place_sub(
+            lane,
+            0,
+            engine::project::SubClip {
+                start: 0,
+                frames: 60,
+                track: pick,
+                in_us: cues[0].start_us,
+                out_us: cues[0].end_us,
+            },
+        )
+        .expect("the lane is empty, so the placement lands");
+    assert_eq!(
+        session.planned_subtitles(engine::export::Format::Hevc, []),
+        format!(
+            "S1 {} — pictures; drawn, not written",
+            session.subtitles()[pick].label
+        ),
+        "a real PGS row on a lane says why it cannot travel"
+    );
+
     // A text row of the same film carries no picture, which is what keeps the
     // two kinds of row apart.
     let text = session
