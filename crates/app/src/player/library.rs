@@ -147,8 +147,10 @@ impl Player {
         self.clipboard = None;
         self.selected = None;
         self.selected_asset = None;
-        // The subtitle rows go with the timeline they were on.
+        // The subtitle rows go with the timeline they were on, and so do the
+        // eyes: S1 of one project is not S1 of the next.
         self.sub_track = 0;
+        self.subs_off.clear();
         self.context_menu = None;
         self.library_menu = None;
         self.eq_open = None;
@@ -991,6 +993,10 @@ impl Player {
                 self.color_open = None;
                 self.speed_open = None;
                 self.close_silence();
+                // The eyes with them: a `Lane` is a position among its
+                // kind, so every shut one now names another track --
+                // the same reason the selection and the cards go.
+                self.subs_off.clear();
                 format!(
                     "{} REMOVED — {} brings it back",
                     lane.label(),
@@ -1043,6 +1049,10 @@ impl Player {
             self.color_open = None;
             self.speed_open = None;
             self.close_silence();
+            // The eyes with them: a `Lane` is a position among its
+            // kind, so every shut one now names another track --
+            // the same reason the selection and the cards go.
+            self.subs_off.clear();
         }
         self.notify_user(
             format!(

@@ -146,6 +146,45 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
     }
 }
 
+/// How many timeline frames a stretch of a subtitle track is worth: the one
+/// conversion between the two clocks a caption has -- microseconds for its
+/// words, frames for where it sits -- and the app-side twin of the engine's own
+/// (`Project::trim_sub_room`). Never zero: a placement of no frames is the one
+/// [`Project::place_sub`] refuses as empty, and a track shorter than a frame is
+/// still a caption somebody dragged.
+pub(crate) fn frames_of_us(us: i64, fps: f64) -> u32 {
+    match fps.is_finite() && fps > 0. {
+        true => ((us as f64) * fps / 1e6)
+            .round()
+            .clamp(1., f64::from(u32::MAX)) as u32,
+        false => 1,
+    }
+}
+
+/// The *placement* a trim is showing, the same way for a caption:
+/// [`Project::trim_sub`] moves the head or the tail and the window follows it,
+/// so the box on screen is the frames alone -- the words it will keep are the
+/// engine's arithmetic at the release, and nothing here draws them.
+///
+/// An edge that has not moved draws the placement it pressed, and one dragged
+/// past its other end keeps the one frame the engine's own walls always leave.
+pub(crate) fn trimmed_sub(sub: SubClip, edge: Edge, to: u32) -> SubClip {
+    match edge {
+        Edge::Start => {
+            let to = to.min(sub.end() - 1);
+            SubClip {
+                start: to,
+                frames: sub.end() - to,
+                ..sub
+            }
+        }
+        Edge::End => SubClip {
+            frames: to.max(sub.start + 1) - sub.start,
+            ..sub
+        },
+    }
+}
+
 /// Which index on its own lane a dragged clip is at *now*: the one it was picked
 /// up at while nothing has moved, and wherever the clip itself has slid to when
 /// an edit during the drag rippled the lane's indices -- a delete, an undo or a
@@ -153,8 +192,9 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
 /// `None` when the clip is gone altogether, and then the drop is not an edit at
 /// all: moving whatever slid into its place is the one thing the hand did not
 /// ask for. A lane's clips are disjoint and sorted, so at most one of them can
-/// be the clip that was picked up.
-pub(crate) fn live_idx(clips: &[Clip], idx: usize, clip: Clip) -> Option<usize> {
+/// be the clip that was picked up. Generic over what a lane holds, because a
+/// [`SubClip`] is dragged under exactly the same rule.
+pub(crate) fn live_idx<T: Copy + PartialEq>(clips: &[T], idx: usize, clip: T) -> Option<usize> {
     match clips.get(idx) {
         Some(&at) if at == clip => Some(idx),
         _ => clips.iter().position(|&c| c == clip),
@@ -396,6 +436,13 @@ pub(crate) fn lane_refuses(path: &Path, lane: Lane) -> Option<String> {
         LaneKind::Audio if engine::is_image(path) => {
             Some(format!("NOT ON {label} — {name} is a still image; drop it on a video lane"))
         }
+        // A subtitle lane holds words and no media at all: the refusal is here
+        // rather than at the engine's door so the shadow is tinted red on the
+        // way down, like every other lane a file cannot go on.
+        LaneKind::Subtitle => Some(format!(
+            "NOT ON {label} — {name} is a file; a subtitle track takes captions, dragged from the \
+             Subtitles list"
+        )),
         _ => None,
     }
 }
