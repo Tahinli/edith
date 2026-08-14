@@ -796,18 +796,19 @@ fn a_cue_steps_over_whatever_bar_is_hanging_off_the_picture() {
 }
 
 /// The two places a subtitle is drawn -- the plate over the picture and the
-/// strip under the lanes -- inside the 640x360 floor the rest of this window
+/// lanes under the tracks -- inside the 640x360 floor the rest of this window
 /// is sized for, and the plate readable on whatever the film is showing.
 #[test]
-fn the_subtitle_plate_and_strip_fit_the_smallest_window() {
-    // The strip costs the panel its own row and the panel's gap, and costs
-    // nothing at all when there is no track to draw.
-    assert_eq!(subtitle_strip_h(false), 0.);
-    assert_eq!(subtitle_strip_h(true), SUB_LANE_H + 8.);
-    // What is left for the picture at the floor, with the panel a project
-    // starts with and the strip under it.
-    let picture = 360. - HEADER_H - panel_h(2) - subtitle_strip_h(true);
-    assert!(picture > 0., "the strip pushed the picture off the window");
+fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
+    // A subtitle lane is a lane: it costs the panel exactly what a third
+    // track costs it, and a timeline with none costs nothing at all -- the
+    // strip that used to hang under the lanes is gone, and with it the one
+    // row nothing could be dropped on.
+    assert_eq!(lanes_h(3) - lanes_h(2), LANE_H + 8.);
+    // What is left for the picture at the floor, with a project's two tracks
+    // and a subtitle lane under them.
+    let picture = 360. - HEADER_H - panel_h(3);
+    assert!(picture > 0., "a subtitle lane pushed the picture off the window");
     // A two-line cue and the gap under it fit inside that, which is the
     // whole claim: the plate sits *over* the picture and must not need more
     // of it than there is.
@@ -822,9 +823,10 @@ fn the_subtitle_plate_and_strip_fit_the_smallest_window() {
     for id in crate::ui::theme::PaletteId::ALL {
         assert!(contrast(id.palette().SUB_FG, 0x000000) >= 7., "{id:?}");
     }
-    // The strip is a picture and not a target -- nothing on it takes a
-    // click -- which is the only reason it may be under `HIT_MIN`.
-    assert!(SUB_LANE_H < HIT_MIN && SUB_LANE_H > 0.);
+    // A subtitle lane is dragged onto, trimmed on and lifted from, so its row
+    // is a target and binds `HIT_MIN` like every other lane's -- the whole
+    // reason it is a lane and no longer a 16 px strip.
+    assert!(LANE_H >= HIT_MIN);
     // The library's own list of tracks scrolls past three rather than
     // taking the media list's room.
     assert_eq!(SUB_ROWS_H / ROW_H, 3.);

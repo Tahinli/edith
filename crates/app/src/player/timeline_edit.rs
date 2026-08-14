@@ -264,6 +264,184 @@ impl Player {
         cx.notify();
     }
 
+    /// The whole of a palette track as a placement: from its own first
+    /// microsecond to its last cue, and as many timeline frames as that is worth
+    /// at this rate. What a row dragged out of the Subtitles list carries, and
+    /// what the ghost is drawn from -- `start` is ignored by
+    /// [`PlaybackSession::place_sub`], which takes the frame the hand let go on.
+    ///
+    /// `None` for a track with nothing to place: one that could not be read, and
+    /// one that genuinely has no cues.
+    pub(crate) fn sub_of_track(&self, track: usize) -> Option<SubClip> {
+        let cues = &self.session.as_ref()?.subtitles().get(track)?.cues;
+        let out_us = cues.iter().map(|c| c.end_us).max()?;
+        Some(SubClip {
+            start: 0,
+            frames: frames_of_us(out_us, self.fps),
+            track,
+            in_us: 0,
+            out_us,
+        })
+    }
+
+    /// A palette row let go at window `x` over subtitle lane `to`: the whole
+    /// track goes down where the hand left it, one undo step
+    /// ([`PlaybackSession::place_sub`]). Every refusal there is words -- an
+    /// overlap, a lane that is not a subtitle lane, a track that is not there --
+    /// and they are shown as the engine worded them.
+    pub(crate) fn place_sub(&mut self, track: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        self.snap_cue = None;
+        self.ghost = None;
+        let at = self.place_frame(x).0;
+        let text = match (self.sub_of_track(track), &mut self.session) {
+            (Some(sub), Some(session)) => match session.place_sub(to, at, sub) {
+                Ok(()) => None,
+                Err(e) => Some(format!("NOT PLACED — {e}")),
+            },
+            // The row is greyed and says why in the list; here it says why at
+            // the moment somebody tried to use it anyway.
+            (None, Some(_)) => Some(
+                "NOT PLACED — that subtitle track has no cues to place; the list says why"
+                    .to_string(),
+            ),
+            (_, None) => Some("NOT PLACED — open a file first".to_string()),
+        };
+        if let Some(text) = text {
+            self.notify_user(text.into());
+        }
+        cx.notify();
+    }
+
+    /// Which index its lane holds the dragged placement at *now*
+    /// ([`Player::dragged`]'s twin, through the same [`live_idx`]): a stroke
+    /// during the gesture -- an undo, another drop -- moves the indices gpui
+    /// froze into the payload.
+    pub(crate) fn dragged_sub(&self, drag: &SubDrag) -> Option<usize> {
+        live_idx(self.session.as_ref()?.sub_lane(drag.lane), drag.idx, drag.sub)
+    }
+
+    /// A placed caption let go at window `x` over subtitle lane `to`: it lands
+    /// with its head where the hand carried it, on the lane it was dropped on --
+    /// one undo step, and none at all for a drop that changed nothing, which is
+    /// why an `Ok` is never a toast ([`Project::move_sub`]). An overlap and a
+    /// lane of the wrong kind are refused in the engine's own words.
+    pub(crate) fn move_sub(&mut self, drag: &SubDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        self.snap_cue = None;
+        self.ghost = None;
+        let Some(idx) = self.dragged_sub(drag) else {
+            return;
+        };
+        let start = self.sub_drop_frame(drag.sub, x).0;
+        if let Some(Err(e)) = self
+            .session
+            .as_mut()
+            .map(|session| session.move_sub(drag.lane, idx, to, start))
+        {
+            self.notify_user(format!("NOT MOVED — {e}").into());
+        }
+        cx.notify();
+    }
+
+    /// The × on a caption's own box: it comes off the lane and leaves the gap,
+    /// one undo step ([`PlaybackSession::lift_sub`]). The palette row it played
+    /// stays in the list, which is what makes this a lift and not a removal --
+    /// and the way a subtitle lane is emptied so it can be taken off at all.
+    pub(crate) fn lift_sub(&mut self, lane: Lane, idx: usize, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let lifted = self
+            .session
+            .as_mut()
+            .is_some_and(|session| session.lift_sub(lane, idx));
+        let text = match lifted {
+            true => format!(
+                "CAPTION LIFTED — {} puts it back",
+                self.keymap.display(ActionId::Undo)
+            ),
+            false => "NOTHING LIFTED — that caption is not there any more".to_string(),
+        };
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// A subtitle lane's eye: whether it draws its captions. State only for now
+    /// -- what reads it is the slice that draws the lanes over the picture --
+    /// and said out loud, because a toggle whose only effect is a header glyph
+    /// has to say what it has and has not done yet.
+    pub(crate) fn toggle_sub_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        let text = match self.subs_off.iter().position(|&l| l == lane) {
+            Some(i) => {
+                self.subs_off.remove(i);
+                format!("{} SHOWS ITS CAPTIONS", lane.label())
+            }
+            None => {
+                self.subs_off.push(lane);
+                format!("{} IS HIDDEN — its captions stay on the lane", lane.label())
+            }
+        };
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// Whether that subtitle lane's captions are drawn -- the eye, read by the
+    /// header that offers it and by whatever draws cues from here on.
+    pub(crate) fn sub_lane_on(&self, lane: Lane) -> bool {
+        !self.subs_off.contains(&lane)
+    }
+
+    /// Where a caption let go at window `x` wants its head: [`Player::drop_frame`]'s
+    /// twin, and the same [`landing`] -- the grab offset the press noted, and the
+    /// snap onto the edges the rest of the timeline offers, so a caption lands on
+    /// the cut it is spoken over.
+    pub(crate) fn sub_drop_frame(&self, sub: SubClip, x: Pixels) -> (u32, Option<u32>) {
+        let marks = self.snap_targets(None);
+        landing(
+            self.frame_under(x),
+            self.grab,
+            sub.frames,
+            self.snap,
+            self.snap_frames(),
+            &marks,
+        )
+    }
+
+    /// The shadow a caption in the hand would fill, on the lane the pointer is
+    /// over: [`Player::preview_ghost`]'s twin, refused for any lane that is not a
+    /// subtitle lane -- which is the answer [`Project::move_sub`] gives at the
+    /// release.
+    pub(crate) fn preview_ghost_sub(&mut self, drag: &SubDrag, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let (start, _) = self.sub_drop_frame(drag.sub, x);
+        let ghost = Ghost {
+            lane: to,
+            start,
+            frames: drag.sub.frames,
+            tint: CLIP_TEXT(),
+            refused: to.kind != LaneKind::Subtitle,
+        };
+        self.set_ghost(Some(ghost), cx);
+    }
+
+    /// The same for a palette row on its way down: it lands at the frame it is
+    /// let go on ([`Player::place_frame`]) and is as long as the whole track it
+    /// names.
+    pub(crate) fn preview_ghost_pick(&mut self, track: usize, to: Lane, x: Pixels, cx: &mut Context<Self>) {
+        let ghost = Ghost {
+            lane: to,
+            start: self.place_frame(x).0,
+            frames: self.sub_of_track(track).map_or(0, |sub| sub.frames),
+            tint: CLIP_TEXT(),
+            refused: to.kind != LaneKind::Subtitle,
+        };
+        self.set_ghost(Some(ghost), cx);
+    }
+
     /// Where a clip let go at window `x` over lane `to` wants its head: the
     /// frame under the pointer, less however far into the box the hand grabbed
     /// it (so the clip does not jump under the pointer), pulled onto a
@@ -624,6 +802,33 @@ impl Player {
         if self.modal() || self.exporting().is_some() {
             return;
         }
+        // A caption's edge, on a lane that holds no `Clip` at all: the same
+        // gesture, the same `Trim`, and the branch is the lane's kind wherever
+        // the drag is asked about ([`Player::trim_to`],
+        // [`Player::commit_trim`]). No selection -- a placement is not in the
+        // clip selection's index space -- and no group: a caption has no half
+        // on another lane.
+        if lane.kind == LaneKind::Subtitle {
+            let Some(sub) = self
+                .session
+                .as_ref()
+                .and_then(|session| session.sub_lane(lane).get(idx).copied())
+            else {
+                return;
+            };
+            self.trim = Some(Trim {
+                lane,
+                idx,
+                edge,
+                to: match edge {
+                    Edge::Start => sub.start,
+                    Edge::End => sub.end(),
+                },
+                link: None,
+            });
+            cx.notify();
+            return;
+        }
         let Some(clip) = self
             .session
             .as_ref()
@@ -659,11 +864,16 @@ impl Player {
         // there is no other end travelling with it, so it snaps at length zero.
         let marks = self.snap_targets(Some((trim.lane, trim.idx)));
         let (at, cue) = self.snap_to(self.frame_under(x), 0, &marks);
-        let Some((lo, hi)) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.trim_room(trim.lane, trim.idx, trim.edge))
-        else {
+        let Some((lo, hi)) = self.session.as_ref().and_then(|session| {
+            match trim.lane.kind == LaneKind::Subtitle {
+                // The walls a caption's edge has -- its neighbour, its own
+                // track's first microsecond and its last cue -- asked at this
+                // timeline's rate, which is why the session is the door and not
+                // the project.
+                true => session.trim_sub_room(trim.lane, trim.idx, trim.edge),
+                false => session.trim_room(trim.lane, trim.idx, trim.edge),
+            }
+        }) else {
             return;
         };
         let to = at.clamp(lo, hi);
@@ -693,6 +903,22 @@ impl Player {
         let Some(trim) = self.trim.take() else {
             return;
         };
+        // A caption's edge reaches the engine through its own door, at this
+        // timeline's rate. An `Ok` is *not* "something changed" -- an edge that
+        // stopped at a wall it already stood against is `Ok` with no undo step
+        // ([`Project::trim_sub`]) -- so only the refusal is ever said out loud,
+        // and nothing reseeks: cues are drawn over whatever is decoded.
+        if trim.lane.kind == LaneKind::Subtitle {
+            if let Some(Err(e)) = self
+                .session
+                .as_mut()
+                .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to))
+            {
+                self.notify_user(format!("NOT TRIMMED — {e}").into());
+            }
+            cx.notify();
+            return;
+        }
         let trimmed = self
             .session
             .as_mut()
@@ -719,6 +945,15 @@ impl Player {
                 .is_some_and(|s| engine::is_image(&s.path))
         });
         trimmed_clip(clip, trim.edge, trim.to, still)
+    }
+
+    /// The caption as the drag is showing it, [`Player::trimmed`]'s twin:
+    /// display only, and the engine hears about it once, at the release.
+    pub(crate) fn trimmed_sub(&self, lane: Lane, idx: usize, sub: SubClip) -> SubClip {
+        match self.trim.filter(|t| (t.lane, t.idx) == (lane, idx)) {
+            Some(trim) => trimmed_sub(sub, trim.edge, trim.to),
+            None => sub,
+        }
     }
 
     /// How long the timeline is *drawn* as: its own length, and while a tail is
