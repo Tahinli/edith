@@ -122,6 +122,18 @@ impl Player {
                     .get(&row.path)
                     .map_or_else(String::new, Proxy::detail),
             );
+            // A stand-in being made is minutes of this machine, and the row
+            // that says how far it has got is where the way out of it belongs.
+            // Gone the moment the worker settles, like the percentage beside
+            // it: there is nothing left to stop.
+            let making = matches!(self.proxies.get(&row.path), Some(Proxy::Making(_)));
+            let stop_path = row.path.clone();
+            let stop_tip: SharedString = format!(
+                "Stop making the stand-in for {} — nothing of it is kept, and the film itself is \
+                 what plays",
+                row.name
+            )
+            .into();
             let usable = row.unusable.is_none();
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);
@@ -219,6 +231,31 @@ impl Player {
                                 .child(under),
                         ),
                 )
+                // The way out of the encode, on the row that shows it running.
+                // A `HIT_MIN` target and the subtitle row's ×, and it stops the
+                // click there: the row under it picks the file, and stopping an
+                // encode is not a way of choosing what to place.
+                .when(making, |d| {
+                    d.child(
+                        div()
+                            .id(("proxy-stop", i))
+                            .flex_none()
+                            .w(px(HIT_MIN))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER())))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(stop_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel_proxy(&stop_path, cx);
+                            }))
+                            .child("×"),
+                    )
+                })
         })
         .collect();
         div()
