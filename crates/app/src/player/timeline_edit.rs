@@ -226,6 +226,9 @@ impl Player {
         let (kind, lanes) = match from.kind {
             LaneKind::Video => ("picture", "video"),
             LaneKind::Audio => ("sound", "audio"),
+            // Never dragged from here yet -- a subtitle lane holds no `Clip`,
+            // so `lane_clips` is empty and the drag above never starts on one.
+            LaneKind::Subtitle => ("caption", "subtitle"),
         };
         match moved {
             true => {
