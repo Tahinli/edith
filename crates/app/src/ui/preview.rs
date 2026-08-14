@@ -12,10 +12,12 @@ impl Player {
     /// the palette and nothing more, exactly as a picture or a song does, and it
     /// reaches the screen when a placement of it sits under the playhead
     /// ([`PlaybackSession::sub_lane_cues`], the same map the export writes the
-    /// file with -- so what is read here is what the file will say). Every lane
-    /// whose eye is open ([`Player::sub_lane_on`]) draws, so two enabled lanes
-    /// are two plates: lane order bottom-up, the first lane where a single
-    /// track's words have always been and each further one stacked above it.
+    /// file with -- so what is read here is what the file will say). **One**
+    /// lane draws, the one that is shown ([`Player::active_sub_lane`]): a
+    /// picture carrying every lane's words at once is unreadable at three lanes
+    /// and nonsense at two hundred, which is the same one-track-at-a-time every
+    /// player offers. What an export writes is untouched by this -- every lane
+    /// on the timeline becomes a subtitle track of the file.
     ///
     /// `None` -- no element at all -- while the toggle is off, with nothing
     /// placed, and between cues: the picture is what this window is for, and a
@@ -40,42 +42,29 @@ impl Player {
         // going off, the file closing and the gap between two cues are the same
         // "nothing on screen", and an 8 MB atlas tile may not survive any of
         // them (an early return above this leaked one per toggle-off).
-        // Per lane and not one flat list: the plates stack by lane below, and a
-        // picture's cache key needs the lane it came off ([`Player::sub_picture`]).
-        let lanes: Vec<(Lane, Vec<engine::subtitle::Cue>)> =
-            match self.session.as_ref().filter(|_| self.subs_on) {
-                Some(session) => session
-                    .subtitle_lanes()
-                    .into_iter()
-                    .filter(|&lane| self.sub_lane_on(lane))
-                    .map(|lane| {
-                        let cues = session.sub_lane_cues(lane);
-                        (lane, cues_at(&cues, at).into_iter().cloned().collect())
-                    })
-                    .filter(|(_, cues): &(_, Vec<_>)| !cues.is_empty())
-                    .collect(),
-                None => Vec::new(),
-            };
-        if lanes.is_empty() {
+        // One lane's cues and never a walk of the lanes: the map is asked of the
+        // shown lane alone, so two hundred subtitle lanes cost this frame what
+        // one does.
+        let shown: Option<(Lane, Vec<engine::subtitle::Cue>)> = self
+            .active_sub_lane()
+            .filter(|_| self.subs_on)
+            .and_then(|lane| {
+                let cues = self.session.as_ref()?.sub_lane_cues(lane);
+                let now: Vec<_> = cues_at(&cues, at).into_iter().cloned().collect();
+                (!now.is_empty()).then_some((lane, now))
+            });
+        let Some((lane, cues)) = shown else {
             self.drop_sub_image(window);
             return None;
-        }
+        };
         // The first picture cue up, decoded once and kept: two bitmap cues at
         // one moment is a thing PGS composes into one display set, so there is
-        // never a second picture to stack under the first *on one lane*.
-        //
-        // corner-cut: two enabled lanes each showing a PGS track draw the lower
-        // lane's picture alone -- one cache slot, one canvas over the whole
-        // region, and a second canvas would cover the first anyway. The upgrade
-        // path is a slot per lane, which wants the plates' stacking rule to mean
-        // something for canvases too.
-        let picture = lanes
+        // never a second picture to stack under the first on one lane -- and one
+        // lane is all there is here.
+        let picture = cues
             .iter()
-            .find_map(|(lane, cues)| {
-                cues.iter()
-                    .find_map(|cue| Some((*lane, cue.start_us, cue.image.as_ref()?)))
-            })
-            .and_then(|(lane, start_us, image)| self.sub_picture(lane, start_us, image, window));
+            .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
+            .and_then(|(start_us, image)| self.sub_picture(lane, start_us, image, window));
         // A picture is fitted onto the whole region and a plate hangs off the
         // bottom of it, and a track is one or the other -- so they are two
         // shapes and not one with the parts switched off.
@@ -120,12 +109,10 @@ impl Player {
                 // The plate takes no click: the picture behind it is still the
                 // drop target the whole window is.
                 //
-                // Reversed, because a column anchored at the bottom lays its
-                // children downwards: the *last* lane is written first so the
-                // first lane keeps the bottom line it has when it is the only
-                // one, and a second lane stacks above it rather than pushing it
-                // off its place.
-                .children(lanes.into_iter().rev().flat_map(|(_, cues)| cues).filter(|c| c.image.is_none()).map(|cue| {
+                // In the lane's own order: two cues at one moment -- a sign and
+                // a line of dialogue -- stack, the first on the bottom line
+                // where a single cue sits.
+                .children(cues.into_iter().filter(|c| c.image.is_none()).map(|cue| {
                     div()
                         .max_w(relative(0.9))
                         .px(px(6.))

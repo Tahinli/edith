@@ -234,8 +234,8 @@ struct Player {
     /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
     /// no magnet may take away.
     snap: bool,
-    /// Whether the subtitle lanes draw at all -- the mute over every lane's eye
-    /// ([`Player::subs_off`]), not a lane of its own. On by default and off by
+    /// Whether the subtitle lanes draw at all -- the mute over the shown lane
+    /// ([`Player::sub_lane`]), not a lane of its own. On by default and off by
     /// one stroke
     /// ([`ActionId::ToggleSubtitles`](keymap::ActionId::ToggleSubtitles)) for
     /// anyone watching the picture rather than reading it. The player's, not the
@@ -251,22 +251,26 @@ struct Player {
     /// like every other index here -- track 2 of one project is not track 2 of
     /// the next.
     sub_track: usize,
-    /// The subtitle lanes whose eye is shut: every lane shows its captions
-    /// until this says otherwise, so a lane that was just added is a lane that
-    /// draws. Held as the lanes that are *off* rather than a flag per lane, so
-    /// adding one needs no bookkeeping at all.
+    /// Which subtitle lane is *shown*: one of them and never two, the way a
+    /// player has one subtitle track chosen at a time -- two hundred lanes of
+    /// different words all drawn at once is two hundred plates over one
+    /// picture, and nothing readable.
     ///
-    /// Read where the cues are drawn ([`Player::subtitle_overlay`]): shutting an
-    /// eye takes that lane's plate off the picture and leaves its captions on
-    /// the lane. Not saved -- a `.edith` has no line for it yet.
+    /// `None` is nobody having picked yet, which reads as the first subtitle
+    /// lane ([`Player::active_sub_lane`]) -- so one lane is shown without a
+    /// pick, the first lane added draws, and a pick naming a lane that has
+    /// since gone falls back to the first rather than showing nothing.
+    ///
+    /// Read where the cues are drawn ([`Player::subtitle_overlay`]) and nowhere
+    /// else: what an *export* writes is every lane on the timeline
+    /// ([`engine::export`]), which this pick has no say in. Not saved -- a
+    /// `.edith` has no line for it yet.
     ///
     /// A [`Lane`] handle is a position among its kind, so a removal or a
-    /// reorder leaves every shut eye naming another track: they are dropped
-    /// wholesale there, exactly as the selection and the open cards are
-    /// ([`Player::remove_lane`], [`Player::reorder_lane`]) -- which is why a
-    /// lane added in a removed one's place opens with its eye open, as every
-    /// new lane does.
-    subs_off: Vec<Lane>,
+    /// reorder leaves a pick naming another track: it is dropped there,
+    /// exactly as the selection and the open cards are ([`Player::remove_lane`],
+    /// [`Player::reorder_lane`]), which shows the first lane again.
+    sub_lane: Option<Lane>,
     /// The frame the live gesture is about to land on, or `None` while it is
     /// over open bed: the line every lane draws so the snap is seen before it
     /// happens rather than discovered after the release. Stale between gestures,
@@ -680,7 +684,7 @@ fn main() {
                     snap: true,
                     subs_on: true,
                     sub_track: 0,
-                    subs_off: Vec::new(),
+                    sub_lane: None,
                     snap_cue: None,
                     ghost: None,
                     lane_drop: None,
