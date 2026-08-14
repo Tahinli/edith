@@ -378,6 +378,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         p.tone(),
         false,
         true,
+        engine::export::EncoderSeat::default(),
         p.limiter(),
         0,
     )

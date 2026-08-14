@@ -286,6 +286,39 @@ impl Player {
             }));
         }
         list.push(r.into_any_element());
+        // Which encoder writes the picture, which was an env pin and therefore
+        // no choice at all. Three seats, so the pointer gets the *list* of them
+        // ([`Pick::Encoder`]) and never a button clicked round -- the Sound
+        // row's rule, one row above. Only where there is a picture to encode:
+        // a WAV has no seat to pick and the row would be a question about
+        // nothing.
+        if self.format.has_video() {
+            let seat = self.encoder_seat();
+            list.push(
+                entry(
+                    ("encoder", 0),
+                    "e",
+                    "Encoder".into(),
+                    format!("{} — e steps", encoder_label(seat)).into(),
+                    false,
+                    true,
+                )
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    this.open_picker(Pick::Encoder, event.position(), cx)
+                }))
+                .into_any_element(),
+            );
+            // ...and, under it, the one thing about that pick a person cannot
+            // know from the words in the list: this box's driver reset itself
+            // on the vendored AV1 encoder. A dimmed row and not a modal -- the
+            // pick is theirs, and the export runs.
+            if let Some(warning) = av1_hw_warning(self.format, seat) {
+                list.push(
+                    entry(("encoder-av1", 0), "", "".into(), warning.into(), false, false)
+                        .into_any_element(),
+                );
+            }
+        }
         // What happens to the subtitles on this timeline, in one line: how many
         // are written into the file and under what names, or the reason each one
         // is not. Which tracks travel is not a pick -- everything with a cue on
@@ -431,7 +464,13 @@ impl Player {
             |(_, audio)| audio,
         );
         let settings =
-            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
+            export_settings(
+            self.quality,
+            self.custom_mbps,
+            self.format,
+            self.audio_kbps,
+            self.encoder_seat(),
+        );
         let size = estimated_bytes(
             settings.bitrate.filter(|_| self.format.has_video()),
             self.session

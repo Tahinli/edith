@@ -556,9 +556,10 @@ impl HwEncoder {
     /// really fires, and the caller's software AV1 encoder takes the export
     /// without saying anything about it.
     ///
-    /// The caller only reaches this behind `VE_HW_AV1=1`: the vendored encoder
-    /// reset this project's own GPU, which [`crate::export::Enc::open_av1`]
-    /// states in full.
+    /// The caller only reaches this when a person picked
+    /// [`crate::export::EncoderSeat::Hardware`] for an AV1 export: the vendored
+    /// encoder reset this project's own GPU, which
+    /// [`crate::export::Enc::open_av1`] states in full.
     pub fn open_av1(
         width: u32,
         height: u32,

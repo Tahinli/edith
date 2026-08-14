@@ -420,7 +420,7 @@ fn codec_chord() -> String {
         .join(" / ")
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 29]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 30]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -486,6 +486,12 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 29]> = std::sync::LazyLock::new(||
             label: "Step through the export sound bitrates",
             category: Category::File,
             reach: Reach::Click("sound"),
+        },
+        Fixed {
+            chord: "e".into(),
+            label: "Step the export encoder seat: Auto, Hardware or Software",
+            category: Category::File,
+            reach: Reach::Click("encoder"),
         },
         Fixed {
             chord: "d".into(),

@@ -56,7 +56,7 @@ use engine::audio::StreamInfo;
 use engine::color::ColorParams;
 use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
-use engine::export::{AUDIO_KBPS, DEFAULT_AUDIO_KBPS, ExportSettings, Format};
+use engine::export::{AUDIO_KBPS, DEFAULT_AUDIO_KBPS, EncoderSeat, ExportSettings, Format};
 use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;

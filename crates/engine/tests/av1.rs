@@ -371,7 +371,7 @@ fn av1_settings() -> ExportSettings {
         format: engine::export::Format::Av1,
         // The software encoder, on every machine: the hardware twin below is
         // where the plugin's AV1 seat is exercised.
-        force_sw: true,
+        seat: engine::export::EncoderSeat::Software,
         ..Default::default()
     }
 }
@@ -466,7 +466,7 @@ fn an_av1_export_carries_the_timelines_sound_in_either_container() {
         let out = Scratch::file("ve_av1_sound", ext);
         let settings = ExportSettings {
             format,
-            force_sw: true,
+            seat: engine::export::EncoderSeat::Software,
             ..Default::default()
         };
         let handle = session.export_to_with(&out, &settings);
