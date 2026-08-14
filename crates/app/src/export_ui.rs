@@ -71,7 +71,7 @@ impl Quality {
             }
             other => format!(
                 "{} Mbps",
-                export_settings(other, 0, Format::Mp4, DEFAULT_AUDIO_KBPS)
+                export_settings(other, 0, Format::Mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto)
                     .bitrate
                     .unwrap_or_default()
                     / 1_000_000
@@ -459,6 +459,52 @@ pub(crate) fn audio_rate_choices(current: u32) -> Vec<ChoiceRow> {
         .collect()
 }
 
+/// How a seat is named where a person reads it: the card row, the notice and
+/// the list row all say the same word ([`engine::export::EncoderSeat`]).
+pub(crate) fn encoder_label(seat: EncoderSeat) -> &'static str {
+    match seat {
+        EncoderSeat::Auto => "Auto",
+        EncoderSeat::Hardware => "Hardware",
+        EncoderSeat::Software => "Software",
+    }
+}
+
+/// The encoder list's rows: all three seats, the one in force marked, and what
+/// each one *does* beside it -- in the fewest words that fit inside `MENU_W`,
+/// the truncation every list above already met. Always offered, whatever this
+/// machine has: a row that vanished with the plugin would be a setting nobody
+/// could find, and the answer to "is there a seat here?" is the planned line
+/// under the rows ([`engine::export::planned_video`]), which is measured.
+pub(crate) fn encoder_choices(current: EncoderSeat) -> Vec<ChoiceRow> {
+    EncoderSeat::ALL
+        .into_iter()
+        .map(|seat| {
+            (
+                Choice::Encoder(seat),
+                encoder_label(seat).into(),
+                match seat {
+                    EncoderSeat::Auto => "the GPU if there is one",
+                    EncoderSeat::Hardware => "the GPU or a refusal",
+                    EncoderSeat::Software => "the CPU, always",
+                }
+                .into(),
+                seat == current,
+            )
+        })
+        .collect()
+}
+
+/// The row under the encoder one where -- and only where -- a person has asked
+/// for the GPU on an AV1 export: this project's own driver reset the GPU on the
+/// vendored AV1 encoder (2026-08-10), so the pick is theirs to make and the
+/// risk is theirs to be told about. `None` for every other pair, which is what
+/// keeps this from becoming a row nobody reads.
+pub(crate) fn av1_hw_warning(format: Format, seat: EncoderSeat) -> Option<&'static str> {
+    (seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4)).then_some(
+        "AV1 on the GPU reset this machine's driver once — Software is the safe seat",
+    )
+}
+
 /// How a rendition is named where a person reads it: the panel button, the
 /// notice and the list row all say the same word ([`engine::tonemap::Preset`]).
 pub(crate) fn tone_label(preset: Preset) -> &'static str {
@@ -623,6 +669,7 @@ pub(crate) fn export_settings(
     custom_mbps: u32,
     format: Format,
     audio_kbps: u32,
+    seat: EncoderSeat,
 ) -> ExportSettings {
     ExportSettings {
         format,
@@ -637,10 +684,10 @@ pub(crate) fn export_settings(
             Quality::High => Some(12_000_000),
             Quality::Custom => Some(u64::from(custom_mbps) * 1_000_000),
         },
-        // No row of its own: the software pin is for a driver that encodes
-        // badly, which is a thing about the machine and not about the output --
-        // `VE_SW_ENC` already says it, and to the whole run rather than once.
-        force_sw: false,
+        // The card's own row now ([`encoder_choices`]), kept with the project:
+        // it was a `VE_SW_ENC` env pin and nothing else, which is a switch
+        // nobody exporting a film would ever find.
+        seat,
         // The picked track is put on by `start_export`, which is the only
         // caller that writes a file; the rest of them are asking about the
         // bitrate and the format.

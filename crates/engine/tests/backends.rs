@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine::Codec;
 use engine::decode::{Backend, probe};
-use engine::export::{ExportSettings, Format};
+use engine::export::{EncoderSeat, ExportSettings, Format};
 use engine::scratch::Scratch;
 use engine::{ExportHandle, PlaybackSession};
 
@@ -144,15 +144,18 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
 
 /// The same pin, swept over the two things that *move* the seat under a user's
 /// hand: the picture size (the plugin refuses HEVC below the driver's 384x384
-/// floor and the software intra encoder takes the file) and the software pin on
-/// the card. The export card reads [`engine::export::planned_video`] for every
-/// one of these combinations, so a size that flips the seat and a card that kept
-/// the old line is the exact lie this sweep exists to catch.
+/// floor and the software intra encoder takes the file) and the seat picked on
+/// the card ([`engine::export::EncoderSeat`]). The export card reads
+/// [`engine::export::planned_video`] for every one of these combinations, so a
+/// size that flips the seat and a card that kept the old line is the exact lie
+/// this sweep exists to catch.
 ///
-/// Not swept: the hardware AV1 seat. It is `VE_HW_AV1=1` opt-in because opening
-/// it hung this box's GPU into a driver reset (2026-08-10), and a test suite is
-/// not the place to find out whether that is fixed -- `av1.rs` keeps that one
-/// `#[ignore]`d and by name.
+/// Not swept: the hardware AV1 seat, which is what `Hardware` means for the two
+/// AV1 rows. Opening it hung this box's GPU into a driver reset (2026-08-10) and
+/// a test suite is not the place to find out whether that is fixed -- `av1.rs`
+/// keeps that one `#[ignore]`d and by name -- so `Hardware` is swept over the
+/// formats whose seat is safe to open, and the AV1 pair only over the seats that
+/// open no plugin at all.
 #[test]
 fn the_planned_seat_follows_the_size_and_the_pin() {
     for (format, ext) in [
@@ -163,10 +166,13 @@ fn the_planned_seat_follows_the_size_and_the_pin() {
         (Format::HevcMp4, "mp4"),
     ] {
         for (width, height) in [(320, 180), (1280, 720), (1920, 1080)] {
-            for force_sw in [false, true] {
+            for seat in EncoderSeat::ALL {
+                if seat == EncoderSeat::Hardware && matches!(format, Format::Av1 | Format::Av1Mp4) {
+                    continue;
+                }
                 let settings = ExportSettings {
                     format,
-                    force_sw,
+                    seat,
                     ..ExportSettings::default()
                 };
                 let mut session =
@@ -178,7 +184,7 @@ fn the_planned_seat_follows_the_size_and_the_pin() {
                     .expect("these formats carry picture");
                 // A pinned job is software by definition, whatever the machine
                 // has -- the one seat this file may assert outright.
-                if force_sw {
+                if seat == EncoderSeat::Software {
                     assert!(
                         planned.starts_with("SW encode"),
                         "{ext} {width}x{height}: a pinned job is software, got {planned}"
@@ -186,13 +192,52 @@ fn the_planned_seat_follows_the_size_and_the_pin() {
                 }
                 let out = out_path("seat", ext);
                 let handle = session.export_to_with(&out, &settings);
+                // `Hardware` on a box with no seat for this size is the one
+                // combination that opens nothing: the job refuses in words and
+                // the card said the same before the button ([`NO_HW_SEAT`]),
+                // which is the claim -- a refusal that fires while a seat *is*
+                // there would be caught by the branch below, where the export
+                // then has to open one.
+                if planned == engine::export::NO_HW_SEAT {
+                    // The verdict is read here rather than through `wind_down`,
+                    // which takes it out of the handle on its way past.
+                    let started = Instant::now();
+                    let err = loop {
+                        if let Some(result) = handle.result() {
+                            break result
+                                .expect_err("hardware was demanded and refused")
+                                .to_string();
+                        }
+                        assert!(
+                            started.elapsed() < Duration::from_secs(60),
+                            "{ext}: a refused export never settled"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    assert!(
+                        err.contains("no VA-API seat"),
+                        "{ext} {width}x{height}: the refusal names the missing seat, got {err}"
+                    );
+                    assert!(
+                        !out.exists(),
+                        "{ext} {width}x{height}: a refused export wrote a file"
+                    );
+                    continue;
+                }
                 let opened = published_encoders(&handle, &format!("{ext} {width}x{height}"));
                 handle.cancel();
                 wind_down(&handle);
                 assert!(
                     opened.starts_with(planned),
-                    "{ext} {width}x{height} force_sw={force_sw}: the card said {planned}, the job opened {opened}"
+                    "{ext} {width}x{height} seat={seat:?}: the card said {planned}, the job opened {opened}"
                 );
+                if seat == EncoderSeat::Hardware {
+                    assert!(
+                        opened.starts_with("HW encode"),
+                        "{ext} {width}x{height}: hardware was demanded and not refused, so the \
+                         job runs on it -- got {opened}"
+                    );
+                }
             }
         }
     }
