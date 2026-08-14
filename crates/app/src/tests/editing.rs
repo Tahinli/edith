@@ -1516,6 +1516,36 @@ fn a_source_is_only_ever_asked_for_its_peaks_once() {
     assert_eq!(unseen_paths(&sources, &streams).len(), 1);
 }
 
+/// The auto switch, which is the whole of what an import asks: with it off no
+/// film is handed to [`engine::proxy`] at all, and turning Proxies on is what
+/// asks for the ones the project is missing -- there is no other door, so a
+/// project that never wants a stand-in never spends a minute encoding one.
+#[test]
+fn a_project_that_makes_no_proxies_by_itself_starts_none_until_it_is_cut_on_them() {
+    let sources = [Source {
+        path: asset("test_av.mp4"),
+        audio_stream: 0,
+    }];
+    let none: HashMap<PathBuf, ()> = HashMap::new();
+    let one = vec![asset("test_av.mp4")];
+    // Today's behaviour, both ways round: auto on starts them whether or not
+    // the picture is cut on them -- the cache is warmed for later.
+    assert_eq!(proxies_to_start(true, false, &sources, &none), one);
+    assert_eq!(proxies_to_start(true, true, &sources, &none), one);
+    // Auto off and not cut on them: nothing is started at all.
+    assert!(
+        proxies_to_start(false, false, &sources, &none).is_empty(),
+        "an import started a stand-in the project asked it not to"
+    );
+    // ...and the switch is the ask: the film comes through the moment Proxies
+    // goes on, because it was left unseen rather than marked done.
+    assert_eq!(proxies_to_start(false, true, &sources, &none), one);
+    // One start per film either way: a film already in the map is one already
+    // asked about, sixty repaints a second notwithstanding.
+    let seen: HashMap<PathBuf, ()> = HashMap::from([(asset("test_av.mp4"), ())]);
+    assert!(proxies_to_start(true, true, &sources, &seen).is_empty());
+}
+
 #[test]
 fn the_add_button_is_dead_unless_it_would_do_something() {
     let picked = (PathBuf::from("/m/0.mp4"), 0);
