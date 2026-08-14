@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use engine::project::{Edge, Lane, LaneKind, SubClip};
 use engine::scratch::Scratch;
-use engine::subtitle::{self, Cue};
+use engine::subtitle::{self, Cue, SubtitleTrack};
 
 fn asset(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -939,9 +939,21 @@ fn a_lane_maps_to_cues_clipped_to_the_window_and_shifted_onto_the_timeline() {
         "both cues clipped to the window and shifted to the placement"
     );
 
-    // A placement whose track has been taken off the palette shows nothing --
-    // never another track's words.
-    project.remove_subtitles(0).expect("the row comes off");
+    // The palette row cannot be taken off under the placement that plays it --
+    // the refusal names the lane and the frame it is at.
+    let why = project
+        .remove_subtitles(0)
+        .expect_err("a placed row does not come off")
+        .to_string();
+    assert!(
+        why.contains("S1 at frame 0") && why.contains("delete those clips first"),
+        "the refusal names where it is placed: {why}"
+    );
+
+    // A placement whose track is gone all the same -- a load that put a shorter
+    // palette back, which is the only door left -- shows nothing, never another
+    // track's words.
+    let project = project.with_subtitles(Vec::new());
     assert!(
         project.sub_lane_cues(lane, LANE_FPS).is_empty(),
         "a placement with no track left shows nothing"
@@ -949,6 +961,111 @@ fn a_lane_maps_to_cues_clipped_to_the_window_and_shifted_onto_the_timeline() {
     assert!(
         project.sub_lane_cues(lane, 0.0).is_empty(),
         "and a rate that is not a rate maps nothing"
+    );
+}
+
+/// A palette row taken off while *another* row is placed: the bug a
+/// placement-that-names-an-index invites, and the rule
+/// [`engine::Project::remove_source`] already follows -- the rows below the one
+/// that went move down, so every clip that named one has to move with them or
+/// it plays somebody else's words.
+#[test]
+fn a_removed_palette_row_walks_the_placements_below_it_down() {
+    let mut project = engine::Project::single(FILE, 150);
+    let base = subtitle::open(&data("test_subs.srt"), None);
+    // Three rows of one file: `add_subtitles` dedupes by (path, track), so
+    // three track numbers are three rows without three files.
+    for (n, label) in [(0u64, "eng"), (1, "fra - Signs"), (2, "spa")] {
+        assert!(
+            project.add_subtitles(&SubtitleTrack {
+                track: Some(n),
+                label: label.into(),
+                ..base.clone()
+            }),
+            "row {label} goes on the palette"
+        );
+    }
+    let lane = project.add_lane(LaneKind::Subtitle);
+    project
+        .place_sub(lane, 30, whole(1))
+        .expect("the middle row is placed");
+    assert_eq!(
+        project.subtitles()[project.sub_lane(lane)[0].track].label,
+        "fra - Signs"
+    );
+
+    // The row above it comes off -- nothing plays it -- and the placement is
+    // walked down with the palette, so it still says the same words.
+    project.remove_subtitles(0).expect("an unplaced row comes off");
+    assert_eq!(
+        project.subtitles().iter().map(|t| &*t.label).collect::<Vec<_>>(),
+        ["fra - Signs", "spa"],
+        "the survivors keep their order"
+    );
+    assert_eq!(project.sub_lane(lane)[0].track, 0, "the placement moved down");
+    assert_eq!(
+        project.subtitles()[project.sub_lane(lane)[0].track].label,
+        "fra - Signs",
+        "and names the very track it named before"
+    );
+
+    // The history went with it: its snapshots hold the indexes as they were
+    // before the reindex, so an undo into one would put the placement back on a
+    // track that is no longer there.
+    assert!(
+        !project.undo(),
+        "no step survives a reindex the snapshots do not know about"
+    );
+
+    // ...and now that it *is* placed, the same row does not come off at all:
+    // the refusal names the lane, the frame, and the way out.
+    let why = project
+        .remove_subtitles(0)
+        .expect_err("a placed row stays")
+        .to_string();
+    assert!(
+        why.contains("fra - Signs") && why.contains("S1 at frame 30"),
+        "the refusal names the row and where it plays: {why}"
+    );
+    assert_eq!(project.subtitles().len(), 2, "and nothing came off");
+}
+
+/// A drag that changes nothing is not a mistake to report: a caption picked up
+/// and put back down, and an edge pulled past a wall it already stands against,
+/// both come back `Ok` and cost no undo step -- a front-end shows every `Err`
+/// as a notice, and neither of these two is worth one.
+#[test]
+fn a_drag_that_changes_nothing_is_ok_and_costs_no_step() {
+    let (mut project, lane) = with_subtitle_lane();
+    project
+        .place_sub(lane, 30, SubClip { frames: 60, ..whole(0) })
+        .expect("it goes down");
+    let placed = project.sub_lane(lane)[0];
+
+    project
+        .move_sub(lane, 0, lane, 30)
+        .expect("put back where it was picked up");
+    assert_eq!(project.sub_lane(lane)[0], placed, "and nothing moved");
+
+    let (_lo, hi) = project
+        .trim_sub_room(lane, 0, Edge::End, LANE_FPS)
+        .expect("the room the tail has");
+    project
+        .trim_sub(lane, 0, Edge::End, hi, LANE_FPS)
+        .expect("out to the wall");
+    let at_wall = project.sub_lane(lane)[0];
+    project
+        .trim_sub(lane, 0, Edge::End, hi + 5, LANE_FPS)
+        .expect("and past it, which is the wall again");
+    assert_eq!(project.sub_lane(lane)[0], at_wall, "the edge stayed put");
+
+    // Two edits happened, so two steps exist: the trim, then the placement.
+    assert!(project.undo(), "the trim walks back");
+    assert_eq!(project.sub_lane(lane)[0], placed);
+    assert!(project.undo(), "and the placement");
+    assert!(
+        project.sub_lane(lane).is_empty(),
+        "the two no-ops left no step of their own"
     );
 }
 

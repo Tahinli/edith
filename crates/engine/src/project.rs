@@ -981,17 +981,33 @@ impl Project {
                 lane.label(),
                 match lane.kind {
                     LaneKind::Video => "video",
-                    LaneKind::Audio | LaneKind::Subtitle => "audio",
+                    LaneKind::Audio => "audio",
+                    // Unreachable while the guard above lets the last subtitle
+                    // lane go, and its own word here so the sentence stays true
+                    // if that rule is ever relaxed.
+                    LaneKind::Subtitle => "subtitle",
                 }
             )
             .into());
         }
-        if let Some(sub) = self.lanes[i].subs.first() {
+        if !self.lanes[i].subs.is_empty() {
+            // Three names and a count, exactly as the clips below get: the way
+            // out of the refusal is the drag, so the words say so.
+            let named: Vec<String> = self.lanes[i]
+                .subs
+                .iter()
+                .take(3)
+                .map(|s| format!("{} at frame {}", self.track_name(s.track), s.start))
+                .collect();
+            let rest = match self.lanes[i].subs.len().saturating_sub(named.len()) {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
             return Err(format!(
-                "{} still holds {} subtitle(s), the first at frame {}: delete those first",
+                "{} still holds {}{rest}: delete those captions (or drag them to \
+                 another track) first",
                 lane.label(),
-                self.lanes[i].subs.len(),
-                sub.start
+                named.join(", ")
             )
             .into());
         }
@@ -1431,7 +1447,18 @@ impl Project {
     /// Every index past `idx` moves down by one, as [`remove_source`](
     /// Project::remove_source)'s do: a caller holding a picked row (an export's
     /// [`crate::export::ExportSettings::subtitles`]) has to fix it up or drop
-    /// it, or it names a different track afterwards.
+    /// it, or it names a different track afterwards. The placements on the
+    /// lanes are *not* a caller's to fix: a [`SubClip`] names its track by
+    /// index into this very list, so every one past `idx` is walked down with
+    /// it here -- the reindex [`remove_source`](Project::remove_source) does
+    /// for its clips, for its reason.
+    ///
+    /// Refused, changing nothing, while anything placed on a subtitle lane
+    /// plays *this* row: the placement would have to be deleted or retargeted,
+    /// and either one is an edit nobody asked for. The refusal names the lane
+    /// and the frame it is at, up to three of them --
+    /// [`remove_source`](Project::remove_source) refuses the same way for the
+    /// same silent corruption.
     ///
     /// corner-cut: not an undo step, for the reason the limiter is not -- the
     /// history snapshots hold the lane list and subtitles are not on it
@@ -1439,13 +1466,49 @@ impl Project {
     /// on -- [`crate::PlaybackSession::import_subtitles`], the panel's own
     /// door, which reads the subtitles of a file and nothing else -- and not a
     /// ctrl+z; the upgrade path is the same one the limiter has: a history
-    /// entry holding the project's own settings beside the lanes.
+    /// entry holding the project's own settings beside the lanes. The history
+    /// is *cleared* rather than kept, as a source removal clears it: the
+    /// snapshots hold the indexes as they were before the reindex, so an undo
+    /// into one would put every placement past `idx` on the wrong track.
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         if idx >= self.subtitles.len() {
             return Err(format!("there is no subtitle track {idx} to remove").into());
         }
+        let placed: Vec<String> = handles(&self.lanes)
+            .into_iter()
+            .zip(&self.lanes)
+            .flat_map(|(lane, data)| {
+                data.subs
+                    .iter()
+                    .filter(move |s| s.track == idx)
+                    .map(move |s| format!("{} at frame {}", lane.label(), s.start))
+            })
+            .take(3)
+            .collect();
+        if !placed.is_empty() {
+            return Err(format!(
+                "{} is on the timeline ({}): delete those clips first",
+                self.track_name(idx),
+                placed.join(", ")
+            )
+            .into());
+        }
         self.subtitles.remove(idx);
+        for s in self.lanes.iter_mut().flat_map(|l| &mut l.subs) {
+            if s.track > idx {
+                s.track -= 1;
+            }
+        }
+        self.history.clear();
         Ok(())
+    }
+
+    /// What a refusal calls a palette row: the name the panel shows, and the
+    /// index alone for a row that is not there.
+    fn track_name(&self, track: usize) -> String {
+        self.subtitles
+            .get(track)
+            .map_or_else(|| format!("subtitle track {track}"), |t| t.label.clone())
     }
 
     /// The subtitle lanes in display order -- what a front-end lays out and
@@ -1468,6 +1531,13 @@ impl Project {
     /// Put `sub` on `lane` at timeline frame `at` -- [`place`](Project::place)'s
     /// twin, with one deliberate difference: it **refuses** an overlap instead
     /// of overwriting what it lands on.
+    ///
+    /// `at` is where it lands and [`sub.start`](SubClip::start) is ignored,
+    /// exactly as [`place`](Project::place) ignores a [`Clip`]'s: what a drag
+    /// carries is a *window of a track* and where the hand let go, and the
+    /// second of those is the argument. So a caller builds the placement once
+    /// (from the palette row it dragged) and drops it at as many frames as it
+    /// likes without rewriting the field each time.
     ///
     /// A picture placed over a picture hides it and the hidden one is still
     /// there to drag back out; two captions in one frame are two lines nobody
@@ -1548,7 +1618,9 @@ impl Project {
     ///
     /// One undo step on success; nothing changed and no step on a refusal --
     /// an index that is not there, a lane that is not a subtitle lane or is not
-    /// there, an overlap, and a drop that changes neither lane nor frame.
+    /// there, and an overlap. A drop that changes neither lane nor frame is
+    /// `Ok` and no step: a hand that picked a caption up and put it back has
+    /// done nothing wrong, and a front-end showing every `Err` would say so.
     pub fn move_sub(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> crate::Result<()> {
         let Some(sub) = self.sub_lane(from).get(idx).copied() else {
             return Err(format!("there is no subtitle {idx} on {}", from.label()).into());
@@ -1564,7 +1636,10 @@ impl Project {
             return Err(format!("there is no {} to move onto", to.label()).into());
         };
         if (here, start) == (dest, sub.start) {
-            return Err("that subtitle is already there".into());
+            // A pick-up-put-back: the drag ended where it began, which is not a
+            // mistake to name -- `Ok`, and no undo step, because nothing
+            // changed. A refusal here would toast a hand that did nothing.
+            return Ok(());
         }
         if start.checked_add(sub.frames).is_none() {
             return Err(
@@ -1620,7 +1695,10 @@ impl Project {
     /// caller's table for, and which this one can simply read.
     ///
     /// `Err`, with nothing changed and no undo step, for an index that is not
-    /// there, an unusable `fps`, and an edge already where it was asked to go.
+    /// there and an unusable `fps`. An edge that ends up where it already was
+    /// -- the hand did not move it, or the clamp stopped it at a wall it stood
+    /// against -- is `Ok` and no step, for [`move_sub`](Project::move_sub)'s
+    /// reason: a drag that stops at a wall is not a mistake to report.
     pub fn trim_sub(
         &mut self,
         lane: Lane,
@@ -1644,10 +1722,11 @@ impl Project {
             Edge::End => sub.end(),
         };
         if to == at {
-            return Err(format!(
-                "that edge is at frame {at} already -- it cannot go past frames {lo}..{hi}"
-            )
-            .into());
+            // The edge is where it was asked to go -- either the hand did not
+            // move it, or the clamp above stopped it at a wall it was already
+            // standing against. Both are a drag that changed nothing: `Ok`, no
+            // undo step, and no toast for a box that simply stopped moving.
+            return Ok(());
         }
         self.snapshot();
         let i = self.index(lane).expect("the subtitle was found on it");
