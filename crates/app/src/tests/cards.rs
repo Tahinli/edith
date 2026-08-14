@@ -1387,3 +1387,37 @@ fn the_export_estimate_rides_out_a_stall_and_converges() {
     assert_eq!(clock(114.), "1:54");
     assert_eq!(clock(-1.), "0:00");
 }
+
+/// The two shapes that made the countdown lie rather than guess: a bar that
+/// went backwards, and a division that could reach infinity. The engine no
+/// longer pulls its bar back (`export`'s `fetch_max`), which is why this asks
+/// the estimator directly -- it is handed the marks a re-run used to leave.
+#[test]
+fn the_export_estimate_answers_a_bar_that_went_backwards_with_a_guess() {
+    // 93% at 400 s, then the hardware encoder dies and the mark stands while
+    // the software one writes the film again from the first frame.
+    let marks = vec![(392., 0.93), (396., 0.93), (400., 0.93)];
+    let stalled = eta_secs(&marks, 400., 0.93).expect("a stall is still estimated");
+    assert!(stalled > 0., "a running export has time left: {stalled}");
+    // The old shape: the same marks against a bar that had been put back to
+    // zero. The rate cannot be negative, so what is left cannot be either --
+    // and it is never the "~0:00 left" that read as an export about to finish.
+    let backwards = eta_secs(&marks, 400., 0.05).expect("a backward bar still estimates");
+    assert!(
+        backwards >= stalled,
+        "a bar at 5% claimed less left than one at 93%: {backwards} vs {stalled}"
+    );
+    assert!(backwards > 1., "the countdown read as good as finished");
+    // Nothing it can be handed prints as an infinite clock.
+    for (marks, elapsed, progress) in [
+        (vec![(0., 0.)], f32::MAX, f32::MIN_POSITIVE),
+        (vec![(0., f32::MAX)], 3., 0.5),
+        (Vec::new(), f32::MAX, 0.5),
+    ] {
+        let left = eta_secs(&marks, elapsed, progress);
+        assert!(
+            left.is_none_or(f32::is_finite),
+            "{left:?} would be printed as a clock"
+        );
+    }
+}

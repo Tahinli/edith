@@ -1211,6 +1211,20 @@ fn a_proxy_of_his_4k_film_is_made_faster_than_it_plays() {
 /// stays pinned to software: it is not what is under test and the fixture must
 /// decode the same way it does everywhere else in this file.
 fn injected<T>(abort: Option<&str>, hang: Option<&str>, body: impl FnOnce() -> T) -> T {
+    // Short, because one of these is waiting out a child that has stopped
+    // answering and the wait is the thing under test.
+    injected_with(abort, hang, Some("1500"), body)
+}
+
+/// The same, with the wait left to the caller: `None` is what a person's own
+/// editor runs with, which is the one setting none of the tests above ever
+/// exercised.
+fn injected_with<T>(
+    abort: Option<&str>,
+    hang: Option<&str>,
+    timeout_ms: Option<&str>,
+    body: impl FnOnce() -> T,
+) -> T {
     let _exclusive = SEAT.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     let restore = std::env::var_os("VE_SW_ENC");
     unsafe {
@@ -1218,9 +1232,10 @@ fn injected<T>(abort: Option<&str>, hang: Option<&str>, body: impl FnOnce() -> T
         std::env::remove_var("VE_SW_ENC");
         std::env::set_var("VE_HW_TEST_FAKE", "1");
         std::env::set_var("VE_HW_CHILD_BIN", env!("CARGO_BIN_EXE_hw-encode-child"));
-        // Short, because one of these is waiting out a child that has stopped
-        // answering and the wait is the thing under test.
-        std::env::set_var("VE_HW_TIMEOUT_MS", "1500");
+        match timeout_ms {
+            Some(ms) => std::env::set_var("VE_HW_TIMEOUT_MS", ms),
+            None => std::env::remove_var("VE_HW_TIMEOUT_MS"),
+        }
         match abort {
             Some(at) => std::env::set_var("VE_HW_TEST_ABORT", at),
             None => std::env::remove_var("VE_HW_TEST_ABORT"),
@@ -1296,6 +1311,164 @@ fn a_hardware_encoder_killed_mid_export_costs_the_file_nothing() {
     }
     assert!(!part_path(&out).exists(), "the .part outlived the export");
     std::fs::remove_file(&out).unwrap();
+}
+
+/// ...and the bar over that same death only ever goes forwards. The rerun is a
+/// whole second pass over the timeline, so the one thing a person must not see
+/// is the progress they watched fill drop back to zero: it holds at the mark the
+/// dead seat reached and moves on from there, ending exactly full.
+#[test]
+fn a_hardware_encoder_killed_mid_export_never_pulls_the_bar_backwards() {
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 20);
+    let out = out_path("hw_child_abort_progress");
+
+    let seen = injected(Some("3"), None, || {
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        // Sampled far faster than the export writes, so the retry cannot slip
+        // through between two reads.
+        let started = Instant::now();
+        let mut seen = vec![handle.progress()];
+        while !handle.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "export did not finish"
+            );
+            let now = handle.progress();
+            if now != *seen.last().unwrap() {
+                seen.push(now);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle
+            .result()
+            .expect("a finished export has an outcome")
+            .expect("the export survived its encoder");
+        seen.push(handle.progress());
+        seen
+    });
+
+    assert!(
+        seen.windows(2).all(|pair| pair[1] >= pair[0]),
+        "the bar went backwards across the fallback: {seen:?}"
+    );
+    assert_eq!(
+        seen.last().copied(),
+        Some(1.0),
+        "a finished export leaves a full bar: {seen:?}"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// Threads of this very process that belong to an audio pass. Every worker the
+/// pass starts inherits its name from the thread that spawned it (Linux `comm`
+/// is inherited), so this is the pass *and its own workers* -- which is what
+/// makes it a measure of how many passes are running: two at once is twice the
+/// crowd of one.
+fn audio_pass_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|thread| {
+            std::fs::read_to_string(thread.path().join("comm"))
+                .is_ok_and(|name| name.trim() == "export-audio")
+        })
+        .count()
+}
+
+/// The busiest that crowd ever gets while `export` writes this project.
+fn busiest_audio_pass(project: Project, meta: engine::VideoMeta, out: &Path) -> usize {
+    let handle = engine::export::start(project, meta, out, &ExportSettings::default());
+    let started = Instant::now();
+    let mut most = 0;
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "export did not finish"
+        );
+        most = most.max(audio_pass_threads());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    handle
+        .result()
+        .expect("a finished export has an outcome")
+        .expect("the export was written");
+    most
+}
+
+/// One audio pass at a time, across that same death. An mp4 runs the sound
+/// beside the picture, and the picture's failure used to leave that thread
+/// *detached*: the re-run started a second pass, and a machine that had just
+/// lost its GPU mixed and encoded the same film's sound twice at once. Measured
+/// against the same export with nothing dying under it -- the fallback may not
+/// be a busier place than an ordinary export is.
+#[test]
+fn a_hardware_encoder_killed_mid_export_leaves_no_audio_pass_behind() {
+    // AC-3: an mp4 cannot carry it, so the pass is a real decode and encode
+    // rather than the packet copy an AAC source is over in a millisecond.
+    let source = asset("test_ac3.mp4");
+    let out = out_path("hw_child_abort_audio");
+
+    let (project, meta) = short_edit(&source, 40);
+    let alone = {
+        let _seat = pin_software();
+        busiest_audio_pass(project, meta, &out)
+    };
+    std::fs::remove_file(&out).unwrap();
+
+    let (project, meta) = short_edit(&source, 40);
+    let across = injected(Some("3"), None, || busiest_audio_pass(project, meta, &out));
+
+    println!("audio pass threads: {alone} alone, {across} across the fallback");
+    assert!(
+        across <= alone,
+        "the fallback ran {across} audio-pass threads where one pass runs {alone}"
+    );
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("the export is a file");
+    assert_eq!(written.frame_count, 40, "every timeline frame was written");
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// What a *shipping* editor waits when its child stops answering. Every test
+/// here pins `VE_HW_TIMEOUT_MS` at 1.5 s, so none of them ever ran the 15 s
+/// default -- fifteen seconds an export spends on a child that will never
+/// answer again, before the software encoder it is owed can even begin.
+///
+/// The ceiling stays where it is, because an encoder opening on a 4K frame is
+/// not a dead one. What changes is that a child which has answered its first
+/// frames has *said* what its frames cost, and from then on the wait is that
+/// measure and not the ceiling.
+#[test]
+fn a_wedged_child_is_waited_out_by_its_own_measure_not_the_ceiling() {
+    let (width, height) = (320u32, 240u32);
+    // No `VE_HW_TIMEOUT_MS` at all: the wait is the one a person's export gets.
+    injected_with(None, Some("10"), None, || {
+        let mut encoder =
+            HwEncoder::open(width, height, 30, 1, 1_000_000).expect("the stand-in seat opened");
+        let (y, u, v) = synthetic(0, width as usize, height as usize);
+        for frame in 0..10 {
+            assert!(
+                encoder.encode(&y, &u, &v, width, height, false).is_ok(),
+                "picture {frame} is before the wedge"
+            );
+        }
+        let started = Instant::now();
+        let wedged = encoder
+            .encode(&y, &u, &v, width, height, false)
+            .expect_err("a child that stops answering is not an encode");
+        let waited = started.elapsed();
+        println!("wedge at the shipping default: contained in {waited:.2?}");
+        assert!(engine::hwproc::is_lost(&wedged), "{wedged}");
+        assert!(
+            waited < Duration::from_secs(6),
+            "waited {waited:.2?} on a wedged child at the shipping default"
+        );
+        // ...and never so little that a slow picture could be mistaken for a
+        // dead one: the floor holds even where every measured frame was
+        // instant, which the stand-in encoder's are.
+        assert!(waited >= Duration::from_secs(2), "waited only {waited:.2?}");
+    });
 }
 
 /// The same death at the *open*: the child never gets far enough to say yes, so

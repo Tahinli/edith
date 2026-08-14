@@ -380,7 +380,10 @@ struct Shared {
     /// backwards -- 5,458 backward steps over one film export before this rule
     /// was written down. A `store` is only correct where nothing else can be
     /// publishing at all, which now means the terminal [`PROGRESS_SCALE`] and
-    /// the audio-only export ([`run_audio`]) that has no second thread.
+    /// the audio-only export ([`run_audio`]) that has no second thread. The
+    /// rule outlives one attempt at the file: an export rerun in software
+    /// because the hardware seat died writes this same atomic, and the bar
+    /// holds where the dead seat left it rather than starting again.
     progress: AtomicU32,
     cancel: AtomicBool,
     finished: AtomicBool,
@@ -513,7 +516,13 @@ pub fn start(
                     {
                         eprintln!("export video: {e}; writing it again in software");
                         let _ = std::fs::remove_file(&part);
-                        worker.progress.store(0, Ordering::Relaxed);
+                        // The bar is *not* put back to zero: the rerun writes
+                        // it with `fetch_max` like everything else
+                        // ([`Shared::progress`]), so it holds where the dead
+                        // seat left it and moves again once the software
+                        // encoder passes that mark. A person whose GPU has just
+                        // died is the last one who should also watch the bar
+                        // run backwards.
                         let mut software = settings.clone();
                         software.seat = EncoderSeat::Software;
                         run(&project, &meta, &part, &worker, &software)
@@ -1619,7 +1628,7 @@ impl CopyPlan {
                 done += 1;
                 shared
                     .progress
-                    .store(picture_progress(done, total), Ordering::Relaxed);
+                    .fetch_max(picture_progress(done, total), Ordering::Relaxed);
             }
         }
         // Everything up to here is still cancellable, exactly as the encoded
@@ -2045,6 +2054,45 @@ fn window_fidelity(
 /// encodes and joins where the file it is writing needs the track.
 type AudioJob = thread::JoinHandle<crate::Result<Option<ExportAudio>>>;
 
+/// The pass while [`run`] holds it, joined however that function leaves --
+/// including through a `?`.
+///
+/// A [`JoinHandle`](thread::JoinHandle) that is merely dropped *detaches* its
+/// thread, and the one error that matters here is the hardware encoder's
+/// process dying ([`crate::hwproc`]): the whole export is then written again by
+/// [`start`], which starts an audio pass of its own. The abandoned one would go
+/// on mixing and encoding the same sound beside it -- two passes of a feature
+/// film's audio at once, on the machine that has just lost its GPU. Joined
+/// instead, so an export has one audio pass at a time and none outlives it.
+struct AudioPass(Option<AudioJob>);
+
+impl AudioPass {
+    /// Whether the pass has landed, so the picture loop may collect it without
+    /// waiting.
+    fn is_finished(&self) -> bool {
+        self.0.as_ref().is_some_and(thread::JoinHandle::is_finished)
+    }
+
+    /// Whether a pass is still to be collected -- which is what "the sound is
+    /// still being worked out" means on the encoder line.
+    fn running(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// The handle, for the one caller that is about to join it itself.
+    fn take(&mut self) -> Option<AudioJob> {
+        self.0.take()
+    }
+}
+
+impl Drop for AudioPass {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            let _ = job.join();
+        }
+    }
+}
+
 /// The pass's answer, or the failure that is the export's failure. A panicked
 /// audio thread reads as an error rather than as silence: an export that wrote
 /// its picture and quietly no sound is the one outcome this must not have.
@@ -2162,7 +2210,9 @@ fn run(
     };
     // A Matroska file (and a copied one, whose muxer is the same) collects it
     // here; an mp4 leaves it running and collects it under the picture below.
-    let mut audio_job = Some(audio_job);
+    // Held in a guard from here on, so no way out of this function leaves the
+    // pass running behind it ([`AudioPass`]).
+    let mut audio_job = AudioPass(Some(audio_job));
     // The condition is the *format*, and the copied-picture path below relies
     // on that covering it too: `plan` hands its packets straight to a Matroska
     // muxer, so it may only exist where this has already collected them --
@@ -2280,7 +2330,7 @@ fn run(
     // it replaced -- and the sound says whether it was copied or encoded, which
     // only `copy_audio` knows and, on the overlapped path, does not know yet.
     let seat = encoder.label();
-    publish_seats(shared, seat, project, settings, sound, opus, audio_job.is_some());
+    publish_seats(shared, seat, project, settings, sound, opus, audio_job.running());
     // When the picture started, so the stage line below can say where under it
     // the sound landed -- the one number that says whether the two passes
     // really overlapped, in the same voice as `encode_audio`'s own timers.
@@ -2391,10 +2441,7 @@ fn run(
             // encoded, and an overlapped pass that reported only at the end
             // would spend the whole encode first. Also where its measured
             // codec reaches the line on screen.
-            if audio_job
-                .as_ref()
-                .is_some_and(thread::JoinHandle::is_finished)
-            {
+            if audio_job.is_finished() {
                 late = join_audio(audio_job.take().expect("just seen to be there"))?;
                 sound = late.as_ref().map(|track| track.copied);
                 opus = late

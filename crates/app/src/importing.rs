@@ -407,9 +407,21 @@ pub(crate) fn eta_secs(marks: &[(f32, f32)], elapsed: f32, progress: f32) -> Opt
     // alone reads well: raw window rate spikes eightfold on either edge of a
     // stall, and the run average alone never notices a segment change.
     let overall = progress / elapsed;
+    // Never below zero, whatever the marks say. A bar that went *backwards*
+    // between two marks -- an export written again from the start after its
+    // hardware encoder died -- made this negative, which cancelled the run's
+    // own rate and left an answer that read "~0:00 left" over six minutes of
+    // software encoding. The bar is monotone at the source now
+    // (`engine::export`'s `fetch_max`), and a rate the other way is still not
+    // an estimate: a window that has gone nowhere leans on the whole run's
+    // rate, which is exactly what a stall does.
     let recent = marks
         .first()
         .filter(|&&(t, _)| elapsed - t >= ETA_SPAN)
-        .map_or(overall, |&(t, p)| (progress - p) / (elapsed - t));
-    Some(2. * (1. - progress) / (recent + overall))
+        .map_or(overall, |&(t, p)| ((progress - p) / (elapsed - t)).max(0.));
+    // Both rates at once can only be zero where nothing has happened at all,
+    // which the guards above already answer with "estimating…" -- said in
+    // arithmetic as well, because the alternative is an infinite division
+    // printed as a clock.
+    Some(2. * (1. - progress) / (recent + overall)).filter(|left| left.is_finite())
 }
