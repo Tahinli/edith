@@ -115,6 +115,11 @@ actions! {
     /// else -- the sound and every export stay the film's whichever way it
     /// is set.
     ToggleProxies,
+    /// Whether a film that wants a stand-in gets one made as it is imported
+    /// ([`engine::proxy::wanted`]): what is *encoded*, where the switch above
+    /// is what is decoded. With it off the switch above is also the ask -- it
+    /// starts the ones the project is missing.
+    ToggleAutoProxies,
     /// The window's own colours, which belong to the person looking at them and
     /// not to the project: a list of the palettes, opened here and from the
     /// toolbar's Theme button. It was a build feature once, which made it a
@@ -179,6 +184,7 @@ impl ActionId {
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
             ActionId::ToggleProxies => "Proxies on / off for the picture",
+            ActionId::ToggleAutoProxies => "Make proxies on import: on / off",
             ActionId::Theme => "Theme: the window's colours…",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
@@ -234,6 +240,7 @@ impl ActionId {
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
             ActionId::ToggleProxies => "toggle-proxies",
+            ActionId::ToggleAutoProxies => "toggle-auto-proxies",
             ActionId::Theme => "theme",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
@@ -290,6 +297,10 @@ impl ActionId {
             // nothing that is saved and nothing that is exported: a stand-in
             // is what one watches while cutting, not what one delivers.
             | ActionId::ToggleProxies
+            // ...and whether those stand-ins are made without being asked: the
+            // other half of the same switch, filed beside it so a card reader
+            // meets the pair the panel shows as a pair.
+            | ActionId::ToggleAutoProxies
             // ...and what the whole window is painted in: it edits nothing at
             // all, it is what one is looking *with*.
             | ActionId::Theme => Category::View,
@@ -827,6 +838,11 @@ impl Keymap {
                 // thrown once for a whole session rather than one wanted under
                 // a hand -- the theme takes ctrl+h for that reason.
                 b(ActionId::ToggleProxies, "p", true),
+                // Making them takes the key next to it, ctrl+o: the pair is one
+                // subject and the two chords are under the same finger, and
+                // every letter of the word itself is spoken for ("a" adds an
+                // audio lane, ctrl+a removes one).
+                b(ActionId::ToggleAutoProxies, "o", true),
                 // The theme takes ctrl+h -- the h of the word, since "t" is the
                 // subtitles and ctrl+t takes one off -- and a ctrl chord because
                 // it is a preference set once, not a stroke wanted under a hand
@@ -1101,8 +1117,9 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 50);
+        assert_eq!(k.entries().len(), 51);
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
+        assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));

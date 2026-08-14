@@ -377,13 +377,14 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         None,
         p.tone(),
         false,
+        true,
         p.limiter(),
         0,
     )
     .expect("save");
     let text = std::fs::read_to_string(&file).expect("read it back");
     assert!(
-        text.starts_with("edith 12"),
+        text.starts_with("edith 13"),
         "{:?}",
         &text[..16.min(text.len())]
     );
