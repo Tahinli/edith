@@ -969,7 +969,11 @@ impl PlaybackSession {
         let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
             .with_mix(&doc.gains, doc.limiter)
             .with_tone(doc.tone)
-            .with_subtitles(subtitles);
+            // The palette before what is placed on it: a caption names a row of
+            // it, and [`Project::with_subs`] refuses one naming a row that is
+            // not there.
+            .with_subtitles(subtitles)
+            .with_subs(doc.subs)?;
         let span = project.composite_span_at(0);
         // Last, because it is the one thing here that cannot be taken back: the
         // feeder thread outlives the `Audio` value (it holds its own clones) and
@@ -1260,6 +1264,9 @@ impl PlaybackSession {
             // project's, not this machine's (the monitoring volume is not
             // written and never will be).
             &self.project.lane_gains(),
+            // ...and what is placed on each lane, in the same order again: the
+            // captions, which are the only thing a subtitle lane holds.
+            &self.project.lane_subs(),
             // The subtitle tracks with them, by reference: which file the cues
             // are in, never the cues (see [`crate::edith`]).
             self.project.subtitles(),

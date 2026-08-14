@@ -260,7 +260,7 @@ fn a_project_keeps_its_subtitles_across_a_save() {
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 14\n"), "{text}");
+    assert!(text.starts_with("edith 15\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the reference is written relative, and no cue is: {text}"
@@ -1210,4 +1210,178 @@ fn pgs_erase() -> Vec<u8> {
     let mut set = pgs_segment(0x16, &[0, 8, 0, 4, 0x10, 0, 1, 0, 0, 0, 0]);
     set.extend(pgs_segment(0x80, &[]));
     set
+}
+
+/// The v15 lines: a subtitle lane is written in its place among the others, a
+/// caption on it is one `sub` line -- both clocks and the palette row it names
+/// -- and an empty one is the bare line a video lane's is. The whole of it
+/// comes back the placement it was, and a re-save is the same bytes, which is
+/// what "the file is the timeline" means for words as much as for pictures.
+#[test]
+fn subtitle_lanes_and_their_captions_survive_a_save() {
+    let dir = scratch("lanes_save");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    let subs = dir.join("test_subs.srt");
+    std::fs::copy(data("test_subs.srt"), &subs).expect("copy the subtitle fixture");
+
+    let mut session = engine::PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0); // silent like the rest of the suites
+    assert_eq!(session.import_subtitles(&subs).expect("the .srt imports"), 1);
+
+    let s1 = session.add_lane(LaneKind::Subtitle);
+    let s2 = session.add_lane(LaneKind::Subtitle);
+    let caption = SubClip {
+        start: 0,
+        frames: 45,
+        track: 0,
+        in_us: 500_000,
+        out_us: 1_500_000,
+    };
+    session.place_sub(s1, 10, caption).expect("a caption goes down");
+
+    let project = dir.join("cut.edith");
+    session.save_project(&project).expect("save");
+    let text = std::fs::read_to_string(&project).expect("read the project back");
+    assert!(text.starts_with("edith 15\n"), "{text}");
+    assert!(
+        text.contains("\nsub 1 10 45 0 500000 1500000\n"),
+        "the placement is one line: where it sits, how long, whose words, and \
+         the window of them in microseconds: {text}"
+    );
+    assert!(
+        text.contains("\nsub 2\n"),
+        "and an empty subtitle lane says so on a line of its own: {text}"
+    );
+
+    let back = engine::PlaybackSession::open_project(&project).expect("open the project");
+    assert_eq!(
+        back.subtitle_lanes(),
+        [s1, s2],
+        "both lanes come back, in the order they were laid out"
+    );
+    assert_eq!(
+        back.sub_lane(s1),
+        [SubClip { start: 10, ..caption }],
+        "and the caption is the very placement it was"
+    );
+    assert!(back.sub_lane(s2).is_empty(), "the empty one is still empty");
+    assert_eq!(back.subtitles()[0].cues, expected(), "palette intact");
+
+    // ...and saving what was loaded writes the file it was loaded from.
+    let again = dir.join("cut2.edith");
+    back.save_project(&again).expect("save again");
+    assert_eq!(
+        std::fs::read_to_string(&again).expect("read"),
+        text,
+        "a load and a re-save is the same file"
+    );
+}
+
+/// The dialect before the lanes: a v14 project names its subtitle files and
+/// places none of them -- there was no line to place one on -- so it loads with
+/// its palette whole and no subtitle lane at all, and re-saves as v15 with the
+/// same one `subtitle` line and nothing on any lane.
+#[test]
+fn a_version_14_project_keeps_its_palette_and_places_nothing() {
+    let dir = scratch("v14");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    let srt = dir.join("test_subs.srt");
+    std::fs::copy(data("test_subs.srt"), &srt).expect("copy the subtitle fixture");
+    let path = dir.join("old.edith");
+    std::fs::write(
+        &path,
+        "edith 14\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         subtitle - test_subs.srt\nvideo 1 0 0 30 0 0 - - fit 1000\n\
+         audio 1 0 0 30 0 0 - - fit 1000\n",
+    )
+    .expect("write a v14 file");
+
+    let loaded = engine::PlaybackSession::open_project(&path).expect("a v14 file still opens");
+    assert_eq!(loaded.subtitles().len(), 1, "the palette row is there");
+    assert_eq!(loaded.subtitles()[0].cues, expected(), "cues and all");
+    assert!(
+        loaded.subtitle_lanes().is_empty(),
+        "and nothing of it is placed: that dialect had nowhere to place it"
+    );
+
+    let now = dir.join("new.edith");
+    loaded.save_project(&now).expect("save");
+    let text = std::fs::read_to_string(&now).expect("read back");
+    assert!(text.starts_with("edith 15\n"), "{text}");
+    assert!(
+        text.contains("\nsubtitle - test_subs.srt\n"),
+        "the row survives the migration: {text}"
+    );
+    assert!(
+        !text.contains("\nsub "),
+        "and no lane and no placement were invented for it: {text}"
+    );
+}
+
+/// The palette bound, which is a clip's source bound for words: a caption names
+/// a `subtitle` line by position, so one naming a row that is not there is
+/// refused -- at the parser, which names the line, and at
+/// [`engine::Project::with_subs`], which names the lane. Neither is a file this
+/// editor wrote; both are files it may be handed.
+#[test]
+fn a_caption_naming_a_track_the_palette_does_not_have_is_refused() {
+    let dir = scratch("badtrack");
+    let media = dir.join("test_av.mp4");
+    std::fs::copy(asset("test_av.mp4"), &media).expect("copy the media fixture");
+    std::fs::copy(data("test_subs.srt"), dir.join("test_subs.srt")).expect("copy the subtitles");
+    let path = dir.join("bad.edith");
+    std::fs::write(
+        &path,
+        "edith 15\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         subtitle - test_subs.srt\nvideo 1 0 0 30 0 0 - - fit 1000\n\
+         audio 1 0 0 30 0 0 - - fit 1000\nsub 1 0 45 3 0 1000000\n",
+    )
+    .expect("write it");
+    let err = engine::PlaybackSession::open_project(&path)
+        .err()
+        .expect("a caption may not name a row that is not there")
+        .to_string();
+    assert_eq!(err, "line 9: caption names subtitle track 3 of 1");
+
+    // An empty placement is refused by the same door, at either clock.
+    let empty = dir.join("empty.edith");
+    std::fs::write(
+        &empty,
+        "edith 15\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+         subtitle - test_subs.srt\nvideo 1 0 0 30 0 0 - - fit 1000\n\
+         audio 1 0 0 30 0 0 - - fit 1000\nsub 1 0 45 0 1000000 1000000\n",
+    )
+    .expect("write it");
+    let err = engine::PlaybackSession::open_project(&empty)
+        .err()
+        .expect("a window of nothing is not a caption")
+        .to_string();
+    assert_eq!(
+        err,
+        "line 9: caption at 0 is empty: 45 frames of [1000000, 1000000)"
+    );
+
+    // ...and the load's own door says the same thing about the same file, by
+    // the lane rather than by the line: `from_parts` for words.
+    let (project, _lane) = with_subtitle_lane();
+    let beyond = SubClip { track: 3, ..whole(0) };
+    let refused = project
+        .clone()
+        .with_subs(vec![Vec::new(), Vec::new(), vec![beyond]])
+        .expect_err("the palette holds one row")
+        .to_string();
+    assert_eq!(refused, "S1 caption at 0 names subtitle track 3 of 1");
+
+    // A caption on a lane that is not a subtitle lane is refused there too --
+    // the media lanes hold pictures and sound, and never words.
+    let wrong = project
+        .with_subs(vec![vec![whole(0)], Vec::new(), Vec::new()])
+        .expect_err("V1 is not a subtitle track")
+        .to_string();
+    assert!(
+        wrong.starts_with("V1 is not a subtitle track and holds 1 caption(s)"),
+        "{wrong}"
+    );
 }

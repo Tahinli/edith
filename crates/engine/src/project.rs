@@ -1295,20 +1295,11 @@ impl Project {
         }
         (
             sources,
-            lanes
-                .into_iter()
-                // corner-cut: the subtitle lanes are left out, because [`Parts`]
-                // is `(LaneKind, Vec<Clip>)` and a subtitle lane's contents are
-                // [`SubClip`]s -- a `.edith` has no line to write one on yet, so
-                // a save that emitted the lane would write a track with nothing
-                // in it and a *reader* that has never seen the keyword would
-                // refuse the file. Upgrade path is the format slice that owns
-                // it: a `sub` line per placement (lane ord, start, frames,
-                // track, window) beside the `video`/`audio` ones, and this
-                // filter goes.
-                .filter(|l| l.kind != LaneKind::Subtitle)
-                .map(|l| (l.kind, l.clips))
-                .collect(),
+            // Every lane, subtitle ones included: they hold no [`Clip`], so what
+            // comes out for one is an empty list, and its *place* in the display
+            // order is what a save writes it for. What is on it travels beside
+            // this, in [`lane_subs`](Project::lane_subs), as the gains do.
+            lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
             eq,
             color,
         )
@@ -1352,15 +1343,85 @@ impl Project {
     /// Every lane's volume in dB, in display order -- what a save writes,
     /// beside the lanes [`Project::without_orphan_sources`] hands back.
     ///
-    /// The *same* lanes as that call, subtitle ones left out: a save zips the
-    /// two lists, so a lane that is in one and not the other would hand every
-    /// track below it the volume of the track above.
+    /// The *same* lanes as that call, subtitle ones included at the `0.0` they
+    /// are pinned to ([`set_lane_gain_db`](Project::set_lane_gain_db) refuses
+    /// one): a save zips the two lists, so a lane that is in one and not the
+    /// other would hand every track below it the volume of the track above.
     pub fn lane_gains(&self) -> Vec<f32> {
-        self.lanes
-            .iter()
-            .filter(|l| l.kind != LaneKind::Subtitle)
-            .map(|l| l.gain_db)
-            .collect()
+        self.lanes.iter().map(|l| l.gain_db).collect()
+    }
+
+    /// What is placed on every lane, in display order and in step with
+    /// [`without_orphan_sources`](Project::without_orphan_sources) exactly as
+    /// [`lane_gains`](Project::lane_gains) is -- what a save writes as its `sub`
+    /// lines. Empty for every video and audio lane, which hold no [`SubClip`].
+    ///
+    /// Nothing is renumbered on the way out: a [`SubClip`] names a *palette*
+    /// row ([`Project::subtitles`]) and the palette is saved whole, so unlike a
+    /// clip's source there is no orphan to prune and no index to move.
+    pub fn lane_subs(&self) -> Vec<Vec<SubClip>> {
+        self.lanes.iter().map(|l| l.subs.clone()).collect()
+    }
+
+    /// The placements a *load* puts back, one list per lane in display order --
+    /// the door [`with_mix`](Project::with_mix) is, and no undo step for the
+    /// same reason. Called *after*
+    /// [`with_subtitles`](Project::with_subtitles), whose palette a placement
+    /// names.
+    ///
+    /// The subtitle half of [`from_parts`](Project::from_parts) and checked
+    /// like it, by name and in release, because it is the same untrusted file:
+    /// a placement on a lane that is not a subtitle lane, an empty span or an
+    /// empty window, a track the palette does not have, a span running past the
+    /// last frame there is, and a lane that is out of order or overlaps itself
+    /// ([`place_sub`] refuses every one of those on the live timeline).
+    ///
+    /// [`place_sub`]: Project::place_sub
+    pub fn with_subs(mut self, subs: Vec<Vec<SubClip>>) -> crate::Result<Self> {
+        let names = handles(&self.lanes);
+        let palette = self.subtitles.len();
+        for ((data, lane), list) in self.lanes.iter_mut().zip(names).zip(subs) {
+            let name = lane.label();
+            if list.is_empty() {
+                continue;
+            }
+            if data.kind != LaneKind::Subtitle {
+                return Err(format!(
+                    "{name} is not a subtitle track and holds {} caption(s): words go on a \
+                     subtitle track",
+                    list.len()
+                )
+                .into());
+            }
+            for s in &list {
+                if s.frames == 0 || s.out_us <= s.in_us || s.in_us < 0 {
+                    return Err(format!(
+                        "{name} caption at {} is empty: {} frames of [{}, {})",
+                        s.start, s.frames, s.in_us, s.out_us
+                    )
+                    .into());
+                }
+                if s.track >= palette {
+                    return Err(format!(
+                        "{name} caption at {} names subtitle track {} of {palette}",
+                        s.start, s.track
+                    )
+                    .into());
+                }
+                if s.start.checked_add(s.frames).is_none() {
+                    return Err(format!(
+                        "{name} caption at {} runs past the last frame there is",
+                        s.start
+                    )
+                    .into());
+                }
+            }
+            if !subs_sorted_disjoint(&list) {
+                return Err(format!("the {name} lane is out of order or overlaps itself").into());
+            }
+            data.subs = list;
+        }
+        Ok(self)
     }
 
     /// The mix settings a *load* puts back: lane volumes in display order (a
