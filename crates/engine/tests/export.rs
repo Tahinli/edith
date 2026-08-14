@@ -1158,3 +1158,206 @@ fn a_proxy_of_his_4k_film_is_made_faster_than_it_plays() {
     assert!(!part_path(&out).exists(), "a cancelled proxy left its .part");
     assert_eq!(engine::proxy::cached(&film), None);
 }
+
+// ---------------------------------------------------------------------------
+// The hardware encoder's process dying under the driver.
+//
+// Mesa's radeonsi calls libc `abort()` from its own C worker thread when the
+// video ring resets under it, which no `catch_unwind` in the process can see:
+// on 2026-08-13 that killed the editor mid-export and took the session with it.
+// The encoder now lives in a child (`engine::hwproc`), and these are the proof
+// that its death is an inconvenience rather than a crash.
+//
+// None of them needs a GPU, and that is deliberate: the machine where this
+// matters is the one whose ring is already wedged, and a test that had to hang a
+// real ring to run could never be the oracle for the fix. `VE_HW_TEST_FAKE`
+// opens a stand-in seat in the child that touches no driver;
+// `VE_HW_TEST_ABORT` / `VE_HW_TEST_HANG` say where it dies or stops.
+
+/// The stand-in-seat variables are process-wide, so the tests below take turns
+/// with them; nothing else in this binary reads them, and every one is removed
+/// again before the turn is given up.
+fn injected<T>(abort: Option<&str>, hang: Option<&str>, body: impl FnOnce() -> T) -> T {
+    use std::sync::Mutex;
+    static TURN: Mutex<()> = Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    unsafe {
+        std::env::set_var("VE_HW_TEST_FAKE", "1");
+        std::env::set_var("VE_HW_CHILD_BIN", env!("CARGO_BIN_EXE_hw-encode-child"));
+        // Short, because one of these is waiting out a child that has stopped
+        // answering and the wait is the thing under test.
+        std::env::set_var("VE_HW_TIMEOUT_MS", "1500");
+        match abort {
+            Some(at) => std::env::set_var("VE_HW_TEST_ABORT", at),
+            None => std::env::remove_var("VE_HW_TEST_ABORT"),
+        }
+        match hang {
+            Some(at) => std::env::set_var("VE_HW_TEST_HANG", at),
+            None => std::env::remove_var("VE_HW_TEST_HANG"),
+        }
+    }
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    unsafe {
+        for var in [
+            "VE_HW_TEST_FAKE",
+            "VE_HW_CHILD_BIN",
+            "VE_HW_TIMEOUT_MS",
+            "VE_HW_TEST_ABORT",
+            "VE_HW_TEST_HANG",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+    match out {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// The timeline these all export: short, and cut, so the export really runs a
+/// span loop rather than copying one clip.
+fn short_edit(source: &Path, frames: u32) -> (Project, engine::VideoMeta) {
+    let (meta, _) = engine::demux::Demuxer::open(source).expect("open source");
+    let mut project = Project::single(source, meta.frame_count);
+    assert!(project.split(frames));
+    assert!(project.delete(1));
+    assert_eq!(project.timeline_frames(), frames);
+    (project, meta)
+}
+
+/// A whole export whose hardware encoder is killed three frames in: the editor
+/// is still here, and so is the file -- written again, from the first frame, by
+/// the software encoder for the same codec, and clean enough that an outside
+/// decoder reads every packet of it without a word.
+///
+/// Invariant 1 at its entry surface: `export::start` is what the export card
+/// presses, and this is that same call with a driver dying under it.
+#[test]
+fn a_hardware_encoder_killed_mid_export_costs_the_file_nothing() {
+    pin_software();
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 20);
+    let out = out_path("hw_child_abort");
+
+    injected(Some("3"), None, || {
+        // `Auto` is what an untouched export card sends: the seat that *may*
+        // fall back, which is the whole question here.
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(180)).expect("the export survived its encoder");
+    });
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("the export is a file");
+    assert_eq!(written.frame_count, 20, "every timeline frame was written");
+    assert_eq!(decode_all(&out).len(), 20, "and every one of them decodes");
+    if let Some(said) = ffmpeg_complaints(&out) {
+        assert!(
+            said.is_empty(),
+            "ffmpeg read the fallback's file badly: {said}"
+        );
+    }
+    assert!(!part_path(&out).exists(), "the .part outlived the export");
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The same death at the *open*: the child never gets far enough to say yes, so
+/// there is no hardware seat at all and the software one takes the export from
+/// the first frame. A refusal, not a crash, and the file is whole.
+#[test]
+fn a_hardware_encoder_killed_at_its_open_is_simply_no_seat() {
+    pin_software();
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 12);
+    let out = out_path("hw_child_abort_init");
+
+    injected(Some("init"), None, || {
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(180)).expect("the export survived the open");
+    });
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("the export is a file");
+    assert_eq!(written.frame_count, 12);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// ...and at the finalize, which is the third place a ring resets: every
+/// picture is fed and the encoder is being flushed when it dies.
+#[test]
+fn a_hardware_encoder_killed_at_the_drain_costs_the_file_nothing() {
+    pin_software();
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 12);
+    let out = out_path("hw_child_abort_drain");
+
+    injected(Some("drain"), None, || {
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(180)).expect("the export survived the drain");
+    });
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("the export is a file");
+    assert_eq!(written.frame_count, 12);
+    assert_eq!(decode_all(&out).len(), 12);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// Invariant 4: a ring can wedge *without* anything dying -- the child stays
+/// alive and simply stops answering. The parent gives it `VE_HW_TIMEOUT_MS` and
+/// then kills it, which lands on the same fallback a death does. "Contained"
+/// here means bounded, so the wait is what is really being measured: an export
+/// that sat on a stuck child forever would be the hang this refuses.
+#[test]
+fn a_hardware_encoder_that_stops_answering_is_killed_and_replaced() {
+    pin_software();
+    let source = asset("test_baseline.mp4");
+    let (project, meta) = short_edit(&source, 12);
+    let out = out_path("hw_child_hang");
+
+    let started = Instant::now();
+    injected(None, Some("2"), || {
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        wait(&handle, Duration::from_secs(180)).expect("the export outlived the wedge");
+    });
+    println!(
+        "hung child: contained in {:.2} s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("the export is a file");
+    assert_eq!(written.frame_count, 12);
+    assert_eq!(decode_all(&out).len(), 12);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The seat's own contract, under the same injection and with no export around
+/// it: a killed child comes back as an error carrying
+/// [`engine::hwproc::HW_LOST`], every later call gives the same answer instead
+/// of blocking on a socket nobody holds, and the process doing the asking is
+/// still running to be asked.
+#[test]
+fn a_dead_encoder_answers_every_later_call_the_same_way() {
+    let (width, height) = (320u32, 240u32);
+    injected(Some("1"), None, || {
+        let mut encoder =
+            HwEncoder::open(width, height, 30, 1, 1_000_000).expect("the stand-in seat opened");
+        let (y, u, v) = synthetic(0, width as usize, height as usize);
+        assert!(
+            encoder.encode(&y, &u, &v, width, height, false).is_ok(),
+            "the first picture is before the injection point"
+        );
+        let died = encoder
+            .encode(&y, &u, &v, width, height, false)
+            .expect_err("the second picture kills the child");
+        assert!(
+            engine::hwproc::is_lost(&died),
+            "an encoder death must say so: {died}"
+        );
+        // The second ask is the one that would hang if the child were not
+        // reaped, and it must not spend the timeout answering either.
+        let again = Instant::now();
+        let repeat = encoder.drain().expect_err("the seat stays dead");
+        assert!(engine::hwproc::is_lost(&repeat), "{repeat}");
+        assert!(
+            again.elapsed() < Duration::from_millis(500),
+            "a dead seat answered only after waiting"
+        );
+    });
+}

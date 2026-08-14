@@ -216,6 +216,56 @@ fn a_decoded_buffer_is_encoded_without_ever_being_read_back() {
     }
 }
 
+/// What the process boundary costs, at the size an export is really written at.
+///
+/// The encoder lives in a child now ([`engine::hwproc`]) so that a driver's
+/// `abort()` cannot take the editor with it, and the price of that has to be
+/// small enough that nobody would trade it back: pictures reach the child
+/// through a shared mapping rather than down a pipe, so a frame costs one
+/// `memcpy` and a ten-byte message. `VE_HW_INPROCESS` pins the seat the way it
+/// used to be, which is the only honest baseline there is.
+///
+/// This is the *worst* case on purpose: an untouched clip's pictures never leave
+/// the GPU at all (`a_decoded_buffer_is_encoded_without_ever_being_read_back`,
+/// whose descriptors cross the same socket), so nothing an export really does is
+/// slower than this.
+#[test]
+#[ignore = "needs libengine_hw.so and a VA-API driver with an H.264 encode entrypoint"]
+fn isolating_the_encoder_costs_little_at_1080p() {
+    const FRAMES: u32 = 60;
+    let (width, height) = (1920u32, 1080u32);
+    let mut spent = Vec::new();
+    for inprocess in [true, false] {
+        // SAFETY-of-a-sort: the ignored run is `--test-threads=1`, which is
+        // what this file's own header already requires of its env pins.
+        unsafe {
+            match inprocess {
+                true => std::env::set_var("VE_HW_INPROCESS", "1"),
+                false => std::env::remove_var("VE_HW_INPROCESS"),
+            }
+        }
+        let started = Instant::now();
+        let Some((_, units)) = encode(width, height, FRAMES) else {
+            println!("no hardware encoder here -- skipping");
+            return;
+        };
+        assert_eq!(units, FRAMES, "one access unit per fed picture");
+        spent.push(started.elapsed().as_secs_f64());
+    }
+    let (local, remote) = (spent[0], spent[1]);
+    println!(
+        "1080p x{FRAMES}: in-process {:.1} fps, isolated {:.1} fps ({:.0}% of it)",
+        f64::from(FRAMES) / local,
+        f64::from(FRAMES) / remote,
+        100.0 * local / remote
+    );
+    assert!(
+        local / remote >= 0.85,
+        "isolation kept only {:.0}% of the in-process rate",
+        100.0 * local / remote
+    );
+}
+
 /// Decode and encode resolve through two independent symbol tables, so an
 /// encoder that cannot load must not cost us the decoder (and vice versa).
 ///
