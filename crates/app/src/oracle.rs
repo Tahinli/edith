@@ -186,11 +186,11 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // Nothing to draw over the picture, so nothing to switch off: the
         // library says how subtitles arrive, and this row would flip a state
         // with no visible half either way.
-        // ...and nothing to take off the timeline either, for the same reason:
-        // the row would name a track that is not there.
-        ActionId::ToggleSubtitles | ActionId::RemoveSubtitleTrack if !ctx.subtitles => {
-            Enable::No("no subtitles yet")
-        }
+        //
+        // The × on a palette row is refused by this very fact and asks this very
+        // arm ([`Player::remove_subtitle_track`]): an empty list is a list with
+        // no row to take off, said in the same words the toggle says it in.
+        ActionId::ToggleSubtitles if !ctx.subtitles => Enable::No("no subtitles yet"),
         // Not `No`: with nothing running there is no export for this to be
         // about at all, which is what keeps `esc` -- the same key -- a quiet
         // way out of a card rather than a line about exports.
