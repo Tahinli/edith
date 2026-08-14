@@ -869,7 +869,12 @@ impl Keymap {
                 // it is a preference set once, not a stroke wanted under a hand
                 // that is editing.
                 b(ActionId::Theme, "h", true),
-                b(ActionId::CancelExport, "escape", false),
+                // A chord, and the only escape in this table: bare `esc` is the
+                // stroke a hand throws at anything on screen, and throwing it
+                // at a running export used to delete an hour of encoding. The
+                // key stays the one people look for -- the modifier is what
+                // makes it an intention ([`crate::cancels_export`]).
+                b(ActionId::CancelExport, "escape", true),
                 // The help key, where every program's list of what it can do
                 // has always been. Free -- gpui names it "f1"
                 // (platform.rs:880, the keysym's own name lowercased) -- and
@@ -1200,7 +1205,9 @@ mod tests {
         assert_eq!(k.lookup("=", false), Some(ActionId::VolumeUp));
         assert_eq!(k.lookup("-", false), Some(ActionId::VolumeDown));
         assert_eq!(k.lookup("+", false), None);
-        assert_eq!(k.lookup("escape", false), Some(ActionId::CancelExport));
+        // The chord, and *only* the chord: bare escape reaches no action at all.
+        assert_eq!(k.lookup("escape", true), Some(ActionId::CancelExport));
+        assert_eq!(k.lookup("escape", false), None);
         // The modifier is half the chord: ctrl+e is not e.
         assert_eq!(k.lookup("e", true), None);
         assert_eq!(k.lookup("space", true), None);
@@ -1222,7 +1229,7 @@ mod tests {
         let text = emit(&Keymap::defaults());
         assert!(text.starts_with("edith-keys 1\nplay space\n"));
         assert!(text.contains("save ctrl+s\n"));
-        assert!(text.contains("cancel-export escape\n"));
+        assert!(text.contains("cancel-export ctrl+escape\n"));
         // Both directions: the file this writes is the file it reads back, and
         // a file read in comes out byte for byte as it went.
         assert_eq!(whole(&text), Keymap::defaults());
@@ -1389,7 +1396,7 @@ mod tests {
         assert_eq!(k.display(ActionId::Delete), "x or delete");
         assert_eq!(k.display(ActionId::Undo), "z or ctrl+z");
         // The one key whose common name is not gpui's.
-        assert_eq!(k.display(ActionId::CancelExport), "esc");
+        assert_eq!(k.display(ActionId::CancelExport), "ctrl+esc");
         assert_eq!(whole("edith-keys 1\n").display(ActionId::Cut), "unbound");
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
