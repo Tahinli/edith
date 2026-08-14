@@ -56,6 +56,9 @@ impl Player {
         // A picture is fitted onto the whole region and a plate hangs off the
         // bottom of it, and a track is one or the other -- so they are two
         // shapes and not one with the parts switched off.
+        // What the transient bars along the bottom edge are taking up right now:
+        // both shapes step up over it rather than be drawn under it.
+        let bars = f32::from(self.notice_h.get());
         if let Some(image) = picture {
             // A *flex* box with the canvas as its one growing item: a percentage
             // size (`size_full`) inside an absolutely placed box has nothing to
@@ -63,16 +66,30 @@ impl Player {
             // flex item is sized by the box itself. Fitted the way the picture
             // above it is -- `Contain` over the same box -- so a canvas of the
             // picture's own shape lands exactly on it.
-            return Some(div().absolute().inset_0().flex().child(
-                img(image).flex_1().h_full().object_fit(gpui::ObjectFit::Contain),
-            ));
+            // Slid up by the bars' height and not *shrunk* by it: the top and
+            // bottom insets cancel, so the box keeps the region's height and the
+            // canvas keeps the fit (and so the scale) it had with nothing
+            // hanging there -- a shorter box would refit the disc's canvas and
+            // move every cue on it, not just the one over the bar. The picture
+            // region clips (`overflow_hidden`), and what leaves the top of a
+            // subtitle canvas is transparent.
+            return Some(
+                div()
+                    .absolute()
+                    .top(px(-bars))
+                    .bottom(px(bars))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .child(img(image).flex_1().h_full().object_fit(gpui::ObjectFit::Contain)),
+            );
         }
         Some(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                .bottom(px(SUB_BOTTOM))
+                .bottom(px(sub_bottom(bars)))
                 .flex()
                 .flex_col()
                 .items_center()

@@ -600,7 +600,16 @@ impl Render for Player {
                                             .gap(px(2.))
                                             .children(self.import_bar(cx))
                                             .children(self.seek_bar())
-                                            .children(self.notice_bar(cx)),
+                                            .children(self.notice_bar(cx))
+                                            // How tall the lot came out, for the
+                                            // cue plate above to step over
+                                            // ([`sub_bottom`]) -- the bars are
+                                            // over the picture, and a message
+                                            // drawn across the line being read
+                                            // loses both of them. Zero with no
+                                            // bar up, since this box is then
+                                            // empty.
+                                            .child(height_probe(self.notice_h.clone())),
                                     ),
                             )
                             .child(self.transport_bar(
