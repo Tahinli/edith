@@ -549,9 +549,18 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
         // (`hevc_export::a_1080p_hardware_export_leaves_a_decoder_with_nothing_to_say`).
         // `None` here is the plugin's own "no" -- no entrypoint, or a picture
         // under the driver's 384x384 floor -- and the software seat takes it.
-        format if format.is_hevc() => {
-            HwEncoder::open_hevc(meta.width, meta.height, fps_num, fps_den, bitrate)
-        }
+        // The colour goes in at the open, from the same [`ColorDescription::output`]
+        // rule the software seat's VUI and both containers' tags come from, so
+        // the file cannot say one thing in its bitstream and another in its
+        // header.
+        format if format.is_hevc() => HwEncoder::open_hevc(
+            meta.width,
+            meta.height,
+            fps_num,
+            fps_den,
+            bitrate,
+            ColorDescription::output(meta.height),
+        ),
         // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
         // AV1 formats sit on it: the container is not the encoder's business.
         format if format.is_av1() && !forced("VE_HW_AV1") => None,
