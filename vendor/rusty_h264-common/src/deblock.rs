@@ -330,6 +330,9 @@ fn bs1_tile(p: &Blk, q: &Blk) -> bool {
 /// Boundary strength from tile entries (spec §8.7.2.1).
 /// Branchless for the same reason as [`BlockInfo::bs_branchless`], but now with
 /// every operand already in a register rather than behind a strided load.
+// --- edith patch: only the `#[cfg(test)]` tile guards below call this, so it
+// sits with them rather than warning in every build. ---
+#[cfg(test)]
 #[inline]
 fn bs_tile(p: &Blk, q: &Blk, mb_edge: bool) -> i32 {
     let intra = !(p.inter & q.inter);

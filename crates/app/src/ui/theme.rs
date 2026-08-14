@@ -99,7 +99,6 @@ palette! {
     SCRIM: u32,
     SCRIM_LIGHT: u32,
     STROKE_DIVIDER: u32,
-    STROKE_FOCUS: u32,
     STROKE_SELECTED: u32,
     FG_PRIMARY: u32,
     FG_SECONDARY: u32,
@@ -229,7 +228,9 @@ impl PaletteId {
     }
 
     /// The numbers themselves, for anything that has to measure a family that
-    /// is not the one in force -- which is what the contrast guards do.
+    /// is not the one in force -- which is only the contrast guards, so it sits
+    /// with them rather than in the binary.
+    #[cfg(test)]
     pub fn palette(self) -> &'static Palette {
         &PALETTES[self as usize]
     }
@@ -320,9 +321,6 @@ pub mod cool {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x2a3442;
-    /// The keyboard's own ring, distinct from selection on purpose: focus is
-    /// where the next stroke lands, selection is what an edit acts on.
-    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = 0x22d3ee;
 
     // -- text -------------------------------------------------------------------
@@ -395,7 +393,6 @@ pub mod warm {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x3a322e;
-    pub const STROKE_FOCUS: u32 = 0xffc38a;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -461,7 +458,6 @@ pub mod forest {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x25362c;
-    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -526,7 +522,6 @@ pub mod violet {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x2e3150;
-    pub const STROKE_FOCUS: u32 = 0xfde68a;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -586,7 +581,6 @@ pub mod rose {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x332f33;
-    pub const STROKE_FOCUS: u32 = 0xfcd34d;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -631,8 +625,7 @@ pub mod rose {
 }
 
 /// Family F: a graphite ground -- neutral, a touch warm -- under one gold
-/// accent. The focus ring turns sky here: gold is the accent now, and the
-/// keyboard's ring is the one thing that may never be mistaken for it.
+/// accent.
 pub mod amber {
     // -- surfaces ---------------------------------------------------------------
     pub const BG_CANVAS: u32 = 0x0d0d0c;
@@ -649,7 +642,6 @@ pub mod amber {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x35352f;
-    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -709,9 +701,6 @@ pub mod ocean {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x1e2d42;
-    /// Gold, not azure: on a blue ground the accent is the one hue the chrome is
-    /// full of, and a focus ring wearing it says nothing.
-    pub const STROKE_FOCUS: u32 = 0xffd166;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -772,7 +761,6 @@ pub mod ice {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x223140;
-    pub const STROKE_FOCUS: u32 = 0xfcd34d;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -831,9 +819,6 @@ pub mod orchid {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x33203f;
-    /// Sky: the ring is neither the orchid the window is full of nor the gold
-    /// the playhead is, so all three are told apart at a glance.
-    pub const STROKE_FOCUS: u32 = 0x7dd3fc;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -901,9 +886,6 @@ pub mod nord {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x434c5e;
-    /// `nord12`. The Frost blue is the accent here, so the ring is Aurora's
-    /// orange -- and the playhead is the yellow beside it, never this.
-    pub const STROKE_FOCUS: u32 = 0xd08770;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -955,9 +937,9 @@ pub mod nord {
 /// and `bg2` are the surfaces verbatim and `fg1`..`fg4` the ink; the clip bodies
 /// are the neutral-mode hues taken down for the same reason Nord's are.
 ///
-/// Three of its colours do three jobs here rather than one: orange is the
-/// accent, green the playhead, blue the focus ring -- so the family is
-/// recognisable from the chrome and not only from the ground.
+/// Two of its colours do two jobs here rather than one: orange is the accent
+/// and green the playhead -- so the family is recognisable from the chrome and
+/// not only from the ground.
 pub mod gruvbox {
     // -- surfaces ---------------------------------------------------------------
     pub const BG_CANVAS: u32 = 0x1d2021;
@@ -974,7 +956,6 @@ pub mod gruvbox {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x504945;
-    pub const STROKE_FOCUS: u32 = 0x83a598;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------
@@ -1036,7 +1017,6 @@ pub mod dracula {
 
     // -- strokes ----------------------------------------------------------------
     pub const STROKE_DIVIDER: u32 = 0x44475a;
-    pub const STROKE_FOCUS: u32 = 0x8be9fd;
     pub const STROKE_SELECTED: u32 = ACCENT_PRIMARY;
 
     // -- text -------------------------------------------------------------------

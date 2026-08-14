@@ -12,7 +12,9 @@ pub(crate) const GHOST_MIN: f32 = 2.;
 pub(crate) const HEADER_H: f32 = 32.;
 // 28 button row + 24 scrub strip + two 48 lanes + the timecode line + the gaps
 // between them, with a few px of slack so a taller text line cannot push a lane
-// off the bottom.
+// off the bottom. The window measures itself from [`timeline_h`] now, so this
+// figure is the guards' anchor for it and sits with them.
+#[cfg(test)]
 pub(crate) const PANEL_H: f32 = 220.;
 /// How many lane rows are drawn before the lane column starts scrolling: past
 /// this the panel would be taller than the picture it belongs under, and a
@@ -230,14 +232,15 @@ pub(crate) fn px_below(max_offset_h: f32, offset_y: f32) -> f32 {
 /// How tall the panel is with `lanes` tracks in it: [`PANEL_H`] is sized for the
 /// two a project starts with, and every further one adds its own row -- up to
 /// [`LANES_MAX`], past which the lane column scrolls instead and the panel stops
-/// growing.
+/// growing. Only the guards ask, so it sits with them.
+#[cfg(test)]
 pub(crate) fn panel_h(lanes: usize) -> f32 {
     PANEL_H + lanes_h(lanes.clamp(2, LANES_MAX)) - lanes_h(2)
 }
 
 /// How tall the timeline region is: its own padding, the timecode line, the
 /// ruler and the gaps between them, plus a row per lane. Measured from its
-/// parts rather than taken off [`PANEL_H`] -- the button row moved out of it
+/// parts rather than taken off `PANEL_H` -- the button row moved out of it
 /// ([`Player::toolbar`]), and a height still carrying that row's pixels is a
 /// height that cuts the last lane off the bottom of the window.
 pub(crate) fn timeline_h(lanes: usize) -> f32 {
