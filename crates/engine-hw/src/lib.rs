@@ -30,6 +30,7 @@ use cros_codecs::decoder::stateless::{DecodeError, StatelessDecoder, StatelessVi
 use cros_codecs::decoder::{BlockingMode, DecodedHandle, DecoderEvent, StreamInfo};
 use cros_codecs::encoder::av1::EncoderConfig as Av1Config;
 use cros_codecs::encoder::h264::EncoderConfig as H264Config;
+use cros_codecs::encoder::h265::ColourDescription as H265Colour;
 use cros_codecs::encoder::h265::EncoderConfig as H265Config;
 use cros_codecs::encoder::stateless::av1::StatelessEncoder as Av1StatelessEncoder;
 use cros_codecs::encoder::stateless::h264::StatelessEncoder;
@@ -1154,7 +1155,7 @@ impl EncSession {
         bitrate: u64,
         codec: EncCodec,
     ) -> Option<Self> {
-        Self::open_seat(width, height, fps_num, fps_den, bitrate, codec, false)
+        Self::open_seat(width, height, fps_num, fps_den, bitrate, codec, false, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,6 +1167,7 @@ impl EncSession {
         bitrate: u64,
         codec: EncCodec,
         intra_only: bool,
+        colour: Option<H265Colour>,
     ) -> Option<Self> {
         // NV12 chroma is half resolution, so odd dimensions have no packing;
         // and radeonsi refuses encode contexts below 64x64 (measured).
@@ -1295,6 +1297,14 @@ impl EncSession {
                         framerate,
                         ..Default::default()
                     },
+                    // What the SPS tells a decoder the samples mean. Without it
+                    // libavcodec reads this stream's colour as "unspecified" and
+                    // renders it BT.601 whatever the container says -- the HEVC
+                    // decoder takes the bitstream's answer and overwrites the
+                    // container's with it, so an untagged 709 export is a
+                    // visible shift (`engine::export::video_signal_type` writes
+                    // the same three code points on the software seat).
+                    colour,
                 };
                 Box::new(
                     HevcEncoder::new_vaapi(
@@ -1625,6 +1635,7 @@ pub extern "C" fn vh_enc_open_intra(
             bitrate,
             EncCodec::H264,
             true,
+            None,
         ) {
             Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
             None => std::ptr::null_mut(),
@@ -1672,16 +1683,43 @@ pub extern "C" fn vh_enc_av1_open(
 /// The session it returns is fed, drained and closed through `vh_enc_frame`,
 /// `vh_enc_drain` and `vh_enc_close` exactly as an H.264 one is; what comes back
 /// out of them is Annex-B HEVC access units.
+///
+/// The last four arguments are what the SPS says the samples mean -- the three
+/// H.273 code points and the range flag -- and they are part of the *symbol*
+/// rather than a later setter because the parameter sets are built when the
+/// sequence starts. A seat that signalled nothing is read back as "unspecified"
+/// and rendered BT.601, the container's own tag notwithstanding, which is why
+/// this replaced the colourless `vh_enc_hevc_open`: an engine older than this
+/// symbol finds none and takes the software intra seat, which has always
+/// written the VUI.
 #[unsafe(no_mangle)]
-pub extern "C" fn vh_enc_hevc_open(
+pub extern "C" fn vh_enc_hevc_open_colour(
     width: u32,
     height: u32,
     fps_num: u32,
     fps_den: u32,
     bitrate: u64,
+    colour_primaries: u32,
+    transfer_characteristics: u32,
+    matrix_coeffs: u32,
+    full_range: i32,
 ) -> *mut c_void {
     catch_unwind(AssertUnwindSafe(|| {
-        match EncSession::open_codec(width, height, fps_num, fps_den, bitrate, EncCodec::Hevc) {
+        match EncSession::open_seat(
+            width,
+            height,
+            fps_num,
+            fps_den,
+            bitrate,
+            EncCodec::Hevc,
+            false,
+            Some(H265Colour {
+                colour_primaries,
+                transfer_characteristics,
+                matrix_coeffs,
+                full_range: full_range != 0,
+            }),
+        ) {
             Some(session) => Box::into_raw(Box::new(session)) as *mut c_void,
             None => std::ptr::null_mut(),
         }

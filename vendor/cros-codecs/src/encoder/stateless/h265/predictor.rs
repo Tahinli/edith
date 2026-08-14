@@ -131,7 +131,7 @@ impl<Picture, Reference> LowDelayH265<Picture, Reference> {
 
         // H.265 Table 6-1, the encoder only supports 4:2:0 subsampling. Must be set before
         // `resolution()`, which derives the conformance window from it.
-        let sps = SpsBuilder::new(Rc::clone(&vps))
+        let mut sps = SpsBuilder::new(Rc::clone(&vps))
             .seq_parameter_set_id(0)
             .chroma_format_idc(1)
             .resolution(coded_width, coded_height)
@@ -150,8 +150,20 @@ impl<Picture, Reference> LowDelayH265<Picture, Reference> {
             .max_latency_increase_plus1(0)
             .short_term_ref_pic_set(short_term_ref_pic_set)
             .long_term_ref_pics_present_flag(false)
-            .timing_info(1, self.tunings.framerate, false)
-            .build();
+            .timing_info(1, self.tunings.framerate, false);
+
+        // What the samples mean, where the caller declared it. `video_format` is
+        // 5, "unspecified": the field is the analogue system a picture came off
+        // and an encoded timeline came off none.
+        if let Some(colour) = config.colour {
+            sps = sps.video_signal_type(5, colour.full_range).colour_description(
+                colour.colour_primaries,
+                colour.transfer_characteristics,
+                colour.matrix_coeffs,
+            );
+        }
+
+        let sps = sps.build();
 
         let min_qp = self.tunings.min_quality.max(MIN_QP as u32);
         let max_qp = self.tunings.max_quality.min(MAX_QP as u32);
