@@ -25,6 +25,25 @@ pub(crate) struct ClipDrag {
     pub(crate) clip: Clip,
 }
 
+/// A *palette* subtitle row being dragged onto a subtitle lane: which track of
+/// [`PlaybackSession::subtitles`] it is, which is the whole of what a row names.
+/// The window it lands with is the track's own, from its first microsecond to
+/// its last cue -- a placement is trimmed after it is placed, like every clip
+/// here.
+pub(crate) struct SubPick(pub(crate) usize);
+
+/// A subtitle already placed on a lane being dragged: [`ClipDrag`]'s twin, and
+/// carrying the placement itself for that struct's reason -- an edit made during
+/// the gesture moves the indices gpui froze into the payload, so the drop finds
+/// its placement by value ([`Player::dragged_sub`]) rather than by an index that
+/// may since have become another caption's.
+#[derive(Clone, Copy)]
+pub(crate) struct SubDrag {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    pub(crate) sub: SubClip,
+}
+
 /// A track *header* being dragged: which track the hand took hold of, to be
 /// let go over the header of the one whose place it is to take
 /// ([`Player::reorder_lane`]). The lane alone -- a track carries its own clips
