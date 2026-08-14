@@ -13,7 +13,7 @@ use super::{
     ACCENT_PRIMARY, AUDIO_KBPS, COLOR_BANDS, COLOR_BAR_W, COLOR_STEP, COLOR_W, CONTROL_H, Clip, Ctx, DEFAULT_AUDIO_KBPS, EQ_BANDS_MAX,
     EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H,
     EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE,
-    EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, FORMATS,
+    EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, EncoderSeat, FORMATS,
     Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, FG_PRIMARY,
     FG_SECONDARY, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
     BG_CANVAS, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
@@ -41,7 +41,8 @@ use super::{
 use super::{
     Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
     Scale, View,
-    ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, clock, eta_secs, file_name, file_uri,
+    ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, av1_hw_warning, clock,
+    encoder_choices, encoder_label, eta_secs, file_name, file_uri,
     fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
     note_progress, px_along,
     IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanKey, ScanPlan, SilenceScan, import_line,

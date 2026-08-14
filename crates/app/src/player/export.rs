@@ -219,7 +219,13 @@ impl Player {
             return;
         };
         let settings =
-            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
+            export_settings(
+            self.quality,
+            self.custom_mbps,
+            self.format,
+            self.audio_kbps,
+            self.encoder_seat(),
+        );
         if !self.export_open {
             return;
         }
@@ -380,6 +386,44 @@ impl Player {
         self.audio_kbps = next_audio_kbps(self.audio_kbps);
     }
 
+    /// Which encoder an export of this project would write the picture with
+    /// ([`engine::export::EncoderSeat`]). The session's, because it is saved
+    /// with the project -- there is no card-local copy to drift from it -- and
+    /// the default with no timeline open, where the card shows nothing anyway.
+    pub(crate) fn encoder_seat(&self) -> EncoderSeat {
+        self.session
+            .as_ref()
+            .map_or_else(EncoderSeat::default, PlaybackSession::encoder_seat)
+    }
+
+    /// Pick the seat. Said out loud like every other pick that changes what a
+    /// file will be written by -- and the card's planned line re-probes by
+    /// itself, since the settings it is keyed on have changed
+    /// ([`Self::cache_export_seat`]).
+    pub(crate) fn apply_encoder(&mut self, seat: EncoderSeat, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.session {
+            session.set_encoder_seat(seat);
+            self.notify_user(format!("Encoder: {}", encoder_label(seat)).into());
+        }
+        cx.notify();
+    }
+
+    /// The seat by keyboard, wrapping through the three -- the Sound row's
+    /// rule, for the row beside it. Refused by name with no timeline: a key
+    /// that silently does nothing is the card looking broken.
+    pub(crate) fn cycle_encoder(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            self.notify_user("no timeline to export — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let at = EncoderSeat::ALL
+            .iter()
+            .position(|&s| s == session.encoder_seat())
+            .unwrap_or(0);
+        self.apply_encoder(EncoderSeat::ALL[(at + 1) % EncoderSeat::ALL.len()], cx);
+    }
+
     /// Why the sound row is not a choice right now, the engine answering about
     /// the very project it would export. No session is the same answer as no
     /// sound: there is nothing to write either way.
@@ -517,7 +561,13 @@ impl Player {
             return;
         }
         let mut settings =
-            export_settings(self.quality, self.custom_mbps, self.format, self.audio_kbps);
+            export_settings(
+            self.quality,
+            self.custom_mbps,
+            self.format,
+            self.audio_kbps,
+            self.encoder_seat(),
+        );
         // Whatever is on the timeline travels -- every track with a cue in the
         // exported range, not the one row the overlay happens to be drawing.
         // Set here rather than inside `export_settings`, which the card also

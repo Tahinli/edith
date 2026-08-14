@@ -61,6 +61,10 @@ pub(crate) enum Pick {
     /// here that is nobody's project: it is the person's, so it outlives the
     /// timeline and every file opened in it.
     Theme,
+    /// Which encoder an export writes the picture with
+    /// ([`engine::export::EncoderSeat`]). Opened from the card's Encoder row,
+    /// which is the only place it means anything.
+    Encoder,
 }
 
 /// One value a list offers, carrying everything picking it needs -- so a click
@@ -77,6 +81,7 @@ pub(crate) enum Choice {
     AudioRate(u32),
     Tone(Preset),
     Theme(ui::theme::PaletteId),
+    Encoder(EncoderSeat),
 }
 
 /// One row of an open list: the value, its name, the small print beside it, and

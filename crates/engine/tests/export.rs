@@ -481,7 +481,7 @@ fn a_higher_bitrate_writes_a_bigger_file() {
         let out = out_path(&format!("bitrate_{bitrate}"));
         let settings = ExportSettings {
             bitrate: Some(bitrate),
-            force_sw: true,
+            seat: engine::export::EncoderSeat::Software,
             ..Default::default()
         };
         let handle = session.export_to_with(&out, &settings);
@@ -985,7 +985,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     session.set_proxies(true);
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 13\n"), "{text}");
+    assert!(text.starts_with("edith 14\n"), "{text}");
     assert!(text.contains("\nproxy on\n"), "{text}");
     let reopened = PlaybackSession::open_project(&project).expect("load");
     assert!(reopened.proxies(), "the switch came back on");
