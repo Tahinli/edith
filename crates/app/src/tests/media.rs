@@ -1102,3 +1102,28 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     assert!(shown(1.8).is_empty(), "between two cues the plate goes");
     assert_eq!(shown(2.5), ["second line\nwith a break"]);
 }
+
+/// One lane over the picture and never two ([`Player::active_sub_lane`]): which
+/// one, at every moment a stack of subtitle lanes goes through -- none, one,
+/// three, a pick, and the pick's lane going away under it.
+#[test]
+fn exactly_one_subtitle_lane_is_shown_whatever_the_pick_and_whatever_is_left() {
+    let sub = |ord| Lane::new(LaneKind::Subtitle, ord);
+    let (s1, s2, s3) = (sub(0), sub(1), sub(2));
+    // Nowhere for words to be: no lane, nothing shown -- and a pick left over
+    // from a timeline that has been closed does not resurrect one.
+    assert_eq!(active_lane(None, &[]), None);
+    assert_eq!(active_lane(Some(s2), &[]), None);
+    // One lane is shown by being the only one: nobody has to pick anything,
+    // which is what the single-lane timeline always did.
+    assert_eq!(active_lane(None, &[s1]), Some(s1));
+    // Three, unpicked: the first, so adding lanes never blanks the picture.
+    assert_eq!(active_lane(None, &[s1, s2, s3]), Some(s1));
+    // ...and picked: that one alone, however many are there.
+    assert_eq!(active_lane(Some(s3), &[s1, s2, s3]), Some(s3));
+    // The picked lane taken off the timeline -- a removal, or the undo of the
+    // add that made it: the first lane left is shown, never nothing.
+    assert_eq!(active_lane(Some(s3), &[s1, s2]), Some(s1));
+    // A pick that is not a subtitle lane at all cannot name one either.
+    assert_eq!(active_lane(Some(Lane::V1), &[s1, s2]), Some(s1));
+}

@@ -654,8 +654,11 @@ impl Player {
             _ => Vec::new(),
         };
         let eye_tip: SharedString = match shown {
-            true => format!("{name} shows its captions — click to hide this track"),
-            false => format!("{name} is hidden — click to show its captions again"),
+            true => format!("{name} is the track shown over the picture"),
+            false => format!(
+                "Click to show {name} over the picture instead — one subtitle track is drawn at a \
+                 time, and an export carries every one of them"
+            ),
         }
         .into();
         // What a caption's box says clicking it does; the media boxes' tooltip
@@ -762,12 +765,15 @@ impl Player {
                             })
                             .into_any_element(),
                         // A subtitle track's own one setting, in the same
-                        // place and for the same reason: whether this lane's
-                        // words are drawn over the picture. The eye every
-                        // player puts on a track, `HIT_MIN` tall like the mix
-                        // button it sits where.
+                        // place and for the same reason: whether *this* lane is
+                        // the one drawn over the picture. A radio and not an
+                        // eye -- one track shows at a time, so a click here
+                        // takes the picture off whichever lane had it -- and
+                        // `HIT_MIN` tall like the mix button it sits where.
+                        // The lit dot and the accent tell the shown lane from
+                        // the rest of a stack of them at a glance.
                         false if sub => div()
-                            .id(("eye-lane", lane.ord))
+                            .id(("show-lane", lane.ord))
                             .flex_1()
                             .w_full()
                             .flex()
@@ -778,9 +784,15 @@ impl Player {
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(BG_HOVER())))
                             .when(!shown, |d| d.text_color(rgb(FG_DISABLED())))
+                            .when(shown, |d| {
+                                d.text_color(rgb(ACCENT_PRIMARY()))
+                                    .bg(rgb(BG_HOVER()))
+                                    .border_1()
+                                    .border_color(rgb(ACCENT_PRIMARY()))
+                            })
                             .tooltip(move |_, cx| cx.new(|_| Tip(eye_tip.clone())).into())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.toggle_sub_lane(lane, cx)
+                                this.show_sub_lane(lane, cx)
                             }))
                             .child(name.clone())
                             .child(

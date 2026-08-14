@@ -28,7 +28,7 @@ use super::{
     format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
     frame_rate_ladder, histogram,
     inserted_band, is_bare_modifier, is_project, keymap, keys_filter, keys_rows, lanes_h,
-    marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
+    active_lane, marked, menu_at, menu_items, menu_rows_h, next_audio_kbps, next_container, normalise, nothing_to_play, panel_h, project_path,
     LATE_RESYNC, RESYNC_GAP, should_resync,
     retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
     SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
