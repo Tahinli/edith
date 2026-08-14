@@ -364,14 +364,27 @@ impl Splits {
 /// region rather than a sliver. Neither end is passable -- a panel dragged to
 /// nothing is a panel nobody can get back, and a picture squeezed out by two
 /// side columns is the same loss on the other side of the window.
-pub(crate) fn split_bounds(split: Split, window: Size<Pixels>) -> (f32, f32) {
+pub(crate) fn split_bounds(split: Split, lanes: usize, window: Size<Pixels>) -> (f32, f32) {
     let (w, h) = (f32::from(window.width), f32::from(window.height));
     match split {
         Split::Library => (LIBRARY_MIN_W, w * SIDE_MAX_FRAC),
         Split::Inspector => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
         // One whole lane under the chrome: a timeline shorter than that is a
-        // ruler with nothing beneath it.
-        Split::Timeline => (TIMELINE_FIXED_H + LANE_H, h * TIMELINE_MAX_SHARE),
+        // ruler with nothing beneath it. A second track pays for the line that
+        // says the rest are below the fold as well -- at this height only one
+        // row fits, so that line is *always* drawn there, and it is drawn
+        // inside the region ([`Player::timeline`]). Left out of the floor it
+        // comes off the lane's own pixels, and the one lane the floor promises
+        // is a header cut in half.
+        Split::Timeline => (
+            TIMELINE_FIXED_H
+                + LANE_H
+                + match lanes > 1 {
+                    true => LABEL_H + 8.,
+                    false => 0.,
+                },
+            h * TIMELINE_MAX_SHARE,
+        ),
     }
 }
 
@@ -386,7 +399,7 @@ pub(crate) fn split_size(
     window: Size<Pixels>,
 ) -> f32 {
     let (w, h) = (f32::from(window.width), f32::from(window.height));
-    let (min, max) = split_bounds(split, window);
+    let (min, max) = split_bounds(split, lanes, window);
     let default = match split {
         Split::Library => library_w(w),
         Split::Inspector => inspector_w(w),
