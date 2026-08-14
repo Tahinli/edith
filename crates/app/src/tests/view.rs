@@ -126,6 +126,20 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
     // engine takes its sound onto one, and the words for a video-only file
     // are its own.
     assert_eq!(lane_refuses(movie, audio), None);
+    // ...and a subtitle lane holds none of the three: a caption comes off the
+    // Subtitles list, which is where the refusal points.
+    for file in [sound, still, movie] {
+        let why = lane_refuses(file, Lane::S1).expect("a subtitle lane takes no media");
+        assert!(why.starts_with("NOT ON S1 — "), "{why}");
+        assert!(why.contains("Subtitles list"), "{why}");
+    }
+    // How the two clocks a caption has meet, which is what a palette row's
+    // length is worked out with: a second of words at 30 fps is 30 frames,
+    // and a track shorter than one frame is still a caption to place.
+    assert_eq!(frames_of_us(1_000_000, 30.), 30);
+    assert_eq!(frames_of_us(500_000, 24.), 12);
+    assert_eq!(frames_of_us(1_000, 30.), 1);
+    assert_eq!(frames_of_us(1_000_000, 0.), 1);
 }
 
 /// Where those edges come from: every lane, not the one being dropped on --
