@@ -286,6 +286,11 @@ struct Player {
     /// handle is held until the worker settles, because its last act is to
     /// delete the output file and a second export must not be what it deletes.
     cancelling: bool,
+    /// The pointer asked to cancel and the progress card is showing the pair
+    /// that answers it ("Keep exporting" / "Cancel export"). One press is never
+    /// the cancel itself: an hour of encoding must not end on a stray click,
+    /// which is the reason the stroke is a chord too ([`cancels_export`]).
+    cancel_armed: bool,
     /// When the running export started, and how far it had come at each sample
     /// since, as `(elapsed, progress)` marks. The elapsed clock and the
     /// rolling-window estimate the progress line reads; see [`note_progress`].
@@ -658,6 +663,7 @@ fn main() {
                     last_target: 0,
                     export: None,
                     cancelling: false,
+                    cancel_armed: false,
                     export_started: None,
                     export_marks: Vec::new(),
                     // Both derived from the file when it lands, by the same

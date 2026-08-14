@@ -141,7 +141,7 @@ impl Render for Player {
                 // would change, so cancelling is the only one that means
                 // anything until it is over.
                 if this.exporting().is_some() {
-                    if cancels_export(key, action) {
+                    if cancels_export(key, ctrl, action) {
                         this.cancel_export();
                     }
                     cx.notify();
@@ -661,6 +661,10 @@ impl Render for Player {
             // window.
             .children(self.keys_overlay(cx))
             .children(self.export_card(window.viewport_size(), cx))
+            // The same sheet once the card has been answered: the running
+            // export is the one state in this window where nothing may be
+            // edited, so it is drawn as what it is rather than as a strip.
+            .children(self.export_progress_card(cx))
             // Last, so it floats over whatever opened it -- an inspector row or
             // a clip menu -- rather than under it.
             .children(self.picker_card(window.viewport_size(), cx))
