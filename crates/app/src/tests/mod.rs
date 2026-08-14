@@ -58,7 +58,7 @@ use super::{
     SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box, sub_bottom,
     carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
     Subs, subtitle_detail, subtitle_notice, subtitle_tail,
-    sub_pick_name, subtitle_rows, walk_subtitles,
+    sub_pick_name, subtitle_rows, subtitle_toggle_notice, walk_subtitles,
 };
 
 use engine::PlaybackSession;

@@ -517,8 +517,8 @@ impl Player {
     /// Worked out from the cues each time rather than kept as a pick, which is
     /// what makes it impossible to desync: a row added or taken off shifts every
     /// index after it, and a stored list would then name tracks nobody chose.
-    /// `Player::sub_track` stays what it always was -- which track the *overlay*
-    /// draws -- and has no say here.
+    /// `Player::sub_track` stays what it always was -- which palette row the
+    /// list *marks* -- and has no say here.
     ///
     /// The honest input and not the final answer: the engine filters it again
     /// per track (a track that could not be read, a picture one) and says so in
