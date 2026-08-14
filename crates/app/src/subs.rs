@@ -589,6 +589,25 @@ pub(crate) fn cue_box(scale: Scale, cue: &engine::subtitle::Cue) -> (f32, f32) {
     )
 }
 
+/// Which subtitle lane draws over the picture, out of the pick somebody made
+/// and the lanes there are *now* ([`Player::active_sub_lane`]): the picked one
+/// while it is still on the timeline, and the first lane otherwise -- which is
+/// the whole of "one lane needs no picking", "the first lane added draws" and
+/// "a removed lane's pick promotes its neighbour rather than showing nothing".
+///
+/// `None` only with no subtitle lane at all, which is a timeline with nowhere
+/// for words to be.
+///
+/// A pick against the live list rather than a pointer kept in step with it: a
+/// [`Lane`] is a position among its kind, so an add, a removal, a reorder and
+/// every undo of those move what a stored handle names -- and each of them is
+/// answered here, at the read, by a list that is never stale.
+pub(crate) fn active_lane(picked: Option<Lane>, lanes: &[Lane]) -> Option<Lane> {
+    picked
+        .filter(|lane| lanes.contains(lane))
+        .or_else(|| lanes.first().copied())
+}
+
 /// Which cues of a track are on screen at `at` seconds. Half-open, as the cue
 /// itself is: one that ends exactly where the next begins hands over rather than
 /// overlapping it for a frame, and several that genuinely overlap all come back
