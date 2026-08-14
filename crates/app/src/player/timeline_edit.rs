@@ -371,29 +371,41 @@ impl Player {
         cx.notify();
     }
 
-    /// A subtitle lane's eye: whether it draws its captions. State only for now
-    /// -- what reads it is the slice that draws the lanes over the picture --
-    /// and said out loud, because a toggle whose only effect is a header glyph
-    /// has to say what it has and has not done yet.
-    pub(crate) fn toggle_sub_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
-        let text = match self.subs_off.iter().position(|&l| l == lane) {
-            Some(i) => {
-                self.subs_off.remove(i);
-                format!("{} SHOWS ITS CAPTIONS", lane.label())
-            }
-            None => {
-                self.subs_off.push(lane);
-                format!("{} IS HIDDEN — its captions stay on the lane", lane.label())
-            }
+    /// A subtitle lane's dot: the one lane whose captions are over the picture.
+    /// A pick and not a toggle -- picking one puts the one that was showing
+    /// away, because two lanes of different words at one moment is two plates
+    /// nobody can read, and it is said out loud for that reason: what the click
+    /// did *and* what it undid.
+    ///
+    /// The lanes it takes off the picture keep their captions and are still
+    /// exported, every one of them ([`Player::start_export`]).
+    pub(crate) fn show_sub_lane(&mut self, lane: Lane, cx: &mut Context<Self>) {
+        let was = self.active_sub_lane();
+        self.sub_lane = Some(lane);
+        let text = match was.filter(|&old| old != lane) {
+            Some(old) => format!(
+                "{} IS SHOWN — {} is off the picture; every subtitle track is still exported",
+                lane.label(),
+                old.label()
+            ),
+            None => format!("{} IS SHOWN — its captions are over the picture", lane.label()),
         };
         self.notify_user(text.into());
         cx.notify();
     }
 
-    /// Whether that subtitle lane's captions are drawn -- the eye, read by the
-    /// header that offers it and by whatever draws cues from here on.
+    /// The subtitle lane whose captions are drawn: the pick resolved against the
+    /// lanes the timeline has right now ([`active_lane`]), so it can never name
+    /// a lane that is not there. `None` with no subtitle lane at all.
+    pub(crate) fn active_sub_lane(&self) -> Option<Lane> {
+        let lanes = self.session.as_ref()?.subtitle_lanes();
+        active_lane(self.sub_lane, &lanes)
+    }
+
+    /// Whether that subtitle lane's captions are drawn -- read by the header
+    /// that offers the pick and by the plate over the picture.
     pub(crate) fn sub_lane_on(&self, lane: Lane) -> bool {
-        !self.subs_off.contains(&lane)
+        self.active_sub_lane() == Some(lane)
     }
 
     /// Where a caption let go at window `x` wants its head: [`Player::drop_frame`]'s

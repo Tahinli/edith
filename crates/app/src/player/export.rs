@@ -510,15 +510,24 @@ impl Player {
         .detach();
     }
 
-    /// The subtitle tracks an export of this timeline carries: every one with a
-    /// cue left in the exported range ([`PlaybackSession::timeline_cues`], the
-    /// very map the file is written from), in the library's own order.
+    /// The subtitle tracks an export of this timeline carries: every one a
+    /// subtitle *lane* places, with a cue left in the exported range
+    /// ([`PlaybackSession::timeline_cues`], the very map the file is written
+    /// from), in the library's own order.
     ///
-    /// Worked out from the cues each time rather than kept as a pick, which is
-    /// what makes it impossible to desync: a row added or taken off shifts every
-    /// index after it, and a stored list would then name tracks nobody chose.
-    /// `Player::sub_track` stays what it always was -- which palette row the
-    /// list *marks* -- and has no say here.
+    /// On the timeline or not at all: a track sitting in the palette is a track
+    /// nobody put anywhere, and one dropped off its lane is one somebody took
+    /// away -- neither belongs in the file. Without the placement test they came
+    /// back through the engine's palette door (`export::planned_subtitles` falls
+    /// back to these picks when no lane holds anything), so emptying every
+    /// subtitle lane and exporting wrote all three of them into the output.
+    ///
+    /// Worked out from the timeline each time rather than kept as a pick, which
+    /// is what makes it impossible to desync: a row added or taken off shifts
+    /// every index after it, and a stored list would then name tracks nobody
+    /// chose. `Player::sub_track` stays what it always was -- which palette row
+    /// the list *marks* -- and has no say here, and neither has the lane that is
+    /// shown over the picture ([`Player::active_sub_lane`]): every lane travels.
     ///
     /// The honest input and not the final answer: the engine filters it again
     /// per track (a track that could not be read, a picture one) and says so in
@@ -527,7 +536,13 @@ impl Player {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
+        let placed: Vec<usize> = session
+            .subtitle_lanes()
+            .into_iter()
+            .flat_map(|lane| session.sub_lane(lane).iter().map(|sub| sub.track))
+            .collect();
         (0..session.subtitles().len())
+            .filter(|i| placed.contains(i))
             .filter(|&i| !session.timeline_cues(i).is_empty())
             .collect()
     }
