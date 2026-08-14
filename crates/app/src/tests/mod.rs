@@ -34,7 +34,7 @@ use super::{
     SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
     EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, TIMELINE_FIXED_H, TIMELINE_SHARE, lanes_shown,
     px_below, rows_below, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
-    push_notice, typed, unseen_paths, unseen_sources,
+    proxies_to_start, push_notice, typed, unseen_paths, unseen_sources,
     whole_take, window_title,
 };
 

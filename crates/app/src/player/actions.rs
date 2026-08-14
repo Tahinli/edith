@@ -88,6 +88,7 @@ impl Player {
             ActionId::ToggleSnap => self.toggle_snap(cx),
             ActionId::ToggleSubtitles => self.toggle_subtitles(cx),
             ActionId::ToggleProxies => self.toggle_proxies(cx),
+            ActionId::ToggleAutoProxies => self.toggle_auto_proxies(cx),
             // The keyboard's door to the same list the toolbar button opens.
             // At the window's corner, since a stroke names no place -- and
             // [`menu_at`] keeps it on screen from there.
