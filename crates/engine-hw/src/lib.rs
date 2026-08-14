@@ -6,9 +6,21 @@
 //! negative code: the caller's contract is "any failure means use the software
 //! codec".
 //!
-//! corner-cut: that guarantee rests on `panic = "unwind"`. Building this crate with
-//! `panic = "abort"` would turn a driver bug into a killed app; the upgrade path
-//! is running the decoder in a child process instead of in-process.
+//! That guarantee rests on `panic = "unwind"`, and it has a floor it can never
+//! reach whatever the panic strategy is: Mesa runs its own C worker threads and
+//! calls libc `abort()` from them when the video ring resets (measured
+//! 2026-08-13, `vcn_unified_0`, mesa 26.1.6). No `catch_unwind` can see a
+//! foreign thread's `abort`. So the *encode* half of this plugin is no longer
+//! loaded by the editor at all: it is `dlopen`ed by the `hw-encode-child`
+//! helper, one process per session, and a driver that aborts now costs an export
+//! its seat rather than costing a person their session
+//! ([`engine::hwproc`](../engine/hwproc/index.html)).
+//!
+//! corner-cut: *decode* is still in the editor's own address space, where the
+//! same abort would still be fatal -- and the same ring hangs it (mmhub page
+//! faults, this box, 2026-08-13). The upgrade path is the seam that already
+//! exists: give `vh_open_at`/`vh_next_frame` the message tags `vh_enc_*` have in
+//! `hwproc` and let the same helper hold both.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_void};

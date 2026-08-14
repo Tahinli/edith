@@ -494,7 +494,33 @@ pub fn start(
                 format.name()
             )
             .into()),
-            format if format.has_video() => run(&project, &meta, &part, &worker, &settings),
+            format if format.has_video() => {
+                let first = run(&project, &meta, &part, &worker, &settings);
+                match first {
+                    // The hardware encoder's *process* died under the driver
+                    // ([`crate::hwproc`]) -- the editor is still here, and the
+                    // file is still owed. Written again by the software encoder
+                    // for this codec, from the first frame: the pictures the
+                    // dead seat coded are not ones this one may continue from.
+                    //
+                    // Not where a person picked the GPU by name: that export
+                    // refuses in words, the same answer [`hw_seat`] already
+                    // gives a machine with no seat at all, rather than quietly
+                    // spending an hour in an encoder nobody chose.
+                    Err(e)
+                        if crate::hwproc::is_lost(&e)
+                            && settings.seat != EncoderSeat::Hardware =>
+                    {
+                        eprintln!("export video: {e}; writing it again in software");
+                        let _ = std::fs::remove_file(&part);
+                        worker.progress.store(0, Ordering::Relaxed);
+                        let mut software = settings.clone();
+                        software.seat = EncoderSeat::Software;
+                        run(&project, &meta, &part, &worker, &software)
+                    }
+                    other => other,
+                }
+            }
             _ => run_audio(&project, &meta, &part, &worker, &settings),
         };
         let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
@@ -583,7 +609,14 @@ fn audio_kbps_of(settings: &ExportSettings) -> u32 {
 /// ([`Enc::open`] runs ahead of the muxer), which is what makes the refusal
 /// free.
 fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Option<HwEncoder>> {
-    if settings.seat == EncoderSeat::Software || forced("VE_SW_ENC") {
+    // `VE_HW_TEST_FAKE` is the containment tests' stand-in seat -- a child that
+    // opens no driver at all -- and it is not what a software pin is pinning
+    // away: the pin says "do not use this machine's GPU", and that seat is not
+    // this machine's GPU. Without this the suite could only prove the fallback
+    // on a run with no other export test in it.
+    if settings.seat == EncoderSeat::Software
+        || (forced("VE_SW_ENC") && !crate::hwproc::faked())
+    {
         return Ok(None);
     }
     let opened = open_hw_seat(meta, settings);
@@ -3547,7 +3580,9 @@ impl Enc {
     /// person picks it by name because the vendored encoder reset this project's GPU
     /// ([`Enc::open_av1`]), and a path that cannot be measured is not one to
     /// widen.
-    fn dma_want(&self, meta: &VideoMeta) -> Option<crate::hw::DmaWant> {
+    /// `&mut` because an isolated seat has to *ask* the process it lives in
+    /// ([`crate::hwproc`]), which is a round trip on its socket.
+    fn dma_want(&mut self, meta: &VideoMeta) -> Option<crate::hw::DmaWant> {
         match self {
             Self::Hw(hw) | Self::HevcHw(hw) => hw.dma_want(meta.width, meta.height),
             _ => None,
