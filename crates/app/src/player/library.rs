@@ -313,35 +313,85 @@ impl Player {
     /// Nothing waits for it: until a proxy is ready the film itself is what
     /// plays, switch or no switch ([`engine::PlaybackSession::picture_path`]),
     /// so a failure costs a line and no more.
+    ///
+    /// A stopped one settles here too ([`Player::cancel_proxy`]), which is what
+    /// makes the stop honest: the worker's own answer is what says the encode
+    /// is over and its half-written file gone -- and where the encode *beat*
+    /// the cancel, the answer is a finished stand-in and it is reported as one
+    /// rather than thrown away.
     pub(crate) fn poll_proxies(&mut self, cx: &mut Context<Self>) {
-        let done: Vec<(PathBuf, engine::Result<PathBuf>)> = self
+        let done: Vec<(PathBuf, bool, engine::Result<PathBuf>)> = self
             .proxies
             .iter()
             .filter_map(|(path, state)| match state {
-                Proxy::Making(job) => Some((path.clone(), job.outcome()?)),
+                Proxy::Making(job) => Some((path.clone(), false, job.outcome()?)),
+                Proxy::Cancelling(job) => Some((path.clone(), true, job.outcome()?)),
                 _ => None,
             })
             .collect();
-        for (path, outcome) in done {
-            let text = match &outcome {
-                Ok(_) => format!(
+        for (path, stopped, outcome) in done {
+            let text = match (&outcome, stopped) {
+                (Ok(_), _) => format!(
                     "PROXY READY for {} — Proxies on cuts on it",
                     file_name(&path)
                 ),
-                Err(e) => format!(
+                // Not a failure and not worded as one: the worker gave up
+                // because it was asked to, and it took its half-written file
+                // with it.
+                (Err(_), true) => format!(
+                    "PROXY STOPPED for {} — nothing of it was kept, and the film itself is what \
+                     plays",
+                    file_name(&path)
+                ),
+                (Err(e), false) => format!(
                     "PROXY FAILED for {} — {e} — the film itself is what plays",
                     file_name(&path)
                 ),
             };
             eprintln!("{text}");
             self.notify_user(text.into());
-            let state = match outcome {
-                Ok(_) => Proxy::Ready,
-                Err(_) => Proxy::Failed,
+            let state = match (outcome, stopped) {
+                (Ok(_), _) => Proxy::Ready,
+                (Err(_), true) => Proxy::Cancelled,
+                (Err(_), false) => Proxy::Failed,
             };
             self.proxies.insert(path, state);
             cx.notify();
         }
+    }
+
+    /// The × on a library row while its stand-in is being made: the worker is
+    /// asked to give up at its next frame and delete the half-written file it
+    /// was writing ([`engine::proxy::Job::cancel`]), and the row says so until
+    /// it has. A whole feature film re-encoded is minutes of a machine the cut
+    /// is being made on, and there was no way to take it back.
+    ///
+    /// Nothing is deleted from here and nothing waits: the film itself is what
+    /// plays throughout ([`engine::PlaybackSession::picture_path`] stats the
+    /// cache and finds nothing), so a stop costs a line and no more. Asking
+    /// twice is asking once -- the second click finds a state that is not
+    /// [`Proxy::Making`] and answers nothing -- and a cancel that arrives after
+    /// the encode has already written its file settles as the *ready* stand-in
+    /// it is ([`Player::poll_proxies`]), never as a deletion of one in use.
+    pub(crate) fn cancel_proxy(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        // Taken out of its slot and put back one state on, rather than removed:
+        // a path that left this map is a path the next repaint starts an encode
+        // for all over again ([`Player::cache_media`]).
+        let Some(slot) = self.proxies.get_mut(path) else {
+            return;
+        };
+        if !matches!(slot, Proxy::Making(_)) {
+            return;
+        }
+        let Proxy::Making(job) = std::mem::replace(slot, Proxy::Cancelled) else {
+            unreachable!("the slot was just read as one being made")
+        };
+        job.cancel();
+        *slot = Proxy::Cancelling(job);
+        let text = format!("STOPPING the stand-in for {}…", file_name(path));
+        eprintln!("{text}");
+        self.notify_user(text.into());
+        cx.notify();
     }
 
     /// What the Proxies button says after the state: how far the stand-ins
@@ -377,19 +427,26 @@ impl Player {
 
     /// Whether any stand-in is still being made -- what keeps the frame loop
     /// alive while one is, so its percentage moves on screen.
+    ///
+    /// One being stopped counts: its worker is still running until it reaches
+    /// the frame it gives up at, and the repaint that notices *that* is this
+    /// same loop -- without it a stopped row would sit on "stopping…" until
+    /// something else happened to repaint the window.
     pub(crate) fn making_proxies(&self) -> bool {
         self.proxies
             .values()
-            .any(|p| matches!(p, Proxy::Making(_)))
+            .any(|p| matches!(p, Proxy::Making(_) | Proxy::Cancelling(_)))
     }
 
     /// How many films are between "shall we?" and "done": the number the start
     /// of another is held against ([`PROXIES_AT_ONCE`]). A header being read
-    /// counts, because the answer may be an encode.
+    /// counts, because the answer may be an encode -- and so does one still
+    /// winding down from a stop, which is an encoder that has not let go of the
+    /// seat yet.
     pub(crate) fn in_flight_proxies(&self) -> usize {
         self.proxies
             .values()
-            .filter(|p| matches!(p, Proxy::Asked | Proxy::Making(_)))
+            .filter(|p| matches!(p, Proxy::Asked | Proxy::Making(_) | Proxy::Cancelling(_)))
             .count()
     }
 

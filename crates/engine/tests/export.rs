@@ -1029,6 +1029,112 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     assert_eq!(engine::proxy::cached(&source), None);
 }
 
+/// The way out of a stand-in nobody wants to wait for -- a whole film through a
+/// decoder and an encoder, started without being asked for, and until now with
+/// nothing that could stop it.
+///
+/// What a stop has to be worth trusting, all of it here: the worker really
+/// gives up (it settles, so its encoder is closed and its thread is gone), the
+/// half-written `.part` goes with it, and **nothing is left under the name a
+/// finished stand-in would have** -- which is the invariant that keeps a cut
+/// from being made on a truncated picture, since the cache is looked up by
+/// existence alone ([`engine::proxy::cached`]).
+///
+/// ...and the two edges: asking twice is asking once, and a stop that arrives
+/// on a stand-in *already written* must not take that file away -- it is what
+/// the switch is at that moment playing.
+///
+/// Software seat, like every default test here ([`pin_software`]).
+#[test]
+fn a_stopped_proxy_leaves_neither_a_stand_in_nor_half_of_one() {
+    let _seat = pin_software();
+    let source = asset("test_av.mp4");
+    let out = engine::proxy::path_for(&source).expect("a cache directory");
+    let part = part_path(&out);
+    // A stand-in left by an earlier run would make this a cache hit, and a
+    // cache hit is the one job with nothing to stop.
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&part);
+
+    let job = engine::proxy::generate(&source).expect("start the proxy");
+    // Stopped with the encoder really running: a flag set before the worker has
+    // opened anything tests the flag and not the stop.
+    let opening = Instant::now();
+    while job.encoder().is_none() && !job.is_finished() {
+        assert!(
+            opening.elapsed() < Duration::from_secs(120),
+            "the encoder never opened"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !job.is_finished(),
+        "the fixture finished before it could be stopped: this test needs a film \
+         the software seat takes a moment over"
+    );
+    // Twice, because a second click on the × is a thing that happens.
+    job.cancel();
+    job.cancel();
+    let stopping = Instant::now();
+    while !job.is_finished() {
+        assert!(
+            stopping.elapsed() < Duration::from_secs(120),
+            "the worker kept encoding after the stop: {:.0}% in",
+            job.progress() * 100.
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let refusal = job
+        .outcome()
+        .expect("a settled job has an outcome")
+        .err()
+        .expect("a stopped proxy is not a proxy");
+    assert!(
+        refusal.to_string().contains("cancelled"),
+        "not the cancellation: {refusal}"
+    );
+    assert!(
+        !out.exists(),
+        "a stopped proxy left {} behind, and the cache is looked up by existence",
+        out.display()
+    );
+    assert!(
+        !part.exists(),
+        "a stopped proxy left the half-written {} behind",
+        part.display()
+    );
+    assert_eq!(
+        engine::proxy::cached(&source),
+        None,
+        "the cache offers a stand-in that was never finished"
+    );
+    // Past the end it is still idempotent, and the outcome is handed out once.
+    job.cancel();
+    assert!(job.outcome().is_none(), "the outcome came out twice");
+    assert!(!out.exists());
+
+    // The other edge, at no cost: a job for a film whose stand-in is already
+    // written is the cache-hit job, which is exactly what a stop racing the
+    // last instant of an encode settles into -- and cancelling it must leave
+    // the file alone, because that file is what the picture is coming off.
+    std::fs::write(&out, b"a stand-in that is already written").expect("seed the cache");
+    let hit = engine::proxy::generate(&source).expect("ask again");
+    assert!(hit.is_finished(), "a cached stand-in is done on the spot");
+    hit.cancel();
+    assert!(
+        out.is_file(),
+        "a stop deleted a finished stand-in the switch was playing"
+    );
+    assert_eq!(engine::proxy::cached(&source), Some(out.clone()));
+    assert_eq!(
+        hit.outcome().expect("cached outcome").expect("cached path"),
+        out,
+        "the stop turned a finished stand-in into a failure"
+    );
+
+    std::fs::remove_file(&out).expect("clean the cache entry up");
+}
+
 /// The same file on the **hardware** seat, asking the one question the software
 /// twin above cannot: is what the GPU wrote really every-frame-a-starting-point?
 ///
