@@ -246,6 +246,11 @@ impl Render for Player {
                         // The sound's rate, `q`'s pair for the other half of
                         // the file. Not a digit: those are the picture's.
                         this.cycle_audio_kbps();
+                    } else if key == "e" {
+                        // Which encoder writes the picture, `b`'s neighbour for
+                        // the other thing about the file a person picks rather
+                        // than types. Card-local like the rest of these.
+                        this.cycle_encoder(cx);
                     } else if key == "d" {
                         // The save dialog, which was the one row here a
                         // keyboard could not open.

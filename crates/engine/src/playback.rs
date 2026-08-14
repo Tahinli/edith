@@ -394,6 +394,11 @@ pub struct PlaybackSession {
     /// the project like the one above it, and read by the front end: the engine
     /// starts no encode of its own.
     auto_proxies: bool,
+    /// Which encoder an export of this project writes its picture with
+    /// ([`crate::export::EncoderSeat`]). The project's, saved with it like the
+    /// two switches above, and read by the front end: the engine starts no
+    /// export of its own.
+    encoder_seat: crate::export::EncoderSeat,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -512,6 +517,7 @@ impl PlaybackSession {
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
             auto_proxies: true,
+            encoder_seat: crate::export::EncoderSeat::default(),
         })
     }
 
@@ -628,6 +634,7 @@ impl PlaybackSession {
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
             auto_proxies: true,
+            encoder_seat: crate::export::EncoderSeat::default(),
         })
     }
 
@@ -708,6 +715,7 @@ impl PlaybackSession {
             // A file just opened is a project nobody has picked stand-ins for.
             proxies: false,
             auto_proxies: true,
+            encoder_seat: crate::export::EncoderSeat::default(),
         })
     }
 
@@ -1008,6 +1016,9 @@ impl PlaybackSession {
             // ...and what it says about making them, which is "yes" for every
             // dialect before v13 and for one that leaves the line out.
             auto_proxies: doc.auto_proxy,
+            // ...and which encoder it exports with, which is the seat this
+            // machine has for every dialect before v14.
+            encoder_seat: doc.encoder,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1271,6 +1282,10 @@ impl PlaybackSession {
             // question from whether it cuts on them and the only one an import
             // asks ([`Self::auto_proxies`]).
             self.auto_proxies,
+            // ...and which encoder an export of it opens, for the same reason:
+            // a project delivered on the software encoder is delivered on it
+            // again after a reload.
+            self.encoder_seat,
             self.project.limiter(),
             playhead,
         )
@@ -2085,6 +2100,21 @@ impl PlaybackSession {
         self.proxies = on;
         let now = self.now();
         self.seek(now);
+    }
+
+    /// Which encoder an export of this project would open its picture on
+    /// ([`crate::export::EncoderSeat`]). What a front-end puts into the
+    /// [`ExportSettings`](crate::export::ExportSettings) it starts an export
+    /// with -- and what the export card shows -- so the pick, the prediction
+    /// and the file are one answer.
+    pub fn encoder_seat(&self) -> crate::export::EncoderSeat {
+        self.encoder_seat
+    }
+
+    /// Pick the seat. Nothing to reseek and nothing to re-probe here: this
+    /// decides what an *export* opens, never what plays.
+    pub fn set_encoder_seat(&mut self, seat: crate::export::EncoderSeat) {
+        self.encoder_seat = seat;
     }
 
     /// Whether an imported film that wants a stand-in gets one made for it
