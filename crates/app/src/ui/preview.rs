@@ -1,7 +1,6 @@
 //! The picture: what is drawn over it and what is read off it.
 
 use crate::*;
-use crate::ui::widgets::*;
 
 impl Player {
     /// The cues the *subtitle lanes* put on screen at `at`, over the picture and

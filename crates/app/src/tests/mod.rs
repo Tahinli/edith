@@ -14,11 +14,11 @@ use super::{
     EQ_CURVE_STEPS, EQ_FFT, EQ_FREQ_HIGH, EQ_FREQ_LOW, EQ_FREQ_STEP, EQ_GAIN_LIMIT, EQ_GRAPH_H,
     EQ_HANDLE, EQ_Q_HIGH, EQ_Q_LOW, EQ_Q_STEP, EQ_SPECTRUM_DB, EQ_TICKS, EQ_W_MAX, ESCAPE,
     EXPORT_FIXED_H, EXPORT_ROWS_H, EXPORT_W, Enable, EncoderSeat, FORMATS,
-    Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN, FG_PRIMARY,
-    FG_SECONDARY, KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
-    BG_CANVAS, LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+    Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN,
+    KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
+    LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
     MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MB_FLOOR, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
-    Quality, ROW_H, RULER_HIT_H, BG_SELECTED, SCROLL_NOTCH_SHARE, SILENCE_ROWS,
+    Quality, ROW_H, RULER_HIT_H, SCROLL_NOTCH_SHARE, SILENCE_ROWS,
     SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, BG_RAISED, SWATCH_W, Source, Speed, StreamInfo,
     Transport, VOLUME_W, Volume, WAVE_BPS, WAVE_COL, WAVE_COLS_MAX, Wave, band_label,
     bitrate_detail, bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
@@ -54,7 +54,7 @@ use super::{
 };
 
 use super::{
-    SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_FG, SUB_LINE_H, SUB_ROWS_H,
+    SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_LINE_H, SUB_ROWS_H,
     SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box, sub_bottom,
     carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
     Subs, subtitle_detail, subtitle_notice, subtitle_tail,
