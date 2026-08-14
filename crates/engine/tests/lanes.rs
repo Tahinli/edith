@@ -14,7 +14,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::{Clip, LaneKind, Source, Speed};
+use engine::project::{Clip, Lane, LaneKind, Source, Speed};
 use engine::scale::FitPolicy;
 use engine::scratch::Scratch;
 use engine::{DecodeSession, ExportHandle, PlaybackSession, Project};
@@ -423,4 +423,138 @@ fn one_lane_projects_are_untouched() {
     let lists = project.audio_segments_from(0, FPS);
     assert_eq!(lists, vec![project.segments_from(0, FPS)]);
     assert_eq!(project.sources(), [Source::new(asset("test_av.mp4"), 0)]);
+}
+
+/// The burden a third lane kind carries: a subtitle lane is a lane like the
+/// others everywhere a *lane* is the subject -- it is added, labelled, ordered,
+/// snapshotted and removed by one code path -- and every path that is about
+/// media refuses it, by the bounds check it already had or by name.
+///
+/// One test rather than a dozen because the claim is one claim: nothing about
+/// a caption was threaded through the media machinery.
+#[test]
+fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
+    use engine::project::{Edge, SubClip};
+
+    let mut project = Project::single(asset("test_av.mp4"), TOTAL);
+    let subs = engine::subtitle::open(&asset("test_subs.srt"), None);
+    assert!(project.add_subtitles(&subs), "the palette takes the track");
+    let s1 = project.add_lane(LaneKind::Subtitle);
+    assert_eq!(project.lanes(), [Lane::V1, Lane::A1, s1], "a peer in the stack");
+    assert_eq!(s1.label(), "S1");
+
+    let caption = SubClip {
+        start: 0,
+        frames: 60,
+        track: 0,
+        in_us: 0,
+        out_us: 2_000_000,
+    };
+    project.place_sub(s1, 0, caption).expect("a caption goes down");
+
+    // Nothing about the *picture* or the *mix* learned about it.
+    assert_eq!(
+        project.composite_spans_from(0),
+        project.spans_from(Lane::V1, 0),
+        "the composite is still V1 alone: a subtitle lane is not a video lane"
+    );
+    assert_eq!(project.composite_clip_at(0), Some((Lane::V1, 0)));
+    assert_eq!(project.audio_lanes(), [Lane::A1], "and the mix is A1 alone");
+    assert_eq!(project.audio_gains().len(), 1);
+    assert_eq!(
+        project.lane_gains().len(),
+        2,
+        "a save's gain list holds the two media lanes, in step with its lane list"
+    );
+
+    // The clip-shaped calls: the lane holds no `Clip`, so each refuses by the
+    // check it always made, and none of them costs an undo step.
+    assert!(project.lane(s1).is_empty(), "there is no clip on a subtitle lane");
+    assert!(!project.set_lane_gain_db(s1, -6.0), "words have no loudness");
+    assert_eq!(project.lane_gain_db(s1), 0.0);
+    assert!(!project.set_eq(s1, 0, None), "and no equalizer");
+    assert!(!project.set_color(s1, 0, None), "and no colour grade");
+    assert!(!project.set_fit(s1, 0, engine::scale::FitPolicy::Fill), "and no fit");
+    let err = project
+        .set_speed(s1, 0, Speed::from_permille(2000))
+        .expect_err("and no speed");
+    assert!(err.to_string().contains("there is no clip 0 on S1"), "{err}");
+    assert!(!project.trim(s1, 0, Edge::End, 10, &[TOTAL]), "nothing to trim");
+    assert!(!project.lift(s1, 0), "nothing to lift");
+    assert!(!project.delete_in(s1, 0), "nothing to delete");
+
+    // ...and the three doors that could still have put a picture on one.
+    let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
+    assert!(!project.place(s1, 0, clip), "a picture may not be placed on it");
+    assert!(!project.place_take(s1, 0, clip), "nor a whole take");
+    assert!(!project.move_clip(Lane::V1, 0, s1, 0), "nor dragged onto it");
+    project.append_clip(0, 30);
+    assert!(
+        project.lane(s1).is_empty(),
+        "an import lands on the media lanes and skips this one"
+    );
+    assert!(project.undo(), "the import is one step");
+    let refused = Project::from_parts(
+        vec![Source::new(asset("test_av.mp4"), 0)],
+        vec![(LaneKind::Subtitle, vec![clip])],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect_err("a file may not name one either");
+    assert!(
+        refused.to_string().contains("S1 is a subtitle track"),
+        "the refusal says which lane and why: {refused}"
+    );
+
+    // The lane's own life cycle, which is the machinery it *does* use.
+    let held = project.remove_lane(s1).expect_err("it still holds a caption");
+    assert!(held.to_string().contains("still holds 1 subtitle(s)"), "{held}");
+    assert!(project.lift_sub(s1, 0), "the caption comes off");
+    project.remove_lane(s1).expect("and then so does the lane");
+    assert_eq!(project.lanes(), [Lane::V1, Lane::A1], "the last one may go");
+    assert!(project.undo() && project.undo(), "both steps walk back");
+    assert_eq!(project.sub_lane(s1), [caption], "caption and lane restored");
+}
+
+/// A rippling paste opens its room on the subtitle lanes too -- the desync a
+/// lane model exists to prevent: a caption that stayed where it was while the
+/// picture under it moved on says the wrong words over the wrong frames.
+#[test]
+fn a_paste_opens_its_room_under_the_captions_too() {
+    use engine::project::SubClip;
+
+    let mut project = Project::single(asset("test_av.mp4"), TOTAL);
+    project.add_subtitles(&engine::subtitle::open(&asset("test_subs.srt"), None));
+    let s1 = project.add_lane(LaneKind::Subtitle);
+    project
+        .place_sub(
+            s1,
+            0,
+            SubClip {
+                start: 0,
+                frames: 60,
+                track: 0,
+                in_us: 0,
+                out_us: 2_000_000,
+            },
+        )
+        .expect("a caption over the first two seconds");
+
+    let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
+    let pasted = Clip {
+        out_frame: 30,
+        ..clip
+    };
+    assert!(project.paste(20, pasted), "thirty frames go in at frame 20");
+    assert_eq!(
+        project
+            .sub_lane(s1)
+            .iter()
+            .map(|s| (s.start, s.frames, s.in_us, s.out_us))
+            .collect::<Vec<_>>(),
+        [(0, 20, 0, 666_666), (50, 40, 666_666, 2_000_000)],
+        "the caption is split at the insert and its tail moved on with the picture"
+    );
+    assert!(project.undo(), "and the paste is one step for the lot");
+    assert_eq!(project.sub_lane(s1).len(), 1);
 }
