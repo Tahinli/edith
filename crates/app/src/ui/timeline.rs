@@ -13,7 +13,7 @@ impl Player {
         &self,
         position: f64,
         state: Transport,
-        viewport_h: f32,
+        viewport: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Where the playhead is *on the bed*, in pixels from its left edge.
@@ -79,7 +79,10 @@ impl Player {
         // number a scroll is measured against, and the one the affordance below
         // counts with. The line it costs is taken off the box before the count,
         // or the row that says "1 more" would be the row hiding it.
-        let region_h = timeline_h(lanes.len()).min(viewport_h * TIMELINE_SHARE);
+        // What the lane count asks for against its share of the window -- or
+        // what a hand dragged the seam above to, which wins both
+        // ([`Player::split_px`]).
+        let region_h = self.split_px(Split::Timeline, viewport);
         let lanes_box = (region_h - TIMELINE_FIXED_H).max(LANE_H);
         let overflows = lanes.len() > lanes_shown(lanes_box);
         let lanes_box = match overflows {

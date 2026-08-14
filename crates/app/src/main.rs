@@ -210,6 +210,14 @@ struct Player {
     /// A drag that started on the ruler. Moves anywhere in the window scrub
     /// while it is set; the release commits the exact position.
     scrubbing: bool,
+    /// What the hand has made of the three panel seams, and which one it is
+    /// holding now. Kept here rather than worked out per frame from the
+    /// window's own shares: a size a person dragged is a size that has to
+    /// survive the release ([`Splits`]).
+    splits: Splits,
+    /// A drag that started on a divider, tracked on the root for `scrubbing`'s
+    /// reason -- the strip is 6 px and the pointer leaves it at once.
+    split_drag: Option<Split>,
     /// A drag that started on a clip's edge, tracked on the root for
     /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
     /// [`Trim`].
@@ -665,6 +673,8 @@ fn main() {
                     hw_caps: None,
                     clipboard: None,
                     scrubbing: false,
+                    splits: Splits::default(),
+                    split_drag: None,
                     trim: None,
                     grab: 0,
                     snap: true,
