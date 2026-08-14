@@ -361,6 +361,20 @@ impl Player {
         }
     }
 
+    /// Pushes the window's two stand-in switches at the session, which is the
+    /// only place they are ever written -- [`Player::apply_volume`]'s contract,
+    /// and for a sharper reason: a fresh session comes up making stand-ins for
+    /// every big film, so a person who turned that off before importing
+    /// anything would watch the very import they were waiting to prevent start
+    /// an encode.
+    pub(crate) fn apply_proxies(&mut self) {
+        let (on, auto) = (self.proxies_on, self.auto_proxies_on);
+        if let Some(session) = &mut self.session {
+            session.set_proxies(on);
+            session.set_auto_proxies(auto);
+        }
+    }
+
     /// Whether any stand-in is still being made -- what keeps the frame loop
     /// alive while one is, so its percentage moves on screen.
     pub(crate) fn making_proxies(&self) -> bool {
@@ -382,12 +396,17 @@ impl Player {
     /// Cuts on the stand-ins, or on the films themselves. The picture and only
     /// the picture: the sound is the film's either way, and so is every frame
     /// an export writes.
+    ///
+    /// Set on the window and pushed at the session, not the other way about:
+    /// this is an import option and a person picks it before the first film
+    /// arrives ([`Player::apply_proxies`]). With nothing open it is the pick
+    /// the next session comes up with.
     pub(crate) fn toggle_proxies(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        let on = !session.proxies();
-        session.set_proxies(on);
+        let on = !self.proxies_on;
+        self.proxies_on = on;
+        if let Some(session) = &mut self.session {
+            session.set_proxies(on);
+        }
         // What is really under the switch, said in the same breath: a project
         // whose films have no stand-in yet would otherwise read as a switch
         // that does nothing.
@@ -412,7 +431,12 @@ impl Player {
         };
         eprintln!("{text}");
         self.notify_user(text.into());
-        self.reset_after_reseek();
+        // The switch reseeks the session, and the wait for that picture is what
+        // this clears -- with nothing open there is no open to wait for, and a
+        // clock started against one would be a seek line about nothing.
+        if self.session.is_some() {
+            self.reset_after_reseek();
+        }
         cx.notify();
     }
 
@@ -424,12 +448,15 @@ impl Player {
     /// is what asks for the ones this project needs ([`Player::cache_media`]),
     /// which is said here because a switch whose only effect is elsewhere is a
     /// switch that reads as doing nothing.
+    ///
+    /// The window's own, like the switch above and for its reason: this one
+    /// decides what an *import* does, so it is answerable before the import.
     pub(crate) fn toggle_auto_proxies(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &mut self.session else {
-            return;
-        };
-        let on = !session.auto_proxies();
-        session.set_auto_proxies(on);
+        let on = !self.auto_proxies_on;
+        self.auto_proxies_on = on;
+        if let Some(session) = &mut self.session {
+            session.set_auto_proxies(on);
+        }
         let text = match on {
             true => "AUTO PROXIES ON — a film that wants a stand-in gets one as it arrives",
             false => "AUTO PROXIES OFF — no import makes one; Proxies on is what asks for them",
@@ -628,6 +655,9 @@ impl Player {
                 // A fresh session comes up at full volume; the player's own
                 // setting outlives the file, so it is pushed at every new one.
                 self.apply_volume();
+                // ...and so do the stand-in switches, which were answerable
+                // before this file existed and decide what its own import does.
+                self.apply_proxies();
                 // Beside the new file, but still the format the card is set to:
                 // opening another clip is not a change of mind about that.
                 self.export_path = retarget(&export_path(path), self.format);
@@ -897,6 +927,14 @@ impl Player {
                 self.export_path = retarget(&export_path(&session.sources()[0].path), self.format);
                 self.session = Some(session);
                 self.apply_volume();
+                // The other way round from every other door: a project carries
+                // its own two switches ([`engine::edith`]) and they are what it
+                // was saved with, so the window takes *them* rather than
+                // pushing what it had -- and the buttons say what was loaded.
+                if let Some(session) = &self.session {
+                    self.proxies_on = session.proxies();
+                    self.auto_proxies_on = session.auto_proxies();
+                }
                 self.project_path = path.to_path_buf();
                 self.name = file_name(path).into();
                 // A copied clip names its source by index, which means a
