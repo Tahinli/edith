@@ -12,6 +12,12 @@ edition.workspace = true
 hound = "3.5.1"
 flacenc = { version = "0.5.1", default-features = false }
 libloading = "0.8"
+# `memfd_create`, `mmap` and `SCM_RIGHTS` -- the three things std has no door to
+# and the whole of what puts the video driver in another process
+# (`crate::hwproc`). Not a new crate tree: it was already in this workspace's
+# lock file, pulled in by half the dependencies here, so this line compiles
+# nothing that was not compiled before.
+libc = "0.2"
 # Still images, decoded once per placed clip (`decode::Still`). Pure Rust like
 # everything else here, and already in the app's tree (gpui pulls it), so this
 # costs the build nothing new. Exactly the formats `crate::is_image` admits: no
