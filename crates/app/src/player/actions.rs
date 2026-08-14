@@ -166,33 +166,34 @@ impl Player {
         self.keys_scroll.set_offset(point(px(0.), px(at)));
     }
 
-    /// The cues over the picture, off and on. Says which it is now *and* what is
-    /// on screen while they are on: a toggle whose answer is invisible when the
-    /// playhead happens to sit between two cues would read as broken.
+    /// The cues over the picture, off and on. Says which it is now *and* how
+    /// much is placed underneath: a toggle whose answer is invisible -- the
+    /// playhead between two cues, or a palette full of tracks nobody dragged
+    /// onto a lane -- would read as broken.
     pub(crate) fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
         self.subs_on = !self.subs_on;
-        // Named with its film here too: a notice saying "SUBTITLES ON — eng"
-        // over a timeline holding two films' eng tracks names neither.
-        let label = self
-            .session
-            .as_ref()
-            .and_then(|session| sub_pick_name(session.subtitles(), self.sub_track))
-            .unwrap_or_else(|| "nothing imported".to_string());
-        self.notify_user(
-            match self.subs_on {
-                true => format!("SUBTITLES ON — {label}"),
-                false => format!("SUBTITLES OFF — {label} is still on the timeline"),
-            }
-            .into(),
-        );
+        // Lane facts and not the picked row: what draws is what is *placed*
+        // ([`Player::subtitle_overlay`]), so naming the palette selection here
+        // named a track the toggle never touched.
+        let placed = self.placed_captions();
+        self.notify_user(subtitle_toggle_notice(self.subs_on, placed).into());
         cx.notify();
     }
 
-    /// The subtitle track the overlay and the strip are showing: the one a
-    /// library row picked, or the first there is. `None` with no timeline and
-    /// for an index left over from one that is gone.
-    pub(crate) fn subtitle_track(&self) -> Option<&engine::subtitle::SubtitleTrack> {
-        self.session.as_ref()?.subtitles().get(self.sub_track)
+    /// How many captions the subtitle lanes hold, all lanes together: what the
+    /// toggle and the toolbar's own label are about, now that the picture reads
+    /// the lanes rather than a pick ([`Player::subtitle_overlay`]). Zero with no
+    /// timeline, and zero for a palette full of tracks nobody placed -- both
+    /// show nothing, so both read "No subs".
+    pub(crate) fn placed_captions(&self) -> usize {
+        let Some(session) = self.session.as_ref() else {
+            return 0;
+        };
+        session
+            .subtitle_lanes()
+            .into_iter()
+            .map(|lane| session.sub_lane(lane).len())
+            .sum()
     }
 
     /// Whether the editor can be asked for `action` right now, and why not when

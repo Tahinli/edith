@@ -882,9 +882,31 @@ fn the_picked_subtitle_is_named_with_the_film_it_came_out_of() {
     // A standalone `.srt` is its own file and its label already says so:
     // one track, so no number, and no stem after it saying it again.
     assert_eq!(name(4), "late.srt");
-    // The silence `subtitle_track` gives at the same moment.
+    // The silence a row left over from a timeline that is gone gets.
     assert_eq!(sub_pick_name(&tracks, 5), None);
     assert_eq!(sub_pick_name(&[], 0), None);
+}
+
+/// What the toggle covers is what is *placed*, so what it says is a lane fact:
+/// naming the palette row the list happens to mark named a track the stroke
+/// never touched ("SUBTITLES OFF — one.srt is still on the timeline" for a
+/// one.srt nobody dragged anywhere).
+#[test]
+fn the_subtitles_toggle_says_what_is_placed_and_never_the_picked_row() {
+    for on in [true, false] {
+        let text = subtitle_toggle_notice(on, 2);
+        assert!(text.contains('2'), "{text} counts the captions placed");
+        assert!(
+            !text.contains("track(s)") && !text.contains(" — a"),
+            "{text} names no palette row"
+        );
+    }
+    // Off leaves them on the lanes; that is the half a person needs told.
+    assert!(subtitle_toggle_notice(false, 2).contains("still placed"));
+    // An empty timeline says the move instead of a count that reads as broken.
+    let none = subtitle_toggle_notice(true, 0);
+    assert!(!none.contains('0'), "{none} counts nothing at nothing");
+    assert!(none.contains("drag"), "{none} says the next move");
 }
 
 /// The door this editor answers "don't make me import the film again" with,

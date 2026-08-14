@@ -341,7 +341,7 @@ impl Player {
                         SNAP_SLOT_W,
                         BG_RAISED(),
                         None,
-                        match (self.subtitle_track().is_some(), self.subs_on) {
+                        match (self.placed_captions() > 0, self.subs_on) {
                             (false, _) => "No subs",
                             (true, true) => "Subs on",
                             (true, false) => "Subs off",
