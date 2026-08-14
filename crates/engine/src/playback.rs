@@ -26,7 +26,7 @@ use crate::colorspace::ColorDescription;
 use crate::decode::{Backend, BackendCell, DecodeSession, Frame, Worker};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
-use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed};
+use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip};
 use crate::scale::{Composer, FitPolicy};
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
@@ -1207,15 +1207,19 @@ impl PlaybackSession {
     /// own remove goes through, the way [`import_subtitles`](
     /// Self::import_subtitles) is the door that puts one on. Refused in
     /// [`Project::remove_subtitles`]'s words for a row this timeline does not
-    /// have.
+    /// have, and for one a caption on a subtitle lane still plays -- delete
+    /// those placements first, or the words under them would change.
     ///
     /// Nothing playable changes and no worker was opened against a cue, so
     /// unlike [`remove_source`](Self::remove_source) this does not reseek. Rows
     /// past `idx` move down by one: a caller holding a picked row (the export's
-    /// subtitle pick) has to fix it up or drop it. Not an undo step, for the
+    /// subtitle pick) has to fix it up or drop it; the placements on the lanes
+    /// are walked down with it and need no fixing. Not an undo step, for the
     /// reason [`Project::remove_subtitles`] gives -- the way back is
     /// [`import_subtitles`](Self::import_subtitles), which reads a file's
-    /// subtitles and touches nothing else on the timeline.
+    /// subtitles and touches nothing else on the timeline -- and it *empties*
+    /// the undo history, because the steps in it name the tracks by the indexes
+    /// this call just changed.
     pub fn remove_subtitles(&mut self, idx: usize) -> crate::Result<()> {
         self.project.remove_subtitles(idx)
     }
@@ -1694,6 +1698,75 @@ impl PlaybackSession {
             self.invalidate(Dirty::Picture);
         }
         Some(moved)
+    }
+
+    /// The subtitle lanes in display order -- `S1..Sn`, the rows a front-end
+    /// lays out beside the picture and sound ones
+    /// ([`Project::subtitle_lanes`]). Empty until something adds one, which is
+    /// [`add_lane`](Self::add_lane) with [`LaneKind::Subtitle`], and they come
+    /// off, move and reorder through the very same doors every other lane does.
+    pub fn subtitle_lanes(&self) -> Vec<Lane> {
+        self.project.subtitle_lanes()
+    }
+
+    /// What is placed on one subtitle lane, in timeline order: what a front-end
+    /// draws as clips, each naming the palette row it plays
+    /// ([`Self::subtitles`]) and the window of it it keeps
+    /// ([`Project::sub_lane`]).
+    pub fn sub_lane(&self, lane: Lane) -> &[SubClip] {
+        self.project.sub_lane(lane)
+    }
+
+    /// Places a stretch of a subtitle track on `lane` at timeline frame `at`
+    /// ([`Project::place_sub`], whose words a refusal is shown in). One undo
+    /// step.
+    ///
+    /// No reseek and no invalidation, which is what the whole wrapper layer is
+    /// here for: cues are drawn from [`sub_lane_cues`](Self::sub_lane_cues)
+    /// over whatever picture is on screen, so nothing already decoded stops
+    /// being right.
+    pub fn place_sub(&mut self, lane: Lane, at: u32, sub: SubClip) -> crate::Result<()> {
+        self.project.place_sub(lane, at, sub)
+    }
+
+    /// Drags a placement to another subtitle lane or another frame
+    /// ([`Project::move_sub`]). One undo step, and `Ok` with none for a drop
+    /// that changed nothing.
+    pub fn move_sub(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> crate::Result<()> {
+        self.project.move_sub(from, idx, to, start)
+    }
+
+    /// Drags one edge of a placement to timeline frame `to`
+    /// ([`Project::trim_sub`]), **at this timeline's own frame rate** -- a
+    /// placement's position is in frames while its words are in microseconds,
+    /// and the rate that joins them is the one thing a [`Project`] does not
+    /// know. That is why a front-end trims through this door and never converts
+    /// a cue's microseconds itself. One undo step.
+    pub fn trim_sub(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> crate::Result<()> {
+        self.project.trim_sub(lane, idx, edge, to, self.meta.frame_rate)
+    }
+
+    /// How far that edge may travel, `(first, last)` timeline frame inclusive
+    /// ([`Project::trim_sub_room`]) -- what a front-end drawing the box during
+    /// a drag asks, at this timeline's rate.
+    pub fn trim_sub_room(&self, lane: Lane, idx: usize, edge: Edge) -> Option<(u32, u32)> {
+        self.project.trim_sub_room(lane, idx, edge, self.meta.frame_rate)
+    }
+
+    /// Takes one placement off a subtitle lane, leaving a gap
+    /// ([`Project::lift_sub`]). One undo step; the palette row it played stays
+    /// on this timeline's list.
+    pub fn lift_sub(&mut self, lane: Lane, idx: usize) -> bool {
+        self.project.lift_sub(lane, idx)
+    }
+
+    /// What that subtitle lane shows on *this* timeline, in start order
+    /// ([`Project::sub_lane_cues`] at this timeline's rate) -- the placed-clip
+    /// counterpart of [`timeline_cues`](Self::timeline_cues), which carries a
+    /// whole palette track through the spans that play its media. Pure, so a
+    /// front-end may ask it per repaint.
+    pub fn sub_lane_cues(&self, lane: Lane) -> Vec<crate::subtitle::Cue> {
+        self.project.sub_lane_cues(lane, self.meta.frame_rate)
     }
 
     /// Splits every lane at `timeline_secs`, so the two sides become two
