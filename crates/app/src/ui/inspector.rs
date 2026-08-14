@@ -302,6 +302,25 @@ impl Player {
                         ActionId::ToggleProxies,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_proxies(cx)),
                     ))
+                    // Beside it, because the two are one subject: that one is
+                    // what the picture is decoded from, this one is whether the
+                    // stand-in is ever made. Two states and no cycle, the rule
+                    // the switch beside it keeps.
+                    .child(self.action_control(
+                        "auto-proxies",
+                        TONE_SLOT_W,
+                        BG_RAISED(),
+                        None,
+                        match self.session.as_ref().map(PlaybackSession::auto_proxies) {
+                            Some(true) => "Auto proxies on",
+                            Some(false) => "Auto proxies off",
+                            None => "Auto proxies",
+                        },
+                        "makes a stand-in for every big film as it is imported; with it off, \
+                         turning Proxies on is what asks for them",
+                        ActionId::ToggleAutoProxies,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_auto_proxies(cx)),
+                    ))
                     .child(self.action_control(
                         "inspect-mix",
                         0.,

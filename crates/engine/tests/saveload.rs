@@ -97,6 +97,43 @@ fn a_picked_audio_stream_lands_saves_and_comes_back() {
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
+/// Both stand-in switches through the front door: what the picture is cut on
+/// and whether an import makes one at all are two settings, saved and reopened
+/// as the pair they are -- and a session that was never told keeps making them,
+/// which is what every project did before there was a switch.
+#[test]
+fn both_proxy_switches_survive_a_save_and_a_reopen() {
+    let dir = scratch("proxyswitches");
+    let media = copy_in(&dir, "test_av.mp4");
+    let mut session = PlaybackSession::open(&media).expect("open the fixture");
+    session.set_gain(0.0);
+    assert!(session.auto_proxies(), "a fresh project makes them by itself");
+    assert!(!session.proxies(), "and is cut on the film itself");
+
+    session.set_proxies(true);
+    session.set_auto_proxies(false);
+    let path = dir.join("switches.edith");
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("proxy on\nautoproxy off\n"), "{text}");
+
+    let loaded = PlaybackSession::open_project(&path).expect("reopen");
+    assert!(loaded.proxies(), "cut on the stand-ins came back");
+    assert!(!loaded.auto_proxies(), "and so did making none of them");
+
+    // ...and the default is the line left out, which is what a v12 file is.
+    session.set_auto_proxies(true);
+    session.save_project(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(!text.contains("autoproxy"), "on is written by saying nothing");
+    assert!(
+        PlaybackSession::open_project(&path)
+            .expect("reopen")
+            .auto_proxies()
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
 /// Why a trim's tail stops where the file ends: a clip reaching past the last
 /// frame of its source is a project that will not open again (`open_project`
 /// refuses it by name). Pulled in on both ends and then dragged out as far as
@@ -208,7 +245,7 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 12\n"), "{text}");
+    assert!(text.starts_with("edith 13\n"), "{text}");
     assert!(
         text.contains("\nresolution 1280 720\n"),
         "a project with no resolution of its own is saved at source 0's: {text}"
@@ -296,7 +333,7 @@ fn a_version_4_project_holds_more_than_two_lanes() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 12\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 13\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          video 1 0 0 30 0 3 - - fit 1000\naudio 1\n\
          video 2 40 0 20 0 - - - fit 1000\naudio 2 0 0 30 0 3 - - fit 1000\n",
         "a four-lane project is written as it was read, three versions on"
@@ -326,7 +363,7 @@ fn a_version_5_project_carries_per_clip_equalizers() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 12\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 13\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
          eq 12000.0:6.25:0.5:hs\n\
          video 1 0 0 30 0 - 0 - fit 1000\nvideo 1 30 30 60 0 - 1 - fit 1000\n\
@@ -361,7 +398,7 @@ fn a_version_6_project_carries_per_clip_colours() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 12\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 13\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          eq 80.0:-3.0:0.707:ls\n\
          color 0.1:1.2:0.9:-0.3\n\
          color -0.25:1.0:0.0:0.5\n\
@@ -411,7 +448,7 @@ fn a_version_7_project_carries_a_resolution_and_fit_policies() {
     loaded.save_project(&again).expect("save");
     assert_eq!(
         std::fs::read_to_string(&again).expect("read back"),
-        "edith 12\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 13\nplayhead 0\nresolution 960 720\nfps 30.0\nsource 0 test_av.mp4\n\
          video 1 0 0 30 0 - - - fill 1000\nvideo 1 30 30 60 0 - - - center 1000\n\
          audio 1 0 0 60 0 - - - fit 1000\n",
         "a v7 project is written back as the v8 it now is: the same clips, each \
@@ -669,7 +706,7 @@ fn malformed_files_are_numbered_errors_and_never_panics() {
 
     for (text, want) in [
         (
-            "edith 13\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
+            "edith 14\nsource 0 test_av.mp4\nvideo 1 0 0 30 0 - - - fit\n",
             "line 1",
         ),
         // An eq index the table does not hold, and a band shape there is none.

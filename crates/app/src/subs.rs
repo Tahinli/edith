@@ -579,6 +579,26 @@ pub(crate) fn unseen_paths<V>(sources: &[Source], seen: &HashMap<PathBuf, V>) ->
     out
 }
 
+/// The films a repaint may start a stand-in for ([`engine::proxy`]): the unseen
+/// ones while this project makes them by itself, and **none at all** while it
+/// does not -- until the Proxies switch is thrown, which is the ask, since
+/// nothing else offers to make one.
+///
+/// A film left out here stays out of the map it was checked against, which is
+/// what brings it back the moment either switch says yes: an import made while
+/// both were off is not a film that missed its turn.
+pub(crate) fn proxies_to_start<V>(
+    auto: bool,
+    cut_on_them: bool,
+    sources: &[Source],
+    seen: &HashMap<PathBuf, V>,
+) -> Vec<PathBuf> {
+    match auto || cut_on_them {
+        true => unseen_paths(sources, seen),
+        false => Vec::new(),
+    }
+}
+
 /// Which timeline frame the playhead is on, by the rule the engine's own edits
 /// use (playback.rs `secs_to_frame`): the frame that has started, with the
 /// epsilon that keeps a clock sitting exactly on a boundary from reading as the
