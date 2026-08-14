@@ -463,8 +463,9 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
     assert_eq!(project.audio_gains().len(), 1);
     assert_eq!(
         project.lane_gains().len(),
-        2,
-        "a save's gain list holds the two media lanes, in step with its lane list"
+        3,
+        "a save's gain list holds one entry per lane, in step with its lane list -- \
+         this one's at the 0.0 a subtitle lane is pinned to"
     );
 
     // The clip-shaped calls: the lane holds no `Clip`, so each refuses by the
