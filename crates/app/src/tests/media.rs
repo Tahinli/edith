@@ -954,7 +954,14 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     let track = &session.subtitles()[0];
     assert_eq!(track.label, "test_subs.srt");
     assert_eq!(subtitle_detail(track), "3 cues");
-    // What the overlay draws at a moment inside the first cue, and between
+    // Arriving is landing in the *list* and nowhere else: no lane is made for
+    // it, so there is nothing over the picture yet -- the rule every other
+    // medium follows here, and what `Player::subtitle_overlay` reads.
+    assert!(
+        session.subtitle_lanes().is_empty(),
+        "an import places nothing: the palette is where a track lands"
+    );
+    // What the track itself says at a moment inside the first cue, and between
     // two of them -- the fixture's own timings (0.5-1.5 s, 2.0-3.25 s).
     let text = |t: f64| -> Vec<String> {
         cues_at(&track.cues, t)
@@ -1019,7 +1026,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     assert!(subtitle_detail(&refused).contains("pictures"));
     assert!(cues_at(&refused.cues, 1.).is_empty());
 
-    // ...and what the plate and the strip draw after a *cut*: the timeline's
+    // ...and what an embedded track carried through a *cut* maps to: the timeline's
     // own clock, asked of the engine through the very map an export writes
     // the file with (`PlaybackSession::timeline_cues`), so the preview and
     // the file cannot drift apart. The numbers are the export's own
@@ -1042,7 +1049,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
             .collect::<Vec<_>>(),
         vec![(500_000, 1_500_000), (2_000_000, 3_000_000)]
     );
-    // The overlay's own two lines, at the same moments as above.
+    // The export's own two lines, at the same moments as above.
     let drawn = |t: f64| -> Vec<String> {
         cues_at(&mapped, t)
             .into_iter()
@@ -1057,4 +1064,41 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     );
     // ...and the strip's: the second cue is one second wide now, not 1.25.
     assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
+
+    // The last mile, what the plate over the picture actually reads
+    // (`Player::subtitle_overlay` -> `PlaybackSession::sub_lane_cues`): a lane
+    // added and still empty draws nothing, and the palette row reaches the
+    // screen the moment it is *placed* on it -- shifted by where it sits, the
+    // way a clip is.
+    let lane = session.add_lane(LaneKind::Subtitle);
+    assert!(
+        session.sub_lane_cues(lane).is_empty(),
+        "an empty subtitle lane draws nothing"
+    );
+    session
+        .place_sub(
+            lane,
+            0,
+            SubClip {
+                start: 0,
+                frames: 90,
+                track: 0,
+                in_us: 0,
+                out_us: 5_000_000,
+            },
+        )
+        .expect("the palette row goes down on the lane");
+    let placed = session.sub_lane_cues(lane);
+    let shown = |t: f64| -> Vec<String> {
+        cues_at(&placed, t)
+            .into_iter()
+            .map(|c| c.text.clone())
+            .collect()
+    };
+    // The placement keeps the track's own clock (it starts at frame 0 and
+    // holds the whole of it), so the words are back at the times the file
+    // wrote them -- the cut above moved the *carried* map, not this one.
+    assert_eq!(shown(0.7), ["first line"]);
+    assert!(shown(1.8).is_empty(), "between two cues the plate goes");
+    assert_eq!(shown(2.5), ["second line\nwith a break"]);
 }
