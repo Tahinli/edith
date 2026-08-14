@@ -2221,6 +2221,23 @@ fn run(
                         "export audio: waited for after {:.1} s of picture",
                         picture_started.elapsed().as_secs_f64()
                     );
+                    // ...and the line on screen finished with it. The loop above
+                    // publishes the measured codec the moment the pass lands
+                    // under the picture, but a picture that outran the mix never
+                    // reaches that branch -- and "working out the sound…" would
+                    // then be the last thing the card ever said about a track it
+                    // had long since written.
+                    publish_seats(
+                        shared,
+                        seat,
+                        project,
+                        settings,
+                        track.as_ref().map(|track| track.copied),
+                        track
+                            .as_ref()
+                            .is_some_and(|track| track.opus_pre_skip.is_some()),
+                        false,
+                    );
                     track
                 }
                 None => late,
