@@ -601,6 +601,170 @@ impl Player {
         )
     }
 
+    /// The export while it runs, on the same sheet it was asked for on: an
+    /// editor that takes no edit until the worker is done says so as a card and
+    /// not as a strip under a panel nobody may touch. Same scrim, same width,
+    /// same raised box as [`Player::export_card`] -- the answer arrives where
+    /// the question was put -- and the timeline is still read around it.
+    ///
+    /// Two things it does *not* do. It never closes: not on a press away, not
+    /// on `esc`. There is nothing here to dismiss while the export is still
+    /// running, and a modal that vanishes leaves a locked editor with no reason
+    /// on screen. And its cancel is two presses, never one -- an hour of
+    /// encoding must not end on a stray click, which is why the stroke is a
+    /// chord as well ([`cancels_export`]).
+    pub(crate) fn export_progress_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let export = self.exporting()?;
+        let progress = export.progress().clamp(0., 1.);
+        let elapsed = self
+            .export_started
+            .map_or(0., |t| t.elapsed().as_secs_f32());
+        // Two numbers that must both be honest: the one that counts up is
+        // measured, the one that counts down is a guess and says so.
+        let left = eta_secs(&self.export_marks, elapsed, progress).map_or_else(
+            || "estimating…".to_owned(),
+            |s| format!("~{} left", clock(s)),
+        );
+        // What is being read, the same files the engine names on stderr
+        // ("export source:"): the project's own sources, never a stand-in.
+        let source = match self.sources() {
+            [] => "the timeline".to_owned(),
+            [one] => file_name(&one.path),
+            [first, rest @ ..] => format!("{} +{} more", file_name(&first.path), rest.len()),
+        };
+        let note = |text: SharedString| {
+            div()
+                .flex_none()
+                .px(px(6.))
+                .text_size(px(11.))
+                .text_color(rgb(FG_SECONDARY()))
+                .child(text)
+        };
+        let armed = self.cancel_armed;
+        Some(
+            scrim()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(SCRIM()))
+                // No `close_card` here, unlike every other sheet: a press away
+                // is not a way out of a running export, and the only thing that
+                // ends this card is the export ending.
+                .on_mouse_down(MouseButton::Left, swallow)
+                .child(
+                    div()
+                        .w(px(EXPORT_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG_RAISED()))
+                        .child(div().flex_none().px(px(6.)).child("Exporting"))
+                        // The bar itself: the same number as the percentage
+                        // below it, and it only ever moves forward -- the
+                        // worker's progress is a monotone `fetch_max`.
+                        .child(
+                            div()
+                                .flex_none()
+                                .mx(px(6.))
+                                .h(px(6.))
+                                .rounded(px(3.))
+                                .bg(rgb(BG_PANEL()))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(progress))
+                                        .rounded(px(3.))
+                                        .bg(rgb(STATUS_PROGRESS())),
+                                ),
+                        )
+                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
+                            SharedString::from(format!(
+                                "{}% · {} elapsed · {left}",
+                                (progress * 100.) as u32,
+                                clock(elapsed),
+                            )),
+                        ))
+                        // The row that was picked, then the seats the worker
+                        // actually opened -- so a fallback to the software
+                        // encoder shows here rather than being invisible.
+                        .child(note(
+                            format!(
+                                "{} · {}",
+                                format_label(self.format),
+                                export
+                                    .encoders()
+                                    .unwrap_or_else(|| "opening the encoder".to_string()),
+                            )
+                            .into(),
+                        ))
+                        .child(note(
+                            format!("{source} → {}", file_name(&self.export_path)).into(),
+                        ))
+                        .child(note(
+                            match armed {
+                                true => "cancelling deletes what has been written so far"
+                                    .to_string(),
+                                false => format!(
+                                    "{} cancels · esc alone does nothing while this runs · the \
+                                     timeline is read-only until it finishes",
+                                    self.keymap.display(ActionId::CancelExport)
+                                ),
+                            }
+                            .into(),
+                        ))
+                        // One button, or the pair that answers it: never a
+                        // control that cycles -- both choices are on screen at
+                        // once, each saying which one it is.
+                        .child(
+                            div()
+                                .mt(px(2.))
+                                .flex()
+                                .gap(px(6.))
+                                .justify_end()
+                                .when(armed, |d| {
+                                    d.child(control(
+                                        "export-keep",
+                                        140.,
+                                        ACCENT_PRIMARY(),
+                                        None,
+                                        "Keep exporting",
+                                        "leaves the export running".to_string(),
+                                        true,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.cancel_armed = false;
+                                            cx.notify();
+                                        }),
+                                    ))
+                                })
+                                .child(control(
+                                    "export-cancel",
+                                    140.,
+                                    BG_RAISED(),
+                                    None,
+                                    "Cancel export",
+                                    match armed {
+                                        true => "stops the worker and deletes the part file"
+                                            .to_string(),
+                                        false => "asks first -- one press only offers the choice"
+                                            .to_string(),
+                                    },
+                                    true,
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        match this.cancel_armed {
+                                            true => this.cancel_export(),
+                                            false => this.cancel_armed = true,
+                                        }
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                ),
+        )
+    }
+
     /// The custom bitrate's two pointer buttons. The typed digits were the last
     /// control in this card a mouse could not reach at all -- and a number that
     /// can only be typed is a number a hand on the pointer has to leave the

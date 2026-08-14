@@ -41,37 +41,12 @@ impl Player {
             rows.push(self.lane_row(lane, filled, cx));
         }
         let (hint, filled) = if let Some(export) = self.exporting() {
-            let progress = export.progress();
-            let elapsed = self
-                .export_started
-                .map_or(0., |t| t.elapsed().as_secs_f32());
-            // Two numbers that must both be honest: the one that counts up is
-            // measured, the one that counts down is a guess and says so.
-            let left = eta_secs(&self.export_marks, elapsed, progress).map_or_else(
-                || "estimating…".to_owned(),
-                |s| format!("~{} left", clock(s)),
-            );
-            (
-                format!(
-                    // Clocks, then the way out, then what is encoding: at the
-                    // 640 px floor the tail is what truncation eats, and the
-                    // codec pair is the one part of this line the card already
-                    // said. The escape must not be what goes missing.
-                    "EXPORTING {}% · {} elapsed · {left} — {} cancels · {} · {}",
-                    (progress * 100.) as u32,
-                    clock(elapsed),
-                    key(ActionId::CancelExport),
-                    // The row that was picked; the engine's line below names the
-                    // seats alone, since the library is what identifies a codec.
-                    format_label(self.format),
-                    // What the worker actually opened, so a fallback to the
-                    // software encoder shows here rather than being invisible.
-                    export
-                        .encoders()
-                        .unwrap_or_else(|| "opening the encoder".to_string()),
-                ),
-                progress,
-            )
+            // The words are the card's now ([`Player::export_progress_card`]):
+            // the export is modal, so this line is under its scrim and a second
+            // copy of the clocks there is one that can only be read dimmed. The
+            // ruler keeps the number -- it is the one part of the progress the
+            // card does not cover, and it costs nothing.
+            (String::new(), export.progress())
         } else {
             // The strokes no button carries; the rest ride on the buttons'
             // tooltips. Keys first: at a 640 px window the tail is what a
