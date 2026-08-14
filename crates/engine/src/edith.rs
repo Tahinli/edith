@@ -1,12 +1,13 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 12
+//! edith 13
 //! playhead 90
 //! resolution 1920 1080
 //! fps 30.0
 //! tonemap vivid
 //! proxy on
+//! autoproxy off
 //! limiter -1.0 on
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
@@ -51,6 +52,14 @@
 //! *Which* sources have a stand-in is not written: a proxy is found by the
 //! film's own path, length and modification time, so the cache is the only
 //! answer and a project file cannot go stale about it.
+//!
+//! The `autoproxy` line is whether a film this machine cuts slowly gets a
+//! stand-in made for it the moment it is imported ([`crate::proxy::wanted`]),
+//! spelled `on` or `off`. Left out when it is on, which is what every dialect
+//! before v13 did and could not be told not to. With it off an import makes
+//! nothing at all, and turning the `proxy` switch on is what asks for the
+//! stand-ins this project is missing -- which is the only way to ask, so a
+//! project that never wants them never spends a minute of encode on one.
 //!
 //! The `limiter` line is the master limiter over the whole mix
 //! ([`crate::limiter`]): its ceiling in dBFS and whether it is in circuit,
@@ -108,7 +117,10 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 11** was this without the `proxy` line: such a project is cut on
+//! **Version 12** was this without the `autoproxy` line: such a project makes a
+//! stand-in for every film that wants one the moment it arrives, which is all
+//! any project could do.
+//! **Version 11** was that without the `proxy` line: such a project is cut on
 //! its films themselves, which is all any project could do.
 //! **Version 10** was that without the `tonemap` line: such a project is shown
 //! in the reference rendition, which is the only one there was.
@@ -133,7 +145,7 @@
 //! what a v1 timeline meant, and an older file simply equalizes and grades
 //! nothing, and an older one plays everything at real time, and an older one
 //! mixes flat, and an older one shows no subtitles, and an older one is shown
-//! in the reference rendition -- and saving any of them writes v11. An older
+//! in the reference rendition -- and saving any of them writes v13. An older
 //! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -169,7 +181,8 @@ use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 12";
+const MAGIC: &[u8] = b"edith 13";
+const MAGIC_V12: &[u8] = b"edith 12";
 const MAGIC_V11: &[u8] = b"edith 11";
 const MAGIC_V10: &[u8] = b"edith 10";
 const MAGIC_V9: &[u8] = b"edith 9";
@@ -230,6 +243,11 @@ pub struct Document {
     /// out, which both mean the films themselves -- the only thing those
     /// projects could do.
     pub proxy: bool,
+    /// Whether an import makes a stand-in for a film that wants one by itself
+    /// ([`crate::proxy`]). `true` for every dialect before v13 and for a v13
+    /// file that leaves the line out, which both mean by itself -- the only
+    /// thing those projects did.
+    pub auto_proxy: bool,
     pub playhead: u32,
 }
 
@@ -250,6 +268,7 @@ pub fn save(
     fps: Option<f64>,
     tone: crate::tonemap::Preset,
     proxy: bool,
+    auto_proxy: bool,
     limiter: Limiter,
     playhead: u32,
 ) -> crate::Result<()> {
@@ -265,7 +284,7 @@ pub fn save(
         .and_then(|mut f| {
             f.write_all(&emit(
                 &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, tone, proxy,
-                limiter, playhead,
+                auto_proxy, limiter, playhead,
             ))?;
             f.sync_all()
         })
@@ -309,6 +328,7 @@ fn emit(
     fps: Option<f64>,
     tone: crate::tonemap::Preset,
     proxy: bool,
+    auto_proxy: bool,
     limiter: Limiter,
     playhead: u32,
 ) -> Vec<u8> {
@@ -332,6 +352,12 @@ fn emit(
     // every project before there were stand-ins -- says nothing here.
     if proxy {
         out.extend_from_slice(b"proxy on\n");
+    }
+    // Beside it and by the same rule the other way up: making them by itself is
+    // what every project before this line did, so only a project told to stop
+    // has anything to say here.
+    if !auto_proxy {
+        out.extend_from_slice(b"autoproxy off\n");
     }
     // Written only when it is not the default, so a project nobody has limited
     // is the same bytes it was in v8 bar the version line.
@@ -462,8 +488,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that says whether it is cut on stand-ins...
-    let v12 = first == MAGIC;
+    // The one that says whether the stand-ins are made by themselves...
+    let v13 = first == MAGIC;
+    // ...the ones that say whether it is cut on stand-ins...
+    let v12 = v13 || first == MAGIC_V12;
     // ...the ones that carry an HDR rendition...
     let v11 = v12 || first == MAGIC_V11;
     // ...the ones that carry subtitle tracks...
@@ -513,6 +541,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         limiter: Limiter::default(),
         tone: crate::tonemap::Preset::default(),
         proxy: false,
+        // ...and nothing before v13 could be told *not* to make one: an import
+        // that wanted a stand-in got one, which is what leaving the line out
+        // still means.
+        auto_proxy: true,
         fps: None,
         playhead: 0,
     };
@@ -596,6 +628,25 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     other => {
                         return Err(format!(
                             "line {n}: proxy is on or off, not {:?}",
+                            String::from_utf8_lossy(other)
+                        )
+                        .into());
+                    }
+                };
+            }
+            b"autoproxy" if v13 => {
+                if !doc.sources.is_empty() {
+                    return Err(
+                        format!("line {n}: autoproxy belongs once, before the sources").into(),
+                    );
+                }
+                let f = fields(rest, 1, "autoproxy", n)?;
+                doc.auto_proxy = match f[0] {
+                    b"on" => true,
+                    b"off" => false,
+                    other => {
+                        return Err(format!(
+                            "line {n}: autoproxy is on or off, not {:?}",
                             String::from_utf8_lossy(other)
                         )
                         .into());
@@ -1122,6 +1173,7 @@ mod tests {
             None,
             crate::tonemap::Preset::default(),
             false,
+            true,
             Limiter::default(),
             playhead,
         )
@@ -1166,6 +1218,7 @@ mod tests {
             None,
             crate::tonemap::Preset::default(),
             false,
+            true,
             Limiter::default(),
             0,
         );
@@ -1194,7 +1247,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 12\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 13\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1230,6 +1283,7 @@ mod tests {
                 None,
                 crate::tonemap::Preset::default(),
                 proxy,
+                true,
                 Limiter::default(),
                 0,
             )
@@ -1261,10 +1315,73 @@ mod tests {
         assert_eq!(mixed, "line 3: unknown keyword \"proxy\"");
         // Anything but on or off is a corrupt line, by name.
         for line in ["proxy\n", "proxy yes\n", "proxy On\n"] {
-            let file = format!("edith 12\nsource 0 a.mp4\n{line}");
+            let file = format!("edith 13\nsource 0 a.mp4\n{line}");
             assert!(
                 parse(file.as_bytes(), &dir).is_err(),
                 "{line:?} is not a proxy line"
+            );
+        }
+    }
+
+    /// The v13 line: whether an import makes a stand-in by itself. Written the
+    /// other way up from every other switch here -- on is the default and the
+    /// line left out -- because that is what every dialect before it did, and a
+    /// v12 file must come back doing it.
+    #[test]
+    fn the_auto_proxy_switch_round_trips_and_a_v12_file_makes_them_by_itself() {
+        let dir = PathBuf::from("/proj");
+        let (_, sources, lanes) = doc();
+        let bytes = |proxy, auto| {
+            super::emit(
+                &dir,
+                &sources,
+                &lanes,
+                &[],
+                &[],
+                &[],
+                &[],
+                (1280, 720),
+                None,
+                crate::tonemap::Preset::default(),
+                proxy,
+                auto,
+                Limiter::default(),
+                0,
+            )
+        };
+        // The default is the line left out, and the two switches are two lines:
+        // a project cut on stand-ins it does not make writes both.
+        let on = bytes(false, true);
+        assert!(
+            !String::from_utf8_lossy(&on).contains("autoproxy"),
+            "on is the line left out: {}",
+            String::from_utf8_lossy(&on)
+        );
+        assert!(parse(&on, &dir).expect("v13 parses").auto_proxy);
+        let off = bytes(true, false);
+        let text = String::from_utf8_lossy(&off).to_string();
+        assert!(text.contains("proxy on\nautoproxy off\n"), "{text}");
+        let back = parse(&off, &dir).expect("v13 parses");
+        assert!(back.proxy, "the other switch came back too");
+        assert!(!back.auto_proxy);
+
+        // A v12 project made them by itself and could not be told otherwise.
+        let v12 = b"edith 12\nplayhead 0\nresolution 1280 720\nproxy on\nsource 0 a.mp4\n\
+                    video 1 0 0 30 0 - - - fit 1000\n";
+        let old = parse(v12, &dir).expect("v12 still loads");
+        assert!(old.auto_proxy, "a v12 project made its stand-ins by itself");
+        assert!(old.proxy, "the rest of it came back too");
+        // ...and the line is not a v12 line: a dialect may not be mixed.
+        let mixed = parse(b"edith 12\nsource 0 a.mp4\nautoproxy off\n", &dir)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mixed, "line 3: unknown keyword \"autoproxy\"");
+        // Anything but on or off is a corrupt line, by name.
+        for line in ["autoproxy\n", "autoproxy no\n", "autoproxy Off\n"] {
+            let file = format!("edith 13\nsource 0 a.mp4\n{line}");
+            assert!(
+                parse(file.as_bytes(), &dir).is_err(),
+                "{line:?} is not an autoproxy line"
             );
         }
     }
@@ -1289,6 +1406,7 @@ mod tests {
                 None,
                 preset,
                 false,
+                true,
                 Limiter::default(),
                 0,
             );
@@ -1383,7 +1501,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1420,7 +1538,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1528,7 +1646,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1632,7 +1750,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1697,7 +1815,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 12\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1735,7 +1853,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -1764,7 +1882,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 12\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -1806,12 +1924,13 @@ mod tests {
             Some(23.976023976023978),
             crate::tonemap::Preset::default(),
             false,
+            true,
             limiter,
             0,
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 13\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -1843,7 +1962,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 12\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -2007,7 +2126,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 12\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -2060,7 +2179,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 12\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -2092,7 +2211,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 12\n"));
+        assert!(v5.starts_with(b"edith 13\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -2191,6 +2310,7 @@ mod tests {
             None,
             crate::tonemap::Preset::default(),
             false,
+            true,
             Limiter::default(),
             0,
         )
@@ -2198,7 +2318,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 12\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 13\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2243,10 +2363,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 13\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 14\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 13");
+        assert_eq!(err, "line 1: unsupported version 14");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
