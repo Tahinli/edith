@@ -1243,10 +1243,34 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
         split_size(Split::Inspector, Some(-40.), 2, window),
         INSPECTOR_MIN_W
     );
+    // The timeline's own floor is a floor with a whole lane *drawn* in it. At
+    // that height the column shows one row of a two-track project, so the line
+    // saying the rest are below is drawn too -- out of the region's pixels,
+    // not out of the lane's. Left unbudgeted the header came out 27 px of its
+    // 48 and the track's name, its subtitle dot and its × were cut in half.
+    let floor = split_size(Split::Timeline, Some(0.), 2, window);
+    assert_eq!(floor, TIMELINE_FIXED_H + LANE_H + LABEL_H + 8.);
+    // The same arithmetic the timeline lays the column out with
+    // ([`Player::timeline`]): what the affordance costs comes off the box, and
+    // a whole lane is still standing under it.
+    let lanes_box = floor - TIMELINE_FIXED_H;
+    assert!(2 > lanes_shown(lanes_box), "no line to pay for at the floor");
+    assert!(
+        lanes_box - LABEL_H - 8. >= LANE_H,
+        "the floor leaves {} px for a {LANE_H} px lane",
+        lanes_box - LABEL_H - 8.
+    );
+    // A lone track has nothing below it and pays nothing for the line -- the
+    // floor is a floor, not a reserved corridor.
     assert_eq!(
-        split_size(Split::Timeline, Some(0.), 2, window),
+        split_size(Split::Timeline, Some(0.), 1, window),
         TIMELINE_FIXED_H + LANE_H
     );
+    // A size dragged with one track and kept while a second arrives is raised
+    // to the new floor as it is read, not silently drawn under it.
+    assert_eq!(split_size(Split::Timeline, Some(126.), 2, window), floor);
+    // And the floor still fits the share the shortest window gives the region.
+    assert!(floor <= 360. * TIMELINE_SHARE, "{floor} px will not fit");
     assert_eq!(
         split_size(Split::Timeline, Some(9000.), 2, window),
         720. * TIMELINE_MAX_SHARE
