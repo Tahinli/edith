@@ -94,6 +94,10 @@ impl Player {
             Choice::Fps(fps) => self.apply_frame_rate(fps, cx),
             Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
             Choice::Tone(preset) => self.apply_tone(preset, cx),
+            // The project's, like the tone map above and unlike the palette
+            // below: kept in the `.edith` and read straight back out of the
+            // session by the card and by the export.
+            Choice::Encoder(seat) => self.apply_encoder(seat, cx),
             // In force for the next paint -- every token is read through
             // [`ui::theme::palette`], so one store repaints the whole window --
             // and kept for the next launch. A file that could not be written is
@@ -151,6 +155,7 @@ impl Player {
             }
             Pick::AudioRate => audio_rate_choices(self.audio_kbps),
             Pick::Tone => tone_choices(session.tone()),
+            Pick::Encoder => encoder_choices(session.encoder_seat()),
             // Answered above, with or without a timeline.
             Pick::Theme => Vec::new(),
         }

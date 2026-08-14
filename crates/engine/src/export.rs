@@ -263,6 +263,48 @@ impl Format {
     }
 }
 
+/// Which encoder writes the picture, as a person picks it on a card. Three
+/// discrete choices and not a switch, because "whatever is best" and "the GPU,
+/// and say so if there is none" are different answers: a driver that encodes
+/// badly wants [`Software`](Self::Software), and a person who *needs* the GPU
+/// (a long delivery, a machine whose CPU is doing something else) wants to be
+/// told when it is not there rather than to wait out a silent fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncoderSeat {
+    /// Hardware where this machine has a seat for the picked codec, software
+    /// everywhere else -- what every export did before there was a choice, and
+    /// still what an unpicked project does.
+    #[default]
+    Auto,
+    /// The GPU or nothing: no silent fallback, and [`Enc::open`] refuses in
+    /// words before a byte is written. The only way to the plugin's AV1 seat,
+    /// which [`Auto`](Self::Auto) will not enter (see [`Enc::open_av1`]).
+    Hardware,
+    /// The software encoder even where a seat exists -- for a driver that
+    /// encodes badly, and for the AV1 pair, where it is what `Auto` picks too.
+    Software,
+}
+
+impl EncoderSeat {
+    pub const ALL: [EncoderSeat; 3] = [Self::Auto, Self::Hardware, Self::Software];
+
+    /// What a card row and a project file call it. The file's keyword too, so
+    /// the two can never drift ([`crate::edith`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        }
+    }
+
+    /// Reads one back. `None` for anything else, which a project file refuses
+    /// by name rather than silently exporting on another seat.
+    pub fn from_name(name: &[u8]) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.name().as_bytes() == name)
+    }
+}
+
 /// What the caller gets to decide about the output. The codec is not among it:
 /// [`Format`] names a container *and* what goes in it, because every pair we
 /// can write is a pair we can also read back.
@@ -271,9 +313,11 @@ pub struct ExportSettings {
     /// Bits per second, clamped to the same sane range the automatic value uses.
     /// `None` picks it from the picture size and frame rate. Video only.
     pub bitrate: Option<u64>,
-    /// Skip the hardware encoder even where it is available -- an escape hatch
-    /// for a driver that encodes badly, matching the `VE_SW_ENC` env pin.
-    pub force_sw: bool,
+    /// Which encoder writes the picture ([`EncoderSeat`]). Was a `force_sw`
+    /// flag, which could say "not the GPU" and never "the GPU or say so".
+    /// [`EncoderSeat::Software`] is what the `VE_SW_ENC` env pin still forces
+    /// on every export of a run.
+    pub seat: EncoderSeat,
     /// The file to write. Defaults to [`Format::Mp4`], which is what every
     /// caller wrote before there was a choice.
     pub format: Format,
@@ -528,14 +572,35 @@ fn audio_kbps_of(settings: &ExportSettings) -> u32 {
 }
 
 /// The hardware seat for these settings, opened exactly as the export opens it
-/// -- the same pins, the same AV1 opt-in, the same dimensions a driver may
-/// refuse -- or `None` where the software encoder takes the file. The single
-/// place that choice is made, which is what lets [`planned_video`] *measure* it
-/// instead of promising it.
-fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
-    if settings.force_sw || forced("VE_SW_ENC") {
-        return None;
+/// -- the same pins, the same dimensions a driver may refuse -- or `None` where
+/// the software encoder takes the file. The single place that choice is made,
+/// which is what lets [`planned_video`] *measure* it instead of promising it.
+///
+/// `Err` is the one answer the software encoder does **not** take over from:
+/// [`EncoderSeat::Hardware`] asked for the GPU by name and this machine has no
+/// seat for the codec, so the export refuses in words rather than falling back
+/// to an encoder nobody picked. Every caller is before a file exists
+/// ([`Enc::open`] runs ahead of the muxer), which is what makes the refusal
+/// free.
+fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Option<HwEncoder>> {
+    if settings.seat == EncoderSeat::Software || forced("VE_SW_ENC") {
+        return Ok(None);
     }
+    let opened = open_hw_seat(meta, settings);
+    if opened.is_none() && settings.seat == EncoderSeat::Hardware {
+        return Err(format!(
+            "hardware encoding was asked for and this machine has no VA-API seat for {}: \
+             pick Auto or Software on the export card",
+            settings.format.name()
+        )
+        .into());
+    }
+    Ok(opened)
+}
+
+/// The plugin half of [`hw_seat`]: what the driver gives for this codec and
+/// this picture, with no policy in it but the AV1 one.
+fn open_hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
     let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate).ok()?;
     let bitrate = bitrate_of(meta, settings);
     match settings.format {
@@ -561,9 +626,10 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
             bitrate,
             ColorDescription::output(meta.height),
         ),
-        // Opt-in only, for the reason [`Enc::open_av1`] states in full. Both
+        // Asked for by name only, for the reason [`Enc::open_av1`] states in
+        // full: `Auto` takes the software encoder here and nowhere else. Both
         // AV1 formats sit on it: the container is not the encoder's business.
-        format if format.is_av1() && !forced("VE_HW_AV1") => None,
+        format if format.is_av1() && settings.seat != EncoderSeat::Hardware => None,
         format if format.is_av1() => {
             HwEncoder::open_av1(meta.width, meta.height, fps_num, fps_den, bitrate)
         }
@@ -585,6 +651,15 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
     }
 }
 
+/// What a hardware encode is called wherever one is named -- the card's line
+/// before the export and the progress line during it.
+const HW_LABEL: &str = "HW encode (VA-API)";
+
+/// ...and what a card says instead where [`EncoderSeat::Hardware`] was picked
+/// and there is no seat: the export's own refusal in the width of a card row,
+/// shown *before* the button is pressed rather than a minute into a file.
+pub const NO_HW_SEAT: &str = "no HW seat here — pick Auto or Software";
+
 /// How a front-end names a video seat: which of the two encoders has the file,
 /// and which library that is. Not the codec -- a caller shows this beside the
 /// format it picked, and `rav1e` names AV1 as `rusty_h264` names H.264. One
@@ -592,7 +667,7 @@ fn hw_seat(meta: &VideoMeta, settings: &ExportSettings) -> Option<HwEncoder> {
 /// during one cannot drift apart.
 fn video_label(format: Format, hw: bool) -> &'static str {
     match (format, hw) {
-        (_, true) => "HW encode (VA-API)",
+        (_, true) => HW_LABEL,
         (Format::Hevc | Format::HevcMp4, false) => "SW encode (oxideav-h265 intra)",
         (Format::Av1 | Format::Av1Mp4, false) => "SW encode (rav1e)",
         (_, false) => "SW encode (rusty_h264)",
@@ -925,10 +1000,12 @@ pub fn planned_subtitles(
 /// Costs that open (~100 ms here): ask it off a render thread and keep the
 /// answer until the format, the resolution or the bitrate changes.
 pub fn planned_video(meta: &VideoMeta, settings: &ExportSettings) -> Option<&'static str> {
-    settings
-        .format
-        .has_video()
-        .then(|| video_label(settings.format, hw_seat(meta, settings).is_some()))
+    settings.format.has_video().then(|| match hw_seat(meta, settings) {
+        Ok(hw) => video_label(settings.format, hw.is_some()),
+        // The seat the settings demand and this machine has not: the very
+        // refusal [`start`] would settle with, said on the card instead.
+        Err(_) => NO_HW_SEAT,
+    })
 }
 
 /// What [`start`] would open for *this* timeline: the picture's seat -- or the
@@ -954,7 +1031,7 @@ pub fn planned_seats(
     let video = settings.format.has_video().then(|| {
         match CopyPlan::of(project, meta, settings).is_some() {
             true => "copy (source packets)",
-            false => video_label(settings.format, hw_seat(meta, settings).is_some()),
+            false => planned_video(meta, settings).unwrap_or(NO_HW_SEAT),
         }
     });
     // The half [`audio_label`] cannot know from the format: a copy is a *sample
@@ -3041,7 +3118,7 @@ impl Enc {
         // hand 24000/1001 over as a rounded 23.976, which is the same
         // truncation the container timing had.
         crate::mux::frame_timing(meta.frame_rate)?;
-        if let Some(hw) = hw_seat(meta, settings) {
+        if let Some(hw) = hw_seat(meta, settings)? {
             eprintln!("export encoder: hardware (VA-API plugin)");
             return Ok(Self::Hw(hw));
         }
@@ -3074,25 +3151,28 @@ impl Enc {
     /// simply has none and this falls through -- the same "no" a GPU without an
     /// AV1 encode entrypoint gives, and the same silent fallback either way.
     ///
-    /// It is **opt-in**, which is the one place this pair does not mirror the
-    /// H.264 one: the vendored cros-codecs AV1 encoder hung the GPU on this
-    /// project's own radeonsi box -- `engine_hw: operation failed`, then an
-    /// amdgpu hard recovery and a lost context, measured 2026-08-10 exporting
-    /// the 720p fixture. A software encoder that takes half a minute is a worse
-    /// export than a hardware one; a driver reset is not an export at all. So
-    /// the plugin's AV1 seat is wired, kept and only entered when `VE_HW_AV1=1`
-    /// asks for it by name.
+    /// It is **asked for by name**, which is the one place this pair does not
+    /// mirror the H.264 one: the vendored cros-codecs AV1 encoder hung the GPU
+    /// on this project's own radeonsi box -- `engine_hw: operation failed`,
+    /// then an amdgpu hard recovery and a lost context, measured 2026-08-10
+    /// exporting the 720p fixture. A software encoder that takes half a minute
+    /// is a worse export than a hardware one; a driver reset is not an export
+    /// at all. So [`EncoderSeat::Auto`] takes `rav1e` here and only
+    /// [`EncoderSeat::Hardware`] -- a person picking the GPU for AV1 on the
+    /// card, under a row that names the risk -- enters the plugin's seat. It
+    /// was an env pin (`VE_HW_AV1=1`) until the card could ask, which is a
+    /// switch nobody exporting a film would ever find.
     ///
     /// corner-cut: the upgrade path is a driver this was reproduced against (or a
     /// cros-codecs release that fixes it) plus a probe encode of one frame at
-    /// open, after which this can prefer hardware the way H.264 does.
+    /// open, after which `Auto` can prefer hardware the way H.264 does.
     fn open_av1(meta: &VideoMeta, settings: &ExportSettings) -> crate::Result<Self> {
         let bitrate = bitrate_of(meta, settings);
         let (fps_num, fps_den) = crate::mux::frame_timing(meta.frame_rate)?;
         // Two seconds between keyframes, as the H.264 seat does: a seek may only
         // land on one, and this is what a cluster of the Matroska file is.
         let gop = (meta.frame_rate * 2.0).round().max(1.0) as u64;
-        if let Some(hw) = hw_seat(meta, settings) {
+        if let Some(hw) = hw_seat(meta, settings)? {
             eprintln!("export encoder: hardware AV1 (VA-API plugin)");
             return Ok(Self::Av1Hw(hw));
         }
@@ -3179,7 +3259,7 @@ impl Enc {
             )
             .into());
         }
-        if let Some(hw) = hw_seat(meta, settings) {
+        if let Some(hw) = hw_seat(meta, settings)? {
             eprintln!("export encoder: hardware HEVC intra (VA-API plugin)");
             return Ok(Self::HevcHw(hw));
         }
@@ -3295,8 +3375,8 @@ impl Enc {
     /// being read back -- `None` for every seat that reads bytes, which is both
     /// software encoders and the intra HEVC one.
     ///
-    /// The AV1 hardware seat is left out on purpose: it is opt-in behind
-    /// `VE_HW_AV1` because the vendored encoder reset this project's GPU
+    /// The AV1 hardware seat is left out on purpose: it is entered only when a
+    /// person picks it by name because the vendored encoder reset this project's GPU
     /// ([`Enc::open_av1`]), and a path that cannot be measured is not one to
     /// widen.
     fn dma_want(&self, meta: &VideoMeta) -> Option<crate::hw::DmaWant> {

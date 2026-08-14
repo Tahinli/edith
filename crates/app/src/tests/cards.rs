@@ -815,24 +815,24 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     // a number typed against the custom row must not leak into it.
     let mp4 = Format::Mp4;
     assert_eq!(
-        export_settings(Quality::Auto, 7, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+        export_settings(Quality::Auto, 7, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
         None
     );
     assert_eq!(
-        export_settings(Quality::Low, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+        export_settings(Quality::Low, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
         Some(2_000_000)
     );
     assert_eq!(
-        export_settings(Quality::Medium, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+        export_settings(Quality::Medium, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
         Some(6_000_000)
     );
     assert_eq!(
-        export_settings(Quality::High, 0, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+        export_settings(Quality::High, 0, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
         Some(12_000_000)
     );
     // Megabits as typed, and as the row says it back.
     assert_eq!(
-        export_settings(Quality::Custom, 7, mp4, DEFAULT_AUDIO_KBPS).bitrate,
+        export_settings(Quality::Custom, 7, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).bitrate,
         Some(7_000_000)
     );
     assert_eq!(Quality::Low.detail(0), "2 Mbps");
@@ -840,7 +840,7 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     // choice the engine never hears about.
     for format in [Format::Mp4, Format::Wav, Format::Flac] {
         assert_eq!(
-            export_settings(Quality::Auto, 0, format, DEFAULT_AUDIO_KBPS).format,
+            export_settings(Quality::Auto, 0, format, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto).format,
             format
         );
     }
@@ -849,7 +849,7 @@ fn a_quality_row_is_the_bitrate_it_promises() {
     // silently changes -- the ceiling row included, which is the one a
     // raised cap could have walked out past.
     for quality in Quality::ALL {
-        let settings = export_settings(quality, MBPS_MAX, mp4, DEFAULT_AUDIO_KBPS);
+        let settings = export_settings(quality, MBPS_MAX, mp4, DEFAULT_AUDIO_KBPS, EncoderSeat::Auto);
         if let Some(bitrate) = settings.bitrate {
             assert!(
                 (u64::from(MBPS_MIN) * 1_000_000..=u64::from(MBPS_MAX) * 1_000_000)
@@ -857,8 +857,9 @@ fn a_quality_row_is_the_bitrate_it_promises() {
                 "{quality:?} outside the engine clamp"
             );
         }
-        // The software pin is the environment's to set, never a row's.
-        assert!(!settings.force_sw);
+        // The seat travels exactly as it was picked, and an unpicked project
+        // exports on the seat this machine has.
+        assert_eq!(settings.seat, EncoderSeat::Auto);
     }
 }
 
@@ -879,7 +880,7 @@ fn the_sound_row_carries_its_rate_into_both_kinds_of_file() {
     for format in [Format::Mp4, Format::Av1, Format::Hevc, Format::Mp3] {
         for kbps in AUDIO_KBPS {
             assert_eq!(
-                export_settings(Quality::Auto, 0, format, kbps).audio_kbps,
+                export_settings(Quality::Auto, 0, format, kbps, EncoderSeat::Auto).audio_kbps,
                 Some(kbps),
                 "{format:?} at {kbps} kbps"
             );
@@ -1197,6 +1198,34 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
         assert!(row.2.chars().count() < 26, "{} loses its tail", row.2);
     }
     assert!(tones[1].3, "the rendition in force is not marked");
+
+    // The encoder list, the export card's own: all three seats, the one in
+    // force marked, and a row each saying what it does. The AV1 warning
+    // belongs to exactly one pair -- the GPU on an AV1 file -- so it cannot
+    // become a line nobody reads.
+    let seats = encoder_choices(EncoderSeat::Software);
+    assert_eq!(seats.len(), EncoderSeat::ALL.len());
+    assert_eq!(seats.iter().filter(|(.., picked)| *picked).count(), 1);
+    for (row, seat) in seats.iter().zip(EncoderSeat::ALL) {
+        assert_eq!(row.0, Choice::Encoder(seat));
+        assert_eq!(row.1.as_ref(), encoder_label(seat));
+        assert!(!row.2.is_empty(), "{seat:?} says nothing about itself");
+        assert!(row.2.chars().count() < 26, "{} loses its tail", row.2);
+    }
+    assert!(seats[2].3, "the seat in force is not marked");
+    for format in [Format::Av1, Format::Av1Mp4] {
+        assert!(av1_hw_warning(format, EncoderSeat::Hardware).is_some());
+        for seat in [EncoderSeat::Auto, EncoderSeat::Software] {
+            assert_eq!(av1_hw_warning(format, seat), None, "{seat:?} is the safe seat");
+        }
+    }
+    for format in [Format::Mp4, Format::Hevc, Format::HevcMp4, Format::Wav] {
+        assert_eq!(
+            av1_hw_warning(format, EncoderSeat::Hardware),
+            None,
+            "{format:?} is not the encoder that reset the driver"
+        );
+    }
 
     // The open list fits the floor the menus are measured against: the
     // longest of them is the rate ladder with an odd rate cycled in, and it
