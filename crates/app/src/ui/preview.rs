@@ -4,19 +4,23 @@ use crate::*;
 use crate::ui::widgets::*;
 
 impl Player {
-    /// The cues of the picked track that are on screen at `at`, over the picture
-    /// and nothing else: bottom-centred where every player puts them, white on a
+    /// The cues the *subtitle lanes* put on screen at `at`, over the picture and
+    /// nothing else: bottom-centred where every player puts them, white on a
     /// plate so the film underneath cannot swallow them, and each cue its own
     /// plate so two at one moment stack rather than run together.
     ///
-    /// `None` -- no element at all -- while the toggle is off, with no track
-    /// picked, and between cues: the picture is what this window is for, and a
-    /// permanent empty band across it would be in the way of exactly that.
+    /// What is drawn is what was *placed*: a track walked out of a file lands in
+    /// the palette and nothing more, exactly as a picture or a song does, and it
+    /// reaches the screen when a placement of it sits under the playhead
+    /// ([`PlaybackSession::sub_lane_cues`], the same map the export writes the
+    /// file with -- so what is read here is what the file will say). Every lane
+    /// whose eye is open ([`Player::sub_lane_on`]) draws, so two enabled lanes
+    /// are two plates: lane order bottom-up, the first lane where a single
+    /// track's words have always been and each further one stacked above it.
     ///
-    /// The cues are the *timeline's* ([`PlaybackSession::timeline_cues`]) and
-    /// not the track's own: on a cut timeline an embedded track's cues ride the
-    /// pictures they belong to, and this is the same map the export writes the
-    /// file with -- so what is read here is what the file says.
+    /// `None` -- no element at all -- while the toggle is off, with nothing
+    /// placed, and between cues: the picture is what this window is for, and a
+    /// permanent empty band across it would be in the way of exactly that.
     ///
     /// A cue off a PGS track is a *picture* and not a line
     /// ([`engine::subtitle::CueImage`]), and is drawn as one: the disc's whole
@@ -37,22 +41,42 @@ impl Player {
         // going off, the file closing and the gap between two cues are the same
         // "nothing on screen", and an 8 MB atlas tile may not survive any of
         // them (an early return above this leaked one per toggle-off).
-        let mapped = match self.session.as_ref().filter(|_| self.subs_on) {
-            Some(session) => session.timeline_cues(self.sub_track),
-            None => Vec::new(),
-        };
-        let cues = cues_at(&mapped, at);
-        if cues.is_empty() {
+        // Per lane and not one flat list: the plates stack by lane below, and a
+        // picture's cache key needs the lane it came off ([`Player::sub_picture`]).
+        let lanes: Vec<(Lane, Vec<engine::subtitle::Cue>)> =
+            match self.session.as_ref().filter(|_| self.subs_on) {
+                Some(session) => session
+                    .subtitle_lanes()
+                    .into_iter()
+                    .filter(|&lane| self.sub_lane_on(lane))
+                    .map(|lane| {
+                        let cues = session.sub_lane_cues(lane);
+                        (lane, cues_at(&cues, at).into_iter().cloned().collect())
+                    })
+                    .filter(|(_, cues): &(_, Vec<_>)| !cues.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+        if lanes.is_empty() {
             self.drop_sub_image(window);
             return None;
         }
         // The first picture cue up, decoded once and kept: two bitmap cues at
         // one moment is a thing PGS composes into one display set, so there is
-        // never a second picture to stack under the first.
-        let picture = cues
+        // never a second picture to stack under the first *on one lane*.
+        //
+        // corner-cut: two enabled lanes each showing a PGS track draw the lower
+        // lane's picture alone -- one cache slot, one canvas over the whole
+        // region, and a second canvas would cover the first anyway. The upgrade
+        // path is a slot per lane, which wants the plates' stacking rule to mean
+        // something for canvases too.
+        let picture = lanes
             .iter()
-            .find_map(|cue| Some((cue.start_us, cue.image.as_ref()?)))
-            .and_then(|(start_us, image)| self.sub_picture(start_us, image, window));
+            .find_map(|(lane, cues)| {
+                cues.iter()
+                    .find_map(|cue| Some((*lane, cue.start_us, cue.image.as_ref()?)))
+            })
+            .and_then(|(lane, start_us, image)| self.sub_picture(lane, start_us, image, window));
         // A picture is fitted onto the whole region and a plate hangs off the
         // bottom of it, and a track is one or the other -- so they are two
         // shapes and not one with the parts switched off.
@@ -96,7 +120,13 @@ impl Player {
                 .gap(px(2.))
                 // The plate takes no click: the picture behind it is still the
                 // drop target the whole window is.
-                .children(cues.into_iter().filter(|c| c.image.is_none()).map(|cue| {
+                //
+                // Reversed, because a column anchored at the bottom lays its
+                // children downwards: the *last* lane is written first so the
+                // first lane keeps the bottom line it has when it is the only
+                // one, and a second lane stacks above it rather than pushing it
+                // off its place.
+                .children(lanes.into_iter().rev().flat_map(|(_, cues)| cues).filter(|c| c.image.is_none()).map(|cue| {
                     div()
                         .max_w(relative(0.9))
                         .px(px(6.))
@@ -118,7 +148,7 @@ impl Player {
         )
     }
 
-    /// The cue starting at `start_us` as a drawable picture, decoded on the
+    /// The cue `lane` starts at `start_us` as a drawable picture, decoded on the
     /// first repaint it is up for and kept until another cue takes its place
     /// ([`Player::sub_image`]). `None` for a display set the decoder refuses,
     /// which draws nothing rather than failing the frame.
@@ -128,11 +158,12 @@ impl Player {
     /// sprite atlas by the whole film.
     pub(crate) fn sub_picture(
         &mut self,
+        lane: Lane,
         start_us: i64,
         image: &engine::subtitle::CueImage,
         window: &mut Window,
     ) -> Option<Arc<RenderImage>> {
-        let key = (self.sub_track, start_us);
+        let key = (lane, start_us);
         if let Some((up, ready)) = &self.sub_image
             && *up == key
         {

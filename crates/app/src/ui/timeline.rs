@@ -363,8 +363,8 @@ impl Player {
                         let tip: SharedString = match &row.refused {
                             Some(why) => format!("{} — {why}", path.display()),
                             None => format!(
-                                "{} — drag it onto a subtitle track to place it, click to show it \
-                                 over the picture",
+                                "{} — drag it onto a subtitle track to place it; nothing is over \
+                                 the picture until it is placed",
                                 path.display()
                             ),
                         }
@@ -407,13 +407,14 @@ impl Player {
                                     .on_drag(SubPick(track), move |_, _, _, cx| {
                                         cx.new(|_| Tip(carried.clone()))
                                     })
+                                    // Selects the row and shows nothing: a
+                                    // subtitle track reaches the picture by
+                                    // being placed on a subtitle lane, the way
+                                    // a film reaches it by being placed on a
+                                    // video one. What the selection is for is
+                                    // the × and the mark on the row.
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.sub_track = track;
-                                        // Picking a track is asking to see it: a
-                                        // click that changed nothing on screen
-                                        // because the toggle was off would read
-                                        // as a dead row.
-                                        this.subs_on = true;
                                         cx.notify();
                                     }))
                             })
@@ -551,16 +552,15 @@ impl Player {
                         .truncate()
                         .text_size(px(11.))
                         .text_color(rgb(FG_SECONDARY()))
-                        .child(match (self.subs_on, sub_pick_name(tracks, self.sub_track)) {
-                            // Which of them is on screen, named by its film:
-                            // the heading over a list of five is where the one
-                            // being shown is worth saying out loud.
-                            (true, Some(pick)) => format!("Subtitles — {pick}"),
-                            (true, None) => "Subtitles".to_string(),
-                            // The toggle's state where the tracks are listed: a
-                            // list of subtitles nothing on screen is showing has
-                            // to say that it is showing none.
-                            (false, _) => "Subtitles — hidden".to_string(),
+                        .child(match self.subs_on {
+                            // A palette and not a picker: none of these rows is
+                            // "the one on screen" any more, so the heading names
+                            // no track. What is on screen is on the subtitle
+                            // lanes, each with its own eye.
+                            true => "Subtitles",
+                            // The mute's state where the tracks are listed: with
+                            // it off no lane draws, however many are placed.
+                            false => "Subtitles — hidden",
                         }),
                 )
                 .child(
