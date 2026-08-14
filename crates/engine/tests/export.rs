@@ -101,6 +101,20 @@ fn decode_all(path: &Path) -> Vec<Vec<u8>> {
     frames.into_iter().map(|frame| frame.bgra).collect()
 }
 
+/// What an outside decoder complains about while reading every packet of
+/// `path`: empty when it read the file clean. `None` where ffmpeg is not
+/// installed, which is a skip rather than a failure -- the same posture the
+/// colour tests take.
+fn ffmpeg_complaints(path: &Path) -> Option<String> {
+    let said = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "null", "-"])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&said.stderr).trim().to_string())
+}
+
 /// One frame of `path` by absolute index.
 fn frame_at(path: &Path, index: u32) -> Vec<u8> {
     let (_, frames, _) = DecodeSession::open_at(path, index).expect("open source");
@@ -1042,6 +1056,26 @@ fn a_hardware_proxy_is_every_frame_a_starting_point_too() {
         syncs.len(),
         meta.frame_count
     );
+    // Counting starting points is not reading the file: a proxy whose every
+    // access unit is garbage counts perfectly. It shipped that way -- the SPS
+    // carried a wrapped `log2_max_frame_num_minus4` of 252 and every decoder
+    // refused the stream, while this test stayed green. So decode it, all of
+    // it, and let an outside decoder say the same.
+    let frames = decode_all(&made);
+    println!("decoded back {} of {} pictures", frames.len(), meta.frame_count);
+    assert_eq!(
+        frames.len() as u32,
+        meta.frame_count,
+        "the proxy demuxes but does not decode"
+    );
+    assert!(
+        frames.iter().all(|f| f.iter().any(|&b| b != 0)),
+        "a decoded picture came back empty"
+    );
+    match ffmpeg_complaints(&made) {
+        Some(said) => assert!(said.is_empty(), "ffmpeg read the proxy and said:\n{said}"),
+        None => eprintln!("no ffmpeg: skipping the outside decoder's word on the proxy"),
+    }
     std::fs::remove_file(&out).expect("clean the cache entry up");
 }
 
