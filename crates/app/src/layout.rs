@@ -1,5 +1,7 @@
 //! The window's fixed geometry: what every region is measured in.
 
+use crate::*;
+
 /// ...and the narrowest it is drawn: a library row whose length the engine has
 /// not measured yet has a landing place but no width, and a head marker says
 /// where it goes where a zero-width box would say nothing.
@@ -294,3 +296,132 @@ pub(crate) const ZOOM_OUT_MARGIN: f64 = 1.05;
 /// short -- the thing a bed scaled to the content's own length cannot say.
 /// [`View::fit`] is the one way back to "the whole timeline across the bed".
 pub(crate) const PPS_DEFAULT: f64 = 40.;
+
+// -- the seams between the regions, and where a hand has dragged them ---------
+
+/// Which divider a hand has hold of. The three seams the main layout has --
+/// library|picture, picture|inspector and the timeline's top edge -- and so the
+/// only three sizes in this window a person sets rather than is given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Split {
+    Library,
+    Inspector,
+    Timeline,
+}
+
+/// How wide a divider is drawn *and* hit. Wider than the 1 px stroke it stands
+/// in for: a seam nobody can put a pointer on is a seam nobody can drag, which
+/// is why every editor that ships this draws a strip rather than the hairline
+/// it looks like.
+pub(crate) const SPLIT_W: f32 = 6.;
+
+/// The most of the window one side column may be dragged to. A third each, so
+/// the picture keeps the middle at every size -- the rule [`library_w`] and
+/// [`inspector_w`] already lay an untouched window out by, kept once the hand
+/// takes over.
+pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
+
+/// The most of the window the timeline may be dragged to. Past
+/// [`TIMELINE_SHARE`], which is what it is *given*: a hand asking for a tall
+/// timeline is asking on purpose, and the picture still keeps most of a third.
+pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
+
+/// What a hand has done to the three seams: the size it dragged each panel to,
+/// or `None` where nobody has touched one and the window's own share still
+/// answers. Held in the model and not recomputed, so a size outlives the
+/// release -- and read through [`split_size`], so it cannot outlive the window
+/// it was set in.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Splits {
+    library: Option<f32>,
+    inspector: Option<f32>,
+    timeline: Option<f32>,
+}
+
+impl Splits {
+    pub(crate) fn get(&self, split: Split) -> Option<f32> {
+        match split {
+            Split::Library => self.library,
+            Split::Inspector => self.inspector,
+            Split::Timeline => self.timeline,
+        }
+    }
+
+    pub(crate) fn set(&mut self, split: Split, size: f32) {
+        *match split {
+            Split::Library => &mut self.library,
+            Split::Inspector => &mut self.inspector,
+            Split::Timeline => &mut self.timeline,
+        } = Some(size);
+    }
+}
+
+/// How small a panel may be dragged and how large: the floor is the size it
+/// still shows something at, the ceiling is what its neighbour needs to stay a
+/// region rather than a sliver. Neither end is passable -- a panel dragged to
+/// nothing is a panel nobody can get back, and a picture squeezed out by two
+/// side columns is the same loss on the other side of the window.
+pub(crate) fn split_bounds(split: Split, window: Size<Pixels>) -> (f32, f32) {
+    let (w, h) = (f32::from(window.width), f32::from(window.height));
+    match split {
+        Split::Library => (LIBRARY_MIN_W, w * SIDE_MAX_FRAC),
+        Split::Inspector => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
+        // One whole lane under the chrome: a timeline shorter than that is a
+        // ruler with nothing beneath it.
+        Split::Timeline => (TIMELINE_FIXED_H + LANE_H, h * TIMELINE_MAX_SHARE),
+    }
+}
+
+/// How big the panel at this seam is drawn: what the hand dragged it to, held
+/// inside the window *being drawn now* -- the window is resizable, and a width
+/// set at 1920 px is not a width at 640 -- or the share the untouched layout
+/// gives it.
+pub(crate) fn split_size(
+    split: Split,
+    set: Option<f32>,
+    lanes: usize,
+    window: Size<Pixels>,
+) -> f32 {
+    let (w, h) = (f32::from(window.width), f32::from(window.height));
+    let (min, max) = split_bounds(split, window);
+    let default = match split {
+        Split::Library => library_w(w),
+        Split::Inspector => inspector_w(w),
+        Split::Timeline => timeline_h(lanes).min(h * TIMELINE_SHARE),
+    };
+    // The floor wins a window too small to honour both ends: a panel at its
+    // floor is still a panel, and `clamp` panics outright on a ceiling under
+    // its floor.
+    set.unwrap_or(default).clamp(min, max.max(min))
+}
+
+/// Where a divider drag puts the panel it belongs to: the pointer's position
+/// turned into that panel's size. Half a strip is taken off each answer because
+/// the strip is grabbed by its middle -- without it the panel jumps a strip's
+/// width on the press and then trails the pointer for the rest of the gesture.
+pub(crate) fn split_drag_size(split: Split, at: Point<Pixels>, window: Size<Pixels>) -> f32 {
+    let (x, y) = (f32::from(at.x), f32::from(at.y));
+    let (w, h) = (f32::from(window.width), f32::from(window.height));
+    match split {
+        Split::Library => x - SPLIT_W / 2.,
+        Split::Inspector => w - x - SPLIT_W / 2.,
+        // This seam sits above the edit toolbar, which is a fixed height: what
+        // is under the pointer is the toolbar and the timeline together.
+        Split::Timeline => h - y - TOOLBAR_H - SPLIT_W / 2.,
+    }
+}
+
+impl Player {
+    /// How big the panel on this seam is this frame -- the one door every
+    /// region measures itself through, so a dragged size and a drawn one cannot
+    /// disagree.
+    pub(crate) fn split_px(&self, split: Split, window: Size<Pixels>) -> f32 {
+        // The pair a fresh project starts with where there is no session yet,
+        // which is what the timeline itself draws (`Player::timeline`).
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or(2, |session| session.lanes().len());
+        split_size(split, self.splits.get(split), lanes, window)
+    }
+}

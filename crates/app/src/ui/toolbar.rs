@@ -131,7 +131,7 @@ impl Player {
         &self,
         position: f64,
         state: Transport,
-        viewport_w: f32,
+        viewport: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let muted = self.volume.muted;
@@ -140,7 +140,13 @@ impl Player {
         // level together do not fit -- so the level's *bar* stands down (its
         // button, its keys and its row on the actions card all remain), and
         // the clock keeps a narrower rect rather than being pushed off.
-        let room = viewport_w - library_w(viewport_w) - inspector_w(viewport_w);
+        // The two panels as they are *now*, dividers and all: a room worked out
+        // from the window's own shares would go stale the moment a seam moved,
+        // and the clock would be sized for a column that is no longer there.
+        let room = f32::from(viewport.width)
+            - self.split_px(Split::Library, viewport)
+            - self.split_px(Split::Inspector, viewport)
+            - 2. * SPLIT_W;
         let clock_w = TIME_W.min(room - 140.).max(96.);
         let slider = room >= TRANSPORT_ROOMY;
         div()

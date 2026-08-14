@@ -168,6 +168,34 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
         .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
 }
 
+/// The seam between two panels, and the handle that resizes them: a strip
+/// [`SPLIT_W`] wide with the resize cursor of its axis on it, which is the whole
+/// of how a person finds out the layout moves at all.
+///
+/// The press is all this element does. The gesture itself is the root's, like
+/// every other drag in this window ([`Player::drag_move`]): a 6 px strip is not
+/// where the pointer stays, and a divider whose own listeners tracked it would
+/// stop following the hand on the first move. `stop_propagation` so the press
+/// never reaches the region under it -- a seam over the timeline must not scrub.
+pub(crate) fn divider(split: Split, cx: &mut Context<Player>) -> Div {
+    let across = matches!(split, Split::Timeline);
+    div()
+        .flex_none()
+        .when(across, |d| d.h(px(SPLIT_W)).w_full().cursor_row_resize())
+        .when(!across, |d| d.w(px(SPLIT_W)).h_full().cursor_col_resize())
+        .bg(rgb(STROKE_DIVIDER()))
+        // Lit under the pointer: the second half of "this can be dragged", said
+        // before the button goes down rather than after.
+        .hover(|s| s.bg(rgb(ACCENT_PRIMARY())))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                this.split_drag = Some(split);
+                cx.stop_propagation();
+            }),
+        )
+}
+
 /// A press that stops here. What every card's body hands its scrim: the scrim
 /// closes the card on a press, and the card is painted after it, so this listener
 /// runs first (gpui dispatches topmost-first, window.rs:3705) and a press meant
