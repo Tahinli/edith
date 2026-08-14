@@ -13,8 +13,8 @@
 //! handle on a child running `hw-encode-child`, which is the one process that
 //! `dlopen`s the plugin and therefore the only one a driver may kill. When it
 //! dies -- by `abort()`, by any signal, or by going quiet past
-//! [`Remote::timeout`] -- the parent sees a closed socket or a timed-out read,
-//! reaps the child, and reports an error carrying [`HW_LOST`]. The export then
+//! [`Remote::deadline`] -- the parent sees a closed socket or a timed-out read,
+//! reaps the child, and reports a [`Lost`]. The export then
 //! runs again on the software encoder ([`crate::export::start`]), or refuses in
 //! words where a person picked the GPU by name.
 //!
@@ -36,17 +36,32 @@ use std::time::Duration;
 use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::hw::VhDma;
 
-/// The words every "the child is gone" error carries, and the only thing
-/// [`crate::export`] matches on to decide that the software encoder should have
-/// another go at the file. A message, not an error kind, because
-/// [`crate::Error`] is a boxed `dyn Error` and a caller two crates away reads
-/// its text.
+/// The words every "the child is gone" error carries, for the person reading
+/// the log; what *decides* anything is [`Lost`], never this text.
 pub const HW_LOST: &str = "the hardware encoder process";
+
+/// The error a dead child carries.
+///
+/// A type and not a phrase. [`is_lost`] is what commits a whole export to being
+/// written again from the first frame ([`crate::export::start`]), and matching
+/// on words handed that decision to any future error whose message happened to
+/// mention the child -- a silent re-encode of a feature film, caused by a
+/// wording. Nothing outside this module can make one.
+#[derive(Debug)]
+pub struct Lost(String);
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Lost {}
 
 /// Whether an error is one: a driver that took its process down, rather than a
 /// picture this engine got wrong.
 pub fn is_lost(error: &crate::Error) -> bool {
-    error.to_string().contains(HW_LOST)
+    error.downcast_ref::<Lost>().is_some()
 }
 
 /// The helper's file name; it is built into the same directory as the editor.
@@ -407,7 +422,31 @@ pub struct Remote {
     /// Set the moment the child is known gone, so every later call refuses in
     /// the same words instead of blocking on a socket nobody holds.
     lost: Option<String>,
+    /// The slowest call this child has answered, and how many it has answered
+    /// at all: what [`Remote::deadline`] measures its patience against.
+    slowest: Duration,
+    answered: u32,
 }
+
+/// How many answered calls it takes before the wait stops being the configured
+/// ceiling and becomes this encoder's own measure, how much slower than its
+/// slowest answer a call may be before it is a wedge, and the least it is ever
+/// given.
+///
+/// The ceiling has to be generous -- an encoder opening on a 4K frame is not a
+/// dead one -- and the export spends every second of it on a child that will
+/// never answer again: the file is owed the software encoder and the wait is
+/// pure delay before it starts. The window is what shrinks, not the ceiling.
+/// Once a child has answered [`CALIBRATE`] calls, the machine has said how long
+/// its own frames take, and eight times the slowest of them (never under
+/// [`FLOOR`]) contains a wedge in two or three seconds rather than fifteen,
+/// while a slow open still gets the whole ceiling and is never killed for
+/// being slow. The editor is live throughout either way -- the wait is on the
+/// export's own thread and the card goes on repainting -- so what this buys is
+/// the delay, not the window.
+const CALIBRATE: u32 = 8;
+const SLACK: u32 = 8;
+const FLOOR: Duration = Duration::from_secs(2);
 
 impl Remote {
     /// How long the child may take over one call before it is treated as hung.
@@ -419,6 +458,17 @@ impl Remote {
             .and_then(|v| v.parse().ok())
             .unwrap_or(15_000);
         Duration::from_millis(ms)
+    }
+
+    /// How long the *next* call may take: the ceiling until this child has
+    /// shown what its frames cost, then its own slowest answer with room to
+    /// spare ([`CALIBRATE`]).
+    fn deadline(&self) -> Duration {
+        let ceiling = Self::timeout();
+        match self.answered >= CALIBRATE {
+            true => ceiling.min((self.slowest * SLACK).max(FLOOR)),
+            false => ceiling,
+        }
     }
 
     /// Starts a child on this seat. `None` is the plugin's own "no" carried
@@ -445,6 +495,8 @@ impl Remote {
             open,
             au: Vec::new(),
             lost: None,
+            slowest: Duration::ZERO,
+            answered: 0,
         };
         // The child answers once its encoder is open: a byte, and with it the
         // descriptor of the staging buffer it made for this session's size.
@@ -550,10 +602,18 @@ impl Remote {
     /// One request and its reply, which is every call above: the child is fed,
     /// then read, and anything that is not an answer is the child being gone.
     fn round_trip(&mut self, msg: &[u8], fds: &[RawFd]) -> crate::Result<Option<&[u8]>> {
+        // Set per call, because what it may be is measured from the calls
+        // before it ([`deadline`]).
+        let _ = self.sock.set_read_timeout(Some(self.deadline()));
+        let started = std::time::Instant::now();
         self.request(msg, fds)?;
         let mut au = std::mem::take(&mut self.au);
         let read = read_reply(&mut self.sock, &mut au);
         self.au = au;
+        if read.is_ok() {
+            self.slowest = self.slowest.max(started.elapsed());
+            self.answered += 1;
+        }
         // Every "no access unit" leaves through a `return`, so the borrow of the
         // buffer below is the only one alive when it is taken.
         match read {
@@ -569,7 +629,7 @@ impl Remote {
 
     fn request(&mut self, msg: &[u8], fds: &[RawFd]) -> crate::Result<()> {
         if let Some(gone) = &self.lost {
-            return Err(gone.clone().into());
+            return Err(Lost(gone.clone()).into());
         }
         match send_msg(&self.sock, msg, fds) {
             Ok(()) => Ok(()),
@@ -591,10 +651,9 @@ impl Remote {
             Some(libc::SIGKILL) | None => format!("stopped answering ({why}) and was killed"),
             Some(signal) => format!("was killed by signal {signal}"),
         };
-        let message =
-            format!("{HW_LOST} {how}; the driver took it down and not the editor");
+        let message = format!("{HW_LOST} {how}; the driver took it down and not the editor");
         self.lost = Some(message.clone());
-        message.into()
+        Lost(message).into()
     }
 }
 
