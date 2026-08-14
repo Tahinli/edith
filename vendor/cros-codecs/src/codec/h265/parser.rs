@@ -1233,8 +1233,11 @@ impl SpsBuilder {
         self
     }
 
+    /// Saturating: a `value` under 16 has no legal `minus4` below zero and
+    /// `0u8 - 4u8` wraps to 252 in release -- the H.264 twin of this shipped
+    /// exactly that in every all-IDR SPS. Clamped above to the spec's 12.
     pub fn max_pic_order_cnt_lsb(self, value: u32) -> Self {
-        self.log2_max_pic_order_cnt_lsb_minus4(value.ilog2() as u8 - 4u8)
+        self.log2_max_pic_order_cnt_lsb_minus4(value.ilog2().saturating_sub(4).min(12) as u8)
     }
 
     pub fn sub_layer_ordering_info_present_flag(mut self, value: bool) -> Self {
