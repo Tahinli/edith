@@ -93,12 +93,23 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
             false => Enable::Yes,
         };
     }
-    // The four that are about the *editor* and its monitoring rather than
+    // The six that are about the *editor* and its monitoring rather than
     // about the edit list: they work with nothing open, the keyboard has
     // always fired them there, and so their buttons are live there too.
+    //
+    // The two stand-in switches are here because they are *import* options:
+    // what an arriving film gets made for it, and what the picture is decoded
+    // from once it has. A person who wants no encode started decides that
+    // before the first file, and a switch that could only be set once a film
+    // was already in was a switch that came too late to mean anything.
     if matches!(
         action,
-        ActionId::ToggleSnap | ActionId::ToggleMute | ActionId::VolumeUp | ActionId::VolumeDown
+        ActionId::ToggleSnap
+            | ActionId::ToggleMute
+            | ActionId::VolumeUp
+            | ActionId::VolumeDown
+            | ActionId::ToggleProxies
+            | ActionId::ToggleAutoProxies
     ) {
         return match ctx.exporting {
             true => Enable::No("an export is running"),

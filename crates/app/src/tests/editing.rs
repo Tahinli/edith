@@ -497,11 +497,19 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // The magnet and the monitoring level are the editor's own and answer
     // with no timeline at all -- the keyboard always fired them there, and
     // now so does the toolbar.
+    //
+    // ...and so do the two stand-in switches, which is not a nicety: they are
+    // *import* options -- what an arriving film gets made for it, and what its
+    // picture is then decoded from -- so a person answers them before the first
+    // file, and a switch that waited for one was a switch that came too late to
+    // stop the encode it was about.
     for editor_wide in [
         ActionId::ToggleSnap,
         ActionId::ToggleMute,
         ActionId::VolumeUp,
         ActionId::VolumeDown,
+        ActionId::ToggleProxies,
+        ActionId::ToggleAutoProxies,
     ] {
         assert!(
             whole(editor_wide, Ctx::default()).yes(),

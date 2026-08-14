@@ -37,9 +37,7 @@ pub(crate) use timeline_math::*;
 pub(crate) use transport::*;
 pub(crate) use viewport::*;
 
-use ui::inspector::section_head;
 use ui::theme::*;
-use ui::toolbar::{EXPORT_SLOT_W, SNAP_SLOT_W, VOLUME_SLOT_W, ZOOM_SLOT_W};
 use ui::widgets::*;
 
 use keymap::{ActionId, Keymap};
@@ -331,6 +329,19 @@ struct Player {
     /// arrive at the root, so the bar's own geometry has to be readable there.
     volume_bar: Rc<Cell<Bounds<Pixels>>>,
     volume_dragging: bool,
+    /// The two stand-in switches ([`engine::proxy`]) as this window has them
+    /// set: whether the picture is cut on the stand-ins, and whether an
+    /// arriving film gets one made for it. Kept here for the volume's reason
+    /// and one more of their own -- they are *import* options, so they have to
+    /// be settable before there is any import to have a session about.
+    ///
+    /// The session's own pair is the project's (it is saved with it): these are
+    /// pushed at every new one ([`Player::apply_proxies`]) and taken back from
+    /// a project as it loads ([`Player::install_project`]), so the button, the
+    /// switch and the file cannot come to disagree. Their initial values are
+    /// the ones a fresh session comes up at.
+    proxies_on: bool,
+    auto_proxies_on: bool,
     /// The keybindings overlay is up. While it is, it owns the keyboard and the
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
@@ -614,6 +625,10 @@ fn main() {
                     volume: Volume::default(),
                     volume_bar: Rc::default(),
                     volume_dragging: false,
+                    // What a session comes up at, so the first one opened is
+                    // pushed the values it already holds.
+                    proxies_on: false,
+                    auto_proxies_on: true,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: 30.,

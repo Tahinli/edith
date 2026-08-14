@@ -9,7 +9,6 @@
 
 use crate::*;
 use crate::ui::toolbar::{TONE_SLOT_W, ZOOM_SLOT_W};
-use crate::ui::widgets::*;
 
 impl Player {
     /// The inspector column. Two sections that are always there -- the
@@ -292,10 +291,13 @@ impl Player {
                         TONE_SLOT_W,
                         BG_RAISED(),
                         None,
-                        match self.session.as_ref().map(PlaybackSession::proxies) {
-                            Some(true) => format!("Proxies on{}", self.proxy_tail()),
-                            Some(false) => format!("Proxies off{}", self.proxy_tail()),
-                            None => "Proxies".to_string(),
+                        // The window's own switch and not the session's: it is
+                        // answerable with nothing open, so a label that read
+                        // "Proxies" there would be a control whose state was a
+                        // secret until a file arrived.
+                        match self.proxies_on {
+                            true => format!("Proxies on{}", self.proxy_tail()),
+                            false => format!("Proxies off{}", self.proxy_tail()),
                         },
                         "cuts on small stand-ins of the big films; the sound and every export \
                          stay the film's own",
@@ -311,10 +313,9 @@ impl Player {
                         TONE_SLOT_W,
                         BG_RAISED(),
                         None,
-                        match self.session.as_ref().map(PlaybackSession::auto_proxies) {
-                            Some(true) => "Auto proxies on",
-                            Some(false) => "Auto proxies off",
-                            None => "Auto proxies",
+                        match self.auto_proxies_on {
+                            true => "Auto proxies on",
+                            false => "Auto proxies off",
                         },
                         "makes a stand-in for every big film as it is imported; with it off, \
                          turning Proxies on is what asks for them",
