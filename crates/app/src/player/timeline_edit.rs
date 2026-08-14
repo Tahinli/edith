@@ -1012,7 +1012,26 @@ impl Player {
     /// where it sits (`Hitbox::is_hovered`, window.rs:788), so while a card is
     /// up the root is not hovered anywhere under it and hears none of this: the
     /// press set a value and the drag then froze on it.
-    pub(crate) fn drag_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn drag_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A divider is answered before every gesture below it: it is pressed on
+        // a strip of its own that nothing else is under, so neither can swallow
+        // the other -- a seam over the timeline never scrubs, and a scrub is
+        // never mistaken for a resize.
+        if let Some(split) = self.split_drag {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.drag_split(split, event.position, window, cx),
+                // Released outside the window: the up below never came, so this
+                // is where the gesture ends. Nothing is owed -- every move has
+                // already been written.
+                _ => self.split_drag = None,
+            }
+            return;
+        }
         // A handle is 10 px across and the pointer leaves it at once, so
         // the equalizer drag is tracked here for the ruler's reason.
         if self.eq_dragging {
@@ -1092,7 +1111,18 @@ impl Player {
     /// live-writing bars -- is paid here. On the root and on a card's scrim
     /// both, for [`Player::drag_move`]'s reason: a release over an open card
     /// never reaches the root.
-    pub(crate) fn drag_release(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn drag_release(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The panel is left exactly where the hand let go, for the reason every
+        // other release here lands one last sample.
+        if let Some(split) = self.split_drag.take() {
+            self.drag_split(split, event.position, window, cx);
+            return;
+        }
         if std::mem::take(&mut self.eq_dragging) {
             // The release lands exactly, then the gesture is written
             // once -- the append-only table's whole reason.
@@ -1129,5 +1159,23 @@ impl Player {
         if std::mem::take(&mut self.scrubbing) {
             self.scrub_to(event.position.x, true, cx);
         }
+    }
+
+    /// Where the hand has taken a divider, live: the panel it belongs to is set
+    /// to what the pointer says and the next frame draws it there. Nothing else
+    /// is written -- a layout is not an edit, so there is no undo step to take
+    /// and no worker to flush. The clamps are the *reader's*
+    /// ([`split_size`]), so a size set in one window is still a size in the
+    /// next one it is drawn in.
+    fn drag_split(
+        &mut self,
+        split: Split,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.splits
+            .set(split, split_drag_size(split, at, window.viewport_size()));
+        cx.notify();
     }
 }
