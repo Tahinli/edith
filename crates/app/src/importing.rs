@@ -76,6 +76,16 @@ pub(crate) enum Proxy {
     Native,
     /// Being made, in the background, while the film keeps playing.
     Making(engine::proxy::Job),
+    /// Stopped by hand ([`Player::cancel_proxy`]) and not yet gone: the worker
+    /// gives up at its next frame and deletes the half-written file itself, and
+    /// the job is held until it does. Kept as a state rather than dropped
+    /// because the encode may still *beat* the cancel -- a stand-in that is
+    /// already written is a file in the cache and is reported as one.
+    Cancelling(engine::proxy::Job),
+    /// Stopped, and the worker has gone. Not [`Self::Failed`]: nothing went
+    /// wrong, somebody asked for it -- and it stays in the map so no repaint
+    /// starts the encode that was just stopped over again.
+    Cancelled,
     /// There is one in the cache. What the switch actually plays.
     Ready,
     /// It could not be made: the film itself is what plays, and the row says
@@ -93,6 +103,11 @@ impl Proxy {
             // Rounded down: a bar that says 100% while the encoder is still
             // writing is the one number a progress line must never show.
             Self::Making(job) => format!("proxy {}%", (job.progress() * 100.) as u32),
+            // Its own word while the worker is still winding down: "no proxy"
+            // the instant the × is clicked would be a claim about a file that
+            // is at that moment still being written.
+            Self::Cancelling(_) => "proxy stopping…".to_string(),
+            Self::Cancelled => "no proxy — stopped".to_string(),
             Self::Ready => "proxy".to_string(),
             Self::Failed => "no proxy".to_string(),
         }
