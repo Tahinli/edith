@@ -10,6 +10,17 @@ use crate::Resolution;
 
 pub struct H265;
 
+/// What the SPS says the coded samples mean, as H.273 code points, and whether
+/// the luma codes cover the full range. Written into the VUI, which is the
+/// answer a decoder takes before it looks at any container tag.
+#[derive(Clone, Copy)]
+pub struct ColourDescription {
+    pub colour_primaries: u32,
+    pub transfer_characteristics: u32,
+    pub matrix_coeffs: u32,
+    pub full_range: bool,
+}
+
 #[derive(Clone)]
 pub struct EncoderConfig {
     pub resolution: Resolution,
@@ -18,6 +29,9 @@ pub struct EncoderConfig {
     pub pred_structure: PredictionStructure,
     /// Initial tunings values
     pub initial_tunings: Tunings,
+    /// What the VUI declares about the samples. `None` writes no video signal
+    /// type at all, and a stream that says nothing is read as "unspecified".
+    pub colour: Option<ColourDescription>,
 }
 
 impl Default for EncoderConfig {
@@ -29,6 +43,7 @@ impl Default for EncoderConfig {
             level: Level::L4,
             pred_structure: PredictionStructure::LowDelay { limit: 2048 },
             initial_tunings: Default::default(),
+            colour: None,
         }
     }
 }

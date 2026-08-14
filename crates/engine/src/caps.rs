@@ -106,7 +106,8 @@ mod tests {
         assert!(hw_line(Some(VhCaps::default())).starts_with("none —"));
         // This project's own GPU as `vainfo` lists it: H.264, HEVC and AV1 both
         // ways, VP9 decode only, and the 10-bit profiles on three of the four.
-        // HEVC is an encode seat here as of the plugin's `vh_enc_hevc_open` --
+        // HEVC is an encode seat here as of the plugin's
+        // `vh_enc_hevc_open_colour` --
         // the 10-bit note beside it stays a *decode* claim, that seat coding
         // 8-bit Main whatever the source was.
         let radeonsi = VhCaps {
