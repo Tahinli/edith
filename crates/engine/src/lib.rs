@@ -13,6 +13,7 @@ pub mod edith;
 pub mod eq;
 pub mod export;
 pub mod hw;
+pub mod hwproc;
 pub mod limiter;
 pub mod mux;
 pub mod playback;
