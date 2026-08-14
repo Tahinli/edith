@@ -86,11 +86,11 @@ struct Player {
     /// drawn ([`engine::subtitle::CueImage::rgba`]), which is a thing to do
     /// when the cue changes -- every few seconds -- and not at every repaint.
     ///
-    /// The *track* is half the key because the four PGS tracks of a remux are
-    /// one film's subtitles in four languages: they start at the same
-    /// microsecond, and a picked row that only changed the language would go on
-    /// showing the one before it.
-    sub_image: Option<((usize, i64), Arc<RenderImage>)>,
+    /// The *lane* is half the key because the four PGS tracks of a remux are
+    /// one film's subtitles in four languages: placed one over the other they
+    /// start at the same microsecond, and a lane whose eye was shut would leave
+    /// the one before it on screen.
+    sub_image: Option<((Lane, i64), Arc<RenderImage>)>,
     /// A frame that arrived before its time; shown on the tick it comes due.
     /// The pump's buffer, not transport state -- but a frame waiting here is
     /// what keeps a finished decoder from reading as [`Transport::Ended`] one
@@ -228,28 +228,31 @@ struct Player {
     /// by one stroke ([`ActionId::ToggleSnap`]) for the frame-by-frame placement
     /// no magnet may take away.
     snap: bool,
-    /// Whether the cue under the playhead is drawn over the picture. On by
-    /// default -- a subtitle imported and then invisible is an import nobody can
-    /// tell happened -- and off by one stroke
+    /// Whether the subtitle lanes draw at all -- the mute over every lane's eye
+    /// ([`Player::subs_off`]), not a lane of its own. On by default and off by
+    /// one stroke
     /// ([`ActionId::ToggleSubtitles`](keymap::ActionId::ToggleSubtitles)) for
     /// anyone watching the picture rather than reading it. The player's, not the
     /// project's: it changes nothing that is saved and nothing that is exported.
     subs_on: bool,
-    /// Which subtitle track is the one on screen: an index into
-    /// [`PlaybackSession::subtitles`], since a file may carry several and only
-    /// one can be read at a time. Cleared with the timeline like every other
-    /// index here -- track 2 of one project is not track 2 of the next.
+    /// Which palette row is *selected*: an index into
+    /// [`PlaybackSession::subtitles`], which is what the × takes off
+    /// ([`ActionId::RemoveSubtitleTrack`](keymap::ActionId::RemoveSubtitleTrack))
+    /// and what the list marks. A selection and nothing more -- what is on
+    /// screen is what is placed on a subtitle lane
+    /// ([`Player::subtitle_overlay`]), so picking a row shows nothing by itself,
+    /// exactly as clicking a media row plays nothing. Cleared with the timeline
+    /// like every other index here -- track 2 of one project is not track 2 of
+    /// the next.
     sub_track: usize,
     /// The subtitle lanes whose eye is shut: every lane shows its captions
     /// until this says otherwise, so a lane that was just added is a lane that
     /// draws. Held as the lanes that are *off* rather than a flag per lane, so
     /// adding one needs no bookkeeping at all.
     ///
-    /// State only this slice: the preview reads the picked palette track still
-    /// ([`Player::sub_picture`]), so shutting an eye marks the header and
-    /// changes nothing over the picture until the slice that draws the lanes'
-    /// cues there reads this field. Not saved either -- a `.edith` has no line
-    /// for it yet.
+    /// Read where the cues are drawn ([`Player::subtitle_overlay`]): shutting an
+    /// eye takes that lane's plate off the picture and leaves its captions on
+    /// the lane. Not saved -- a `.edith` has no line for it yet.
     ///
     /// A [`Lane`] handle is a position among its kind, so a removal or a
     /// reorder leaves every shut eye naming another track: they are dropped
