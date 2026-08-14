@@ -39,7 +39,7 @@ use super::{
 };
 
 use super::{
-    Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
+    Choice, EDGE_W, ETA_SPAN, Edge, FITS, FRAME_RATES, LaneKind, SubClip, PPS_DEFAULT, PPS_MIN, Preset, RESOLUTIONS, Repeat,
     Scale, View,
     ZOOM_MIN_FRAMES, ZOOM_OUT_MARGIN, ZOOM_STEP, audio_rate_choices, av1_hw_warning, clock,
     encoder_choices, encoder_label, eta_secs, file_name, file_uri,
@@ -49,16 +49,16 @@ use super::{
     Landing, arrival, launch_queue,
     read_ahead, scan_plan, seek_line, silence_line, source_secs, stash_or_write,
     repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
-    clip_width, trimmed_clip, trims, unscannable, unusable,
+    clip_width, frames_of_us, trimmed_clip, trimmed_sub, trims, unscannable, unusable,
     visible_slice,
 };
 
 use super::{
-    SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_FG, SUB_LANE_H, SUB_LINE_H, SUB_ROWS_H,
+    SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_FG, SUB_LINE_H, SUB_ROWS_H,
     SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box, sub_bottom,
     carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
     Subs, subtitle_detail, subtitle_notice, subtitle_tail,
-    sub_pick_name, subtitle_rows, subtitle_strip_h, walk_subtitles,
+    sub_pick_name, subtitle_rows, subtitle_toggle_notice, walk_subtitles,
 };
 
 use engine::PlaybackSession;

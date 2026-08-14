@@ -821,14 +821,15 @@ pub(crate) fn commit_mbps(text: &str) -> Result<u32, String> {
     }
 }
 
-/// Whether a stroke gets out of a running export. Escape does, whatever
-/// modifiers are held with it, for the same reason it gets out of a capture and
-/// out of the overlay: it is this window's way out, and a way out that only
-/// works with the right modifiers is not one. Whatever the keymap has on cancel
-/// works too, so rebinding it adds a way rather than replacing the one that
-/// always worked -- and that binding is still what the progress line shows.
-pub(crate) fn cancels_export(key: &str, action: Option<ActionId>) -> bool {
-    key == ESCAPE || action == Some(ActionId::CancelExport)
+/// Whether a stroke gets out of a running export. `ctrl+escape` does -- a chord
+/// and not the bare key, which used to end an hour of encoding on the stroke a
+/// hand reaches for to shut a menu it has already shut. Bare escape does nothing
+/// at all here: the progress card is not dismissable, so there is nothing left
+/// for it to mean. Whatever the keymap has on cancel works too, so rebinding it
+/// adds a way rather than replacing this one -- and that binding is what the
+/// card shows.
+pub(crate) fn cancels_export(key: &str, ctrl: bool, action: Option<ActionId>) -> bool {
+    (ctrl && key == ESCAPE) || action == Some(ActionId::CancelExport)
 }
 
 /// A clip's share of the lane. A timeline with no length reads as one full-width

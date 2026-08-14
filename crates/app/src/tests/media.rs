@@ -796,18 +796,19 @@ fn a_cue_steps_over_whatever_bar_is_hanging_off_the_picture() {
 }
 
 /// The two places a subtitle is drawn -- the plate over the picture and the
-/// strip under the lanes -- inside the 640x360 floor the rest of this window
+/// lanes under the tracks -- inside the 640x360 floor the rest of this window
 /// is sized for, and the plate readable on whatever the film is showing.
 #[test]
-fn the_subtitle_plate_and_strip_fit_the_smallest_window() {
-    // The strip costs the panel its own row and the panel's gap, and costs
-    // nothing at all when there is no track to draw.
-    assert_eq!(subtitle_strip_h(false), 0.);
-    assert_eq!(subtitle_strip_h(true), SUB_LANE_H + 8.);
-    // What is left for the picture at the floor, with the panel a project
-    // starts with and the strip under it.
-    let picture = 360. - HEADER_H - panel_h(2) - subtitle_strip_h(true);
-    assert!(picture > 0., "the strip pushed the picture off the window");
+fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
+    // A subtitle lane is a lane: it costs the panel exactly what a third
+    // track costs it, and a timeline with none costs nothing at all -- the
+    // strip that used to hang under the lanes is gone, and with it the one
+    // row nothing could be dropped on.
+    assert_eq!(lanes_h(3) - lanes_h(2), LANE_H + 8.);
+    // What is left for the picture at the floor, with a project's two tracks
+    // and a subtitle lane under them.
+    let picture = 360. - HEADER_H - panel_h(3);
+    assert!(picture > 0., "a subtitle lane pushed the picture off the window");
     // A two-line cue and the gap under it fit inside that, which is the
     // whole claim: the plate sits *over* the picture and must not need more
     // of it than there is.
@@ -822,9 +823,10 @@ fn the_subtitle_plate_and_strip_fit_the_smallest_window() {
     for id in crate::ui::theme::PaletteId::ALL {
         assert!(contrast(id.palette().SUB_FG, 0x000000) >= 7., "{id:?}");
     }
-    // The strip is a picture and not a target -- nothing on it takes a
-    // click -- which is the only reason it may be under `HIT_MIN`.
-    assert!(SUB_LANE_H < HIT_MIN && SUB_LANE_H > 0.);
+    // A subtitle lane is dragged onto, trimmed on and lifted from, so its row
+    // is a target and binds `HIT_MIN` like every other lane's -- the whole
+    // reason it is a lane and no longer a 16 px strip.
+    assert!(LANE_H >= HIT_MIN);
     // The library's own list of tracks scrolls past three rather than
     // taking the media list's room.
     assert_eq!(SUB_ROWS_H / ROW_H, 3.);
@@ -952,7 +954,14 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     let track = &session.subtitles()[0];
     assert_eq!(track.label, "test_subs.srt");
     assert_eq!(subtitle_detail(track), "3 cues");
-    // What the overlay draws at a moment inside the first cue, and between
+    // Arriving is landing in the *list* and nowhere else: no lane is made for
+    // it, so there is nothing over the picture yet -- the rule every other
+    // medium follows here, and what `Player::subtitle_overlay` reads.
+    assert!(
+        session.subtitle_lanes().is_empty(),
+        "an import places nothing: the palette is where a track lands"
+    );
+    // What the track itself says at a moment inside the first cue, and between
     // two of them -- the fixture's own timings (0.5-1.5 s, 2.0-3.25 s).
     let text = |t: f64| -> Vec<String> {
         cues_at(&track.cues, t)
@@ -1017,7 +1026,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     assert!(subtitle_detail(&refused).contains("pictures"));
     assert!(cues_at(&refused.cues, 1.).is_empty());
 
-    // ...and what the plate and the strip draw after a *cut*: the timeline's
+    // ...and what an embedded track carried through a *cut* maps to: the timeline's
     // own clock, asked of the engine through the very map an export writes
     // the file with (`PlaybackSession::timeline_cues`), so the preview and
     // the file cannot drift apart. The numbers are the export's own
@@ -1040,7 +1049,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
             .collect::<Vec<_>>(),
         vec![(500_000, 1_500_000), (2_000_000, 3_000_000)]
     );
-    // The overlay's own two lines, at the same moments as above.
+    // The export's own two lines, at the same moments as above.
     let drawn = |t: f64| -> Vec<String> {
         cues_at(&mapped, t)
             .into_iter()
@@ -1055,4 +1064,41 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
     );
     // ...and the strip's: the second cue is one second wide now, not 1.25.
     assert_eq!(cue_box(scale, &mapped[1]), (80., 40.));
+
+    // The last mile, what the plate over the picture actually reads
+    // (`Player::subtitle_overlay` -> `PlaybackSession::sub_lane_cues`): a lane
+    // added and still empty draws nothing, and the palette row reaches the
+    // screen the moment it is *placed* on it -- shifted by where it sits, the
+    // way a clip is.
+    let lane = session.add_lane(LaneKind::Subtitle);
+    assert!(
+        session.sub_lane_cues(lane).is_empty(),
+        "an empty subtitle lane draws nothing"
+    );
+    session
+        .place_sub(
+            lane,
+            0,
+            SubClip {
+                start: 0,
+                frames: 90,
+                track: 0,
+                in_us: 0,
+                out_us: 5_000_000,
+            },
+        )
+        .expect("the palette row goes down on the lane");
+    let placed = session.sub_lane_cues(lane);
+    let shown = |t: f64| -> Vec<String> {
+        cues_at(&placed, t)
+            .into_iter()
+            .map(|c| c.text.clone())
+            .collect()
+    };
+    // The placement keeps the track's own clock (it starts at frame 0 and
+    // holds the whole of it), so the words are back at the times the file
+    // wrote them -- the cut above moved the *carried* map, not this one.
+    assert_eq!(shown(0.7), ["first line"]);
+    assert!(shown(1.8).is_empty(), "between two cues the plate goes");
+    assert_eq!(shown(2.5), ["second line\nwith a break"]);
 }

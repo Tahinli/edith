@@ -307,15 +307,15 @@ impl Player {
                         }),
                     ))
                     .child(self.action_control(
-                        "add-subtitle-track",
+                        "add-subtitle-lane",
                         0.,
                         BG_RAISED(),
                         None,
                         "+ S",
-                        "adds every subtitle track in a file you pick",
-                        ActionId::AddSubtitleTrack,
+                        "adds a subtitle track under the ones there",
+                        ActionId::AddSubtitleLane,
                         cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.pick_and_add_subtitles(cx)
+                            this.add_lane(LaneKind::Subtitle, cx)
                         }),
                     ))
                     .child(separator())
@@ -341,7 +341,7 @@ impl Player {
                         SNAP_SLOT_W,
                         BG_RAISED(),
                         None,
-                        match (self.subtitle_track().is_some(), self.subs_on) {
+                        match (self.placed_captions() > 0, self.subs_on) {
                             (false, _) => "No subs",
                             (true, true) => "Subs on",
                             (true, false) => "Subs off",
