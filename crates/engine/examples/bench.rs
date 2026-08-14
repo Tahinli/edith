@@ -44,7 +44,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use engine::export::{ExportSettings, Format};
+use engine::export::{EncoderSeat, ExportSettings, Format};
 use engine::project::{Clip, LaneKind, Project, Source, Speed};
 
 // `posix_fadvise(2)`, straight from libc, which std already links: dropping
@@ -617,15 +617,15 @@ fn scrub_bench(path: &Path) {
 /// The rate is frames the worker reported written over wall seconds, so a run
 /// stopped at the cap still reports a rate; the row says `CAPPED` when it was.
 fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
-    let (format, force_sw) = match seat {
-        "h264sw" => (Format::Mp4, true),
-        "h264hw" => (Format::Mp4, false),
-        "av1" => (Format::Av1, true),
+    let (format, pick) = match seat {
+        "h264sw" => (Format::Mp4, EncoderSeat::Software),
+        "h264hw" => (Format::Mp4, EncoderSeat::Auto),
+        "av1" => (Format::Av1, EncoderSeat::Software),
         // `hevc` keeps meaning the software intra seat, so a row measured
         // against an older baseline still compares with the one beside it; the
         // GPU seat is the new name.
-        "hevc" => (Format::Hevc, true),
-        "hevchw" => (Format::Hevc, false),
+        "hevc" => (Format::Hevc, EncoderSeat::Software),
+        "hevchw" => (Format::Hevc, EncoderSeat::Auto),
         _ => usage(),
     };
     // The sound is opt-in and named in the row, so an `_av` number is never
@@ -675,7 +675,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         }
     };
     let settings = ExportSettings {
-        force_sw,
+        seat: pick,
         format,
         ..ExportSettings::default()
     };

@@ -1,13 +1,14 @@
 //! The project file: a line of text per thing, and nothing else.
 //!
 //! ```text
-//! edith 13
+//! edith 14
 //! playhead 90
 //! resolution 1920 1080
 //! fps 30.0
 //! tonemap vivid
 //! proxy on
 //! autoproxy off
+//! encoder hardware
 //! limiter -1.0 on
 //! source 0 test_av.mp4
 //! source 1 /elsewhere/test_av2.mp4
@@ -60,6 +61,15 @@
 //! nothing at all, and turning the `proxy` switch on is what asks for the
 //! stand-ins this project is missing -- which is the only way to ask, so a
 //! project that never wants them never spends a minute of encode on one.
+//!
+//! The `encoder` line is which seat an export of this project writes its
+//! picture with ([`crate::export::EncoderSeat`]), spelled `auto`, `hardware` or
+//! `software`. Left out when it is `auto` -- hardware where this machine has a
+//! seat and software everywhere else -- which is what every dialect before v14
+//! did and could not be told otherwise. It is the project's and not the
+//! machine's for the reason the tone map is: a person who picked the software
+//! encoder for *this* delivery picked it for every export of it, and a pick
+//! that vanished on a reload is a pick nobody could keep.
 //!
 //! The `limiter` line is the master limiter over the whole mix
 //! ([`crate::limiter`]): its ceiling in dBFS and whether it is in circuit,
@@ -117,7 +127,10 @@
 //! is the only way an empty lane could still be there on the way back. A lane
 //! number may not skip one of its kind.
 //!
-//! **Version 12** was this without the `autoproxy` line: such a project makes a
+//! **Version 13** was this without the `encoder` line: an export of such a
+//! project takes the hardware seat where there is one and the software encoder
+//! everywhere else, which is the only choice those projects had.
+//! **Version 12** was that without the `autoproxy` line: such a project makes a
 //! stand-in for every film that wants one the moment it arrives, which is all
 //! any project could do.
 //! **Version 11** was that without the `proxy` line: such a project is cut on
@@ -145,7 +158,7 @@
 //! what a v1 timeline meant, and an older file simply equalizes and grades
 //! nothing, and an older one plays everything at real time, and an older one
 //! mixes flat, and an older one shows no subtitles, and an older one is shown
-//! in the reference rendition -- and saving any of them writes v13. An older
+//! in the reference rendition -- and saving any of them writes v14. An older
 //! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -181,7 +194,8 @@ use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 13";
+const MAGIC: &[u8] = b"edith 14";
+const MAGIC_V13: &[u8] = b"edith 13";
 const MAGIC_V12: &[u8] = b"edith 12";
 const MAGIC_V11: &[u8] = b"edith 11";
 const MAGIC_V10: &[u8] = b"edith 10";
@@ -248,6 +262,11 @@ pub struct Document {
     /// file that leaves the line out, which both mean by itself -- the only
     /// thing those projects did.
     pub auto_proxy: bool,
+    /// Which encoder an export writes the picture with
+    /// ([`crate::export::EncoderSeat`]). `Auto` for every dialect before v14 and
+    /// for a v14 file that leaves the line out, which both mean the seat this
+    /// machine has -- the only choice those projects offered.
+    pub encoder: crate::export::EncoderSeat,
     pub playhead: u32,
 }
 
@@ -269,6 +288,7 @@ pub fn save(
     tone: crate::tonemap::Preset,
     proxy: bool,
     auto_proxy: bool,
+    encoder: crate::export::EncoderSeat,
     limiter: Limiter,
     playhead: u32,
 ) -> crate::Result<()> {
@@ -284,7 +304,7 @@ pub fn save(
         .and_then(|mut f| {
             f.write_all(&emit(
                 &dir, sources, lanes, gains, subtitles, eq, color, resolution, fps, tone, proxy,
-                auto_proxy, limiter, playhead,
+                auto_proxy, encoder, limiter, playhead,
             ))?;
             f.sync_all()
         })
@@ -329,6 +349,7 @@ fn emit(
     tone: crate::tonemap::Preset,
     proxy: bool,
     auto_proxy: bool,
+    encoder: crate::export::EncoderSeat,
     limiter: Limiter,
     playhead: u32,
 ) -> Vec<u8> {
@@ -358,6 +379,12 @@ fn emit(
     // has anything to say here.
     if !auto_proxy {
         out.extend_from_slice(b"autoproxy off\n");
+    }
+    // ...and which encoder writes the picture, by the same rule again: `auto`
+    // is what every project before this line did, so only a project whose owner
+    // picked a seat says anything here.
+    if encoder != crate::export::EncoderSeat::default() {
+        out.extend_from_slice(format!("encoder {}\n", encoder.name()).as_bytes());
     }
     // Written only when it is not the default, so a project nobody has limited
     // is the same bytes it was in v8 bar the version line.
@@ -497,8 +524,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that says whether the stand-ins are made by themselves...
-    let v13 = first == MAGIC;
+    // The one that says which encoder an export takes...
+    let v14 = first == MAGIC;
+    // ...the ones that say whether the stand-ins are made by themselves...
+    let v13 = v14 || first == MAGIC_V13;
     // ...the ones that say whether it is cut on stand-ins...
     let v12 = v13 || first == MAGIC_V12;
     // ...the ones that carry an HDR rendition...
@@ -554,6 +583,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // that wanted a stand-in got one, which is what leaving the line out
         // still means.
         auto_proxy: true,
+        // ...and nothing before v14 could be told *which* encoder: an export
+        // took the seat this machine had, which is what leaving the line out
+        // still means.
+        encoder: crate::export::EncoderSeat::default(),
         fps: None,
         playhead: 0,
     };
@@ -661,6 +694,20 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         .into());
                     }
                 };
+            }
+            b"encoder" if v14 => {
+                if !doc.sources.is_empty() {
+                    return Err(
+                        format!("line {n}: encoder belongs once, before the sources").into()
+                    );
+                }
+                let f = fields(rest, 1, "encoder", n)?;
+                doc.encoder = crate::export::EncoderSeat::from_name(f[0]).ok_or_else(|| {
+                    format!(
+                        "line {n}: encoder is auto, hardware or software, not {:?}",
+                        String::from_utf8_lossy(f[0])
+                    )
+                })?;
             }
             b"limiter" if v9 => {
                 if !doc.sources.is_empty() {
@@ -1183,6 +1230,7 @@ mod tests {
             crate::tonemap::Preset::default(),
             false,
             true,
+            crate::export::EncoderSeat::default(),
             Limiter::default(),
             playhead,
         )
@@ -1228,6 +1276,7 @@ mod tests {
             crate::tonemap::Preset::default(),
             false,
             true,
+            crate::export::EncoderSeat::default(),
             Limiter::default(),
             0,
         );
@@ -1256,7 +1305,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 13\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 14\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1293,6 +1342,7 @@ mod tests {
                 crate::tonemap::Preset::default(),
                 proxy,
                 true,
+                crate::export::EncoderSeat::default(),
                 Limiter::default(),
                 0,
             )
@@ -1354,6 +1404,7 @@ mod tests {
                 crate::tonemap::Preset::default(),
                 proxy,
                 auto,
+                crate::export::EncoderSeat::default(),
                 Limiter::default(),
                 0,
             )
@@ -1395,6 +1446,78 @@ mod tests {
         }
     }
 
+    /// The v14 line: which encoder an export writes the picture with, by name,
+    /// read back as the very seat -- and the dialect before it, which had no
+    /// way to say one and took whatever this machine had.
+    #[test]
+    fn the_encoder_seat_round_trips_by_name_and_a_v13_file_takes_the_machines() {
+        use crate::export::EncoderSeat;
+        let dir = PathBuf::from("/proj");
+        let (_, sources, lanes) = doc();
+        let bytes = |seat| {
+            super::emit(
+                &dir,
+                &sources,
+                &lanes,
+                &[],
+                &[],
+                &[],
+                &[],
+                (1280, 720),
+                None,
+                crate::tonemap::Preset::default(),
+                false,
+                true,
+                seat,
+                Limiter::default(),
+                0,
+            )
+        };
+        // The default is the line left out, so a project nobody has picked a
+        // seat for is the bytes a v13 file was bar the version line.
+        let auto = bytes(EncoderSeat::Auto);
+        assert!(
+            !String::from_utf8_lossy(&auto).contains("encoder"),
+            "auto is the line left out: {}",
+            String::from_utf8_lossy(&auto)
+        );
+        assert_eq!(
+            parse(&auto, &dir).expect("v14 parses").encoder,
+            EncoderSeat::Auto
+        );
+        for seat in [EncoderSeat::Hardware, EncoderSeat::Software] {
+            let written = bytes(seat);
+            let text = String::from_utf8_lossy(&written).to_string();
+            assert!(text.contains(&format!("encoder {}\n", seat.name())), "{text}");
+            assert_eq!(parse(&written, &dir).expect("v14 parses").encoder, seat);
+        }
+
+        // A v13 project took the seat this machine had and could not be told
+        // otherwise.
+        let v13 = b"edith 13\nplayhead 0\nresolution 1280 720\nautoproxy off\nsource 0 a.mp4\n\
+                    video 1 0 0 30 0 - - - fit 1000\n";
+        let old = parse(v13, &dir).expect("v13 still loads");
+        assert_eq!(
+            old.encoder,
+            EncoderSeat::Auto,
+            "a v13 project exported on whatever seat there was"
+        );
+        assert!(!old.auto_proxy, "the rest of it came back too");
+        // ...and the line is not a v13 line: a dialect may not be mixed.
+        let mixed = parse(b"edith 13\nsource 0 a.mp4\nencoder software\n", &dir)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mixed, "line 3: unknown keyword \"encoder\"");
+        // Anything but the three names is a corrupt line, by name.
+        for line in ["encoder\n", "encoder gpu\n", "encoder Hardware\n"] {
+            let file = format!("edith 14\nsource 0 a.mp4\n{line}");
+            assert!(
+                parse(file.as_bytes(), &dir).is_err(),
+                "{line:?} is not an encoder line"
+            );
+        }
+    }
+
     /// The v11 line: the HDR rendition, written by name, read back as the very
     /// preset -- and the dialect before it, which had no way to say one and
     /// meant the published conversion.
@@ -1416,6 +1539,7 @@ mod tests {
                 preset,
                 false,
                 true,
+                crate::export::EncoderSeat::default(),
                 Limiter::default(),
                 0,
             );
@@ -1510,7 +1634,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1547,7 +1671,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1655,7 +1779,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -1759,7 +1883,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -1824,7 +1948,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -1862,7 +1986,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -1891,7 +2015,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -1934,12 +2058,13 @@ mod tests {
             crate::tonemap::Preset::default(),
             false,
             true,
+            crate::export::EncoderSeat::default(),
             limiter,
             0,
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 14\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -1971,7 +2096,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 13\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -2135,7 +2260,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -2188,7 +2313,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 13\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 14\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -2220,7 +2345,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 13\n"));
+        assert!(v5.starts_with(b"edith 14\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -2320,6 +2445,7 @@ mod tests {
             crate::tonemap::Preset::default(),
             false,
             true,
+            crate::export::EncoderSeat::default(),
             Limiter::default(),
             0,
         )
@@ -2327,7 +2453,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 13\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 14\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2372,10 +2498,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 14\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 15\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 14");
+        assert_eq!(err, "line 1: unsupported version 15");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
