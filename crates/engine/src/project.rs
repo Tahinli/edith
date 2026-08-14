@@ -42,6 +42,17 @@
 //! and the caller must reseek. Every successful edit snapshots every lane, so
 //! [`Project::undo`] is an exact restore -- of the clips *and* of the lane list.
 //!
+//! Words are a third kind of lane ([`LaneKind::Subtitle`]) and not a setting on
+//! the project: a caption is placed, moved, trimmed, cut and rippled by the
+//! very machinery above, and it joins the undo history for free because a
+//! snapshot is the whole lane list. What such a lane holds is a [`SubClip`] --
+//! a `[in_us, out_us)` window of one of the project's subtitle tracks
+//! ([`Project::subtitles`], which stays the *palette* the cues are read into),
+//! placed at a timeline frame like everything else. It holds no [`Clip`] at
+//! all, which is what keeps every media path (the composite, the mix, an
+//! equalizer, a speed) from ever meeting one: they read a lane's clips, and
+//! there are none.
+//!
 //! A clip names its file by *index* into [`Project::sources`], which is
 //! append-only: an index handed out once stays valid forever, so a clip on the
 //! clipboard or inside an undo snapshot can never dangle. An index -- not an
@@ -68,7 +79,7 @@ use crate::color::ColorParams;
 use crate::eq::EqParams;
 use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
-use crate::subtitle::SubtitleTrack;
+use crate::subtitle::{Cue as SubtitleCue, SubtitleTrack};
 
 /// How far down a lane's own volume goes ([`Project::set_lane_gain_db`]).
 /// -60 dB is a thousandth of the amplitude -- a track that is out of the mix
@@ -455,11 +466,26 @@ impl Source {
 }
 
 /// What a lane carries, which is what a *gap* in it means: black frames on a
-/// video lane, silence on an audio one.
+/// video lane, silence on an audio one, nothing over the picture on a subtitle
+/// one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LaneKind {
     Video,
     Audio,
+    /// Words over the picture, placed and trimmed like everything else
+    /// ([`SubClip`]). A lane of its own rather than a setting on the project,
+    /// so a caption is dragged, cut, rippled and undone by the machinery every
+    /// other clip already goes through.
+    ///
+    /// It carries no [`Clip`] at all, and that is what keeps the media paths
+    /// free of it: [`Project::lane`] hands back an empty slice, so every
+    /// clip-indexed call ([`Project::trim`], [`Project::set_eq`],
+    /// [`Project::set_speed`], [`Project::lift`]) refuses it by the bounds
+    /// check it already had, [`Project::composite_span_at`] and
+    /// [`Project::audio_lanes`] never look at it, and the three doors that
+    /// could still put a picture on one -- [`Project::from_parts`],
+    /// [`Project::place`], [`Project::append_clip`] -- say so by name.
+    Subtitle,
 }
 
 /// Which lane an operation acts on: a kind plus a 0-based position among the
@@ -481,6 +507,10 @@ impl Lane {
     pub const V1: Lane = Lane::new(LaneKind::Video, 0);
     /// The first audio lane: what the audio worker plays.
     pub const A1: Lane = Lane::new(LaneKind::Audio, 0);
+    /// The first subtitle lane -- the one a project has only once something
+    /// added it ([`Project::add_lane`]); a project starts with `V1` and `A1`
+    /// alone.
+    pub const S1: Lane = Lane::new(LaneKind::Subtitle, 0);
 
     pub const fn new(kind: LaneKind, ord: usize) -> Self {
         Self { kind, ord }
@@ -492,8 +522,71 @@ impl Lane {
         let kind = match self.kind {
             LaneKind::Video => 'V',
             LaneKind::Audio => 'A',
+            LaneKind::Subtitle => 'S',
         };
         format!("{kind}{}", self.ord + 1)
+    }
+}
+
+/// A placed subtitle: a `[in_us, out_us)` window of one of the project's
+/// subtitle tracks ([`Project::subtitles`], which is the *palette*), shown from
+/// timeline frame [`start`](SubClip::start) for [`frames`](SubClip::frames)
+/// frames. Never empty at either end.
+///
+/// A [`Clip`] with the two frame spaces swapped for the two clocks a subtitle
+/// actually has, and placed by the same one number: the window is in the
+/// microseconds every parser here speaks ([`crate::subtitle::Cue`]), the
+/// placement is in timeline frames like everything else on a lane. So the lane
+/// invariant is the lane's ([`subs_sorted_disjoint`] is
+/// [`sorted_disjoint`] over the same arithmetic), a move is `start` and nothing
+/// else, and only the two calls that change a *duration* -- a trim, and the
+/// mapping out -- ever need the timeline's rate.
+///
+/// `Copy` for [`Clip`]'s reason: the palette is named by index, so a copy, a
+/// paste and an undo snapshot are a plain assignment and can never dangle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SubClip {
+    /// Timeline frame its first frame is shown at.
+    pub start: u32,
+    /// How many timeline frames it covers; `>= 1`. Held rather than derived
+    /// from the window because a [`Project`] has no frame rate -- the rate
+    /// enters at the door of the two calls that need it -- and every placement
+    /// question (where it ends, what it overlaps) is asked in frames.
+    pub frames: u32,
+    /// Index into [`Project::subtitles`]: *which* track's words these are.
+    pub track: usize,
+    /// The half-open window of that track it shows, in microseconds from the
+    /// start of the track -- exactly the clock its [`crate::subtitle::Cue`]s are
+    /// timed in, so no conversion stands between a cue and the window that
+    /// keeps it.
+    pub in_us: i64,
+    pub out_us: i64,
+}
+
+impl SubClip {
+    /// One past the last timeline frame it covers -- [`Clip::end`]'s twin, and
+    /// what every overlap question is asked of.
+    pub fn end(&self) -> u32 {
+        self.start + self.frames
+    }
+
+    /// How much of its track it shows, in microseconds; `>= 1` by the
+    /// never-empty invariant.
+    pub fn window_us(&self) -> i64 {
+        self.out_us - self.in_us
+    }
+
+    /// Where in its window the timeline frame `frame` falls, in microseconds --
+    /// the cut a split, a ripple and a trim all land on.
+    ///
+    /// By proportion and not by the timeline's rate: the window and the frame
+    /// count measure the same stretch of time, so the fraction of the frames
+    /// before `frame` is the fraction of the microseconds before it. That is
+    /// what lets a subtitle be cut by [`clear`]'s and [`open_room`]'s twins
+    /// without either of them learning an fps.
+    fn window_at(&self, frame: u32) -> i64 {
+        let into = i64::from(frame.saturating_sub(self.start));
+        self.in_us + self.window_us() * into / i64::from(self.frames.max(1))
     }
 }
 
@@ -503,8 +596,16 @@ impl Lane {
 #[derive(Clone, Debug)]
 struct LaneData {
     kind: LaneKind,
-    /// Sorted by `start` and disjoint ([`sorted_disjoint`]).
+    /// Sorted by `start` and disjoint ([`sorted_disjoint`]). Always empty on a
+    /// [`LaneKind::Subtitle`] lane, which is what keeps every media path from
+    /// ever seeing a subtitle: they all read this list.
     clips: Vec<Clip>,
+    /// The same, for a subtitle lane ([`subs_sorted_disjoint`]), and always
+    /// empty on a video or audio one. Beside the clips rather than an enum over
+    /// them so that everything a lane *is* -- its place in the stack, its
+    /// label, its undo snapshot, its removal -- stays one code path for all
+    /// three kinds.
+    subs: Vec<SubClip>,
     /// How loud this lane plays, in dB, `0.0` for one nobody has touched --
     /// [`Project::lane_gain_db`]. Whole-lane and whole-band, which is what
     /// makes it a different thing from a clip's equalizer: it moves everything
@@ -518,6 +619,7 @@ impl LaneData {
         Self {
             kind,
             clips,
+            subs: Vec::new(),
             gain_db: 0.0,
         }
     }
@@ -732,6 +834,18 @@ impl Project {
             .collect();
         for (data, lane) in lanes.iter().zip(handles(&lanes)) {
             let name = lane.label();
+            // A subtitle lane carries words and never a picture
+            // ([`LaneKind::Subtitle`]); a file that puts one there names a
+            // source on a lane that has nothing to play it with, and every
+            // media path below would then read a clip off a lane it does not
+            // know about.
+            if data.kind == LaneKind::Subtitle && !data.clips.is_empty() {
+                return Err(format!(
+                    "{name} is a subtitle track and holds {} media clip(s): a picture cannot play on one",
+                    data.clips.len()
+                )
+                .into());
+            }
             for c in &data.clips {
                 if c.out_frame <= c.in_frame {
                     return Err(format!(
@@ -858,14 +972,26 @@ impl Project {
         let Some(i) = self.index(lane) else {
             return Err(format!("there is no {} to remove", lane.label()).into());
         };
-        if self.lane_count(lane.kind) == 1 {
+        // A subtitle lane is not in that rule: nothing lands on one by itself
+        // -- a project starts without any and one is added when a caption is --
+        // so the last of them comes off like any other empty track.
+        if self.lane_count(lane.kind) == 1 && lane.kind != LaneKind::Subtitle {
             return Err(format!(
                 "{} is the only {} track: every import lands on it",
                 lane.label(),
                 match lane.kind {
                     LaneKind::Video => "video",
-                    LaneKind::Audio => "audio",
+                    LaneKind::Audio | LaneKind::Subtitle => "audio",
                 }
+            )
+            .into());
+        }
+        if let Some(sub) = self.lanes[i].subs.first() {
+            return Err(format!(
+                "{} still holds {} subtitle(s), the first at frame {}: delete those first",
+                lane.label(),
+                self.lanes[i].subs.len(),
+                sub.start
             )
             .into());
         }
@@ -985,10 +1111,14 @@ impl Project {
         }
     }
 
-    /// Append a whole-file clip of `source` to the end of *every* lane, grouped
-    /// -- an import lands as one take. One history snapshot, so an import is one
-    /// undo step, and undoing it leaves the (harmless) source entry behind,
-    /// because indexes are forever. Refused for an unknown source index.
+    /// Append a whole-file clip of `source` to the end of every *media* lane,
+    /// grouped -- an import lands as one take. Subtitle lanes are skipped: they
+    /// carry no [`Clip`] ([`LaneKind::Subtitle`]), and a file's own subtitles
+    /// come in through [`Project::add_subtitles`], which is the palette.
+    ///
+    /// One history snapshot, so an import is one undo step, and undoing it
+    /// leaves the (harmless) source entry behind, because indexes are forever.
+    /// Refused for an unknown source index.
     pub fn append_clip(&mut self, source: usize, frame_count: u32) -> bool {
         if source >= self.sources.len() {
             return false;
@@ -1006,7 +1136,11 @@ impl Project {
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
-        for data in &mut self.lanes {
+        for data in self
+            .lanes
+            .iter_mut()
+            .filter(|l| l.kind != LaneKind::Subtitle)
+        {
             data.clips.push(clip);
         }
         true
@@ -1145,7 +1279,20 @@ impl Project {
         }
         (
             sources,
-            lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
+            lanes
+                .into_iter()
+                // corner-cut: the subtitle lanes are left out, because [`Parts`]
+                // is `(LaneKind, Vec<Clip>)` and a subtitle lane's contents are
+                // [`SubClip`]s -- a `.edith` has no line to write one on yet, so
+                // a save that emitted the lane would write a track with nothing
+                // in it and a *reader* that has never seen the keyword would
+                // refuse the file. Upgrade path is the format slice that owns
+                // it: a `sub` line per placement (lane ord, start, frames,
+                // track, window) beside the `video`/`audio` ones, and this
+                // filter goes.
+                .filter(|l| l.kind != LaneKind::Subtitle)
+                .map(|l| (l.kind, l.clips))
+                .collect(),
             eq,
             color,
         )
@@ -1164,11 +1311,17 @@ impl Project {
     /// One undo step like every other edit -- it is in the lane list, so an
     /// undo restores it with the rest. `false`, and no history, for a lane that
     /// is not there, for a value that is not finite, and for one already set.
+    ///
+    /// `false` too for a subtitle lane, and that one is a *refusal* rather than
+    /// a value nobody reads: words have no loudness, so a slider that appeared
+    /// to move one would be a control with no effect. (A video lane's gain is
+    /// meaningless in the same way but is kept settable: it is the pair `A1`
+    /// carries for a take, and mixing reads it off the audio lane alone.)
     pub fn set_lane_gain_db(&mut self, lane: Lane, db: f32) -> bool {
         let Some(i) = self.index(lane) else {
             return false;
         };
-        if !db.is_finite() {
+        if !db.is_finite() || lane.kind == LaneKind::Subtitle {
             return false;
         }
         let db = db.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
@@ -1182,8 +1335,16 @@ impl Project {
 
     /// Every lane's volume in dB, in display order -- what a save writes,
     /// beside the lanes [`Project::without_orphan_sources`] hands back.
+    ///
+    /// The *same* lanes as that call, subtitle ones left out: a save zips the
+    /// two lists, so a lane that is in one and not the other would hand every
+    /// track below it the volume of the track above.
     pub fn lane_gains(&self) -> Vec<f32> {
-        self.lanes.iter().map(|l| l.gain_db).collect()
+        self.lanes
+            .iter()
+            .filter(|l| l.kind != LaneKind::Subtitle)
+            .map(|l| l.gain_db)
+            .collect()
     }
 
     /// The mix settings a *load* puts back: lane volumes in display order (a
@@ -1285,6 +1446,341 @@ impl Project {
         }
         self.subtitles.remove(idx);
         Ok(())
+    }
+
+    /// The subtitle lanes in display order -- what a front-end lays out and
+    /// what [`sub_lane_cues`](Project::sub_lane_cues) is asked of, the twin of
+    /// [`audio_lanes`](Project::audio_lanes).
+    pub fn subtitle_lanes(&self) -> Vec<Lane> {
+        self.lanes()
+            .into_iter()
+            .filter(|l| l.kind == LaneKind::Subtitle)
+            .collect()
+    }
+
+    /// What is placed on `lane`, in timeline order -- [`Project::lane`]'s twin
+    /// for a subtitle track, and empty for every other lane and for one that is
+    /// not there.
+    pub fn sub_lane(&self, lane: Lane) -> &[SubClip] {
+        self.index(lane).map_or(&[][..], |i| &self.lanes[i].subs)
+    }
+
+    /// Put `sub` on `lane` at timeline frame `at` -- [`place`](Project::place)'s
+    /// twin, with one deliberate difference: it **refuses** an overlap instead
+    /// of overwriting what it lands on.
+    ///
+    /// A picture placed over a picture hides it and the hidden one is still
+    /// there to drag back out; two captions in one frame are two lines nobody
+    /// asked to stack, and the words that lost are gone from the screen with
+    /// nothing to show for it. So the refusal names the placement in the way,
+    /// and the caller picks another frame or another lane -- which is what a
+    /// second subtitle lane is for.
+    ///
+    /// One undo step on success, and none on any refusal: an empty window or an
+    /// empty span, a track the palette does not have
+    /// ([`Project::subtitles`]), a lane that is not there, a lane that is not a
+    /// subtitle lane, a span that would run past the last frame there is, and
+    /// the overlap above.
+    pub fn place_sub(&mut self, lane: Lane, at: u32, sub: SubClip) -> crate::Result<()> {
+        if lane.kind != LaneKind::Subtitle {
+            return Err(format!(
+                "{} is not a subtitle track: words go on a subtitle track, pictures and sound on \
+                 the others",
+                lane.label()
+            )
+            .into());
+        }
+        let Some(i) = self.index(lane) else {
+            return Err(format!("there is no {} to place on", lane.label()).into());
+        };
+        if sub.frames == 0 || sub.out_us <= sub.in_us || sub.in_us < 0 {
+            return Err(format!(
+                "that placement is empty: {} frames of [{}, {})",
+                sub.frames, sub.in_us, sub.out_us
+            )
+            .into());
+        }
+        if sub.track >= self.subtitles.len() {
+            return Err(format!(
+                "it names subtitle track {} of {}",
+                sub.track,
+                self.subtitles.len()
+            )
+            .into());
+        }
+        let sub = SubClip { start: at, ..sub };
+        if at.checked_add(sub.frames).is_none() {
+            return Err(format!("a placement at frame {at} runs past the last frame there is").into());
+        }
+        if let Some(other) = self.lanes[i]
+            .subs
+            .iter()
+            .find(|o| o.end() > sub.start && o.start < sub.end())
+        {
+            return Err(format!(
+                "the {} subtitle at frame {} already covers [{}, {}): move it, or place this one \
+                 on another subtitle track",
+                lane.label(),
+                other.start,
+                other.start,
+                other.end()
+            )
+            .into());
+        }
+        self.snapshot();
+        let subs = &mut self.lanes[i].subs;
+        let idx = subs.partition_point(|o| o.start < sub.start);
+        subs.insert(idx, sub);
+        debug_assert!(subs_sorted_disjoint(subs));
+        Ok(())
+    }
+
+    /// Move the subtitle at `idx` of `from` onto `to` with its head at `start`
+    /// -- [`move_clip`](Project::move_clip)'s twin, and refusing an overlap
+    /// where that one clamps to it, for [`place_sub`](Project::place_sub)'s
+    /// reason: there is no group to hold a subtitle still and no picture under
+    /// it that a landing would hide, so "as far as it goes" would silently be a
+    /// frame nobody named.
+    ///
+    /// The window travels untouched: a caption dragged later says the same
+    /// words later, exactly as a clip dragged later plays the same pictures
+    /// later.
+    ///
+    /// One undo step on success; nothing changed and no step on a refusal --
+    /// an index that is not there, a lane that is not a subtitle lane or is not
+    /// there, an overlap, and a drop that changes neither lane nor frame.
+    pub fn move_sub(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> crate::Result<()> {
+        let Some(sub) = self.sub_lane(from).get(idx).copied() else {
+            return Err(format!("there is no subtitle {idx} on {}", from.label()).into());
+        };
+        if to.kind != LaneKind::Subtitle {
+            return Err(format!(
+                "{} is not a subtitle track: a caption cannot play on it",
+                to.label()
+            )
+            .into());
+        }
+        let (Some(here), Some(dest)) = (self.index(from), self.index(to)) else {
+            return Err(format!("there is no {} to move onto", to.label()).into());
+        };
+        if (here, start) == (dest, sub.start) {
+            return Err("that subtitle is already there".into());
+        }
+        if start.checked_add(sub.frames).is_none() {
+            return Err(
+                format!("a placement at frame {start} runs past the last frame there is").into(),
+            );
+        }
+        let moved = SubClip { start, ..sub };
+        if let Some(other) = self.lanes[dest]
+            .subs
+            .iter()
+            .enumerate()
+            .find(|&(j, o)| {
+                !(dest == here && j == idx) && o.end() > moved.start && o.start < moved.end()
+            })
+            .map(|(_, o)| *o)
+        {
+            return Err(format!(
+                "the {} subtitle at frame {} already covers [{}, {})",
+                to.label(),
+                other.start,
+                other.start,
+                other.end()
+            )
+            .into());
+        }
+        self.snapshot();
+        self.lanes[here].subs.remove(idx);
+        let subs = &mut self.lanes[dest].subs;
+        let at = subs.partition_point(|o| o.start < moved.start);
+        subs.insert(at, moved);
+        debug_assert!(subs_sorted_disjoint(subs));
+        debug_assert!(subs_sorted_disjoint(&self.lanes[here].subs));
+        Ok(())
+    }
+
+    /// Move one `edge` of the subtitle at `idx` of `lane` to timeline frame
+    /// `to` -- [`trim`](Project::trim)'s twin, and clamped like it: a hand
+    /// pulling an edge past what is legal means "as far as it goes".
+    ///
+    /// The window follows the edge, in the seconds the frames are worth at
+    /// `fps`: a head pulled in starts the caption later *in its track* (the
+    /// cues that were skipped stay skipped, exactly as a trimmed clip's frames
+    /// stay behind), and a tail pulled out shows more of it. `fps` is the one
+    /// thing a [`Project`] does not know -- it is the caller's timeline rate,
+    /// the same one [`crate::export::timeline_cues`] is asked with -- and it is
+    /// needed here and nowhere else in this file, because a trim is the only
+    /// edit that changes a *duration*.
+    ///
+    /// The walls: one frame always survives, an edge never crosses the
+    /// neighbouring subtitle on its own lane, a head never walks back past the
+    /// track's own start (`in_us` of 0), and a tail never runs past the last
+    /// cue the track has -- which is the source length a media trim needs a
+    /// caller's table for, and which this one can simply read.
+    ///
+    /// `Err`, with nothing changed and no undo step, for an index that is not
+    /// there, an unusable `fps`, and an edge already where it was asked to go.
+    pub fn trim_sub(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        to: u32,
+        fps: f64,
+    ) -> crate::Result<()> {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Err(format!("{fps} is not a frame rate to trim against").into());
+        }
+        let Some((lo, hi)) = self.trim_sub_room(lane, idx, edge, fps) else {
+            return Err(format!("there is no subtitle {idx} on {}", lane.label()).into());
+        };
+        let Some(sub) = self.sub_lane(lane).get(idx).copied() else {
+            return Err(format!("there is no subtitle {idx} on {}", lane.label()).into());
+        };
+        let to = to.clamp(lo, hi);
+        let at = match edge {
+            Edge::Start => sub.start,
+            Edge::End => sub.end(),
+        };
+        if to == at {
+            return Err(format!(
+                "that edge is at frame {at} already -- it cannot go past frames {lo}..{hi}"
+            )
+            .into());
+        }
+        self.snapshot();
+        let i = self.index(lane).expect("the subtitle was found on it");
+        let s = &mut self.lanes[i].subs[idx];
+        match edge {
+            // The words that stay are the words that were there, so the window
+            // moves with the head -- a trim, not a slip.
+            Edge::Start => {
+                // Clamped to a window that is still a window: the walls above
+                // are frames and the rounding between the two clocks is not
+                // exact, and neither is a caller's hand-built placement.
+                s.in_us = (s.in_us + us_of(i64::from(to) - i64::from(s.start), fps))
+                    .clamp(0, s.out_us - 1);
+                s.frames = s.end() - to;
+                s.start = to;
+            }
+            Edge::End => {
+                s.out_us =
+                    (s.out_us + us_of(i64::from(to) - i64::from(s.end()), fps)).max(s.in_us + 1);
+                s.frames = to - s.start;
+            }
+        }
+        debug_assert!(s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0);
+        debug_assert!(subs_sorted_disjoint(&self.lanes[i].subs));
+        Ok(())
+    }
+
+    /// How far that edge may travel, `(first, last)` timeline frame inclusive
+    /// -- [`trim_room`](Project::trim_room)'s twin, and what a front-end
+    /// drawing the box during a drag asks. `None` for an index that is not
+    /// there.
+    pub fn trim_sub_room(
+        &self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        fps: f64,
+    ) -> Option<(u32, u32)> {
+        let subs = self.sub_lane(lane);
+        let s = *subs.get(idx)?;
+        // How many timeline frames a stretch of the track is worth, which is
+        // what turns its two walls -- its own start, and its last cue -- into
+        // frames. A rate that is not a rate leaves the window where it is.
+        let frames_of = |us: i64| match fps.is_finite() && fps > 0.0 {
+            true => ((us as f64) * fps / 1e6).round().max(0.0).min(f64::from(u32::MAX)) as u32,
+            false => 0,
+        };
+        Some(match edge {
+            Edge::Start => (
+                s.start
+                    .saturating_sub(frames_of(s.in_us))
+                    .max(idx.checked_sub(1).map_or(0, |p| subs[p].end())),
+                s.end() - 1,
+            ),
+            Edge::End => {
+                // Out to the end of the track it reads, and never over the
+                // subtitle behind it. A track the palette no longer has (or one
+                // with no cues at all) may not grow, exactly as a source with no
+                // entry in a media trim's table may not.
+                let track_end = self
+                    .subtitles
+                    .get(s.track)
+                    .and_then(|t| t.cues.iter().map(|c| c.end_us).max())
+                    .unwrap_or(s.out_us);
+                (
+                    s.start + 1,
+                    s.start
+                        .saturating_add(frames_of(track_end - s.in_us).max(1))
+                        .min(subs.get(idx + 1).map_or(u32::MAX, |n| n.start)),
+                )
+            }
+        })
+    }
+
+    /// Take the subtitle at `idx` off `lane`, leaving a gap and moving nothing
+    /// else -- [`lift`](Project::lift)'s twin, and one undo step like it.
+    /// `false` for an index that is not there (which a lane that is not a
+    /// subtitle lane always is).
+    pub fn lift_sub(&mut self, lane: Lane, idx: usize) -> bool {
+        let Some(i) = self.index(lane).filter(|_| idx < self.sub_lane(lane).len()) else {
+            return false;
+        };
+        self.snapshot();
+        self.lanes[i].subs.remove(idx);
+        true
+    }
+
+    /// What `lane` shows, as cues on the **timeline's** clock: every placement's
+    /// window of its track, clipped to that window and shifted to where the
+    /// placement sits. The map [`crate::export::timeline_cues`] is for a track
+    /// carried through the picture's spans -- this is its twin for a track that
+    /// is placed on a lane of its own, and it is what a preview draws and what
+    /// an export of the lane would write.
+    ///
+    /// Cut, not stretched: a cue half inside the window keeps the half that is
+    /// inside, and a cue wholly outside it is gone -- the same rule the media
+    /// spans follow. `fps` is the timeline's rate, needed here because a
+    /// placement's *position* is in frames while its words are in microseconds.
+    ///
+    /// Pure and cheap enough to ask per repaint (a walk of the placements and
+    /// of their cues, no file opened), which is how a front-end asks it.
+    pub fn sub_lane_cues(&self, lane: Lane, fps: f64) -> Vec<SubtitleCue> {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for s in self.sub_lane(lane) {
+            let Some(track) = self.subtitles.get(s.track) else {
+                // A placement whose track was taken off the palette
+                // ([`Project::remove_subtitles`]) shows nothing rather than
+                // showing another track's words.
+                continue;
+            };
+            // Where the placement's own first microsecond lands on the
+            // timeline; every cue in the window is that far along from it.
+            let onto = |t: i64| (f64::from(s.start) / fps * 1e6).round() as i64 + (t - s.in_us);
+            for cue in &track.cues {
+                let (a, b) = (cue.start_us.max(s.in_us), cue.end_us.min(s.out_us));
+                if b <= a {
+                    continue; // wholly outside the window this placement keeps
+                }
+                out.push(SubtitleCue {
+                    start_us: onto(a),
+                    end_us: onto(b),
+                    text: cue.text.clone(),
+                    image: cue.image.clone(),
+                });
+            }
+        }
+        // The placements come in timeline order, but two lanes' worth (or a
+        // track whose cues a window reordered) do not.
+        out.sort_by_key(|cue| cue.start_us);
+        out
     }
 
     /// What each of [`audio_segments_from`](Project::audio_segments_from)'s
@@ -1587,15 +2083,34 @@ impl Project {
                 clip.out_frame = in_frame + len;
                 cursor = clip.end();
             }
+            // A subtitle's *window* is in microseconds and a rate change moves
+            // no seconds, so only where it sits is remapped -- through the same
+            // [`Rate::timeline_at`] every clip boundary goes through, so a
+            // caption still starts on the frame its picture does.
+            let mut cursor = 0;
+            for sub in &mut lane.subs {
+                let start = k.timeline_at(sub.start).max(cursor);
+                sub.frames = k.timeline_at(sub.end()).saturating_sub(start).max(1);
+                sub.start = start;
+                cursor = sub.end();
+            }
         }
     }
 
     /// Length of the timeline in frames: where the *last* lane runs out. A lane
     /// that ends early is a trailing gap in that lane, not a shorter timeline.
+    ///
+    /// A subtitle lane counts like any other: a caption placed past the last
+    /// picture holds the timeline open under it, exactly as an `A2` running
+    /// past `V1` does, rather than being silently clipped away by the length
+    /// ([`crate::export::timeline_cues`] clips cues to this).
     pub fn timeline_frames(&self) -> u32 {
         self.lanes
             .iter()
-            .filter_map(|l| l.clips.last().map(Clip::end))
+            .filter_map(|l| match l.kind {
+                LaneKind::Subtitle => l.subs.last().map(SubClip::end),
+                _ => l.clips.last().map(Clip::end),
+            })
             .max()
             .unwrap_or(0)
     }
@@ -1822,11 +2337,33 @@ impl Project {
                     .flatten()
             })
             .collect();
-        if cut.iter().all(Option::is_none) {
+        // The same question on the subtitle lanes, in their own arithmetic: a
+        // razor cuts the captions with the picture, and a frame where only a
+        // caption can be cut is still a cut.
+        let cut_subs: Vec<bool> = self
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                on.contains(&i) && l.subs.iter().any(|s| s.start < timeline_frame && timeline_frame < s.end())
+            })
+            .collect();
+        if cut.iter().all(Option::is_none) && !cut_subs.contains(&true) {
             return false;
         }
         if snapshot {
             self.snapshot();
+        }
+        for (data, _) in self
+            .lanes
+            .iter_mut()
+            .zip(&cut_subs)
+            .filter(|&(_, &cut)| cut)
+        {
+            // A split is room of no width: the halves keep their windows by
+            // proportion and nothing moves.
+            sub_open_room(&mut data.subs, timeline_frame, 0);
+            debug_assert!(subs_sorted_disjoint(&data.subs));
         }
         // Each side is its own question: two clips may start together and end
         // apart, and every lane whose halves do line up stays one take.
@@ -1879,12 +2416,24 @@ impl Project {
                     .map(|idx| (l.clips[idx].start, l.clips[idx + 1].end()))
             })
             .collect();
-        if joined.iter().all(Option::is_none) {
+        // ...and the subtitle lanes' own halves, by [`sub_joinable`]'s rule.
+        let join_subs: Vec<Option<usize>> = self
+            .lanes
+            .iter()
+            .map(|l| sub_joinable(&l.subs, timeline_frame))
+            .collect();
+        if joined.iter().all(Option::is_none) && join_subs.iter().all(Option::is_none) {
             return false;
         }
         self.snapshot();
         let ids = self.group_ids(&joined);
-        for (data, link) in self.lanes.iter_mut().zip(ids) {
+        for ((data, link), sub) in self.lanes.iter_mut().zip(ids).zip(join_subs) {
+            if let Some(idx) = sub {
+                data.subs[idx].frames += data.subs[idx + 1].frames;
+                data.subs[idx].out_us = data.subs[idx + 1].out_us;
+                data.subs.remove(idx + 1);
+                debug_assert!(subs_sorted_disjoint(&data.subs));
+            }
             let Some(idx) = joinable(&data.clips, timeline_frame) else {
                 continue;
             };
@@ -2019,9 +2568,14 @@ impl Project {
     /// another lane to be grouped *with*; [`Project::regroup`] is how clips
     /// become a group again.
     ///
-    /// Refused for an empty `clip` and for a lane that is not there.
+    /// Refused for an empty `clip`, for a lane that is not there, and for a
+    /// subtitle lane, which carries no picture and no sound
+    /// ([`Project::place_sub`] is its door).
     pub fn place(&mut self, lane: Lane, timeline_frame: u32, clip: Clip) -> bool {
-        if clip.out_frame <= clip.in_frame || self.index(lane).is_none() {
+        if clip.out_frame <= clip.in_frame
+            || lane.kind == LaneKind::Subtitle
+            || self.index(lane).is_none()
+        {
             return false;
         }
         self.snapshot();
@@ -2463,6 +3017,11 @@ impl Project {
                 .iter()
                 .flat_map(|l| &l.clips)
                 .any(|c| c.end() > at && c.end().checked_add(len).is_none())
+            || self
+                .lanes
+                .iter()
+                .flat_map(|l| &l.subs)
+                .any(|s| s.end() > at && s.end().checked_add(len).is_none())
         {
             return false;
         }
@@ -2500,6 +3059,11 @@ impl Project {
             .collect();
         for (i, data) in self.lanes.iter_mut().enumerate() {
             open_room(&mut data.clips, at, len);
+            // The room is opened on the subtitle lanes too, and for the reason
+            // it is opened on the lanes the paste does not land on: a caption
+            // that stayed put while the picture under it moved on is two things
+            // that no longer say the same thing.
+            sub_open_room(&mut data.subs, at, len);
             if takes.contains(&i) {
                 let idx = data.clips.partition_point(|c| c.start < at);
                 data.clips.insert(idx, clip);
@@ -3039,7 +3603,7 @@ impl Project {
 /// The handle of every lane, in storage order -- the one definition of what
 /// [`Lane::ord`] counts.
 fn handles(lanes: &[LaneData]) -> Vec<Lane> {
-    let (mut video, mut audio) = (0, 0);
+    let (mut video, mut audio, mut subtitle) = (0, 0, 0);
     lanes
         .iter()
         .map(|l| match l.kind {
@@ -3050,6 +3614,10 @@ fn handles(lanes: &[LaneData]) -> Vec<Lane> {
             LaneKind::Audio => {
                 audio += 1;
                 Lane::new(LaneKind::Audio, audio - 1)
+            }
+            LaneKind::Subtitle => {
+                subtitle += 1;
+                Lane::new(LaneKind::Subtitle, subtitle - 1)
             }
         })
         .collect()
@@ -3135,6 +3703,94 @@ fn color_finite(p: &ColorParams) -> bool {
 fn sorted_disjoint(clips: &[Clip]) -> bool {
     clips.iter().all(|c| c.out_frame > c.in_frame)
         && clips.windows(2).all(|w| w[0].end() <= w[1].start)
+}
+
+/// The very same invariant on a subtitle lane, in that lane's own two units:
+/// sorted by `start`, no two placements overlapping, no empty placement at
+/// either end. Asserted after every mutation, exactly as its twin is.
+fn subs_sorted_disjoint(subs: &[SubClip]) -> bool {
+    subs.iter()
+        .all(|s| s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0)
+        && subs.windows(2).all(|w| w[0].end() <= w[1].start)
+}
+
+/// What `frames` timeline frames are worth in microseconds at `fps`, signed --
+/// the one conversion between a lane's clock and a cue's, and `0` for a rate
+/// that is not one (every caller of this has already refused such a rate).
+fn us_of(frames: i64, fps: f64) -> i64 {
+    match fps.is_finite() && fps > 0.0 {
+        true => ((frames as f64) / fps * 1e6).round() as i64,
+        false => 0,
+    }
+}
+
+/// [`clear`] for a subtitle lane: removes the timeline frames `[start, end)`,
+/// dropping what is inside the hole, splitting what straddles it and trimming
+/// what overlaps an edge. The windows follow the cut by proportion
+/// ([`SubClip::window_at`]), so what is left says exactly the words it said.
+fn sub_clear(subs: &mut Vec<SubClip>, start: u32, end: u32) {
+    let mut out = Vec::with_capacity(subs.len() + 1);
+    for s in subs.drain(..) {
+        if s.end() <= start || s.start >= end {
+            out.push(s);
+            continue;
+        }
+        if s.start < start {
+            out.push(SubClip {
+                frames: start - s.start,
+                out_us: s.window_at(start),
+                ..s
+            });
+        }
+        if s.end() > end {
+            out.push(SubClip {
+                start: end,
+                frames: s.end() - end,
+                in_us: s.window_at(end),
+                ..s
+            });
+        }
+    }
+    *subs = out;
+}
+
+/// [`open_room`] for a subtitle lane: slides everything from `at` on later by
+/// `len`, splitting a placement that straddles `at` so the two halves end up on
+/// either side of the hole. A `len` of 0 is that split alone, which is what a
+/// [`Project::split`] over a subtitle lane is.
+fn sub_open_room(subs: &mut Vec<SubClip>, at: u32, len: u32) {
+    if let Some(idx) = subs.iter().position(|s| s.start < at && at < s.end()) {
+        let s = subs[idx];
+        let cut = s.window_at(at);
+        subs[idx] = SubClip {
+            frames: at - s.start,
+            out_us: cut,
+            ..s
+        };
+        subs.insert(
+            idx + 1,
+            SubClip {
+                start: at,
+                frames: s.end() - at,
+                in_us: cut,
+                ..s
+            },
+        );
+    }
+    for s in subs.iter_mut().filter(|s| s.start >= at) {
+        s.start += len;
+    }
+}
+
+/// [`joinable`] for a subtitle lane: the first of the two placements a
+/// [`Project::regroup`] at `frame` would rejoin. What a split could have
+/// produced and nothing else -- they touch on the timeline, they read the same
+/// track, and the second one's window carries on where the first's stopped.
+fn sub_joinable(subs: &[SubClip], frame: u32) -> Option<usize> {
+    let idx = subs.iter().position(|s| s.end() == frame)?;
+    let next = subs.get(idx + 1)?;
+    (next.start == frame && next.track == subs[idx].track && next.in_us == subs[idx].out_us)
+        .then_some(idx)
 }
 
 /// The grouping invariant, checked in release at [`Project::from_parts`] and
@@ -3251,6 +3907,15 @@ fn ripple(lanes: &mut [LaneData], on: &[usize], at: u32, len: u32) {
             c.start -= len;
         }
         debug_assert!(sorted_disjoint(clips));
+        // The subtitle lanes close the hole with everything else: a caption
+        // left standing where the picture it belongs to was cut out is the
+        // desync a lane model exists to make impossible.
+        let subs = &mut lanes[i].subs;
+        sub_clear(subs, at, at + len);
+        for s in subs.iter_mut().filter(|s| s.start >= at) {
+            s.start -= len;
+        }
+        debug_assert!(subs_sorted_disjoint(subs));
     }
 }
 

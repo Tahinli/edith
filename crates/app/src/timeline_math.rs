@@ -35,6 +35,9 @@ pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> b
         // The sound of a take, only while the take is still there: its group is
         // carried by a clip on some other lane.
         (LaneKind::Audio, _) => paired(),
+        // A subtitle lane carries no `Clip` at all, so the lookup above already
+        // returned: never a take, and never rippled as one.
+        (LaneKind::Subtitle, _) => false,
     }
 }
 
