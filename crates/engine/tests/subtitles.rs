@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use engine::project::{Edge, Lane, LaneKind, SubClip};
 use engine::scratch::Scratch;
 use engine::subtitle::{self, Cue};
 
@@ -689,6 +690,318 @@ fn a_track_that_states_its_language_the_modern_way_keeps_it() {
     let want: Vec<&str> = legacy.iter().map(|t| &*t.label).collect();
     let got: Vec<&str> = tracks.iter().map(|t| &*t.label).collect();
     assert_eq!(got, want, "the two files list the same two tracks");
+}
+
+/// The frame rate every placement test below counts in: at 30 fps a frame is
+/// 33333 microseconds and a second is 30 frames exactly, so a window and a span
+/// can be read against each other by eye.
+const LANE_FPS: f64 = 30.0;
+/// Never opened -- a `Project` is pure data ([`engine::Project::single`] reads
+/// no file), so a path that is not there simply dedups by spelling.
+const FILE: &str = "/nonexistent/subs.mp4";
+
+/// A project with the three-cue `.srt` on its palette and one empty subtitle
+/// lane: `V1`, `A1`, `S1`, which is the state a `+ S` press leaves.
+fn with_subtitle_lane() -> (engine::Project, Lane) {
+    let mut project = engine::Project::single(FILE, 150);
+    assert!(
+        project.add_subtitles(&subtitle::open(&data("test_subs.srt"), None)),
+        "the palette takes the track"
+    );
+    let lane = project.add_lane(LaneKind::Subtitle);
+    assert_eq!(lane, Lane::S1, "the first subtitle lane is S1");
+    assert_eq!(lane.label(), "S1", "and is written S1");
+    (project, lane)
+}
+
+/// A placement of the whole of palette track 0, five seconds of it.
+fn whole(track: usize) -> SubClip {
+    SubClip {
+        start: 0,
+        frames: 150,
+        track,
+        in_us: 0,
+        out_us: 5_000_000,
+    }
+}
+
+/// The lane half of the model: a caption is placed, trimmed at either end,
+/// moved and taken back -- all of it through the machinery a clip already goes
+/// through, so an undo is the lane snapshot every other edit pushes.
+#[test]
+fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
+    let (mut project, lane) = with_subtitle_lane();
+    project.place_sub(lane, 30, whole(0)).expect("it goes down");
+    assert_eq!(
+        project.sub_lane(lane),
+        [SubClip {
+            start: 30,
+            ..whole(0)
+        }],
+        "placed where it was asked for, window untouched"
+    );
+
+    // The tail in: fewer frames, and the window loses exactly the seconds the
+    // frames did (90 frames of 30 fps is 3s, so [0, 2s) is what is left).
+    project
+        .trim_sub(lane, 0, Edge::End, 90, LANE_FPS)
+        .expect("the tail comes in");
+    assert_eq!(
+        project.sub_lane(lane)[0],
+        SubClip {
+            start: 30,
+            frames: 60,
+            track: 0,
+            in_us: 0,
+            out_us: 2_000_000,
+        }
+    );
+
+    // ...and the head, which moves the window's *start* with it: the words that
+    // stay are the words that were there.
+    project
+        .trim_sub(lane, 0, Edge::Start, 45, LANE_FPS)
+        .expect("the head comes in");
+    assert_eq!(
+        project.sub_lane(lane)[0],
+        SubClip {
+            start: 45,
+            frames: 45,
+            track: 0,
+            in_us: 500_000,
+            out_us: 2_000_000,
+        }
+    );
+
+    // A move is `start` and nothing else -- the same words, later.
+    project
+        .move_sub(lane, 0, lane, 300)
+        .expect("it slides down the lane");
+    assert_eq!(
+        project.sub_lane(lane)[0],
+        SubClip {
+            start: 300,
+            frames: 45,
+            track: 0,
+            in_us: 500_000,
+            out_us: 2_000_000,
+        }
+    );
+
+    // ...and onto another subtitle track, which is the same call: a drag across
+    // lanes is where a second caption row is *for*.
+    let s2 = project.add_lane(LaneKind::Subtitle);
+    project.move_sub(lane, 0, s2, 300).expect("it changes lane");
+    assert!(project.sub_lane(lane).is_empty(), "off the first row");
+    assert_eq!(project.sub_lane(s2).len(), 1, "and onto the second");
+    assert!(project.undo() && project.undo(), "the move and the added lane");
+
+    // Every one of the four was one undo step, and the snapshots are the lane
+    // list's own: subtitles joined the history without a history of their own.
+    for want in [
+        SubClip {
+            start: 45,
+            frames: 45,
+            track: 0,
+            in_us: 500_000,
+            out_us: 2_000_000,
+        },
+        SubClip {
+            start: 30,
+            frames: 60,
+            track: 0,
+            in_us: 0,
+            out_us: 2_000_000,
+        },
+        SubClip {
+            start: 30,
+            ..whole(0)
+        },
+    ] {
+        assert!(project.undo(), "there is a step to walk back");
+        assert_eq!(project.sub_lane(lane)[0], want);
+    }
+    assert!(project.undo(), "and the placement itself");
+    assert!(
+        project.sub_lane(lane).is_empty(),
+        "which leaves the lane as it was added"
+    );
+}
+
+/// Two captions may not cover one frame of one lane, and every refusal says so
+/// in words -- the one place this model *differs* from
+/// [`engine::Project::place`], which overwrites what it lands on. A refusal
+/// costs no undo step.
+#[test]
+fn two_captions_may_not_cover_one_frame_and_the_refusal_says_which() {
+    let (mut project, lane) = with_subtitle_lane();
+    project
+        .place_sub(lane, 30, SubClip { frames: 60, ..whole(0) })
+        .expect("the first goes down");
+    let err = project
+        .place_sub(lane, 60, SubClip { frames: 60, ..whole(0) })
+        .expect_err("the second lands inside it");
+    assert!(
+        err.to_string().contains("already covers [30, 90)"),
+        "the refusal names the one in the way: {err}"
+    );
+
+    project
+        .place_sub(lane, 200, SubClip { frames: 60, ..whole(0) })
+        .expect("clear of it, it goes down");
+    let err = project
+        .move_sub(lane, 0, lane, 150)
+        .expect_err("and a drag onto it is refused too");
+    assert!(
+        err.to_string().contains("already covers [200, 260)"),
+        "by the same words: {err}"
+    );
+
+    // Neither refusal moved anything, and neither cost a step: one undo takes
+    // the *second placement* back, not a refusal.
+    assert_eq!(
+        project.sub_lane(lane).iter().map(|s| s.start).collect::<Vec<_>>(),
+        [30, 200]
+    );
+    assert!(project.undo());
+    assert_eq!(
+        project.sub_lane(lane).iter().map(|s| s.start).collect::<Vec<_>>(),
+        [30]
+    );
+
+    // The other refusals of the door, each in its own words.
+    for (lane, at, sub, want) in [
+        (Lane::V1, 0, whole(0), "not a subtitle track"),
+        (Lane::new(LaneKind::Subtitle, 4), 0, whole(0), "there is no S5"),
+        (Lane::S1, 0, SubClip { frames: 0, ..whole(0) }, "is empty"),
+        (Lane::S1, 0, SubClip { track: 7, ..whole(0) }, "subtitle track 7 of 1"),
+    ] {
+        let err = project.place_sub(lane, at, sub).expect_err("refused");
+        assert!(
+            err.to_string().contains(want),
+            "{want:?} is what it says, not {err:?}"
+        );
+    }
+}
+
+/// The mapping: what a lane *shows* is its placements' windows of their track,
+/// cut to the window and shifted to where the placement sits -- the twin of
+/// `export::timeline_cues` for a track that is placed rather than carried.
+#[test]
+fn a_lane_maps_to_cues_clipped_to_the_window_and_shifted_onto_the_timeline() {
+    let (mut project, lane) = with_subtitle_lane();
+    // Two seconds of the track, placed two seconds in: the first cue and no
+    // more -- the second starts at exactly 2s, which the half-open window ends
+    // at.
+    project
+        .place_sub(
+            lane,
+            60,
+            SubClip {
+                frames: 60,
+                out_us: 2_000_000,
+                ..whole(0)
+            },
+        )
+        .expect("it goes down");
+    let cues = project.sub_lane_cues(lane, LANE_FPS);
+    assert_eq!(cues.len(), 1, "one cue is inside that window");
+    assert_eq!(
+        (cues[0].start_us, cues[0].end_us, &*cues[0].text),
+        (2_500_000, 3_500_000, "first line"),
+        "shifted by the two seconds the placement sits at"
+    );
+
+    // A window that starts mid-cue keeps the half that is inside it, exactly as
+    // a cut clip keeps the frames that are.
+    project.undo();
+    project
+        .place_sub(
+            lane,
+            0,
+            SubClip {
+                frames: 60,
+                in_us: 1_000_000,
+                out_us: 3_000_000,
+                ..whole(0)
+            },
+        )
+        .expect("it goes down");
+    let cues = project.sub_lane_cues(lane, LANE_FPS);
+    assert_eq!(
+        cues.iter()
+            .map(|c| (c.start_us, c.end_us, c.text.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (0, 500_000, "first line".to_string()),
+            (1_000_000, 2_000_000, "second line\nwith a break".to_string()),
+        ],
+        "both cues clipped to the window and shifted to the placement"
+    );
+
+    // A placement whose track has been taken off the palette shows nothing --
+    // never another track's words.
+    project.remove_subtitles(0).expect("the row comes off");
+    assert!(
+        project.sub_lane_cues(lane, LANE_FPS).is_empty(),
+        "a placement with no track left shows nothing"
+    );
+    assert!(
+        project.sub_lane_cues(lane, 0.0).is_empty(),
+        "and a rate that is not a rate maps nothing"
+    );
+}
+
+/// The razor and the ripple, which is the whole reason a caption is a lane and
+/// not a setting: a cut through the picture cuts the words over it, and the
+/// windows follow by proportion -- no frame rate anywhere in that arithmetic.
+#[test]
+fn a_caption_is_cut_and_rippled_with_the_picture_under_it() {
+    let (mut project, lane) = with_subtitle_lane();
+    project
+        .place_sub(
+            lane,
+            0,
+            SubClip {
+                frames: 60,
+                out_us: 2_000_000,
+                ..whole(0)
+            },
+        )
+        .expect("it goes down");
+
+    // The razor: halves that add up to the whole, in frames and in microseconds.
+    assert!(project.split(30), "the cut lands on the picture and the words");
+    assert_eq!(
+        project
+            .sub_lane(lane)
+            .iter()
+            .map(|s| (s.start, s.frames, s.in_us, s.out_us))
+            .collect::<Vec<_>>(),
+        [(0, 30, 0, 1_000_000), (30, 30, 1_000_000, 2_000_000)]
+    );
+    // ...and its inverse puts the caption back exactly as it was.
+    assert!(project.regroup(30), "the halves rejoin");
+    assert_eq!(
+        project.sub_lane(lane).iter().map(|s| (s.start, s.frames, s.in_us, s.out_us)).collect::<Vec<_>>(),
+        [(0, 60, 0, 2_000_000)]
+    );
+
+    // A rippling delete through the middle of it: the hole closes, what was
+    // inside it is gone from the words as well as from the picture, and the two
+    // halves keep exactly the seconds they kept frames for.
+    assert!(project.ripple_delete(20, 20), "the hole closes on every lane");
+    assert_eq!(
+        project
+            .sub_lane(lane)
+            .iter()
+            .map(|s| (s.start, s.frames, s.in_us, s.out_us))
+            .collect::<Vec<_>>(),
+        [(0, 20, 0, 666_666), (20, 20, 1_333_333, 2_000_000)],
+        "cut by proportion of the window, not by a frame rate"
+    );
+    assert!(project.undo(), "and the whole ripple is one step");
+    assert_eq!(project.sub_lane(lane).len(), 1);
 }
 
 /// An EBML element: its id as it is written in the file, then an 8-byte

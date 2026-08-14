@@ -432,6 +432,12 @@ fn emit(
                 audio += 1;
                 ("audio", audio)
             }
+            // Unreachable by construction: `Project::without_orphan_sources`
+            // leaves the subtitle lanes out of the [`Parts`] it hands a save,
+            // because this format has no line to write a `SubClip` on yet and a
+            // reader that met the keyword would refuse the file. Skipped rather
+            // than emitted, and the corner-cut is named at the filter.
+            LaneKind::Subtitle => continue,
         };
         // A lane is declared by its clips; one holding nothing has to say so on
         // a line of its own, or the lane itself would not survive the round trip.
@@ -470,6 +476,9 @@ fn emit(
                 audio += 1;
                 ("audio", audio)
             }
+            // Never here, for the reason above -- and a subtitle lane has no
+            // volume to write anyway (`Project::set_lane_gain_db` refuses one).
+            LaneKind::Subtitle => continue,
         };
         if db != 0.0 {
             out.extend_from_slice(format!("gain {keyword} {ord} {db:?}\n").as_bytes());
