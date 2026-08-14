@@ -19,7 +19,7 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use engine::export::{ExportSettings, Format};
-use engine::project::Lane;
+use engine::project::{Lane, LaneKind, SubClip};
 use engine::scratch::Scratch;
 use engine::subtitle::{self, Cue, SubtitleTrack};
 use engine::{ExportHandle, Project};
@@ -130,6 +130,18 @@ fn both_tracks() -> Vec<SubtitleTrack> {
 /// and hands back what our own reader finds in the file -- one track per pick,
 /// in the order they were picked.
 fn exported(name: &str, project: Project, picks: &[usize]) -> (Scratch, Vec<SubtitleTrack>) {
+    exported_want(name, project, picks, picks.len())
+}
+
+/// The same, for a project whose tracks are its subtitle *lanes*: the picks say
+/// nothing then ([`engine::export::planned_subtitles`] reads the lanes instead),
+/// so how many tracks the file must carry is the caller's own statement.
+fn exported_want(
+    name: &str,
+    project: Project,
+    picks: &[usize],
+    want: usize,
+) -> (Scratch, Vec<SubtitleTrack>) {
     pin_software();
     let out = out_path(name);
     let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");
@@ -145,11 +157,7 @@ fn exported(name: &str, project: Project, picks: &[usize]) -> (Scratch, Vec<Subt
     );
     wait(&handle, Duration::from_secs(300)).expect("the export finishes");
     let tracks = subtitle::of_matroska(&out).expect("read the export back");
-    assert_eq!(
-        tracks.len(),
-        picks.len(),
-        "exactly the picked tracks: {tracks:?}"
-    );
+    assert_eq!(tracks.len(), want, "exactly the tracks asked for: {tracks:?}");
     for track in &tracks {
         assert_eq!(track.refused, None, "the track reads back as text");
     }
@@ -741,4 +749,266 @@ fn the_plan_says_what_each_container_does_with_them() {
         engine::export::planned_subtitles(&mixed, Format::Hevc, [0, 1]),
         "eng → embedded; fra — Signs — no cues"
     );
+}
+
+// --- The lanes -------------------------------------------------------------
+//
+// A timeline that *places* its words writes one track per subtitle lane, in
+// lane order, and the pick list above says nothing about it. Every project that
+// exists today has no placement and takes the old door -- which is what the
+// tests above are, unchanged.
+
+/// A project of the fixture media with one subtitle lane per `(track, at,
+/// frames, in_us, out_us)`, in the order given: `S1` first.
+fn on_lanes(tracks: Vec<SubtitleTrack>, placed: &[(usize, u32, u32, i64, i64)]) -> Project {
+    let mut project = Project::single(asset(MEDIA), FRAMES).with_subtitles(tracks);
+    for &(track, at, frames, in_us, out_us) in placed {
+        let lane = project.add_lane(LaneKind::Subtitle);
+        project
+            .place_sub(
+                lane,
+                at,
+                SubClip {
+                    start: at,
+                    frames,
+                    track,
+                    in_us,
+                    out_us,
+                },
+            )
+            .expect("the lane is empty, so the placement lands");
+    }
+    project
+}
+
+/// The whole of a palette row, placed at frame 0: the window every "this lane
+/// carries that track" test wants.
+const WHOLE: (u32, u32, i64, i64) = (0, FRAMES, 0, 5_000_000);
+
+/// Two lanes are two tracks, **in lane order** -- not in the palette's. `S1`
+/// carries the French row and `S2` the English one, and the file declares them
+/// that way round, which is what a subtitle menu will list.
+#[test]
+fn a_lane_is_a_track_and_the_lanes_order_the_file() {
+    let project = on_lanes(
+        both_tracks(),
+        &[
+            (1, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+            (0, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+        ],
+    );
+    // The card says the same before the button is pressed, lane by lane.
+    assert_eq!(
+        engine::export::planned_subtitles(&project, Format::Hevc, [0, 1]),
+        "2 lanes → embedded (S1 fra — Signs, S2 eng)"
+    );
+
+    // ...and the picks are *not* what travels: this asks for the palette's order
+    // and gets the lanes' one.
+    let (out, tracks) = exported_want("lanes_two", project, &[0, 1], 2);
+    assert_eq!(tracks[0].label, "fra — Signs", "S1 is the first track");
+    assert_eq!(tracks[1].label, "eng", "S2 is the second");
+    for track in &tracks {
+        assert_eq!(track.cues.len(), 3, "the lane's whole window: {track:?}");
+        near(track.cues[0].start_us, 500_000, "cue start");
+        near(track.cues[2].end_us, 4_750_000, "cue end");
+    }
+    if let Some(listing) = ffmpeg_streams(&out) {
+        assert!(
+            listing.contains("(fra): Subtitle") && listing.contains("(eng): Subtitle"),
+            "a second implementation reads both lanes: {listing}"
+        );
+    }
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The same two lanes into an **mp4**, where a track is `tx3g` timed text:
+/// ffmpeg reads two `mov_text` streams in the lanes' order.
+#[test]
+fn two_lanes_leave_an_mp4_as_two_timed_text_tracks() {
+    let project = on_lanes(
+        both_tracks(),
+        &[
+            (1, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+            (0, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+        ],
+    );
+    let out = exported_mp4("lanes_mp4", project, &[]);
+    let Some(listing) = ffmpeg_streams(&out) else {
+        println!("no ffmpeg on this box: an mp4's tx3g has no other reader here");
+        std::fs::remove_file(&out).unwrap();
+        return;
+    };
+    assert_eq!(
+        listing.matches("Subtitle: mov_text").count(),
+        2,
+        "one stream per lane, though nothing was picked: {listing}"
+    );
+    assert!(
+        listing.contains("(fra): Subtitle") && listing.contains("(eng): Subtitle"),
+        "both lanes' languages: {listing}"
+    );
+    let srt = ffmpeg_srt(&out, 0).expect("ffmpeg is here");
+    println!("ffmpeg reads mp4 lane S1 back as:\n{srt}");
+    assert!(
+        srt.contains("first line") && srt.contains("third line"),
+        "{srt}"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// A *trimmed* placement carries the cues its window keeps and no others, at the
+/// times the placement puts them: 2.5s..5.0s of the track, dropped at timeline
+/// frame 60, is the last two cues two and a half seconds earlier than the track
+/// states them -- and the first one, outside the window, is not in the file.
+#[test]
+fn a_trimmed_placement_writes_the_cues_it_keeps_where_it_puts_them() {
+    let project = on_lanes(vec![track()], &[(0, 60, 75, 2_500_000, 5_000_000)]);
+    let (out, tracks) = exported_want("lanes_trim", project, &[], 1);
+    let cues = &tracks[0].cues;
+    assert_eq!(cues.len(), 2, "the first cue is outside the window: {cues:?}");
+    // 2.0..3.25 of the track, of which 2.5s on is inside the window, landing at
+    // the placement's frame 60 (2.0s).
+    near(
+        cues[0].start_us,
+        2_000_000,
+        "the straddling cue starts at the drop",
+    );
+    near(cues[0].end_us, 2_750_000, "...and keeps the rest of its length");
+    assert_eq!(cues[0].text, "second line\nwith a break");
+    // 4.0..4.75, a second and a half into the window.
+    near(
+        cues[1].start_us,
+        3_500_000,
+        "the last cue moves with the placement",
+    );
+    near(cues[1].end_us, 4_250_000, "...end with it");
+    assert_eq!(cues[1].text, "third line");
+    if let Some(srt) = ffmpeg_srt(&out, 0) {
+        println!("ffmpeg reads the trimmed lane back as:\n{srt}");
+        assert!(!srt.contains("first line"), "{srt}");
+        assert!(srt.contains("00:00:02,000 --> 00:00:02,750"), "{srt}");
+        assert!(srt.contains("00:00:03,500 --> 00:00:04,250"), "{srt}");
+    }
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// A lane nobody has placed anything on is not a project that uses lanes: the
+/// picks still say what travels, byte for byte the file today's app exports.
+#[test]
+fn an_empty_lane_leaves_the_pick_list_in_charge() {
+    let mut project = Project::single(asset(MEDIA), FRAMES).with_subtitles(both_tracks());
+    project.add_lane(LaneKind::Subtitle);
+    assert_eq!(
+        engine::export::planned_subtitles(&project, Format::Hevc, [0]),
+        "eng → embedded",
+        "the pick list's words, not a lane's"
+    );
+    let (out, tracks) = exported("lanes_none", project, &[0]);
+    assert_eq!(tracks.len(), 1, "the pick, and only the pick");
+    assert_eq!(tracks[0].label, "eng");
+    assert_eq!(tracks[0].cues.len(), 3);
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// A lane of **pictures** writes nothing at all, and says why before the button
+/// is pressed: both muxers write words (`S_TEXT/UTF8`, `tx3g`) and neither has a
+/// path that could write a bitmap -- the refusal is the capability's absence and
+/// not a policy.
+#[test]
+fn a_lane_of_pictures_is_refused_in_words_and_written_nowhere() {
+    let mut pictures = track();
+    pictures.bitmap = true;
+    pictures.label = "PGS".into();
+    let project = on_lanes(
+        vec![track(), pictures],
+        &[
+            (0, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+            (1, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3),
+        ],
+    );
+    assert_eq!(
+        engine::export::planned_subtitles(&project, Format::Hevc, []),
+        "S1 eng → embedded; S2 PGS — pictures; drawn, not written",
+        "the picture lane costs its own row and not the other's"
+    );
+    // ...and the file has the one lane's track and nothing for the other: zero
+    // streams for a lane of pictures, not an empty one.
+    let (out, tracks) = exported_want("lanes_pgs", project, &[], 1);
+    assert_eq!(
+        tracks[0].label, "eng",
+        "the words travelled; the pictures did not"
+    );
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// A caption hanging past the last picture: the timeline is held open under it
+/// ([`Project::timeline_frames`]) but the export ends with the picture, so what
+/// is out there is cut off -- a cue straddling the end keeps the half inside, a
+/// lane wholly past it writes no track, and the card says so.
+#[test]
+fn a_caption_past_the_last_picture_is_cut_off_with_the_file() {
+    // S1 straddles the end: dropped at frame 120 (4.0s) with a 60-frame window
+    // of the track's first two seconds, so its one cue runs 4.5s..5.5s and the
+    // media stops at 5.0s. S2 sits entirely past the end.
+    let project = on_lanes(
+        vec![track(), track()],
+        &[(0, 120, 60, 0, 2_000_000), (1, FRAMES, 60, 0, 2_000_000)],
+    );
+    assert_eq!(project.timeline_frames(), 210, "the captions hold it open");
+    assert_eq!(project.media_frames(), FRAMES, "the pictures do not");
+    assert_eq!(
+        engine::export::planned_subtitles(&project, Format::Hevc, []),
+        "S1 eng → embedded; S2 eng — past the last picture; cues past the last picture are cut \
+         off there"
+    );
+
+    let (out, tracks) = exported_want("lanes_tail", project, &[], 1);
+    let cues = &tracks[0].cues;
+    assert_eq!(cues.len(), 1, "the one cue the window holds: {cues:?}");
+    near(cues[0].start_us, 4_500_000, "where the placement puts it");
+    near(cues[0].end_us, 5_000_000, "cut off with the last picture");
+    std::fs::remove_file(&out).unwrap();
+}
+
+/// The Matroska ceiling counts lanes as it counts picks: past `MAX_SUB_TRACKS` a
+/// block could not number the track, so the card says so and the export refuses
+/// by name and leaves no file.
+#[test]
+fn more_lanes_than_a_block_can_number_are_refused_by_name() {
+    pin_software();
+    let over = engine::mux::MAX_SUB_TRACKS + 1;
+    let project = on_lanes(
+        (0..over).map(|_| track()).collect(),
+        &(0..over)
+            .map(|i| (i, WHOLE.0, WHOLE.1, WHOLE.2, WHOLE.3))
+            .collect::<Vec<_>>(),
+    );
+    let said = engine::export::planned_subtitles(&project, Format::Hevc, []);
+    assert!(
+        said.contains(&format!("{over} subtitle lanes"))
+            && said.contains(&format!("at most {}", engine::mux::MAX_SUB_TRACKS)),
+        "the card says how many were placed and how many fit: {said}"
+    );
+
+    let out = out_path("lanes_ceiling");
+    let (meta, _) = engine::demux::Demuxer::open(&asset(MEDIA)).expect("probe the media");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Hevc,
+            ..Default::default()
+        },
+    );
+    let said = wait(&handle, Duration::from_secs(300))
+        .expect_err("a file that cannot be numbered is not written")
+        .to_string();
+    assert!(
+        said.contains(&format!("{over} subtitle tracks"))
+            && said.contains(&format!("at most {}", engine::mux::MAX_SUB_TRACKS)),
+        "the muxer refuses it again, in its own words: {said}"
+    );
+    assert!(!out.exists(), "and no half-written file is left: {said}");
 }
