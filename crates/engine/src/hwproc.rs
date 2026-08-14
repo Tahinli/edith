@@ -462,18 +462,31 @@ impl Remote {
 
     /// What the child's encoder codes in, or `None` where it has no zero-copy
     /// door.
+    ///
+    /// The two `None`s are not the same thing and only one of them is an
+    /// answer. A child that *says* it has no door costs the caller a read-back
+    /// and nothing else; a child that does not answer at all is gone, and is
+    /// reaped right here -- otherwise the next picture would spend a whole
+    /// second timeout discovering what this call already knows.
     pub fn dma_geometry(&mut self) -> Option<(u32, u32)> {
         self.request(&[T_GEOM], &[]).ok()?;
-        let (tag, _) = recv_tag(&self.sock).ok()?;
-        if tag != R_AU {
-            return None;
-        }
         let mut buf = [0u8; 8];
-        self.sock.read_exact(&mut buf).ok()?;
-        Some((
-            u32::from_le_bytes(buf[..4].try_into().ok()?),
-            u32::from_le_bytes(buf[4..].try_into().ok()?),
-        ))
+        let answered = match recv_tag(&self.sock) {
+            Ok((R_AU, _)) => self.sock.read_exact(&mut buf).map(|()| true),
+            Ok(_) => Ok(false),
+            Err(e) => Err(e),
+        };
+        match answered {
+            Ok(true) => Some((
+                u32::from_le_bytes(buf[..4].try_into().ok()?),
+                u32::from_le_bytes(buf[4..].try_into().ok()?),
+            )),
+            Ok(false) => None,
+            Err(e) => {
+                self.bury(&e.to_string());
+                None
+            }
+        }
     }
 
     /// Feeds one packed I420 picture through the shared mapping.
