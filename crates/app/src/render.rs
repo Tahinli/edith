@@ -647,7 +647,6 @@ impl Render for Player {
             .child(self.toolbar(cx))
             .child(self.timeline(
                 position,
-                duration,
                 state,
                 f32::from(window.viewport_size().height),
                 cx,

@@ -12,7 +12,6 @@ impl Player {
     pub(crate) fn timeline(
         &self,
         position: f64,
-        duration: f64,
         state: Transport,
         viewport_h: f32,
         cx: &mut Context<Self>,
@@ -23,10 +22,6 @@ impl Player {
         // the bed for long.
         let bed_w = f32::from(self.ruler.get().size.width);
         let filled = self.scale.px_at(position).clamp(0., bed_w);
-        // An export owns the hint slot and the ruler while it runs: the
-        // percentage and the accent bar are the same number, so the playhead
-        // fill doubles as the progress bar for free.
-        let exporting = self.exporting().is_some();
         let key = |action| self.keymap.display(action);
         // The lanes the project has, or the pair a fresh one starts with so the
         // panel reads the same before a file is open as after.
