@@ -924,6 +924,27 @@ fn lane_subtitles(project: &Project, fps: f64) -> Vec<SubParams> {
         .collect()
 }
 
+/// The composite spans an export *writes*: [`Project::composite_spans_from`]
+/// cut to where the media runs out ([`Project::media_frames`]).
+///
+/// The walk itself is the timeline's ([`Project::timeline_frames`]), because a
+/// caption placed past the last picture holds the timeline open under it and
+/// playback parks on that tail -- but there is nothing to *write* out there, so
+/// an unbounded walk encoded and muxed black frames past the end of the media
+/// and padded the sound to match. This is the one place that end is decided:
+/// the frame count [`run`] publishes, the cues [`lane_subtitles`] clips and the
+/// blocks [`CopyPlan`] copies are then the same number by construction, which
+/// is what makes [`planned_lanes`]' "cut off there" true of the file.
+fn export_spans(project: &Project) -> Vec<crate::project::Span> {
+    let end = project.media_frames();
+    let mut spans = project.composite_spans_from(0);
+    spans.retain(|span| span.start < end);
+    for span in &mut spans {
+        span.len = span.len.min(end - span.start);
+    }
+    spans
+}
+
 /// The track's cues where the *exported* timeline puts them, which is the only
 /// clock the file has: the export writes timeline frame 0 onwards and nothing
 /// else, exactly as the sound is mixed from frame 0 and resized to the
@@ -1275,7 +1296,24 @@ fn copy_audio(
     // everything on `A2`), and copying `A1`'s list in that case would write a
     // file with no audio track at all -- silently, which is the failure this
     // whole comment is about.
-    let lanes = project.audio_segments_from(0, meta.frame_rate);
+    let mut lanes = project.audio_segments_from(0, meta.frame_rate);
+    // ...cut to what the picture writes ([`export_spans`]). The play list is
+    // the *timeline's* ([`Project::timeline_frames`]), so a caption hanging past
+    // the last picture ends every audio lane with a trailing gap -- silence this
+    // path would copy out past the last frame, three seconds of it on the film
+    // this was found on. Only a gap can be out there (`media_frames` is the last
+    // clip's own end), and the mixed paths already resize to the same length
+    // ([`encode_audio`]); a copy carries source packets and has no resize.
+    let over = f64::from(project.timeline_frames() - project.media_frames()) / meta.frame_rate;
+    for lane in &mut lanes {
+        match lane.last_mut() {
+            Some((None, _, len)) if *len > over => *len -= over,
+            Some((None, _, _)) if over > 0.0 => {
+                lane.pop();
+            }
+            _ => {}
+        }
+    }
     let [segments] = &lanes[..] else {
         return encode_audio(project, meta, kbps, mkv, shared);
     };
@@ -1414,7 +1452,7 @@ impl CopyPlan {
         let mut sources: Vec<Option<MkvDemuxer>> = (0..entries.len()).map(|_| None).collect();
         let mut declared: Option<(Vec<u8>, ColorDescription)> = None;
         let mut regions: Vec<CopyRegion> = Vec::new();
-        for span in project.composite_spans_from(0) {
+        for span in export_spans(project) {
             // A gap is black frames, which only an encoder makes.
             let (source, in_frame) = span.from?;
             if !span.speed.is_normal() {
@@ -2230,10 +2268,12 @@ fn run(
     let black = Black::new(meta);
     // Spans, not clips: a gap in the video is part of the timeline and gets
     // encoded too, as black frames. The picture count is therefore
-    // `timeline_frames` however the lanes are arranged -- and *which* lane a
-    // span comes from is `composite_spans_from`'s answer, the same one playback
-    // shows, so an export is what was watched.
-    for span in project.composite_spans_from(0) {
+    // `media_frames` however the lanes are arranged -- [`export_spans`] is that
+    // walk cut to it, so `done` ends on the `total` above instead of running
+    // past it under a trailing caption -- and *which* lane a span comes from is
+    // `composite_spans_from`'s answer, the same one playback shows, so an
+    // export is what was watched.
+    for span in export_spans(project) {
         // Every clip reopens its own source file at its own in point; the
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the

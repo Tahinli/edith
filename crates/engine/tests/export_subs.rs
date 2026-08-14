@@ -156,6 +156,10 @@ fn exported_want(
         },
     );
     wait(&handle, Duration::from_secs(300)).expect("the export finishes");
+    // The bar ends where it was told it would: the picture loop's own count and
+    // the total published for it are one number ([`export::export_spans`]), so a
+    // walk that ran past the media would show up here as well as in the file.
+    assert_eq!(handle.progress(), 1.0, "finished at full progress");
     let tracks = subtitle::of_matroska(&out).expect("read the export back");
     assert_eq!(tracks.len(), want, "exactly the tracks asked for: {tracks:?}");
     for track in &tracks {
@@ -216,6 +220,54 @@ fn ffmpeg_streams(path: &Path) -> Option<String> {
     let listing = String::from_utf8_lossy(&out.stderr).into_owned();
     println!("ffmpeg sees:\n{listing}");
     Some(listing)
+}
+
+/// The average luma of the **last** picture in `path`, as ffmpeg's
+/// `signalstats` measures it: what says a file's tail is a picture and not the
+/// encoded black a walk past the media would leave. `None` where there is no
+/// ffmpeg on the box, the same posture the readers above take.
+fn ffmpeg_last_luma(path: &Path) -> Option<f64> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    assert!(
+        out.status.success(),
+        "ffmpeg refused the exported picture: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let last = printed
+        .lines()
+        .filter_map(|line| line.split_once("YAVG=").map(|(_, v)| v.trim().to_string()))
+        .next_back()
+        .expect("signalstats printed a YAVG per frame");
+    println!("last written picture: YAVG {last}");
+    Some(last.parse().expect("YAVG is a number"))
+}
+
+/// When the file's **last sound** is, as ffprobe reads the packets: the sound is
+/// the other end that has to stop with the picture -- a copied lane's trailing
+/// gap is silence written past the last frame. `None` where there is no ffprobe.
+fn ffprobe_last_audio_pts(path: &Path) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let last = printed.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    println!("last audio packet: {last} s");
+    last.trim_end_matches(',').parse().ok()
 }
 
 fn near(got: i64, want: i64, what: &str) {
@@ -968,6 +1020,43 @@ fn a_caption_past_the_last_picture_is_cut_off_with_the_file() {
     assert_eq!(cues.len(), 1, "the one cue the window holds: {cues:?}");
     near(cues[0].start_us, 4_500_000, "where the placement puts it");
     near(cues[0].end_us, 5_000_000, "cut off with the last picture");
+
+    // ...and the *file* is that long, which is what makes the sentence above
+    // true rather than merely written: the picture stops with the media and the
+    // 60 frames the caption hangs over it are not encoded black.
+    let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen the export");
+    assert_eq!(
+        written.frame_count, FRAMES,
+        "the pictures end with the media, not with the caption"
+    );
+    // A count alone would pass on a file whose tail is black, so the last
+    // picture is *looked at*: a padded frame is 16/128/128 and reads back at
+    // YAVG 16. ffmpeg does the looking -- this file is HEVC and there is no
+    // software HEVC decoder here to read it back with.
+    match ffmpeg_last_luma(&out) {
+        Some(luma) => assert!(
+            luma > 20.0,
+            "the last written picture is black (YAVG {luma:.2}): the walk ran past the media"
+        ),
+        None => println!("no ffmpeg on this box: the frame count is the only witness"),
+    }
+    // ...and the sound stops with the picture: the copied lane's trailing gap
+    // is the same overhang, written as silence rather than as black.
+    let duration_s = f64::from(written.frame_count) / written.frame_rate;
+    match ffprobe_last_audio_pts(&out) {
+        Some(pts) => assert!(
+            pts <= duration_s,
+            "the sound runs to {pts:.3} s, past the picture's {duration_s:.3} s"
+        ),
+        None => println!("no ffprobe on this box: the picture is the only witness"),
+    }
+    // The cue is inside the file it was clipped to, by the file's own clock.
+    let duration_us = (duration_s * 1e6).round() as i64;
+    assert!(
+        cues[0].end_us <= duration_us + SLACK_US,
+        "the cue ends at {} us, past the file's {duration_us} us",
+        cues[0].end_us
+    );
     std::fs::remove_file(&out).unwrap();
 }
 
