@@ -1095,12 +1095,10 @@ pub fn clip_kind(kind: LaneKind, image: bool) -> u32 {
         LaneKind::Audio => CLIP_AUDIO(),
         LaneKind::Video if image => CLIP_IMAGE(),
         LaneKind::Video => CLIP_VIDEO(),
-        // A caption borrows the still's shade until the slice that draws
-        // subtitle lanes gives it one of its own in every family: nothing on
-        // screen paints one yet (the engine model landed first), and inventing
-        // a colour here for a box nobody draws is the one thing this call says
-        // not to do.
-        LaneKind::Subtitle => CLIP_IMAGE(),
+        // The purple every editor paints a title track, and the one clip colour
+        // this palette already carried and nothing drew: a caption's box is now
+        // that box.
+        LaneKind::Subtitle => CLIP_TEXT(),
     }
 }
 

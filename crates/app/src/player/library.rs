@@ -147,8 +147,10 @@ impl Player {
         self.clipboard = None;
         self.selected = None;
         self.selected_asset = None;
-        // The subtitle rows go with the timeline they were on.
+        // The subtitle rows go with the timeline they were on, and so do the
+        // eyes: S1 of one project is not S1 of the next.
         self.sub_track = 0;
+        self.subs_off.clear();
         self.context_menu = None;
         self.library_menu = None;
         self.eq_open = None;
@@ -691,7 +693,7 @@ impl Player {
         // same question -- and *before* the chooser rather than after it: a door
         // that opens a dialog, waits for a file and only then says the timeline
         // was never there is the second door disagreeing with the first.
-        if let Some(why) = self.enable(ActionId::AddSubtitleTrack, None).why() {
+        if let Some(why) = self.enable(ActionId::ImportSubtitles, None).why() {
             let text = format!("NO SUBTITLES ADDED — {why}");
             eprintln!("{text}");
             self.notify_user(text.into());
@@ -782,12 +784,17 @@ impl Player {
     ) {
         let text = match added {
             Some(Ok(0)) => format!(
-                "{}'s subtitles are on the timeline already",
+                "{}'s subtitles are in the palette already",
                 file_name(path)
             ),
+            // Where they are and what to do with them: the tracks are in the
+            // palette and nothing is placed until one is dragged onto an S
+            // track, which is the whole of what this door does.
             Some(Ok(n)) => format!(
-                "SUBTITLES {} — {n} track(s), showing over the picture, {} hides them",
+                "SUBTITLES {} — {n} track(s) in the palette — drag one onto an S track ({} adds \
+                 one), showing over the picture meanwhile, {} hides them",
                 file_name(path),
+                self.keymap.display(ActionId::AddSubtitleLane),
                 self.keymap.display(ActionId::ToggleSubtitles)
             ),
             Some(Err(e)) => format!("SUBTITLE IMPORT FAILED: {e}"),
@@ -816,7 +823,10 @@ impl Player {
         // action with nothing to act on, and the engine's "there is no subtitle
         // track 0" is an index nobody typed. A real removal that fails still
         // says what the engine said, below.
-        if let Some(why) = self.enable(ActionId::RemoveSubtitleTrack, None).why() {
+        // The palette's list is what this takes a row off, and an empty list is
+        // the very fact the toggle is refused by -- so the same arm answers
+        // both (oracle.rs) rather than a second reading of the same state.
+        if let Some(why) = self.enable(ActionId::ToggleSubtitles, None).why() {
             let text = format!("NO SUBTITLES REMOVED — {why}");
             eprintln!("{text}");
             self.notify_user(text.into());
@@ -847,8 +857,9 @@ impl Player {
                 // note, for its reason and with its upgrade path.
                 self.sub_image = None;
                 format!(
-                    "{name} REMOVED — {} puts a file's subtitles back on, the file itself stays off",
-                    self.keymap.display(ActionId::AddSubtitleTrack)
+                    "{name} REMOVED — {} puts a file's subtitles back in the palette, the file \
+                     itself stays off",
+                    self.keymap.display(ActionId::ImportSubtitles)
                 )
             }
             Some(Err(e)) => format!("NO SUBTITLES REMOVED — {e}"),
@@ -954,8 +965,16 @@ impl Player {
                 let lane = session.add_lane(kind);
                 self.notify_user(
                     format!(
-                        "{} ADDED — drag a clip onto it, {} takes it back",
+                        "{} ADDED — drag {} onto it, {} takes it back",
                         lane.label(),
+                        // A subtitle lane takes no clip at all: what lands on it
+                        // is a palette row, so the notice names the panel the
+                        // hand has to go to rather than "a clip", which is the
+                        // one thing that will never work here.
+                        match kind {
+                            LaneKind::Subtitle => "a subtitle from the panel",
+                            _ => "a clip",
+                        },
                         self.keymap.display(ActionId::Undo)
                     )
                     .into(),
@@ -991,6 +1010,10 @@ impl Player {
                 self.color_open = None;
                 self.speed_open = None;
                 self.close_silence();
+                // The eyes with them: a `Lane` is a position among its
+                // kind, so every shut one now names another track --
+                // the same reason the selection and the cards go.
+                self.subs_off.clear();
                 format!(
                     "{} REMOVED — {} brings it back",
                     lane.label(),
@@ -1043,6 +1066,10 @@ impl Player {
             self.color_open = None;
             self.speed_open = None;
             self.close_silence();
+            // The eyes with them: a `Lane` is a position among its
+            // kind, so every shut one now names another track --
+            // the same reason the selection and the cards go.
+            self.subs_off.clear();
         }
         self.notify_user(
             format!(
@@ -1069,8 +1096,25 @@ impl Player {
         });
         match last {
             Some(lane) => self.remove_lane(lane, cx),
+            // Two different nothings: no timeline at all, and a timeline whose
+            // lanes of this kind have all gone -- which is the ordinary state of
+            // the subtitle ones, since a project starts with none. "Open a file
+            // first" over an open file is a notice that reads as a bug.
             None => {
-                self.notify_user("NO TRACK REMOVED — open a file first".into());
+                self.notify_user(
+                    match self.session.is_some() {
+                        true => format!(
+                            "NO TRACK REMOVED — there is no {} track to remove",
+                            match kind {
+                                LaneKind::Video => "video",
+                                LaneKind::Audio => "audio",
+                                LaneKind::Subtitle => "subtitle",
+                            }
+                        ),
+                        false => "NO TRACK REMOVED — open a file first".to_string(),
+                    }
+                    .into(),
+                );
                 cx.notify();
             }
         }
