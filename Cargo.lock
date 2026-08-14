@@ -1639,6 +1639,7 @@ dependencies = [
  "flacenc",
  "hound",
  "image",
+ "libc",
  "libloading",
  "miniz_oxide",
  "mp4",
