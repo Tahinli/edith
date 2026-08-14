@@ -123,22 +123,7 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
         );
         let out = out_path("planned", ext);
         let handle = session.export_to_with(&out, &settings);
-        let started = Instant::now();
-        let opened = loop {
-            if let Some(line) = handle.encoders() {
-                break line;
-            }
-            assert!(
-                !handle.is_finished(),
-                "the export settled before it opened an encoder: {:?}",
-                handle.result().map(|r| r.err())
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(60),
-                "no encoder was published"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+        let opened = published_encoders(&handle, ext);
         // Nothing here wants the file, only the seat it was going to be written
         // with: cancelling deletes the `.part` the worker had started.
         handle.cancel();
@@ -201,22 +186,7 @@ fn the_planned_seat_follows_the_size_and_the_pin() {
                 }
                 let out = out_path("seat", ext);
                 let handle = session.export_to_with(&out, &settings);
-                let started = Instant::now();
-                let opened = loop {
-                    if let Some(line) = handle.encoders() {
-                        break line;
-                    }
-                    assert!(
-                        !handle.is_finished(),
-                        "{ext} {width}x{height}: settled before an encoder opened: {:?}",
-                        handle.result().map(|r| r.err())
-                    );
-                    assert!(
-                        started.elapsed() < Duration::from_secs(60),
-                        "no encoder was published"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                };
+                let opened = published_encoders(&handle, &format!("{ext} {width}x{height}"));
                 handle.cancel();
                 wind_down(&handle);
                 assert!(
@@ -313,28 +283,64 @@ fn a_mixed_timeline_says_it_re_encodes_and_then_does() {
             ..ExportSettings::default()
         },
     );
-    let started = Instant::now();
-    let opened = loop {
-        if let Some(line) = handle.encoders() {
-            break line;
-        }
-        assert!(
-            !handle.is_finished(),
-            "the export settled before it opened an encoder: {:?}",
-            handle.result().map(|r| r.err())
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "no encoder was published"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    handle.cancel();
-    wind_down(&handle);
+    let opened = published_encoders(&handle, "a mixed timeline");
     assert!(
         opened.ends_with(&planned),
         "{opened} does not end in {planned}"
     );
+    // ...and it is the line the job *settles* on, which is why this one runs to
+    // the end instead of cancelling: an mp4 mixes its sound beside the picture,
+    // and a hardware picture is through first, so the measured codec reaches the
+    // line where the pass is collected under the muxer rather than in the frame
+    // loop. A card left saying "working out the sound…" over a written file is
+    // the same lie as one naming a codec that never ran.
+    let started = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "the export did not finish in 300 s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.result().expect("an outcome").expect("the export");
+    let settled = handle.encoders().expect("a finished job still names its seats");
+    assert!(
+        settled.ends_with(&planned),
+        "the export settled on {settled}, which does not end in {planned}"
+    );
+}
+
+/// The half-line an export shows while its sound is still being mixed on the
+/// thread beside the picture (`engine::export::publish_seats`). An mp4 job
+/// overlaps the two passes, so this is what the *first* line out of one says
+/// about a codec that has not run yet.
+const MIXING: &str = "working out the sound…";
+
+/// The encoders line a running job settles on: published as soon as the picture
+/// seat is open, and completed once the sound has been measured. Waiting for the
+/// second half is what makes this the line a card shows rather than a snapshot
+/// of an export mid-decision -- and, because a job that ends without ever
+/// completing it fails here, it is also the pin on that completion happening at
+/// all, whichever of the two passes finishes first.
+fn published_encoders(handle: &ExportHandle, what: &str) -> String {
+    let started = Instant::now();
+    loop {
+        match handle.encoders() {
+            Some(line) if !line.ends_with(MIXING) => return line,
+            _ => {}
+        }
+        assert!(
+            !handle.is_finished(),
+            "{what}: the export settled without naming its encoders ({:?}): {:?}",
+            handle.encoders(),
+            handle.result().map(|r| r.err())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{what}: no encoder was published"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Waits for a cancelled job to settle, so its `.part` is gone before the test
