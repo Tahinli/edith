@@ -1865,6 +1865,31 @@ mod tests {
         assert_eq!(gop_limit(u32::MAX, false), u16::MAX);
     }
 
+    /// What that group of one writes into the sequence header, which is the
+    /// half that shipped broken: the predictor hands the limit straight to
+    /// `SpsBuilder::max_frame_num` (`h264/predictor.rs:89`), and `1.ilog2()`
+    /// is 0, so the old `0u8 - 4u8` wrapped to 252 in release. Every intra-only
+    /// hardware file then carried `log2_max_frame_num_minus4 = 252` -- outside
+    /// the spec's 0..=12 -- and no decoder would parse it. Zero is the right
+    /// answer, not merely a legal one: `frame_num` never leaves 0 when every
+    /// picture is an IDR. No GPU: this is the bitstream side of the seat.
+    #[test]
+    fn an_intra_seat_writes_a_sequence_header_a_decoder_can_read() {
+        use cros_codecs::codec::h264::parser::SpsBuilder;
+
+        let limit = u32::from(gop_limit(30, true));
+        let sps = SpsBuilder::new().max_frame_num(limit).max_pic_order_cnt_lsb(limit * 2).build();
+        assert_eq!(sps.log2_max_frame_num_minus4, 0, "252 is what a wrap looks like");
+        assert_eq!(sps.log2_max_pic_order_cnt_lsb_minus4, 0);
+        // The ordinary export's limit is untouched by the saturation, and a
+        // limit at the top of the `u16` stays inside the spec's 0..=12.
+        let long = u32::from(gop_limit(30, false));
+        assert_eq!(SpsBuilder::new().max_frame_num(long).build().log2_max_frame_num_minus4, 1);
+        assert!(
+            SpsBuilder::new().max_frame_num(u32::MAX).build().log2_max_frame_num_minus4 <= 12
+        );
+    }
+
     /// The other half of the same fault: a slice is marked IDR only where the
     /// access unit carries an SPS, so a "forced key frame" that writes no
     /// parameter sets reads back as an ordinary I picture -- no decoder starts

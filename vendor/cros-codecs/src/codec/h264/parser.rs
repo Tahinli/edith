@@ -1170,8 +1170,13 @@ impl SpsBuilder {
         self
     }
 
+    /// Saturating, because an all-IDR stream asks for `max_frame_num` 1: its
+    /// `ilog2()` is 0 and `0u8 - 4u8` wraps to 252 in release, an SPS out of
+    /// the spec's 0..=12 that every decoder refuses. Zero is not merely legal
+    /// there, it is right: `frame_num` never leaves 0 when every picture is an
+    /// IDR.
     pub fn max_frame_num(self, value: u32) -> Self {
-        self.log2_max_frame_num_minus4(value.ilog2() as u8 - 4u8)
+        self.log2_max_frame_num_minus4(value.ilog2().saturating_sub(4).min(12) as u8)
     }
 
     pub fn pic_order_cnt_type(mut self, value: u8) -> Self {
@@ -1184,8 +1189,10 @@ impl SpsBuilder {
         self
     }
 
+    /// Saturating for the same reason as [`SpsBuilder::max_frame_num`]: the
+    /// all-IDR caller asks for 2 here, whose `ilog2()` is 1.
     pub fn max_pic_order_cnt_lsb(self, value: u32) -> Self {
-        self.log2_max_pic_order_cnt_lsb_minus4(value.ilog2() as u8 - 4u8)
+        self.log2_max_pic_order_cnt_lsb_minus4(value.ilog2().saturating_sub(4).min(12) as u8)
     }
 
     pub fn delta_pic_order_always_zero_flag(mut self, value: bool) -> Self {
