@@ -555,10 +555,14 @@ impl Render for Player {
                     .min_h(px(0.))
                     .flex()
                     .child(self.library(
-                        library_w(f32::from(window.viewport_size().width)),
+                        self.split_px(Split::Library, window.viewport_size()),
                         f32::from(window.viewport_size().height),
                         cx,
                     ))
+                    // The seams, one per pair of regions: what a hand drags to
+                    // give a panel more room and its neighbour less
+                    // ([`divider`]).
+                    .child(divider(Split::Library, cx))
                     .child(
                         div()
                             .flex_1()
@@ -636,21 +640,21 @@ impl Render for Player {
                             .child(self.transport_bar(
                                 position,
                                 state,
-                                f32::from(window.viewport_size().width),
+                                window.viewport_size(),
                                 cx,
                             )),
                     )
+                    .child(divider(Split::Inspector, cx))
                     // The settings cards live in here rather than over the
                     // timeline: adjusting a clip must not hide the clip.
                     .child(self.inspector(window.viewport_size(), cx)),
             )
+            // Above the toolbar rather than under it: the toolbar is a fixed
+            // strip belonging to the timeline, so the pair moves as one and the
+            // edge the hand is pulling is the edge under the pointer.
+            .child(divider(Split::Timeline, cx))
             .child(self.toolbar(cx))
-            .child(self.timeline(
-                position,
-                state,
-                f32::from(window.viewport_size().height),
-                cx,
-            ))
+            .child(self.timeline(position, state, window.viewport_size(), cx))
             // Over the region they were opened on, and under the modal cards:
             // they are only ever up while none of those is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))

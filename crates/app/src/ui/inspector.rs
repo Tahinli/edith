@@ -16,7 +16,7 @@ impl Player {
     /// is open, which is a section of this panel rather than a sheet over the
     /// window.
     pub(crate) fn inspector(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = inspector_w(f32::from(viewport.width));
+        let width = self.split_px(Split::Inspector, viewport);
         // The cards measure themselves against the room they are given, and the
         // room they are given is this column -- not the window.
         let room = size(px(width), viewport.height);

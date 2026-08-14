@@ -1202,3 +1202,111 @@ fn the_volume_slider_lands_where_it_paints() {
         );
     }
 }
+
+/// The three seams a hand may move, and the two ends neither of them may be
+/// dragged past: a panel dragged to nothing is a panel nobody can get back, and
+/// a picture squeezed out by its two neighbours is that same loss from the
+/// other side of the window.
+#[test]
+fn a_dragged_divider_stops_before_either_panel_disappears() {
+    use crate::ui::theme::INSPECTOR_MIN_W;
+    use crate::{
+        SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, TOOLBAR_H, inspector_w, library_w,
+        split_drag_size, split_size, timeline_h,
+    };
+    use gpui::{point, px, size};
+
+    let window = size(px(1280.), px(720.));
+    // Untouched, every region is still the share the window gives it.
+    assert_eq!(split_size(Split::Library, None, 2, window), library_w(1280.));
+    assert_eq!(
+        split_size(Split::Inspector, None, 2, window),
+        inspector_w(1280.)
+    );
+    assert_eq!(
+        split_size(Split::Timeline, None, 2, window),
+        timeline_h(2).min(720. * TIMELINE_SHARE)
+    );
+    // Dragged, it is what the hand asked for...
+    assert_eq!(split_size(Split::Library, Some(300.), 2, window), 300.);
+    assert_eq!(split_size(Split::Timeline, Some(300.), 2, window), 300.);
+    // ...and never past either end of it.
+    assert_eq!(
+        split_size(Split::Library, Some(0.), 2, window),
+        LIBRARY_MIN_W
+    );
+    assert_eq!(
+        split_size(Split::Library, Some(9000.), 2, window),
+        1280. * SIDE_MAX_FRAC
+    );
+    assert_eq!(
+        split_size(Split::Inspector, Some(-40.), 2, window),
+        INSPECTOR_MIN_W
+    );
+    assert_eq!(
+        split_size(Split::Timeline, Some(0.), 2, window),
+        TIMELINE_FIXED_H + LANE_H
+    );
+    assert_eq!(
+        split_size(Split::Timeline, Some(9000.), 2, window),
+        720. * TIMELINE_MAX_SHARE
+    );
+    // A window too narrow to honour both ends keeps the floor rather than
+    // panicking inside `clamp`, which is what a ceiling under its own floor
+    // does.
+    let narrow = size(px(600.), px(360.));
+    assert_eq!(
+        split_size(Split::Inspector, Some(9000.), 2, narrow),
+        INSPECTOR_MIN_W
+    );
+
+    // The pointer turned into a size: the panel follows the hand, and the two
+    // that do not start at the window's own edge are measured from the far one.
+    // Half a strip off each, because the strip is grabbed by its middle.
+    assert_eq!(
+        split_drag_size(Split::Library, point(px(300.), px(400.)), window),
+        300. - SPLIT_W / 2.
+    );
+    assert_eq!(
+        split_drag_size(Split::Inspector, point(px(1000.), px(400.)), window),
+        280. - SPLIT_W / 2.
+    );
+    // The seam sits above the fixed toolbar, so what the pointer leaves under
+    // it is that strip and the timeline together.
+    assert_eq!(
+        split_drag_size(Split::Timeline, point(px(300.), px(500.)), window),
+        220. - TOOLBAR_H - SPLIT_W / 2.
+    );
+}
+
+/// Every seam in the main layout has a handle on it, and every region draws
+/// itself at the size that handle sets: a region still measuring itself off the
+/// window's own share is a panel whose divider moves nothing.
+#[test]
+fn every_seam_in_the_layout_has_a_divider_on_it() {
+    let render = src_text("render.rs");
+    for split in ["Split::Library", "Split::Inspector", "Split::Timeline"] {
+        assert!(
+            render.contains(&format!("divider({split}")),
+            "{split} has no divider to drag"
+        );
+    }
+    // The strip is drawn wide enough to hit and says which way it moves --
+    // an invisible hairline is a feature nobody finds.
+    let interact = src_text("interact.rs");
+    assert!(
+        interact.contains("cursor_col_resize") && interact.contains("cursor_row_resize"),
+        "a divider with no resize cursor on it"
+    );
+    // ...and nothing lays a region out off the untouched share any more.
+    for (file, stale) in [
+        ("ui/inspector.rs", "inspector_w("),
+        ("ui/toolbar.rs", "library_w("),
+        ("render.rs", "library_w("),
+    ] {
+        assert!(
+            !src_text(file).contains(stale),
+            "{file} still measures a panel with {stale}"
+        );
+    }
+}
