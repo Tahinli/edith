@@ -257,6 +257,24 @@ pub(crate) fn subtitle_tail(session: &mut PlaybackSession, subs: Subs) -> Option
     }
 }
 
+/// What the subtitles toggle says it just did ([`Player::toggle_subtitles`]),
+/// worded off the lanes: `placed` is every caption on every subtitle lane
+/// ([`Player::placed_captions`]), because that -- and never the palette row the
+/// list marks -- is what the toggle covers and uncovers.
+///
+/// Nothing placed is its own sentence: "SUBTITLES SHOWN — 0 caption(s)" over an
+/// unchanged picture reads as a broken toggle, so it says the move that would
+/// put words there instead.
+pub(crate) fn subtitle_toggle_notice(on: bool, placed: usize) -> String {
+    match (on, placed) {
+        (true, 0) => {
+            "SUBTITLES SHOWN — nothing placed yet: drag a track onto a subtitle track".to_string()
+        }
+        (true, n) => format!("SUBTITLES SHOWN — {n} caption(s) on the timeline"),
+        (false, n) => format!("SUBTITLES HIDDEN — {n} caption(s) still placed"),
+    }
+}
+
 /// The push both deliberate add-subtitles doors end on -- `+ S` and its key
 /// ([`Player::add_subtitles`]) and a dropped or argv'd subtitle file
 /// ([`Player::take_subtitles`]) -- so the two cannot come to word the same file
@@ -423,7 +441,8 @@ pub(crate) struct SubGroup {
 pub(crate) struct SubRow {
     /// Which track of the session's list this row is: the *flat* index into the
     /// add-order Vec `PlaybackSession::subtitles` hands back, which is what a
-    /// click sets `sub_track` to and what a save writes into the `.edith`.
+    /// click sets `sub_track` to and what a caption placed on a subtitle lane
+    /// names, so it is what a save writes into the `.edith` for that caption.
     /// Grouping moves rows around on screen and never touches this number.
     pub(crate) track: usize,
     /// Which of *this file's* tracks it is, counted from 1 -- the numbering
