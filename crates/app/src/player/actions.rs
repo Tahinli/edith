@@ -73,11 +73,14 @@ impl Player {
             // through the × in its own header.
             ActionId::RemoveVideoLane => self.remove_last_lane(LaneKind::Video, cx),
             ActionId::RemoveAudioLane => self.remove_last_lane(LaneKind::Audio, cx),
-            // The same chooser the + S button opens, and the picked row -- the
-            // one the panel draws highlighted -- for the removal: the × on any
-            // other row is that row's own door, and both doors are one call.
-            ActionId::AddSubtitleTrack => self.pick_and_add_subtitles(cx),
-            ActionId::RemoveSubtitleTrack => self.remove_subtitle_track(self.sub_track, cx),
+            // The third kind of track, added and taken back exactly as the two
+            // above it: what a caption is dragged onto. The words themselves
+            // arrive by the door below, which places nothing.
+            ActionId::AddSubtitleLane => self.add_lane(LaneKind::Subtitle, cx),
+            ActionId::RemoveSubtitleLane => self.remove_last_lane(LaneKind::Subtitle, cx),
+            // The chooser the palette's own button opens: a file's tracks into
+            // the list, the file itself joining nothing.
+            ActionId::ImportSubtitles => self.pick_and_add_subtitles(cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),

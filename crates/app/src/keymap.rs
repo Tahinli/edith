@@ -99,8 +99,13 @@ actions! {
     AddAudioLane,
     RemoveVideoLane,
     RemoveAudioLane,
-    AddSubtitleTrack,
-    RemoveSubtitleTrack,
+    AddSubtitleLane,
+    RemoveSubtitleLane,
+    /// The palette's own door: a file's subtitle tracks read into the list the
+    /// panel shows, which is where a lane's words are dragged *from*. Adding a
+    /// track to that list places nothing -- the pair above it is what makes the
+    /// timeline row a caption can land on.
+    ImportSubtitles,
     ToggleMute,
     VolumeUp,
     VolumeDown,
@@ -172,8 +177,9 @@ impl ActionId {
             ActionId::AddAudioLane => "Add an audio track",
             ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
             ActionId::RemoveAudioLane => "Remove the last audio track (it must be empty)",
-            ActionId::AddSubtitleTrack => "Add subtitles from a file…",
-            ActionId::RemoveSubtitleTrack => "Remove the picked subtitle track",
+            ActionId::AddSubtitleLane => "Add a subtitle track",
+            ActionId::RemoveSubtitleLane => "Remove the last subtitle track (it must be empty)",
+            ActionId::ImportSubtitles => "Add subtitles from a file…",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
@@ -228,8 +234,9 @@ impl ActionId {
             ActionId::AddAudioLane => "add-audio-lane",
             ActionId::RemoveVideoLane => "remove-video-lane",
             ActionId::RemoveAudioLane => "remove-audio-lane",
-            ActionId::AddSubtitleTrack => "add-subtitle-track",
-            ActionId::RemoveSubtitleTrack => "remove-subtitle-track",
+            ActionId::AddSubtitleLane => "add-subtitle-lane",
+            ActionId::RemoveSubtitleLane => "remove-subtitle-lane",
+            ActionId::ImportSubtitles => "import-subtitles",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
@@ -319,8 +326,12 @@ impl ActionId {
             // they add is on the timeline and goes into the file an export
             // writes, where the toggle two headings down only decides whether
             // this window draws it.
-            | ActionId::AddSubtitleTrack
-            | ActionId::RemoveSubtitleTrack
+            | ActionId::AddSubtitleLane
+            | ActionId::RemoveSubtitleLane
+            // ...and the door that fills the palette those lanes are dragged
+            // from: it edits no lane, but what it brings in is the project's
+            // and is saved with it, which is not a view setting.
+            | ActionId::ImportSubtitles
             | ActionId::RemoveAudioLane => Category::Editing,
             ActionId::ToggleMute
             | ActionId::VolumeUp
@@ -806,8 +817,12 @@ impl Keymap {
                 // ctrl chord takes it back. Ctrl+s is that save, so the removal
                 // takes the other letter subtitles already answer to here: "t"
                 // shows and hides them, and ctrl+t takes one off the timeline.
-                b(ActionId::AddSubtitleTrack, "s", false),
-                b(ActionId::RemoveSubtitleTrack, "t", true),
+                b(ActionId::AddSubtitleLane, "s", false),
+                b(ActionId::RemoveSubtitleLane, "t", true),
+                // Reading a file's tracks into the palette is not adding a
+                // track to the timeline, so it is not the bare "s": ctrl+i, the
+                // i of import, free and next to nothing that deletes.
+                b(ActionId::ImportSubtitles, "i", true),
                 b(ActionId::ToggleMute, "m", false),
                 // The unshifted pair, which is what gpui reports for those two
                 // keys ("=" and "-", platform.rs:862): the volume keys every
@@ -1123,7 +1138,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 51);
+        assert_eq!(k.entries().len(), 52);
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
@@ -1174,8 +1189,10 @@ mod tests {
         assert_eq!(k.lookup("a", true), Some(ActionId::RemoveAudioLane));
         // The subtitle pair, the third kind of track: the initial adds and the
         // subtitle letter's chord takes it back.
-        assert_eq!(k.lookup("s", false), Some(ActionId::AddSubtitleTrack));
-        assert_eq!(k.lookup("t", true), Some(ActionId::RemoveSubtitleTrack));
+        assert_eq!(k.lookup("s", false), Some(ActionId::AddSubtitleLane));
+        assert_eq!(k.lookup("t", true), Some(ActionId::RemoveSubtitleLane));
+        // ...and the palette's own door, which adds no track to the timeline.
+        assert_eq!(k.lookup("i", true), Some(ActionId::ImportSubtitles));
         assert_eq!(k.lookup("m", false), Some(ActionId::ToggleMute));
         assert_eq!(k.lookup("q", false), Some(ActionId::Equalizer));
         // The volume pair is the unshifted one, so neither needs a modifier

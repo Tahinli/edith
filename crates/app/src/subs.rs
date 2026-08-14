@@ -323,17 +323,24 @@ pub(crate) fn subtitle_plan(
     picks: &[usize],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
-    // "none" is the engine's word for an empty pick list and would read as a
-    // verdict on the tracks named after it.
-    if !picks.is_empty() {
-        parts.push(plan);
+    // "none" is the engine's word for having nothing to say and would read as a
+    // verdict on the tracks named after it. Anything else is the sentence the
+    // export is actually planned from -- the lanes' own, wherever the timeline
+    // places words ([`engine::export::planned_subtitles`]) -- and it is kept
+    // whatever the palette picks are: dropping it on an empty pick list is how a
+    // card showing "S1 eng — past the last picture" said nothing at all.
+    if plan != "none" {
+        parts.push(plan.clone());
     }
     parts.extend(
         tracks
             .iter()
             .enumerate()
-            .filter(|(i, _)| !picks.contains(i))
-            .map(|(_, track)| format!("{} — no cues here", track.label)),
+            .filter(|(i, track)| !picks.contains(i) && !spoken_for(&plan, track))
+            // Not "no cues here": a row the export leaves out is a row nothing
+            // on the timeline placed, and what puts that right is the drag --
+            // the same sentence the import notice ends with.
+            .map(|(_, track)| format!("{} — in the palette, on no track", track.label)),
     );
     let named = parts.join("; ");
     if named.chars().count() <= SUB_PLAN_CHARS {
@@ -347,7 +354,7 @@ pub(crate) fn subtitle_plan(
         match (
             track.refused.is_some(),
             track.is_bitmap(),
-            picks.contains(&i),
+            picks.contains(&i) || spoken_for(&plan, track),
         ) {
             (true, _, _) => unread += 1,
             (_, true, _) => pictures += 1,
@@ -360,13 +367,28 @@ pub(crate) fn subtitle_plan(
         [
             (pictures, "pictures"),
             (unread, "unread"),
-            (off, "no cues here"),
+            (off, "in the palette, on no track"),
         ]
         .into_iter()
         .filter(|(n, _)| *n > 0)
         .map(|(n, why)| format!("{n} {why}")),
     );
     counted.join("; ")
+}
+
+/// Whether the engine's sentence already speaks for this row: with words placed
+/// on lanes, every clause of it names the palette row its lane shows
+/// ([`engine::export::planned_subtitles`]) -- and a line that embeds a track and
+/// then says the same track is on no track is a line contradicting itself.
+///
+/// corner-cut: the match is the label found in the sentence, because the engine
+/// hands back one string and not the rows it spoke for. Ceiling: two rows whose
+/// labels are one a prefix of the other ("eng", "eng 2") -- with the longer one
+/// placed, the shorter loses its clause; it never gains a wrong one. Upgrade
+/// path: `planned_subtitles` handing its clauses back as data, the same upgrade
+/// [`subtitle_plan`]'s own note names.
+fn spoken_for(plan: &str, track: &engine::subtitle::SubtitleTrack) -> bool {
+    !track.label.is_empty() && plan.contains(track.label.as_str())
 }
 
 /// Every subtitle track one file gave, kept together. Plain data, planned

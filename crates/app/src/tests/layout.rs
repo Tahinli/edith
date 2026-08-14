@@ -759,7 +759,7 @@ fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
     // What the engine answers about the one pick that reached it, and what
     // this side knows about the row that did not.
     let named = subtitle_plan("[ASS] → embedded".to_string(), &two, &[0]);
-    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — no cues here");
+    assert_eq!(named, "[ASS] → embedded; [ASS] [FOR DUB] — in the palette, on no track");
     assert!(
         named.chars().count() <= SUB_PLAN_CHARS,
         "two tracks fit the value box: {named}"
@@ -778,13 +778,30 @@ fn the_card_names_the_subtitle_it_leaves_off_and_counts_them_when_it_cannot() {
     // and the nine picture ones, which the engine drops itself.
     let picks: Vec<usize> = (0..31usize).collect();
     let counted = subtitle_plan("22 tracks → embedded (…)".to_string(), &many, &picks);
-    assert_eq!(counted, "22 of 35 → embedded; 9 pictures; 1 unread; 3 no cues here");
+    assert_eq!(
+        counted,
+        "22 of 35 → embedded; 9 pictures; 1 unread; 3 in the palette, on no track"
+    );
     assert!(
         counted.chars().count() <= SUB_PLAN_CHARS,
         "thirty-five tracks still fit the value box: {counted}"
     );
     // Nothing on the timeline at all is still the engine's word for it.
     assert_eq!(subtitle_plan("none".to_string(), &[], &[]), "none");
+    // The lanes are what an export writes once anything is placed on one, and
+    // the engine words that whole ([`engine::export::planned_subtitles`]) --
+    // including the lanes it carries *nothing* of, which is a sentence with no
+    // pick behind it at all. That used to be dropped on the floor: the card said
+    // "[ASS] — no cues here" twice and never said what became of the lane.
+    let placed = "S1 [ASS] — past the last picture".to_string();
+    assert_eq!(
+        subtitle_plan(placed.clone(), &two, &[]),
+        "S1 [ASS] — past the last picture; [ASS] [FOR DUB] — in the palette, on no track"
+    );
+    // ...and the row that sentence speaks for gets no clause of its own: a line
+    // that names a lane's track and then calls the same track unplaced is the
+    // card contradicting itself in one breath.
+    assert!(!subtitle_plan(placed, &two[..1], &[]).contains("in the palette"));
 }
 
 /// The list is in the order tracks were added, which is not the order a
@@ -884,9 +901,9 @@ fn the_text_tab_carries_the_add_subtitles_door() {
     let at = library
         .find("\"add-subtitles\"")
         .expect("no add-subtitles control in the library column");
-    let block = &library[at..(at + 1400).min(library.len())];
+    let block = &library[at..(at + 1600).min(library.len())];
     assert!(
-        block.contains("ActionId::AddSubtitleTrack"),
+        block.contains("ActionId::ImportSubtitles"),
         "the button is a door of its own rather than the action: {block}"
     );
     assert!(

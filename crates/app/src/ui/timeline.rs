@@ -322,7 +322,7 @@ impl Player {
         let groups = subtitle_rows(tracks);
         // What the row's × says the way back is, in the stroke this keymap
         // actually binds: a file's subtitles go on without the file.
-        let add_key = self.keymap.display(ActionId::AddSubtitleTrack);
+        let add_key = self.keymap.display(ActionId::ImportSubtitles);
         // One file's tracks need no prefix saying which file: it is the only
         // one, and every row would carry the same word.
         let several_files = groups.len() > 1;
@@ -376,7 +376,8 @@ impl Player {
                         // the tooltip is what says which track it takes off.
                         let remove_tip: SharedString =
                             format!(
-                                "Remove {title} — {} puts a file's subtitles back on",
+                                "Remove {title} from the palette — {} puts a file's subtitles \
+                                 back in it",
                                 add_key
                             )
                                 .into();
