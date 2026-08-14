@@ -81,8 +81,10 @@ impl Volume {
         u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS)
     }
 
-    /// What the button reads. The level shows while muted too: it is what the
-    /// next press of the mute key brings back.
+    /// What the button read before the mute state became a glyph and a colour
+    /// ([`Player::toolbar`]): the guards still hold the wording to it, so it
+    /// sits with them rather than in the binary.
+    #[cfg(test)]
     pub(crate) fn label(self) -> String {
         let percent = u32::from(self.steps) * 100 / u32::from(Self::MAX_STEPS);
         if self.muted {
