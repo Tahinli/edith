@@ -492,6 +492,11 @@ struct Player {
     /// -- any key retires it, so does a click on it -- the bar says how many are
     /// behind it, and answering it brings the next one up.
     notices: std::collections::VecDeque<SharedString>,
+    /// How tall the transient bars hanging off the bottom of the picture (the
+    /// import line, the seek line, the notice) came out at prepaint, so the cue
+    /// plate can sit clear of them ([`sub_bottom`]). Measured and not counted:
+    /// a notice wraps to as many lines as the window is narrow.
+    notice_h: Rc<Cell<Pixels>>,
     /// What the last finished export wrote, so the notice can be the way to it.
     /// Only the [`EXPORT_DONE`] line reads it -- any later notice has replaced
     /// that text -- so a click never opens a file the bar is not naming.
@@ -594,6 +599,7 @@ fn main() {
                     sub_image: None,
                     held: None,
                     ruler: Rc::default(),
+                    notice_h: Rc::default(),
                     // A second is [`PPS_DEFAULT`] pixels wide until someone
                     // zooms or asks for the fit: a project opens at a scale, not
                     // at whatever its first import happens to be long.

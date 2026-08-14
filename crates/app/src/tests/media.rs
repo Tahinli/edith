@@ -772,6 +772,29 @@ fn a_cue_is_on_screen_from_its_start_until_the_moment_it_ends() {
     assert!(at(-1.).is_empty());
 }
 
+/// The cue plate and the transient bars share the bottom edge of the picture,
+/// and the plate is the one that moves: a notice drawn across the line being
+/// read costs the reader both of them.
+#[test]
+fn a_cue_steps_over_whatever_bar_is_hanging_off_the_picture() {
+    // Nothing hanging there, nothing moved: people know where the line sits,
+    // and the no-notice position is the one they know, to the pixel.
+    assert_eq!(sub_bottom(0.), SUB_BOTTOM);
+    // A bar of any height is a bar the plate is clear of: its bottom edge is
+    // above the bar's top edge, with the plate's own gap still under it.
+    for bars in [1., 26., 48., 96., 300.] {
+        assert!(
+            sub_bottom(bars) >= bars + SUB_BOTTOM,
+            "a {bars} px bar reaches the plate"
+        );
+    }
+    // A taller bar never lowers the plate, and a box that was never painted
+    // (or measured as nothing) reads as no bar at all rather than as a plate
+    // pulled off the bottom of the window.
+    assert!(sub_bottom(48.) > sub_bottom(26.));
+    assert_eq!(sub_bottom(-10.), SUB_BOTTOM);
+}
+
 /// The two places a subtitle is drawn -- the plate over the picture and the
 /// strip under the lanes -- inside the 640x360 floor the rest of this window
 /// is sized for, and the plate readable on whatever the film is showing.

@@ -128,6 +128,20 @@ pub(crate) const SUB_TEXT: f32 = 14.;
 pub(crate) const SUB_LINE_H: f32 = 18.;
 /// How far off the bottom of the picture the plate sits.
 pub(crate) const SUB_BOTTOM: f32 = 8.;
+/// The same, once the transient bars that hang off that bottom edge (import,
+/// seek, notice) are `bars_h` tall: the cue steps up over them and comes back
+/// down the frame they leave, which is what a player does with its OSD -- the
+/// alternative, a notice drawn over the line being read, loses both of them.
+///
+/// `bars_h` is *measured* ([`height_probe`]) and never counted: a notice wraps
+/// to as many lines as the window is narrow, and any constant here would be
+/// right at one width. Nothing hanging there means nothing to step over, so the
+/// no-notice position is [`SUB_BOTTOM`] exactly, to the pixel.
+pub(crate) fn sub_bottom(bars_h: f32) -> f32 {
+    // A box that was never painted measures zero, and a negative is not a
+    // height -- either way there is nothing to clear.
+    SUB_BOTTOM + bars_h.max(0.)
+}
 /// The subtitle strip under the lanes: thin, because it is a picture of where
 /// the cues are and nothing on it can be dragged -- `HIT_MIN` binds targets, and
 /// this row has none.

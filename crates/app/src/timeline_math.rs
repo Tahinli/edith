@@ -232,6 +232,27 @@ pub(crate) fn bounds_probe(into: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
         .size_full()
 }
 
+/// [`bounds_probe`] for a box something *else* is laid out against: it also asks
+/// for one more frame whenever the height changed.
+///
+/// A measurement is read by the frame after the one that took it, and a notice
+/// arriving over a paused picture repaints exactly once -- so without this the
+/// cue would sit under that notice until something else happened to draw, which
+/// on a paused window can be never.
+pub(crate) fn height_probe(into: Rc<Cell<Pixels>>) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _| {
+            // Only on a change: an unconditional request is a repaint loop.
+            if into.replace(bounds.size.height) != bounds.size.height {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _, _| (),
+    )
+    .absolute()
+    .size_full()
+}
+
 /// Where along an element a click landed, 0..1. An element that was never
 /// painted has no width, and reads as its start rather than as NaN.
 pub(crate) fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
