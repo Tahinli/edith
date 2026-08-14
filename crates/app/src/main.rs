@@ -58,7 +58,7 @@ use engine::decode::Backend;
 use engine::eq::{Band, BandKind, EqParams};
 use engine::export::{AUDIO_KBPS, DEFAULT_AUDIO_KBPS, EncoderSeat, ExportSettings, Format};
 use engine::limiter::Limiter;
-use engine::project::{Edge, Lane, LaneKind, Source, Speed};
+use engine::project::{Edge, Lane, LaneKind, Source, Speed, SubClip};
 use engine::scale::FitPolicy;
 use engine::tonemap::Preset;
 use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
@@ -240,6 +240,24 @@ struct Player {
     /// one can be read at a time. Cleared with the timeline like every other
     /// index here -- track 2 of one project is not track 2 of the next.
     sub_track: usize,
+    /// The subtitle lanes whose eye is shut: every lane shows its captions
+    /// until this says otherwise, so a lane that was just added is a lane that
+    /// draws. Held as the lanes that are *off* rather than a flag per lane, so
+    /// adding one needs no bookkeeping at all.
+    ///
+    /// State only this slice: the preview reads the picked palette track still
+    /// ([`Player::sub_picture`]), so shutting an eye marks the header and
+    /// changes nothing over the picture until the slice that draws the lanes'
+    /// cues there reads this field. Not saved either -- a `.edith` has no line
+    /// for it yet.
+    ///
+    /// A [`Lane`] handle is a position among its kind, so a removal or a
+    /// reorder leaves every shut eye naming another track: they are dropped
+    /// wholesale there, exactly as the selection and the open cards are
+    /// ([`Player::remove_lane`], [`Player::reorder_lane`]) -- which is why a
+    /// lane added in a removed one's place opens with its eye open, as every
+    /// new lane does.
+    subs_off: Vec<Lane>,
     /// The frame the live gesture is about to land on, or `None` while it is
     /// over open bed: the line every lane draws so the snap is seen before it
     /// happens rather than discovered after the release. Stale between gestures,
@@ -629,6 +647,7 @@ fn main() {
                     snap: true,
                     subs_on: true,
                     sub_track: 0,
+                    subs_off: Vec::new(),
                     snap_cue: None,
                     ghost: None,
                     lane_drop: None,

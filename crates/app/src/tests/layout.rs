@@ -405,6 +405,82 @@ fn a_trim_preview_lands_where_the_release_commits() {
     }
 }
 
+/// The caption a drag is showing lands where the release commits -- the
+/// subtitle twin of the trim preview above -- and the two contracts the boxes
+/// on the lanes rest on: `place_sub`'s `at` wins over the placement's own
+/// `start`, and a gesture that changed nothing is `Ok` and not a refusal, so a
+/// front-end that toasted every `Ok` would toast a pick-up-put-back.
+#[test]
+fn a_caption_trim_preview_lands_where_the_release_commits() {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let fps = session.meta().frame_rate;
+    let srt = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../engine/tests/data/test_subs.srt")
+        .canonicalize()
+        .expect("the subtitle fixture");
+    session.import_subtitles(&srt).expect("the .srt imports");
+    let lane = session.add_lane(LaneKind::Subtitle);
+    // The whole track as a placement, exactly as `Player::sub_of_track` builds
+    // one from a palette row.
+    let out_us = session.subtitles()[0]
+        .cues
+        .iter()
+        .map(|c| c.end_us)
+        .max()
+        .expect("the fixture has cues");
+    let whole = SubClip {
+        start: 0,
+        frames: frames_of_us(out_us, fps),
+        track: 0,
+        in_us: 0,
+        out_us,
+    };
+    session
+        .place_sub(lane, 30, whole)
+        .expect("an empty subtitle lane takes it");
+    assert_eq!(
+        session.sub_lane(lane)[0].start,
+        30,
+        "the frame the hand let go on wins over the placement's own start"
+    );
+    for edge in [Edge::Start, Edge::End] {
+        let (lo, hi) = session
+            .trim_sub_room(lane, 0, edge)
+            .expect("placement 0 is there");
+        for to in [lo, (lo + hi) / 2, hi] {
+            let placed = session.sub_lane(lane)[0];
+            let preview = trimmed_sub(placed, edge, to);
+            session
+                .trim_sub(lane, 0, edge, to)
+                .expect("an edge inside its own room is never refused");
+            let now = session.sub_lane(lane)[0];
+            assert_eq!(
+                (preview.start, preview.frames),
+                (now.start, now.frames),
+                "{edge:?} to {to}"
+            );
+            // One edit, one undo step -- and none at all where the edge was
+            // already there, which is the `Ok` that must stay silent.
+            if (now.start, now.frames) != (placed.start, placed.frames) {
+                assert!(session.undo(), "the trim is one undo step");
+            }
+        }
+    }
+    // Picked up and put back down: `Ok`, nothing moved, nothing to say.
+    let before = session.sub_lane(lane)[0];
+    session
+        .move_sub(lane, 0, lane, before.start)
+        .expect("a drop that changes nothing is not a refusal");
+    assert_eq!(session.sub_lane(lane)[0], before);
+    // ...and two captions over one frame are refused in words, which is what
+    // the notice shows verbatim.
+    let over = session
+        .place_sub(lane, before.start, whole)
+        .expect_err("two captions may not cover one frame");
+    assert!(over.to_string().contains("already covers"), "{over}");
+}
+
 /// A still trims the same way, and the preview knows it: its head grows
 /// forward from source frame 0 -- every frame of it is the same picture --
 /// so the box stretches instead of sliding left.

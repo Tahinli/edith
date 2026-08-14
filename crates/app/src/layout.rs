@@ -142,10 +142,6 @@ pub(crate) fn sub_bottom(bars_h: f32) -> f32 {
     // height -- either way there is nothing to clear.
     SUB_BOTTOM + bars_h.max(0.)
 }
-/// The subtitle strip under the lanes: thin, because it is a picture of where
-/// the cues are and nothing on it can be dragged -- `HIT_MIN` binds targets, and
-/// this row has none.
-pub(crate) const SUB_LANE_H: f32 = 16.;
 /// A mark narrower than this is still drawn this wide: a one-frame cue on a
 /// zoomed-out bed is worth a fraction of a pixel, and a mark nobody can see says
 /// the track is empty. The silence preview's marks are floored by it too -- they
@@ -227,16 +223,6 @@ pub(crate) fn rows_below(total: usize, box_h: f32, scrolled: f32) -> usize {
 /// been (`offset`, which gpui keeps negative going down).
 pub(crate) fn px_below(max_offset_h: f32, offset_y: f32) -> f32 {
     (max_offset_h + offset_y).max(0.)
-}
-
-/// What the subtitle strip adds to the panel: its own row and the panel's gap
-/// above it, and nothing at all for a timeline with no subtitles on it -- the
-/// picture does not pay for a strip that is not drawn.
-pub(crate) fn subtitle_strip_h(shown: bool) -> f32 {
-    match shown {
-        true => SUB_LANE_H + 8.,
-        false => 0.,
-    }
 }
 
 /// How tall the panel is with `lanes` tracks in it: [`PANEL_H`] is sized for the
