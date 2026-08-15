@@ -1312,6 +1312,17 @@ impl Player {
             }
             return;
         }
+        // The lane stack's own thumb, on exactly the same terms: the pointer
+        // leaves the strip on the first move, so the root carries the gesture
+        // -- and a hand holding the stack is not holding anything on it
+        // either.
+        if self.lanes_drag.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.lanes_drag_to(event.position.y, cx),
+                _ => self.lanes_drag = None,
+            }
+            return;
+        }
         // A divider is answered before every gesture below it: it is pressed on
         // a strip of its own that nothing else is under, so neither can swallow
         // the other -- a seam over the timeline never scrubs, and a scrub is
@@ -1415,6 +1426,10 @@ impl Player {
         // other release here lands one last sample.
         if self.scroll_drag.take().is_some() {
             self.scroll_drag_to(event.position.x, cx);
+            return;
+        }
+        if self.lanes_drag.take().is_some() {
+            self.lanes_drag_to(event.position.y, cx);
             return;
         }
         if let Some(split) = self.split_drag.take() {
