@@ -32,7 +32,7 @@ use super::{
     LATE_RESYNC, RESYNC_GAP, should_resync,
     retarget, row_enable, row_items, scrub_due, secs_label, show_label, silence_rate, size_label, snap_cue, snap_marks, snapped,
     SUB_PLAN_CHARS, source_tint, span_partner, speed_at, sub_pick_after_removal, subtitle_plan, summary_head, summary_tail, timecode, transport,
-    EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, TIMELINE_FIXED_H, TIMELINE_SHARE, lanes_shown,
+    EXPORT_DONE, NOTICES_MAX, STATUS_ERROR, TIMELINE_SHARE, lanes_shown, timeline_fixed_h,
     px_below, rows_below, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
     proxies_to_start, push_notice, typed, unseen_paths, unseen_sources,
     whole_take, window_title,

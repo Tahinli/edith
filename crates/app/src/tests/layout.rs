@@ -63,7 +63,6 @@ fn no_colour_is_written_outside_the_theme() {
 /// being scrolled, or it is an instruction nobody can carry out.
 #[test]
 fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
-    use crate::timeline_fixed_h;
 
     // The timeline is a region and not the window: its chrome -- the
     // scrollbar strip's row included, which is the larger of the two the
@@ -292,6 +291,41 @@ fn the_scroll_thumb_is_the_visible_share_at_its_own_place() {
     assert_eq!(w, SCROLL_THUMB_MIN);
     assert_eq!(x, 400. - SCROLL_THUMB_MIN);
     assert_eq!(scroll_thumb(400., 1_000_000., 0., 100.).0, 0.);
+}
+
+/// A press beside the time axis's thumb jumps so the thumb's middle is under
+/// the pointer, and the drag that carries on from the press must land exactly
+/// where the jump left the view: both are read through the track's own
+/// proportion (a jump worked out in pixels at the view's pps used to land at
+/// span-over-duration of the target, and the snap on the first move was the
+/// drag correcting it). The equality below is the no-snap invariant, at the
+/// thumb's own width and at its floor width alike.
+#[test]
+fn a_beside_thumb_press_jumps_by_the_tracks_own_proportion() {
+    use crate::scroll_thumb;
+
+    let bed = 400.;
+    // The mapping both halves of the gesture share: a place on the track is
+    // that share of the drawn duration.
+    let jump = |at: f32, thumb_w: f32| (at - thumb_w / 2.).max(0.) / bed;
+    for (duration, span) in [(100_f32, 20_f32), (1_000_000_f32, 100_f32)] {
+        let (_, thumb_w) = scroll_thumb(bed, f64::from(duration), 0., f64::from(span));
+        let at = 3. * bed / 4.;
+        let start = jump(at, thumb_w) * duration;
+        // The jump centres the thumb on the press (the far end of a million
+        // seconds is the clamp's to hold, so the pin is measured from the
+        // thumb the track actually shows).
+        let (x, w) = scroll_thumb(bed, f64::from(duration), f64::from(start), f64::from(span));
+        let centre = (x + w / 2.).min(bed - w / 2.);
+        assert!(
+            (centre - at.min(bed - w / 2.)).abs() < 1.,
+            "thumb centre {centre} not at the press {at}"
+        );
+        // The drag's first sample from that press -- the grabbed middle, the
+        // same track proportion -- is the same start, whatever the width.
+        let grab = thumb_w / 2.;
+        assert_eq!(jump(at, 2. * grab) * duration, start);
+    }
 }
 
 /// The strip's row is furniture only while there is somewhere to scroll to:
@@ -1422,9 +1456,8 @@ fn the_volume_slider_lands_where_it_paints() {
 fn a_dragged_divider_stops_before_either_panel_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        SIDE_MAX_FRAC, SPLIT_W, SCROLL_HIT, SCROLL_THUMB_MIN, Split, TIMELINE_MAX_SHARE,
-        TOOLBAR_H, inspector_w, lanes_thumb, library_w, split_drag_size, split_size,
-        timeline_fixed_h, timeline_h,
+        SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, TOOLBAR_H, inspector_w, library_w,
+        split_drag_size, split_size, timeline_fixed_h, timeline_h,
     };
     use gpui::{point, px, size};
 
