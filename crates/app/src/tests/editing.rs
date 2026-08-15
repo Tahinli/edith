@@ -479,6 +479,36 @@ fn a_caption_grouped_with_a_clip_pairs_it_for_the_whole_take_question() {
     );
 }
 
+/// A caption anchor names the media half of its group: the video member for
+/// the cards that are about the picture, the audio member for the ones about
+/// the sound. A caption in no group names nothing -- which is what the cards'
+/// new refusals say out loud.
+#[test]
+fn a_caption_anchor_names_the_media_half_of_its_group() {
+    use crate::caption_media_half;
+
+    let (mut session, lane) = with_subtitle_lane();
+    session
+        .place_sub(lane, 0, one_second(0))
+        .expect("the caption goes down");
+    // Ungrouped: no pictures and no sound behind the words.
+    assert_eq!(caption_media_half(&session, (lane, 0), LaneKind::Video), None);
+    assert_eq!(caption_media_half(&session, (lane, 0), LaneKind::Audio), None);
+    // Grouped with the take -- whose sound rides along unasked -- both halves
+    // answer by lane and index.
+    session
+        .group_all(&[(Lane::V1, 0), (lane, 0)])
+        .expect("a clip and a caption are a group");
+    assert_eq!(
+        caption_media_half(&session, (lane, 0), LaneKind::Video),
+        Some((Lane::V1, 0))
+    );
+    assert_eq!(
+        caption_media_half(&session, (lane, 0), LaneKind::Audio),
+        Some((Lane::A1, 0))
+    );
+}
+
 /// The manual group's oracle question: a selection of placements, one per lane.
 /// Two picks on two lanes is a group waiting to happen; a lane picked twice is
 /// the one thing a group may never hold; a single pick is the partner hunt.
