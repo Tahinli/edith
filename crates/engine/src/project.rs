@@ -97,9 +97,11 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 /// number that was set. A thousandth is finer than any card can drag and coarser
 /// than any rounding anyone can hear.
 ///
-/// The rate alone: a speeded clip is resampled, so its pitch moves with it (the
-/// tape effect). Nothing here preserves pitch and nothing here plays backwards
-/// -- [`Speed::MIN`] is a quarter speed, [`Speed::MAX`] four times.
+/// The rate alone: the audio path time-stretches a speeded clip
+/// (`crate::stretch`), so its pitch stays where it was recorded while its
+/// seconds compress or stretch -- the tape effect this used to be is gone.
+/// Nothing here plays backwards -- [`Speed::MIN`] is a quarter speed,
+/// [`Speed::MAX`] four times.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Speed(u16);
 
