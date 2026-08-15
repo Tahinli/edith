@@ -243,23 +243,44 @@ pub(crate) fn panel_h(lanes: usize) -> f32 {
 }
 
 /// How tall the timeline region is: its own padding, the timecode line, the
-/// ruler and the gaps between them, plus a row per lane. Measured from its
-/// parts rather than taken off `PANEL_H` -- the button row moved out of it
+/// ruler, the scrollbar strip under the lanes when there is one to draw, and
+/// the gaps between them, plus a row per lane. Measured from its parts rather
+/// than taken off `PANEL_H` -- the button row moved out of it
 /// ([`Player::toolbar`]), and a height still carrying that row's pixels is a
 /// height that cuts the last lane off the bottom of the window.
-pub(crate) fn timeline_h(lanes: usize) -> f32 {
-    TIMELINE_FIXED_H + lanes_h(lanes.clamp(2, LANES_MAX))
+pub(crate) fn timeline_h(lanes: usize, scroll: bool) -> f32 {
+    timeline_fixed_h(scroll) + lanes_h(lanes.clamp(2, LANES_MAX))
 }
 
 /// 8+8 padding, the timecode line, the 24 px ruler strip and the two 8 px gaps
 /// between the three rows, with a couple of px of slack so a taller text line
-/// cannot push a lane off the bottom.
+/// cannot push a lane off the bottom. The scrollbar strip's row is *not* here:
+/// the strip comes and goes with the zoom, so its pixels are carried by
+/// [`timeline_fixed_h`] alone, where every derivation that must agree with
+/// what is drawn reads them together.
 pub(crate) const TIMELINE_FIXED_H: f32 = 16. + 18. + 8. + RULER_HIT_H + 8. + 4.;
 
-/// The most of a short window the timeline may take. At the 640x360 floor that
-/// is 151 px of the 360, which leaves the picture a region rather than a
-/// letterbox stripe -- and the lanes scroll inside it.
-pub(crate) const TIMELINE_SHARE: f32 = 0.42;
+/// The panel's fixed furniture with its scrollbar strip while the timeline has
+/// somewhere to scroll to. With nowhere to go the strip is not drawn -- a bar
+/// for a view that cannot move is a bar teaching nothing -- and its row goes
+/// with it, out of every budget at once: a height still carrying the row would
+/// hand it to the lane column as a bonus at exactly the zoom where the hand is
+/// least expecting the bed to move.
+pub(crate) fn timeline_fixed_h(scroll: bool) -> f32 {
+    TIMELINE_FIXED_H + match scroll {
+        true => 8. + SCROLL_HIT,
+        false => 0.,
+    }
+}
+
+/// The most of a short window the timeline may take, sized so the seam's own
+/// floor still fits inside it ([`split_bounds`]): at the 640x360 floor that is
+/// 171 px of the 360 -- the chrome with the scrollbar strip in it, one whole
+/// lane, and the line saying the rest are below. Left smaller than the floor
+/// the floor would win the clamp anyway and this number would say the panel
+/// takes less of a short window than it does. The lanes scroll inside whatever
+/// is left, which leaves the picture a region rather than a letterbox stripe.
+pub(crate) const TIMELINE_SHARE: f32 = 171. / 360.;
 
 /// The edit toolbar directly above the timeline: one control's height in its
 /// own padding, fixed so nothing in it can push the timeline down.
