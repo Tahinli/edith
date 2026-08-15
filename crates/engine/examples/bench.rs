@@ -584,25 +584,51 @@ fn cutloop_bench(path: &Path, regions: u32, keep_s: f64, cut_s: f64) {
             return;
         }
     }
-    // The holes are the odd clips: index 1, `regions` times over, as every
-    // delete closes the list up onto the next one.
-    for i in 0..regions {
-        if !session.delete_clip(Lane::V1, 1) {
+    // ...and the end of the last keep, so the timeline that plays out is the
+    // keeps alone and not the rest of the film (a cut past the end of the
+    // file is no cut, and the shape check below says so if it mattered).
+    session.cut_at(f64::from(regions) * stride + keep_s);
+    eprintln!(
+        "cutloop: spans before the deletes: {:?}",
+        session.clip_spans()
+    );
+    // The holes are the odd clips and the tail is the last: deleted from the
+    // far end down, so no delete moves the index of a clip still to be
+    // deleted. V1 names each hole and the group takes the A1 half of the
+    // take with it; the shape check below guards the lot.
+    for idx in (1..=2 * regions as usize + 1).rev().step_by(2) {
+        if !session.delete_clip(Lane::V1, idx) {
             row(
                 path,
                 "cutloop_displayed",
                 "count",
                 &[],
-                &format!("FAIL(hole {i} of {regions} would not delete)"),
+                &format!("FAIL(clip {idx} of the cut timeline would not delete)"),
             );
             return;
         }
     }
-    let timeline = session.timeline_duration();
     eprintln!(
-        "cutloop: {regions} regions of {cut_s}s cut, {} clips of {keep_s}s left, \
-         {timeline:.1}s of timeline at {fps:.3} fps",
-        regions + 1
+        "cutloop: spans after the deletes: {:?}",
+        session.clip_spans()
+    );
+    let spans = session.clip_spans();
+    let timeline = session.timeline_duration();
+    let expect = (f64::from(regions) + 1.0) * keep_s;
+    if (timeline - expect).abs() > keep_s {
+        row(
+            path,
+            "cutloop_displayed",
+            "count",
+            &[],
+            &format!("FAIL(timeline {timeline:.2}s, expected ~{expect:.2}s of kept clips)"),
+        );
+        return;
+    }
+    eprintln!(
+        "cutloop: {regions} regions of {cut_s}s cut, {} clips left on the \
+         video lane, {timeline:.1}s of timeline at {fps:.3} fps",
+        spans.len()
     );
 
     session.seek(0.0);
