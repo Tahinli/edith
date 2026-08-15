@@ -204,6 +204,21 @@ pub(crate) fn scroll_thumb(
     (x as f32, width as f32)
 }
 
+/// The lane stack's thumb over a track `h` px tall: `(y, height)` of the box
+/// standing for the visible share of a stack `content` px tall in a box
+/// `box_h` px tall, taken down by `scrolled` px -- the time axis's
+/// [`scroll_thumb`] turned through a right angle, and on the same terms:
+/// full track when the whole stack is on screen, never shorter than
+/// [`SCROLL_THUMB_MIN`] when it is not, and never off the track either way.
+pub(crate) fn lanes_thumb(track: f32, content: f32, box_h: f32, scrolled: f32) -> (f32, f32) {
+    if track <= 0. || content <= 0. || box_h >= content {
+        return (0., track.max(0.));
+    }
+    let height = (track * box_h / content).clamp(SCROLL_THUMB_MIN, track);
+    let y = (scrolled / (content - box_h) * (track - height)).clamp(0., track - height);
+    (y, height)
+}
+
 impl Selection {
     pub(crate) fn len(&self) -> usize {
         self.picks.len()
@@ -477,6 +492,12 @@ pub(crate) fn frac_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
 /// painted reads as its start.
 pub(crate) fn px_along(x: Pixels, bounds: Bounds<Pixels>) -> f32 {
     f32::from(x - bounds.left()).clamp(0., f32::from(bounds.size.width).max(0.))
+}
+
+/// [`px_along`] turned through a right angle, for the lane stack's scrollbar:
+/// how far down its track a press landed.
+pub(crate) fn px_down(y: Pixels, bounds: Bounds<Pixels>) -> f32 {
+    f32::from(y - bounds.top()).clamp(0., f32::from(bounds.size.height).max(0.))
 }
 
 /// One turn of the wheel as a single number, positive for a turn *up*, in

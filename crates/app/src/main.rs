@@ -110,6 +110,12 @@ struct Player {
     /// A thumb in the hand: how far into the thumb the press landed, in
     /// track pixels. `None` with no drag in flight.
     scroll_drag: Option<f32>,
+    /// A thumb of the lane stack's own scrollbar in the hand: how far into
+    /// the thumb the press landed, in track pixels. `None` with no drag in
+    /// flight. The stack's box itself is read straight off the scroll handle
+    /// each frame, so unlike the time axis's strip it needs no probe of its
+    /// own.
+    lanes_drag: Option<f32>,
     /// How wide a second of timeline is drawn, and from which moment. Held here
     /// and nowhere else: every frame-to-pixel answer in the panel comes out of
     /// it, so the boxes, the playhead and the pointer cannot disagree.
@@ -656,6 +662,7 @@ fn main() {
                     ruler: Rc::default(),
                     scroll_track: Rc::default(),
                     scroll_drag: None,
+                    lanes_drag: None,
                     // draws: the title bar and the header name it while its
                     // header is still being read.
                     name: name.clone(),

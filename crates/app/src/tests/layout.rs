@@ -63,12 +63,17 @@ fn no_colour_is_written_outside_the_theme() {
 /// being scrolled, or it is an instruction nobody can carry out.
 #[test]
 fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
-    // The timeline is a region and not the window: its chrome and one whole
-    // lane fit the share it may take at the floor.
+    use crate::timeline_fixed_h;
+
+    // The timeline is a region and not the window: its chrome -- the
+    // scrollbar strip's row included, which is the larger of the two the
+    // zoom can leave in it -- and one whole lane fit the share it may take
+    // at the floor.
     let floor = 360. * TIMELINE_SHARE;
     assert!(
-        TIMELINE_FIXED_H + LANE_H <= floor,
-        "{TIMELINE_FIXED_H} px of chrome and a lane will not fit {floor} px"
+        timeline_fixed_h(true) + LANE_H <= floor,
+        "{} px of chrome and a lane will not fit {floor} px",
+        timeline_fixed_h(true)
     );
     // What is left over is measured in whole lanes, at least one.
     assert_eq!(lanes_shown(LANE_H), 1);
@@ -287,6 +292,82 @@ fn the_scroll_thumb_is_the_visible_share_at_its_own_place() {
     assert_eq!(w, SCROLL_THUMB_MIN);
     assert_eq!(x, 400. - SCROLL_THUMB_MIN);
     assert_eq!(scroll_thumb(400., 1_000_000., 0., 100.).0, 0.);
+}
+
+/// The strip's row is furniture only while there is somewhere to scroll to:
+/// zoomed out to the whole timeline the strip is not drawn and neither is its
+/// height -- out of every budget at once (the region, the box the lanes are
+/// laid out against, and the seam's floor), or the lanes would gain or lose a
+/// strip's row at the zoom boundary without the strip to show for it.
+#[test]
+fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
+    use crate::{SCROLL_HIT, Split, lanes_h, split_size, timeline_fixed_h, timeline_h};
+    use gpui::{px, size};
+
+    // The strip's row, and only the strip's row, is what the two faces differ
+    // by -- the gap above it and its own hit height.
+    assert_eq!(
+        timeline_fixed_h(true) - timeline_fixed_h(false),
+        8. + SCROLL_HIT
+    );
+    let window = size(px(1280.), px(720.));
+    for scroll in [false, true] {
+        // Whatever the strip is doing, the lanes keep exactly the room they
+        // had: the region grows by the strip's row when it appears, by
+        // exactly the row the lanes would otherwise lose to it.
+        assert_eq!(timeline_h(2, scroll) - timeline_fixed_h(scroll), lanes_h(2));
+        assert_eq!(
+            timeline_h(6, scroll) - timeline_fixed_h(scroll),
+            lanes_h(6)
+        );
+        // ...and the floor keeps a whole lane standing under the line, on
+        // either face of the zoom boundary.
+        let floor = split_size(Split::Timeline, Some(0.), 2, window, scroll);
+        let box_h = floor - timeline_fixed_h(scroll);
+        assert!(2 > lanes_shown(box_h), "no line to pay for at the floor");
+        assert!(
+            box_h - LABEL_H - 8. >= LANE_H,
+            "the floor leaves {} px for a {LANE_H} px lane",
+            box_h - LABEL_H - 8.
+        );
+        // The two floors land the lanes in the same place: whichever face
+        // the zoom is on, a timeline held at its floor shows the same whole
+        // lane under the same line -- the strip's row comes and goes with
+        // the floor, not out of the lane. (A size dragged into the interior
+        // stays the hand's across the boundary, and the lanes are simply
+        // given the row back.)
+        assert_eq!(box_h, LANE_H + LABEL_H + 8.);
+    }
+    // The share covers the taller floor, strip in -- the one the clamp would
+    // otherwise overrule at the 640x360 floor, saying the panel takes less of
+    // a short window than it does.
+    assert!(
+        timeline_fixed_h(true) + LANE_H + LABEL_H + 8. <= 360. * TIMELINE_SHARE,
+        "the strip-bearing floor will not fit the share"
+    );
+}
+
+/// The lane stack's thumb: the visible share of the rows at their own place
+/// on the track, the time axis's own thumb turned through a right angle.
+#[test]
+fn the_lane_thumb_is_the_visible_share_of_the_stack() {
+    use crate::lanes_thumb;
+    use crate::SCROLL_THUMB_MIN;
+
+    // Whole stack on screen: the track fills and there is nothing to scroll.
+    assert_eq!(lanes_thumb(200., 104., 200., 0.), (0., 200.));
+    assert_eq!(lanes_thumb(200., 0., 0., 0.), (0., 200.));
+    // Half the stack visible, taken halfway down: a half-height thumb at the
+    // halfway mark.
+    assert_eq!(lanes_thumb(200., 400., 200., 100.), (50., 100.));
+    assert_eq!(lanes_thumb(200., 400., 200., 0.), (0., 100.));
+    // The floor height: however tall the stack, the thumb stays holdable --
+    // and the clamp keeps it on the track, not the caller.
+    let (y, h) = lanes_thumb(200., 2000., 200., 1800.);
+    assert_eq!(h, SCROLL_THUMB_MIN);
+    assert_eq!(y, 200. - SCROLL_THUMB_MIN);
+    assert_eq!(lanes_thumb(200., 2000., 200., 0.).0, 0.);
+    assert_eq!(lanes_thumb(200., 1_000_000., 200., 0.).0, 0.);
 }
 
 /// A caption's box wears the rate its window plays at, derived off the
@@ -1341,36 +1422,44 @@ fn the_volume_slider_lands_where_it_paints() {
 fn a_dragged_divider_stops_before_either_panel_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
     use crate::{
-        SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, TOOLBAR_H, inspector_w, library_w,
-        split_drag_size, split_size, timeline_h,
+        SIDE_MAX_FRAC, SPLIT_W, SCROLL_HIT, SCROLL_THUMB_MIN, Split, TIMELINE_MAX_SHARE,
+        TOOLBAR_H, inspector_w, lanes_thumb, library_w, split_drag_size, split_size,
+        timeline_fixed_h, timeline_h,
     };
     use gpui::{point, px, size};
 
     let window = size(px(1280.), px(720.));
-    // Untouched, every region is still the share the window gives it.
-    assert_eq!(split_size(Split::Library, None, 2, window), library_w(1280.));
+    // Untouched, every region is still the share the window gives it. The
+    // timeline's answer is stated for both of its faces: the timeline fits
+    // the bed with nothing to scroll to, and zoomed in past that line the
+    // strip's row joins the furniture.
+    assert_eq!(split_size(Split::Library, None, 2, window, false), library_w(1280.));
     assert_eq!(
-        split_size(Split::Inspector, None, 2, window),
+        split_size(Split::Inspector, None, 2, window, false),
         inspector_w(1280.)
     );
     assert_eq!(
-        split_size(Split::Timeline, None, 2, window),
-        timeline_h(2).min(720. * TIMELINE_SHARE)
+        split_size(Split::Timeline, None, 2, window, false),
+        timeline_h(2, false).min(720. * TIMELINE_SHARE)
+    );
+    assert_eq!(
+        split_size(Split::Timeline, None, 2, window, true),
+        timeline_h(2, true).min(720. * TIMELINE_SHARE)
     );
     // Dragged, it is what the hand asked for...
-    assert_eq!(split_size(Split::Library, Some(300.), 2, window), 300.);
-    assert_eq!(split_size(Split::Timeline, Some(300.), 2, window), 300.);
+    assert_eq!(split_size(Split::Library, Some(300.), 2, window, false), 300.);
+    assert_eq!(split_size(Split::Timeline, Some(300.), 2, window, false), 300.);
     // ...and never past either end of it.
     assert_eq!(
-        split_size(Split::Library, Some(0.), 2, window),
+        split_size(Split::Library, Some(0.), 2, window, false),
         LIBRARY_MIN_W
     );
     assert_eq!(
-        split_size(Split::Library, Some(9000.), 2, window),
+        split_size(Split::Library, Some(9000.), 2, window, false),
         1280. * SIDE_MAX_FRAC
     );
     assert_eq!(
-        split_size(Split::Inspector, Some(-40.), 2, window),
+        split_size(Split::Inspector, Some(-40.), 2, window, false),
         INSPECTOR_MIN_W
     );
     // The timeline's own floor is a floor with a whole lane *drawn* in it. At
@@ -1378,12 +1467,14 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // saying the rest are below is drawn too -- out of the region's pixels,
     // not out of the lane's. Left unbudgeted the header came out 27 px of its
     // 48 and the track's name, its subtitle dot and its × were cut in half.
-    let floor = split_size(Split::Timeline, Some(0.), 2, window);
-    assert_eq!(floor, TIMELINE_FIXED_H + LANE_H + LABEL_H + 8.);
+    // Stated for the strip-bearing face, the taller of the two -- that is the
+    // one the clamp has to hold at the 640x360 floor.
+    let floor = split_size(Split::Timeline, Some(0.), 2, window, true);
+    assert_eq!(floor, timeline_fixed_h(true) + LANE_H + LABEL_H + 8.);
     // The same arithmetic the timeline lays the column out with
     // ([`Player::timeline`]): what the affordance costs comes off the box, and
     // a whole lane is still standing under it.
-    let lanes_box = floor - TIMELINE_FIXED_H;
+    let lanes_box = floor - timeline_fixed_h(true);
     assert!(2 > lanes_shown(lanes_box), "no line to pay for at the floor");
     assert!(
         lanes_box - LABEL_H - 8. >= LANE_H,
@@ -1393,16 +1484,16 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // A lone track has nothing below it and pays nothing for the line -- the
     // floor is a floor, not a reserved corridor.
     assert_eq!(
-        split_size(Split::Timeline, Some(0.), 1, window),
-        TIMELINE_FIXED_H + LANE_H
+        split_size(Split::Timeline, Some(0.), 1, window, true),
+        timeline_fixed_h(true) + LANE_H
     );
     // A size dragged with one track and kept while a second arrives is raised
     // to the new floor as it is read, not silently drawn under it.
-    assert_eq!(split_size(Split::Timeline, Some(126.), 2, window), floor);
+    assert_eq!(split_size(Split::Timeline, Some(126.), 2, window, true), floor);
     // And the floor still fits the share the shortest window gives the region.
     assert!(floor <= 360. * TIMELINE_SHARE, "{floor} px will not fit");
     assert_eq!(
-        split_size(Split::Timeline, Some(9000.), 2, window),
+        split_size(Split::Timeline, Some(9000.), 2, window, true),
         720. * TIMELINE_MAX_SHARE
     );
     // A window too narrow to honour both ends keeps the floor rather than
@@ -1410,7 +1501,7 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // does.
     let narrow = size(px(600.), px(360.));
     assert_eq!(
-        split_size(Split::Inspector, Some(9000.), 2, narrow),
+        split_size(Split::Inspector, Some(9000.), 2, narrow, false),
         INSPECTOR_MIN_W
     );
 

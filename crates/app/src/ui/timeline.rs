@@ -82,25 +82,43 @@ impl Player {
         // What the lane count asks for against its share of the window -- or
         // what a hand dragged the seam above to, which wins both
         // ([`Player::split_px`]).
+        //
+        // The scrollbar's geometry comes off the very view the wheel and the
+        // zoom write: `settled` is what those paths clamp to, so the thumb
+        // never disagrees with where the panel actually is. And with the whole
+        // timeline on the bed there is no strip at all -- nor a row reserved
+        // for one: the region, this box and the seam's floor all carry the
+        // strip's pixels or none of them do ([`timeline_fixed_h`]), so the
+        // lanes keep exactly the room they had at either side of the zoom
+        // that crosses the line.
+        let view = self.view();
+        let scrollable = view.duration > view.span();
         let region_h = self.split_px(Split::Timeline, viewport);
-        let lanes_box = (region_h - TIMELINE_FIXED_H).max(LANE_H);
+        let lanes_box = (region_h - timeline_fixed_h(scrollable)).max(LANE_H);
         let overflows = lanes.len() > lanes_shown(lanes_box);
         let lanes_box = match overflows {
             true => (lanes_box - LABEL_H - 8.).max(LANE_H),
             false => lanes_box,
         };
-        // The scrollbar's geometry, off the very view the wheel and the zoom
-        // write: `settled` is what those paths clamp to, so the thumb never
-        // disagrees with where the panel actually is.
-        let view = self.view();
-        let scrollable = view.duration > view.span();
         let (thumb_x, thumb_w) =
             scroll_thumb(view.bed, view.duration, view.scale.start.max(0.), view.span());
         // Live, not a count of the lanes: the column reports where it has been
         // taken to, so the line empties itself as the last track comes up
-        // instead of insisting there is still something below.
+        // instead of insisting there is still something below. The stack's own
+        // strip below reads the same number, so a thumb dragged there and a
+        // count the affordance lets go of cannot disagree.
         let scrolled = -f32::from(self.lanes_scroll.offset().y);
         let below = rows_below(lanes.len(), lanes_box, scrolled);
+        // The stack's own scrollbar: the thumb is the visible share of the
+        // lane rows, read straight off the column's own scroll state -- the
+        // box, the fold and how far down it has been taken are all the
+        // handle's to know, so nothing here is a second truth about any of
+        // them.
+        let stack = self.lanes_scroll.bounds();
+        let track_h = f32::from(stack.size.height);
+        let stack_max = f32::from(self.lanes_scroll.max_offset().height);
+        let (stack_y, stack_thumb_h) =
+            lanes_thumb(track_h, track_h + stack_max, track_h, scrolled);
         div()
             .flex_none()
             // Never more than its share of a short window: the lane column
@@ -219,93 +237,168 @@ impl Player {
             // column, so a project with more lanes than the panel is tall
             // scrolls its tracks instead of pushing the picture off the window.
             // The gap is the panel's own, so two lanes lay out exactly as they
-            // did when they were two children of it.
+            // did when they were two children of it. The column sits in a
+            // relative box so the stack's own scrollbar can lie *over* the
+            // beds' right edge: a gutter beside them would take its width off
+            // the bed, and the ruler above would stop pointing at the moment
+            // the lanes are drawn at.
             .child(
                 div()
-                    .id("lanes")
-                    // Takes whatever the region has left and scrolls inside it:
-                    // at the 640x360 floor the region is capped
-                    // ([`TIMELINE_SHARE`]) and a fixed column would be clipped
-                    // by it rather than scrolled.
                     .flex_1()
                     .min_h(px(0.))
+                    .max_h(px(lanes_h(LANES_MAX)))
+                    .relative()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .max_h(px(lanes_h(LANES_MAX)))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.lanes_scroll)
-                    .children(rows),
-            )
-            // The timeline's own scrollbar: the time axis is the one dimension
-            // the panel scrolls, and until now only the wheel and the keys
-            // reached it. The thumb is the visible share of the drawn duration
-            // and sits where that share is -- read off the very `Scale` every
-            // box is drawn through, so a wheel notch, a zoom about the pointer
-            // and the follow of the playhead all move it, because they all move
-            // the one state.
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .gap(px(HEADER_GAP))
-                    // Under the lane headers like the ruler is above them, so
-                    // the thumb and the bed it stands for line up.
-                    .child(div().flex_none().w(px(HEADER_W)))
                     .child(
                         div()
-                            .id("timeline-scroll")
+                            .id("lanes")
+                            // Takes whatever the region has left and scrolls
+                            // inside it: at the 640x360 floor the region is
+                            // capped ([`TIMELINE_SHARE`]) and a fixed column
+                            // would be clipped by it rather than scrolled.
                             .flex_1()
-                            .min_w(px(0.))
-                            .h(px(SCROLL_HIT_H))
+                            .min_h(px(0.))
+                            .w_full()
                             .flex()
                             .flex_col()
-                            .justify_center()
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER_DIM())))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| {
-                                    Tip("Scroll the timeline — drag the thumb or click to jump; \
-                                         wheel scrolls, ctrl+wheel zooms"
-                                        .into())
+                            .gap(px(8.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.lanes_scroll)
+                            .children(rows),
+                    )
+                    // The lane stack's own scrollbar, drawn only while the
+                    // stack overflows -- the same state the affordance below
+                    // announces -- and never while the whole stack is on
+                    // screen, where a full-height thumb would say nothing the
+                    // lanes themselves do not. It costs the lanes nothing,
+                    // being over the bed rather than out of it, and it is its
+                    // own mouse region: a press there never reaches a clip.
+                    .when(overflows, |d| {
+                        d.child(
+                            div()
+                                .id("lanes-scroll")
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(SCROLL_HIT))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER_DIM())))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| {
+                                        Tip("Scroll the tracks — drag the thumb or click to \
+                                             jump; the wheel scrolls them"
+                                            .into())
+                                    })
+                                    .into()
                                 })
-                                .into()
-                            })
-                            .on_scroll_wheel(cx.listener(
-                                |this, event: &ScrollWheelEvent, _, cx| {
-                                    this.timeline_wheel(event, cx);
-                                },
-                            ))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.scroll_press(event.position.x, cx);
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(px(6.))
-                                    .rounded(px(3.))
-                                    .bg(rgb(BG_RAISED()))
-                                    .child(bounds_probe(self.scroll_track.clone()))
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .rounded(px(3.))
-                                            .left(px(thumb_x))
-                                            .absolute()
-                                            .top_0()
-                                            .w(px(thumb_w))
-                                            .bg(rgb(match scrollable {
-                                                true => ACCENT_PRIMARY(),
-                                                false => FG_SECONDARY(),
-                                            })),
-                                    ),
-                            ),
-                    ),
+                                .on_scroll_wheel(cx.listener(
+                                    |this, event: &ScrollWheelEvent, _, cx| {
+                                        this.lanes_wheel(wheel_delta(event), cx);
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        this.lanes_press(event.position.y, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(px((SCROLL_HIT - 6.) / 2.))
+                                        .w(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(rgb(BG_RAISED()))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(stack_y))
+                                                .h(px(stack_thumb_h))
+                                                .w_full()
+                                                .rounded(px(3.))
+                                                .bg(rgb(ACCENT_PRIMARY())),
+                                        ),
+                                ),
+                        )
+                    }),
             )
+            // The timeline's own scrollbar: the time axis is the one dimension
+            // the panel scrolls with no bar of its own, and until f69ba33 only
+            // the wheel and the keys reached it. The thumb is the visible share
+            // of the drawn duration and sits where that share is -- read off
+            // the very `Scale` every box is drawn through, so a wheel notch, a
+            // zoom about the pointer and the follow of the playhead all move
+            // it, because they all move the one state. The row exists only
+            // while there is somewhere to scroll to: zoomed out to the whole
+            // timeline the strip is not drawn and no pixels are held for it
+            // ([`timeline_fixed_h`]) -- a bar for a view that cannot move is a
+            // bar teaching nothing.
+            .when(scrollable, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap(px(HEADER_GAP))
+                        // Under the lane headers like the ruler is above them, so
+                        // the thumb and the bed it stands for line up.
+                        .child(div().flex_none().w(px(HEADER_W)))
+                        .child(
+                            div()
+                                .id("timeline-scroll")
+                                .flex_1()
+                                .min_w(px(0.))
+                                .h(px(SCROLL_HIT))
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER_DIM())))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| {
+                                        Tip("Scroll the timeline — drag the thumb or click to \
+                                             jump; wheel scrolls, ctrl+wheel zooms"
+                                            .into())
+                                    })
+                                    .into()
+                                })
+                                .on_scroll_wheel(cx.listener(
+                                    |this, event: &ScrollWheelEvent, _, cx| {
+                                        this.timeline_wheel(event, cx);
+                                    },
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        this.scroll_press(event.position.x, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(rgb(BG_RAISED()))
+                                        .child(bounds_probe(self.scroll_track.clone()))
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .rounded(px(3.))
+                                                .left(px(thumb_x))
+                                                .absolute()
+                                                .top_0()
+                                                .w(px(thumb_w))
+                                                .bg(rgb(ACCENT_PRIMARY())),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             // "It scrolls" is not "it can be found": when the region is too
             // short for every track -- which is what the 640x360 floor does to a
             // three-track project -- the lanes below the fold say so, in the one

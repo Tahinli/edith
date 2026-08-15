@@ -221,10 +221,12 @@ pub(crate) const SNAP_PX: f64 = 5.;
 /// own seek strip, which is the idiom it sits under.
 pub(crate) const SCROLL_THUMB_MIN: f32 = 24.;
 
-/// The scrollbar track's own hit height: the bar looks 6 px tall, and the
-/// strip that takes the press is taller for the ruler strip's reason -- a
-/// hand must be able to find it without aiming (WCAG 2.5.8).
-pub(crate) const SCROLL_HIT_H: f32 = 14.;
+/// The thickness of a scrollbar strip's hit area, in the one dimension the
+/// strip spans: the height of the horizontal one under the lanes, the width
+/// of the vertical one on the beds' right edge. The bar inside it looks 6 px,
+/// and the strip that takes the press is thicker for the ruler strip's
+/// reason -- a hand must be able to find it without aiming (WCAG 2.5.8).
+pub(crate) const SCROLL_HIT: f32 = 14.;
 
 /// Where a held key would land, which is the whole of what auto-repeat has to
 /// know. [`Player::repeat_scope`] answers it from the same state the handler
