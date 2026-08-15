@@ -3956,13 +3956,31 @@ impl Project {
                 // -- same words on less timeline, its window untouched, for
                 // [`write_speed`]'s reason -- and everything behind the region
                 // slides up by what the region gave back.
+                //
+                // The pieces inside re-time by their *boundaries*, not each
+                // on its own: rounding one piece's start and its neighbour's
+                // start apart can land both on the same frame (two one-frame
+                // cues of a thirty-frame region at 2x both want frame 15), so
+                // the mapped boundaries are walked in order and forced apart
+                // -- each piece at least one frame, none past the region's own
+                // new end, where the first follower lands exactly. A rounding
+                // artifact is clamped, not refused: nothing about the words
+                // asked for an overlap.
                 let share = f64::from(after) / f64::from(len).max(1.);
-                for s in &mut self.lanes[l].subs {
+                let map = |bound: u32| at + (f64::from(bound - at) * share).round() as u32;
+                let mut prev = at;
+                let subs = &mut self.lanes[l].subs;
+                for i in 0..subs.len() {
+                    let s = subs[i];
                     if s.start >= at + len {
-                        s.start -= delta;
+                        subs[i].start = s.start - delta;
                     } else if s.start >= at && s.end() <= at + len {
-                        s.start = at + (f64::from(s.start - at) * share).round() as u32;
-                        s.frames = (f64::from(s.frames) * share).round().max(1.) as u32;
+                        let mut start = map(s.start).max(prev);
+                        let end = map(s.end()).max(start + 1).min(at + after);
+                        start = start.min(end - 1);
+                        subs[i].start = start;
+                        subs[i].frames = end - start;
+                        prev = end;
                     }
                 }
                 debug_assert!(subs_sorted_disjoint(&self.lanes[l].subs));
@@ -5084,6 +5102,63 @@ mod tests {
             "the piece behind slides up by what the region gave back"
         );
         assert!(subs_sorted_disjoint(&p.lanes[p.index(s1).unwrap()].subs));
+    }
+
+    /// The region's caption pieces re-time by mapped boundaries forced apart:
+    /// rounding start and length independently can land two cues on one frame,
+    /// and the artifact is clamped -- one frame each, in order, none past the
+    /// region's new end -- never an overlap on the lane.
+    #[test]
+    fn a_regions_caption_pieces_never_round_onto_one_another() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = |n| SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: format!("eng{n}"),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        // Three lanes, one repro shape each: adjacent one-frame cues, a
+        // three-frame pair, and the region's last cue against the first
+        // caption behind it. The region [0, 30) plays at 2x: 15 frames.
+        let mut p = Project::single(FILE, 60).with_subtitles(vec![track(0), track(1), track(2)]);
+        let lanes: Vec<Lane> = (0..3).map(|_| p.add_lane(LaneKind::Subtitle)).collect();
+        p.place_sub(lanes[0], 9, caption(9, 1)).expect("placed");
+        p.place_sub(lanes[0], 10, caption(10, 1)).expect("placed");
+        p.place_sub(lanes[1], 5, caption(5, 3)).expect("placed");
+        p.place_sub(lanes[1], 8, caption(8, 3)).expect("placed");
+        p.place_sub(lanes[2], 29, caption(29, 1)).expect("placed");
+        p.place_sub(lanes[2], 30, caption(30, 15)).expect("placed");
+
+        let mut scope = vec![Lane::V1, Lane::A1];
+        scope.extend(lanes.iter().copied());
+        p.speed_regions(&[(0, 30)], Speed::from_permille(2000), &scope)
+            .expect("the region speeds up");
+        // Adjacent one-frame cues: both map to frame 5, and are forced apart.
+        let spans = |p: &Project, lane: Lane| -> Vec<(u32, u32)> {
+            p.sub_lane(lane).iter().map(|s| (s.start, s.frames)).collect()
+        };
+        assert_eq!(spans(&p, lanes[0]), [(5, 1), (6, 1)], "one frame each, in order");
+        // The three-frame pair: [5, 8) and [8, 11) map to [3, 5) and [4, 6),
+        // and the walk pushes the second to where the first ends.
+        assert_eq!(spans(&p, lanes[1]), [(3, 1), (4, 2)], "forced apart, kept in order");
+        // The last cue of the region ends exactly where the region now does
+        // (frame 15), and the caption behind it lands on that same frame:
+        // touching, never overlapping.
+        assert_eq!(spans(&p, lanes[2]), [(14, 1), (15, 15)], "the cue ends with the region");
+        for &lane in &lanes {
+            assert!(subs_sorted_disjoint(&p.lanes[p.index(lane).unwrap()].subs));
+        }
     }
 
     /// The scope law names a caption half too: a scoped cut that would move one
