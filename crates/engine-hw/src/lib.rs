@@ -141,6 +141,53 @@ const LEADING_LIMIT: u32 = 64;
 /// at ~3 MB of video memory each.
 const DMA_HOLD: usize = 6;
 
+/// How far ahead of the decode position [`Session::seek_to`] walks forward
+/// rather than flushing, in seconds of the stream's own frames. A silence cut
+/// lands the next span ahead of the decoder by the length of what it removed
+/// -- tenths of a second -- and walking that forward costs only the decode of
+/// the frames in between, dropped without the read-back ([`Session::pump`]'s
+/// skip path) with the decoder's reference chain and pipeline depth left
+/// standing. The flush it replaces costs a decoder reset, a demuxer seek to
+/// the random access point, up to a group of skip-decoded pictures behind it,
+/// and a full re-prime before the first frame is out again (~178 ms measured
+/// at 4K, which is longer than the clips a silence cut leaves); past half a
+/// second of walking, the skip-decode run alone approaches that bill and a
+/// real seek wins.
+const FORWARD_SECS: f64 = 0.5;
+
+/// The forward reach in frames: [`FORWARD_SECS`] at the stream's own rate.
+/// `0` for a rate the stream does not really state, which is "never forward"
+/// -- exactly the flush every reposition did before this distinction existed.
+fn forward_limit(frame_rate: f64) -> u32 {
+    (FORWARD_SECS * frame_rate).round().max(0.) as u32
+}
+
+/// How a reposition to `target` (a 0-based display frame) is reached from
+/// `position`, the frame the session would hand out next. Pure arithmetic,
+/// so every shape of the answer is testable without a GPU.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Reposition {
+    /// Decode forward from where the session stands, dropping this many
+    /// pictures on the way: no flush, no demuxer seek, no re-prime.
+    Forward(u32),
+    /// Flush the decoder and seek the demuxer to the random access point at
+    /// or before `target`.
+    Flush,
+}
+
+fn reposition(position: i64, target: i64, frame_count: u32, limit: u32) -> Reposition {
+    // A decoder cannot walk backwards, and a target at or past the last frame
+    // is not one decoding forward can hand out -- both take the seek that has
+    // always handled them, EOF included.
+    if target < position || target >= i64::from(frame_count) {
+        return Reposition::Flush;
+    }
+    match u32::try_from(target - position) {
+        Ok(ahead) if ahead <= limit => Reposition::Forward(ahead),
+        _ => Reposition::Flush,
+    }
+}
+
 struct Session {
     decoder: Decoder,
     /// NV12 (or, for a 10-bit stream, P010) descriptor for `vaGetImage`,
@@ -159,6 +206,11 @@ struct Session {
     flushed: bool,
     /// Pictures still to be decoded and thrown away to land on a seek target.
     skip: u32,
+    /// The display frame the next `pump` would hand out, however it gets
+    /// there: one further along for every handle taken off `ready`, skipped
+    /// past and delivered alike. The one thing that can tell a reposition
+    /// *ahead* of the decoder from one behind it ([`Session::seek_to`]).
+    position: i64,
     /// Access units dropped because they referenced pictures this session never
     /// decoded -- see [`Session::pump`]. Counted rather than flagged so the
     /// tolerance ends somewhere, and raised to [`LEADING_LIMIT`] the moment a
@@ -321,6 +373,7 @@ impl Session {
             timestamp: 0,
             flushed: false,
             skip: 0,
+            position: 0,
             // A stream read from its own beginning has no missing references
             // and therefore no leading pictures to forgive: the window opens
             // only for a session positioned somewhere else ([`Session::open_at`]),
@@ -349,6 +402,7 @@ impl Session {
         let target_frame = target_sample.saturating_sub(1);
         let first = session.demuxer.seek_to_sync_at_or_before(target_frame);
         session.skip = (i64::from(target_frame) - first).max(0) as u32;
+        session.position = first;
         if target_frame > 0 {
             session.leading = 0;
         }
@@ -358,10 +412,15 @@ impl Session {
     /// Repositions an **open** session, exactly as [`Session::open_at`] positions
     /// a new one: the next [`Session::pump`] hands back sample `target_sample`.
     ///
-    /// This is what a seek costs when the session is kept: a demuxer seek and a
-    /// decoder flush, and *not* the VA-API initialisation (~90 ms measured), the
-    /// render node probe, the container parse and the surface pool that opening
-    /// one again pays for.
+    /// This is what a seek costs when the session is kept, and most of it is
+    /// skippable: a target *ahead* of where the decoder stands, within
+    /// [`FORWARD_SECS`] of it, is reached by decoding on and dropping the
+    /// pictures in between ([`reposition`]) -- no flush, no demuxer seek, no
+    /// re-prime -- which is the landing a silence cut leaves at every boundary
+    /// it cuts to, a fraction of a second ahead of the clip that just ended.
+    /// Everything else pays the demuxer seek and the decoder flush, and *not*
+    /// the VA-API initialisation (~90 ms measured), the render node probe, the
+    /// container parse and the surface pool that opening one again pays for.
     ///
     /// The flush is the whole of the decoder's reset: cros-codecs finishes what
     /// is in flight and goes to `Reset`, from where it resumes on the next
@@ -371,6 +430,22 @@ impl Session {
     /// flush makes ready are dropped with `ready`: they belong to where the
     /// session *was*.
     fn seek_to(&mut self, target_sample: u32) -> Result<(), String> {
+        // The same arithmetic `open_at` does, for the same reason.
+        let target_frame = target_sample.saturating_sub(1);
+        if let Reposition::Forward(ahead) = reposition(
+            self.position,
+            i64::from(target_frame),
+            self.meta.frame_count,
+            forward_limit(self.meta.frame_rate),
+        ) {
+            // Nothing about the session moves but the skip: not the decoder,
+            // not the access unit half-fed to it, not the pictures already
+            // waiting in `ready` -- the skip walks past all of them exactly
+            // as it walks past the ones still to decode, one `position` step
+            // per handle either way.
+            self.skip = self.skip.saturating_add(ahead);
+            return Ok(());
+        }
         self.decoder.get().flush().map_err(|e| e.to_string())?;
         // Drain what the flush completed, dropping every handle: each one holds
         // a pool buffer out of circulation, and none of them is ours to show.
@@ -388,10 +463,9 @@ impl Session {
         self.ready.clear();
         self.pending.clear();
         self.flushed = false;
-        // The same arithmetic `open_at` does, for the same reason.
-        let target_frame = target_sample.saturating_sub(1);
         let first = self.demuxer.seek_to_sync_at_or_before(target_frame);
         self.skip = (i64::from(target_frame) - first).max(0) as u32;
+        self.position = first;
         // ...and the same open-GOP window: a session positioned anywhere but the
         // start may meet leading pictures that reference what it never decoded.
         self.leading = if target_frame > 0 { 0 } else { LEADING_LIMIT };
@@ -425,6 +499,9 @@ impl Session {
                 }
             }
             if let Some(handle) = self.ready.pop_front() {
+                // One picture further along, shown or skipped past alike:
+                // this is the only place [`Session::position`] walks.
+                self.position += 1;
                 // Seek discards: dropping the handle skips the `vaGetImage`
                 // read-back (~1.2 ms/picture) and frees its pool buffer.
                 if self.skip > 0 {
@@ -1981,5 +2058,50 @@ mod tests {
         assert_eq!(caps.decode_10bit & !caps.decode, 0, "{caps:?}");
         // H.264 here is 8-bit 4:2:0; the table has no 10-bit profile for it.
         assert_eq!(caps.decode_10bit & CAP_H264, 0, "{caps:?}");
+    }
+
+    /// Every shape of the forward-or-flush decision a reposition makes, with
+    /// no GPU in sight: the boundary a silence cut leaves is a target a few
+    /// frames *ahead* of the decoder and that is the walk; behind it, past the
+    /// reach, and past the end of the stream are the flush.
+    #[test]
+    fn a_target_ahead_within_the_reach_walks_forward() {
+        use Reposition::{Flush, Forward};
+        // A 30 fps stream, so the reach is [`FORWARD_SECS`] of it.
+        let (count, limit) = (10_000u32, forward_limit(30.0));
+        assert_eq!(forward_limit(30.0), 15);
+        // The boundary a 0.3 s silence cut leaves: 9 frames ahead, dropped
+        // unread on the way to exactly the target.
+        assert_eq!(reposition(120, 129, count, limit), Forward(9));
+        // Exactly at the reach, and a reseek to exactly where the decoder
+        // stands (a superseded span's landing): nothing to do but not flush.
+        assert_eq!(reposition(120, 135, count, limit), Forward(15));
+        assert_eq!(reposition(120, 120, count, limit), Forward(0));
+        // One frame past either end of the walk is the flush's.
+        assert_eq!(reposition(120, 136, count, limit), Flush);
+        assert_eq!(reposition(120, 119, count, limit), Flush);
+        assert_eq!(reposition(120, 0, count, limit), Flush);
+        // The last frame of the stream is a frame like any other...
+        assert_eq!(reposition(9_995, 9_999, count, limit), Forward(4));
+        // ...while a target at or past the end is not one decoding forward
+        // can hand out: EOF falls back to the seek that always handled it.
+        assert_eq!(reposition(9_995, 10_000, count, limit), Flush);
+        assert_eq!(reposition(9_995, 60_000, count, limit), Flush);
+        // From the end itself -- everything delivered, `pump` at clean EOF --
+        // even a target inside the stream is behind.
+        assert_eq!(reposition(10_000, 9_999, count, limit), Flush);
+    }
+
+    /// The reach is time, carried at the stream's own rate, and a stream that
+    /// states no rate gets none of it: such a session keeps the behaviour
+    /// every reposition had, rather than a skip of nonsense frames.
+    #[test]
+    fn the_reach_is_half_a_second_at_the_streams_own_rate() {
+        assert_eq!(forward_limit(23.976), 12);
+        assert_eq!(forward_limit(24.0), 12);
+        assert_eq!(forward_limit(60.0), 30);
+        assert_eq!(forward_limit(0.0), 0);
+        assert_eq!(forward_limit(f64::NAN), 0);
+        assert_eq!(forward_limit(-30.0), 0);
     }
 }

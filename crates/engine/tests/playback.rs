@@ -706,6 +706,83 @@ fn edits_traverse_cuts() {
     );
 }
 
+/// A cut small enough to land *ahead* of the decoder rather than behind it:
+/// less than half a second of file removed, which is the shape a silence cut
+/// leaves at every boundary it makes. The picture worker reaches the next
+/// span by decoding forward and dropping (the plugin's forward skip, no
+/// flush) -- and what must survive that is the exactness of the landing: the
+/// first frame past the boundary is the source frame the cut ended on, pixel
+/// for pixel, exactly as the long cut above is asserted.
+#[test]
+fn a_small_cut_lands_frame_exact_across_the_boundary() {
+    let path = asset("test_baseline.mp4");
+    let mut session = open(&path);
+    let (fps, total) = (session.meta().frame_rate, session.meta().frame_count);
+    // 0.2 s out of the middle: 6 frames at 30 fps, well inside the half a
+    // second a reposition may walk forward.
+    let (cut, hole_end) = ((1.0 * fps) as u32, (1.2 * fps) as u32);
+    assert!(session.cut_at(1.0), "cut at 1 s");
+    assert!(session.cut_at(1.2), "cut at 1.2 s");
+    assert!(session.delete_clip(Lane::V1, 1), "drop the hole");
+    let kept = total - (hole_end - cut);
+
+    // Play the whole edited timeline from the top, one frame at a time.
+    session.seek(0.0);
+    session.play();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut expect, mut boundary) = (0, None);
+    loop {
+        session.tick();
+        while let Some(frame) = session.try_frame() {
+            assert_eq!(frame.index, expect, "timeline indices must be contiguous");
+            if frame.index == cut {
+                boundary = Some(frame.bgra);
+            }
+            expect += 1;
+        }
+        if session.is_eos() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "still draining after 20 s");
+        sleep(Duration::from_millis(4));
+    }
+    assert_eq!(expect, kept, "the edited timeline, whole and nothing but");
+    session.pause();
+
+    let boundary = boundary.expect("no frame at the cut");
+    assert!(
+        boundary == source_frame(&path, hole_end),
+        "the boundary frame is not source {hole_end}"
+    );
+    assert!(
+        boundary != source_frame(&path, cut),
+        "the deleted range is still being decoded"
+    );
+}
+
+/// The prime a picture restart spends, as the session reports it: owed from
+/// the moment a span is started until that span's first frame arrives. A
+/// front-end gates its late-picture restart on this, so what it reads has to
+/// be exactly this and nothing looser.
+#[test]
+fn picture_priming_spans_a_restart_and_ends_at_its_first_frame() {
+    let path = asset("test_baseline.mp4");
+    let mut session = open(&path);
+    // The open itself is a span that has not delivered yet.
+    assert!(session.picture_priming(), "a fresh session is priming");
+    let first = next_frame(&mut session, "the open");
+    assert!(!session.picture_priming(), "the first frame ends the prime");
+    assert_eq!(first.index, 0);
+
+    // A seek restarts the picture at its target: a new span, a new prime --
+    // the same start every clip boundary and edit takes.
+    session.seek(2.0);
+    assert!(session.picture_priming(), "the reseek is priming again");
+    let landed = next_frame(&mut session, "the reseek");
+    assert!(!session.picture_priming());
+    assert_eq!(landed.index, (2.0 * session.meta().frame_rate) as u32);
+}
+
 /// Copy and paste. A clipboard clip is a pair of *source* frame numbers, so the
 /// pasted stretch has to decode its own range -- not the frames the timeline
 /// used to hold at that position.

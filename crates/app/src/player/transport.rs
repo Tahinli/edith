@@ -18,6 +18,12 @@ impl Player {
         let Some(session) = &mut self.session else {
             return;
         };
+        // Whether the span now decoding has yet to hand over a picture, read
+        // *before* the drain: the frame the drain is about to take is the one
+        // that ends the prime, and its own lateness -- however long the span's
+        // reopen took -- is exactly what the resync below must not answer with
+        // another reopen.
+        let priming = session.picture_priming();
         let target = session.now() * self.fps;
         let mut newest: Option<Frame> = None;
         // A frame the screen is owed: a seek's landing, and the one readiness
@@ -95,6 +101,12 @@ impl Player {
         // (`PlaybackSession::resync_picture`), so nothing the ear is following
         // moves. Never on a frame a seek owed: that one is late by however long
         // its own reopen took, and answering it with another reopen is a loop.
+        // The same is true of a *clip boundary's* first frame -- a silence cut
+        // leaves a timeline of clips shorter than their own reopen -- so the
+        // restart waits for a span that has delivered and fallen behind after
+        // it (`resync_due`, primed on `PlaybackSession::picture_priming`):
+        // restarting the prime only buys the same lateness again, and every
+        // `RESYNC_GAP` after that.
         //
         // corner-cut: on a machine that cannot decode the file in real time at
         // all this settles into one restart per `RESYNC_GAP` -- in sync, and
@@ -102,7 +114,7 @@ impl Player {
         // The upgrade path is dropping late frames *inside* the worker (skip
         // the convert and the send for anything already past due), which needs
         // the deadline shared with it.
-        if !owed && session.is_playing() && should_resync(late, self.resynced) {
+        if !owed && session.is_playing() && resync_due(late, self.resynced, priming) {
             eprintln!("picture {late:.3}s behind the clock: restarting it there");
             session.resync_picture();
             self.held = None;
@@ -304,5 +316,46 @@ impl Player {
                 }
             }
         }
+    }
+}
+
+/// Whether a late picture is restarted at the clock: the rule
+/// [`should_resync`] always was, plus the prime it must not interrupt. A span
+/// that has not handed over a picture yet is late by exactly its own reopen
+/// -- a clip boundary on a silence-cut timeline most of all, where the clips
+/// are shorter than that reopen -- and restarting it spends the reopen again
+/// for the same lateness, every `RESYNC_GAP` after that. The restart is for a
+/// span that has *delivered* and fallen behind afterwards.
+pub(crate) fn resync_due(late: f64, last: Option<Instant>, priming: bool) -> bool {
+    !priming && should_resync(late, last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prime gate: a span still owing its first picture is never
+    /// restarted, however late the last frame to arrive was. The same span
+    /// once it has delivered keeps the rule -- thresholds and cooldown
+    /// unchanged -- because a decoder that is genuinely too slow is still
+    /// behind on its second frame, one repaint later.
+    #[test]
+    fn a_priming_span_is_never_restarted() {
+        assert!(!resync_due(0., None, true));
+        assert!(!resync_due(LATE_RESYNC, None, true));
+        assert!(!resync_due(9., None, true));
+        // ...and the rule itself, exactly as it was, once the prime is over.
+        assert!(!resync_due(0., None, false));
+        assert!(!resync_due(LATE_RESYNC, None, false));
+        assert!(resync_due(LATE_RESYNC + 0.1, None, false));
+        // A decoder still behind right after a restart waits out the gap
+        // instead of reopening at every repaint...
+        assert!(!resync_due(9., Some(Instant::now()), false));
+        // ...and fires again once it has passed.
+        assert!(resync_due(
+            9.,
+            Some(Instant::now() - RESYNC_GAP - Duration::from_millis(1)),
+            false
+        ));
     }
 }
