@@ -289,6 +289,21 @@ fn a_caption_box_wears_the_rate_its_window_plays_at() {
         None,
         "placement rounding is not a re-timing"
     );
+    // ...and rounding on SHORT tracks, where half a frame is a large share of
+    // the window: `frames_of_us` of 1,016,667µs gives 31 frames (16,667µs of
+    // error -- 16 permille, but half a frame), and of 5,015,000µs gives 150
+    // (15,000µs). Both are unity; a relative gate badges one 0.98x and the
+    // other a self-contradicting 1.00x.
+    assert_eq!(
+        caption_rate(sub(31, 1_016_667), 30.),
+        None,
+        "half a frame off a one-second window is still unity"
+    );
+    assert_eq!(
+        caption_rate(sub(150, 5_015_000), 30.),
+        None,
+        "a hair under five seconds rounds to 150 frames and stays unity"
+    );
     // A 2x re-rate: a 5s span holding the same 10s of words.
     assert_eq!(
         caption_rate(sub(150, 10_000_000), 30.).map(|s| s.permille()),
