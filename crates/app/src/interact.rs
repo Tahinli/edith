@@ -216,6 +216,16 @@ pub(crate) fn swallow(_: &MouseDownEvent, _: &mut Window, cx: &mut App) {
 /// takes must still be able to leave a gap of a few frames there.
 pub(crate) const SNAP_PX: f64 = 5.;
 
+/// The scrollbar's thumb never narrows past this, however long the timeline:
+/// a thumb a pixel wide is a thumb no hand can hold. A quarter of the ruler's
+/// own seek strip, which is the idiom it sits under.
+pub(crate) const SCROLL_THUMB_MIN: f32 = 24.;
+
+/// The scrollbar track's own hit height: the bar looks 6 px tall, and the
+/// strip that takes the press is taller for the ruler strip's reason -- a
+/// hand must be able to find it without aiming (WCAG 2.5.8).
+pub(crate) const SCROLL_HIT_H: f32 = 14.;
+
 /// Where a held key would land, which is the whole of what auto-repeat has to
 /// know. [`Player::repeat_scope`] answers it from the same state the handler
 /// walks below itself.

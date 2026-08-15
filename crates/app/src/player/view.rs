@@ -238,6 +238,67 @@ impl Player {
         cx.notify();
     }
 
+    /// A press on the scrollbar's track: on the thumb, the drag begins from
+    /// wherever in it the hand landed; beside it, the view jumps so the
+    /// thumb's middle is at the press and the drag carries on from there --
+    /// a click is a jump, and holding it is a jump that keeps going.
+    pub(crate) fn scroll_press(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let view = self.view();
+        if view.bed <= 0. || view.duration <= 0. {
+            return;
+        }
+        let (thumb_x, thumb_w) =
+            scroll_thumb(view.bed, view.duration, view.scale.start.max(0.), view.span());
+        let at = px_along(x, self.scroll_track.get());
+        let grab = match (thumb_x..thumb_x + thumb_w).contains(&at) {
+            true => at - thumb_x,
+            // Beside the thumb: jump so its middle is under the pointer. The
+            // thumb is clamped inside the track by [`scroll_thumb`], so the
+            // grab it leaves is always a real place inside it.
+            false => {
+                let view = View {
+                    scale: Scale {
+                        start: (view.scale.start.max(0.)
+                            + f64::from(at - thumb_x - thumb_w / 2.) / view.scale.pps)
+                            .max(0.),
+                        ..view.scale
+                    },
+                    ..view
+                };
+                self.scale = view.settled();
+                thumb_w / 2.
+            }
+        };
+        self.scroll_drag = Some(grab);
+        // The wheel's own claim on the follow: a hand on the scrollbar is
+        // looking away from the playhead on purpose.
+        self.panned = true;
+        cx.notify();
+    }
+
+    /// A sample of a thumb drag: the window starts where the thumb's grabbed
+    /// point sits under the pointer, clamped by the same `settled` every other
+    /// scroll answers to. No reseek, no worker -- the view is the only thing
+    /// moving.
+    pub(crate) fn scroll_drag_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(grab) = self.scroll_drag else {
+            return;
+        };
+        let view = self.view();
+        let at = px_along(x, self.scroll_track.get());
+        // The thumb's grabbed point under the pointer names the start, in the
+        // track's own proportion. `settled` owns the ends -- and on a timeline
+        // so long the thumb sits at its floor width, the last stretch of track
+        // is the clamp's to hold, exactly as every scrollbar's is.
+        let start = f64::from((at - grab).max(0.)) / f64::from(view.bed.max(1.)) * view.duration;
+        self.scale = View {
+            scale: Scale { start, ..view.scale },
+            ..view
+        }
+        .settled();
+        cx.notify();
+    }
+
     /// One notch of the wheel anywhere over the timeline -- the ruler or a
     /// lane's bed alike, since a hand aims at the clip it is working on and not
     /// at the strip above it. Ctrl zooms about the pointer, bare scrolls the
