@@ -1866,8 +1866,10 @@ impl PlaybackSession {
 
     /// Whether the caption at `idx` of `lane` is grouped with clips on other
     /// lanes: the one question every caption edit that can move media has to
-    // ask first, because the answer is whether the edit owes a reseek.
-    fn caption_grouped_with_clips(&self, lane: Lane, idx: usize) -> bool {
+    /// ask first, because the answer is whether the edit owes a reseek -- and
+    /// the front-end owes the same answer, asked before the edit moves the
+    /// indices, so its flag reset matches the engine's reseek exactly.
+    pub fn caption_grouped_with_clips(&self, lane: Lane, idx: usize) -> bool {
         self.project
             .sub_lane(lane)
             .get(idx)
