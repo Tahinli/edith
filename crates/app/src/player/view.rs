@@ -252,20 +252,25 @@ impl Player {
         let at = px_along(x, self.scroll_track.get());
         let grab = match (thumb_x..thumb_x + thumb_w).contains(&at) {
             true => at - thumb_x,
-            // Beside the thumb: jump so its middle is under the pointer. The
-            // thumb is clamped inside the track by [`scroll_thumb`], so the
-            // grab it leaves is always a real place inside it.
+            // Beside the thumb: jump so its middle is under the pointer --
+            // by the track's own proportion, the very mapping a drag sample
+            // is read through below, so the first move of the drag that
+            // follows lands exactly where the jump left the view and the
+            // thumb never snaps under the hand (a jump worked out in pixels
+            // at the view's own pps landed at span-over-duration of the
+            // target and the snap was the drag correcting it). The thumb is
+            // clamped inside the track by [`scroll_thumb`], so the grab this
+            // leaves is always a real place inside it -- at the thumb's floor
+            // width as much as anywhere else.
             false => {
-                let view = View {
-                    scale: Scale {
-                        start: (view.scale.start.max(0.)
-                            + f64::from(at - thumb_x - thumb_w / 2.) / view.scale.pps)
-                            .max(0.),
-                        ..view.scale
-                    },
+                let start = f64::from((at - thumb_w / 2.).max(0.))
+                    / f64::from(view.bed.max(1.))
+                    * view.duration;
+                self.scale = View {
+                    scale: Scale { start, ..view.scale },
                     ..view
-                };
-                self.scale = view.settled();
+                }
+                .settled();
                 thumb_w / 2.
             }
         };
@@ -360,18 +365,18 @@ impl Player {
         cx.notify();
     }
 
-    /// One notch of the wheel over the lane stack's strip: the stack moves a
-    /// share of what it is showing, the same share the time axis gives a
-    /// notch of its own -- the strip is the names' scroll surface, and this
-    /// is what a wheel there did already.
-    pub(crate) fn lanes_wheel(&mut self, notches: f32, cx: &mut Context<Self>) {
-        let track = f32::from(self.lanes_scroll.bounds().size.height);
+    /// The wheel over the lane stack's strip, in the pixels gpui's own scroll
+    /// of the column would move it (`pixel_delta` -- a line a notch, not a
+    /// share of anything): the strip stops the wheel before the column behind
+    /// it sees it, so this is the notch's one path and it moves the stack
+    /// exactly as far as the names' own surface does.
+    pub(crate) fn lanes_wheel(&mut self, dy: f32, cx: &mut Context<Self>) {
         let max = f32::from(self.lanes_scroll.max_offset().height);
-        if track <= 0. || max <= 0. {
+        if max <= 0. {
             return;
         }
         let scrolled = -f32::from(self.lanes_scroll.offset().y);
-        let to = self.lanes_taken(scrolled - notches * track * SCROLL_NOTCH_SHARE);
+        let to = self.lanes_taken(scrolled - dy);
         self.lanes_scroll
             .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
         cx.notify();

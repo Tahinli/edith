@@ -294,16 +294,50 @@ impl Player {
                                     })
                                     .into()
                                 })
+                                // The strip is its own mouse region, and it
+                                // says so with an occluder: gpui's hit test
+                                // stops here, so the clip a press lands on
+                                // top of -- and the column's own native
+                                // scroll, and the bed's time wheel behind
+                                // that -- never hear anything through it.
+                                // Occluding is also why the two drag
+                                // listeners ride here and not only on the
+                                // root: an occluder deafens the root to
+                                // everything under it ([`drag_scrim`]'s
+                                // lesson), and this thumb's drag runs along
+                                // the strip's own 14 px -- the pointer never
+                                // leaves the one place the root cannot hear.
+                                // A drag that does leave it is picked up by
+                                // the root's own copies, without a seam.
+                                .occlude()
                                 .on_scroll_wheel(cx.listener(
-                                    |this, event: &ScrollWheelEvent, _, cx| {
-                                        this.lanes_wheel(wheel_delta(event), cx);
+                                    |this, event: &ScrollWheelEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        let line = window.line_height();
+                                        let dy =
+                                            f32::from(event.delta.pixel_delta(line).y);
+                                        this.lanes_wheel(dy, cx);
                                     },
                                 ))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
                                         this.lanes_press(event.position.y, cx);
                                     }),
+                                )
+                                // A right press is a clip's menu anywhere
+                                // else on the bed; over the strip it is
+                                // nothing, and the clip beneath must not
+                                // answer it through the strip.
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    |_: &MouseDownEvent, _, cx| cx.stop_propagation(),
+                                )
+                                .on_mouse_move(cx.listener(Player::drag_move))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(Player::drag_release),
                                 )
                                 .child(
                                     div()
@@ -367,14 +401,21 @@ impl Player {
                                     })
                                     .into()
                                 })
+                                // Both consumed here for the vertical strip's
+                                // reason: the row sits over nothing today, but
+                                // a press or a notch that fell through it
+                                // would be a gesture the strip drew and the
+                                // panel answered.
                                 .on_scroll_wheel(cx.listener(
                                     |this, event: &ScrollWheelEvent, _, cx| {
+                                        cx.stop_propagation();
                                         this.timeline_wheel(event, cx);
                                     },
                                 ))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
                                         this.scroll_press(event.position.x, cx);
                                     }),
                                 )
