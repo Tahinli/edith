@@ -522,11 +522,14 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
     assert_eq!(project.sub_lane(s1), [caption], "caption and lane restored");
 }
 
-/// A rippling paste opens its room on the subtitle lanes too -- the desync a
-/// lane model exists to prevent: a caption that stayed where it was while the
-/// picture under it moved on says the wrong words over the wrong frames.
+/// A paste inserts media, the words keep their clock; co-travel is what a
+/// group is for. The rippling insert used to open room on the subtitle lanes
+/// too -- splitting the caption it landed inside and sliding the tail behind
+/// the picture -- so the hand asked for an add and got a cut it never made.
+/// What goes down at frame 20 is the paste's business; the caption stays
+/// byte for byte the placement it was given.
 #[test]
-fn a_paste_opens_its_room_under_the_captions_too() {
+fn a_paste_never_touches_the_captions() {
     use engine::project::SubClip;
 
     let mut project = Project::single(asset("test_av.mp4"), TOTAL);
@@ -546,6 +549,7 @@ fn a_paste_opens_its_room_under_the_captions_too() {
             },
         )
         .expect("a caption over the first two seconds");
+    let before = project.sub_lane(s1).to_vec();
 
     let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
     let pasted = Clip {
@@ -553,15 +557,13 @@ fn a_paste_opens_its_room_under_the_captions_too() {
         ..clip
     };
     assert!(project.paste(20, pasted), "thirty frames go in at frame 20");
+    assert_eq!(project.sub_lane(s1), &before[..], "the caption keeps its clock");
+    assert_eq!(project.sub_lane(s1).len(), 1, "and uncut");
     assert_eq!(
-        project
-            .sub_lane(s1)
-            .iter()
-            .map(|s| (s.start, s.frames, s.in_us, s.out_us))
-            .collect::<Vec<_>>(),
-        [(0, 20, 0, 666_666), (50, 40, 666_666, 2_000_000)],
-        "the caption is split at the insert and its tail moved on with the picture"
+        project.lane(Lane::V1).len(),
+        3,
+        "the media lanes took the split, not the words"
     );
     assert!(project.undo(), "and the paste is one step for the lot");
-    assert_eq!(project.sub_lane(s1).len(), 1);
+    assert_eq!(project.sub_lane(s1), &before[..], "the caption never noticed");
 }
