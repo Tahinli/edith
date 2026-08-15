@@ -455,6 +455,15 @@ impl Player {
         let Some(idx) = self.dragged_sub(drag) else {
             return;
         };
+        // Asked before the edit, on the indices the press captured: the
+        // engine's own grouped-with-clips answer, which is exactly when its
+        // move reseeks -- a caption grouped only with other captions moves no
+        // media, and a flag reset without a delivered frame would latch the
+        // seek wait forever.
+        let grouped = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.caption_grouped_with_clips(drag.lane, idx));
         let start = self.sub_drop_frame(drag.sub, x).0;
         match self
             .session
@@ -474,9 +483,9 @@ impl Player {
             // A lane holds its captions in start order, so the drop moved the
             // mark as well as the box: it is re-read off where the caption
             // landed rather than left on the index it had, which after the move
-            // is a neighbour's. A grouped caption dragged its clips with it --
-            // the engine reseeks itself, and this owes the flag reset a clip's
-            // drop pays at the same moment.
+            // is a neighbour's. A grouped-with-clips caption dragged media with
+            // it -- the engine reseeks itself, and this owes the flag reset a
+            // clip's drop pays at the same moment.
             Some(Ok(())) => {
                 let mark = self
                     .session
@@ -491,7 +500,7 @@ impl Player {
                     }
                     None => Selection::new(),
                 };
-                if drag.sub.link.is_some() {
+                if grouped {
                     self.reset_after_reseek();
                 }
             }
@@ -1125,17 +1134,23 @@ impl Player {
         // timeline's rate. An `Ok` is *not* "something changed" -- an edge that
         // stopped at a wall it already stood against is `Ok` with no undo step
         // ([`Project::trim_sub`]) -- so only the refusal is ever said out loud.
-        // A lone caption's trim moves nothing that plays, and nothing reseeks;
-        // a grouped one trimmed its clips with it, and owes the same flag
-        // reset a clip's trim pays.
+        // A lone caption's trim -- and one grouped only with other captions --
+        // moves nothing that plays and reseeks nothing; a caption grouped with
+        // clips trimmed them with it and owes the flag reset a clip's trim
+        // pays. The grouped question is asked before the edit moves indices,
+        // in the engine's own words, so the two answers can never disagree.
         if trim.lane.kind == LaneKind::Subtitle {
+            let grouped = self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.caption_grouped_with_clips(trim.lane, trim.idx));
             let trimmed = self
                 .session
                 .as_mut()
                 .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to));
             match trimmed {
                 Some(Err(e)) => self.notify_user(format!("NOT TRIMMED — {e}").into()),
-                Some(Ok(())) if trim.link.is_some() => self.reset_after_reseek(),
+                Some(Ok(())) if grouped => self.reset_after_reseek(),
                 _ => {}
             }
             cx.notify();
