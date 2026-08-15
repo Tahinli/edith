@@ -53,6 +53,7 @@ use symphonia_core::units;
 use symphonia_core::units::{Time, TimeBase};
 
 use crate::eq::{EqParams, EqState};
+use crate::stretch::TimeStretch;
 use crate::limiter::{Limiter, LimiterState};
 
 /// ffmpeg's AAC-LC encoder delay, used when the file carries no edit list.
@@ -85,7 +86,7 @@ const MP4_DECODED: &str = "AAC-LC and AC-3/E-AC-3";
 const PRE_ROLL: u32 = 2;
 
 /// Frames per channel one AAC-LC packet carries. Fixed by the codec.
-const SAMPLES_PER_PACKET: u32 = 1024;
+pub(crate) const SAMPLES_PER_PACKET: u32 = 1024;
 
 /// Syncframes decoded and thrown away ahead of an AC-3 seek target: one, for the
 /// 256-sample overlap-add the target frame is reconstructed with.
@@ -493,16 +494,23 @@ impl AudioSession {
             })
             .collect();
 
-        // One resampler per segment that needs one, built where the sample rate
-        // is known: what the timeline owes it is seconds there and frames here.
+        // One rate chain per segment that needs one, built where the sample
+        // rate is known: what the timeline owes it is seconds there and frames
+        // here.
         //
-        // Two things ask for one and they compose into a single step: the clip's
-        // own speed, and a source written at a rate other than the timeline's --
-        // the ratio of the two rates is exactly a speed, and reading the samples
-        // at it is what keeps a 48 kHz file's pitch on a 44.1 kHz timeline. A
-        // segment with neither has no resampler at all and reaches the mixer
-        // with the decoder's own samples, byte for byte, as it always did.
-        let speeds: Vec<Option<Resample>> = segments
+        // Two things ask for one, and they are NOT the same thing: a source
+        // written at a rate other than the timeline's is a *rate conversion*
+        // -- reading the samples at the ratio of the two rates is what keeps
+        // a 48 kHz file's pitch on a 44.1 kHz timeline, and is the resampler's
+        // whole duty now. A clip whose own [`Speed`] is not real time is a
+        // *time* change: the resample hands the stretch a pitch-true stream
+        // and the stretch hands the timeline the clip's compressed or
+        // stretched seconds with every period of the signal kept (the tape
+        // effect this used to be -- one resample at the speed -- moved the
+        // pitch with the rate). A segment with neither has no chain at all
+        // and reaches the mixer with the decoder's own samples, byte for
+        // byte, as it always did.
+        let speeds: Vec<Option<Rate>> = segments
             .iter()
             .zip(segs)
             .enumerate()
@@ -516,6 +524,7 @@ impl AudioSession {
                 if stretch.is_none() && rate == meta.sample_rate {
                     return None;
                 }
+                let channels = usize::from(meta.channels);
                 // A speeded clip states the timeline it owes; a plain one owes
                 // the window it was placed for, and an open-ended window owes
                 // whatever its source has ([`Resample::UNBOUNDED`]).
@@ -527,7 +536,22 @@ impl AudioSession {
                     frames if frames > 0.0 => Resample::UNBOUNDED,
                     _ => 0,
                 };
-                Some(Resample::new(stretch.map_or(1.0, |s| s.step) * ratio, owed))
+                Some(match stretch {
+                    // A rate conversion alone: the resampler owns the
+                    // segment's promise, as it always has.
+                    None => Rate {
+                        resample: Resample::new(ratio, owed),
+                        stretch: None,
+                    },
+                    // A speeded clip: the resample is only the rate
+                    // conversion -- unbounded, because the ratio is all it
+                    // is asked for -- and the stretch lands the timeline's
+                    // frames exactly.
+                    Some(s) => Rate {
+                        resample: Resample::new(ratio, Resample::UNBOUNDED),
+                        stretch: Some(TimeStretch::new(s.step, owed, channels)),
+                    },
+                })
             })
             .collect();
 
@@ -2585,36 +2609,39 @@ impl Segment {
     }
 }
 
-/// One speeded segment's resampler: the tape effect, done by reading the
-/// decoded samples at a rate other than the one they were written at, so the
-/// pitch moves with the speed. Linear interpolation between the two frames a
-/// fractional position falls between -- one multiply-add per channel, which is
-/// nothing beside the decode that produced them, and enough that a 2x clip is
-/// not the aliasing mess plain sample-dropping would give.
+/// One segment's rate conversion: the decoded samples read at the ratio of
+/// the source's own sample rate to the timeline's, which is a pure rate
+/// conversion -- the pitch is preserved because the frames are read at the
+/// ratio of the rates rather than dropped, and 48 kHz onto a 44.1 kHz
+/// timeline is one resampler, not two. Linear interpolation between the two
+/// frames a fractional position falls between -- one multiply-add per
+/// channel, which is nothing beside the decode that produced them, and for a
+/// 48:44.1 ratio its worst-case image lands ~40 dB down; the alternative is
+/// a windowed-sinc kernel and a new state machine for a conversion that is
+/// not the audible risk in this path.
 ///
 /// It lives across the whole segment: `pos` carries the fraction over a packet
 /// boundary and `tail` keeps the frame before the buffer, so the interpolation
 /// at the seam is the same one it would have been inside a buffer. A segment
-/// starts one clean and drops it at the end, which is what makes a seek a reset
-/// for free -- exactly as the equalizer's state does.
+/// starts one clean and drops it at the end, which is what makes a seek a
+/// reset for free -- exactly as the equalizer's state does.
 ///
-/// It is also what makes a file written at another sample rate playable at all:
-/// the step is the clip's speed *times* the source rate over the timeline's, so
-/// 48 kHz read onto a 44.1 kHz timeline is one resampler, not two, and the pitch
-/// is preserved because the frames are read at the ratio of the rates rather
-/// than dropped. Linear interpolation is what a speed change already uses here
-/// -- for a 48:44.1 ratio its worst-case image lands ~40 dB down and the
-/// alternative is a windowed-sinc kernel and a new state machine for a
-/// conversion that is not the audible risk in this path.
+/// Time is no longer this struct's business: a clip whose own
+/// [`Speed`](crate::project::Speed) is not real time is re-timed by the
+/// [`TimeStretch`] behind it in its [`Rate`] chain, which compresses or
+/// stretches the timeline while keeping every period of the signal its own
+/// length -- this hands it a pitch-true stream at the timeline's rate and
+/// that is the whole of the hand-off.
 ///
 /// `owed` is what the timeline gives the segment, in frames per channel:
 /// resampling resolves to whole samples and a clip's own window resolves to
 /// whole *source* frames, so the two miss each other by a sample or two per
 /// clip. Truncating and padding to what is owed keeps that from accumulating
-/// into audible drift over a timeline of speeded cuts -- the picture's clip
-/// boundaries are exact by construction, and this makes the sound's exact too.
+/// into audible drift over a timeline of rate-mismatched cuts -- the picture's
+/// clip boundaries are exact by construction, and this makes the sound's
+/// exact too.
 struct Resample {
-    /// Source frames per output frame: the speed itself.
+    /// Source frames per output frame: the ratio of the two sample rates.
     step: f64,
     /// Where the next output frame reads, relative to the current buffer's
     /// first frame. Negative means it reads across the seam, into `tail`.
@@ -2704,6 +2731,44 @@ impl Resample {
     }
 }
 
+/// One speeded-or-converted segment's whole rate chain: the resample that
+/// turns the source's own rate into the timeline's, and -- only for a clip
+/// whose [`Speed`](crate::project::Speed) is not real time -- the stretch
+/// that changes its *time* without touching its pitch, after the resample
+/// and before the equalizer sees a sample (the filter's bands are set in the
+/// frequency a listener hears, and after a stretch that is still the
+/// frequency the file was written at).
+///
+/// Which half owns the segment's promise depends on which halves there are:
+/// a rate conversion alone is paced by the resample, as it always was, and a
+/// speeded clip's resample runs unbounded (the ratio is all it is asked for)
+/// while the stretch lands the timeline's frames exactly.
+struct Rate {
+    resample: Resample,
+    stretch: Option<TimeStretch>,
+}
+
+impl Rate {
+    fn process(&mut self, buf: &mut Vec<f32>, channels: usize) {
+        self.resample.process(buf, channels);
+        if let Some(stretch) = self.stretch.as_mut() {
+            stretch.process(buf, channels);
+        }
+    }
+
+    fn flush(
+        &mut self,
+        channels: usize,
+        timeline: &mut u64,
+        tx: &SyncSender<AudioChunk>,
+    ) -> bool {
+        match self.stretch.as_mut() {
+            Some(stretch) => stretch.flush(channels, timeline, tx),
+            None => self.resample.flush(channels, timeline, tx),
+        }
+    }
+}
+
 struct Worker {
     /// Indexed by [`Segment::source`]; only the sources some segment names are
     /// `Some`, the rest were never opened.
@@ -2715,10 +2780,11 @@ struct Worker {
     /// Beside the segments rather than inside them so the emit path can hold the
     /// window rules and the filter memory at once without splitting a borrow.
     eqs: Vec<Option<EqState>>,
-    /// One per entry of `segments` again: the rate that segment is read at, or
-    /// `None` for one at real time -- which is every segment of a project nobody
-    /// has speeded, and the path that emits the decoder's own samples untouched.
-    speeds: Vec<Option<Resample>>,
+    /// One per entry of `segments` again: that segment's rate chain, or
+    /// `None` for one at real time on the timeline's own rate -- which is
+    /// every segment of a project nobody has speeded or rate-mismatched, and
+    /// the path that emits the decoder's own samples untouched.
+    speeds: Vec<Option<Rate>>,
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
@@ -2981,7 +3047,7 @@ fn run(mut w: Worker) {
 /// [`Resample::flush`]). Nothing at all at real time, where a segment owes the
 /// timeline only the samples it decoded.
 fn settle(
-    speed: &mut Option<Resample>,
+    speed: &mut Option<Rate>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3013,7 +3079,7 @@ fn emit(
     channels: usize,
     seg: &Segment,
     eq: Option<&mut EqState>,
-    speed: Option<&mut Resample>,
+    speed: Option<&mut Rate>,
     pos: u64,
     next: u64,
     timeline: &mut u64,
@@ -3062,7 +3128,7 @@ fn run_ac3(
     track: &mut Ac3Track,
     seg: &Segment,
     mut eq: Option<&mut EqState>,
-    speed: &mut Option<Resample>,
+    speed: &mut Option<Rate>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3125,7 +3191,7 @@ fn run_mkv_ac3(
     track: &mut MkvAc3Track,
     seg: &Segment,
     mut eq: Option<&mut EqState>,
-    speed: &mut Option<Resample>,
+    speed: &mut Option<Rate>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3192,7 +3258,7 @@ fn run_sym(
     track: &mut SymTrack,
     seg: &Segment,
     mut eq: Option<&mut EqState>,
-    speed: &mut Option<Resample>,
+    speed: &mut Option<Rate>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
