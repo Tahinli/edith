@@ -1096,12 +1096,14 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
             .map(|c| c.text.clone())
             .collect()
     };
-    // The placement keeps the track's own clock (it starts at frame 0 and
-    // holds the whole of it), so the words are back at the times the file
-    // wrote them -- the cut above moved the *carried* map, not this one.
+    // The placement holds five seconds of the track in a three-second box,
+    // so the words cross the plate by the placement's own proportion: the
+    // cue times compress with it (first line [0.5, 1.5) -> [0.3, 0.9),
+    // second [2, 3.25) -> [1.2, 1.95)) -- a unity placement would keep the
+    // file's own times, to the microsecond.
     assert_eq!(shown(0.7), ["first line"]);
-    assert!(shown(1.8).is_empty(), "between two cues the plate goes");
-    assert_eq!(shown(2.5), ["second line\nwith a break"]);
+    assert!(shown(0.95).is_empty(), "between two cues the plate goes");
+    assert_eq!(shown(1.5), ["second line\nwith a break"]);
 }
 
 /// One lane over the picture and never two ([`Player::active_sub_lane`]): which

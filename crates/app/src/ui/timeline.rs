@@ -1363,6 +1363,38 @@ impl Player {
                                     this.open_menu(lane, i, event.position, cx);
                                 }),
                             )
+                            // The rate the caption's own window plays at, off
+                            // the placement itself: a re-timed group leaves it
+                            // on the box even after the group comes apart, and
+                            // the badge is the clip's badge -- same place, same
+                            // look -- on the visible slice, for the clip's
+                            // reason (zoomed in, the box's own edge is off the
+                            // screen and a badge at it with it).
+                            .when_some(
+                                caption_rate(shown_sub, self.fps).filter(|_| vis_w > 0.),
+                                |d, rate| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left(px(vis_x))
+                                            .w(px(vis_w))
+                                            .flex()
+                                            .justify_end()
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .px(px(3.))
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(ACCENT_PRIMARY()))
+                                                    .text_size(px(9.))
+                                                    .text_color(rgb(BG_RAISED()))
+                                                    .child(format!("{rate}")),
+                                            ),
+                                    )
+                                },
+                            )
                             // The two strips a drag lengthens it by, on the same
                             // rule a clip's are drawn by ([`trims`]).
                             .children(
