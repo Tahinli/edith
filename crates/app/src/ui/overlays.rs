@@ -470,8 +470,13 @@ impl Player {
     ) -> Option<impl IntoElement> {
         let menu = self.context_menu?;
         let session = self.session.as_ref()?;
-        let clip = *session.lane_clips(menu.lane).get(menu.idx)?;
-        let source = session.sources().get(clip.source).cloned()?;
+        // Both `None` when the menu was opened on a caption: a subtitle lane
+        // holds no `Clip` and a caption plays no source file. The rows are the
+        // oracle's either way ([`Ctx::caption`]), so what the card *has* is
+        // asked for where it is used rather than at the door -- refusing here
+        // would be a right-click that opens nothing.
+        let clip = session.lane_clips(menu.lane).get(menu.idx).copied();
+        let source = clip.and_then(|clip| session.sources().get(clip.source).cloned());
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
         let row = |n: usize| {
             div()
@@ -487,7 +492,7 @@ impl Player {
                 .rounded(px(3.))
         };
         let mut rows: Vec<AnyElement> = Vec::new();
-        if menu.details {
+        if let (true, Some((clip, source))) = (menu.details, clip.zip(source.clone())) {
             // Read-only, so no ids and no hover: this side is a card, not a
             // list of things to click. Each value is one truncated line, which
             // is what keeps the height below the one the clamp was given.
@@ -596,7 +601,10 @@ impl Player {
                         .into_any_element(),
                 );
             }
-            rows.push(
+            // What a caption has no other side to turn over to: its file, its
+            // source range and its bitrate are a clip's, and a row that opened
+            // an empty card would be the stub this menu does not draw.
+            rows.extend(clip.map(|_| {
                 row(rows.len())
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(BG_HOVER())))
@@ -610,15 +618,18 @@ impl Player {
                     // No stroke reaches this one, and a blank column would read
                     // as one that was forgotten.
                     .child(div().text_color(rgb(FG_SECONDARY())).child("…"))
-                    .into_any_element(),
-            );
+                    .into_any_element()
+            }));
         }
         // The height the card is *placed* by and the height its list is drawn
         // to are one number: placed by a taller one, the card would hang off the
         // window's floor -- the very thing the clamp is for.
         let list_h = menu_rows_h(rows.len(), viewport);
         let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
-        let full: SharedString = source.path.display().to_string().into();
+        let full: SharedString = source
+            .map(|source| source.path.display().to_string())
+            .unwrap_or_default()
+            .into();
         Some(
             scrim()
                 // Click away closes it, either button, and the press is
