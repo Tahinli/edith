@@ -98,6 +98,7 @@ fn the_session_maps_a_pgs_track_onto_the_timeline_and_draws_it() {
                 track: pick,
                 in_us: cues[0].start_us,
                 out_us: cues[0].end_us,
+                link: None,
             },
         )
         .expect("the lane is empty, so the placement lands");

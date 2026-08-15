@@ -260,7 +260,7 @@ fn a_project_keeps_its_subtitles_across_a_save() {
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 15\n"), "{text}");
+    assert!(text.starts_with("edith 16\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the reference is written relative, and no cue is: {text}"
@@ -722,6 +722,7 @@ fn whole(track: usize) -> SubClip {
         track,
         in_us: 0,
         out_us: 5_000_000,
+        link: None,
     }
 }
 
@@ -754,6 +755,7 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
             track: 0,
             in_us: 0,
             out_us: 2_000_000,
+            link: None,
         }
     );
 
@@ -770,6 +772,7 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
             track: 0,
             in_us: 500_000,
             out_us: 2_000_000,
+            link: None,
         }
     );
 
@@ -785,6 +788,7 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
             track: 0,
             in_us: 500_000,
             out_us: 2_000_000,
+            link: None,
         }
     );
 
@@ -805,6 +809,7 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
             track: 0,
             in_us: 500_000,
             out_us: 2_000_000,
+            link: None,
         },
         SubClip {
             start: 30,
@@ -812,8 +817,10 @@ fn a_caption_is_placed_trimmed_moved_and_undone_on_its_lane() {
             track: 0,
             in_us: 0,
             out_us: 2_000_000,
+            link: None,
         },
         SubClip {
+            link: None,
             start: 30,
             ..whole(0)
         },
@@ -1237,13 +1244,14 @@ fn subtitle_lanes_and_their_captions_survive_a_save() {
         track: 0,
         in_us: 500_000,
         out_us: 1_500_000,
+        link: None,
     };
     session.place_sub(s1, 10, caption).expect("a caption goes down");
 
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 15\n"), "{text}");
+    assert!(text.starts_with("edith 16\n"), "{text}");
     assert!(
         text.contains("\nsub 1 10 45 0 500000 1500000\n"),
         "the placement is one line: where it sits, how long, whose words, and \
@@ -1309,7 +1317,7 @@ fn a_version_14_project_keeps_its_palette_and_places_nothing() {
     let now = dir.join("new.edith");
     loaded.save_project(&now).expect("save");
     let text = std::fs::read_to_string(&now).expect("read back");
-    assert!(text.starts_with("edith 15\n"), "{text}");
+    assert!(text.starts_with("edith 16\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the row survives the migration: {text}"
@@ -1334,7 +1342,7 @@ fn a_caption_naming_a_track_the_palette_does_not_have_is_refused() {
     let path = dir.join("bad.edith");
     std::fs::write(
         &path,
-        "edith 15\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 16\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          subtitle - test_subs.srt\nvideo 1 0 0 30 0 0 - - fit 1000\n\
          audio 1 0 0 30 0 0 - - fit 1000\nsub 1 0 45 3 0 1000000\n",
     )
@@ -1349,7 +1357,7 @@ fn a_caption_naming_a_track_the_palette_does_not_have_is_refused() {
     let empty = dir.join("empty.edith");
     std::fs::write(
         &empty,
-        "edith 15\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
+        "edith 16\nplayhead 0\nresolution 1280 720\nfps 30.0\nsource 0 test_av.mp4\n\
          subtitle - test_subs.srt\nvideo 1 0 0 30 0 0 - - fit 1000\n\
          audio 1 0 0 30 0 0 - - fit 1000\nsub 1 0 45 0 1000000 1000000\n",
     )

@@ -826,6 +826,7 @@ fn on_lanes(tracks: Vec<SubtitleTrack>, placed: &[(usize, u32, u32, i64, i64)]) 
                     track,
                     in_us,
                     out_us,
+                    link: None,
                 },
             )
             .expect("the lane is empty, so the placement lands");

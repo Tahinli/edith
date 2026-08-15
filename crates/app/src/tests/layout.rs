@@ -266,22 +266,77 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
     assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
 }
 
+/// The selection itself: clicks in order, the anchor under the hand, the
+/// toggle that assembles a group, and the plain click that replaces it all.
+#[test]
+fn a_selection_holds_its_picks_in_click_order_and_anchors_the_last() {
+    use crate::Selection;
+
+    let mut sel = Selection::new();
+    assert!(sel.is_empty());
+    assert_eq!(sel.anchor(), None);
+
+    let (v, a, cap) = (
+        (Lane::V1, 0),
+        (Lane::A1, 1),
+        (Lane::new(LaneKind::Subtitle, 0), 0),
+    );
+    sel.set_one(v);
+    assert_eq!(sel.len(), 1);
+    assert_eq!(sel.anchor(), Some(v));
+
+    // Ctrl-clicks join, in the order they were made.
+    sel.toggle(a);
+    sel.toggle(cap);
+    assert_eq!(sel.picks(), &[v, a, cap]);
+    assert_eq!(sel.anchor(), Some(cap), "the last pick is the anchor");
+    assert!(sel.contains(a));
+
+    // ...and a ctrl-click on a pick already held takes it back out, leaving
+    // the others where they were.
+    sel.toggle(a);
+    assert_eq!(sel.picks(), &[v, cap]);
+    assert!(!sel.contains(a));
+
+    // A plain click is the whole selection, one pick: whatever was held gives
+    // way to the thing just named.
+    sel.set_one(a);
+    assert_eq!(sel.picks(), &[a]);
+
+    // `add` joins without disturbing -- Select All's builder.
+    let mut all = Selection::new();
+    all.add(v);
+    all.add(a);
+    all.add(v);
+    assert_eq!(all.picks(), &[v, a], "a pick is never held twice");
+
+    sel.clear();
+    assert!(sel.is_empty());
+    assert_eq!(sel.anchor(), None);
+}
+
 #[test]
 fn a_click_marks_the_whole_group_and_nothing_else() {
     let (v, a) = ((Lane::V1, 0), (Lane::A1, 0));
-    // Clicking the video half of group 1 marks the audio half with it.
-    assert!(marked(v, Some(1), Some(v), Some(1)));
-    assert!(marked(a, Some(1), Some(v), Some(1)));
+    // Clicking the video half of group 1 marks the audio half with it -- the
+    // pick, and everything sharing its link.
+    assert!(marked(v, Some(1), &[v], &[Some(1)]));
+    assert!(marked(a, Some(1), &[v], &[Some(1)]));
     // Another group's clips stay unmarked, in either lane.
-    assert!(!marked((Lane::V1, 1), Some(2), Some(v), Some(1)));
-    assert!(!marked((Lane::A1, 1), Some(2), Some(v), Some(1)));
+    assert!(!marked((Lane::V1, 1), Some(2), &[v], &[Some(1)]));
+    assert!(!marked((Lane::A1, 1), Some(2), &[v], &[Some(1)]));
     // A half a lift left behind has no group: it marks itself only, which
     // is what makes it separately deletable. Two ungrouped clips must not
     // mark each other by both being ungrouped.
-    assert!(marked(a, None, Some(a), None));
-    assert!(!marked(v, None, Some(a), None));
+    assert!(marked(a, None, &[a], &[None]));
+    assert!(!marked(v, None, &[a], &[None]));
+    // A caption ctrl-clicked into the selection marks the clip it was pinned
+    // to, and the caption is marked by the clip's pick just the same.
+    let cap = (Lane::new(LaneKind::Subtitle, 0), 0);
+    assert!(marked(cap, Some(1), &[cap, v], &[None, Some(1)]));
+    assert!(marked(a, Some(1), &[cap, v], &[None, Some(1)]));
     // Nothing selected marks nothing.
-    assert!(!marked(v, Some(1), None, None));
+    assert!(!marked(v, Some(1), &[], &[]));
 }
 
 #[test]
@@ -435,6 +490,7 @@ fn a_caption_trim_preview_lands_where_the_release_commits() {
         track: 0,
         in_us: 0,
         out_us,
+        link: None,
     };
     session
         .place_sub(lane, 30, whole)

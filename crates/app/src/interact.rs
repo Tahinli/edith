@@ -96,12 +96,17 @@ pub(crate) struct Trim {
     pub(crate) lane: Lane,
     pub(crate) idx: usize,
     pub(crate) edge: Edge,
+    /// Where the edge stood at the press: with `to`, the delta the whole group
+    /// follows by -- each member's own edge moves this far, clamped to its own
+    /// room, which is exactly what the engine commits at the release.
+    pub(crate) from: u32,
     /// Already clamped by `PlaybackSession::trim_room`, so the width drawn from
     /// it is the width the release commits -- an edge stops under the pointer
     /// rather than snapping back after the fact.
     pub(crate) to: u32,
-    /// The dragged clip's group, so its other halves' boxes follow the edge on
-    /// screen exactly as the engine will move them.
+    /// The dragged placement's group, so the boxes of everything it names --
+    /// clips and captions alike -- follow the edge on screen exactly as the
+    /// engine will move them.
     pub(crate) link: Option<u32>,
 }
 

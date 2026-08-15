@@ -449,6 +449,7 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
         track: 0,
         in_us: 0,
         out_us: 2_000_000,
+        link: None,
     };
     project.place_sub(s1, 0, caption).expect("a caption goes down");
 
@@ -541,6 +542,7 @@ fn a_paste_opens_its_room_under_the_captions_too() {
                 track: 0,
                 in_us: 0,
                 out_us: 2_000_000,
+                link: None,
             },
         )
         .expect("a caption over the first two seconds");
