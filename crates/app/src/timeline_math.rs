@@ -160,22 +160,26 @@ pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
     if !(fps.is_finite() && fps > 0.0) || sub.window_us() <= 0 {
         return None;
     }
-    let span_us = f64::from(sub.frames) / fps * 1e6;
+    let (span_us, window_us) = (f64::from(sub.frames) / fps * 1e6, sub.window_us() as f64);
+    // The unity gate is absolute, in frames of the timeline: placement
+    // rounding (`frames_of_us`) leaves a short track up to half a frame off
+    // real time, which against a one-second window is fifteen permille -- a
+    // relative gate would badge most palette drops under two and a half
+    // seconds. Unity is "the window lands within a frame and a half of the
+    // span"; the permille is only ever the rate the badge shows.
+    if (span_us - window_us).abs() <= 1.5 / fps * 1e6 {
+        return None;
+    }
     // The rate is the window over the span -- content per timeline, a clip's
     // own `speed` in the same spelling: 10s of words crossing 5s of timeline
     // is 2.00x.
-    let permille = (sub.window_us() as f64 / span_us * 1000.).round();
-    // The gate is generous by two permille either way: placement rounding
-    // (`frames_of_us`) leaves an odd-width unity window a frame off real
-    // time, and that is not a re-timing.
-    ((permille - 1000.).abs() > 2.).then(|| {
-        Speed::from_permille(
-            permille.clamp(
-                f64::from(Speed::MIN.permille()),
-                f64::from(Speed::MAX.permille()),
-            ) as u16,
-        )
-    })
+    let permille = (window_us / span_us * 1000.).round();
+    Some(Speed::from_permille(
+        permille.clamp(
+            f64::from(Speed::MIN.permille()),
+            f64::from(Speed::MAX.permille()),
+        ) as u16,
+    ))
 }
 
 impl Selection {
