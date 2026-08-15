@@ -121,6 +121,14 @@ impl Player {
             return;
         }
         let selected = self.selected.take();
+        // A caption is marked in its own lane's index space -- that lane holds
+        // no `Clip` -- so the same key reaches it through the one removal a
+        // placed subtitle has ([`Player::lift_sub`], one undo step). Parity: the
+        // box on a subtitle lane goes by the stroke every other box goes by.
+        if let Some((lane, idx)) = selected.filter(|(lane, _)| lane.kind == LaneKind::Subtitle) {
+            self.lift_sub(lane, idx, cx);
+            return;
+        }
         // Whichever lane it was clicked in: the index is that lane's own, and
         // the ripple cuts the clip's span out of every lane -- a group covers
         // one span, so deleting a take by its audio half is the same edit as by
@@ -296,6 +304,12 @@ impl Player {
         self.snap_cue = None;
         self.ghost = None;
         let at = self.place_frame(x).0;
+        // What the mark is on, before the lane is renumbered: a caption's start
+        // frame is its name on its lane ([`sub_mark`]).
+        let marked = self
+            .selected
+            .filter(|&(lane, _)| lane == to)
+            .and_then(|(lane, idx)| Some(self.session.as_ref()?.sub_lane(lane).get(idx)?.start));
         let text = match (self.sub_of_track(track), &mut self.session) {
             (Some(sub), Some(session)) => match session.place_sub(to, at, sub) {
                 Ok(()) => None,
@@ -309,8 +323,21 @@ impl Player {
             ),
             (_, None) => Some("NOT PLACED — open a file first".to_string()),
         };
-        if let Some(text) = text {
-            self.notify_user(text.into());
+        match (text, marked) {
+            (Some(text), _) => self.notify_user(text.into()),
+            // It went down, and a lane holds its captions in start order
+            // ([`Project::place_sub`]'s sorted insert), so one placed *before*
+            // the marked caption slid it one along and the index left behind
+            // names its new neighbour -- the caption the next Delete would take.
+            // The mark goes back on the caption it was on.
+            (None, Some(start)) => {
+                self.selected = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| sub_mark(session.sub_lane(to), start))
+                    .map(|i| (to, i));
+            }
+            (None, None) => {}
         }
         cx.notify();
     }
@@ -338,20 +365,46 @@ impl Player {
             return;
         };
         let start = self.sub_drop_frame(drag.sub, x).0;
-        if let Some(Err(e)) = self
+        match self
             .session
             .as_mut()
             .map(|session| session.move_sub(drag.lane, idx, to, start))
         {
-            self.notify_user(format!("NOT MOVED — {e}").into());
+            Some(Err(e)) => {
+                // Nothing moved ([`Project::move_sub`] refuses before its
+                // snapshot), so nothing was renumbered and the mark is left
+                // exactly where it was. Re-reading it off the frame the drop
+                // *asked* for used to hand it to whatever caption already
+                // covered that frame -- the drop at the left edge saturates to
+                // 0 ([`landing`]), so a refused drag marked, and the next
+                // Delete lifted, a caption the hand never touched.
+                self.notify_user(format!("NOT MOVED — {e}").into());
+            }
+            // A lane holds its captions in start order, so the drop moved the
+            // mark as well as the box: it is re-read off where the caption
+            // landed rather than left on the index it had, which after the move
+            // is a neighbour's.
+            Some(Ok(())) => {
+                self.selected = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| sub_mark(session.sub_lane(to), start))
+                    .map(|i| (to, i));
+            }
+            None => {}
         }
         cx.notify();
     }
 
-    /// The × on a caption's own box: it comes off the lane and leaves the gap,
-    /// one undo step ([`PlaybackSession::lift_sub`]). The palette row it played
-    /// stays in the list, which is what makes this a lift and not a removal --
-    /// and the way a subtitle lane is emptied so it can be taken off at all.
+    /// A caption off its lane, leaving the gap, one undo step
+    /// ([`PlaybackSession::lift_sub`]). The palette row it played stays in the
+    /// list, which is what makes this a lift and not a removal -- and the way a
+    /// subtitle lane is emptied so it can be taken off at all.
+    ///
+    /// The one door out for a placed caption: the Delete key
+    /// ([`Player::delete_selected`]) and the Delete row of its own menu both
+    /// land here, so there is one removal and one undo step however it is asked
+    /// for.
     pub(crate) fn lift_sub(&mut self, lane: Lane, idx: usize, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
@@ -367,6 +420,16 @@ impl Player {
             ),
             false => "NOTHING LIFTED — that caption is not there any more".to_string(),
         };
+        if lifted {
+            // Everything after it on that lane slid down one ([`Vec::remove`]),
+            // so a mark or an open menu left at or past it names a *different*
+            // caption now -- and the next Delete would take that one. Both go
+            // with the caption they were on.
+            if self.selected.is_some_and(|(l, i)| l == lane && i >= idx) {
+                self.selected = None;
+            }
+            self.context_menu = None;
+        }
         self.notify_user(text.into());
         cx.notify();
     }
@@ -817,9 +880,10 @@ impl Player {
         // A caption's edge, on a lane that holds no `Clip` at all: the same
         // gesture, the same `Trim`, and the branch is the lane's kind wherever
         // the drag is asked about ([`Player::trim_to`],
-        // [`Player::commit_trim`]). No selection -- a placement is not in the
-        // clip selection's index space -- and no group: a caption has no half
-        // on another lane.
+        // [`Player::commit_trim`]). A caption *is* markable -- the mark is its
+        // lane and its index like a clip's ([`Player::select`]) -- but an edge
+        // drag is a trim and not a pick, so this leaves the mark where the hand
+        // left it. No group either: a caption has no half on another lane.
         if lane.kind == LaneKind::Subtitle {
             let Some(sub) = self
                 .session

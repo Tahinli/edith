@@ -213,11 +213,16 @@ impl Player {
         let Some(session) = &self.session else {
             return Ctx::default();
         };
+        let on = on.or(self.selected);
         let clip = on
-            .or(self.selected)
             .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
         Ctx {
             clip,
+            // The same pair read in the other index space: a subtitle lane's
+            // own, where the box that was clicked is a caption.
+            caption: on.is_some_and(|(lane, idx)| {
+                lane.kind == LaneKind::Subtitle && idx < session.sub_lane(lane).len()
+            }),
             image: clip.is_some_and(|(clip, _)| {
                 session
                     .sources()

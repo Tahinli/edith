@@ -201,6 +201,20 @@ pub(crate) fn live_idx<T: Copy + PartialEq>(clips: &[T], idx: usize, clip: T) ->
     }
 }
 
+/// Which index a lane's mark is on after that lane was renumbered: the caption
+/// that starts at `start`, and `None` when it is not there any more.
+///
+/// The mark on a caption is an index like a clip's ([`Player::selected`]), and a
+/// subtitle lane both *inserts in start order* ([`engine::Project::place_sub`])
+/// and removes, so any placement or lift renumbers every caption after it and an
+/// index left as it was names a neighbour -- the caption the next Delete would
+/// take. So the mark is read off the caption's start frame before such an edit
+/// and found again by it after: captions on a lane are disjoint and in order, so
+/// a start frame names exactly one of them and is the identity an index is not.
+pub(crate) fn sub_mark(subs: &[SubClip], start: u32) -> Option<usize> {
+    subs.iter().position(|s| s.start == start)
+}
+
 /// The part of a clip's box that is on the bed, in the box's own pixels:
 /// `(left, width)` of its intersection with the visible strip. Everything drawn
 /// *inside* a box -- its waveform, its name, its speed badge -- is placed in

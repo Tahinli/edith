@@ -263,6 +263,204 @@ fn every_audio_stream_of_a_file_is_a_row_usable_or_not() {
 /// the playhead rather than on the clicked clip are the ones that can be
 /// inapplicable, and a menu at the edge of the window has to come back
 /// inside it or its last item cannot be clicked at all.
+/// A caption's own menu, opened on a box that is not a clip: one row that acts
+/// on it -- Delete, which routes to `Player::lift_sub` -- the timeline's global
+/// item beside it, and nothing else drawn at all. What a placed subtitle used to
+/// have no menu, and no stroke, to do.
+#[test]
+fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
+    use keymap::ActionId;
+    // A subtitle lane holds no `Clip`, so this is what the player reads off a
+    // right-clicked caption: nothing in the clip index space, and `caption`.
+    let cap = Ctx {
+        caption: true,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert!(cap.clip.is_none(), "a caption is never a clip");
+    assert_eq!(
+        enable(ActionId::Delete, cap),
+        Enable::Yes,
+        "the one thing a placed caption can be asked to do",
+    );
+    // The clip rows are refusals of *kind* on a caption, so the menu leaves them
+    // out rather than drawing "click a clip first" over a clicked box.
+    for clip_only in [
+        ActionId::Copy,
+        ActionId::Lift,
+        ActionId::Detach,
+        ActionId::Group,
+        ActionId::Equalizer,
+    ] {
+        assert_eq!(
+            enable(clip_only, cap),
+            Enable::Hidden("this is a caption"),
+            "{clip_only:?} is not a row on a caption",
+        );
+    }
+    // ...and the playhead's actions are *not* among them: the split and the
+    // regroup act at the line and the cards fall back to the clip under it, so a
+    // caption in hand is no reason for them to go dead -- which, hidden, is
+    // exactly what they went: `Player::act` returns without a word on `Hidden`,
+    // and no click on the bed clears the mark that put them there.
+    for playhead in [
+        ActionId::Cut,
+        ActionId::Regroup,
+        ActionId::Color,
+        ActionId::Speed,
+        ActionId::Fit,
+        ActionId::Silence,
+    ] {
+        assert_eq!(
+            enable(playhead, cap),
+            Enable::Yes,
+            "{playhead:?} is about the playhead and not about the mark",
+        );
+    }
+    // ...but live is not *listed*: every one of those rows reaches the clip
+    // under the playhead and not the caption, and a menu opened on a caption
+    // that offered a grade would read as the caption's. The caption's menu is
+    // its one row and the global pair the card already names as global.
+    assert_eq!(
+        menu_items(cap),
+        vec![ActionId::Paste, ActionId::Delete, ActionId::ToggleMute],
+        "the caption's menu is its removal and the global rows alone",
+    );
+    // ...and the same reading with a clip under it is the clip menu, untouched:
+    // the flag is off wherever a `Clip` was clicked.
+    assert!(menu_items(Ctx {
+        timeline: true,
+        ..Ctx::default()
+    })
+    .contains(&ActionId::Cut));
+}
+
+/// A timeline with a subtitle palette and an empty subtitle lane: what a
+/// caption is placed on, at the fixture's own rate.
+fn with_subtitle_lane() -> (PlaybackSession, Lane) {
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    subtitle_notice(&mut session, &asset("test_subs.mkv")).expect("the mkv carries subtitles");
+    let lane = session.add_lane(LaneKind::Subtitle);
+    (session, lane)
+}
+
+/// A second of palette track 0, to be placed wherever the test drops it.
+fn one_second(start: u32) -> SubClip {
+    SubClip {
+        start,
+        frames: 30,
+        track: 0,
+        in_us: 0,
+        out_us: 1_000_000,
+    }
+}
+
+/// A drop the engine *refuses* moves nothing -- so it must move no mark either.
+/// A drag towards the left edge saturates to frame 0 (`landing`), and reading
+/// the mark back off the frame the drop asked for handed it to whatever caption
+/// already covered frame 0: the next Delete then lifted a caption the hand never
+/// touched. The mark stays on the caption that did not move.
+#[test]
+fn a_refused_caption_drop_leaves_the_mark_where_it_was() {
+    use crate::sub_mark;
+    let (mut session, lane) = with_subtitle_lane();
+    session.place_sub(lane, 0, one_second(0)).expect("A goes down");
+    session
+        .place_sub(lane, 60, one_second(0))
+        .expect("B goes down after it");
+    let before = session.sub_lane(lane).to_vec();
+    // The mark is on B, the caption in hand: index 1 of the lane.
+    assert_eq!(sub_mark(session.sub_lane(lane), 60), Some(1));
+
+    let err = session
+        .move_sub(lane, 1, lane, 0)
+        .expect_err("A already covers frame 0");
+    assert!(err.to_string().contains("already covers"), "{err}");
+    assert_eq!(session.sub_lane(lane), before, "a refusal moved nothing");
+    // The trap this pins: the frame the drop *asked* for names A, so the old
+    // re-read marked A -- the caption nobody dragged -- and `x` lifted it.
+    assert_eq!(
+        sub_mark(session.sub_lane(lane), 0),
+        Some(0),
+        "frame 0 is A's, which is why a refused drop must not re-read the mark",
+    );
+    // Nothing was renumbered, so B is still index 1 and still the marked one.
+    assert_eq!(sub_mark(session.sub_lane(lane), 60), Some(1));
+}
+
+/// A lane inserts its captions in start order (`Project::place_sub`), so one
+/// placed *before* the marked caption slides it one along: the mark left on its
+/// old index would name the caption that just arrived, and `x` would lift that
+/// one instead. The mark is kept by the caption's start frame, which is its name
+/// on its lane, so it follows the caption it was on.
+#[test]
+fn a_caption_placed_before_the_marked_one_leaves_the_mark_on_the_original() {
+    use crate::sub_mark;
+    let (mut session, lane) = with_subtitle_lane();
+    session
+        .place_sub(lane, 100, one_second(0))
+        .expect("A goes down");
+    let marked = session.sub_lane(lane)[0].start;
+    assert_eq!(sub_mark(session.sub_lane(lane), marked), Some(0));
+
+    session
+        .place_sub(lane, 0, one_second(0))
+        .expect("the new one goes down before it");
+    assert_eq!(
+        session
+            .sub_lane(lane)
+            .iter()
+            .map(|s| s.start)
+            .collect::<Vec<_>>(),
+        [0, 100],
+        "the lane holds them in start order",
+    );
+    // What the player does with the mark across that placement.
+    let mark = sub_mark(session.sub_lane(lane), marked).expect("A is still there");
+    assert_eq!(mark, 1, "A slid one along and the mark went with it");
+
+    // ...and the Delete that stroke reaches takes A, not the caption that
+    // arrived: `Player::delete_selected` routes a caption's mark to `lift_sub`.
+    assert!(session.lift_sub(lane, mark));
+    assert_eq!(
+        session
+            .sub_lane(lane)
+            .iter()
+            .map(|s| s.start)
+            .collect::<Vec<_>>(),
+        [0],
+        "the caption the user marked is the one that died",
+    );
+}
+
+/// The playhead's actions with a caption marked: live, and doing what they say.
+/// Hidden, they were dead *and* silent -- `Player::act` says nothing on a class
+/// refusal -- from the first click on a caption until something else was
+/// clicked, and no click on the bed clears that mark.
+#[test]
+fn the_playhead_actions_still_work_with_a_caption_marked() {
+    use keymap::ActionId;
+    let cap = Ctx {
+        caption: true,
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Cut, cap), Enable::Yes);
+    assert_eq!(enable(ActionId::Regroup, cap), Enable::Yes);
+
+    // And the edits themselves, on a timeline holding a placed caption: the
+    // split at the playhead and the rejoin at the seam it leaves.
+    let (mut session, lane) = with_subtitle_lane();
+    session.place_sub(lane, 0, one_second(0)).expect("it goes down");
+    let clips = session.lane_clips(Lane::V1).len();
+    assert!(session.cut_at(2.0), "the playhead splits the clip under it");
+    assert_eq!(session.lane_clips(Lane::V1).len(), clips + 1);
+    assert!(session.regroup_at(2.0), "and the seam rejoins");
+    assert_eq!(session.lane_clips(Lane::V1).len(), clips);
+    assert_eq!(session.sub_lane(lane).len(), 1, "the caption is untouched");
+}
+
 #[test]
 fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     use keymap::{ActionId, Keymap};

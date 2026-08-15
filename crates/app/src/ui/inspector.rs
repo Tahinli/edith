@@ -103,9 +103,18 @@ impl Player {
                 image,
             ))
         });
-        let head = match &picked {
-            Some((lane, _, name, _)) => format!("{} · {}", lane.label(), name),
-            None => "Nothing selected".to_string(),
+        // A subtitle lane holds no `Clip`, so the read above answers `None` on a
+        // marked caption -- while the bed draws that caption in the selection's
+        // own colours and this panel's Delete lifts it. The panel says what is
+        // marked or it is telling the user the opposite of what they can see.
+        let caption = self.selected.filter(|_| picked.is_none()).and_then(|(lane, idx)| {
+            let sub = self.session.as_ref()?.sub_lane(lane).get(idx).copied()?;
+            Some((lane, sub))
+        });
+        let head = match (&picked, &caption) {
+            (Some((lane, _, name, _)), _) => format!("{} · {}", lane.label(), name),
+            (None, Some((lane, _))) => format!("{} · caption", lane.label()),
+            (None, None) => "Nothing selected".to_string(),
         };
         let detail = match &picked {
             Some((_, clip, _, _)) => format!(
@@ -115,7 +124,17 @@ impl Player {
                 span_label(f64::from(clip.frames()) / self.fps),
                 clip.speed,
             ),
-            None => "Click a clip on the timeline to see its settings".to_string(),
+            // The words' own span, in the same shape a clip's is written in --
+            // and no speed, because a caption has none to change.
+            None => match &caption {
+                Some((_, sub)) => format!(
+                    "{} → {} · {} · words",
+                    timecode(f64::from(sub.start) / self.fps, self.fps),
+                    timecode(f64::from(sub.end()) / self.fps, self.fps),
+                    span_label(f64::from(sub.frames) / self.fps),
+                ),
+                None => "Click a clip on the timeline to see its settings".to_string(),
+            },
         };
         div()
             .flex()
@@ -128,7 +147,7 @@ impl Player {
                 div()
                     .flex_none()
                     .truncate()
-                    .text_color(rgb(match picked.is_some() {
+                    .text_color(rgb(match picked.is_some() || caption.is_some() {
                         true => FG_PRIMARY(),
                         false => FG_SECONDARY(),
                     }))
@@ -137,6 +156,11 @@ impl Player {
                     .when_some(picked.as_ref(), |d, (lane, _, _, image)| {
                         d.border_l_2()
                             .border_color(rgb(clip_kind(lane.kind, *image)))
+                            .pl(px(6.))
+                    })
+                    .when_some(caption.as_ref(), |d, (lane, _)| {
+                        d.border_l_2()
+                            .border_color(rgb(clip_kind(lane.kind, false)))
                             .pl(px(6.))
                     })
                     .child(head),
