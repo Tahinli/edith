@@ -360,6 +360,160 @@ impl Player {
         }
     }
 
+    /// Starts the stand-in for one file: the slot is taken the moment the ask
+    /// goes out, so a repaint mid-encode cannot start a second one, and what
+    /// comes back off the worker settles the slot.
+    ///
+    /// One body, two doors: the sweep [`Player::cache_media`] runs over
+    /// everything the session has not seen, and the switch on a library row
+    /// ([`Player::toggle_proxy`]) for the one file under the pointer. The cap on
+    /// how many run at once belongs to the sweep -- a person who asks for *this*
+    /// film's stand-in has asked, and is told by the row how far it has got.
+    pub(crate) fn start_proxy_for(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let path = path.to_path_buf();
+        self.proxies.insert(path.clone(), Proxy::Asked);
+        let started = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { engine::proxy::generate_if_wanted(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let started = started.await;
+            this.update(cx, |this, cx| {
+                // Switched off while the header was being read
+                // ([`Player::toggle_proxy`]): the slot is no longer the `Asked`
+                // this put there, so what came back is *stopped as it lands*
+                // rather than installed over the stop. Without this the second
+                // half of a click made during the ask is an encoder nothing in
+                // the map can reach -- and it finishes minutes later and puts
+                // back the stand-in somebody switched off.
+                let stopped = !matches!(this.proxies.get(&path), Some(Proxy::Asked));
+                let state = match started {
+                    // Cancelled and *held*, exactly as a stop of a running one
+                    // is: the worker's own answer is what settles it, so an
+                    // encode that beat the stop is reported as the finished
+                    // stand-in it is ([`Player::poll_proxies`]).
+                    Ok(Some(job)) if stopped => {
+                        job.cancel();
+                        Proxy::Cancelling(job)
+                    }
+                    // ...and a stop of something that was never going to be
+                    // encoded is simply the film itself, which is what it was.
+                    Ok(None) | Err(_) if stopped => Proxy::Cancelled,
+                    Ok(Some(job)) => Proxy::Making(job),
+                    // A film that needs none keeps the state it was inserted
+                    // with, which is what it is.
+                    Ok(None) => Proxy::Native,
+                    Err(e) => {
+                        let text = format!(
+                            "NO PROXY for {} — {e} — the film itself is what plays",
+                            file_name(&path)
+                        );
+                        eprintln!("{text}");
+                        this.notify_user(text.into());
+                        Proxy::Failed
+                    }
+                };
+                this.proxies.insert(path, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The switch on a library row: this file's stand-in on, or off. One
+    /// control for the whole life of the thing, because a row with a separate
+    /// start, stop and delete is three buttons for one fact.
+    ///
+    /// * being made -- the ask is to *stop*, which is
+    ///   [`Player::cancel_proxy`]'s half-written-file-and-all path and never a
+    ///   deletion;
+    /// * asked for, and the worker has not answered yet -- the same stop, made
+    ///   before there is a job to stop: the slot is marked and the answer is
+    ///   cancelled as it lands ([`Player::start_proxy_for`]). Never a second
+    ///   start, which is what two encoders on one `.part` path used to be;
+    /// * there is one -- the file in the cache goes ([`engine::proxy::delete`]),
+    ///   and the slot is left [`Proxy::Cancelled`] rather than emptied: an empty
+    ///   slot is what the next repaint's sweep starts an encode from
+    ///   ([`proxies_to_start`] passes on everything the map has not seen), so
+    ///   emptying it would rebuild the stand-in a second after it was turned
+    ///   off. A delete that could not happen leaves the row *on*, because the
+    ///   file is still there and still what plays;
+    /// * anything else -- start one.
+    ///
+    /// `showed_stop` is what the row was drawing when the pointer went down:
+    /// a stand-in that finished between that paint and this click is a click on
+    /// a **stop**, and a stop settles as the ready stand-in it is rather than
+    /// deleting a file nobody asked to lose ([`Player::cancel_proxy`]'s own
+    /// promise).
+    ///
+    /// The off is remembered past the window ([`engine::proxy::set_off`]): the
+    /// sweep runs again at every launch, and a switch that forgets is one that
+    /// re-encodes tomorrow what was turned off today.
+    pub(crate) fn toggle_proxy(
+        &mut self,
+        path: &std::path::Path,
+        showed_stop: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match self.proxies.get(path) {
+            Some(Proxy::Making(_)) => self.cancel_proxy(path, cx),
+            // Already winding down: the second click on a stop is nothing.
+            Some(Proxy::Cancelling(_)) => {}
+            Some(Proxy::Asked) => {
+                engine::proxy::set_off(path, true);
+                self.proxies.insert(path.to_path_buf(), Proxy::Cancelled);
+                let text = format!("STOPPING the stand-in for {}…", file_name(path));
+                eprintln!("{text}");
+                self.notify_user(text.into());
+                cx.notify();
+            }
+            // The encode beat the click: what is under the pointer is a stop,
+            // and the film has a stand-in now.
+            Some(Proxy::Ready) if showed_stop => {
+                let text = format!(
+                    "PROXY READY for {} — it finished before the stop; click again to delete it",
+                    file_name(path)
+                );
+                eprintln!("{text}");
+                self.notify_user(text.into());
+                cx.notify();
+            }
+            Some(Proxy::Ready) => {
+                let text = match engine::proxy::delete(path) {
+                    Ok(gone) => {
+                        engine::proxy::set_off(path, true);
+                        self.proxies.insert(path.to_path_buf(), Proxy::Cancelled);
+                        match gone {
+                            true => format!(
+                                "PROXY OFF for {} — the film itself is what plays",
+                                file_name(path)
+                            ),
+                            false => {
+                                format!("NO PROXY for {} — nothing to delete", file_name(path))
+                            }
+                        }
+                    }
+                    // The file is still on the disk and [`engine::proxy::cached`]
+                    // is still handing it to playback, so the row stays on: the
+                    // one thing it must never do is say off over a proxy that is
+                    // playing.
+                    Err(e) => format!(
+                        "PROXY KEPT for {} — {e} — it could not be deleted and is still what plays",
+                        file_name(path)
+                    ),
+                };
+                eprintln!("{text}");
+                self.notify_user(text.into());
+                cx.notify();
+            }
+            _ => {
+                engine::proxy::set_off(path, false);
+                self.start_proxy_for(path, cx);
+            }
+        }
+    }
+
     /// The × on a library row while its stand-in is being made: the worker is
     /// asked to give up at its next frame and delete the half-written file it
     /// was writing ([`engine::proxy::Job::cancel`]), and the row says so until
@@ -388,6 +542,9 @@ impl Player {
         };
         job.cancel();
         *slot = Proxy::Cancelling(job);
+        // Remembered past this window, for [`Player::toggle_proxy`]'s reason:
+        // the launch sweep would otherwise start again what was just stopped.
+        engine::proxy::set_off(path, true);
         let text = format!("STOPPING the stand-in for {}…", file_name(path));
         eprintln!("{text}");
         self.notify_user(text.into());

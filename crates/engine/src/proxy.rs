@@ -223,6 +223,114 @@ pub fn cached(source: &Path) -> Option<PathBuf> {
     path_for(source).filter(|p| p.is_file())
 }
 
+/// Deletes the stand-in of `source`, if there is one, and says whether a file
+/// went. The one *by hand* eviction: [`sweep`] takes the oldest to stay under a
+/// cap, this takes the one that was asked for.
+///
+/// The source itself is never touched -- what is deleted is [`path_for`]'s
+/// answer, a name in the cache directory and nothing else -- and deleting one
+/// under a session that is playing off it costs a re-open: [`cached`] stats,
+/// finds nothing, and the film itself is what plays from the next span on
+/// ([`crate::PlaybackSession::picture_path`]).
+/// Three answers and not two, because they are three different rows: `Ok(true)`
+/// is a stand-in that went, `Ok(false)` is one that was never there (a no-op,
+/// and the switch is honestly off afterwards), and `Err` is a file that is
+/// **still on the disk** -- a read-only cache directory, a filesystem gone
+/// away. A caller that folded the last two together drew the row as OFF over a
+/// proxy [`cached`] went on handing to playback.
+pub fn delete(source: &Path) -> std::io::Result<bool> {
+    let Some(path) = path_for(source) else {
+        return Ok(false);
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            eprintln!("proxy cache: deleted {}", path.display());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The mark beside a cache entry that says its film was switched *off* by hand,
+/// and the one thing about a stand-in that outlives the window: without it the
+/// next launch's sweep re-encodes the very proxy somebody just turned off.
+///
+/// Keyed exactly as the stand-in itself is ([`path_for`]) and living beside it,
+/// which is what makes it answer for a film that is in no project at all -- the
+/// `.edith` file knows only the sources of one timeline, and the switch is on a
+/// library row that may belong to none. Derived and disposable like everything
+/// else in this directory: a re-encoded source names another key and is asked
+/// again, and deleting the cache forgets the choice, which costs one click.
+///
+/// corner-cut: the choice therefore does not survive a cache wipe or an edit to
+/// the source file. Upgrade path is a list in the `.edith`, which needs the
+/// project format to carry per-source flags.
+fn off_marker(source: &Path) -> Option<PathBuf> {
+    Some(path_for(source)?.with_extension("off"))
+}
+
+/// Whether this film's stand-in was switched off by hand ([`off_marker`]).
+pub fn is_off(source: &Path) -> bool {
+    off_marker(source).is_some_and(|p| p.exists())
+}
+
+/// Writes or clears that mark. Best effort: a cache directory that cannot be
+/// written is a choice that does not survive the session, never a refused
+/// click.
+pub fn set_off(source: &Path, off: bool) {
+    let Some(marker) = off_marker(source) else {
+        return;
+    };
+    match off {
+        true => {
+            if let Some(dir) = marker.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&marker, b"");
+        }
+        false => {
+            let _ = std::fs::remove_file(&marker);
+        }
+    }
+}
+
+/// The stand-ins being written *right now*, one entry per live encoder, held
+/// for the life of the [`Job`].
+///
+/// The one-encoder-per-film rule lives here rather than only in the window that
+/// draws the switch: two starts for one film race over one `.part` path, and
+/// the second unlinks the first's file and leaves it writing into an orphaned
+/// inode with nothing left holding its handle -- an encode nobody can stop,
+/// which finishes minutes later and puts back a proxy somebody had switched
+/// off. A guarantee that lives in the caller is a guarantee every future caller
+/// has to re-make.
+static IN_FLIGHT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A held seat in [`IN_FLIGHT`], given up when the job that owns it is dropped.
+struct Claim(PathBuf);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = held.iter().position(|p| *p == self.0) {
+            held.swap_remove(i);
+        }
+    }
+}
+
+/// Takes the seat for `out`, or `None` where an encoder already has it.
+fn claim(out: &Path) -> Option<Claim> {
+    let mut held = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    match held.iter().any(|p| p == out) {
+        true => None,
+        false => {
+            held.push(out.to_path_buf());
+            Some(Claim(out.to_path_buf()))
+        }
+    }
+}
+
 /// A proxy being made -- or one that was already there, which is the same thing
 /// to whoever is waiting for a path.
 ///
@@ -234,6 +342,9 @@ pub struct Job {
     out: PathBuf,
     /// `None` for a cache hit: there was nothing to run.
     handle: Option<ExportHandle>,
+    /// The seat this encoder holds ([`IN_FLIGHT`]), given back when the job
+    /// goes. `None` for a cache hit, which codes nothing.
+    _claim: Option<Claim>,
 }
 
 impl Job {
@@ -319,6 +430,13 @@ pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
     if crate::is_audio(source) || crate::is_image(source) {
         return Ok(None);
     }
+    // Switched off by hand, in this session or in one last week ([`set_off`]):
+    // the sweep that runs at every launch comes through here, and without this
+    // it re-encodes the stand-in somebody just turned off. Answered before the
+    // header is read, so a library of switched-off films costs no disk at all.
+    if is_off(source) {
+        return Ok(None);
+    }
     match started(source, wanted) {
         Err(e) if NoVideoTrack::is_it(&e) => Ok(None),
         other => other,
@@ -330,8 +448,16 @@ pub fn generate_if_wanted(source: &Path) -> crate::Result<Option<Job>> {
 fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Option<Job>> {
     let out = path_for(source).ok_or("no cache directory to keep a proxy in")?;
     if out.is_file() {
-        return Ok(Some(Job { out, handle: None }));
+        return Ok(Some(Job {
+            out,
+            handle: None,
+            _claim: None,
+        }));
     }
+    // One encoder per film, taken before the header is read and given back when
+    // the job is dropped ([`IN_FLIGHT`]): the second start would unlink the
+    // first's `.part` below and orphan an encode nothing can stop.
+    let claim = claim(&out).ok_or("a stand-in for this film is already being made")?;
     // The source's own header: its rate and length are the proxy's (a stand-in
     // that ran at another rate or stopped early would put every cut on another
     // frame), and only its picture size changes.
@@ -402,6 +528,7 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
     Ok(Some(Job {
         out,
         handle: Some(handle),
+        _claim: Some(claim),
     }))
 }
 
@@ -624,6 +751,96 @@ mod tests {
         filetime_bump(&file);
         assert_ne!(path_for(&file), Some(first), "touched: another name");
         assert_eq!(cached(&file), None, "nothing written, nothing cached");
+    }
+
+    /// Turning one off deletes the stand-in and *only* the stand-in: the film
+    /// it was made from is what plays afterwards, so it had better still be
+    /// there.
+    #[test]
+    fn delete_takes_the_proxy_and_never_the_source() {
+        let dir = crate::scratch::Scratch::dir("proxy-delete");
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"the film itself").expect("write");
+        let proxy = path_for(&file).expect("a key");
+        std::fs::create_dir_all(proxy.parent().expect("a cache dir")).expect("cache dir");
+        std::fs::write(&proxy, b"a stand-in").expect("write the proxy");
+        assert_eq!(cached(&file).as_ref(), Some(&proxy), "one in the cache");
+        assert_eq!(delete(&file).ok(), Some(true), "the stand-in went");
+        assert_eq!(cached(&file), None, "and is gone from the cache");
+        assert!(file.is_file(), "the film itself is untouched");
+        assert_eq!(delete(&file).ok(), Some(false), "nothing left to take");
+        assert!(file.is_file(), "still untouched");
+    }
+
+    /// A delete that *failed* is not a delete: the row above it draws itself
+    /// from this answer, and folding "could not" into "was not there" drew a
+    /// switch as OFF over a proxy still on the disk and still being played.
+    #[test]
+    fn a_delete_that_could_not_happen_says_so() {
+        let dir = crate::scratch::Scratch::dir("proxy-delete-refused");
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"the film itself").expect("write");
+        let proxy = path_for(&file).expect("a key");
+        std::fs::create_dir_all(&proxy).expect("something an unlink will refuse");
+        // An unlink that fails for anything but "it was not there" -- a
+        // read-only cache directory in the field, a directory in this test --
+        // is a stand-in still on the disk, and it is answered as one.
+        let answer = delete(&file);
+        assert!(answer.is_err(), "a refused unlink reported as a delete");
+        assert!(proxy.is_dir(), "and what could not be deleted is still there");
+        std::fs::remove_dir(&proxy).expect("clean up");
+        // ...against the honest no-op, which *is* an off switch: nothing there.
+        assert_eq!(delete(&file).ok(), Some(false), "nothing to take");
+        assert!(file.is_file(), "the film itself, throughout");
+    }
+
+    /// The switch turned off outlives the window: the mark sits beside the
+    /// cache entry, so the sweep at the next launch answers `None` for that
+    /// film instead of re-encoding the stand-in somebody just deleted.
+    #[test]
+    fn a_film_switched_off_by_hand_stays_off() {
+        let dir = crate::scratch::Scratch::dir("proxy-off-mark");
+        let file = dir.join("a.mp4");
+        std::fs::write(&file, b"the film itself").expect("write");
+        assert!(!is_off(&file), "nothing has been switched off yet");
+        set_off(&file, true);
+        assert!(is_off(&file), "the mark is beside the cache entry");
+        // Which is what the sweep asks -- and it does not even read the header.
+        assert!(
+            matches!(generate_if_wanted(&file), Ok(None)),
+            "a switched-off film was started again"
+        );
+        set_off(&file, false);
+        assert!(!is_off(&file), "switched back on, the mark is gone");
+        // The mark is keyed like the stand-in: a source that changed is a
+        // different film and is asked again.
+        set_off(&file, true);
+        // Taken back by hand before the key moves: the scratch directory takes
+        // the film with it, and a mark left in the real cache would outlive the
+        // test that wrote it.
+        let stale = off_marker(&file).expect("a key");
+        std::fs::write(&file, b"re-encoded").expect("rewrite");
+        filetime_bump(&file);
+        assert!(!is_off(&file), "a changed source kept the old answer");
+        std::fs::remove_file(stale).expect("the old mark");
+    }
+
+    /// One encoder per film, in the engine and not only in the window that
+    /// draws the switch: the seat is taken for as long as the job lives, and a
+    /// second start for the same stand-in is refused rather than allowed to
+    /// unlink the first one's half-written file.
+    #[test]
+    fn one_encoder_per_stand_in() {
+        let dir = crate::scratch::Scratch::dir("proxy-one-encoder");
+        let out = dir.join("f00d.mp4");
+        let first = claim(&out).expect("the seat was free");
+        assert!(claim(&out).is_none(), "two encoders on one path");
+        // Another film is another seat.
+        let other = claim(&dir.join("beef.mp4")).expect("a different stand-in");
+        drop(first);
+        let again = claim(&out).expect("the seat came back with the job");
+        drop((again, other));
+        assert!(claim(&out).is_some(), "the seat was never given back");
     }
 
     /// `std::fs` has no set-mtime, and a rewrite inside the same nanosecond is

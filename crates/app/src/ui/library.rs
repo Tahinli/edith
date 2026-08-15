@@ -126,15 +126,55 @@ impl Player {
             // that says how far it has got is where the way out of it belongs.
             // Gone the moment the worker settles, like the percentage beside
             // it: there is nothing left to stop.
-            let making = matches!(self.proxies.get(&row.path), Some(Proxy::Making(_)));
+            // The switch, and what it is showing. One control for the whole
+            // life of a stand-in ([`Player::toggle_proxy`]): a filled dot for
+            // one that exists, a stop square while one is being made -- with
+            // how far it has got drawn under it -- and a hollow dot for a row
+            // that has none. Never an ×: that shape means the file leaves the
+            // library, and taking a *stand-in* off a row is not that.
+            let (glyph, proxy_on, progress, waiting) = match self.proxies.get(&row.path) {
+                Some(Proxy::Ready) => ("●", true, None, false),
+                Some(Proxy::Making(job)) => ("■", true, Some(job.progress()), false),
+                // Asked for and already winding down: the same square, dimmed,
+                // so a second click does not look like the first one missed.
+                Some(Proxy::Cancelling(_)) => ("■", true, None, true),
+                Some(Proxy::Asked) => ("○", false, None, true),
+                _ => ("○", false, None, false),
+            };
+            // What the row is drawing right now, carried into the click: a
+            // stand-in that finishes between this paint and the pointer going
+            // down must not turn a stop into a deletion
+            // ([`Player::toggle_proxy`]).
+            let showed_stop = glyph == "■";
             let stop_path = row.path.clone();
-            let stop_tip: SharedString = format!(
-                "Stop making the stand-in for {} — nothing of it is kept, and the film itself is \
-                 what plays",
-                row.name
-            )
+            let stop_tip: SharedString = match self.proxies.get(&row.path) {
+                Some(Proxy::Making(_)) => format!(
+                    "Stop making the stand-in for {} — nothing of it is kept, and the film itself \
+                     is what plays",
+                    row.name
+                ),
+                Some(Proxy::Cancelling(_)) => {
+                    format!("Stopping the stand-in for {}…", row.name)
+                }
+                Some(Proxy::Ready) => format!(
+                    "Stand-in ON for {} — click to delete it; the film itself is what plays after \
+                     that, and nothing of the film is touched",
+                    row.name
+                ),
+                _ => format!("Stand-in OFF for {} — click to make one", row.name),
+            }
             .into();
             let usable = row.unusable.is_none();
+            // What is left of the row for words: the switch and the gap before
+            // it, on the rows that carry one. Both lines are held to it -- the
+            // name alone was, and the detail line under it ran on under the
+            // switch and was cut mid-word -- and an unusable row draws no switch
+            // and so pays nothing for one.
+            let text_w = row_text_w(width)
+                - match usable {
+                    true => HIT_MIN + 6.,
+                    false => 0.,
+                };
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);
             let menu_path = path.clone();
@@ -221,39 +261,71 @@ impl Player {
                             div()
                                 .truncate()
                                 .text_size(px(11.))
-                                .child(clip_middle(&name, row_text_w(width))),
+                                // Less the stand-in switch and the gap before
+                                // it: a media row carries one where a subtitle
+                                // row -- built to the same `row_text_w` -- does
+                                // not, so the difference is taken here.
+                                .child(clip_middle(&name, text_w)),
                         )
                         .child(
                             div()
                                 .truncate()
                                 .text_size(px(10.))
                                 .text_color(rgb(FG_SECONDARY()))
-                                .child(under),
+                                .child(clip_middle(&under, text_w)),
                         ),
                 )
-                // The way out of the encode, on the row that shows it running.
-                // A `HIT_MIN` target and the subtitle row's ×, and it stops the
-                // click there: the row under it picks the file, and stopping an
-                // encode is not a way of choosing what to place.
-                .when(making, |d| {
+                // The stand-in switch, on every row that can carry one. A
+                // `HIT_MIN` target that stops the click there: the row under it
+                // picks the file, and turning a stand-in on or off is not a way
+                // of choosing what to place. The selection language the rest of
+                // the window speaks says which way it is set -- lit like a
+                // picked row when there is one, dimmed like an unusable one
+                // when there is not.
+                .when(usable, |d| {
                     d.child(
                         div()
-                            .id(("proxy-stop", i))
+                            .id(("proxy-toggle", i))
                             .flex_none()
                             .w(px(HIT_MIN))
                             .h_full()
                             .flex()
+                            .flex_col()
                             .items_center()
                             .justify_center()
+                            .gap(px(2.))
                             .rounded(px(3.))
+                            .text_size(px(10.))
+                            .when(proxy_on, |d| d.bg(rgb(BG_SELECTED())))
+                            .when(!proxy_on, |d| d.text_color(rgb(FG_SECONDARY())))
+                            .when(waiting, |d| d.opacity(0.55))
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(BG_HOVER())))
                             .tooltip(move |_, cx| cx.new(|_| Tip(stop_tip.clone())).into())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.cancel_proxy(&stop_path, cx);
+                                this.toggle_proxy(&stop_path, showed_stop, cx);
                             }))
-                            .child("×"),
+                            .child(glyph)
+                            // How far the encode has come, under the stop it is
+                            // stopped with: a bar rather than only the row's
+                            // "proxy 37%", so the control reads as a job that is
+                            // running and not as a thing that removes something.
+                            .children(progress.map(|p| {
+                                div()
+                                    .flex_none()
+                                    .w(px(PROXY_BAR_W))
+                                    .h(px(2.))
+                                    .rounded(px(1.))
+                                    .bg(rgb(BG_RAISED()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(px(PROXY_BAR_W * p.clamp(0., 1.)))
+                                            .rounded(px(1.))
+                                            .bg(rgb(ACCENT_PRIMARY())),
+                                    )
+                            })),
                     )
                 })
         })
