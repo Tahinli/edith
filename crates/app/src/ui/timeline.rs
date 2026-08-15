@@ -664,8 +664,8 @@ impl Player {
         // What a caption's box says clicking it does; the media boxes' tooltip
         // names edits a placement has none of (no group, no speed, no ripple).
         let sub_tip: SharedString =
-            "Drag it along the lane or onto another subtitle track, an end to trim it, × takes it \
-             off"
+            "Drag it along the lane or onto another subtitle track, an end to trim it, x or the \
+             right button takes it off"
                 .into();
         // What this track plays at, on the header it belongs to: shown only
         // when it is not unity, because a column 40 px wide has room for a
@@ -1248,8 +1248,10 @@ impl Player {
                     }))
                     // The same bed's other kind of box: a stretch of a palette
                     // track placed on this lane, dragged along it, dragged onto
-                    // another subtitle lane, trimmed at either end and lifted
-                    // off by its own ×. Empty on every lane that is not a
+                    // another subtitle lane, trimmed at either end, marked by a
+                    // click and lifted off by the Delete row of its own menu or
+                    // the stroke that row names -- the doors every other box on
+                    // the bed has. Empty on every lane that is not a
                     // subtitle one, which is why there is one row and not two.
                     .children(subs.iter().enumerate().map(|(i, placed)| {
                         // What the drag payload names, and what an edge drag is
@@ -1274,6 +1276,10 @@ impl Player {
                             label.clone().unwrap_or_else(|| lane.label()).into();
                         let tip = sub_tip.clone();
                         let head = shown_sub.start;
+                        // Marked the way every other box on this bed is marked,
+                        // in this lane's own index space -- a caption has no
+                        // group, so nothing else lights with it.
+                        let on = sel == Some((lane, i));
                         div()
                             .id((row_id.clone(), i))
                             .absolute()
@@ -1284,11 +1290,18 @@ impl Player {
                             .overflow_hidden()
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(rgb(FG_SECONDARY()))
+                            .border_color(rgb(if on {
+                                STROKE_SELECTED()
+                            } else {
+                                FG_SECONDARY()
+                            }))
                             // The captions' own colour, dimmed on a lane whose
                             // eye is shut: what is not being drawn over the
-                            // picture is still on the lane, and says so.
-                            .bg(rgb(CLIP_TEXT()))
+                            // picture is still on the lane, and says so. Marked,
+                            // it takes the selection's colours instead, the same
+                            // pair a marked clip takes -- what Delete will act
+                            // on has one look on this bed and not two.
+                            .bg(rgb(if on { BG_SELECTED() } else { CLIP_TEXT() }))
                             .when(!shown, |d| d.opacity(0.55))
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT_PRIMARY())))
@@ -1309,7 +1322,22 @@ impl Player {
                                     // than jumping its head under it.
                                     this.grab =
                                         this.frame_under(event.position.x).saturating_sub(head);
-                                    cx.notify();
+                                    // ...and it marks the caption, exactly as
+                                    // the press that may become a clip's drag
+                                    // marks the clip: picking a caption up and
+                                    // putting it back down is a click.
+                                    this.select((lane, i), cx);
+                                }),
+                            )
+                            // The right button marks it and hangs the menu at
+                            // the pointer, the clip menu opened on the clip
+                            // box's own rule -- the Delete row of it is this
+                            // caption's, and the rows a caption has no use for
+                            // are not drawn ([`oracle::enable`]).
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.open_menu(lane, i, event.position, cx);
                                 }),
                             )
                             // The two strips a drag lengthens it by, on the same
@@ -1340,7 +1368,20 @@ impl Player {
                                                     cx.stop_propagation();
                                                     this.timeline_wheel(event, cx);
                                                 },
-                                            ));
+                                            ))
+                                            // Occluded, so the box's own
+                                            // right-button listener never fires
+                                            // here: the same menu, opened by the
+                                            // same call, exactly as a clip's
+                                            // edge strip does it.
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.open_menu(lane, i, event.position, cx);
+                                                    },
+                                                ),
+                                            );
                                         zone = match edge {
                                             Edge::Start => zone.left_0(),
                                             Edge::End => zone.right_0(),
@@ -1362,47 +1403,14 @@ impl Player {
                                         .child(label),
                                 )
                             })
-                            // The way back off the lane, on the box itself: a
-                            // caption is not in the clip selection's index
-                            // space, so no stroke reaches it -- and a lane
-                            // holding one cannot be removed either
-                            // ([`Project::remove_lane`] refuses it), which
-                            // would leave a placement nobody could undo but by
-                            // undoing. Only where the box is wide enough to
-                            // hold a target beside its name; narrower than that
-                            // it is lifted after zooming in, exactly as it is
-                            // trimmed after zooming in.
-                            //
-                            // Clear of the tail's own trim strip by that
-                            // strip's width: both occlude and this one is drawn
-                            // last, so hard against the right edge it swallowed
-                            // every press meant for the edge and the tail could
-                            // not be dragged at all (caught driving it).
-                            .when(vis_w >= 2. * HIT_MIN + EDGE_W, |d| {
-                                d.child(
-                                    div()
-                                        .id(("sub-lift", i))
-                                        .absolute()
-                                        .top_0()
-                                        .left(px(vis_x + vis_w - HIT_MIN - EDGE_W))
-                                        .w(px(HIT_MIN))
-                                        .h(px(HIT_MIN))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .occlude()
-                                        .rounded(px(3.))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(BG_HOVER())))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, _, cx| {
-                                                cx.stop_propagation();
-                                                this.lift_sub(lane, i, cx);
-                                            },
-                                        ))
-                                        .child("×"),
-                                )
-                            })
+                            // The way back off the lane is the way every other
+                            // box takes: the Delete stroke on the marked caption
+                            // and the Delete row of its own menu
+                            // ([`Player::lift_sub`]). The × that used to sit
+                            // here is gone with them -- it was drawn only where
+                            // the box was wide enough to hold it, so the one
+                            // removal a caption had was the one a zoomed-out
+                            // caption did not have.
                     }))
                     // ...and where the words actually are inside those boxes:
                     // the cues this lane shows on *this* timeline, in a band

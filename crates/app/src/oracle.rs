@@ -51,6 +51,12 @@ pub(crate) struct Ctx {
     /// and the clip-relative answers stand aside: those actions find their own
     /// clip under the playhead and word their own refusal.
     pub(crate) clip: Option<(Clip, Lane)>,
+    /// What was clicked is a placed caption and not a clip: a subtitle lane
+    /// holds no `Clip` at all, so [`Ctx::clip`] is `None` there and the
+    /// clip-relative answers would read it as "nothing marked". Its own flag,
+    /// so the one action a caption has -- coming off the lane again -- is a
+    /// live row while the rest are not rows at all.
+    pub(crate) caption: bool,
     /// The clip plays a still ([`engine::is_image`]), which has no sound to
     /// reach at all -- not the lane's business, because a still sits on a video
     /// lane exactly like a take whose sound is one lane down.
@@ -125,6 +131,36 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         return match action {
             ActionId::CancelExport => Enable::Yes,
             _ => Enable::No("an export is running"),
+        };
+    }
+    // A caption is not a clip: the actions that act on *the marked clip and
+    // nothing else* have nothing to act on over a placed subtitle, so they are
+    // refusals of kind -- not rows at all, rather than rows saying "click a clip
+    // first" over a clicked caption. Delete is the one that means something: it
+    // routes to [`Player::lift_sub`] when what is marked is a caption.
+    //
+    // And it is *only* those. The playhead actions are about the timeline rather
+    // than about what is marked -- the split and the regroup act at the line
+    // ([`Player::cut`], [`Player::regroup`]), and the grade, the rate, the fit
+    // and the scan fall back to the clip under it -- so a caption in hand is no
+    // reason for them to stop. Hiding them here made them dead *and* silent
+    // ([`Player::act`] returns without a word on `Hidden`) from the moment a
+    // caption was clicked until something else was, which no click on the bed
+    // undoes: there is no handler there to clear the mark.
+    if ctx.caption
+        && matches!(
+            action,
+            ActionId::Copy
+                | ActionId::Delete
+                | ActionId::Lift
+                | ActionId::Detach
+                | ActionId::Group
+                | ActionId::Equalizer
+        )
+    {
+        return match action {
+            ActionId::Delete => Enable::Yes,
+            _ => Enable::Hidden("this is a caption"),
         };
     }
     match action {
@@ -224,10 +260,27 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
 /// a waveform, an equalizer on a picture -- is not a row at all, so a future
 /// action cannot appear where it does not apply by being added to
 /// [`MENU_ITEMS`] alone.
+///
+/// Being *live* and *belonging in this menu* are two different questions, and
+/// only this one is the menu's. The playhead actions stay live over a marked
+/// caption -- [`enable`] says so, and the strokes and the toolbar read that --
+/// but a split, a rate, a grade or a fit listed under a right-clicked caption
+/// reads as something the caption is about to get, when what they reach is the
+/// video clip the playhead is standing in. So a caption's menu carries the one
+/// row that is the caption's ([`Player::lift_sub`], reached through Delete) and
+/// the rows the card already prints "(global)" beside, which say for themselves
+/// that they are not about what was clicked.
 pub(crate) fn menu_items(ctx: Ctx) -> Vec<ActionId> {
     MENU_ITEMS
         .into_iter()
         .filter(|&action| enable(action, ctx).listed())
+        .filter(|&action| {
+            !ctx.caption
+                || matches!(
+                    action,
+                    ActionId::Delete | ActionId::Paste | ActionId::ToggleMute
+                )
+        })
         .collect()
 }
 
