@@ -2214,8 +2214,25 @@ impl Project {
             return Err(format!("there is no clip {idx} on {}", lane.label()).into());
         };
         let labels = handles(&self.lanes);
-        // Media members only: a caption has no rate to change, and what the
-        // id binds it to -- a move, a trim, a delete -- travels by frames.
+        // The clip the hand is holding is the group's clock: everything else
+        // in the group, caption members included, re-times by the ratio its new
+        // rate gives its own frames. The clips take the rate itself; a caption
+        // has none, so it takes the *ratio* -- its span on the timeline
+        // compresses or stretches about the held clip's head, while the words
+        // it reads keep their own timing ([`write_sub_edge`]'s law: the
+        // timeline moves, the track does not).
+        let Some(held) = self.lane(lane).get(idx).copied() else {
+            return Err(format!("there is no clip {idx} on {}", lane.label()).into());
+        };
+        let (old, new) = (f64::from(held.frames()), f64::from(speed.frames(held.len())));
+        let ratio = new / old.max(1.);
+        let retimed = |s: SubClip| SubClip {
+            start: ((f64::from(s.start) - f64::from(held.start)) * ratio + f64::from(held.start))
+                .round()
+                .clamp(0., f64::from(u32::MAX)) as u32,
+            frames: (f64::from(s.frames) * ratio).round().clamp(1., f64::from(u32::MAX)) as u32,
+            ..s
+        };
         for &(l, i) in &members.clips {
             let clips = &self.lanes[l].clips;
             let mut moved = clips[i];
@@ -2233,12 +2250,39 @@ impl Project {
                 .into());
             }
         }
+        // ...and the captions, against their own lanes' captions: a stretch
+        // that runs one into its neighbour is refused for the clip arm's
+        // reason -- a lane may not overlap itself -- and by name like it.
+        let subs: Vec<(usize, usize, SubClip)> = members
+            .subs
+            .iter()
+            .map(|&(l, i)| (l, i, retimed(self.lanes[l].subs[i])))
+            .collect();
+        for &(l, i, moved) in &subs {
+            for (j, other) in self.lanes[l].subs.iter().enumerate() {
+                if j != i && moved.start < other.end() && other.start < moved.end() {
+                    return Err(format!(
+                        "at {speed} the {} caption at frame {} would run to frame {} and the next \
+                         starts at {}: move it along, or trim this one first",
+                        labels[l].label(),
+                        self.lanes[l].subs[i].start,
+                        moved.end(),
+                        other.start
+                    )
+                    .into());
+                }
+            }
+        }
         if snapshot {
             self.snapshot();
         }
         for (l, i) in members.clips {
             self.lanes[l].clips[i].speed = speed;
             debug_assert!(sorted_disjoint(&self.lanes[l].clips));
+        }
+        for (l, i, moved) in subs {
+            self.lanes[l].subs[i] = moved;
+            debug_assert!(subs_sorted_disjoint(&self.lanes[l].subs));
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
         Ok(())
@@ -3719,26 +3763,50 @@ impl Project {
     /// not move, so it is not this rule's business.
     fn scope_holds_takes_whole(&self, on: &[usize], from: u32) -> crate::Result<()> {
         let labels = handles(&self.lanes);
+        // The halves of a group are on either of a lane's lists, and the
+        // refusal names whichever sits outside the scope -- a clip like it
+        // always has, and a caption now that a group may hold one.
+        let halves = |start: u32, link: Option<u32>, what: &str| -> crate::Result<()> {
+            let Some(id) = link else {
+                return Ok(());
+            };
+            for (j, data) in self.lanes.iter().enumerate() {
+                if on.contains(&j) {
+                    continue;
+                }
+                let clip = data.clips.iter().find(|o| o.link == Some(id));
+                let sub = data.subs.iter().find(|s| s.link == Some(id));
+                if let Some(half) = clip {
+                    return Err(format!(
+                        "the {what} at frame {start} is one take with the {} clip at frame {}: \
+                         moving one track of a take would pull it apart -- take the whole take, \
+                         or detach them first",
+                        labels[j].label(),
+                        half.start
+                    )
+                    .into());
+                }
+                if let Some(half) = sub {
+                    return Err(format!(
+                        "the {what} at frame {start} is one take with the {} caption at frame {}: \
+                         moving one track of a take would pull it apart -- take the whole take, \
+                         or detach them first",
+                        labels[j].label(),
+                        half.start
+                    )
+                    .into());
+                }
+            }
+            Ok(())
+        };
         for &i in on {
             for c in self.lanes[i].clips.iter().filter(|c| c.end() > from) {
-                let Some(id) = c.link else { continue };
-                for (j, data) in self.lanes.iter().enumerate() {
-                    if on.contains(&j) {
-                        continue;
-                    }
-                    if let Some(half) = data.clips.iter().find(|o| o.link == Some(id)) {
-                        return Err(format!(
-                            "the {} clip at frame {} is one take with the {} clip at frame {}: \
-                             moving one track of a take would pull it apart -- take the whole take, \
-                             or detach them first",
-                            labels[i].label(),
-                            c.start,
-                            labels[j].label(),
-                            half.start
-                        )
-                        .into());
-                    }
-                }
+                halves(c.start, c.link, &format!("{} clip", labels[i].label()))?;
+            }
+            // A caption before the first cut does not move, so it is not this
+            // rule's business -- exactly the clip test's own line.
+            for s in self.lanes[i].subs.iter().filter(|s| s.end() > from) {
+                halves(s.start, s.link, &format!("{} caption", labels[i].label()))?;
             }
         }
         Ok(())
@@ -3864,6 +3932,8 @@ impl Project {
                 (None, None) => continue,
                 (None, Some((_, after))) => after,
             };
+            // The region's new length, on every scoped lane alike.
+            let after = shrunk;
             let Some(delta) = len.checked_sub(shrunk) else {
                 self.undo();
                 return Err(format!(
@@ -3881,6 +3951,21 @@ impl Project {
                     }
                 }
                 debug_assert!(sorted_disjoint(&self.lanes[l].clips));
+                // The captions on a scoped lane travel with the region's time:
+                // a piece inside it plays in `after` frames instead of `len`
+                // -- same words on less timeline, its window untouched, for
+                // [`write_speed`]'s reason -- and everything behind the region
+                // slides up by what the region gave back.
+                let share = f64::from(after) / f64::from(len).max(1.);
+                for s in &mut self.lanes[l].subs {
+                    if s.start >= at + len {
+                        s.start -= delta;
+                    } else if s.start >= at && s.end() <= at + len {
+                        s.start = at + (f64::from(s.start - at) * share).round() as u32;
+                        s.frames = (f64::from(s.frames) * share).round().max(1.) as u32;
+                    }
+                }
+                debug_assert!(subs_sorted_disjoint(&self.lanes[l].subs));
             }
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
@@ -4871,6 +4956,184 @@ mod tests {
             "the caption keeps its own group"
         );
         assert!(links_are_consistent(&p.lanes).is_ok());
+    }
+
+    /// A rate re-times the caption members of the group by the ratio it gives
+    /// the held clip: the span on the timeline compresses about the held clip's
+    /// head, the words' own window untouched -- and one undo puts it back.
+    #[test]
+    fn a_rate_carries_the_group_caption_by_the_held_clips_ratio() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let grouped = || {
+            let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+            let s1 = p.add_lane(LaneKind::Subtitle);
+            p.place_sub(s1, 0, caption(0, 90)).expect("placed");
+            p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+            (p, s1)
+        };
+
+        // An aligned take, doubled: the caption plays in half the frames.
+        let (mut p, s1) = grouped();
+        p.set_speed(Lane::V1, 0, Speed::from_permille(2000))
+            .expect("room for it");
+        assert_eq!(p.lane(Lane::V1)[0].frames(), 45);
+        let s = p.sub_lane(s1)[0];
+        assert_eq!((s.start, s.frames), (0, 45), "same words, half the timeline");
+        assert_eq!((s.in_us, s.out_us), (0, 90_000_000), "the window is untouched");
+        assert!(links_are_consistent(&p.lanes).is_ok());
+        assert!(p.undo());
+        assert_eq!(p.sub_lane(s1)[0].frames, 90, "one undo puts it back");
+
+        // An offset group, slowed to half: the caption's *offset from the held
+        // clip's head* is what scales -- it sits 30 frames in at 1x, 60 at
+        // 0.5x, and still ends where the clip does.
+        let (mut p, s1) = grouped();
+        p.lift_sub(s1, 0);
+        p.place_sub(s1, 30, caption(30, 60)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        p.set_speed(Lane::V1, 0, Speed::from_permille(500))
+            .expect("room for it");
+        assert_eq!(p.lane(Lane::V1)[0].frames(), 180);
+        let s = p.sub_lane(s1)[0];
+        assert_eq!((s.start, s.frames), (60, 120), "the offset doubles with the clip");
+        assert_eq!(s.end(), p.lane(Lane::V1)[0].end(), "still ends with the clip");
+
+        // A stretch that runs the caption into its neighbour is refused, by
+        // lane and frame, and costs no undo step.
+        let (mut p, s1) = grouped();
+        p.lift_sub(s1, 0);
+        p.place_sub(s1, 0, caption(0, 90)).expect("placed");
+        p.place_sub(s1, 95, caption(95, 5)).expect("the neighbour");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        let history = p.history.len();
+        let err = p
+            .set_speed(Lane::V1, 0, Speed::from_permille(500))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the S1 caption at frame 0 would run to frame 180 and the next starts at 95"),
+            "{err}"
+        );
+        assert_eq!(p.history.len(), history, "a refusal costs no undo step");
+    }
+
+    /// The silence scan's speed-up re-times the captions on a scoped lane with
+    /// everything else: the piece inside the region plays in the region's new
+    /// frames, and what sits behind the region slides up with the clips.
+    #[test]
+    fn speeding_a_region_carries_the_captions_on_the_scoped_lanes() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        // Words over the region [30, 60) and words behind it.
+        p.place_sub(s1, 30, caption(30, 30)).expect("placed");
+        p.place_sub(s1, 60, caption(60, 30)).expect("placed");
+
+        // The region [30, 60) plays at 4x: 30 frames become 8, everything
+        // behind slides up 22.
+        // The scope is what the card's Take row says, caption lane included.
+        p.speed_regions(
+            &[(30, 30)],
+            Speed::from_permille(4000),
+            &[Lane::V1, Lane::A1, s1],
+        )
+        .expect("the region speeds up");
+        let subs = p.sub_lane(s1);
+        assert_eq!(
+            (subs[0].start, subs[0].frames),
+            (30, 8),
+            "the piece inside plays in the region's new frames"
+        );
+        assert_eq!(
+            (subs[1].start, subs[1].frames),
+            (38, 30),
+            "the piece behind slides up by what the region gave back"
+        );
+        assert!(subs_sorted_disjoint(&p.lanes[p.index(s1).unwrap()].subs));
+    }
+
+    /// The scope law names a caption half too: a scoped cut that would move one
+    // track of a group whose caption sits outside the scope is refused.
+    #[test]
+    fn the_scope_law_refuses_a_caption_half_outside_the_scope() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 0, caption(0, 90)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+
+        // The subtitle lane is not in the scope, so the group's caption half
+        // sits outside it: refused, in the law's own words.
+        let err = p
+            .cut_regions(&[(10, 5)], &[Lane::V1, Lane::A1])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is one take with the S1 caption at frame 0"),
+            "{err}"
+        );
+
+        // ...and with the caption's lane in the scope, the cut carries it:
+        // the words over the hole go, and the words behind slide up.
+        p.cut_regions(&[(10, 5)], &[Lane::V1, Lane::A1, s1])
+            .expect("the whole group is in the scope");
+        let subs = p.sub_lane(s1);
+        assert_eq!(
+            subs.iter().map(|s| (s.start, s.frames)).collect::<Vec<_>>(),
+            [(0, 10), (10, 75)],
+            "the caption is cut and shifted with the clips"
+        );
     }
 
     /// The caption a hand groups: `group_all` over clips *and* a caption, the

@@ -309,11 +309,32 @@ impl Player {
             cx.notify();
             return;
         };
-        match self
+        // A caption the hand is on names the clip it was pinned to, and the
+        // card opens on that. A caption in no group has no rate to change and
+        // nothing behind it that does: said out loud, rather than a card that
+        // reads 1.00x and writes nothing.
+        let anchor = match self
             .selected
             .anchor()
             .or_else(|| session.video_clip_at(session.now()))
         {
+            Some((lane, idx)) if lane.kind == LaneKind::Subtitle => {
+                match caption_media_half(session, (lane, idx), LaneKind::Video) {
+                    Some(half) => Some(half),
+                    None => {
+                        self.notify_user(
+                            "NOTHING TO RE-TIME — a caption has no speed of its own; group it \
+                             with a clip first (ctrl-click both, then Group)"
+                                .into(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            other => other,
+        };
+        match anchor {
             Some(clip) => {
                 self.speed_open = Some(clip);
                 self.speed_dragging = false;
@@ -452,12 +473,32 @@ impl Player {
             cx.notify();
             return;
         };
-        match self
+        // A caption the hand is on names the sound its group plays: the card
+        // scans that half. A caption with no sound behind it -- alone, or
+        // grouped with clips that have none -- is a scan with nothing to hear,
+        // and it says so instead of returning without a word.
+        let anchor = match self
             .selected
             .anchor()
             .or_else(|| session.video_clip_at(session.now()))
-            .map(|clip| audio_half(session, clip))
         {
+            Some((lane, idx)) if lane.kind == LaneKind::Subtitle => {
+                match caption_media_half(session, (lane, idx), LaneKind::Audio) {
+                    Some(half) => Some(half),
+                    None => {
+                        self.notify_user(
+                            "NOTHING TO SCAN — a caption has no sound of its own; group it with \
+                             the take's sound first (ctrl-click both, then Group)"
+                                .into(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            other => other,
+        };
+        match anchor.map(|clip| audio_half(session, clip)) {
             Some((lane, idx)) => {
                 let found = self.session.as_ref().and_then(|session| {
                     let clip = *session.lane_clips(lane).get(idx)?;
@@ -783,7 +824,12 @@ impl Player {
                     .lanes()
                     .into_iter()
                     .filter(|&l| {
-                        l == lane || session.lane_clips(l).iter().any(|c| c.link == Some(id))
+                        l == lane
+                            || session.lane_clips(l).iter().any(|c| c.link == Some(id))
+                            // The caption pinned to the take travels with it:
+                            // the ripple closes its lane too, or the words
+                            // would stay put while the clip under them moved.
+                            || session.sub_lane(l).iter().any(|s| s.link == Some(id))
                     })
                     .collect(),
             },
@@ -961,7 +1007,19 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let refusal = match (self.selected.anchor(), &self.session) {
+        // A caption the hand is on names the sound its group plays, and the
+        // card opens on that; one in no group has no sound to equalize and
+        // falls to the lane refusal below, in the words it always used.
+        let anchor = match (self.selected.anchor(), self.session.as_ref()) {
+            (Some((lane, idx)), Some(session))
+                if lane.kind == LaneKind::Subtitle =>
+            {
+                caption_media_half(session, (lane, idx), LaneKind::Audio)
+                    .or(self.selected.anchor())
+            }
+            _ => self.selected.anchor(),
+        };
+        let refusal = match (anchor, &self.session) {
             (_, None) => Some("NO TIMELINE — open a file first".to_string()),
             (None, _) => Some(format!(
                 "NOTHING SELECTED — click an audio clip or press {}, then ask again",
@@ -977,7 +1035,7 @@ impl Player {
             cx.notify();
             return;
         }
-        let (lane, idx) = self.selected.anchor().expect("checked above");
+        let (lane, idx) = anchor.expect("checked above");
         let session = self.session.as_ref().expect("checked above");
         // What the clip already plays through, or the flat default -- so the
         // card opens on the curve that is in force and a reopen shows the last
