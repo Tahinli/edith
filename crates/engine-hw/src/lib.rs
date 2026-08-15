@@ -188,6 +188,18 @@ fn reposition(position: i64, target: i64, frame_count: u32, limit: u32) -> Repos
     }
 }
 
+/// The skip a forward reposition leaves standing: `ahead` itself, replacing
+/// whatever skip was undrained -- `_standing` is read by no one, on purpose.
+/// [`Session::pump`] advances `position` for every handle it pops, dropped
+/// and delivered alike, so the next picture delivered is always
+/// `position + skip`: only a replacement keeps that on the target. An
+/// accumulate would land `ahead` frames past it -- and silently, because the
+/// pictures keep arriving (a stacked reseek before the first drains, or a
+/// flush whose RAP skip is still standing when a forward span is asked).
+fn forward_skip(_standing: u32, ahead: u32) -> u32 {
+    ahead
+}
+
 struct Session {
     decoder: Decoder,
     /// NV12 (or, for a 10-bit stream, P010) descriptor for `vaGetImage`,
@@ -442,8 +454,12 @@ impl Session {
             // not the access unit half-fed to it, not the pictures already
             // waiting in `ready` -- the skip walks past all of them exactly
             // as it walks past the ones still to decode, one `position` step
-            // per handle either way.
-            self.skip = self.skip.saturating_add(ahead);
+            // per handle either way. It *replaces* whatever skip was
+            // standing, never adds to it: `position` already counts every
+            // handle popped, dropped ones included, so the picture delivered
+            // is always `position + skip` ([`forward_skip`]) -- an accumulate
+            // would land `ahead` frames past the target, silently.
+            self.skip = forward_skip(self.skip, ahead);
             return Ok(());
         }
         self.decoder.get().flush().map_err(|e| e.to_string())?;
@@ -2103,5 +2119,48 @@ mod tests {
         assert_eq!(forward_limit(0.0), 0);
         assert_eq!(forward_limit(f64::NAN), 0);
         assert_eq!(forward_limit(-30.0), 0);
+    }
+
+    /// The drain machine's one law, held across *stacked* repositions: the
+    /// picture delivered is `position + skip`, `position` advancing one per
+    /// handle popped ([`Session::pump`]). A second forward reseek before the
+    /// first's skip has drained must land on its own target -- the skip is
+    /// replaced ([`forward_skip`]), never added to, or every reseek inside
+    /// another's window walks its predecessor's frames past the target and
+    /// the pictures keep arriving, only wrong.
+    #[test]
+    fn stacked_forward_reseeks_land_exactly_on_their_target() {
+        use Reposition::Forward;
+        let (count, limit) = (10_000u32, forward_limit(30.0));
+        let land = |position: i64, skip: u32| position + i64::from(skip);
+        let (mut position, mut skip) = (100i64, 0u32);
+        let Forward(ahead) = reposition(position, 110, count, limit) else {
+            panic!("110 is within the reach of 100")
+        };
+        skip = forward_skip(skip, ahead);
+        let Forward(ahead) = reposition(position, 114, count, limit) else {
+            panic!("114 is within the reach of 100")
+        };
+        skip = forward_skip(skip, ahead);
+        assert_eq!(land(position, skip), 114, "the second target, exactly");
+
+        // A flush whose RAP skip is still undrained when a forward span is
+        // asked: the flush stood at its RAP with `skip` toward its own
+        // target, and the forward reseek through that window replaces it.
+        position = 200;
+        skip = 12;
+        let Forward(ahead) = reposition(position, 208, count, limit) else {
+            panic!("208 is within the reach of 200")
+        };
+        skip = forward_skip(skip, ahead);
+        assert_eq!(land(position, skip), 208, "a flush's undrained skip does not compound");
+
+        // ...and a reseek to exactly where the decoder stands cancels
+        // whatever was standing: the next handle is shown, not skipped past.
+        let Forward(ahead) = reposition(position, position, count, limit) else {
+            panic!("a session's own position is within its reach")
+        };
+        skip = forward_skip(skip, ahead);
+        assert_eq!((ahead, land(position, skip)), (0, position));
     }
 }
