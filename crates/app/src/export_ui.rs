@@ -271,6 +271,30 @@ pub(crate) fn audio_half(session: &PlaybackSession, (lane, idx): (Lane, usize)) 
         .unwrap_or((lane, idx))
 }
 
+/// The member of a caption's group on a media lane of the wanted kind: what a
+/// card that is about media opens on when the hand is on the caption pinned to
+/// it. `None` for a caption in no group with clips -- there are no pictures or
+/// sound behind the words to be reaching at, and the card that opened anyway
+/// would be a card of settings nothing plays.
+pub(crate) fn caption_media_half(
+    session: &PlaybackSession,
+    (lane, idx): (Lane, usize),
+    kind: LaneKind,
+) -> Option<(Lane, usize)> {
+    let link = session.sub_lane(lane).get(idx).and_then(|s| s.link)?;
+    session
+        .lanes()
+        .into_iter()
+        .filter(|l| l.kind == kind)
+        .find_map(|l| {
+            session
+                .lane_clips(l)
+                .iter()
+                .position(|c| c.link == Some(link))
+                .map(|i| (l, i))
+        })
+}
+
 pub(crate) fn color_key(key: &str) -> Option<ColorKey> {
     Some(match key {
         ESCAPE => ColorKey::Close,
