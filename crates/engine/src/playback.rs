@@ -1753,9 +1753,16 @@ impl PlaybackSession {
 
     /// Drags a placement to another subtitle lane or another frame
     /// ([`Project::move_sub`]). One undo step, and `Ok` with none for a drop
-    /// that changed nothing.
+    /// that changed nothing. A caption in a group drags the group's clips with
+    /// it -- a mapping change -- so this reseeks like a clip's drag does; a
+    /// caption in no group moves nothing that plays and disturbs nothing.
     pub fn move_sub(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> crate::Result<()> {
-        self.project.move_sub(from, idx, to, start)
+        let grouped = self.caption_grouped_with_clips(from, idx);
+        let moved = self.project.move_sub(from, idx, to, start);
+        if moved.is_ok() && grouped {
+            self.invalidate(Dirty::Both);
+        }
+        moved
     }
 
     /// Drags one edge of a placement to timeline frame `to`
@@ -1763,9 +1770,16 @@ impl PlaybackSession {
     /// placement's position is in frames while its words are in microseconds,
     /// and the rate that joins them is the one thing a [`Project`] does not
     /// know. That is why a front-end trims through this door and never converts
-    /// a cue's microseconds itself. One undo step.
+    /// a cue's microseconds itself. One undo step. A caption in a group trims
+    /// the group's clips with it, and that half reseeked; a lone caption's trim
+    /// changes only the words, which are drawn over whatever is decoded.
     pub fn trim_sub(&mut self, lane: Lane, idx: usize, edge: Edge, to: u32) -> crate::Result<()> {
-        self.project.trim_sub(lane, idx, edge, to, self.meta.frame_rate)
+        let grouped = self.caption_grouped_with_clips(lane, idx);
+        let trimmed = self.project.trim_sub(lane, idx, edge, to, self.meta.frame_rate);
+        if trimmed.is_ok() && grouped {
+            self.invalidate(Dirty::Both);
+        }
+        trimmed
     }
 
     /// How far that edge may travel, `(first, last)` timeline frame inclusive
@@ -1841,8 +1855,20 @@ impl PlaybackSession {
     pub fn delete_sub(&mut self, lane: Lane, idx: usize) -> bool {
         // Which of the two, asked before anything moves: the reseek a grouped
         // delete owes is the whole difference between the paths.
-        let grouped = self
-            .project
+        match self.caption_grouped_with_clips(lane, idx) {
+            true => self.edit(Dirty::Both, |p| p.delete_sub_in(lane, idx)),
+            // A caption in no group -- or one grouped only with other captions,
+            // which lift and move nothing that plays -- is the lift it always
+            // was.
+            false => self.project.delete_sub_in(lane, idx),
+        }
+    }
+
+    /// Whether the caption at `idx` of `lane` is grouped with clips on other
+    /// lanes: the one question every caption edit that can move media has to
+    // ask first, because the answer is whether the edit owes a reseek.
+    fn caption_grouped_with_clips(&self, lane: Lane, idx: usize) -> bool {
+        self.project
             .sub_lane(lane)
             .get(idx)
             .and_then(|s| s.link)
@@ -1851,14 +1877,7 @@ impl PlaybackSession {
                     .lanes()
                     .into_iter()
                     .any(|l| l != lane && self.project.lane(l).iter().any(|c| c.link == Some(id)))
-            });
-        match grouped {
-            true => self.edit(Dirty::Both, |p| p.delete_sub_in(lane, idx)),
-            // A caption in no group -- or one grouped only with other captions,
-            // which lift and move nothing that plays -- is the lift it always
-            // was.
-            false => self.project.delete_sub_in(lane, idx),
-        }
+            })
     }
 
     /// What the clip at `idx` of `lane` is equalized with, or `None` for one

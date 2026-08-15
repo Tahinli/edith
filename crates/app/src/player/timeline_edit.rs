@@ -396,23 +396,39 @@ impl Player {
             // ([`Project::place_sub`]'s sorted insert), so one placed *before*
             // the marked caption slid it one along and the index left behind
             // names its new neighbour -- the caption the next Delete would take.
-            // The mark goes back on the caption it was on.
+            // The mark goes back on the caption it was on, every *other* pick
+            // this lane held goes with the indices that moved (they name
+            // neighbours now), and picks on other lanes keep what they name:
+            // a placement renumbers this lane alone.
             (None, Some(start)) => {
                 let mark = self
                     .session
                     .as_ref()
                     .and_then(|session| sub_mark(session.sub_lane(to), start))
                     .map(|i| (to, i));
-                self.selected = match mark {
-                    Some(mark) => {
-                        let mut sel = Selection::new();
-                        sel.set_one(mark);
-                        sel
+                let mut kept = Selection::new();
+                for &(lane, idx) in self.selected.picks() {
+                    if lane != to {
+                        kept.add((lane, idx));
                     }
-                    None => Selection::new(),
-                };
+                }
+                if let Some(mark) = mark {
+                    kept.add(mark);
+                }
+                self.selected = kept;
             }
-            (None, None) => {}
+            // Nothing marked on this lane, but the placement renumbered it all
+            // the same: a pick left on a slid index names the wrong caption,
+            // and the discipline of every renumbering edit applies.
+            (None, None) => {
+                let mut kept = Selection::new();
+                for &(lane, idx) in self.selected.picks() {
+                    if lane != to {
+                        kept.add((lane, idx));
+                    }
+                }
+                self.selected = kept;
+            }
         }
         cx.notify();
     }
@@ -458,7 +474,9 @@ impl Player {
             // A lane holds its captions in start order, so the drop moved the
             // mark as well as the box: it is re-read off where the caption
             // landed rather than left on the index it had, which after the move
-            // is a neighbour's.
+            // is a neighbour's. A grouped caption dragged its clips with it --
+            // the engine reseeks itself, and this owes the flag reset a clip's
+            // drop pays at the same moment.
             Some(Ok(())) => {
                 let mark = self
                     .session
@@ -473,6 +491,9 @@ impl Player {
                     }
                     None => Selection::new(),
                 };
+                if drag.sub.link.is_some() {
+                    self.reset_after_reseek();
+                }
             }
             None => {}
         }
@@ -1103,15 +1124,19 @@ impl Player {
         // A caption's edge reaches the engine through its own door, at this
         // timeline's rate. An `Ok` is *not* "something changed" -- an edge that
         // stopped at a wall it already stood against is `Ok` with no undo step
-        // ([`Project::trim_sub`]) -- so only the refusal is ever said out loud,
-        // and nothing reseeks: cues are drawn over whatever is decoded.
+        // ([`Project::trim_sub`]) -- so only the refusal is ever said out loud.
+        // A lone caption's trim moves nothing that plays, and nothing reseeks;
+        // a grouped one trimmed its clips with it, and owes the same flag
+        // reset a clip's trim pays.
         if trim.lane.kind == LaneKind::Subtitle {
-            if let Some(Err(e)) = self
+            let trimmed = self
                 .session
                 .as_mut()
-                .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to))
-            {
-                self.notify_user(format!("NOT TRIMMED — {e}").into());
+                .map(|session| session.trim_sub(trim.lane, trim.idx, trim.edge, trim.to));
+            match trimmed {
+                Some(Err(e)) => self.notify_user(format!("NOT TRIMMED — {e}").into()),
+                Some(Ok(())) if trim.link.is_some() => self.reset_after_reseek(),
+                _ => {}
             }
             cx.notify();
             return;

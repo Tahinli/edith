@@ -919,10 +919,17 @@ impl Project {
             }
         }
         links_are_consistent(&lanes)?;
+        // The counter sits past every id the file names, on either of a lane's
+        // lists: a v16 caption may carry the highest link there is, and a
+        // re-issued id would silently group it with the next placement that
+        // asks for one -- the loader refusing a save the editor just wrote.
         let next_link = lanes
             .iter()
-            .flat_map(|l| &l.clips)
-            .filter_map(|c| c.link)
+            .flat_map(|l| {
+                let clips = l.clips.iter().filter_map(|c| c.link);
+                let subs = l.subs.iter().filter_map(|s| s.link);
+                clips.chain(subs)
+            })
             .max()
             // Saturating so a crafted file cannot make the counter wrap: at the
             // ceiling ids stop being fresh, which loses grouping, not memory.
@@ -1445,6 +1452,17 @@ impl Project {
                 return Err(format!("the {name} lane is out of order or overlaps itself").into());
             }
             data.subs = list;
+            // The counter also has to clear the ids these captions carry: this
+            // is the door a load's placements come through, *after*
+            // [`from_parts`](Project::from_parts) seeded it from the clips, and
+            // a hand-grouped caption may carry the highest id in the file.
+            self.next_link = self.next_link.max(
+                data.subs
+                    .iter()
+                    .filter_map(|s| s.link)
+                    .max()
+                    .map_or(0, |m| m.saturating_add(1)),
+            );
         }
         Ok(self)
     }
@@ -4800,6 +4818,59 @@ mod tests {
         assert!(p.undo());
         assert!(p.undo());
         assert_eq!(shape(&p), before);
+    }
+
+    /// The link counter a load seeds sits past every id the file names,
+    /// captions included: a hand-grouped caption may carry the highest id there
+    /// is, and a counter that read the clips alone would hand it to the next
+    /// group that asked -- silently grouping the caption with clips it never
+    /// met.
+    #[test]
+    fn the_link_counter_sits_past_a_caption_only_id() {
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9);
+        p.add_lane(LaneKind::Subtitle);
+        let caption = SubClip {
+            start: 0,
+            frames: 6,
+            track: 0,
+            in_us: 0,
+            out_us: 6_000_000,
+            // The highest id in the file, and only a caption carries it.
+            link: Some(1),
+        };
+        let mut p = p
+            .with_subtitles(vec![track()])
+            .with_subs(vec![Vec::new(), Vec::new(), vec![caption]])
+            .expect("a caption may carry the file's highest id");
+
+        // A new group on lanes the caption is not on mints the next id -- which
+        // must not be the caption's.
+        let v2 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v2, 0, clip(0, 0, 9, 0)));
+        p.group_all(&[(Lane::V1, 0), (v2, 0)])
+            .expect("the clips group");
+        let minted = p.lane(Lane::V1)[0].link.expect("grouped");
+        assert_ne!(
+            minted,
+            1,
+            "the caption's id is not re-issued to clips"
+        );
+        assert_eq!(
+            p.sub_lane(Lane::new(LaneKind::Subtitle, 0))[0].link,
+            Some(1),
+            "the caption keeps its own group"
+        );
+        assert!(links_are_consistent(&p.lanes).is_ok());
     }
 
     /// The caption a hand groups: `group_all` over clips *and* a caption, the
