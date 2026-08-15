@@ -91,7 +91,7 @@ impl Player {
     /// with nothing marked the section says how to get one, and each button is
     /// dimmed with the oracle's reason rather than missing.
     fn selection_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let picked = self.selected.and_then(|(lane, idx)| {
+        let picked = self.selected.anchor().and_then(|(lane, idx)| {
             let session = self.session.as_ref()?;
             let clip = session.lane_clips(lane).get(idx).copied()?;
             let source = session.sources().get(clip.source);
@@ -107,14 +107,26 @@ impl Player {
         // marked caption -- while the bed draws that caption in the selection's
         // own colours and this panel's Delete lifts it. The panel says what is
         // marked or it is telling the user the opposite of what they can see.
-        let caption = self.selected.filter(|_| picked.is_none()).and_then(|(lane, idx)| {
+        let caption = self
+            .selected
+            .anchor()
+            .filter(|_| picked.is_none())
+            .and_then(|(lane, idx)| {
             let sub = self.session.as_ref()?.sub_lane(lane).get(idx).copied()?;
             Some((lane, sub))
         });
+        // A multi-selection is named for its anchor and counted: what the
+        // panel shows is the anchor's settings, and the count says there is
+        // more in hand than the panel is showing.
+        let more = self.selected.len().saturating_sub(1);
         let head = match (&picked, &caption) {
             (Some((lane, _, name, _)), _) => format!("{} · {}", lane.label(), name),
             (None, Some((lane, _))) => format!("{} · caption", lane.label()),
             (None, None) => "Nothing selected".to_string(),
+        };
+        let head = match more {
+            0 => head,
+            n => format!("{head} · and {n} more picked"),
         };
         let detail = match &picked {
             Some((_, clip, _, _)) => format!(

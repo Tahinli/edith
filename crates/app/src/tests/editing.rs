@@ -261,12 +261,14 @@ fn every_audio_stream_of_a_file_is_a_row_usable_or_not() {
 
 /// What the clip menu offers, and where it hangs. The two items that act on
 /// the playhead rather than on the clicked clip are the ones that can be
-/// inapplicable, and a menu at the edge of the window has to come back
-/// inside it or its last item cannot be clicked at all.
-/// A caption's own menu, opened on a box that is not a clip: one row that acts
-/// on it -- Delete, which routes to `Player::lift_sub` -- the timeline's global
-/// item beside it, and nothing else drawn at all. What a placed subtitle used to
-/// have no menu, and no stroke, to do.
+/// inapplicable, and a menu at the edge of the window has to come back inside
+/// it or its last item cannot be clicked at all.
+///
+/// A caption's own menu, opened on a box that is not a clip: the rows that act
+/// on it -- Delete, which routes to `Player::lift_sub`, and the group pair now
+/// that a caption may be grouped by hand -- the timeline's global items beside
+/// them, and nothing else drawn at all. What a placed subtitle used to have no
+/// menu, and no stroke, to do.
 #[test]
 fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     use keymap::ActionId;
@@ -281,26 +283,35 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     assert_eq!(
         enable(ActionId::Delete, cap),
         Enable::Yes,
-        "the one thing a placed caption can be asked to do",
+        "the one thing a placed caption could always be asked to do",
     );
-    // The clip rows are refusals of *kind* on a caption, so the menu leaves them
-    // out rather than drawing "click a clip first" over a clicked box.
-    for clip_only in [
-        ActionId::Copy,
-        ActionId::Lift,
-        ActionId::Detach,
-        ActionId::Group,
-        ActionId::Equalizer,
-    ] {
+    // The clip rows are refusals of *kind* on a caption, so the menu leaves
+    // them out rather than drawing "click a clip first" over a clicked box.
+    for clip_only in [ActionId::Copy, ActionId::Lift, ActionId::Equalizer] {
         assert_eq!(
             enable(clip_only, cap),
             Enable::Hidden("this is a caption"),
             "{clip_only:?} is not a row on a caption",
         );
     }
-    // ...and the playhead's actions are *not* among them: the split and the
-    // regroup act at the line and the cards fall back to the clip under it, so a
-    // caption in hand is no reason for them to go dead -- which, hidden, is
+    // The group rows are the caption's now: a caption out of any group says so
+    // in the detach's own words, and Group over one pick is the partner hunt.
+    assert_eq!(
+        enable(ActionId::Detach, cap),
+        Enable::No("this caption is not grouped")
+    );
+    assert_eq!(enable(ActionId::Group, cap), Enable::Yes);
+    // ...and a caption in a group detaches like a clip does.
+    let grouped = Ctx {
+        caption: true,
+        caption_link: Some(3),
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Detach, grouped), Enable::Yes);
+    // ...and the playhead's actions are *not* refusals: the split and the
+    // regroup act at the line and the cards fall back to the clip under it, so
+    // a caption in hand is no reason for them to go dead -- which, hidden, is
     // exactly what they went: `Player::act` returns without a word on `Hidden`,
     // and no click on the bed clears the mark that put them there.
     for playhead in [
@@ -320,11 +331,17 @@ fn a_caption_is_deleted_by_the_same_row_and_stroke_every_box_is() {
     // ...but live is not *listed*: every one of those rows reaches the clip
     // under the playhead and not the caption, and a menu opened on a caption
     // that offered a grade would read as the caption's. The caption's menu is
-    // its one row and the global pair the card already names as global.
+    // its own rows and the global pair the card already names as global.
     assert_eq!(
         menu_items(cap),
-        vec![ActionId::Paste, ActionId::Delete, ActionId::ToggleMute],
-        "the caption's menu is its removal and the global rows alone",
+        vec![
+            ActionId::Paste,
+            ActionId::Delete,
+            ActionId::Detach,
+            ActionId::Group,
+            ActionId::ToggleMute,
+        ],
+        "the caption's menu is its removal, its group rows, and the global ones",
     );
     // ...and the same reading with a clip under it is the clip menu, untouched:
     // the flag is off wherever a `Clip` was clicked.
@@ -353,6 +370,7 @@ fn one_second(start: u32) -> SubClip {
         track: 0,
         in_us: 0,
         out_us: 1_000_000,
+        link: None,
     }
 }
 
@@ -432,6 +450,82 @@ fn a_caption_placed_before_the_marked_one_leaves_the_mark_on_the_original() {
         [0],
         "the caption the user marked is the one that died",
     );
+}
+
+/// A caption a hand grouped with a clip pairs it for the whole-take question:
+/// deleting the picture takes the group, because the group -- not the lane's
+/// kind -- is what pairs. The engine door is the one the menu's Group row
+/// reaches (`group_all`), tested here from the selection's own side of it.
+#[test]
+fn a_caption_grouped_with_a_clip_pairs_it_for_the_whole_take_question() {
+    let (mut session, lane) = with_subtitle_lane();
+    session
+        .place_sub(lane, 0, one_second(0))
+        .expect("the caption goes down");
+    session
+        .group_all(&[(Lane::V1, 0), (lane, 0)])
+        .expect("a clip and a caption are a group");
+    // Paired through the caption alone: the sound half is gone (the fixture's
+    // take was split above), and the question is the picture's to answer.
+    assert!(
+        whole_take(&session, Lane::V1, 0),
+        "the caption the clip was grouped with pairs it"
+    );
+    // ...and the detach takes the pairing off again.
+    assert!(session.ungroup(lane, 0));
+    assert!(
+        !whole_take(&session, Lane::V1, 0),
+        "ungrouped, the clip is a half like any other"
+    );
+}
+
+/// The manual group's oracle question: a selection of placements, one per lane.
+/// Two picks on two lanes is a group waiting to happen; a lane picked twice is
+/// the one thing a group may never hold; a single pick is the partner hunt.
+#[test]
+fn group_is_live_over_a_multi_selection_and_words_a_repeated_lane() {
+    use keymap::ActionId;
+    let distinct = Ctx {
+        timeline: true,
+        picks: 2,
+        pick_lanes: 2,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Group, distinct), Enable::Yes);
+    let twice = Ctx {
+        timeline: true,
+        picks: 2,
+        pick_lanes: 1,
+        ..Ctx::default()
+    };
+    assert_eq!(
+        enable(ActionId::Group, twice),
+        Enable::No("a group is one clip per lane: keep one pick per track")
+    );
+    // One pick and none at all: the partner hunt and its own refusal, which
+    // the player words rather than the oracle.
+    let one = Ctx {
+        timeline: true,
+        picks: 1,
+        pick_lanes: 1,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Group, one), Enable::Yes);
+    // Nothing picked at all, on an open timeline: the partner hunt's own
+    // refusal, worded by the player rather than the oracle.
+    let none = Ctx {
+        timeline: true,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Group, none), Enable::Yes);
+    // Stale picks (an edit moved the indices) count as none.
+    let stale = Ctx {
+        timeline: true,
+        picks: 0,
+        pick_lanes: 0,
+        ..Ctx::default()
+    };
+    assert_eq!(enable(ActionId::Group, stale), Enable::Yes);
 }
 
 /// The playhead's actions with a caption marked: live, and doing what they say.
@@ -1338,7 +1432,7 @@ fn a_row_dropped_on_the_open_bed_lands_under_the_pointer() {
     // bed: ten seconds in, five seconds past the end of the timeline, and
     // no mark anywhere near enough to pull it back.
     let clips = [session.lane_clips(Lane::V1), session.lane_clips(Lane::A1)];
-    let marks = snap_marks(&clips, None, frame_at(session.now(), fps));
+    let marks = snap_marks(&clips, None, None, frame_at(session.now(), fps));
     let under = frame_at(scale.time_at(px_along(px(212.), bed)), fps);
     let (at, cue) = landing(under, 0, 0, true, scale.snap_frames(fps), &marks);
     assert_eq!((at, cue), (300, None), "the pointer is on frame 300");

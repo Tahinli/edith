@@ -74,6 +74,14 @@ pub(crate) struct Ctx {
     /// about a clip.
     pub(crate) playable: bool,
     pub(crate) exporting: bool,
+    /// How many placements the selection holds, and on how many distinct
+    /// lanes -- the manual group's two questions in one reading. Picks that
+    /// name nothing (a stroke moved the indices under them) count as none.
+    pub(crate) picks: usize,
+    pub(crate) pick_lanes: usize,
+    /// The group id of the marked caption, when what is marked is one: the
+    /// detach question, asked over a box the clip index space cannot name.
+    pub(crate) caption_link: Option<u32>,
 }
 
 /// Whether `action` can be asked for, on `ctx`. One arm per action and nothing
@@ -137,7 +145,10 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // nothing else* have nothing to act on over a placed subtitle, so they are
     // refusals of kind -- not rows at all, rather than rows saying "click a clip
     // first" over a clicked caption. Delete is the one that means something: it
-    // routes to [`Player::lift_sub`] when what is marked is a caption.
+    // routes to [`Player::lift_sub`] when what is marked is a caption, and so
+    // are Group and Detach now that a caption may be grouped by hand -- the one
+    // over the selection the menu was opened on, the other over the group the
+    // marked caption is in.
     //
     // And it is *only* those. The playhead actions are about the timeline rather
     // than about what is marked -- the split and the regroup act at the line
@@ -150,12 +161,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     if ctx.caption
         && matches!(
             action,
-            ActionId::Copy
-                | ActionId::Delete
-                | ActionId::Lift
-                | ActionId::Detach
-                | ActionId::Group
-                | ActionId::Equalizer
+            ActionId::Copy | ActionId::Delete | ActionId::Lift | ActionId::Equalizer
         )
     {
         return match action {
@@ -216,11 +222,25 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
             }
             _ => Enable::Yes,
         },
-        // Nothing to take apart in a clip that names no group at all. Whether
-        // the group it names still has another half is the engine's question,
-        // like the regroup above.
-        ActionId::Detach => match ctx.clip {
-            Some((clip, _)) if clip.link.is_none() => Enable::No("this clip is not grouped"),
+        // Nothing to take apart in a placement that names no group at all --
+        // a clip by its own field, a caption by the one the mark carries.
+        // Whether the group it names still has another half is the engine's
+        // question, like the regroup above.
+        ActionId::Detach => match (ctx.clip, ctx.caption) {
+            (Some((clip, _)), _) if clip.link.is_none() => Enable::No("this clip is not grouped"),
+            (None, true) if ctx.caption_link.is_none() => {
+                Enable::No("this caption is not grouped")
+            }
+            _ => Enable::Yes,
+        },
+        // The manual group: a *selection* of placements, at most one per lane.
+        // Two picks or more, all on their own lanes, is a group waiting to be
+        // made; a lane picked twice is the one thing a group may never hold;
+        // and a single pick is the partner hunt it always was, which the engine
+        // words itself.
+        ActionId::Group => match ctx.picks {
+            2.. if ctx.pick_lanes == ctx.picks => Enable::Yes,
+            2.. => Enable::No("a group is one clip per lane: keep one pick per track"),
             _ => Enable::Yes,
         },
         // The three that act on the marked clip and on nothing else: with none
@@ -266,10 +286,12 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
 /// caption -- [`enable`] says so, and the strokes and the toolbar read that --
 /// but a split, a rate, a grade or a fit listed under a right-clicked caption
 /// reads as something the caption is about to get, when what they reach is the
-/// video clip the playhead is standing in. So a caption's menu carries the one
-/// row that is the caption's ([`Player::lift_sub`], reached through Delete) and
-/// the rows the card already prints "(global)" beside, which say for themselves
-/// that they are not about what was clicked.
+/// video clip the playhead is standing in. So a caption's menu carries the rows
+/// that are the caption's -- its removal ([`Player::lift_sub`], reached through
+/// Delete) and, since a caption may be grouped by hand, the group pair over the
+/// selection and its own group -- and the rows the card already prints
+/// "(global)" beside, which say for themselves that they are not about what was
+/// clicked.
 pub(crate) fn menu_items(ctx: Ctx) -> Vec<ActionId> {
     MENU_ITEMS
         .into_iter()
@@ -278,7 +300,11 @@ pub(crate) fn menu_items(ctx: Ctx) -> Vec<ActionId> {
             !ctx.caption
                 || matches!(
                     action,
-                    ActionId::Delete | ActionId::Paste | ActionId::ToggleMute
+                    ActionId::Delete
+                        | ActionId::Paste
+                        | ActionId::ToggleMute
+                        | ActionId::Group
+                        | ActionId::Detach
                 )
         })
         .collect()

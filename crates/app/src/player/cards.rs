@@ -178,6 +178,7 @@ impl Player {
         };
         let target = self
             .selected
+            .anchor()
             .filter(|(lane, _)| lane.kind == LaneKind::Video)
             .or_else(|| session.video_clip_at(session.now()));
         match target {
@@ -310,6 +311,7 @@ impl Player {
         };
         match self
             .selected
+            .anchor()
             .or_else(|| session.video_clip_at(session.now()))
         {
             Some(clip) => {
@@ -452,6 +454,7 @@ impl Player {
         };
         match self
             .selected
+            .anchor()
             .or_else(|| session.video_clip_at(session.now()))
             .map(|clip| audio_half(session, clip))
         {
@@ -842,7 +845,7 @@ impl Player {
                 // selection now names a different clip than the one that is
                 // highlighted -- dropped here as after every other edit that
                 // moves indexes (a delete, a paste, an undo).
-                self.selected = None;
+                self.selected.clear();
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
@@ -881,7 +884,7 @@ impl Player {
                 // Splitting each silence out and closing the room it no longer
                 // needs moves indexes exactly as the cut does: the selection
                 // goes with them.
-                self.selected = None;
+                self.selected.clear();
                 self.reset_after_reseek();
                 self.notify_user(
                     format!(
@@ -958,7 +961,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let refusal = match (self.selected, &self.session) {
+        let refusal = match (self.selected.anchor(), &self.session) {
             (_, None) => Some("NO TIMELINE — open a file first".to_string()),
             (None, _) => Some(format!(
                 "NOTHING SELECTED — click an audio clip or press {}, then ask again",
@@ -974,7 +977,7 @@ impl Player {
             cx.notify();
             return;
         }
-        let (lane, idx) = self.selected.expect("checked above");
+        let (lane, idx) = self.selected.anchor().expect("checked above");
         let session = self.session.as_ref().expect("checked above");
         // What the clip already plays through, or the flat default -- so the
         // card opens on the curve that is in force and a reopen shows the last

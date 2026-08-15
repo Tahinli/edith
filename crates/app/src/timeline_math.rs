@@ -5,7 +5,8 @@ use crate::*;
 /// Whether this clip is a whole take, i.e. whether deleting it may close the
 /// hole under it: a take is what the first pair of lanes carries between them,
 /// `V1`'s picture and the sound grouped with it, and dropping one moves the
-/// frames after it on every lane.
+/// frames after it on every lane. A caption a hand grouped with the clip
+/// counts as its partner too: the group is what pairs, not the lane's kind.
 ///
 /// Everything else is a half or a layer, and is *lifted* instead: a half whose
 /// picture was lifted (what a lift leaves behind) has no take to ripple, and a
@@ -20,8 +21,12 @@ pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> b
             .lanes()
             .into_iter()
             .filter(|&other| other != lane)
-            .flat_map(|other| session.lane_clips(other))
-            .any(|o| o.link.is_some() && o.link == clip.link)
+            .flat_map(|other| {
+                let clips = session.lane_clips(other).iter().map(|c| c.link);
+                let subs = session.sub_lane(other).iter().map(|s| s.link);
+                clips.chain(subs)
+            })
+            .any(|link| link.is_some() && link == clip.link)
     };
     match (lane.kind, lane.ord) {
         (_, 1..) => false,
@@ -69,18 +74,107 @@ pub(crate) fn span_partner(session: &PlaybackSession, lane: Lane, idx: usize) ->
     opposite.into_iter().chain(same).find_map(matches)
 }
 
-/// Whether a click marks this clip: the clip that was clicked always, and the
-/// other lane's clip of the same group with it. A clip whose group has no other
-/// half -- what a lift leaves behind -- marks only itself, which is what makes a
-/// detached half separately deletable.
+/// What the timeline has picked: every clip and caption a hand ctrl-clicked
+/// into the selection, in click order and with no two the same. The last of
+/// them is the [`anchor`](Selection::anchor) -- the one every action that is
+/// about *one* thing (delete, lift, copy, the equalizer) acts on -- and the
+/// whole list is what a manual Group names to the engine.
+///
+/// Indices move under every edit, exactly as the single mark this replaces
+/// did, so every edit that renumbers a lane clears the picks it cannot keep
+/// honest. Pure and engine-free, so a test can build one without a window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Selection {
+    /// `(lane, index into that lane's own list)` -- a subtitle lane's index
+    /// space for a caption, exactly the pair a click was told about.
+    picks: Vec<(Lane, usize)>,
+}
+
+impl Selection {
+    /// Nothing picked: what the timeline starts as and what an edit that moved
+    /// indices leaves behind.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The one a plain click and every selection key leave: the whole of the
+    /// selection, one pick. A click names a thing, and the things it had been
+    /// naming along with it are no longer named.
+    pub(crate) fn set_one(&mut self, pick: (Lane, usize)) {
+        self.picks.clear();
+        self.picks.push(pick);
+    }
+
+    /// A ctrl-click: the pick joins the selection if it was not in it and
+    /// leaves if it was -- the toggle that assembles a group by hand. The
+    /// order is the order they were picked in, and the anchor rides on it.
+    pub(crate) fn toggle(&mut self, pick: (Lane, usize)) {
+        match self.picks.iter().position(|&p| p == pick) {
+            Some(at) => {
+                self.picks.remove(at);
+            }
+            None => self.picks.push(pick),
+        }
+    }
+
+    /// The last pick: what "the selected clip" is to every action that acts on
+    /// one thing. The click order puts it under the hand, which is where the
+    /// eye is.
+    pub(crate) fn anchor(&self) -> Option<(Lane, usize)> {
+        self.picks.last().copied()
+    }
+
+    /// Whether `pick` is one of the selection's -- the question a right-click
+        /// asks before it decides whether the menu is about the selection or
+        /// about the clip under it.
+    pub(crate) fn contains(&self, pick: (Lane, usize)) -> bool {
+        self.picks.contains(&pick)
+    }
+
+    /// Every pick, in click order: what a manual Group names to the engine.
+    pub(crate) fn picks(&self) -> &[(Lane, usize)] {
+        &self.picks
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.picks.is_empty()
+    }
+
+    /// A pick that joins without disturbing the rest -- Select All's builder,
+    /// which names every placement there is and cannot be a `set_one`.
+    pub(crate) fn add(&mut self, pick: (Lane, usize)) {
+        if !self.picks.contains(&pick) {
+            self.picks.push(pick);
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.picks.len()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.picks.clear();
+    }
+}
+
+/// Whether a click marks this box: any pick on it always, and any box sharing
+/// a group id with a pick -- the clip the anchor was ctrl-clicked beside, and
+/// the caption a hand pinned to a clip. A group whose only member is picked
+/// marks that member alone, which is what makes a detached half separately
+/// deletable.
+///
+/// `pick_links` are the group ids of the picks themselves, read by the caller
+/// off the session in the same order as `picks` -- the one fact this pure
+/// question cannot know.
 pub(crate) fn marked(
     here: (Lane, usize),
     link: Option<u32>,
-    sel: Option<(Lane, usize)>,
-    sel_link: Option<u32>,
+    picks: &[(Lane, usize)],
+    pick_links: &[Option<u32>],
 ) -> bool {
-    sel == Some(here) || (link.is_some() && link == sel_link)
+    picks.contains(&here) || (link.is_some() && pick_links.contains(&link))
 }
+
 
 /// Whether a clip is wide enough to be worth naming.
 pub(crate) fn show_label(w: f32) -> bool {
@@ -368,18 +462,22 @@ pub(crate) fn snapped(raw: u32, len: u32, tol: u32, marks: &[u32]) -> u32 {
 
 /// The edges worth landing on, off *every* lane: both ends of every clip on the
 /// timeline, less `skip` -- the clip being dragged, which does not snap to where
-/// it already is -- and less the other halves of its group, which travel with
-/// it. `skip` is a lane's place in `lanes` and an index into it. The playhead
-/// and the head of the timeline go on the end: a clip meets the cursor and the
-/// start of the show as readily as it meets another take.
+/// it already is -- and less `skip_link`, the group id of whatever is being
+/// dragged: its clips travel with it, and so does any caption the id names.
+/// `skip` is a lane's place in `lanes` and an index into it; `skip_link` is
+/// read off a caption by the caller, whose drag has no clip for `skip` to
+/// name. The playhead and the head of the timeline go on the end: a clip meets
+/// the cursor and the start of the show as readily as it meets another take.
 ///
 /// All lanes rather than the one being dropped on, because a cut is made across
 /// the timeline: a title on V2 lines up with the shot under it, and a sound
 /// effect lines up with the frame it belongs to.
-pub(crate) fn snap_marks(lanes: &[&[Clip]], skip: Option<(usize, usize)>, playhead: u32) -> Vec<u32> {
-    let link = skip
-        .and_then(|(lane, idx)| lanes.get(lane)?.get(idx))
-        .and_then(|clip| clip.link);
+pub(crate) fn snap_marks(
+    lanes: &[&[Clip]],
+    skip: Option<(usize, usize)>,
+    skip_link: Option<u32>,
+    playhead: u32,
+) -> Vec<u32> {
     let mut marks: Vec<u32> = lanes
         .iter()
         .enumerate()
@@ -388,7 +486,8 @@ pub(crate) fn snap_marks(lanes: &[&[Clip]], skip: Option<(usize, usize)>, playhe
                 .iter()
                 .enumerate()
                 .filter(move |&(idx, clip)| {
-                    Some((lane, idx)) != skip && !(link.is_some() && clip.link == link)
+                    Some((lane, idx)) != skip
+                        && !(skip_link.is_some() && clip.link == skip_link)
                 })
                 .flat_map(|(_, clip)| [clip.start, clip.end()])
         })

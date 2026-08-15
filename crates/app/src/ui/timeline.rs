@@ -596,13 +596,20 @@ impl Player {
         // The group ids some *other* lane carries: a clip whose id is in here
         // has a half elsewhere, and one whose is not is a detached half however
         // many lanes there are.
+        // The group ids some *other* lane carries, on either of its lists: a
+        // placement whose id is in here has a half elsewhere -- a clip on
+        // another track, or a caption pinned to this clip -- and one whose is
+        // not is detached however many lanes there are.
         let others: Vec<u32> = self.session.as_ref().map_or_else(Vec::new, |session| {
             session
                 .lanes()
                 .into_iter()
                 .filter(|&other| other != lane)
-                .flat_map(|other| session.lane_clips(other))
-                .filter_map(|clip| clip.link)
+                .flat_map(|other| {
+                    let clips = session.lane_clips(other).iter().filter_map(|c| c.link);
+                    let subs = session.sub_lane(other).iter().filter_map(|s| s.link);
+                    clips.chain(subs)
+                })
                 .collect()
         });
         let name = lane.label();
@@ -629,7 +636,7 @@ impl Player {
             .session
             .as_ref()
             .map_or(&[][..], PlaybackSession::sources);
-        let (sel, sel_link) = (self.selected, self.selected_link());
+        let (picks, pick_links) = self.marks();
         let audio = lane.kind == LaneKind::Audio;
         // A subtitle lane holds no `Clip` and every other lane holds no
         // `SubClip`, so the two lists below are never both full and the bed
@@ -964,7 +971,7 @@ impl Player {
                             f64::from(clip.start) / self.fps,
                             f64::from(clip.frames()) / self.fps,
                         );
-                        let on = marked((lane, i), clip.link, sel, sel_link);
+                        let on = marked((lane, i), clip.link, &picks, &pick_links);
                         // A group with a half in the other lane wears its tint;
                         // one without is outlined, so a detached half is visible
                         // as detached before anyone clicks it.
@@ -1074,7 +1081,10 @@ impl Player {
                                     // than jump its head under it.
                                     this.grab =
                                         this.frame_under(event.position.x).saturating_sub(head);
-                                    this.select((lane, i), cx);
+                                    // Ctrl held, the pick joins the selection
+                                    // instead of replacing it -- the toggle a
+                                    // group is assembled by hand with.
+                                    this.pick((lane, i), event.modifiers.control, cx);
                                 }),
                             )
                             // The right button selects exactly as the left one
@@ -1115,8 +1125,14 @@ impl Player {
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
-                                                    move |this, _: &MouseDownEvent, _, cx| {
-                                                        this.start_trim(lane, i, edge, cx);
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.start_trim(
+                                                            lane,
+                                                            i,
+                                                            edge,
+                                                            event.modifiers.control,
+                                                            cx,
+                                                        );
                                                     },
                                                 ),
                                             )
@@ -1277,9 +1293,13 @@ impl Player {
                         let tip = sub_tip.clone();
                         let head = shown_sub.start;
                         // Marked the way every other box on this bed is marked,
-                        // in this lane's own index space -- a caption has no
-                        // group, so nothing else lights with it.
-                        let on = sel == Some((lane, i));
+                        // in this lane's own index space -- and a caption in a
+                        // group lights with the clips it was pinned to, exactly
+                        // as a clip lights with its halves.
+                        let on = marked((lane, i), placed.link, &picks, &pick_links);
+                        // ...and wears the group's border rather than a lone
+                        // box's, so what travels together reads together.
+                        let grouped = placed.link.is_some_and(|link| others.contains(&link));
                         div()
                             .id((row_id.clone(), i))
                             .absolute()
@@ -1292,6 +1312,8 @@ impl Player {
                             .border_1()
                             .border_color(rgb(if on {
                                 STROKE_SELECTED()
+                            } else if grouped {
+                                ACCENT_PRIMARY()
                             } else {
                                 FG_SECONDARY()
                             }))
@@ -1325,8 +1347,9 @@ impl Player {
                                     // ...and it marks the caption, exactly as
                                     // the press that may become a clip's drag
                                     // marks the clip: picking a caption up and
-                                    // putting it back down is a click.
-                                    this.select((lane, i), cx);
+                                    // putting it back down is a click. Ctrl
+                                    // toggles it into the selection like a clip.
+                                    this.pick((lane, i), event.modifiers.control, cx);
                                 }),
                             )
                             // The right button marks it and hangs the menu at
@@ -1358,8 +1381,14 @@ impl Player {
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(
-                                                    move |this, _: &MouseDownEvent, _, cx| {
-                                                        this.start_trim(lane, i, edge, cx);
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        this.start_trim(
+                                                            lane,
+                                                            i,
+                                                            edge,
+                                                            event.modifiers.control,
+                                                            cx,
+                                                        );
                                                     },
                                                 ),
                                             )
