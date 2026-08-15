@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use engine::export::{EncoderSeat, ExportSettings, Format};
-use engine::project::{Clip, LaneKind, Project, Source, Speed};
+use engine::project::{Clip, Lane, LaneKind, Project, Source, Speed};
 
 // `posix_fadvise(2)`, straight from libc, which std already links: dropping
 // this file's pages needs no crate and no privilege.
@@ -63,6 +63,12 @@ fn main() {
         "seek" => seek_bench(&path, arg_f64(args.next(), "seconds")),
         "seekstorm" => seekstorm_bench(&path, arg_seed(args.next())),
         "playloop" => playloop_bench(&path, arg_f64(args.next(), "seconds"), arg_seed(args.next())),
+        "cutloop" => cutloop_bench(
+            &path,
+            arg_or(args.next(), 20.0) as u32,
+            arg_or(args.next(), 0.5),
+            arg_or(args.next(), 0.3),
+        ),
         "scrub" => scrub_bench(&path),
         "waveform" => waveform_bench(&path),
         "export" => {
@@ -79,6 +85,7 @@ fn usage() -> ! {
         "usage: bench open <file>\n       bench seek <file> <secs>\n       \
          bench seekstorm <file> [seed]\n       \
          bench playloop <file> <secs> [seed]\n       \
+         bench cutloop <file> [regions=20] [keep_s=0.5] [cut_s=0.3]\n       \
          bench scrub <file>\n       bench waveform <file>\n       \
          bench export <file> <h264sw|h264hw|av1|hevc|hevchw> <out_dir>"
     );
@@ -88,6 +95,12 @@ fn usage() -> ! {
 fn arg_f64(arg: Option<String>, what: &str) -> f64 {
     arg.and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("missing {what}"))
+}
+
+/// An optional measurement parameter with a default, so a rerun that names
+/// nothing runs the same shape of timeline the last one did.
+fn arg_or(arg: Option<String>, default: f64) -> f64 {
+    arg.and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
 /// The seed the random metrics draw their positions from: same seed, same
@@ -387,9 +400,10 @@ fn seekstorm_bench(path: &Path, seed: u64) {
 /// boundary, or by the late-picture resync, which is counted separately in the
 /// note.
 ///
-/// The resync rule is the app's, repeated here (`LATE_RESYNC`, `RESYNC_GAP` in
-/// `crates/app/src/transport.rs`) because an engine example cannot depend on
-/// the binary. Repeated only: nothing in this file changes how playback runs.
+/// The resync rule is the app's, repeated here (`LATE_RESYNC`, `RESYNC_GAP`
+/// and the never-during-a-prime gate in `crates/app/src/player/transport.rs`)
+/// because an engine example cannot depend on the binary. Repeated only:
+/// nothing in this file changes how playback runs.
 const PLAYLOOP_SEEK_GAP: Duration = Duration::from_secs(5);
 const LATE_RESYNC: f64 = 0.4;
 const RESYNC_GAP: Duration = Duration::from_secs(2);
@@ -421,6 +435,9 @@ fn playloop_bench(path: &Path, secs: f64, seed: u64) {
     let mut next_seek = start + PLAYLOOP_SEEK_GAP;
     while Instant::now() < deadline {
         session.tick();
+        // Read before the drain, as the app does: the frame the drain takes
+        // is the one that ends the prime, and its lateness is the reopen's.
+        let priming = session.picture_priming();
         let target = session.now() * fps;
         let mut newest = None;
         while session.is_playing() || owed {
@@ -455,6 +472,7 @@ fn playloop_bench(path: &Path, secs: f64, seed: u64) {
             owed = false;
         }
         if !owed
+            && !priming
             && session.is_playing()
             && late > LATE_RESYNC
             && last_resync.is_none_or(|t| t.elapsed() >= RESYNC_GAP)
@@ -511,6 +529,177 @@ fn playloop_bench(path: &Path, secs: f64, seed: u64) {
         "count",
         &[session.restarts() as f64],
         &format!("backend {backend}, {resyncs} late-picture resyncs, {seeks} seeks"),
+    );
+}
+
+// ----------------------------------------------------------------- cutloop
+
+/// The freeze metric: a **silence-cut** timeline -- `regions` holes of
+/// `cut_s` punched out of one file, `keep_s` of picture left between them --
+/// played end to end with the app's own pump, drop policy and resync rule
+/// (`playloop_bench`'s, without the random seeks). Every boundary between two
+/// kept clips is a same-file reseek of the picture worker while the audio
+/// feeder runs straight through -- exactly the timeline a silence removal
+/// leaves, and the complaint it brought: clips shorter than a decoder's own
+/// re-prime, a picture that starves while the sound plays on, and a
+/// late-picture resync every `RESYNC_GAP` buying the same reopen again.
+///
+/// What comes out: displayed and dropped pictures per wall-clock second (a
+/// freeze is a second that shows nothing), on stderr one line each, and in
+/// the TSV the per-second displayed counts beside the totals -- restarts,
+/// resyncs and underruns -- that say which mechanism spent the time.
+///
+/// ```text
+/// bench cutloop <4k file> 20 0.5 0.3
+/// ```
+fn cutloop_bench(path: &Path, regions: u32, keep_s: f64, cut_s: f64) {
+    let mut session = match engine::PlaybackSession::open(path) {
+        Ok(session) => session,
+        Err(e) => {
+            row(path, "cutloop_displayed", "count", &[], &format!("FAIL({e})"));
+            return;
+        }
+    };
+    // Muted like the tests: the device still schedules the stream and the
+    // clock still counts its samples, which is the whole of what this
+    // measures -- the sound is the master the picture is starving against.
+    session.set_gain(0.0);
+    session.drop_late_pictures(true);
+    let fps = session.meta().frame_rate;
+
+    // Cut every hole out before a single picture decodes: keep, cut, keep,
+    // cut -- `regions` pairs of boundaries, so the timeline that plays is
+    // `regions + 1` clips of one file with the holes joined shut.
+    let stride = keep_s + cut_s;
+    for i in 0..regions {
+        let at = keep_s + f64::from(i) * stride;
+        if !session.cut_at(at) || !session.cut_at(at + cut_s) {
+            row(
+                path,
+                "cutloop_displayed",
+                "count",
+                &[],
+                &format!("FAIL(file shorter than region {i} of {regions})"),
+            );
+            return;
+        }
+    }
+    // The holes are the odd clips: index 1, `regions` times over, as every
+    // delete closes the list up onto the next one.
+    for i in 0..regions {
+        if !session.delete_clip(Lane::V1, 1) {
+            row(
+                path,
+                "cutloop_displayed",
+                "count",
+                &[],
+                &format!("FAIL(hole {i} of {regions} would not delete)"),
+            );
+            return;
+        }
+    }
+    let timeline = session.timeline_duration();
+    eprintln!(
+        "cutloop: {regions} regions of {cut_s}s cut, {} clips of {keep_s}s left, \
+         {timeline:.1}s of timeline at {fps:.3} fps",
+        regions + 1
+    );
+
+    session.seek(0.0);
+    session.play();
+    let start = Instant::now();
+    let mut held: Option<engine::Frame> = None;
+    let (mut shown, mut dropped, mut resyncs) = (0u64, 0u64, 0u64);
+    let mut last_resync: Option<Instant> = None;
+    // The first frame of the run is owed exactly as a seek's landing is.
+    let mut owed = true;
+    let mut per_second: Vec<(u64, u64)> = vec![(0, 0)];
+    loop {
+        session.tick();
+        // Read before the drain, as the app does: the frame the drain takes
+        // is the one that ends the prime, and its lateness is the reopen's.
+        let priming = session.picture_priming();
+        let target = session.now() * fps;
+        let mut newest = None;
+        let mut dropped_now = 0u64;
+        while session.is_playing() || owed {
+            let frame = match held.take() {
+                Some(frame) => frame,
+                None => match session.try_frame() {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
+            if f64::from(frame.index) <= target {
+                dropped_now += u64::from(newest.is_some());
+                newest = Some(frame);
+            } else {
+                held = Some(frame);
+                break;
+            }
+        }
+        dropped += dropped_now;
+        let late = newest
+            .as_ref()
+            .map_or(0.0, |f| (target - f64::from(f.index)) / fps);
+        if newest.is_some() {
+            shown += 1;
+            owed = false;
+        }
+        let slot = start.elapsed().as_secs() as usize;
+        if per_second.len() <= slot {
+            per_second.resize(slot + 1, (0, 0));
+        }
+        per_second[slot].0 += u64::from(newest.is_some());
+        per_second[slot].1 += dropped_now;
+        if !owed
+            && !priming
+            && session.is_playing()
+            && late > LATE_RESYNC
+            && last_resync.is_none_or(|t| t.elapsed() >= RESYNC_GAP)
+        {
+            eprintln!("cutloop: picture {late:.3}s behind the clock: restarting it there");
+            session.resync_picture();
+            held = None;
+            last_resync = Some(Instant::now());
+            resyncs += 1;
+        }
+        // End of stream is the end of the run: the clock is halted on the out
+        // point, as the app's transport does, so the last second's bucket is
+        // closed rather than walked off the end of the timeline.
+        if session.is_eos() {
+            session.halt_at_end();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    session.pause();
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let rates: Vec<f64> = per_second.iter().map(|(s, _)| *s as f64).collect();
+    let backend = session.decode_backend().label();
+    let underruns = session.audio_underruns().map_or(0, |(n, _)| n);
+    for (i, (shown, dropped)) in per_second.iter().enumerate() {
+        eprintln!("cutloop[{i:2}s]: {shown:3} displayed, {dropped:3} dropped");
+    }
+    row(
+        path,
+        "cutloop_displayed",
+        "count",
+        &rates,
+        &format!(
+            "per second; backend {backend}, {shown} displayed, {dropped} dropped, \
+             {resyncs} resyncs in {elapsed:.1}s, {regions} x {cut_s}s cuts of {keep_s}s clips"
+        ),
+    );
+    row(
+        path,
+        "cutloop_restarts",
+        "count",
+        &[session.restarts() as f64],
+        &format!(
+            "backend {backend}, {resyncs} late-picture resyncs, {underruns} underruns"
+        ),
     );
 }
 

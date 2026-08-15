@@ -360,6 +360,14 @@ pub struct PlaybackSession {
     /// the sound is silence, the duration is zero, and placing anything reseeks
     /// straight back out of it.
     span: Option<Span>,
+    /// Whether the span now decoding still owes its first picture: set by
+    /// every span start ([`start_span`](Self::start_span)), cleared by the
+    /// first frame that span hands over ([`try_frame`](Self::try_frame)).
+    /// This is the window a clip boundary -- or any picture restart -- spends
+    /// reopening the decoder, and a front-end must not answer a picture that
+    /// is late by exactly this window's length with another restart of it
+    /// ([`picture_priming`](Self::picture_priming)).
+    span_priming: bool,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
     /// The mix the running mixer is reading, when there is one: what lets a
@@ -510,6 +518,7 @@ impl PlaybackSession {
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
             span,
+            span_priming: true,
             eos: false,
             mix: None,
             priming: false,
@@ -627,6 +636,7 @@ impl PlaybackSession {
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
             span,
+            span_priming: true,
             eos: false,
             mix: None,
             priming: false,
@@ -708,6 +718,7 @@ impl PlaybackSession {
             rates: vec![Rate::REAL_TIME],
             span_rate: Rate::REAL_TIME,
             span,
+            span_priming: true,
             eos: false,
             mix: None,
             priming: false,
@@ -1010,6 +1021,7 @@ impl PlaybackSession {
             rates,
             span_rate: Rate::REAL_TIME,
             span,
+            span_priming: true,
             eos: false,
             mix: None,
             priming: false,
@@ -1332,6 +1344,9 @@ impl PlaybackSession {
                     frame.index = self.span.map_or(frame.index, |s| {
                         s.timeline_at(self.span_rate.timeline_at(frame.index))
                     });
+                    // The first picture out of the span now decoding ends its
+                    // prime ([`Self::span_priming`]).
+                    self.span_priming = false;
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -1426,6 +1441,17 @@ impl PlaybackSession {
         self.restarts
     }
 
+    /// Whether the picture span now decoding has yet to hand over a frame:
+    /// true from the moment a span is started -- a seek, a clip boundary, a
+    /// picture restart -- until that span's first frame arrives. Whatever
+    /// lateness that first frame carries is the span's own reopen, not a
+    /// decoder falling behind, so a front-end gating its late-picture restart
+    /// on this answers a prime with the decode already on its way rather than
+    /// with another restart of it.
+    pub fn picture_priming(&self) -> bool {
+        self.span_priming
+    }
+
     /// Starved audio callbacks since the device opened, and how far into the
     /// device's own playback (seconds) the last of them was -- `None` for a
     /// session with no device at all. The counter the plugin prints on drop,
@@ -1498,6 +1524,10 @@ impl PlaybackSession {
             Some((source, _)) => self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME),
             None => Rate::REAL_TIME,
         };
+        // The new span owes its first picture from the moment it is asked for:
+        // every path below, the reused worker as much as a fresh one
+        // ([`Self::span_priming`]).
+        self.span_priming = true;
         let opened = match span {
             // The grade is the composite's at this frame -- the same clip the
             // span itself came from -- and it is constant across the span, so
