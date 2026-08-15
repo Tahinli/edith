@@ -89,6 +89,13 @@ impl Player {
             true => (lanes_box - LABEL_H - 8.).max(LANE_H),
             false => lanes_box,
         };
+        // The scrollbar's geometry, off the very view the wheel and the zoom
+        // write: `settled` is what those paths clamp to, so the thumb never
+        // disagrees with where the panel actually is.
+        let view = self.view();
+        let scrollable = view.duration > view.span();
+        let (thumb_x, thumb_w) =
+            scroll_thumb(view.bed, view.duration, view.scale.start.max(0.), view.span());
         // Live, not a count of the lanes: the column reports where it has been
         // taken to, so the line empties itself as the last track comes up
         // instead of insisting there is still something below.
@@ -229,6 +236,75 @@ impl Player {
                     .overflow_y_scroll()
                     .track_scroll(&self.lanes_scroll)
                     .children(rows),
+            )
+            // The timeline's own scrollbar: the time axis is the one dimension
+            // the panel scrolls, and until now only the wheel and the keys
+            // reached it. The thumb is the visible share of the drawn duration
+            // and sits where that share is -- read off the very `Scale` every
+            // box is drawn through, so a wheel notch, a zoom about the pointer
+            // and the follow of the playhead all move it, because they all move
+            // the one state.
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .gap(px(HEADER_GAP))
+                    // Under the lane headers like the ruler is above them, so
+                    // the thumb and the bed it stands for line up.
+                    .child(div().flex_none().w(px(HEADER_W)))
+                    .child(
+                        div()
+                            .id("timeline-scroll")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(SCROLL_HIT_H))
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER_DIM())))
+                            .tooltip(|_, cx| {
+                                cx.new(|_| {
+                                    Tip("Scroll the timeline — drag the thumb or click to jump; \
+                                         wheel scrolls, ctrl+wheel zooms"
+                                        .into())
+                                })
+                                .into()
+                            })
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    this.timeline_wheel(event, cx);
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.scroll_press(event.position.x, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(6.))
+                                    .rounded(px(3.))
+                                    .bg(rgb(BG_RAISED()))
+                                    .child(bounds_probe(self.scroll_track.clone()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .rounded(px(3.))
+                                            .left(px(thumb_x))
+                                            .absolute()
+                                            .top_0()
+                                            .w(px(thumb_w))
+                                            .bg(rgb(match scrollable {
+                                                true => ACCENT_PRIMARY(),
+                                                false => FG_SECONDARY(),
+                                            })),
+                                    ),
+                            ),
+                    ),
             )
             // "It scrolls" is not "it can be found": when the region is too
             // short for every track -- which is what the 640x360 floor does to a
