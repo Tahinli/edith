@@ -389,20 +389,27 @@ impl Splits {
 /// region rather than a sliver. Neither end is passable -- a panel dragged to
 /// nothing is a panel nobody can get back, and a picture squeezed out by two
 /// side columns is the same loss on the other side of the window.
-pub(crate) fn split_bounds(split: Split, lanes: usize, window: Size<Pixels>) -> (f32, f32) {
+pub(crate) fn split_bounds(
+    split: Split,
+    lanes: usize,
+    window: Size<Pixels>,
+    scroll: bool,
+) -> (f32, f32) {
     let (w, h) = (f32::from(window.width), f32::from(window.height));
     match split {
         Split::Library => (LIBRARY_MIN_W, w * SIDE_MAX_FRAC),
         Split::Inspector => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
-        // One whole lane under the chrome: a timeline shorter than that is a
-        // ruler with nothing beneath it. A second track pays for the line that
-        // says the rest are below the fold as well -- at this height only one
-        // row fits, so that line is *always* drawn there, and it is drawn
-        // inside the region ([`Player::timeline`]). Left out of the floor it
-        // comes off the lane's own pixels, and the one lane the floor promises
-        // is a header cut in half.
+        // One whole lane under the chrome, the scrollbar strip's row included
+        // while there is one to draw ([`timeline_fixed_h`]): a timeline
+        // shorter than that is a ruler with nothing beneath it. A second
+        // track pays for the line that says the rest are below the fold as
+        // well -- at this height only one row fits, so that line is *always*
+        // drawn there, and it is drawn inside the region
+        // ([`Player::timeline`]). Left out of the floor it comes off the
+        // lane's own pixels, and the one lane the floor promises is a header
+        // cut in half.
         Split::Timeline => (
-            TIMELINE_FIXED_H
+            timeline_fixed_h(scroll)
                 + LANE_H
                 + match lanes > 1 {
                     true => LABEL_H + 8.,
@@ -413,22 +420,19 @@ pub(crate) fn split_bounds(split: Split, lanes: usize, window: Size<Pixels>) -> 
     }
 }
 
-/// How big the panel at this seam is drawn: what the hand dragged it to, held
-/// inside the window *being drawn now* -- the window is resizable, and a width
-/// set at 1920 px is not a width at 640 -- or the share the untouched layout
-/// gives it.
 pub(crate) fn split_size(
     split: Split,
     set: Option<f32>,
     lanes: usize,
     window: Size<Pixels>,
+    scroll: bool,
 ) -> f32 {
     let (w, h) = (f32::from(window.width), f32::from(window.height));
-    let (min, max) = split_bounds(split, lanes, window);
+    let (min, max) = split_bounds(split, lanes, window, scroll);
     let default = match split {
         Split::Library => library_w(w),
         Split::Inspector => inspector_w(w),
-        Split::Timeline => timeline_h(lanes).min(h * TIMELINE_SHARE),
+        Split::Timeline => timeline_h(lanes, scroll).min(h * TIMELINE_SHARE),
     };
     // The floor wins a window too small to honour both ends: a panel at its
     // floor is still a panel, and `clamp` panics outright on a ceiling under
@@ -463,6 +467,14 @@ impl Player {
             .session
             .as_ref()
             .map_or(2, |session| session.lanes().len());
-        split_size(split, self.splits.get(split), lanes, window)
+        // Whether the time axis has anywhere to go: the scrollbar strip is
+        // drawn only while it does, and the region's furniture -- and its
+        // floor -- carry the strip's row only while it is. One door
+        // ([`timeline_fixed_h`]) answers the region, the fold and the floor
+        // together, so the three cannot disagree about whether the strip is
+        // there.
+        let view = self.view();
+        let scroll = view.duration > view.span();
+        split_size(split, self.splits.get(split), lanes, window, scroll)
     }
 }

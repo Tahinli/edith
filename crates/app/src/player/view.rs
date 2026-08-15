@@ -299,6 +299,84 @@ impl Player {
         cx.notify();
     }
 
+    /// The lane stack's own scroll, as one number: how far down the column
+    /// has been taken, clamped to what it can show. The names and the beds
+    /// are one column (`id("lanes")`), so one offset moves them together and
+    /// this is the whole of the stack's scrolling -- the wheel over the names
+    /// and the thumb on the strip both land here.
+    fn lanes_taken(&self, to: f32) -> f32 {
+        let max = f32::from(self.lanes_scroll.max_offset().height);
+        to.clamp(0., max)
+    }
+
+    /// A press on the lane stack's scrollbar: on the thumb, the drag begins
+    /// from wherever in it the hand landed; beside it, the stack jumps so the
+    /// thumb's middle is at the press and the drag carries on from there --
+    /// the time axis's own terms ([`Self::scroll_press`]), turned through a
+    /// right angle.
+    pub(crate) fn lanes_press(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let track = f32::from(self.lanes_scroll.bounds().size.height);
+        let max = f32::from(self.lanes_scroll.max_offset().height);
+        if track <= 0. || max <= 0. {
+            return;
+        }
+        let scrolled = -f32::from(self.lanes_scroll.offset().y);
+        let (thumb_y, thumb_h) = lanes_thumb(track, track + max, track, scrolled);
+        let at = px_down(y, self.lanes_scroll.bounds());
+        let grab = match (thumb_y..thumb_y + thumb_h).contains(&at) {
+            true => at - thumb_y,
+            // Beside the thumb: jump so its middle is under the pointer, at
+            // the press's own share of the stack. The thumb is clamped inside
+            // the track by [`lanes_thumb`], so the grab this leaves is always
+            // a real place inside it.
+            false => {
+                let to = self.lanes_taken(
+                    (at - thumb_h / 2.).max(0.) / (track - thumb_h).max(1.) * max,
+                );
+                self.lanes_scroll
+                    .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
+                thumb_h / 2.
+            }
+        };
+        self.lanes_drag = Some(grab);
+        cx.notify();
+    }
+
+    /// A sample of the lane thumb's drag: the stack is taken to where the
+    /// thumb's grabbed point sits under the pointer, clamped by the same
+    /// `max_offset` the column's own wheel answers to. No reseek, no repaint
+    /// of anything outside the column -- the view is not moving.
+    pub(crate) fn lanes_drag_to(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let Some(grab) = self.lanes_drag else {
+            return;
+        };
+        let track = f32::from(self.lanes_scroll.bounds().size.height);
+        let max = f32::from(self.lanes_scroll.max_offset().height);
+        let (_, thumb_h) = lanes_thumb(track, track + max, track, 0.);
+        let at = px_down(y, self.lanes_scroll.bounds());
+        let to = self.lanes_taken((at - grab).max(0.) / (track - thumb_h).max(1.) * max);
+        self.lanes_scroll
+            .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
+        cx.notify();
+    }
+
+    /// One notch of the wheel over the lane stack's strip: the stack moves a
+    /// share of what it is showing, the same share the time axis gives a
+    /// notch of its own -- the strip is the names' scroll surface, and this
+    /// is what a wheel there did already.
+    pub(crate) fn lanes_wheel(&mut self, notches: f32, cx: &mut Context<Self>) {
+        let track = f32::from(self.lanes_scroll.bounds().size.height);
+        let max = f32::from(self.lanes_scroll.max_offset().height);
+        if track <= 0. || max <= 0. {
+            return;
+        }
+        let scrolled = -f32::from(self.lanes_scroll.offset().y);
+        let to = self.lanes_taken(scrolled - notches * track * SCROLL_NOTCH_SHARE);
+        self.lanes_scroll
+            .set_offset(point(self.lanes_scroll.offset().x, px(-to)));
+        cx.notify();
+    }
+
     /// One notch of the wheel anywhere over the timeline -- the ruler or a
     /// lane's bed alike, since a hand aims at the clip it is working on and not
     /// at the strip above it. Ctrl zooms about the pointer, bare scrolls the
