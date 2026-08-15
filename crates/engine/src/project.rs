@@ -2009,8 +2009,16 @@ impl Project {
                 continue;
             };
             // Where the placement's own first microsecond lands on the
-            // timeline; every cue in the window is that far along from it.
-            let onto = |t: i64| (f64::from(s.start) / fps * 1e6).round() as i64 + (t - s.in_us);
+            // timeline, and how many microseconds of timeline one microsecond
+            // of the window is worth: the placement's own proportion, which a
+            // group's re-rate changes (the frames compress, the window does
+            // not -- [`write_speed`]'s law). At unity the ratio is 1.0 and
+            // every cue lands where it always did; at 2x the words cross the
+            // screen in half the time, cue for cue.
+            let per = f64::from(s.frames) / fps * 1e6 / (s.window_us().max(1) as f64);
+            let onto = |t: i64| {
+                (f64::from(s.start) / fps * 1e6 + (t - s.in_us) as f64 * per).round() as i64
+            };
             for cue in &track.cues {
                 let (a, b) = (cue.start_us.max(s.in_us), cue.end_us.min(s.out_us));
                 if b <= a {
@@ -5102,6 +5110,73 @@ mod tests {
             "the piece behind slides up by what the region gave back"
         );
         assert!(subs_sorted_disjoint(&p.lanes[p.index(s1).unwrap()].subs));
+    }
+
+    /// A grouped caption's cues re-time with its clip: the placement's window
+    /// crossed the timeline at its own proportion before any rate, and a
+    /// re-rate changes that proportion (the frames compress, the window does
+    /// not). A cue eight seconds into a window played at 2x crosses the screen
+    /// four seconds in -- and at unity every cue lands exactly where it always
+    /// did, byte for byte.
+    #[test]
+    fn a_grouped_captions_cues_re_time_with_its_clip() {
+        let track = SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: vec![crate::subtitle::Cue {
+                start_us: 8_000_000,
+                end_us: 9_000_000,
+                text: "late line".into(),
+                image: None,
+            }],
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 300).with_subtitles(vec![track]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        // Ten seconds of the track over ten seconds of timeline: unity.
+        p.place_sub(
+            s1,
+            0,
+            SubClip {
+                start: 0,
+                frames: 300,
+                track: 0,
+                in_us: 0,
+                out_us: 10_000_000,
+                link: None,
+            },
+        )
+        .expect("placed");
+
+        // Unity: the cue sits at its own [8s, 9s), to the microsecond.
+        let unity = p.sub_lane_cues(s1, FPS);
+        assert_eq!(
+            unity
+                .iter()
+                .map(|c| (c.start_us, c.end_us, &*c.text))
+                .collect::<Vec<_>>(),
+            [(8_000_000, 9_000_000, "late line")],
+            "a unity placement maps exactly as it always did"
+        );
+
+        // Grouped with the clip and re-rated to 2x: the same window now crosses
+        // in half the time, so the cue at 8s of it lands 4s in.
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        p.set_speed(Lane::V1, 0, Speed::from_permille(2000))
+            .expect("room for it");
+        let re_timed = p.sub_lane_cues(s1, FPS);
+        assert_eq!(
+            re_timed
+                .iter()
+                .map(|c| (c.start_us, c.end_us))
+                .collect::<Vec<_>>(),
+            [(4_000_000, 4_500_000)],
+            "the cue crosses with the clip's new rate"
+        );
     }
 
     /// The region's caption pieces re-time by mapped boundaries forced apart:

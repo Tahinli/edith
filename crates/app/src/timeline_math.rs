@@ -147,7 +147,38 @@ impl Selection {
             self.picks.push(pick);
         }
     }
+}
 
+/// The rate a caption's box plays its window at, read off the placement
+/// itself: how long the words are, against how much timeline they cross. A
+/// clip's badge comes from its own `speed`; a caption has none, so its box
+/// derives one -- and keeps it even after the group that re-timed it comes
+/// apart, because the proportion is the placement's own. `None` at unity:
+/// placement rounding leaves an odd-width window a frame or so off real time,
+/// and a badge is for a box that was *re-timed*, not one that rounds.
+pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
+    if !(fps.is_finite() && fps > 0.0) || sub.window_us() <= 0 {
+        return None;
+    }
+    let span_us = f64::from(sub.frames) / fps * 1e6;
+    // The rate is the window over the span -- content per timeline, a clip's
+    // own `speed` in the same spelling: 10s of words crossing 5s of timeline
+    // is 2.00x.
+    let permille = (sub.window_us() as f64 / span_us * 1000.).round();
+    // The gate is generous by two permille either way: placement rounding
+    // (`frames_of_us`) leaves an odd-width unity window a frame off real
+    // time, and that is not a re-timing.
+    ((permille - 1000.).abs() > 2.).then(|| {
+        Speed::from_permille(
+            permille.clamp(
+                f64::from(Speed::MIN.permille()),
+                f64::from(Speed::MAX.permille()),
+            ) as u16,
+        )
+    })
+}
+
+impl Selection {
     pub(crate) fn len(&self) -> usize {
         self.picks.len()
     }

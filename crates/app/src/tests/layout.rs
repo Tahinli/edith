@@ -266,6 +266,42 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
     assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
 }
 
+/// A caption's box wears the rate its window plays at, derived off the
+/// placement itself: unity placements -- including odd widths whose frames
+/// came off `frames_of_us` rounding -- do not badge, and a re-rate does, with
+/// the rate surviving the group coming apart.
+#[test]
+fn a_caption_box_wears_the_rate_its_window_plays_at() {
+    use crate::caption_rate;
+
+    let sub = |frames: u32, out_us: i64| SubClip {
+        start: 0,
+        frames,
+        track: 0,
+        in_us: 0,
+        out_us,
+        link: None,
+    };
+    // Unity, exact and rounded: neither is a re-timing.
+    assert_eq!(caption_rate(sub(300, 10_000_000), 30.), None);
+    assert_eq!(
+        caption_rate(sub(100, 3_333_333), 30.),
+        None,
+        "placement rounding is not a re-timing"
+    );
+    // A 2x re-rate: a 5s span holding the same 10s of words.
+    assert_eq!(
+        caption_rate(sub(150, 10_000_000), 30.).map(|s| s.permille()),
+        Some(2000)
+    );
+    // ...and a slowed one -- a 20s span for the same words -- which the badge
+    // keeps after any detach: the proportion is the placement's own.
+    assert_eq!(
+        caption_rate(sub(600, 10_000_000), 30.).map(|s| s.permille()),
+        Some(500)
+    );
+}
+
 /// The selection itself: clicks in order, the anchor under the hand, the
 /// toggle that assembles a group, and the plain click that replaces it all.
 #[test]

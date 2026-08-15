@@ -176,11 +176,34 @@ impl Player {
             cx.notify();
             return;
         };
-        let target = self
-            .selected
-            .anchor()
-            .filter(|(lane, _)| lane.kind == LaneKind::Video)
-            .or_else(|| session.video_clip_at(session.now()));
+        // A caption the hand is on names the clip it was pinned to, and the
+        // card opens on that; one in no group has no picture to grade and it
+        // says so, rather than falling to the playhead's clip behind the
+        // hand's back.
+        let target = match self.selected.anchor() {
+            // A caption the hand is on names the clip it was pinned to, and the
+            // grade is that clip's; one in no group has no picture to grade
+            // and it says so, rather than grading the playhead's clip behind
+            // the hand's back.
+            Some((lane, idx)) if lane.kind == LaneKind::Subtitle => {
+                match caption_media_half(session, (lane, idx), LaneKind::Video) {
+                    Some(half) => Some(half),
+                    None => {
+                        self.notify_user(
+                            "NOTHING TO GRADE — a caption has no picture; group it with a clip \
+                             first (ctrl-click both, then Group)"
+                                .into(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            // A sound half has no picture of its own: the playhead's clip, as
+            // it always was.
+            Some((lane, _)) if lane.kind == LaneKind::Audio => session.video_clip_at(session.now()),
+            other => other.or_else(|| session.video_clip_at(session.now())),
+        };
         match target {
             Some(clip) => {
                 self.color_open = Some(clip);
