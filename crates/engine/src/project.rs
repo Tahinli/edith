@@ -3568,9 +3568,11 @@ impl Project {
     /// source with no picture ([`crate::is_audio`]) reaches `A1` only -- on a
     /// video lane it is a clip that decodes to nothing, and a save carrying one
     /// does not open again -- and a still image ([`crate::is_image`]) reaches
-    /// `V1` only, for the mirror of that reason. The room is still opened
-    /// everywhere, or the lanes it was not inserted into would slide out of step
-    /// with the ones it was.
+    /// `V1` only, for the mirror of that reason. The room is still opened on
+    /// every media lane, or the lanes it was not inserted into would slide out
+    /// of step with the ones it was -- and the subtitle lanes are left alone:
+    /// the words keep their own clock, and a caption that should travel with a
+    /// clip is what a group is for.
     ///
     /// Exactly one history snapshot, so one [`Project::undo`] takes it back.
     /// Changes the timeline->source mapping: the caller must reseek. Refused for
@@ -3611,11 +3613,6 @@ impl Project {
                 .iter()
                 .flat_map(|l| &l.clips)
                 .any(|c| c.end() > at && c.end().checked_add(len).is_none())
-            || self
-                .lanes
-                .iter()
-                .flat_map(|l| &l.subs)
-                .any(|s| s.end() > at && s.end().checked_add(len).is_none())
         {
             return false;
         }
@@ -3653,16 +3650,21 @@ impl Project {
             .collect();
         for (i, data) in self.lanes.iter_mut().enumerate() {
             open_room(&mut data.clips, at, len);
-            // The room is opened on the subtitle lanes too, and for the reason
-            // it is opened on the lanes the paste does not land on: a caption
-            // that stayed put while the picture under it moved on is two things
-            // that no longer say the same thing.
-            sub_open_room(&mut data.subs, at, len);
+            // The subtitle lanes are NOT touched: a paste inserts media, and
+            // the words keep their own clock. Opening room here used to split
+            // a caption the paste landed inside and slide the rest behind it
+            // -- "a caption that stayed put while the picture moved on no
+            // longer says the same thing" -- but a caption pinned to nothing
+            // (and a video arriving on a timeline of words alone) has no
+            // picture to follow, and the split did to the words what no hand
+            // asked for. A caption that should travel with a clip is what a
+            // group is for, and a group moves as one.
             if takes.contains(&i) {
                 let idx = data.clips.partition_point(|c| c.start < at);
                 data.clips.insert(idx, clip);
             }
             debug_assert!(sorted_disjoint(&data.clips));
+            debug_assert!(subs_sorted_disjoint(&data.subs));
         }
         true
     }
@@ -5177,6 +5179,57 @@ mod tests {
             [(4_000_000, 4_500_000)],
             "the cue crosses with the clip's new rate"
         );
+    }
+
+    /// A video arriving on a timeline of words mutates none of them: the
+    /// import's rippling insert used to open room on the subtitle lanes too,
+    /// splitting a caption it landed inside and sliding the rest behind the
+    /// video -- the hand asked for an add, and got a cut it never made. The
+    /// words keep their own clock; co-travel is what a group is for.
+    #[test]
+    fn an_arriving_clip_never_touches_the_captions() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: i64::from(start) * 1_000_000 / 30,
+            out_us: i64::from(start + frames) * 1_000_000 / 30,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        // A timeline of words alone: 60 frames of caption, no media clips.
+        let mut p = Project::single(FILE, 60)
+            .with_subtitles(vec![track()]);
+        for l in [Lane::V1, Lane::A1] {
+            while !p.lane(l).is_empty() {
+                p.lift(l, 0);
+            }
+        }
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 0, caption(0, 60)).expect("placed");
+        let before = p.sub_lane(s1).to_vec();
+
+        // The video lands BEFORE the caption's span: nothing moves.
+        let vid = clip(0, 0, 30, 0);
+        assert!(p.paste(0, vid), "the video goes down at the head");
+        assert_eq!(p.sub_lane(s1), &before[..], "the caption keeps its clock");
+
+        // ...and OVERLAPPING it, dead centre: no split, no shift, byte for
+        // byte the placement the hand made.
+        assert!(p.paste(15, vid), "a second video lands inside the caption");
+        assert_eq!(p.sub_lane(s1), &before[..], "still one caption, unmoved");
+        assert_eq!(p.sub_lane(s1).len(), 1, "and uncut");
+        assert_eq!(p.lane(Lane::V1).len(), 3, "the videos landed");
+        assert!(links_are_consistent(&p.lanes).is_ok());
     }
 
     /// The region's caption pieces re-time by mapped boundaries forced apart:
