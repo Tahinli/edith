@@ -124,6 +124,11 @@ impl Player {
         // stand-in through here at the next repaint, which is the only door
         // there is. Left unseen meanwhile, so nothing is missed by having been
         // imported while the switch was off.
+        // Gathered here and started at the bottom of this function: the list is
+        // read off the session, and starting one takes the whole player
+        // ([`Player::start_proxy_for`], which the row's switch calls too), so
+        // the two cannot be the same statement.
+        let mut starting: Vec<PathBuf> = Vec::new();
         for path in proxies_to_start(
             session.auto_proxies(),
             session.proxies(),
@@ -135,38 +140,10 @@ impl Player {
             // otherwise start ten encodes fighting over the one hardware seat.
             // The unstarted ones simply stay out of the map, which is what
             // brings them back here ([`unseen_paths`]).
-            if self.in_flight_proxies() >= PROXIES_AT_ONCE {
+            if self.in_flight_proxies() + starting.len() >= PROXIES_AT_ONCE {
                 break;
             }
-            self.proxies.insert(path.clone(), Proxy::Asked);
-            let started = cx.background_executor().spawn({
-                let path = path.clone();
-                async move { engine::proxy::generate_if_wanted(&path) }
-            });
-            cx.spawn(async move |this, cx| {
-                let started = started.await;
-                this.update(cx, |this, cx| {
-                    let state = match started {
-                        Ok(Some(job)) => Proxy::Making(job),
-                        // A film that needs none keeps the state it was
-                        // inserted with, which is what it is.
-                        Ok(None) => Proxy::Native,
-                        Err(e) => {
-                            let text = format!(
-                                "NO PROXY for {} — {e} — the film itself is what plays",
-                                file_name(&path)
-                            );
-                            eprintln!("{text}");
-                            this.notify_user(text.into());
-                            Proxy::Failed
-                        }
-                    };
-                    this.proxies.insert(path, state);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+            starting.push(path);
         }
         for key in unseen_sources(session.sources(), &self.waves) {
             self.waves.insert(key.clone(), Wave::Loading);
@@ -199,6 +176,9 @@ impl Player {
                 .ok();
             })
             .detach();
+        }
+        for path in starting {
+            self.start_proxy_for(&path, cx);
         }
     }
 

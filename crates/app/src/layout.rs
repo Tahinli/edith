@@ -73,6 +73,10 @@ pub(crate) const ROW_H: f32 = 32.;
 /// The tint swatch down the left of a row: the same colour that source's clips
 /// wear in the lanes, which is the whole of the panel<->timeline association.
 pub(crate) const SWATCH_W: f32 = 4.;
+/// How far the encode has come, drawn under the stop square on a library row.
+/// Inside a `HIT_MIN` cell with a little air each side, so the bar never reaches
+/// the edge of the target it belongs to.
+pub(crate) const PROXY_BAR_W: f32 = HIT_MIN - 10.;
 pub(crate) const CONTROL_H: f32 = 28.;
 /// The volume slider beside its button: a hundred steps across it, so a pixel
 /// is finer than a step and the drag reads as continuous.
