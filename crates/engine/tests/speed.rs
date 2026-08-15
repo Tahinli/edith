@@ -331,6 +331,126 @@ fn an_mp4_export_resamples_a_speeded_sound_clip() {
     std::fs::remove_file(&out).ok();
 }
 
+/// The amplitude of `hz` inside `samples`, by Goertzel at the fixture's rate
+/// over a fixed window: the pitch meter the pitch tests assert with, rather
+/// than trusting that a re-timed beep *sounds* unchanged.
+fn tone(samples: &[f32], hz: f64) -> f64 {
+    let n = samples.len() as f64;
+    let w = 2. * std::f64::consts::PI * hz / f64::from(RATE);
+    let coeff = 2. * w.cos();
+    let (mut s1, mut s2) = (0., 0.);
+    for &x in samples {
+        let s0 = f64::from(x) + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    2. * (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt() / n
+}
+
+/// The beep's own frequency in the played samples, to the nearest strong
+/// Goertzel bin: the fixture's beep is 1 kHz, and this walks a coarse ladder
+/// of bins around it so the measurement is of *where the energy sits*, not of
+/// one bin that could be low for its own reasons.
+fn beep_hz(samples: &[f32], at: f64) -> f64 {
+    // One channel, before anything else: the stream is interleaved stereo,
+    // and a Goertzel fed a 1 kHz tone woven with its own copy reads a
+    // carrier, not the tone.
+    let mono: Vec<f32> = samples.chunks(2).map(|f| f[0]).collect();
+    let samples = &mono[..];
+    // The beep is a tenth of a second at real time and shrinks with the rate,
+    // so the window is centred on the loudest sample at or after its start
+    // and is a fifth of a second wide: the beep whole, the silence around it
+    // mostly out, at every rate the engine can hold.
+    let stereo = f64::from(RATE);
+    let from = (at * stereo) as usize;
+    let peak = samples[from..]
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(i, _)| from + i)
+        .expect("a sample after the beep starts");
+    let half = (stereo * 0.1) as usize;
+    let window = &samples[peak.saturating_sub(half)..(peak + half).min(samples.len())];
+    (700..=1400)
+        .step_by(25)
+        .map(|hz| (tone(window, f64::from(hz)), hz))
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+        .expect("a window to measure")
+        .1 as f64
+}
+
+/// The pitch itself: a 2x clip plays its beep at 1 kHz, not the octave. The
+/// tape effect -- one resample at the speed -- put it there (this ladder's
+/// peak reads 1350 Hz on this fixture before the stretch landed, the octave
+/// smeared by how short the re-timed beep is); the time-stretch behind the
+/// rate conversion keeps every period of the signal its own length, beep
+/// included.
+#[test]
+fn a_2x_clip_keeps_the_beeps_pitch() {
+    let (mut project, _) = sync_project();
+    project
+        .set_speed(Lane::V1, 0, Speed::from_permille(2000))
+        .expect("room for it");
+    let played = play(&project);
+    let at = beep_at(&played);
+    let hz = beep_hz(&played, at);
+    assert!(
+        (hz - 1000.).abs() <= 1000. * 0.02,
+        "the beep measures {hz} Hz: the tape effect would put it near 2000"
+    );
+}
+
+/// The symmetric half: a clip at half speed plays its beep at 1 kHz too, not
+/// the sub-octave the tape effect would leave there.
+#[test]
+fn a_half_speed_clip_keeps_the_beeps_pitch() {
+    let (mut project, _) = sync_project();
+    project
+        .set_speed(Lane::V1, 0, Speed::from_permille(500))
+        .expect("room for it");
+    let played = play(&project);
+    let at = beep_at(&played);
+    let hz = beep_hz(&played, at);
+    assert!(
+        (hz - 1000.).abs() <= 1000. * 0.02,
+        "the beep measures {hz} Hz: the tape effect would put it near 500"
+    );
+}
+
+/// The export's own path, measured the same way: a 2x WAV carries the beep at
+/// 1 kHz, so what a file plays is what the preview played -- the stretch sits
+/// at the one choke point both of them go through.
+#[test]
+fn a_wav_export_of_a_2x_clip_keeps_the_beeps_pitch() {
+    let (mut project, meta) = sync_project();
+    project
+        .set_speed(Lane::V1, 0, Speed::from_permille(2000))
+        .expect("room for it");
+    let out = out_path("pitch", "wav");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Wav,
+            ..Default::default()
+        },
+    );
+    wait(&handle, Duration::from_secs(120)).expect("wav export");
+    let mut reader = hound::WavReader::open(&out).expect("read the export back");
+    let samples: Vec<f32> = reader
+        .samples::<i16>()
+        .map(|s| f32::from(s.expect("a sample")) / f32::from(i16::MAX))
+        .collect();
+    let at = beep_at(&samples);
+    let hz = beep_hz(&samples, at);
+    assert!(
+        (hz - 1000.).abs() <= 1000. * 0.02,
+        "the beep in the file measures {hz} Hz, not the 1 kHz it was recorded at"
+    );
+    std::fs::remove_file(&out).ok();
+}
+
 /// The half that honours, and the shape that catches a walk that only works at
 /// one rate: **2x then 1x on the same lane**. Each span picks its own source
 /// frames, so the mark inside the fast clip lands at half its source offset and
