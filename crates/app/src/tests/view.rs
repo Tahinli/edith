@@ -164,20 +164,21 @@ fn the_marks_are_every_lane_the_playhead_and_the_start() {
     let lanes: [&[Clip]; 2] = [&video, &audio];
 
     // Nothing in the hand: both lanes' edges, the playhead, and 0.
-    let mut all = snap_marks(&lanes, None, 300);
+    let mut all = snap_marks(&lanes, None, None, 300);
     all.sort_unstable();
     assert_eq!(all, [0, 100, 100, 160, 160, 300, 400, 430]);
 
-    // The video half in the hand: its own edges are gone, and so are its
-    // group's on the other lane -- both boxes travel with the drag. The
-    // lone audio clip is still a target, which is the whole point: a take
-    // being carried on V1 lands flush with a sound on A1.
-    let mut carried = snap_marks(&lanes, Some((0, 0)), 300);
+    // The video half in the hand, with its group named as the caller reads it
+    // off the pick: its own edges are gone, and so are its group's on the
+    // other lane -- both boxes travel with the drag. The lone audio clip is
+    // still a target, which is the whole point: a take being carried on V1
+    // lands flush with a sound on A1.
+    let mut carried = snap_marks(&lanes, Some((0, 0)), Some(7), 300);
     carried.sort_unstable();
     assert_eq!(carried, [0, 300, 400, 430]);
 
     // An index that names no clip skips nothing and still answers.
-    assert_eq!(snap_marks(&[], Some((3, 9)), 0), [0, 0]);
+    assert_eq!(snap_marks(&[], Some((3, 9)), None, 0), [0, 0]);
 }
 
 /// The line the bed draws, and the switch that turns the whole thing off.

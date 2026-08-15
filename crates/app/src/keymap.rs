@@ -86,6 +86,10 @@ actions! {
     Select,
     SelectNext,
     SelectPrev,
+    /// Every placement on every lane in one selection -- the companion of the
+    /// ctrl-click that builds a selection by hand, for the times everything
+    /// wants selecting at once.
+    SelectAll,
     Delete,
     Lift,
     Color,
@@ -159,11 +163,12 @@ impl ActionId {
             // Neither half's action: it takes the *pair* apart, and the menu
             // that offers it hangs on whichever half was right-clicked -- worded
             // from the picture's side it read as a video item on an audio clip.
-            ActionId::Detach => "Ungroup the picture and the sound",
-            ActionId::Group => "Group with the clip on another track",
+            ActionId::Detach => "Ungroup the selection (clips and captions)",
+            ActionId::Group => "Group the selection (ctrl-click the clips first)",
             ActionId::Select => "Select the clip under the playhead (again for the next lane)",
             ActionId::SelectNext => "Select the next clip in the lane",
             ActionId::SelectPrev => "Select the previous clip in the lane",
+            ActionId::SelectAll => "Select everything (every clip and caption)",
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Color => "Colour…",
@@ -221,6 +226,7 @@ impl ActionId {
             ActionId::Select => "select",
             ActionId::SelectNext => "select-next",
             ActionId::SelectPrev => "select-prev",
+            ActionId::SelectAll => "select-all",
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Color => "color",
@@ -277,6 +283,7 @@ impl ActionId {
             | ActionId::Select
             | ActionId::SelectNext
             | ActionId::SelectPrev
+            | ActionId::SelectAll
             | ActionId::Delete
             | ActionId::Lift
             | ActionId::Color
@@ -776,6 +783,11 @@ impl Keymap {
                 b(ActionId::Select, "tab", false),
                 b(ActionId::SelectNext, "]", false),
                 b(ActionId::SelectPrev, "[", false),
+                // Select-all, on the chord every editor and every text field
+                // already means it by -- which is why the audio-lane removal
+                // below had to move off ctrl+a: a stroke that universal was
+                // never really the removal's to keep.
+                b(ActionId::SelectAll, "a", true),
                 b(ActionId::Delete, "x", false),
                 b(ActionId::Delete, "delete", false),
                 b(ActionId::Lift, "l", false),
@@ -811,7 +823,10 @@ impl Keymap {
                 // matching initial and is the paste, so the video one takes the
                 // key beside it.
                 b(ActionId::RemoveVideoLane, "b", true),
-                b(ActionId::RemoveAudioLane, "a", true),
+                // Ctrl+a is the select-all above now, so the audio removal
+                // takes the free key beside its own letter: "a" neighbours
+                // "q" on the row, and ctrl+q was taken by nothing.
+                b(ActionId::RemoveAudioLane, "q", true),
                 // The subtitle pair reads the same way: the unshifted initial
                 // adds one -- "s" is free, the save is the *ctrl* chord -- and a
                 // ctrl chord takes it back. Ctrl+s is that save, so the removal
@@ -862,7 +877,7 @@ impl Keymap {
                 // Making them takes the key next to it, ctrl+o: the pair is one
                 // subject and the two chords are under the same finger, and
                 // every letter of the word itself is spoken for ("a" adds an
-                // audio lane, ctrl+a removes one).
+                // audio lane, ctrl+a selects everything).
                 b(ActionId::ToggleAutoProxies, "o", true),
                 // The theme takes ctrl+h -- the h of the word, since "t" is the
                 // subtitles and ctrl+t takes one off -- and a ctrl chord because
@@ -1143,7 +1158,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 52);
+        assert_eq!(k.entries().len(), 53);
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
@@ -1189,9 +1204,12 @@ mod tests {
         assert_eq!(k.lookup("v", false), Some(ActionId::AddVideoLane));
         assert_eq!(k.lookup("a", false), Some(ActionId::AddAudioLane));
         // ...and the ctrl ones take a track away, out of the way of a stray
-        // press. Ctrl+v is the paste, so the video one sits beside it.
+        // press. Ctrl+v is the paste, so the video one sits beside it; ctrl+a
+        // is the select-all every editor shares, so the audio one sits beside
+        // its own letter instead.
         assert_eq!(k.lookup("b", true), Some(ActionId::RemoveVideoLane));
-        assert_eq!(k.lookup("a", true), Some(ActionId::RemoveAudioLane));
+        assert_eq!(k.lookup("q", true), Some(ActionId::RemoveAudioLane));
+        assert_eq!(k.lookup("a", true), Some(ActionId::SelectAll));
         // The subtitle pair, the third kind of track: the initial adds and the
         // subtitle letter's chord takes it back.
         assert_eq!(k.lookup("s", false), Some(ActionId::AddSubtitleLane));

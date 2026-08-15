@@ -1085,6 +1085,7 @@ fn subtitles_arrive_beside_the_media_and_inside_it() {
                 track: 0,
                 in_us: 0,
                 out_us: 5_000_000,
+                link: None,
             },
         )
         .expect("the palette row goes down on the lane");

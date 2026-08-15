@@ -51,7 +51,7 @@ impl Player {
         };
         match placed {
             Ok(true) => {
-                self.selected = None;
+                self.selected.clear();
                 self.reset_after_reseek();
             }
             // The engine's own words: a stream that cannot join this timeline
@@ -145,7 +145,7 @@ impl Player {
         // The drawn cue with it, and its tile for the same reason as above.
         self.sub_image = None;
         self.clipboard = None;
-        self.selected = None;
+        self.selected.clear();
         self.selected_asset = None;
         // The subtitle rows go with the timeline they were on, and so does the
         // lane that was shown: S1 of one project is not S1 of the next.
@@ -1154,7 +1154,7 @@ impl Player {
                 // A copied clip names its source by index, which means a
                 // different file -- or none -- in another project.
                 self.clipboard = None;
-                self.selected = None;
+                self.selected.clear();
                 // A menu can be up while a project is dropped on the window --
                 // the scrim swallows clicks, never a drop -- and its index
                 // would name some other timeline's clip. The two clip cards
@@ -1256,7 +1256,7 @@ impl Player {
             .map(|session| session.remove_lane(lane));
         let text = match removed {
             Some(Ok(())) => {
-                self.selected = None;
+                self.selected.clear();
                 self.context_menu = None;
                 self.eq_open = None;
                 self.color_open = None;
@@ -1313,7 +1313,7 @@ impl Player {
             return;
         };
         if moved != lane {
-            self.selected = None;
+            self.selected.clear();
             self.context_menu = None;
             self.eq_open = None;
             self.color_open = None;

@@ -116,11 +116,13 @@ struct Player {
     /// the head is on screen again, and by every transport ask (a seek, a
     /// play/pause) outright -- those are a person saying where to look.
     panned: bool,
-    /// Which clip the edit keys act on: the lane it is in and its index there.
-    /// The *clicked* half, not the group -- a group is what gets marked on
-    /// screen, but Lift has to know which half it was aimed at. Indices move
-    /// under every edit, so this is cleared by all of them.
-    selected: Option<(Lane, usize)>,
+    /// Which placements the edit keys act on: the lane each is in and its
+    /// index there, every ctrl-click in the order it was made. The *clicked*
+    /// half and not the group -- a group is what gets marked on screen, but
+    /// Lift has to know which half it was aimed at -- and the last pick is the
+    /// [`anchor`](Selection::anchor) every single-thing action uses. Indices
+    /// move under every edit, so this is cleared by all of them.
+    selected: Selection,
     /// The clip menu a right-click opened, if one is up. Holds an index like
     /// `selected` does, so it is closed by anything that can move indices --
     /// every stroke, and every item of its own.
@@ -660,7 +662,7 @@ fn main() {
                     // Nobody has scrolled anything yet, so the follow has the
                     // view: the first frame is drawn where the head is.
                     panned: false,
-                    selected: None,
+                    selected: Selection::new(),
                     context_menu: None,
                     picker: None,
                     library_menu: None,

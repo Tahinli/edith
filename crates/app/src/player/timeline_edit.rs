@@ -27,7 +27,7 @@ impl Player {
         if let Some(session) = &mut self.session {
             session.cut_at(f64::from(at) / self.fps);
         }
-        self.selected = None;
+        self.selected.clear();
         cx.notify();
     }
 
@@ -42,7 +42,7 @@ impl Player {
         }
         if let Some(session) = &mut self.session {
             if session.regroup_at(session.now()) {
-                self.selected = None;
+                self.selected.clear();
             } else {
                 self.notify_user(
                     "NOTHING TO REGROUP — put the playhead where two clips meet, on frames that were cut apart"
@@ -61,7 +61,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        match (&mut self.session, self.selected) {
+        match (&mut self.session, self.selected.anchor()) {
             (Some(session), Some((lane, idx))) => {
                 if !session.ungroup(lane, idx) {
                     self.notify_user(
@@ -77,35 +77,55 @@ impl Player {
         cx.notify();
     }
 
-    /// Puts the selected clip back in a group with the clip covering exactly the
-    /// same frames on another track -- the way back from [`Player::detach`], and
-    /// the way to group a picture with sound it was never opened with. The
-    /// partner is not clicked because there is nothing to choose: a group id
-    /// names one span, so only a clip covering these very frames could join it,
-    /// and the engine words what to do when none does.
+    /// Puts the selection into one group. Two paths, by how much of a
+    /// selection there is:
+    ///
+    /// * **One pick** -- the way back from [`Player::detach`], and the way to
+    ///   group a picture with sound it was never opened with. The partner is
+    ///   not clicked because there is nothing to choose: the clip covering
+    ///   exactly the same frames on another track, and the engine words what to
+    ///   do when none does.
+    ///
+    /// * **A ctrl-click selection** -- the group a hand builds: every pick it
+    ///   names, clips and captions alike, into one id, whatever frames each of
+    ///   them covers. The members keep their own offsets, which is the point:
+    ///   from here they move, trim and delete together.
     pub(crate) fn group(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;
         }
-        let partner = match (&self.session, self.selected) {
-            (Some(session), Some((lane, idx))) => span_partner(session, lane, idx),
-            _ => None,
-        };
-        match (&mut self.session, self.selected, partner) {
-            (Some(session), Some((lane, idx)), Some((other, o_idx))) => {
-                if let Err(e) = session.group(lane, idx, other, o_idx) {
+        // The picks the selection holds that still name something: a stale
+        // index (a stroke nobody saw) is not a thing to group.
+        let picks = self.marks().0;
+        match (&mut self.session, self.selected.anchor(), picks.len()) {
+            (_, None, _) => {
+                self.notify_user("NOTHING GROUPED — click one of the halves first".into())
+            }
+            // The hand's group: every pick, one id.
+            (Some(session), _, 2..) => {
+                if let Err(e) = session.group_all(&picks) {
                     self.notify_user(format!("NOT GROUPED — {e}").into());
                 }
             }
-            (Some(_), Some(_), None) => {
-                self.notify_user(
-                    "NOTHING TO GROUP WITH — no clip on another track covers exactly these frames"
-                        .into(),
-                )
+            // One pick that no longer names anything.
+            (Some(_), Some(_), 0) => {
+                self.notify_user("NOTHING GROUPED — that clip is no longer there".into())
             }
-            (Some(_), None, _) => {
-                self.notify_user("NOTHING GROUPED — click one of the halves first".into())
-            }
+            // One pick: the partner flow it always was.
+            (Some(session), Some((lane, idx)), _) => match span_partner(session, lane, idx) {
+                Some((other, o_idx)) => {
+                    if let Err(e) = session.group(lane, idx, other, o_idx) {
+                        self.notify_user(format!("NOT GROUPED — {e}").into());
+                    }
+                }
+                None => {
+                    self.notify_user(
+                        "NOTHING TO GROUP WITH — no clip on another track covers exactly these \
+                         frames; ctrl-click the clips to group instead"
+                            .into(),
+                    )
+                }
+            },
             (None, ..) => {}
         }
         cx.notify();
@@ -120,20 +140,43 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let selected = self.selected.take();
+        let selected = self.selected.anchor();
+        self.selected.clear();
         // A caption is marked in its own lane's index space -- that lane holds
         // no `Clip` -- so the same key reaches it through the one removal a
-        // placed subtitle has ([`Player::lift_sub`], one undo step). Parity: the
-        // box on a subtitle lane goes by the stroke every other box goes by.
+        // placed subtitle has ([`Player::lift_sub`], one undo step), unless a
+        // hand put it in a group: then it goes the way its group goes.
+        // Parity: the box on a subtitle lane goes by the stroke every other box
+        // goes by.
         if let Some((lane, idx)) = selected.filter(|(lane, _)| lane.kind == LaneKind::Subtitle) {
-            self.lift_sub(lane, idx, cx);
+            // A caption carrying a group id is a member, and a member goes the
+            // way its group goes -- the engine's own door decides how much of
+            // that is media (and so a reseek) and how much is a lift.
+            let grouped = self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.sub_lane(lane).get(idx).is_some_and(|s| s.link.is_some()));
+            match grouped {
+                true => {
+                    if self
+                        .session
+                        .as_mut()
+                        .is_some_and(|session| session.delete_sub(lane, idx))
+                    {
+                        self.reset_after_reseek();
+                    }
+                }
+                false => self.lift_sub(lane, idx, cx),
+            }
+            cx.notify();
             return;
         }
         // Whichever lane it was clicked in: the index is that lane's own, and
-        // the ripple cuts the clip's span out of every lane -- a group covers
-        // one span, so deleting a take by its audio half is the same edit as by
-        // its picture. What is not a whole take is lifted instead, which is what
-        // reaches a clip on an added track ([`whole_take`]).
+        // the engine cuts what the clip covers out of the lanes it covers -- a
+        // lone clip's span out of every lane, a grouped member's own span out
+        // of its own lane and its caption members off their lanes. What is not
+        // a whole take is lifted instead, which is what reaches a clip on an
+        // added track ([`whole_take`]).
         let deleted = match (&mut self.session, selected) {
             (Some(session), Some((lane, idx))) => match whole_take(session, lane, idx) {
                 true => session.delete_clip(lane, idx),
@@ -157,7 +200,9 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        match (&mut self.session, self.selected.take()) {
+        let selected = self.selected.anchor();
+        self.selected.clear();
+        match (&mut self.session, selected) {
             (Some(session), Some((lane, idx))) => {
                 if session.lift_clip(lane, idx) {
                     self.reset_after_reseek();
@@ -181,16 +226,34 @@ impl Player {
         // frames is a paste of the wrong thing.
         if let Some(clip) = self
             .selected
+            .anchor()
             .and_then(|(lane, idx)| session?.lane_clips(lane).get(idx).copied())
         {
             self.clipboard = Some(clip);
         }
     }
 
-    /// The group id of the clicked clip, which is what marks the other half.
-    pub(crate) fn selected_link(&self) -> Option<u32> {
-        let (lane, idx) = self.selected?;
-        self.session.as_ref()?.lane_clips(lane).get(idx)?.link
+    /// The picks and their group ids, in click order: the two halves of what
+    /// [`marked`] asks about every box on the bed -- which picks there are, and
+    /// which groups they carry (a caption's included, which is what marks the
+    /// clip it was pinned to). Picks an edit has left stale name nothing and
+    /// contribute no id.
+    pub(crate) fn marks(&self) -> (Vec<(Lane, usize)>, Vec<Option<u32>>) {
+        let Some(session) = &self.session else {
+            return (Vec::new(), Vec::new());
+        };
+        let (mut picks, mut links) = (Vec::new(), Vec::new());
+        for &(lane, idx) in self.selected.picks() {
+            let link = match lane.kind {
+                LaneKind::Subtitle => session.sub_lane(lane).get(idx).map(|s| s.link),
+                _ => session.lane_clips(lane).get(idx).map(|c| c.link),
+            };
+            if let Some(link) = link {
+                picks.push((lane, idx));
+                links.push(link);
+            }
+        }
+        (picks, links)
     }
 
     /// Drops the copied clip in at the playhead. The engine reseeks itself, so
@@ -202,7 +265,7 @@ impl Player {
             _ => false,
         };
         if pasted {
-            self.selected = None;
+            self.selected.clear();
             self.reset_after_reseek();
         }
         cx.notify();
@@ -240,7 +303,7 @@ impl Player {
         };
         match moved {
             true => {
-                self.selected = None;
+                self.selected.clear();
                 self.reset_after_reseek();
             }
             // The three ways a drag is refused, told apart by what the
@@ -289,6 +352,9 @@ impl Player {
             track,
             in_us: 0,
             out_us,
+            // A palette row arrives in no group: pinning its words to a clip is
+            // a hand's decision, made with the Group row afterwards.
+            link: None,
         })
     }
 
@@ -308,6 +374,7 @@ impl Player {
         // frame is its name on its lane ([`sub_mark`]).
         let marked = self
             .selected
+            .anchor()
             .filter(|&(lane, _)| lane == to)
             .and_then(|(lane, idx)| Some(self.session.as_ref()?.sub_lane(lane).get(idx)?.start));
         let text = match (self.sub_of_track(track), &mut self.session) {
@@ -331,11 +398,19 @@ impl Player {
             // names its new neighbour -- the caption the next Delete would take.
             // The mark goes back on the caption it was on.
             (None, Some(start)) => {
-                self.selected = self
+                let mark = self
                     .session
                     .as_ref()
                     .and_then(|session| sub_mark(session.sub_lane(to), start))
                     .map(|i| (to, i));
+                self.selected = match mark {
+                    Some(mark) => {
+                        let mut sel = Selection::new();
+                        sel.set_one(mark);
+                        sel
+                    }
+                    None => Selection::new(),
+                };
             }
             (None, None) => {}
         }
@@ -385,11 +460,19 @@ impl Player {
             // landed rather than left on the index it had, which after the move
             // is a neighbour's.
             Some(Ok(())) => {
-                self.selected = self
+                let mark = self
                     .session
                     .as_ref()
                     .and_then(|session| sub_mark(session.sub_lane(to), start))
                     .map(|i| (to, i));
+                self.selected = match mark {
+                    Some(mark) => {
+                        let mut sel = Selection::new();
+                        sel.set_one(mark);
+                        sel
+                    }
+                    None => Selection::new(),
+                };
             }
             None => {}
         }
@@ -425,8 +508,12 @@ impl Player {
             // so a mark or an open menu left at or past it names a *different*
             // caption now -- and the next Delete would take that one. Both go
             // with the caption they were on.
-            if self.selected.is_some_and(|(l, i)| l == lane && i >= idx) {
-                self.selected = None;
+            if self
+                .selected
+                .anchor()
+                .is_some_and(|(l, i)| l == lane && i >= idx)
+            {
+                self.selected.clear();
             }
             self.context_menu = None;
         }
@@ -714,8 +801,19 @@ impl Player {
         };
         let lanes = session.lanes();
         let clips: Vec<&[Clip]> = lanes.iter().map(|&lane| session.lane_clips(lane)).collect();
+        // The dragged placement's group, whatever kind it is: the clips of the
+        // group travel with a clip's drag, and a caption's drag -- which has no
+        // clip of its own to skip by -- must not snap onto the very clips it is
+        // carrying.
+        let skip_link = skip.and_then(|(lane, idx)| {
+            match lane.kind {
+                LaneKind::Subtitle => session.sub_lane(lane).get(idx).map(|s| s.link),
+                _ => session.lane_clips(lane).get(idx).map(|c| c.link),
+            }
+            .flatten()
+        });
         let skip = skip.and_then(|(lane, idx)| Some((lanes.iter().position(|&l| l == lane)?, idx)));
-        snap_marks(&clips, skip, frame_at(session.now(), self.fps))
+        snap_marks(&clips, skip, skip_link, frame_at(session.now(), self.fps))
     }
 
     /// Where a gesture at `raw` lands and the mark that pulled it there, with
@@ -854,12 +952,17 @@ impl Player {
     /// Opens the clip menu on the box under the pointer, from the right button
     /// wherever it was pressed on that box -- its middle or one of its edge
     /// strips, which cover the middle's own listener. Selecting first is part of
-    /// it: every item acts on the clip the menu names.
+    /// it: every item acts on the clip the menu names -- and a right-click on
+    /// one of the clips a ctrl-click selection already holds keeps that
+    /// selection, so the menu's Group is about the whole of it. A right-click
+    /// anywhere else is the single mark, exactly as a left press is.
     pub(crate) fn open_menu(&mut self, lane: Lane, idx: usize, at: Point<Pixels>, cx: &mut Context<Self>) {
         if self.modal() {
             return;
         }
-        self.select((lane, idx), cx);
+        if !self.selected.contains((lane, idx)) {
+            self.select((lane, idx), cx);
+        }
         self.context_menu = Some(ContextMenu {
             lane,
             idx,
@@ -869,11 +972,19 @@ impl Player {
         cx.notify();
     }
 
-    /// A press on a clip's edge: the start of the drag that changes how much of
-    /// its source it plays. It selects the clip as a press anywhere else on the
+    /// A press on an edge: the start of the drag that changes how much of a
+    /// source it plays. It picks the placement as a press anywhere else on the
     /// box does -- the edge strip covers the box's own listener (`occlude`), so
-    /// this is the only one that fires there.
-    pub(crate) fn start_trim(&mut self, lane: Lane, idx: usize, edge: Edge, cx: &mut Context<Self>) {
+    /// this is the only one that fires there -- and ctrl makes that pick the
+    /// toggle it is everywhere else on the bed.
+    pub(crate) fn start_trim(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        edge: Edge,
+        ctrl: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.modal() || self.exporting().is_some() {
             return;
         }
@@ -881,9 +992,8 @@ impl Player {
         // gesture, the same `Trim`, and the branch is the lane's kind wherever
         // the drag is asked about ([`Player::trim_to`],
         // [`Player::commit_trim`]). A caption *is* markable -- the mark is its
-        // lane and its index like a clip's ([`Player::select`]) -- but an edge
-        // drag is a trim and not a pick, so this leaves the mark where the hand
-        // left it. No group either: a caption has no half on another lane.
+        // lane and its index like a clip's ([`Player::pick`]) -- and a caption
+        // in a group carries its link, so its trim drags the group with it.
         if lane.kind == LaneKind::Subtitle {
             let Some(sub) = self
                 .session
@@ -892,15 +1002,22 @@ impl Player {
             else {
                 return;
             };
+            self.pick((lane, idx), ctrl, cx);
             self.trim = Some(Trim {
                 lane,
                 idx,
                 edge,
+                // Where the edge already is: a press that never moves is not an
+                // edit, and the engine refuses exactly that.
+                from: match edge {
+                    Edge::Start => sub.start,
+                    Edge::End => sub.end(),
+                },
                 to: match edge {
                     Edge::Start => sub.start,
                     Edge::End => sub.end(),
                 },
-                link: None,
+                link: sub.link,
             });
             cx.notify();
             return;
@@ -912,13 +1029,17 @@ impl Player {
         else {
             return;
         };
-        self.select((lane, idx), cx);
+        self.pick((lane, idx), ctrl, cx);
         self.trim = Some(Trim {
             lane,
             idx,
             edge,
             // Where the edge already is: a press that never moves is not an
             // edit, and `Project::trim` refuses exactly that.
+            from: match edge {
+                Edge::Start => clip.start,
+                Edge::End => clip.end(),
+            },
             to: match edge {
                 Edge::Start => clip.start,
                 Edge::End => clip.end(),
@@ -1006,30 +1127,73 @@ impl Player {
     }
 
     /// The clip as the drag is showing it: an edge under the pointer moves its
-    /// own box, and the boxes of the halves linked to it, before anything is
+    /// own box, and the boxes of everything linked to it, before anything is
     /// committed. Display only -- the project is not touched until the release.
+    /// A member of the group follows by the same delta, clamped to its own
+    /// room, which is the arithmetic the release commits -- so a box let go of
+    /// is the box that lands.
     pub(crate) fn trimmed(&self, lane: Lane, idx: usize, clip: Clip) -> Clip {
         let Some(trim) = self.trim.filter(|t| {
             (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == clip.link)
         }) else {
             return clip;
         };
+        let to = self.followed(trim, (lane, idx), match trim.edge {
+            Edge::Start => clip.start,
+            Edge::End => clip.end(),
+        });
         let still = self.session.as_ref().is_some_and(|session| {
             session
                 .sources()
                 .get(clip.source)
                 .is_some_and(|s| engine::is_image(&s.path))
         });
-        trimmed_clip(clip, trim.edge, trim.to, still)
+        trimmed_clip(clip, trim.edge, to, still)
     }
 
     /// The caption as the drag is showing it, [`Player::trimmed`]'s twin:
-    /// display only, and the engine hears about it once, at the release.
+    /// display only, and the engine hears about it once, at the release. A
+    /// caption in the dragged group follows by the same delta, against its own
+    /// walls.
     pub(crate) fn trimmed_sub(&self, lane: Lane, idx: usize, sub: SubClip) -> SubClip {
-        match self.trim.filter(|t| (t.lane, t.idx) == (lane, idx)) {
-            Some(trim) => trimmed_sub(sub, trim.edge, trim.to),
-            None => sub,
+        let Some(trim) = self.trim.filter(|t| {
+            (t.lane, t.idx) == (lane, idx) || (t.link.is_some() && t.link == sub.link)
+        }) else {
+            return sub;
+        };
+        let to = self.followed(
+            trim,
+            (lane, idx),
+            match trim.edge {
+                Edge::Start => sub.start,
+                Edge::End => sub.end(),
+            },
+        );
+        trimmed_sub(sub, trim.edge, to)
+    }
+
+    /// The frame a trim is showing for the placement at `here`, whose edge
+    /// stands at `at`: the drag's own `to` when `here` is the placement the
+    /// press started on, and that `to`'s delta from where the press started,
+    /// clamped to this placement's own room, when it is a member following.
+    fn followed(&self, trim: Trim, here: (Lane, usize), at: u32) -> u32 {
+        if (trim.lane, trim.idx) == here {
+            return trim.to;
         }
+        let delta = i64::from(trim.to) - i64::from(trim.from);
+        let room = match here.0.kind {
+            LaneKind::Subtitle => self
+                .session
+                .as_ref()
+                .and_then(|session| session.trim_sub_room(here.0, here.1, trim.edge)),
+            _ => self
+                .session
+                .as_ref()
+                .and_then(|session| session.trim_room(here.0, here.1, trim.edge)),
+        };
+        room.map_or(trim.to, |(lo, hi)| {
+            (i64::from(at) + delta).clamp(i64::from(lo), i64::from(hi)) as u32
+        })
     }
 
     /// How long the timeline is *drawn* as: its own length, and while a tail is

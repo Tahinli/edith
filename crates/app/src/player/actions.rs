@@ -54,6 +54,7 @@ impl Player {
             ActionId::Select => self.select_under_playhead(cx),
             ActionId::SelectNext => self.select_step(true, cx),
             ActionId::SelectPrev => self.select_step(false, cx),
+            ActionId::SelectAll => self.select_all(cx),
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Color => self.open_color(cx),
@@ -213,16 +214,30 @@ impl Player {
         let Some(session) = &self.session else {
             return Ctx::default();
         };
-        let on = on.or(self.selected);
+        let on = on.or(self.selected.anchor());
         let clip = on
             .and_then(|(lane, idx)| session.lane_clips(lane).get(idx).map(|clip| (*clip, lane)));
+        let caption = on.is_some_and(|(lane, idx)| {
+            lane.kind == LaneKind::Subtitle && idx < session.sub_lane(lane).len()
+        });
+        // The selection's shape, over the picks that still name something:
+        // how many placements, and on how many lanes. The lane count is the
+        // manual group's one-per-lane question -- equal counts say a group, a
+        // short one says a lane is picked twice.
+        let (picks, _) = self.marks();
+        let mut lanes = Vec::new();
+        for &(lane, _) in &picks {
+            if !lanes.contains(&lane) {
+                lanes.push(lane);
+            }
+        }
+        let pick_lanes = lanes.len();
         Ctx {
             clip,
             // The same pair read in the other index space: a subtitle lane's
             // own, where the box that was clicked is a caption.
-            caption: on.is_some_and(|(lane, idx)| {
-                lane.kind == LaneKind::Subtitle && idx < session.sub_lane(lane).len()
-            }),
+            caption,
+            caption_link: caption.then(|| on.and_then(|(lane, idx)| session.sub_lane(lane).get(idx)).and_then(|s| s.link)).flatten(),
             image: clip.is_some_and(|(clip, _)| {
                 session
                     .sources()
@@ -235,6 +250,8 @@ impl Player {
             subtitles: !session.subtitles().is_empty(),
             playable: !nothing_to_play(Some(session)),
             exporting: self.exporting().is_some(),
+            picks: picks.len(),
+            pick_lanes,
         }
     }
 
@@ -347,7 +364,7 @@ impl Player {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
             self.reset_after_reseek();
         }
-        self.selected = None;
+        self.selected.clear();
         cx.notify();
     }
 

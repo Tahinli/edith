@@ -4,12 +4,26 @@
 use crate::*;
 
 impl Player {
-    /// The one place a clip becomes *the* selected one: a click, a right-click
-    /// that opens the menu, and every selection key go through here, so what a
-    /// keyboard marks and what a pointer marks are the same state marked the
-    /// same way (group and all -- see [`marked`]).
+    /// The one place a clip becomes *the* selected one: a plain click, a
+    /// right-click that opens the menu, and every selection key go through
+    /// here, so what a keyboard marks and what a pointer marks are the same
+    /// state marked the same way (group and all -- see [`marked`]). One pick,
+    /// because one click names one thing; [`Player::pick`] is the ctrl+click
+    /// that grows the selection instead.
     pub(crate) fn select(&mut self, target: (Lane, usize), cx: &mut Context<Self>) {
-        self.selected = Some(target);
+        self.selected.set_one(target);
+        cx.notify();
+    }
+
+    /// A press with ctrl held: the pick joins the selection, or leaves it if
+    /// it was already in -- the toggle that assembles a group by hand. Without
+    /// ctrl this is exactly [`Player::select`], which is why every box on the
+    /// bed asks this one and lets the modifier decide.
+    pub(crate) fn pick(&mut self, target: (Lane, usize), ctrl: bool, cx: &mut Context<Self>) {
+        match ctrl {
+            true => self.selected.toggle(target),
+            false => self.selected.set_one(target),
+        }
         cx.notify();
     }
 
@@ -27,7 +41,6 @@ impl Player {
             .filter_map(|lane| Some((lane, session.lane_clip_at(lane, now)?)))
             .collect()
     }
-
     /// Selects the clip under the playhead, and on a repeat press the next
     /// lane's -- so one key reaches every clip the playhead is over, which is
     /// what makes selection (and everything that acts on a selection: delete,
@@ -43,6 +56,7 @@ impl Player {
         // means; a selection off the playhead starts the walk over.
         let next = self
             .selected
+            .anchor()
             .and_then(|sel| under.iter().position(|&clip| clip == sel))
             .map_or(first, |at| under[(at + 1) % under.len()]);
         self.select(next, cx);
@@ -54,9 +68,10 @@ impl Player {
     pub(crate) fn select_step(&mut self, forward: bool, cx: &mut Context<Self>) {
         let clips = self
             .selected
+            .anchor()
             .zip(self.session.as_ref())
             .map_or(0, |((lane, _), session)| session.lane_clips(lane).len());
-        match (self.selected, clips) {
+        match (self.selected.anchor(), clips) {
             // An empty lane is a selection nothing can be stepped from -- as is
             // no selection at all, and the playhead answers both.
             (Some((lane, idx)), len) if len > 0 => {
@@ -69,6 +84,32 @@ impl Player {
             }
             _ => self.select_under_playhead(cx),
         }
+    }
+
+    /// Every placement on every lane, in the order the lanes are drawn: what
+    /// Select All marks -- the clips and the captions both, one selection that
+    /// a Group can take apart lane by lane and a Delete can walk pick by pick.
+    pub(crate) fn select_all(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let mut selected = Selection::new();
+        for lane in session.lanes() {
+            let len = match lane.kind {
+                LaneKind::Subtitle => session.sub_lane(lane).len(),
+                _ => session.lane_clips(lane).len(),
+            };
+            for idx in 0..len {
+                selected.add((lane, idx));
+            }
+        }
+        self.selected = selected;
+        if self.selected.is_empty() {
+            // A key that does nothing looks broken: an empty timeline has
+            // nothing to select, and that is a thing to say rather than skip.
+            self.notify_user("NOTHING TO SELECT — the timeline is empty".into());
+        }
+        cx.notify();
     }
 
     /// Cycles the fit policy of the clip the picture is coming from -- the
@@ -91,6 +132,7 @@ impl Player {
         };
         let target = self
             .selected
+            .anchor()
             .filter(|(lane, _)| lane.kind == LaneKind::Video)
             .or_else(|| session.video_clip_at(session.now()));
         let Some((lane, idx)) = target else {
