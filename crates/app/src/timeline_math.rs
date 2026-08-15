@@ -182,6 +182,28 @@ pub(crate) fn caption_rate(sub: SubClip, fps: f64) -> Option<Speed> {
     ))
 }
 
+/// The scrollbar's thumb over a track `w` px wide: `(x, width)` of the box
+/// standing for the visible share of a timeline `duration` long whose window
+/// starts at `start` and spans `span`. Full width when nothing is off-screen
+/// (there is nothing to scroll and the strip says so by filling), never
+/// narrower than [`SCROLL_THUMB_MIN`] when there is (a thumb a pixel wide is a
+/// thumb no hand can hold), and never off the track either way -- the clamp,
+/// not the caller, owns that, because a drag's samples arrive raw.
+pub(crate) fn scroll_thumb(
+    w: f32,
+    duration: f64,
+    start: f64,
+    span: f64,
+) -> (f32, f32) {
+    if w <= 0. || duration <= 0. || span >= duration {
+        return (0., w.max(0.));
+    }
+    let share = f64::from(w);
+    let width = ((span / duration) * share).clamp(f64::from(SCROLL_THUMB_MIN), f64::from(w));
+    let x = (start / duration * share).clamp(0., f64::from(w) - width);
+    (x as f32, width as f32)
+}
+
 impl Selection {
     pub(crate) fn len(&self) -> usize {
         self.picks.len()

@@ -103,6 +103,13 @@ struct Player {
     /// The ruler's own box, recorded at prepaint: a mouse listener is handed
     /// the window position and nothing else.
     ruler: Rc<Cell<Bounds<Pixels>>>,
+    /// The scrollbar track's laid-out box, recorded at prepaint like the
+    /// ruler's: a thumb drag is followed on the root (the pointer leaves the
+    /// strip at once), and the root has only window coordinates to work with.
+    scroll_track: Rc<Cell<Bounds<Pixels>>>,
+    /// A thumb in the hand: how far into the thumb the press landed, in
+    /// track pixels. `None` with no drag in flight.
+    scroll_drag: Option<f32>,
     /// How wide a second of timeline is drawn, and from which moment. Held here
     /// and nowhere else: every frame-to-pixel answer in the panel comes out of
     /// it, so the boxes, the playhead and the pointer cannot disagree.
@@ -646,14 +653,15 @@ fn main() {
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: 30.,
-                    // The file being opened, from the first frame the window
+                    ruler: Rc::default(),
+                    scroll_track: Rc::default(),
+                    scroll_drag: None,
                     // draws: the title bar and the header name it while its
                     // header is still being read.
                     name: name.clone(),
                     image: None,
                     sub_image: None,
                     held: None,
-                    ruler: Rc::default(),
                     notice_h: Rc::default(),
                     // A second is [`PPS_DEFAULT`] pixels wide until someone
                     // zooms or asks for the fit: a project opens at a scale, not

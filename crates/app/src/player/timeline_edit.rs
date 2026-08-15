@@ -1298,6 +1298,20 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The scrollbar's thumb first: the pointer leaves the 6 px strip on
+        // the first move, so the gesture is followed here for the ruler's own
+        // reason -- and it must outrank every other drag, because a hand
+        // holding the view is not holding anything on it.
+        if self.scroll_drag.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.scroll_drag_to(event.position.x, cx),
+                // A release outside the window never reaches the handler
+                // below, so the first button-up move is when we learn the
+                // drag is over.
+                _ => self.scroll_drag = None,
+            }
+            return;
+        }
         // A divider is answered before every gesture below it: it is pressed on
         // a strip of its own that nothing else is under, so neither can swallow
         // the other -- a seam over the timeline never scrubs, and a scrub is
@@ -1399,6 +1413,10 @@ impl Player {
     ) {
         // The panel is left exactly where the hand let go, for the reason every
         // other release here lands one last sample.
+        if self.scroll_drag.take().is_some() {
+            self.scroll_drag_to(event.position.x, cx);
+            return;
+        }
         if let Some(split) = self.split_drag.take() {
             self.drag_split(split, event.position, window, cx);
             return;

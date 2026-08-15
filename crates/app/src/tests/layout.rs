@@ -266,6 +266,29 @@ fn a_lane_row_is_a_fixed_header_and_a_bed_that_can_be_hit() {
     assert_eq!(lanes_h(2), 2. * LANE_H + 8.);
 }
 
+/// The scrollbar's thumb: the visible share of the timeline at its own
+/// place on the track, full width with nothing to scroll, never narrower than
+/// a hand can hold, and never off the ends.
+#[test]
+fn the_scroll_thumb_is_the_visible_share_at_its_own_place() {
+    use crate::scroll_thumb;
+    use crate::SCROLL_THUMB_MIN;
+
+    // Nothing to scroll: the strip fills and says so.
+    assert_eq!(scroll_thumb(400., 10., 0., 12.), (0., 400.));
+    assert_eq!(scroll_thumb(400., 0., 0., 0.), (0., 400.));
+    // Half the timeline on the bed: a half-width thumb, halfway along for a
+    // window starting halfway in.
+    assert_eq!(scroll_thumb(400., 20., 0., 10.), (0., 200.));
+    assert_eq!(scroll_thumb(400., 20., 10., 10.), (200., 200.));
+    // The floor width: however long the timeline, the thumb stays holdable --
+    // and the clamp keeps it on the track, not the caller.
+    let (x, w) = scroll_thumb(400., 1_000_000., 999_000., 100.);
+    assert_eq!(w, SCROLL_THUMB_MIN);
+    assert_eq!(x, 400. - SCROLL_THUMB_MIN);
+    assert_eq!(scroll_thumb(400., 1_000_000., 0., 100.).0, 0.);
+}
+
 /// A caption's box wears the rate its window plays at, derived off the
 /// placement itself: unity placements -- including odd widths whose frames
 /// came off `frames_of_us` rounding -- do not badge, and a re-rate does, with
