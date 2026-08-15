@@ -1825,6 +1825,42 @@ impl PlaybackSession {
         self.project.group(a, a_idx, b, b_idx)
     }
 
+    /// Puts every placement the picks name into one group
+    /// ([`Project::group_all`]) -- the ctrl-click selection's own door, which
+    /// may name clips and captions alike. Metadata only like the pair above:
+    /// no reseek, one undo step, and the error says why when it refuses.
+    pub fn group_all(&mut self, picks: &[(Lane, usize)]) -> crate::Result<()> {
+        self.project.group_all(picks)
+    }
+
+    /// [`delete_clip`](Self::delete_clip) for the caption the pick named: a
+    /// caption in no group lifts exactly as [`lift_sub`](Self::lift_sub) lifts
+    /// it -- no reseek, because nothing that plays has changed -- and a caption
+    /// in a group takes the group with it, which ripples the media members and
+    /// reseeks like a delete. `false` for a bad index.
+    pub fn delete_sub(&mut self, lane: Lane, idx: usize) -> bool {
+        // Which of the two, asked before anything moves: the reseek a grouped
+        // delete owes is the whole difference between the paths.
+        let grouped = self
+            .project
+            .sub_lane(lane)
+            .get(idx)
+            .and_then(|s| s.link)
+            .is_some_and(|id| {
+                self.project
+                    .lanes()
+                    .into_iter()
+                    .any(|l| l != lane && self.project.lane(l).iter().any(|c| c.link == Some(id)))
+            });
+        match grouped {
+            true => self.edit(Dirty::Both, |p| p.delete_sub_in(lane, idx)),
+            // A caption in no group -- or one grouped only with other captions,
+            // which lift and move nothing that plays -- is the lift it always
+            // was.
+            false => self.project.delete_sub_in(lane, idx),
+        }
+    }
+
     /// What the clip at `idx` of `lane` is equalized with, or `None` for one
     /// that plays flat -- what a card shows before it lets anyone drag a band.
     pub fn eq_of(&self, lane: Lane, idx: usize) -> Option<&EqParams> {

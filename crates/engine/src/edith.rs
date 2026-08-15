@@ -143,11 +143,13 @@
 //! track 3 of a two-track palette is refused here, as a clip naming a source
 //! that is not there is.
 //!
-//! **Version 14** was this without the `sub` lines: such a project holds no
+//! **Version 15** was this without the caption's group field: such a project
+//! holds captions no hand ever grouped, which is every caption there could be.
+//! **Version 14** was that without the `sub` lines: such a project holds no
 //! subtitle lane at all -- its `subtitle` lines are the palette, and where the
 //! words of it were shown was nowhere in the file.
-//! **Version 13** was that without the `encoder` line: an export of such a
-//! project takes the hardware seat where there is one and the software encoder
+//! **Version 13** was that without the `encoder` line: such a project takes the
+//! hardware seat where there is one and the software encoder
 //! everywhere else, which is the only choice those projects had.
 //! **Version 12** was that without the `autoproxy` line: such a project makes a
 //! stand-in for every film that wants one the moment it arrives, which is all
@@ -178,7 +180,7 @@
 //! nothing, and an older one plays everything at real time, and an older one
 //! mixes flat, and an older one shows no subtitles, and an older one is shown
 //! in the reference rendition, and an older one places none of the words it
-//! names -- and saving any of them writes v15. An older
+//! names -- and saving any of them writes v16. An older
 //! reader refuses a newer file by name.
 //!
 //! Text because an edit list is a few integers and a path, and a path is
@@ -214,7 +216,8 @@ use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 15";
+const MAGIC: &[u8] = b"edith 16";
+const MAGIC_V15: &[u8] = b"edith 15";
 const MAGIC_V14: &[u8] = b"edith 14";
 const MAGIC_V13: &[u8] = b"edith 13";
 const MAGIC_V12: &[u8] = b"edith 12";
@@ -503,9 +506,13 @@ fn emit(
                 out.extend_from_slice(format!("{keyword} {ord}\n").as_bytes());
             }
             for s in placed {
+                // The group field only when the caption is in one, for the
+                // clip line's reason: a project nobody grouped a caption in is
+                // the same bytes it was in v15.
+                let link = s.link.map_or(String::new(), |l| format!(" {l}"));
                 out.extend_from_slice(
                     format!(
-                        "{keyword} {ord} {} {} {} {} {}\n",
+                        "{keyword} {ord} {} {} {} {} {}{link}\n",
                         s.start, s.frames, s.track, s.in_us, s.out_us
                     )
                     .as_bytes(),
@@ -573,8 +580,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that places the words it names...
-    let v15 = first == MAGIC;
+    // The one whose captions may carry a group id...
+    let v16 = first == MAGIC;
+    // ...the one that places the words it names...
+    let v15 = v16 || first == MAGIC_V15;
     // ...the ones that say which encoder an export takes...
     let v14 = v15 || first == MAGIC_V14;
     // ...the ones that say whether the stand-ins are made by themselves...
@@ -948,13 +957,33 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if rest.is_empty() {
                     continue;
                 }
-                let f = fields(rest, 5, "sub", n)?;
+                // v16 on may carry a sixth field -- the caption's group id, the
+                // same spelling a clip's link takes (`-` for none). A v15 line
+                // stops at five, and a sixth field in one is a file this parser
+                // never wrote.
+                let all: Vec<&[u8]> = rest.split(|&b| b == b' ').collect();
+                let ok = all.len() == 5 || (v16 && all.len() == 6);
+                if !ok {
+                    return Err(format!(
+                        "line {n}: sub wants {} fields, found {}",
+                        if v16 { "5 or 6" } else { "5" },
+                        all.len()
+                    )
+                    .into());
+                }
+                let link = match all.get(5) {
+                    None => None,
+                    Some(f) if *f == b"-" => None,
+                    Some(f) => Some(number(f, n)?),
+                };
+                let f = &all;
                 let sub = SubClip {
                     start: number(f[0], n)?,
                     frames: number(f[1], n)?,
                     track: number(f[2], n)? as usize,
                     in_us: micros(f[3], n)?,
                     out_us: micros(f[4], n)?,
+                    link,
                 };
                 // The never-empty invariant at both clocks, which is what
                 // [`crate::Project::place_sub`] refuses on the live timeline.
@@ -1440,7 +1469,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 15\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 16\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1773,7 +1802,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1810,7 +1839,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -1918,7 +1947,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -2022,7 +2051,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -2087,7 +2116,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -2125,7 +2154,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -2154,7 +2183,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -2204,7 +2233,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 16\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -2236,7 +2265,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 15\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -2400,7 +2429,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -2453,7 +2482,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 15\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -2485,7 +2514,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 15\n"));
+        assert!(v5.starts_with(b"edith 16\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -2594,7 +2623,7 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 15\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 16\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2639,10 +2668,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 16\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 17\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 16");
+        assert_eq!(err, "line 1: unsupported version 17");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),
