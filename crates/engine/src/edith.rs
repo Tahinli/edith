@@ -1485,6 +1485,70 @@ mod tests {
         }
     }
 
+    /// The caption's group field (v16): written only when the caption is in a
+    /// group -- so a project nobody grouped a caption in is the same bytes it
+    /// was in v15 -- read back as the id, and refused in an older dialect,
+    /// which never wrote one.
+    #[test]
+    fn a_caption_group_round_trips_and_an_old_dialect_refuses_the_field() {
+        let dir = PathBuf::from("/proj");
+        let caption = |start: u32, frames: u32, link| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link,
+        };
+        let lanes = vec![
+            (LaneKind::Video, vec![clip(0, 0, 30, 0, Some(7))]),
+            (LaneKind::Audio, vec![clip(0, 0, 30, 0, Some(7))]),
+            (LaneKind::Subtitle, Vec::new()),
+        ];
+        let subs = vec![vec![], vec![], vec![caption(0, 30, Some(7)), caption(40, 10, None)]];
+        let bytes = super::emit(
+            &dir,
+            &doc().1,
+            &lanes,
+            &[],
+            &subs,
+            &[subtitle("/proj/subs.srt", None)],
+            &[],
+            &[],
+            (1280, 720),
+            None,
+            crate::tonemap::Preset::default(),
+            false,
+            true,
+            crate::export::EncoderSeat::default(),
+            Limiter::default(),
+            0,
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("sub 1 0 30 0 0 30000000 7\n"),
+            "the grouped caption carries its id: {text}"
+        );
+        assert!(
+            text.contains("sub 1 40 10 0 0 10000000\n"),
+            "a caption in no group writes no field: {text}"
+        );
+        let back = parse(&bytes, &dir).expect("v16 parses");
+        assert_eq!(back.subs[2][0].link, Some(7));
+        assert_eq!(back.subs[2][1].link, None);
+
+        // The older dialect never wrote a sixth field, and one claiming to be
+        // it is a file this parser refuses by name.
+        let v15 = parse(
+            b"edith 15\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\nsubtitle - subs.srt\n\
+               sub 1 0 30 0 0 30000000 7\n",
+            &dir,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(v15, "line 6: sub wants 5 fields, found 6");
+    }
+
     /// The v12 line: whether the project is cut on the stand-ins, written only
     /// when it is -- and the dialect before it, which had no stand-ins and
     /// whose bytes are therefore unchanged bar the version.
