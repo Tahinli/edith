@@ -561,6 +561,12 @@ pub struct SubClip {
     /// keeps it.
     pub in_us: i64,
     pub out_us: i64,
+    /// Group id: `Some` exactly when a hand put this caption in a group with
+    /// clips on other lanes ([`Project::group_all`]) -- a caption arrives in
+    /// no group, and what a cut cuts apart loses the one it had
+    /// ([`sub_open_room`], for [`Clip::link`]'s reason). Sharing an id with a
+    /// clip is what makes the caption move, trim and delete with it.
+    pub link: Option<u32>,
 }
 
 impl SubClip {
@@ -631,6 +637,25 @@ impl LaneData {
             LaneData::new(LaneKind::Video, video),
             LaneData::new(LaneKind::Audio, audio),
         ]
+    }
+}
+
+/// The placements one group id names, split by the two lists a lane holds:
+/// what a drag, a trim and a delete each have to walk, now that a group may
+/// hold a caption beside its clips ([`Project::group_all`]). A clip and a
+/// caption of one group never share a lane -- a subtitle lane holds no `Clip`
+/// -- so the pairs are `(lane storage index, index into that lane's list)`.
+#[derive(Default)]
+struct Members {
+    clips: Vec<(usize, usize)>,
+    subs: Vec<(usize, usize)>,
+}
+
+impl Members {
+    /// Whether the group is the one placement and no more: what a lift leaves
+    /// behind, and what every whole-group question answers "not one" for.
+    fn alone(&self) -> bool {
+        self.clips.len() + self.subs.len() < 2
     }
 }
 
@@ -1639,7 +1664,14 @@ impl Project {
             )
             .into());
         }
-        let sub = SubClip { start: at, ..sub };
+        // The placement belongs to no group, for [`place`]'s reason: a caption
+        // dragged out of the palette arrives alone, and grouping it with what
+        // is under it is a hand's decision ([`Project::group_all`]).
+        let sub = SubClip {
+            start: at,
+            link: None,
+            ..sub
+        };
         if at.checked_add(sub.frames).is_none() {
             return Err(format!("a placement at frame {at} runs past the last frame there is").into());
         }
@@ -1667,11 +1699,16 @@ impl Project {
     }
 
     /// Move the subtitle at `idx` of `from` onto `to` with its head at `start`
-    /// -- [`move_clip`](Project::move_clip)'s twin, and refusing an overlap
-    /// where that one clamps to it, for [`place_sub`](Project::place_sub)'s
-    /// reason: there is no group to hold a subtitle still and no picture under
-    /// it that a landing would hide, so "as far as it goes" would silently be a
-    /// frame nobody named.
+    /// -- [`move_clip`](Project::move_clip)'s twin. A caption in no group is
+    /// refused an overlap where that one clamps to it, for
+    /// [`place_sub`](Project::place_sub)'s reason: there is no group to hold it
+    /// still and no picture under it that a landing would hide, so "as far as
+    /// it goes" would silently be a frame nobody named.
+    ///
+    /// A caption *in* a group drags the group: one delta for every member --
+    /// its clips and its other captions -- clamped to the room each of them
+    /// has, exactly as a clip's drag always has. That is the point of putting
+    /// a caption in a group: the words go where the picture goes.
     ///
     /// The window travels untouched: a caption dragged later says the same
     /// words later, exactly as a clip dragged later plays the same pictures
@@ -1679,9 +1716,10 @@ impl Project {
     ///
     /// One undo step on success; nothing changed and no step on a refusal --
     /// an index that is not there, a lane that is not a subtitle lane or is not
-    /// there, and an overlap. A drop that changes neither lane nor frame is
-    /// `Ok` and no step: a hand that picked a caption up and put it back has
-    /// done nothing wrong, and a front-end showing every `Err` would say so.
+    /// there, and (for a caption in no group) an overlap. A drop that changes
+    /// neither lane nor frame is `Ok` and no step: a hand that picked a caption
+    /// up and put it back has done nothing wrong, and a front-end showing every
+    /// `Err` would say so.
     pub fn move_sub(&mut self, from: Lane, idx: usize, to: Lane, start: u32) -> crate::Result<()> {
         let Some(sub) = self.sub_lane(from).get(idx).copied() else {
             return Err(format!("there is no subtitle {idx} on {}", from.label()).into());
@@ -1706,6 +1744,51 @@ impl Project {
             return Err(
                 format!("a placement at frame {start} runs past the last frame there is").into(),
             );
+        }
+        // A grouped caption carries its group, clamped to the room the whole
+        // group has rather than refused ([`Project::move_room]) -- one drag, one
+        // delta, one undo step.
+        let members = self.group_of(from, idx).expect("the subtitle was found");
+        if !members.alone() {
+            if members
+                .subs
+                .iter()
+                .any(|&(l, i)| l == dest && (l, i) != (here, idx))
+            {
+                return Err(format!(
+                    "a group is one caption per track: {} already carries this group",
+                    to.label()
+                )
+                .into());
+            }
+            let want = i64::from(start) - i64::from(sub.start);
+            let Some((lo, hi)) = self.move_room(&members, Some((here, idx, dest, start))) else {
+                return Err(format!(
+                    "another placement already covers those frames on {}",
+                    to.label()
+                )
+                .into());
+            };
+            let delta = want.clamp(lo, hi);
+            self.snapshot();
+            for &(l, i) in &members.clips {
+                let c = &mut self.lanes[l].clips[i];
+                c.start = (i64::from(c.start) + delta) as u32;
+            }
+            for &(l, i) in &members.subs {
+                let s = &mut self.lanes[l].subs[i];
+                s.start = (i64::from(s.start) + delta) as u32;
+            }
+            let moved = self.lanes[here].subs.remove(idx);
+            let subs = &mut self.lanes[dest].subs;
+            let at = subs.partition_point(|o| o.start < moved.start);
+            subs.insert(at, moved);
+            debug_assert!(subs_sorted_disjoint(subs));
+            debug_assert!(members
+                .clips
+                .iter()
+                .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips)));
+            return Ok(());
         }
         let moved = SubClip { start, ..sub };
         if let Some(other) = self.lanes[dest]
@@ -1790,6 +1873,7 @@ impl Project {
             return Ok(());
         }
         self.snapshot();
+        let members = self.group_of(lane, idx).expect("the subtitle was found");
         let i = self.index(lane).expect("the subtitle was found on it");
         let s = &mut self.lanes[i].subs[idx];
         match edge {
@@ -1812,6 +1896,11 @@ impl Project {
         }
         debug_assert!(s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0);
         debug_assert!(subs_sorted_disjoint(&self.lanes[i].subs));
+        // A caption in a group drags its group's edge with it, exactly as a
+        // clip's trim does: one delta, each member clamped to its own room.
+        // No source table to grow by, which only tightens how far a member may
+        // follow -- never whether it may.
+        self.follow_group(&members, &(i, idx), edge, i64::from(to) - i64::from(at), &[]);
         Ok(())
     }
 
@@ -2107,8 +2196,9 @@ impl Project {
             return Err(format!("there is no clip {idx} on {}", lane.label()).into());
         };
         let labels = handles(&self.lanes);
-        let mut span: Option<(Lane, u32, u32)> = None;
-        for &(l, i) in &members {
+        // Media members only: a caption has no rate to change, and what the
+        // id binds it to -- a move, a trim, a delete -- travels by frames.
+        for &(l, i) in &members.clips {
             let clips = &self.lanes[l].clips;
             let mut moved = clips[i];
             moved.speed = speed;
@@ -2124,34 +2214,11 @@ impl Project {
                 )
                 .into());
             }
-            // A link is **one span on however many lanes**
-            // ([`links_are_consistent`]), and one rate over two halves does not
-            // guarantee that: two clips of *different source lengths* can occupy
-            // the same timeline frames at their old rates (rounding collapses
-            // neighbouring lengths onto one footprint at 4x), and re-rating them
-            // pulls those footprints apart. Refused by name rather than written
-            // -- a group whose halves disagree about their span is a project
-            // that would not load again.
-            match span {
-                None => span = Some((labels[l], moved.start, moved.end())),
-                Some((first, start, end)) if (start, end) != (moved.start, moved.end()) => {
-                    return Err(format!(
-                        "at {speed} the {} half would cover [{}, {}) and the {} half [{start}, {end}): \
-                         they are one take and a take is one span -- detach them first",
-                        labels[l].label(),
-                        moved.start,
-                        moved.end(),
-                        first.label()
-                    )
-                    .into());
-                }
-                Some(_) => {}
-            }
         }
         if snapshot {
             self.snapshot();
         }
-        for (l, i) in members {
+        for (l, i) in members.clips {
             self.lanes[l].clips[i].speed = speed;
             debug_assert!(sorted_disjoint(&self.lanes[l].clips));
         }
@@ -2507,6 +2574,24 @@ impl Project {
                 on.contains(&i) && l.subs.iter().any(|s| s.start < timeline_frame && timeline_frame < s.end())
             })
             .collect();
+        // The links the captions carry, read before the room is opened below
+        // -- `sub_open_room` takes the id off both halves, exactly as
+        // `open_room` does for a clip, and the split hands the halves theirs
+        // back afterwards.
+        let sub_orig: Vec<Option<u32>> = self
+            .lanes
+            .iter()
+            .zip(&cut_subs)
+            .map(|(l, &cut)| {
+                cut.then(|| {
+                    l.subs
+                        .iter()
+                        .find(|s| s.start < timeline_frame && timeline_frame < s.end())
+                        .and_then(|s| s.link)
+                })
+                .flatten()
+            })
+            .collect();
         if cut.iter().all(Option::is_none) && !cut_subs.contains(&true) {
             return false;
         }
@@ -2524,22 +2609,42 @@ impl Project {
             sub_open_room(&mut data.subs, timeline_frame, 0);
             debug_assert!(subs_sorted_disjoint(&data.subs));
         }
-        // Each side is its own question: two clips may start together and end
-        // apart, and every lane whose halves do line up stays one take.
-        let starts: Vec<Option<u32>> = cut.iter().map(|c| c.map(|c| c.start)).collect();
-        let ends: Vec<Option<u32>> = cut.iter().map(|c| c.map(|c| c.end())).collect();
-        let left = self.group_ids(&starts);
-        let right = self.group_ids(&ends);
-        for (((data, left), right), cut) in self
-            .lanes
-            .iter_mut()
-            .zip(left)
-            .zip(right)
-            .zip(cut.iter().map(Option::is_some))
-        {
+        // Each side is its own question, and the answer is the group the clip
+        // already carried: the left half *keeps* its take's id -- the take the
+        // frames before the cut still are -- and the right halves of one take
+        // share one fresh id of their own, clips and captions alike. A lane
+        // holding no group (a `place`ment, a caption nobody grouped) comes out
+        // of the cut holding none, which is what it went in with. The captions'
+        // own links were drawn above, before the room opened.
+        let orig: Vec<Option<u32>> = cut.iter().map(|c| c.and_then(|c| c.link)).collect();
+        let mut distinct: Vec<u32> = Vec::new();
+        for id in orig.iter().chain(&sub_orig).flatten() {
+            if !distinct.contains(id) {
+                distinct.push(*id);
+            }
+        }
+        let fresh: Vec<u32> = (0..distinct.len()).map(|_| self.new_link()).collect();
+        let right_of =
+            |link: Option<u32>| link.and_then(|id| distinct.iter().position(|&d| d == id)).map(|at| fresh[at]);
+        for (l, data) in self.lanes.iter_mut().enumerate() {
+            if !cut_subs[l] {
+                continue;
+            }
+            // The pair the razor just made: they touch at the frame it cut.
+            if let Some(idx) = data
+                .subs
+                .iter()
+                .position(|s| s.end() == timeline_frame)
+                .filter(|&idx| data.subs.get(idx + 1).is_some_and(|n| n.start == timeline_frame))
+            {
+                data.subs[idx].link = sub_orig[l];
+                data.subs[idx + 1].link = right_of(sub_orig[l]);
+            }
+        }
+        for (data_i, data) in self.lanes.iter_mut().enumerate() {
             // The lanes this call was not scoped to are not cut, whatever their
             // own clips would allow.
-            let Some(idx) = splittable(&data.clips, timeline_frame).filter(|_| cut) else {
+            let Some(idx) = splittable(&data.clips, timeline_frame).filter(|_| cut[data_i].is_some()) else {
                 continue;
             };
             let mut tail = data.clips[idx];
@@ -2549,9 +2654,9 @@ impl Project {
             // the two would not add up to the one being cut.
             tail.in_frame = split_source(&tail, timeline_frame).expect("splittable said so");
             tail.start = timeline_frame;
-            tail.link = right;
+            tail.link = right_of(orig[data_i]);
             data.clips[idx].out_frame = tail.in_frame;
-            data.clips[idx].link = left;
+            data.clips[idx].link = orig[data_i];
             data.clips.insert(idx + 1, tail);
         }
         true
@@ -2562,9 +2667,9 @@ impl Project {
     /// Only what a split could have produced is rejoined -- the two sides must
     /// touch on the timeline *and* be consecutive frames of the same source --
     /// so the clip list comes back exactly as it was and traversal with it.
-    /// `false` when no lane has such a pair. The rejoined clips share one id
-    /// only when they rejoin into the same span, for [`split`](Project::split)'s
-    /// reason.
+    /// `false` when no lane has such a pair. The rejoined placement keeps the
+    /// **left** half's id, which is the take the split left on it: rejoining a
+    /// cut take puts the take back, id and all.
     pub fn regroup(&mut self, timeline_frame: u32) -> bool {
         // What each lane would end up covering, if it joins here at all.
         let joined: Vec<Option<(u32, u32)>> = self
@@ -2585,8 +2690,7 @@ impl Project {
             return false;
         }
         self.snapshot();
-        let ids = self.group_ids(&joined);
-        for ((data, link), sub) in self.lanes.iter_mut().zip(ids).zip(join_subs) {
+        for (data, sub) in self.lanes.iter_mut().zip(join_subs) {
             if let Some(idx) = sub {
                 data.subs[idx].frames += data.subs[idx + 1].frames;
                 data.subs[idx].out_us = data.subs[idx + 1].out_us;
@@ -2597,16 +2701,17 @@ impl Project {
                 continue;
             };
             data.clips[idx].out_frame = data.clips[idx + 1].out_frame;
-            data.clips[idx].link = link;
             data.clips.remove(idx + 1);
         }
         true
     }
 
-    /// Take the clip at `idx` of `lane` out of its group: every clip carrying
-    /// its id -- on however many lanes -- is handed an id of its own, so from
-    /// here on each half moves, trims and is deleted alone. The music video
-    /// whose sound is to be cut against its picture starts here.
+    /// Take the placement at `idx` of `lane` out of its group: every clip and
+    /// every caption carrying its id -- on however many lanes -- is handed an
+    /// id of its own, so from here on each half moves, trims and is deleted
+    /// alone. The music video whose sound is to be cut against its picture
+    /// starts here, and so does the caption that has to come off the picture it
+    /// was pinned to.
     ///
     /// An id of its own rather than none at all: a half no other lane is grouped
     /// with is exactly what a [`lift`](Project::lift) leaves behind and is legal
@@ -2617,29 +2722,35 @@ impl Project {
     /// Metadata only, like a [`split`](Project::split): no mapping changes, so
     /// nothing has to be reseeked. One snapshot, so one [`Project::undo`] puts
     /// the group back. Refused (`false`, nothing changed) for an index that is
-    /// not there, a clip in no group at all, and one whose group has no other
-    /// half -- that one is already detached, and a refusal must not cost an undo
-    /// step.
+    /// not there, a placement in no group at all, and one whose group has no
+    /// other half -- that one is already detached, and a refusal must not cost
+    /// an undo step.
     pub fn ungroup(&mut self, lane: Lane, idx: usize) -> bool {
-        let Some(id) = self.lane(lane).get(idx).and_then(|c| c.link) else {
+        let Some(members) = self.group_of(lane, idx) else {
             return false;
         };
-        let members = self
-            .lanes
-            .iter()
-            .flat_map(|l| &l.clips)
-            .filter(|c| c.link == Some(id))
-            .count();
-        if members < 2 {
+        if members.alone() {
             return false;
         }
+        let Some(id) = self
+            .lane(lane)
+            .get(idx)
+            .and_then(|c| c.link)
+            .or_else(|| self.sub_lane(lane).get(idx).and_then(|s| s.link))
+        else {
+            return false;
+        };
         self.snapshot();
         // Drawn before the walk: `new_link` takes the whole project, and the
         // walk holds the lanes.
-        let mut fresh = (0..members).map(|_| self.new_link()).collect::<Vec<_>>();
+        let count = members.clips.len() + members.subs.len();
+        let mut fresh = (0..count).map(|_| self.new_link()).collect::<Vec<_>>();
         for data in &mut self.lanes {
             for c in data.clips.iter_mut().filter(|c| c.link == Some(id)) {
                 c.link = fresh.pop();
+            }
+            for s in data.subs.iter_mut().filter(|s| s.link == Some(id)) {
+                s.link = fresh.pop();
             }
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
@@ -2708,6 +2819,103 @@ impl Project {
         // And the two themselves, which a `place` may have left in no group.
         self.lane_mut(a).expect("read above")[a_idx].link = Some(id);
         self.lane_mut(b).expect("read above")[b_idx].link = Some(id);
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        Ok(())
+    }
+
+    /// Put every placement the picks name into one group -- the group a hand
+    /// builds with ctrl-click and a menu: the picture, its sound and the
+    /// caption over it, on as many lanes as the picks name. What any of them
+    /// was already grouped with rides along (one group, not two sharing a
+    /// member), and the members keep their own spans: a group is one id over
+    /// one placement per lane, and the offsets between them are what the group
+    /// preserves -- a drag, a trim and a delete all move the members *by the
+    /// same distance*, not to the same frames.
+    ///
+    /// No two picks may name one lane -- that is the one clip-per-lane rule,
+    /// and the refusal says which lane -- and a pick that names nothing is
+    /// refused with its own words. At least two picks, or there is nothing to
+    /// group.
+    ///
+    /// Metadata only, one snapshot, so one [`Project::undo`] takes the group
+    /// apart again. None of the refusals changes anything or costs an undo
+    /// step.
+    pub fn group_all(&mut self, picks: &[(Lane, usize)]) -> crate::Result<()> {
+        if picks.len() < 2 {
+            return Err("a group is two placements or more: pick another one first".into());
+        }
+        let mut seen: Vec<Lane> = Vec::with_capacity(picks.len());
+        for &(lane, idx) in picks {
+            if seen.contains(&lane) {
+                return Err(format!(
+                    "a group is one placement per lane: {} is picked twice -- keep one clip per \
+                     track",
+                    lane.label()
+                )
+                .into());
+            }
+            seen.push(lane);
+            let there = if lane.kind == LaneKind::Subtitle {
+                idx < self.sub_lane(lane).len()
+            } else {
+                idx < self.lane(lane).len()
+            };
+            if !there {
+                let what = if lane.kind == LaneKind::Subtitle {
+                    "subtitle"
+                } else {
+                    "clip"
+                };
+                return Err(
+                    format!("there is no {what} {idx} on {}", lane.label()).into()
+                );
+            }
+        }
+        let links: Vec<Option<u32>> = picks
+            .iter()
+            .map(|&(lane, idx)| {
+                if lane.kind == LaneKind::Subtitle {
+                    self.sub_lane(lane)[idx].link
+                } else {
+                    self.lane(lane)[idx].link
+                }
+            })
+            .collect();
+        self.snapshot();
+        let id = self.new_link();
+        // Whatever any pick was grouped with comes along, for [`group`]'s
+        // reason -- one id over the lot, not two groups sharing a member.
+        for data in &mut self.lanes {
+            for c in data.clips.iter_mut() {
+                if c.link.is_some() && links.contains(&c.link) {
+                    c.link = Some(id);
+                }
+            }
+            for s in data.subs.iter_mut() {
+                if s.link.is_some() && links.contains(&s.link) {
+                    s.link = Some(id);
+                }
+            }
+        }
+        // And the picks themselves, which a `place` may have left in no group.
+        // The lane seats are read before the walk, which holds the lanes.
+        let seats: Vec<(usize, bool)> = picks
+            .iter()
+            .map(|&(lane, _)| {
+                (
+                    self.index(lane).expect("checked above"),
+                    lane.kind == LaneKind::Subtitle,
+                )
+            })
+            .collect();
+        for (&(lane, idx), &(at, sub)) in picks.iter().zip(&seats) {
+            let _ = lane;
+            if sub {
+                self.lanes[at].subs[idx].link = Some(id);
+            } else {
+                self.lanes[at].clips[idx].link = Some(id);
+            }
+        }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
         Ok(())
     }
@@ -2841,40 +3049,23 @@ impl Project {
         // is the one thing a link may never mean. Refused rather than clamped:
         // the partner moves the same distance, so there is no room for it
         // anywhere on that lane.
-        if dest != held && members.iter().any(|&(l, _)| l == dest) {
+        if dest != held
+            && members
+                .clips
+                .iter()
+                .chain(&members.subs)
+                .any(|&(l, _)| l == dest)
+        {
             return false;
         }
         let want = i64::from(start) - i64::from(clip.start);
         // How far the group may travel, in timeline frames and signed: every
-        // member narrows it to the gap it is landing in, and what is left is
-        // what the pointer is clamped to.
-        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
-        for &(l, i) in &members {
-            let c = self.lanes[l].clips[i];
-            let land = if (l, i) == (held, idx) { dest } else { l };
-            // Which gap this member's walls are read off: its own place on the
-            // lane it stays on, and the frame the pointer named on the lane it
-            // is let go over.
-            let at = if land == l { c.start } else { start };
-            let (mut wall_lo, mut wall_hi) = (0, u32::MAX);
-            for (j, other) in self.lanes[land].clips.iter().enumerate() {
-                if members.contains(&(land, j)) {
-                    continue;
-                }
-                if other.start <= at && at < other.end() {
-                    return false;
-                }
-                match other.end() <= at {
-                    true => wall_lo = wall_lo.max(other.end()),
-                    false => wall_hi = wall_hi.min(other.start),
-                }
-            }
-            if wall_hi - wall_lo < c.frames() {
-                return false;
-            }
-            lo = lo.max(i64::from(wall_lo) - i64::from(c.start));
-            hi = hi.min(i64::from(wall_hi - c.frames()) - i64::from(c.start));
-        }
+        // member -- the clips and any caption grouped with them -- narrows it
+        // to the gap it is landing in, and what is left is what the pointer is
+        // clamped to.
+        let Some((lo, hi)) = self.move_room(&members, Some((held, idx, dest, start))) else {
+            return false;
+        };
         if lo > hi {
             return false;
         }
@@ -2883,10 +3074,14 @@ impl Project {
             return false;
         }
         self.snapshot();
-        for &(l, i) in &members {
+        for &(l, i) in &members.clips {
             let c = &mut self.lanes[l].clips[i];
             // In range by the walls above, which are `u32` frames throughout.
             c.start = (i64::from(c.start) + delta) as u32;
+        }
+        for &(l, i) in &members.subs {
+            let s = &mut self.lanes[l].subs[i];
+            s.start = (i64::from(s.start) + delta) as u32;
         }
         if dest != held {
             let clip = self.lanes[held].clips.remove(idx);
@@ -2895,12 +3090,91 @@ impl Project {
             clips.insert(at, clip);
         }
         debug_assert!(sorted_disjoint(&self.lanes[dest].clips));
-        debug_assert!(
-            members
-                .iter()
-                .all(|&(l, _)| sorted_disjoint(&self.lanes[l].clips))
-        );
+        debug_assert!(members
+            .clips
+            .iter()
+            .chain(&members.subs)
+            .all(|&(l, _)| {
+                sorted_disjoint(&self.lanes[l].clips) && subs_sorted_disjoint(&self.lanes[l].subs)
+            }));
         true
+    }
+
+    /// How far a group drag may travel, `(least, most)` in timeline frames and
+    /// signed: every member narrows the range to the gap it is landing in --
+    /// the clips against their lanes' clips and the captions against their
+    /// lanes' captions -- and what is left is what the pointer is clamped to.
+    /// `travelling` names the one member that changes lane, if any: the clip a
+    /// hand is carrying onto another track, whose walls are read on the lane it
+    /// is let go over at the frame the pointer named. `None` when a member has
+    /// no gap to land in at all.
+    fn move_room(
+        &self,
+        members: &Members,
+        travelling: Option<(usize, usize, usize, u32)>,
+    ) -> Option<(i64, i64)> {
+        let (mut lo, mut hi) = (i64::MIN, i64::MAX);
+        for &(l, i) in members.clips.iter().chain(&members.subs) {
+            let sub = members.subs.contains(&(l, i));
+            let (start, frames) = match self.lanes[l]
+                .clips
+                .get(i)
+                .filter(|_| !sub)
+                .map(|c| (c.start, c.frames()))
+            {
+                Some(pair) => pair,
+                None => {
+                    let s = self.lanes[l].subs.get(i)?;
+                    (s.start, s.frames)
+                }
+            };
+            let land = travelling
+                .filter(|&(fl, fi, ..)| (fl, fi) == (l, i))
+                .map_or(l, |(_, _, dest, _)| dest);
+            // Which gap this member's walls are read off: its own place on the
+            // lane it stays on, and the frame the pointer named on the lane it
+            // is let go over. A clip's neighbours are the clips of the lane it
+            // lands on and a caption's are its captions -- the two lists of one
+            // lane never meet.
+            let at = match travelling {
+                Some((fl, fi, _, asked)) if (fl, fi) == (l, i) && land != l => asked,
+                _ => start,
+            };
+            let (mut wall_lo, mut wall_hi) = (0, u32::MAX);
+            let neighbours: Vec<(u32, u32)> = if sub {
+                self.lanes[land]
+                    .subs
+                    .iter()
+                    .map(|s| (s.start, s.end()))
+                    .collect()
+            } else {
+                self.lanes[land]
+                    .clips
+                    .iter()
+                    .map(|c| (c.start, c.end()))
+                    .collect()
+            };
+            for (j, (other_start, other_end)) in neighbours.iter().enumerate() {
+                if members.clips.contains(&(land, j)) || members.subs.contains(&(land, j)) {
+                    continue;
+                }
+                if *other_start <= at && at < *other_end {
+                    // A head let go inside another placement, which a clamp
+                    // has no answer for: the drop is refused.
+                    return None;
+                }
+                match other_end <= &at {
+                    true => wall_lo = wall_lo.max(*other_end),
+                    false => wall_hi = wall_hi.min(*other_start),
+                }
+            }
+            if wall_hi - wall_lo < frames {
+                return None;
+            }
+            lo = lo.max(i64::from(wall_lo) - i64::from(start));
+            hi = hi.min(i64::from(wall_hi - frames) - i64::from(start));
+        }
+        Some((lo, hi))
     }
 
     /// Move one `edge` of the clip at `idx` of `lane` to timeline frame `to` --
@@ -2926,10 +3200,10 @@ impl Project {
     /// `PlaybackSession::trim_clip`, which fills it in). A source with no entry
     /// there may not grow at all.
     ///
-    /// Linked clips trim *together*, to one clamped edge: a link is one span on
-    /// however many lanes ([`links_are_consistent`]), so a picture trimmed away
-    /// from its sound would be a group no save could load. The room is therefore
-    /// what every member of the group has -- the tightest wall wins.
+    /// Linked placements trim *together*, by one delta: every member's same
+    /// edge moves the distance the dragged one did, clamped to the room its
+    /// own walls leave -- offsets between the members of a hand-built group
+    /// survive the trim, exactly as they survive a drag.
     ///
     /// `false`, changing nothing and costing no undo step, for an index that is
     /// not there and for an edge that is already where it was asked to go.
@@ -2956,64 +3230,130 @@ impl Project {
             return false;
         }
         // Worked out before anything moves: at a slow rate a room can be too
-        // narrow to hold even one source frame ([`Speed::fit`]), and a member
-        // that cannot fit must refuse the whole gesture rather than be given a
-        // range wider than its room -- which is the overlap the lane invariant
-        // exists to forbid. The walls below leave that room, so this is the
-        // backstop for a project that came in through another door.
+        // narrow to hold even one source frame ([`Speed::fit`]), and the
+        // dragged clip refusing to fit must refuse the whole gesture rather
+        // than be given a range wider than its room -- which is the overlap
+        // the lane invariant exists to forbid. The walls below leave that room,
+        // so this is the backstop for a project that came in through another
+        // door.
+        let room = match edge {
+            // The frames that stay play what they played, so what survives is
+            // measured from the *end*.
+            Edge::Start => clip.end() - to,
+            Edge::End => to - clip.start,
+        };
+        let Some(keep) = clip.speed.fit(room) else {
+            return false;
+        };
         let members = self.group_of(lane, idx).expect("checked above");
-        let mut fitted = Vec::with_capacity(members.len());
-        for &(l, i) in &members {
+        self.snapshot();
+        let still = self.is_still(&clip);
+        let held = self.index(lane).expect("checked above");
+        let c = &mut self.lanes[held].clips[idx];
+        match edge {
+            // A still has no earlier frame to walk an in-point back to --
+            // every frame of it is the same picture -- so its head grows
+            // *forward*: the range it plays is however long the new room is,
+            // anchored at the source's frame 0. Bounded by `lo`, which is where
+            // the cap in `source_frames` is applied.
+            Edge::Start if still => {
+                c.in_frame = 0;
+                c.out_frame = keep;
+                c.start = to;
+            }
+            Edge::Start => {
+                // Non-negative by `lo`, which is what keeps the in-point on the
+                // source.
+                c.in_frame = c.out_frame - keep.min(c.out_frame);
+                c.start = to;
+            }
+            // Never wider than the room the edge was clamped to: see
+            // [`Speed::fit`].
+            Edge::End => c.out_frame = c.in_frame + keep,
+        }
+        debug_assert!(sorted_disjoint(&self.lanes[held].clips));
+        self.follow_group(&members, &(held, idx), edge, i64::from(to) - i64::from(at), source_frames);
+        true
+    }
+
+    /// The rest of a group after one member's `edge` has moved by `delta`:
+    /// every other member's same edge moves the same distance, clamped to the
+    /// room its own walls leave -- a clip's against its lane and its source,
+    /// a caption's against its own lane, its window following by the
+    /// placement's own proportion. The undo step is the caller's: this is the
+    // second half of one edit, not an edit of its own.
+    fn follow_group(
+        &mut self,
+        members: &Members,
+        dragged: &(usize, usize),
+        edge: Edge,
+        delta: i64,
+        source_frames: &[u32],
+    ) {
+        for &(l, i) in &members.clips {
+            if (l, i) == *dragged {
+                continue;
+            }
             let c = self.lanes[l].clips[i];
+            let at = match edge {
+                Edge::Start => c.start,
+                Edge::End => c.end(),
+            };
+            let (lo, hi) = self.clip_room(l, i, edge, source_frames);
+            let to = (i64::from(at) + delta).clamp(i64::from(lo), i64::from(hi)) as u32;
+            if to == at {
+                continue;
+            }
             let room = match edge {
-                // The frames that stay play what they played, so what survives
-                // is measured from the *end*.
                 Edge::Start => c.end() - to,
                 Edge::End => to - c.start,
             };
-            match c.speed.fit(room) {
-                // Not clamped to the clip's current length: an out-point trim
-                // *grows* the range, and the source wall in `hi` is what bounds
-                // that. The in-point's own clamp is at the write below.
-                Some(keep) => fitted.push(keep),
-                None => return false,
-            }
-        }
-        self.snapshot();
-        for (&(l, i), keep) in members.iter().zip(fitted) {
+            let Some(keep) = c.speed.fit(room) else {
+                continue;
+            };
             let still = self.is_still(&self.lanes[l].clips[i]);
             let c = &mut self.lanes[l].clips[i];
             match edge {
-                // A still has no earlier frame to walk an in-point back to --
-                // every frame of it is the same picture -- so its head grows
-                // *forward*: the range it plays is however long the new room
-                // is, anchored at the source's frame 0. Bounded by `lo`, which
-                // is where the cap in `source_frames` is applied.
                 Edge::Start if still => {
                     c.in_frame = 0;
                     c.out_frame = keep;
                     c.start = to;
                 }
                 Edge::Start => {
-                    // Non-negative by `lo`, which is what keeps the in-point on
-                    // the source.
                     c.in_frame = c.out_frame - keep.min(c.out_frame);
                     c.start = to;
                 }
-                // Never wider than the room the edge was clamped to: see
-                // [`Speed::fit`].
                 Edge::End => c.out_frame = c.in_frame + keep,
             }
             debug_assert!(sorted_disjoint(&self.lanes[l].clips));
         }
-        true
+        for &(l, i) in &members.subs {
+            if (l, i) == *dragged {
+                continue;
+            }
+            let s = self.lanes[l].subs[i];
+            let at = match edge {
+                Edge::Start => s.start,
+                Edge::End => s.end(),
+            };
+            let (lo, hi) = sub_edge_room(&self.lanes[l].subs, i, edge);
+            let to = (i64::from(at) + delta).clamp(i64::from(lo), i64::from(hi)) as u32;
+            if to == at {
+                continue;
+            }
+            write_sub_edge(&mut self.lanes[l].subs[i], edge, to);
+            debug_assert!(subs_sorted_disjoint(&self.lanes[l].subs));
+        }
     }
 
     /// How far that edge may travel, `(first, last)` timeline frame inclusive --
     /// the walls [`trim`](Project::trim) clamps to, without moving anything.
     /// What a front-end drawing the box *during* a drag asks, so the live width
     /// is the width the release will commit and an edge stops under the pointer
-    /// rather than snapping back. `None` for an index that is not there.
+    /// rather than snapping back. The **clip's own** walls: the rest of its
+    /// group follows by the same delta within their own ([`follow_group`]), so
+    /// what is drawn for the dragged edge is what its own clip will commit.
+    /// `None` for an index that is not there.
     pub fn trim_room(
         &self,
         lane: Lane,
@@ -3021,71 +3361,80 @@ impl Project {
         edge: Edge,
         source_frames: &[u32],
     ) -> Option<(u32, u32)> {
-        let (mut lo, mut hi) = (u32::MIN, u32::MAX);
-        for (l, i) in self.group_of(lane, idx)? {
-            let clips = &self.lanes[l].clips;
-            let c = clips[i];
-            let (member_lo, member_hi) = match edge {
-                Edge::Start => (
-                    // Back to the source's own first frame -- as many *timeline*
-                    // frames as that head is worth at the clip's rate, which at
-                    // real time is the head itself -- and never over the clip in
-                    // front of it. Saturating because a clip may hold *more*
-                    // head than the timeline has room for -- a ripple delete
-                    // slides a clip back to frame 0 with its in-point wherever
-                    // the cut left it -- and frame 0 is the other wall.
-                    //
-                    // A still is measured from its *tail* instead: it has no
-                    // in-point worth the name (every frame the same picture), so
-                    // its head reaches exactly as far as its tail does -- out to
-                    // the length the caller's table gives it, whole. Measured
-                    // from the in-point it would have no head room at all, which
-                    // is a placed picture whose left edge cannot be dragged out.
-                    // No entry in the table means no growth, as it does at the
-                    // other end.
-                    if self.is_still(&c) {
-                        c.end().saturating_sub(
-                            c.speed
-                                .room(source_frames.get(c.source).copied().unwrap_or(c.len())),
-                        )
-                    } else {
-                        c.start.saturating_sub(c.speed.room(c.in_frame))
-                    }
-                    .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
-                    // One *frame of clip* always survives, and at a rate below
-                    // real time one frame of clip is several frames of timeline
-                    // ([`Speed::room`]): an edge dragged closer than that would
-                    // ask for a range no source frame fits in. At real time this
-                    // is `end - 1`, unchanged.
-                    c.end() - c.speed.room(1),
-                ),
-                Edge::End => (
-                    // ...and the same wall from the other end: the shortest this
-                    // clip can be is the room one source frame of it takes.
-                    c.start + c.speed.room(1),
-                    // Out to whatever is left of the source -- again in timeline
-                    // frames, at this clip's rate -- and never over the clip
-                    // behind it.
-                    c.start
-                        .saturating_add(
-                            c.speed.room(
-                                source_frames
-                                    .get(c.source)
-                                    .copied()
-                                    .unwrap_or(c.out_frame)
-                                    .saturating_sub(c.in_frame),
-                            ),
-                        )
-                        .min(clips.get(i + 1).map_or(u32::MAX, |n| n.start)),
-                ),
-            };
-            lo = lo.max(member_lo);
-            hi = hi.min(member_hi);
-        }
+        let l = self.index(lane)?;
+        (idx < self.lanes[l].clips.len()).then(|| self.clip_room(l, idx, edge, source_frames))
+    }
+
+    /// [`trim_room`](Project::trim_room) for a clip the caller already holds by
+    /// its lane's storage index: the one wall computation, asked for the clip
+    /// itself and for each member a group trim carries.
+    fn clip_room(
+        &self,
+        l: usize,
+        i: usize,
+        edge: Edge,
+        source_frames: &[u32],
+    ) -> (u32, u32) {
+        let clips = &self.lanes[l].clips;
+        let c = clips[i];
+        let (lo, hi) = match edge {
+            Edge::Start => (
+                // Back to the source's own first frame -- as many *timeline*
+                // frames as that head is worth at the clip's rate, which at
+                // real time is the head itself -- and never over the clip in
+                // front of it. Saturating because a clip may hold *more*
+                // head than the timeline has room for -- a ripple delete
+                // slides a clip back to frame 0 with its in-point wherever
+                // the cut left it -- and frame 0 is the other wall.
+                //
+                // A still is measured from its *tail* instead: it has no
+                // in-point worth the name (every frame the same picture), so
+                // its head reaches exactly as far as its tail does -- out to
+                // the length the caller's table gives it, whole. Measured
+                // from the in-point it would have no head room at all, which
+                // is a placed picture whose left edge cannot be dragged out.
+                // No entry in the table means no growth, as it does at the
+                // other end.
+                if self.is_still(&c) {
+                    c.end().saturating_sub(
+                        c.speed
+                            .room(source_frames.get(c.source).copied().unwrap_or(c.len())),
+                    )
+                } else {
+                    c.start.saturating_sub(c.speed.room(c.in_frame))
+                }
+                .max(i.checked_sub(1).map_or(0, |p| clips[p].end())),
+                // One *frame of clip* always survives, and at a rate below
+                // real time one frame of clip is several frames of timeline
+                // ([`Speed::room`]): an edge dragged closer than that would
+                // ask for a range no source frame fits in. At real time this
+                // is `end - 1`, unchanged.
+                c.end() - c.speed.room(1),
+            ),
+            Edge::End => (
+                // ...and the same wall from the other end: the shortest this
+                // clip can be is the room one source frame of it takes.
+                c.start + c.speed.room(1),
+                // Out to whatever is left of the source -- again in timeline
+                // frames, at this clip's rate -- and never over the clip
+                // behind it.
+                c.start
+                    .saturating_add(
+                        c.speed.room(
+                            source_frames
+                                .get(c.source)
+                                .copied()
+                                .unwrap_or(c.out_frame)
+                                .saturating_sub(c.in_frame),
+                        ),
+                    )
+                    .min(clips.get(i + 1).map_or(u32::MAX, |n| n.start)),
+            ),
+        };
         // `hi.max(lo)`: for a clip the invariants hold for, the range always
         // contains the edge's own place, and a caller's wrong `source_frames`
         // must not become an empty range (or a panicking `clamp`) here.
-        Some((lo, hi.max(lo)))
+        (lo, hi.max(lo))
     }
 
     /// Whether `clip` plays a still image ([`crate::is_image`]): a file whose
@@ -3098,22 +3447,38 @@ impl Project {
             .is_some_and(|s| crate::is_image(&s.path))
     }
 
-    /// The clips that move as one with the clip at `idx` of `lane` -- itself and
-    /// whatever carries its link on the other lanes -- as `(lane storage index,
-    /// clip index)` pairs. `None` for an index that is not there.
-    fn group_of(&self, lane: Lane, idx: usize) -> Option<Vec<(usize, usize)>> {
-        let clip = *self.lane(lane).get(idx)?;
-        Some(match clip.link {
-            Some(link) => self
-                .lanes
-                .iter()
-                .enumerate()
-                .filter_map(|(l, data)| {
-                    Some((l, data.clips.iter().position(|c| c.link == Some(link))?))
-                })
-                .collect(),
-            None => vec![(self.index(lane).expect("the clip was found on it"), idx)],
-        })
+    /// The placements that move as one with the one at `idx` of `lane` --
+    /// itself and whatever carries its link, on the media lanes and the
+    /// subtitle ones alike. `None` for an index that is not there.
+    fn group_of(&self, lane: Lane, idx: usize) -> Option<Members> {
+        let sub = lane.kind == LaneKind::Subtitle;
+        let link = if sub {
+            self.sub_lane(lane).get(idx)?.link
+        } else {
+            self.lane(lane).get(idx)?.link
+        };
+        let mut members = Members::default();
+        match link {
+            Some(link) => {
+                for (l, data) in self.lanes.iter().enumerate() {
+                    if let Some(i) = data.clips.iter().position(|c| c.link == Some(link)) {
+                        members.clips.push((l, i));
+                    }
+                    if let Some(i) = data.subs.iter().position(|s| s.link == Some(link)) {
+                        members.subs.push((l, i));
+                    }
+                }
+            }
+            None => {
+                let l = self.index(lane).expect("the placement was found on it");
+                if sub {
+                    members.subs.push((l, idx));
+                } else {
+                    members.clips.push((l, idx));
+                }
+            }
+        }
+        Some(members)
     }
 
     /// Insert `clip` into the first lane of each kind at `timeline_frame` as one
@@ -3322,10 +3687,10 @@ impl Project {
         }
     }
 
-    /// The law a scoped ripple lives under: **a link is one span on however
-    /// many lanes**, so a batch that moves one half of a take and not the other
-    /// would leave a group whose halves disagree -- a project no save could
-    /// load ([`links_are_consistent`]).
+    /// The law a scoped ripple lives under: **a group travels as one**, so a
+    /// batch that moves one half of a take and not the other would leave the
+    /// halves disagreeing about where they stand -- an offset no hand asked
+    /// for, and the reason the take's lanes have to be scoped together.
     ///
     /// Refused by name rather than widened silently. Widening would edit a
     /// track the user did not scope, which is exactly the surprise scoping
@@ -3511,15 +3876,64 @@ impl Project {
         self.delete_in(Lane::V1, idx)
     }
 
-    /// [`delete`](Project::delete) for the lane the clip was picked on: the
-    /// clip's own span is cut out of *every* lane, so a take deletes whole from
-    /// whichever half of it was clicked. `false` for a bad index, and for a lane
-    /// that is not there.
+    /// [`delete`](Project::delete) for the lane the clip was picked on. A clip
+    /// in no group (or a group of one, which is the same thing to a delete) is
+    /// what it always was: its own span cut out of *every* lane, so the
+    /// timeline closes up under it. A clip in a group takes the group with it,
+    /// each member by its **own** span and on its **own** lane -- the members
+    /// keep their offsets, so their spans may disagree, and the lanes may end
+    /// up out of step with each other, which is inherent to a hand-built group
+    /// and one undo away. The caption members lift rather than ripple, for the
+    /// reason a caption's own delete always lifted: a subtitle lane never
+    /// slides, or the words after the cut would stop matching the ones before
+    /// it. One snapshot for the whole group, so one [`Project::undo`] puts it
+    /// back. `false` for a bad index, and for a lane that is not there.
+    /// Changes the mapping: the caller must reseek.
     pub fn delete_in(&mut self, lane: Lane, idx: usize) -> bool {
+        let Some(members) = self.group_of(lane, idx) else {
+            return false;
+        };
+        if !members.alone() {
+            return self.delete_members(&members);
+        }
         let Some(clip) = self.lane(lane).get(idx).copied() else {
             return false;
         };
         self.ripple_delete(clip.start, clip.frames())
+    }
+
+    /// [`delete_in`](Project::delete_in) for the caption the pick named: a
+    /// caption in no group lifts, exactly as its own key always made it
+    /// ([`Project::lift_sub`]), and a caption in a group takes the group with
+    /// it by [`delete_in`](Project::delete_in)'s rule -- the media members'
+    /// spans out of their own lanes, the other captions lifted. `false` for a
+    /// bad index.
+    pub fn delete_sub_in(&mut self, lane: Lane, idx: usize) -> bool {
+        let Some(members) = self.group_of(lane, idx) else {
+            return false;
+        };
+        if !members.alone() {
+            return self.delete_members(&members);
+        }
+        self.lift_sub(lane, idx)
+    }
+
+    /// The one whole-group delete both doors land in: every media member's own
+    /// span cut out of its own lane and the hole closed there -- and nothing
+    /// else on another lane moves, which is what keeps one member's ripple from
+    /// dragging another member's lane out from under it -- and every caption
+    /// member lifted. One snapshot, one undo step.
+    fn delete_members(&mut self, members: &Members) -> bool {
+        self.snapshot();
+        for &(l, i) in &members.clips {
+            let c = self.lanes[l].clips[i];
+            ripple(&mut self.lanes, &[l], c.start, c.frames());
+        }
+        for &(l, i) in members.subs.iter().rev() {
+            self.lanes[l].subs.remove(i);
+        }
+        debug_assert!(links_are_consistent(&self.lanes).is_ok());
+        true
     }
 
     /// Restore every lane from before the last successful edit -- the clips and
@@ -3732,31 +4146,6 @@ impl Project {
         id
     }
 
-    /// One fresh group id per *distinct* key, in lane order, and `None` where a
-    /// lane has no key -- how [`split`](Project::split) and
-    /// [`regroup`](Project::regroup) hand out ids across however many lanes.
-    /// Lanes sharing a key end up sharing an id, which is exactly the rule
-    /// [`links_are_consistent`] enforces: one id, one span.
-    fn group_ids<K: PartialEq>(&mut self, keys: &[Option<K>]) -> Vec<Option<u32>> {
-        // Linear, over a handful of lanes: a hash of a lane list would cost
-        // more than it saves and would not be deterministic for free.
-        let mut seen: Vec<(&K, u32)> = Vec::new();
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            out.push(
-                key.as_ref()
-                    .map(|k| match seen.iter().find(|(other, _)| *other == k) {
-                        Some(&(_, id)) => id,
-                        None => {
-                            let id = self.new_link();
-                            seen.push((k, id));
-                            id
-                        }
-                    }),
-            );
-        }
-        out
-    }
 }
 
 /// The handle of every lane, in storage order -- the one definition of what
@@ -3898,6 +4287,10 @@ fn sub_clear(subs: &mut Vec<SubClip>, start: u32, end: u32) {
             out.push(SubClip {
                 frames: start - s.start,
                 out_us: s.window_at(start),
+                // Both pieces lose the group id, for [`clear`]'s reason: one
+                // id on two boxes of one lane is the one thing it may never
+                // mean.
+                link: None,
                 ..s
             });
         }
@@ -3906,6 +4299,7 @@ fn sub_clear(subs: &mut Vec<SubClip>, start: u32, end: u32) {
                 start: end,
                 frames: s.end() - end,
                 in_us: s.window_at(end),
+                link: None,
                 ..s
             });
         }
@@ -3924,6 +4318,7 @@ fn sub_open_room(subs: &mut Vec<SubClip>, at: u32, len: u32) {
         subs[idx] = SubClip {
             frames: at - s.start,
             out_us: cut,
+            link: None,
             ..s
         };
         subs.insert(
@@ -3932,6 +4327,7 @@ fn sub_open_room(subs: &mut Vec<SubClip>, at: u32, len: u32) {
                 start: at,
                 frames: s.end() - at,
                 in_us: cut,
+                link: None,
                 ..s
             },
         );
@@ -3952,15 +4348,56 @@ fn sub_joinable(subs: &[SubClip], frame: u32) -> Option<usize> {
         .then_some(idx)
 }
 
+/// How far one `edge` of the caption at `idx` may travel against its own lane's
+/// walls alone: the frame arithmetic of [`Project::trim_sub_room`] without the
+/// rate, which a caption *following* a group's trim does not have to be exact
+/// about -- its own walls, its own one surviving frame, and nothing that needs
+/// a clock.
+fn sub_edge_room(subs: &[SubClip], idx: usize, edge: Edge) -> (u32, u32) {
+    let s = &subs[idx];
+    match edge {
+        Edge::Start => (
+            idx.checked_sub(1).map_or(0, |p| subs[p].end()),
+            s.end() - 1,
+        ),
+        Edge::End => (s.start + 1, subs.get(idx + 1).map_or(u32::MAX, |n| n.start)),
+    }
+}
+
+/// Move one `edge` of `s` to timeline frame `to`, its window following by the
+/// placement's own proportion -- [`SubClip::window_at`]'s arithmetic, run
+/// forwards and backwards. The caption a group's trim is carrying has no rate
+/// of its own and needs none: what one frame of it is worth in microseconds is
+/// the window it already shows over the frames it already takes.
+fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
+    let per_frame = s.window_us() / i64::from(s.frames.max(1));
+    let by = |from: u32, to: u32| per_frame.saturating_mul(i64::from(to) - i64::from(from));
+    match edge {
+        Edge::Start => {
+            s.in_us = (s.in_us + by(s.start, to)).clamp(0, s.out_us - 1);
+            s.frames = s.end() - to;
+            s.start = to;
+        }
+        Edge::End => {
+            s.out_us = (s.out_us + by(s.end(), to)).max(s.in_us + 1);
+            s.frames = to - s.start;
+        }
+    }
+    debug_assert!(s.frames >= 1 && s.out_us > s.in_us && s.in_us >= 0);
+}
+
 /// The grouping invariant, checked in release at [`Project::from_parts`] and
-/// asserted by the tests after every edit: a link id names **at most one** clip
-/// per lane, and every clip carrying it covers the same timeline span -- that is
-/// all "these move together" can mean.
+/// asserted by the tests after every edit: a link id names **at most one**
+/// placement per lane -- a clip on a media lane or a caption on a subtitle
+/// one, whichever carries it. That is all "these move together" can mean now
+/// that a group is assembled by hand: the members keep their own spans and
+/// their own offsets, and what binds them is the id alone.
 ///
-/// Deliberately *not* a pairing of two lanes: with N lanes a take may run on
-/// `V1`, `V2` and `A1` at once, and the rule that makes an id meaningful is span
-/// identity, not which lane (or which `ord`) the partner sits on. Two lanes are
-/// the case where it reads as "the picture and its sound".
+/// Deliberately *not* a pairing of two lanes, and never a span rule: with N
+/// lanes a group may run on `V1`, `A1` and a subtitle lane at once, and two
+/// placements of one group may cover different frames -- the offset-preserving
+/// group a hand builds with [`Project::group_all`], which a drag moves by one
+/// delta rather than by one span.
 ///
 /// A link no other lane carries is legal and is not an error: lifting one half
 /// of a group ([`Project::lift`]) leaves exactly that, and a save of that
@@ -3976,26 +4413,17 @@ fn links_are_consistent(lanes: &[LaneData]) -> crate::Result<()> {
                 );
             }
         }
-    }
-    // First lane to carry an id fixes the span every other lane must agree on.
-    let mut seen: Vec<(u32, Lane, u32, u32)> = Vec::new();
-    for (data, &lane) in lanes.iter().zip(&handles) {
-        for c in &data.clips {
-            let Some(id) = c.link else { continue };
-            match seen.iter().find(|(other, ..)| *other == id) {
-                Some(&(_, first, start, end)) => {
-                    if (start, end) != (c.start, c.end()) {
-                        return Err(format!(
-                            "link {id} covers [{start}, {end}) in {} and [{}, {}) in {}",
-                            first.label(),
-                            c.start,
-                            c.end(),
-                            lane.label()
-                        )
-                        .into());
-                    }
-                }
-                None => seen.push((id, lane, c.start, c.end())),
+        // ...and the same for the captions, in their own list on the same lane:
+        // a subtitle lane holds no `Clip`, so this is the only list a caption's
+        // id could be doubled on.
+        for (i, s) in data.subs.iter().enumerate() {
+            let Some(id) = s.link else { continue };
+            if data.subs[..i].iter().any(|prev| prev.link == Some(id)) {
+                return Err(format!(
+                    "link {id} names two captions in the {} lane",
+                    lane.label()
+                )
+                .into());
             }
         }
     }
@@ -4372,6 +4800,258 @@ mod tests {
         assert!(p.undo());
         assert!(p.undo());
         assert_eq!(shape(&p), before);
+    }
+
+    /// The caption a hand groups: `group_all` over clips *and* a caption, the
+    /// mates riding along, the offsets kept, the refusals in words.
+    #[test]
+    fn a_hand_built_group_holds_clips_and_a_caption() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let v2 = p.add_lane(LaneKind::Video);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        // A layer at its own offset, and a caption over the head of the take.
+        assert!(p.place(v2, 2, clip(2, 0, 7, 0)));
+        p.place_sub(s1, 0, caption(0, 6)).expect("placed");
+
+        // Too few, one lane twice, and an index that is not there: words, no
+        // snapshot.
+        let history = p.history.len();
+        assert!(p.group_all(&[]).unwrap_err().to_string().contains("two placements or more"));
+        assert!(p
+            .group_all(&[(Lane::V1, 0), (Lane::V1, 0)])
+            .unwrap_err()
+            .to_string()
+            .contains("V1 is picked twice"));
+        assert!(p
+            .group_all(&[(Lane::V1, 0), (s1, 9)])
+            .unwrap_err()
+            .to_string()
+            .contains("no subtitle 9"));
+        assert_eq!(p.history.len(), history, "refusals cost no undo step");
+
+        // The group: the picture, the layer, and the caption -- and the sound
+        // the picture was already grouped with comes along unasked.
+        p.group_all(&[(Lane::V1, 0), (v2, 0), (s1, 0)])
+            .expect("three picks, three lanes");
+        let id = p.lane(Lane::V1)[0].link.expect("grouped");
+        for lane in [Lane::V1, Lane::A1, v2] {
+            assert_eq!(p.lane(lane)[0].link, Some(id), "{} rides along", lane.label());
+        }
+        assert_eq!(p.sub_lane(s1)[0].link, Some(id), "the caption is a member");
+        assert_eq!(p.sub_lane(s1)[0].frames, 6, "its own span, kept");
+        assert_eq!(p.lane(v2)[0].start, 2, "the layer's offset, kept");
+        assert!(links_are_consistent(&p.lanes).is_ok());
+        assert_eq!(p.history.len(), history + 1, "one snapshot for the group");
+
+        // ...and one undo takes it apart again.
+        assert!(p.undo());
+        assert_eq!(p.sub_lane(s1)[0].link, None, "the caption is loose again");
+
+        // Detach names a caption like it names a clip: every member an id of
+        // its own, which is never `None` (see `ungroup`).
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("two picks");
+        assert!(p.ungroup(s1, 0));
+        let (loose_sub, loose_clip) = (p.sub_lane(s1)[0].link, p.lane(Lane::V1)[0].link);
+        assert!(loose_sub.is_some() && loose_clip.is_some());
+        assert_ne!(loose_sub, loose_clip);
+        assert!(links_are_consistent(&p.lanes).is_ok());
+    }
+
+    /// A split hands the caption of a group the same ids it hands the clips:
+    /// the left halves keep the group, the right halves share a fresh one.
+    #[test]
+    fn a_split_cuts_a_grouped_caption_with_its_clips() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 0, caption(0, 9)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        let take = p.lane(Lane::V1)[0].link.expect("the group id");
+
+        assert!(p.split(4));
+        let (left, right) = (p.sub_lane(s1)[0], p.sub_lane(s1)[1]);
+        assert_eq!(left.link, Some(take), "the caption's head keeps the group");
+        assert_eq!(left.frames, 4);
+        assert_eq!(
+            right.link,
+            p.lane(Lane::V1)[1].link,
+            "the caption's tail shares the clips' fresh id"
+        );
+        assert_ne!(right.link, Some(take));
+        assert!(links_are_consistent(&p.lanes).is_ok());
+
+        // Regroup at the seam restores the take, caption included.
+        assert!(p.regroup(4));
+        assert_eq!(p.sub_lane(s1).len(), 1, "the caption rejoined");
+        assert_eq!(p.sub_lane(s1)[0].link, Some(take));
+    }
+
+    /// Deleting a member of a hand-built group takes the group: each media
+    /// member's own span out of its own lane, the captions lifted -- the lanes
+    /// may end up out of step, which is what one undo restores together.
+    #[test]
+    fn deleting_a_grouped_clip_ripples_each_lane_alone_and_lifts_the_captions() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 2, caption(2, 4)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        // A neighbour on a lane the group does not touch.
+        let v2 = p.add_lane(LaneKind::Video);
+        assert!(p.place(v2, 10, clip(10, 0, 3, 0)));
+
+        // By the picture or by the caption, the same whole-group delete.
+        assert!(p.delete_sub_in(s1, 0));
+        assert!(p.lane(Lane::V1).is_empty(), "the take's span left V1");
+        assert!(p.sub_lane(s1).is_empty(), "the caption lifted");
+        assert_eq!(p.lane(v2)[0].start, 10, "a lane the group does not touch stays");
+        assert!(links_are_consistent(&p.lanes).is_ok());
+        assert!(p.undo(), "one step puts the group back");
+        assert_eq!(p.sub_lane(s1)[0].start, 2, "offsets and all");
+    }
+
+    /// Dragging a grouped caption carries its clips, one delta for all of them
+    /// -- and a caption in no group refuses an overlap exactly as it always did.
+    #[test]
+    fn dragging_a_grouped_caption_carries_its_group() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 2, caption(2, 4)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+
+        // Same lane, further along: everyone moves by the same eight frames.
+        p.move_sub(s1, 0, s1, 10).expect("room for all of it");
+        assert_eq!(p.sub_lane(s1)[0].start, 10);
+        assert_eq!(p.lane(Lane::V1)[0].start, 8, "the clip follows by the delta");
+        assert!(links_are_consistent(&p.lanes).is_ok());
+
+        // ...and an ungrouped caption is the caption it always was.
+        assert!(p.ungroup(s1, 0));
+        let mut q = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let s1 = q.add_lane(LaneKind::Subtitle);
+        q.place_sub(s1, 0, caption(0, 4)).expect("placed");
+        q.place_sub(s1, 5, caption(5, 4)).expect("placed");
+        assert!(q
+            .move_sub(s1, 0, s1, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("already covers"));
+    }
+
+    /// A trim carries a group's caption by the same delta as its clips, clamped
+    /// to the caption's own walls -- the offsets between the members survive.
+    #[test]
+    fn trimming_a_grouped_clip_carries_the_caption_by_the_same_delta() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 9).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        // The caption sits two frames into the take and ends one early. The
+        // source runs past the clip, or there is no tail to pull out.
+        let src = &[20];
+        p.place_sub(s1, 2, caption(2, 6)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+
+        // The tail goes out by three: the clip to 12, the caption to 11.
+        assert!(p.trim(Lane::V1, 0, Edge::End, 12, src));
+        assert_eq!(p.lane(Lane::V1)[0].end(), 12);
+        assert_eq!(
+            (p.sub_lane(s1)[0].start, p.sub_lane(s1)[0].end()),
+            (2, 11),
+            "the caption follows by the delta"
+        );
+        assert!(p.sub_lane(s1)[0].out_us > p.sub_lane(s1)[0].in_us);
+
+        // The head comes in by two: everyone's start moves two along.
+        assert!(p.trim(Lane::V1, 0, Edge::Start, 2, src));
+        assert_eq!(p.sub_lane(s1)[0].start, 4, "the offset is kept");
+        assert!(links_are_consistent(&p.lanes).is_ok());
     }
 
     #[test]
@@ -5944,13 +6624,15 @@ mod tests {
     }
 
     /// The grouping rules, at the untrusted door and after every edit that can
-    /// touch a link. A link id is at most one clip per lane and, wherever it is
-    /// carried, one span -- and no sequence of edits may produce otherwise,
-    /// because what an edit produces is what a save writes and a load reads.
+    /// touch a link. A link id is at most one placement per lane -- a clip or a
+    /// caption, whichever carries it -- and no sequence of edits may produce
+    /// otherwise, because what an edit produces is what a save writes and a load
+    /// reads.
     ///
-    /// Amended for the lane model: the two errors name their lane `V1`/`A1`
-    /// rather than "video"/"audio", because with N lanes "the video lane" is no
-    /// longer a lane. Same causes, same door, same claim.
+    /// Amended for the offset-preserving group: the members keep their own
+    /// spans, so two placements of one id covering different frames is *legal*
+    /// -- it is what a hand-built group is -- and the only refusal left is the
+    /// doubled id inside one lane.
     #[test]
     fn a_link_id_is_never_two_clips_of_one_lane() {
         let sources = vec![Source::new(FILE, 0)];
@@ -5966,7 +6648,7 @@ mod tests {
             speed: Speed::NORMAL,
         };
 
-        // The door: named errors, one per cause.
+        // The door: a doubled id inside one lane, refused by name.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
             Project::from_parts(sources.clone(), two(video, audio), Vec::new(), Vec::new())
                 .expect_err("refused")
@@ -5977,11 +6659,34 @@ mod tests {
                 .contains("link 7 names two clips in the V1 lane"),
             "a duplicate id inside one lane is refused by name"
         );
-        assert!(
-            err(vec![linked(0, 0, 5, 2)], vec![linked(0, 0, 3, 2)])
-                .contains("link 2 covers [0, 5) in V1 and [0, 3) in A1"),
-            "a pair that does not cover one span is refused by name"
+        // ...and the same doubling on a subtitle lane, in its own words: a
+        // caption is the other placement an id may name.
+        let caption = |start: u32, frames: u32, link| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: Some(link),
+        };
+        let subs = LaneData {
+            clips: Vec::new(),
+            subs: vec![caption(0, 3, 7), caption(4, 3, 7)],
+            ..LaneData::new(LaneKind::Subtitle, Vec::new())
+        };
+        assert_eq!(
+            links_are_consistent(&[subs]).unwrap_err().to_string(),
+            "link 7 names two captions in the S1 lane"
         );
+        // A pair covering *different* frames is legal now: the members of a
+        // hand-built group keep their own spans, and what binds them is the id.
+        let apart = Project::from_parts(
+            sources.clone(),
+            two(vec![linked(0, 0, 5, 2)], vec![linked(0, 0, 3, 2)]),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(apart.is_ok(), "offsets within one group load: {apart:?}");
         // A one-sided link is *not* an error: it is what a lift leaves behind.
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0));
@@ -6646,81 +7351,65 @@ mod tests {
         assert_eq!(shape(&p), vec![before[0].clone(), before[1].clone(), over]);
     }
 
-    /// The grouping rule across more than two lanes: a link id is one *span*,
-    /// on however many lanes carry it -- not a video/audio pair and not a
-    /// pairing by `ord`. So a split shares an id with every lane whose half
-    /// lines up, and gives its own to every lane whose half does not.
+    /// The grouping rule across more than two lanes, under the offset model: a
+    /// split *keeps* the group on the left halves and hands the right halves of
+    /// that group one fresh id of their own -- a clip in no group comes out of
+    /// the cut in none. So a take cut apart is two takes, one per side, and a
+    /// lane that was never part of it stays out of both.
     #[test]
-    fn a_group_id_is_one_span_across_every_lane() {
+    fn a_split_keeps_the_left_group_and_shares_a_fresh_right_one() {
         let mut p = Project::single(FILE, 9);
+        let take = p.clips()[0].link.expect("a fresh project is one take");
         let v2 = p.add_lane(LaneKind::Video);
-        assert!(p.place(v2, 0, clip(0, 0, 9, 0)), "three lanes, one span");
+        assert!(p.place(v2, 0, clip(0, 0, 9, 0)), "a placement joins no group");
         assert!(p.split(4));
         let side = |p: &Project, i: usize| -> Vec<Option<u32>> {
             p.lanes().into_iter().map(|l| p.lane(l)[i].link).collect()
         };
         let (left, right) = (side(&p, 0), side(&p, 1));
-        assert!(
-            left[0].is_some() && left.iter().all(|id| *id == left[0]),
-            "one id for three left halves: {left:?}"
+        // The lanes in order are V1, A1, V2: the take's two keep its id on the
+        // left, and the placed clip never had one for the cut to keep.
+        assert_eq!(
+            left,
+            vec![Some(take), Some(take), None],
+            "the left halves keep the take"
         );
-        assert!(right.iter().all(|id| *id == right[0]), "{right:?}");
-        assert_ne!(left[0], right[0], "the halves are no longer one take");
+        // ...and the right halves of that take are one fresh group.
+        assert_eq!(right[0], right[1]);
+        assert_ne!(right[0], Some(take));
+        assert_eq!(right[2], None, "an unlinked lane stays unlinked");
         invariants_hold(&p, "split across three lanes");
 
-        // V2 ends early: same start, so the left halves are one take; different
-        // end, so the right halves cannot be.
+        // V2 ends early: the left halves still keep what each clip carried --
+        // the take on V1 and A1, nothing on V2 -- and the fresh right id is
+        // shared by exactly the take's lanes.
         let mut p = Project::single(FILE, 9);
         let v2 = p.add_lane(LaneKind::Video);
         assert!(p.place(v2, 0, clip(0, 0, 6, 0)));
         assert!(p.split(3));
-        assert_eq!(p.lane(Lane::V1)[0].link, p.lane(v2)[0].link, "same [0, 3)");
-        assert_ne!(
-            p.lane(Lane::V1)[1].link,
-            p.lane(v2)[1].link,
-            "[3,9) vs [3,6)"
-        );
+        assert_eq!(p.lane(Lane::V1)[0].link, Some(take));
+        assert_eq!(p.lane(v2)[0].link, None, "[0, 3) of a placement");
         assert_eq!(p.lane(Lane::V1)[1].link, p.lane(Lane::A1)[1].link);
+        assert_eq!(p.lane(v2)[1].link, None, "[3, 6) of a placement");
         invariants_hold(&p, "split where one lane ends early");
 
-        // The inverse rejoins all three, and groups them the same way.
+        // The inverse rejoins each lane into the group its left half kept.
         assert!(p.regroup(3));
         assert_eq!(p.lane(Lane::V1)[0].link, p.lane(Lane::A1)[0].link);
-        assert_ne!(
-            p.lane(Lane::V1)[0].link,
-            p.lane(v2)[0].link,
-            "V2 rejoins into a span of its own"
-        );
-        invariants_hold(&p, "regroup across three lanes");
-
-        // ...and the rule is enforced, not merely produced: two video lanes
-        // carrying one id over two spans is refused, by lane name.
-        let linked = |out_frame, link| Clip {
-            start: 0,
-            in_frame: 0,
-            out_frame,
-            source: 0,
-            link: Some(link),
-            eq: None,
-            color: None,
-            fit: FitPolicy::default(),
-            speed: Speed::NORMAL,
-        };
-        let lanes = vec![
-            LaneData::new(LaneKind::Video, vec![linked(3, 4)]),
-            LaneData::new(LaneKind::Video, vec![linked(5, 4)]),
-        ];
         assert_eq!(
-            links_are_consistent(&lanes).unwrap_err().to_string(),
-            "link 4 covers [0, 3) in V1 and [0, 5) in V2"
+            p.lane(Lane::V1)[0].link,
+            Some(take),
+            "the take's id is back, not a fresh one"
         );
+        assert_eq!(p.lane(v2)[0].link, None, "V2 rejoined into no group");
+        invariants_hold(&p, "regroup across three lanes");
     }
 
-    /// A group is a set of clips over one span, at most one per lane: a picture
-    /// may be grouped with sound in *any* audio lane -- there is no paired ord,
-    /// and the lanes in between may be empty -- and the two ways to break that
-    /// name the lane they broke it on. Lanes built by hand, because the rule is
-    /// checked at the untrusted door and no edit can produce these.
+    /// A group is one placement per lane, on however many lanes carry the id --
+    /// not a video/audio pair and not a pairing by `ord` -- and the members may
+    /// cover whatever frames they cover: the offset between them is what a
+    /// hand-built group keeps. Lanes built by hand, because the rule is checked
+    /// at the untrusted door and no edit can produce the one thing it refuses.
     #[test]
     fn a_group_may_span_any_lane() {
         let lane = |kind, clips: Vec<Clip>| LaneData::new(kind, clips);
@@ -6751,13 +7440,14 @@ mod tests {
         // way a lifted half is legal.
         let across = build([take(), Vec::new(), Vec::new(), take()]);
         assert!(links_are_consistent(&across).is_ok(), "V1 grouped with A2");
-        // Disagreeing about the span is not, and the message names both lanes.
-        let apart = build([take(), Vec::new(), Vec::new(), vec![one(0, 6, 7)]]);
-        assert_eq!(
-            links_are_consistent(&apart).unwrap_err().to_string(),
-            "link 7 covers [0, 4) in V1 and [0, 6) in A2"
+        // ...and so is a group whose members disagree about their spans: the
+        // offset between them is the hand's business, not the loader's.
+        let apart = build([take(), Vec::new(), Vec::new(), vec![one(2, 6, 7)]]);
+        assert!(
+            links_are_consistent(&apart).is_ok(),
+            "[0, 4) on V1 and [2, 6) on A2 are one group"
         );
-        // ...and one id twice in one lane is still that lane's error, by name.
+        // One id twice in one lane is still that lane's error, by name.
         let twice = build([
             Vec::new(),
             Vec::new(),
