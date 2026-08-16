@@ -2074,9 +2074,18 @@ impl PlaybackSession {
     /// would run it into its neighbour, and nothing changes.
     pub fn set_speed(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
         // Spelled out rather than through `edit`, whose closure hands back a
-        // bool and would drop the refusal's own words.
+        // bool and would drop the refusal's own words. The playhead moves
+        let at = self.project.speeded_playhead(
+            lane,
+            idx,
+            speed,
+            secs_to_frame(self.now(), self.meta.frame_rate),
+        );
         self.project.set_speed(lane, idx, speed)?;
-        let now = self.now();
+        let now = at.map_or_else(
+            || self.now(),
+            |frame| f64::from(frame) / self.meta.frame_rate,
+        );
         self.seek(now);
         Ok(())
     }
@@ -2085,10 +2094,33 @@ impl PlaybackSession {
     /// one drag ([`Project::set_speed_live`]). Reseeks like the committing one,
     /// which is what makes the bar move the picture under the hand.
     pub fn set_speed_live(&mut self, lane: Lane, idx: usize, speed: Speed) -> crate::Result<()> {
+        // The mapping on every sample, not just at the commit: the bar moves
+        // the rate live, and the scene has to stay put across the whole
+        // gesture or the last picture before the release is not the one the
+        // commit lands on.
+        let at = self.project.speeded_playhead(
+            lane,
+            idx,
+            speed,
+            secs_to_frame(self.now(), self.meta.frame_rate),
+        );
         self.project.set_speed_live(lane, idx, speed)?;
-        let now = self.now();
+        let now = at.map_or_else(
+            || self.now(),
+            |frame| f64::from(frame) / self.meta.frame_rate,
+        );
         self.seek(now);
         Ok(())
+    }
+
+    /// The picture's source frame at `timeline_secs`: which source, and which
+    /// frame of it -- the composite a viewer is looking at, through the same
+    /// span math the decoder walks. What a test asks to prove a reseek kept
+    /// the scene, and nothing in the editor itself reads.
+    pub fn video_source_frame_at(&self, timeline_secs: f64) -> Option<(usize, u32)> {
+        self.project
+            .composite_span_at(secs_to_frame(timeline_secs, self.meta.frame_rate))
+            .and_then(|s| s.from)
     }
 
     /// Cuts every one of `regions` -- `(start, len)` in timeline frames -- out

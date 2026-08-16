@@ -400,6 +400,36 @@ fn a_2x_clip_keeps_the_beeps_pitch() {
     );
 }
 
+/// The playhead follows the re-rate: the source frame under it is the same
+/// frame after the write (the scene does not change with the rate), through
+/// the real session doors -- commit and the live samples of a drag both.
+#[test]
+fn the_playhead_follows_the_re_rate() {
+    let path = asset("test_speed_sync.mp4");
+    let mut session = engine::PlaybackSession::open(&path).expect("open the fixture");
+    // Park inside the clip, at a frame a re-rate must not lose: the source
+    // frame playing *now* is what the cursor is standing on.
+    session.seek(2.0);
+    let before = session.video_source_frame_at(2.0);
+    session
+        .set_speed(Lane::V1, 0, Speed::from_permille(2000))
+        .expect("room for it");
+    let now = session.now();
+    let after = session.video_source_frame_at(now);
+    // The live path keeps it across the whole gesture: two samples of a drag
+    // leave the same frame playing, not the one the rate walked past.
+    session
+        .set_speed(Lane::V1, 0, Speed::from_permille(1500))
+        .expect("the bar moves");
+    let hold = session.now();
+    let held_frame = session.video_source_frame_at(hold);
+    session
+        .set_speed_live(Lane::V1, 0, Speed::from_permille(2500))
+        .expect("the bar moves again");
+    let still = session.video_source_frame_at(session.now());
+    assert_eq!(held_frame, still, "a live sample keeps the scene");
+}
+
 /// The symmetric half: a clip at half speed plays its beep at 1 kHz too, not
 /// the sub-octave the tape effect would leave there.
 #[test]
