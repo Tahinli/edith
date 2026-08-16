@@ -106,6 +106,17 @@ pub const MAX_GAIN_DB: f32 = 12.0;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct Speed(u16);
 
+/// What [`Project::parts`] hands back: the comparable shape of everything an
+/// edit can change, for the sweep's undo round-trip. Test-only, like every
+/// accessor it exists for: the sweep lives behind `cfg(test)`.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SweepParts(
+    pub(crate) usize,
+    pub(crate) Vec<(LaneKind, Vec<Clip>)>,
+    pub(crate) Vec<Vec<SubClip>>,
+);
+
 impl Speed {
     /// Real time -- what every clip is until something says otherwise, and the
     /// value every path in this engine short-circuits on.
@@ -4143,6 +4154,30 @@ impl Project {
         true
     }
 
+    /// The clips a lane holds, for the sweep's order law: `lane`'s own list.
+    #[cfg(test)]
+    pub(crate) fn lane_clips_pub(&self, lane: Lane) -> &[Clip] {
+        self.lane(lane)
+    }
+
+    /// How many undo steps are stacked: what the sweep asks so "one op, one
+    /// snapshot" is a count and not a guess.
+    #[cfg(test)]
+    pub(crate) fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Every part of the project that an edit can change, as comparable
+    /// values: what the sweep's undo round-trip asks "byte identical?" of.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> SweepParts {
+        SweepParts(
+            self.sources.len(),
+            self.lanes.iter().map(|l| (l.kind, l.clips.clone())).collect(),
+            self.lanes.iter().map(|l| l.subs.clone()).collect(),
+        )
+    }
+
     /// Restore every lane from before the last successful edit -- the clips and
     /// the lane list both. `false` when there is nothing left to undo.
     pub fn undo(&mut self) -> bool {
@@ -4609,6 +4644,13 @@ fn write_sub_edge(s: &mut SubClip, edge: Edge, to: u32) {
 /// A link no other lane carries is legal and is not an error: lifting one half
 /// of a group ([`Project::lift`]) leaves exactly that, and a save of that
 /// timeline has to load again.
+/// [`links_are_consistent`](self::links_are_consistent) for a whole project,
+/// asked by the sweep suite's universal law.
+#[cfg(test)]
+pub(crate) fn links_are_consistent_pub(p: &Project) -> crate::Result<()> {
+    links_are_consistent(&p.lanes)
+}
+
 fn links_are_consistent(lanes: &[LaneData]) -> crate::Result<()> {
     let handles = handles(lanes);
     for (data, lane) in lanes.iter().zip(&handles) {

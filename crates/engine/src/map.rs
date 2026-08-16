@@ -82,6 +82,7 @@ impl TimelineMap {
     /// needs one picks the span's head, which is where a ripple put what
     /// followed it). The knots are monotone, so this is the same walk with
     /// the axes traded.
+    #[cfg(test)]
     pub(crate) fn invert(&self, frame: u32) -> Option<u32> {
         if self.knots.is_empty() {
             return Some(frame);
@@ -105,6 +106,7 @@ impl TimelineMap {
         Some(frame.saturating_sub(n).saturating_add(o))
     }
 
+    #[cfg(test)]
     pub(crate) fn shifted_total(&self) -> i64 {
         match self.knots.last() {
             Some(&(o, n)) => i64::from(n) - i64::from(o),

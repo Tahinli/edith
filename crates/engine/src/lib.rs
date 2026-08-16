@@ -25,6 +25,8 @@ pub mod scratch;
 pub mod silence;
 pub mod subtitle;
 pub(crate) mod map;
+#[cfg(test)]
+mod sweep;
 pub(crate) mod stretch;
 pub mod tonemap;
 pub mod waveform;
