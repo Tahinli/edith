@@ -400,6 +400,7 @@ fn a_2x_clip_keeps_the_beeps_pitch() {
     );
 }
 
+
 /// The playhead follows the re-rate: the source frame under it is the same
 /// frame after the write (the scene does not change with the rate), through
 /// the real session doors -- commit and the live samples of a drag both.
@@ -416,6 +417,8 @@ fn the_playhead_follows_the_re_rate() {
         .expect("room for it");
     let now = session.now();
     let after = session.video_source_frame_at(now);
+    assert_eq!(before, after, "the same source frame is under the playhead");
+    assert!((now - 1.0).abs() < 2.0 / FPS, "and the minute moved to {now}");
     // The live path keeps it across the whole gesture: two samples of a drag
     // leave the same frame playing, not the one the rate walked past.
     session
