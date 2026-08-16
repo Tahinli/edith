@@ -4103,9 +4103,9 @@ impl Project {
     /// [`delete_in`](Project::delete_in) for the caption the pick named: a
     /// caption in no group lifts, exactly as its own key always made it
     /// ([`Project::lift_sub`]), and a caption in a group takes the group with
-    /// it by [`delete_in`](Project::delete_in)'s rule -- the media members'
-    /// spans out of their own lanes, the other captions lifted. `false` for a
-    /// bad index.
+    /// it by [`delete_in`](Project::delete_in)'s rule -- every member's own
+    /// span out of its own lane, hole closed, captions and clips alike.
+    /// `false` for a bad index.
     pub fn delete_sub_in(&mut self, lane: Lane, idx: usize) -> bool {
         let Some(members) = self.group_of(lane, idx) else {
             return false;
@@ -4127,8 +4127,17 @@ impl Project {
             let c = self.lanes[l].clips[i];
             ripple(&mut self.lanes, &[l], c.start, c.frames());
         }
-        for &(l, i) in members.subs.iter().rev() {
-            self.lanes[l].subs.remove(i);
+        // The captions go by the same law their clip siblings do -- the span
+        // out of its own lane, the hole closed -- and not by the lift a
+        // *lone* caption's delete is: deleted with its group, the words after
+        // it slide up with everything else, or the lane the group emptied is
+        // the one lane the delete left a hole in. `ripple` is the one
+        // mechanism (it clears the span and shifts the rest, clips and
+        // captions alike); a sub lane holds no clips, so its other list is
+        // untouched.
+        for &(l, i) in &members.subs {
+            let s = self.lanes[l].subs[i];
+            ripple(&mut self.lanes, &[l], s.start, s.frames);
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
         true
@@ -5668,6 +5677,79 @@ mod tests {
         assert!(links_are_consistent(&p.lanes).is_ok());
         assert!(p.undo(), "one step puts the group back");
         assert_eq!(p.sub_lane(s1)[0].start, 2, "offsets and all");
+    }
+
+    /// The delete law, one statement for every anchor: a caption deleted
+    /// WITH its group ripples its lane exactly as its clip siblings do --
+    /// the hole closes and what follows slides up -- while a caption lifted
+    /// alone leaves its gap, as it always has. And the delete of a grouped
+    /// clip takes the group from whichever member was clicked.
+    #[test]
+    fn a_grouped_delete_closes_the_caption_lane_and_takes_the_group_from_every_anchor() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        // V+A+S grouped, with a second caption BEHIND the group's caption:
+        // closing the hole is what the second caption's position says.
+        let group = || {
+            let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+            let s1 = p.add_lane(LaneKind::Subtitle);
+            p.place_sub(s1, 30, caption(30, 30)).expect("the group's caption");
+            p.place_sub(s1, 90, caption(90, 30)).expect("the caption behind");
+            p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+            (p, s1)
+        };
+
+        // Deleted by the picture: all three lanes close.
+        let (mut p, s1) = group();
+        assert!(p.delete_in(Lane::V1, 0));
+        assert!(p.lane(Lane::V1).is_empty(), "the clip's span left V1");
+        assert!(p.lane(Lane::A1).is_empty(), "and the sound's");
+        assert_eq!(
+            p.sub_lane(s1).iter().map(|s| s.start).collect::<Vec<_>>(),
+            [60],
+            "the caption's lane closed by its own span: the follower slid up"
+        );
+        assert!(p.undo(), "one step");
+        assert_eq!(p.sub_lane(s1).len(), 2, "both captions back, offsets and all");
+
+        // By the sound: the same whole-group delete.
+        let (mut p, s1) = group();
+        assert!(p.delete_in(Lane::A1, 0));
+        assert!(p.lane(Lane::V1).is_empty() && p.lane(Lane::A1).is_empty());
+        assert_eq!(p.sub_lane(s1)[0].start, 60, "the caption lane closed too");
+
+        // By the caption itself: the same again.
+        let (mut p, s1) = group();
+        assert!(p.delete_sub_in(s1, 0));
+        assert!(p.lane(Lane::V1).is_empty() && p.lane(Lane::A1).is_empty());
+        assert_eq!(p.sub_lane(s1)[0].start, 60, "closed from the caption's own door");
+        assert!(links_are_consistent(&p.lanes).is_ok());
+
+        // A caption lifted ALONE still leaves its gap: the ungrouped law,
+        // unchanged.
+        let (mut p, s1) = group();
+        assert!(p.ungroup(s1, 0), "the caption stands alone");
+        assert!(p.lift_sub(s1, 0));
+        assert_eq!(
+            p.sub_lane(s1)[0].start, 90,
+            "the follower stayed put: a lone caption's lift is a gap"
+        );
     }
 
     /// Dragging a grouped caption carries its clips, one delta for all of them
