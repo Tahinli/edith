@@ -4092,12 +4092,13 @@ impl Project {
     /// each member by its **own** span and on its **own** lane -- the members
     /// keep their offsets, so their spans may disagree, and the lanes may end
     /// up out of step with each other, which is inherent to a hand-built group
-    /// and one undo away. The caption members lift rather than ripple, for the
-    /// reason a caption's own delete always lifted: a subtitle lane never
-    /// slides, or the words after the cut would stop matching the ones before
-    /// it. One snapshot for the whole group, so one [`Project::undo`] puts it
-    /// back. `false` for a bad index, and for a lane that is not there.
-    /// Changes the mapping: the caller must reseek.
+    /// and one undo away. Every member -- clips and captions alike -- goes by
+    /// the same law: its own span out of its own lane, hole closed; a caption
+    /// in no group keeps the lift that leaves a gap, which is its own door's
+    /// law ([`delete_sub_in`](Project::delete_sub_in)). One snapshot for the
+    /// whole group, so one [`Project::undo`] puts it back. `false` for a bad
+    /// index, and for a lane that is not there. Changes the mapping: the
+    /// caller must reseek.
     pub fn delete_in(&mut self, lane: Lane, idx: usize) -> bool {
         let Some(members) = self.group_of(lane, idx) else {
             return false;
@@ -4127,11 +4128,11 @@ impl Project {
         self.lift_sub(lane, idx)
     }
 
-    /// The one whole-group delete both doors land in: every media member's own
-    /// span cut out of its own lane and the hole closed there -- and nothing
-    /// else on another lane moves, which is what keeps one member's ripple from
-    /// dragging another member's lane out from under it -- and every caption
-    /// member lifted. One snapshot, one undo step.
+    /// The one whole-group delete both doors land in: every member's own span
+    /// cut out of its own lane and the hole closed there -- clips and
+    /// captions by the same law -- and nothing else on another lane moves,
+    /// which is what keeps one member's ripple from dragging another
+    /// member's lane out from under it. One snapshot, one undo step.
     fn delete_members(&mut self, members: &Members) -> bool {
         self.snapshot();
         for &(l, i) in &members.clips {
@@ -5680,11 +5681,11 @@ mod tests {
         assert_eq!(p.sub_lane(s1)[0].link, Some(take));
     }
 
-    /// Deleting a member of a hand-built group takes the group: each media
-    /// member's own span out of its own lane, the captions lifted -- the lanes
-    /// may end up out of step, which is what one undo restores together.
+    /// Deleting a member of a hand-built group takes the group: every
+    /// member's own span out of its own lane, hole closed -- the lanes may
+    /// end up out of step, which is what one undo restores together.
     #[test]
-    fn deleting_a_grouped_clip_ripples_each_lane_alone_and_lifts_the_captions() {
+    fn deleting_a_grouped_clip_ripples_every_members_own_lane() {
         let caption = |start: u32, frames: u32| SubClip {
             start,
             frames,
@@ -5714,7 +5715,7 @@ mod tests {
         // By the picture or by the caption, the same whole-group delete.
         assert!(p.delete_sub_in(s1, 0));
         assert!(p.lane(Lane::V1).is_empty(), "the take's span left V1");
-        assert!(p.sub_lane(s1).is_empty(), "the caption lifted");
+        assert!(p.sub_lane(s1).is_empty(), "the caption's span left its lane");
         assert_eq!(p.lane(v2)[0].start, 10, "a lane the group does not touch stays");
         assert!(links_are_consistent(&p.lanes).is_ok());
         assert!(p.undo(), "one step puts the group back");

@@ -175,15 +175,17 @@ fn the_sweep_speed_keeps_the_group_and_the_playhead_scene() {
         for (what, speed) in [("2x", Speed::from_permille(2000)), ("half", Speed::from_permille(500))] {
             let (mut p, _s1) = project(shape);
             let pre = p.parts();
-            // The map the op will have applied, asked BEFORE the write (the
-            // old ends are what it maps through).
             let at = 45u32;
             let mapped = p.speeded_playhead(Lane::V1, 0, speed, at);
             let before = p.span_at(Lane::V1, at).and_then(|s| s.from);
-            let held_frames = p.lane(Lane::V1)[0].frames();
+            // The map the write itself is a shape of, built from the
+            // member's own old geometry -- NOT from the playhead's answer,
+            // which is what it will be checked against.
+            let held = p.lane(Lane::V1)[0];
+            let new_len = (f64::from(held.len()) / speed.as_f64()).round() as u32;
             let map = TimelineMap::piece(
-                (p.lane(Lane::V1)[0].start, p.lane(Lane::V1)[0].start + held_frames),
-                (p.lane(Lane::V1)[0].start, mapped.unwrap_or(at).max(p.lane(Lane::V1)[0].start)),
+                (held.start, held.start + held.frames()),
+                (held.start, held.start + new_len),
             );
             if let Err(why) = p.set_speed(Lane::V1, 0, speed) {
                 // A stretch the neighbours leave no room for is refused in
@@ -197,8 +199,15 @@ fn the_sweep_speed_keeps_the_group_and_the_playhead_scene() {
                 continue;
             }
             laws(&p, &format!("{shape}/{what} after speed"));
-            // Survivor continuity: the clip's own new end is the map of its
-            // old one, and the playhead's scene survived.
+            // Survivor continuity through the map: the clip's old span maps
+            // onto exactly the span it landed in -- the piece's own ends, on
+            // the lane, not inferred back from anything the write produced.
+            let landed = p.lane(Lane::V1)[0];
+            assert_eq!(
+                (landed.start, landed.start + landed.frames()),
+                (map.apply(held.start), map.apply(held.start + held.frames())),
+                "{shape}/{what}: the clip's new span is the map of its old one"
+            );
             // The scene law to the frame a rate can hold: an odd source
             // frame at 2x never lands on an integer playhead, so the
             // tolerance is the one frame the map's own rounding admits.
@@ -212,7 +221,6 @@ fn the_sweep_speed_keeps_the_group_and_the_playhead_scene() {
                 apart <= 1,
                 "{shape}/{what}: the scene under the playhead, {before:?} vs {after:?}"
             );
-            let _ = map; // the piece is pinned by the span math above
             undo_round_trip(p, pre, &format!("{shape}/{what} speed"));
         }
     }
