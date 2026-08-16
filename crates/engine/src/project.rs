@@ -73,6 +73,7 @@
 //! a save. An index rather than the four floats themselves for the same reason:
 //! twenty clips graded alike name one entry, and the file writes it once.
 
+use crate::map::TimelineMap;
 use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
@@ -2296,6 +2297,70 @@ impl Project {
         }
         debug_assert!(links_are_consistent(&self.lanes).is_ok());
         Ok(())
+    }
+
+    /// Where a re-rate of the clip at `idx` of `lane` to `speed` puts a
+    /// playhead standing at `at` -- read off the geometry **before** the
+    /// write, because the old ends are gone after it. The question a card
+    /// asks as its bar moves: the picture under the cursor has to stay the
+    /// picture under the cursor, or the scene changes with the rate.
+    ///
+    /// The answer is piecewise, exactly as [`write_speed`] re-times, and it
+    /// is asked of the same [`TimelineMap`] the write itself is a shape of:
+    /// a clip member keeps its own start and re-fits its length at the new
+    /// rate -- its **old** rate against the new one, which is what the bar's
+    /// live samples ask about as much as a first press does; a caption
+    /// member scales about the held clip's start by the held clip's own
+    /// proportion; and a playhead outside every member's old extent stays
+    /// exactly where it was -- nothing ripples, so the gap a shrink leaves
+    /// (or the room a stretch takes) absorbs the difference, not the
+    /// playhead. `None` for an index that is not there.
+    pub fn speeded_playhead(&self, lane: Lane, idx: usize, speed: Speed, at: u32) -> Option<u32> {
+        let members = self.group_of(lane, idx)?;
+        let held = self.lane(lane).get(idx).copied()?;
+        let (held_old, new) = (held.speed.as_f64(), speed.as_f64());
+        for &(l, i) in members.clips.iter().chain(&members.subs) {
+            let (span, map) = match self
+                .lanes[l]
+                .clips
+                .get(i)
+                .filter(|_| members.clips.contains(&(l, i)))
+            {
+                // The clip's own span, re-fitted at its own old rate: one
+                // piece of the map, anchored where the clip itself is. The
+                // new length is the same *source* frames at the new rate --
+                // len divided by it, never multiplied.
+                Some(c) => (
+                    (c.start, c.start + c.frames()),
+                    TimelineMap::piece(
+                        (c.start, c.start + c.frames()),
+                        (
+                            c.start,
+                            c.start + (c.len() as f64 / new).round() as u32,
+                        ),
+                    ),
+                ),
+                // The caption's span, scaled about the held clip's head by
+                // the held clip's proportion -- the offset the group keeps.
+                None => {
+                    let s = self.lanes[l].subs.get(i)?;
+                    let held_start = f64::from(held.start);
+                    let scale = |f: u32| {
+                        (held_start + (f64::from(f) - held_start) * held_old / new).round() as u32
+                    };
+                    (
+                        (s.start, s.end()),
+                        TimelineMap::piece((s.start, s.end()), (scale(s.start), scale(s.end()))),
+                    )
+                }
+            };
+            // The piece owns only its own old span: outside it the playhead
+            // is another member's question, or nobody's.
+            if (span.0..span.1).contains(&at) {
+                return Some(map.apply(at));
+            }
+        }
+        Some(at)
     }
 
     /// How the clip at `idx` of `lane` meets a project canvas of another shape.
@@ -4933,6 +4998,110 @@ mod tests {
         assert!(p.undo());
         assert!(p.undo());
         assert_eq!(shape(&p), before);
+    }
+
+    /// Where a re-rate puts a playhead: the scene under the cursor stays the
+    /// scene under the cursor, measured the way a viewer would -- the source
+    /// frame playing at the playhead is the same frame after the write, at
+    /// every playhead position the re-rate can catch one.
+    #[test]
+    fn a_re_rate_keeps_the_frame_under_the_playhead() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        // A group of a 300-frame clip and a caption offset 30 frames into it.
+        let mut p = Project::single(FILE, 300).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        p.place_sub(s1, 30, caption(30, 240)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+
+        // The frame playing at `at`: which clip, and which source frame of it.
+        let playing = |p: &Project, at: u32| -> Option<(usize, u32)> {
+            p.span_at(Lane::V1, at)
+                .and_then(|s| s.from.map(|(source, from)| (source, from)))
+        };
+
+        // Inside the held clip: the source frame under the playhead is the
+        // same one after the re-rate, at 2x and at half speed both.
+        for (what, speed) in [("2x", 2000u16), ("half", 500)] {
+            let at = 120;
+            let before = playing(&p, at).expect("a clip under the playhead");
+            let mapped = p.speeded_playhead(Lane::V1, 0, Speed::from_permille(speed), at);
+            p.set_speed(Lane::V1, 0, Speed::from_permille(speed))
+                .expect("room for it");
+            let after = playing(&p, mapped.unwrap()).expect("still a clip there");
+            assert_eq!(before, after, "{what}: the same source frame plays");
+            // ...and the write itself is untouched by the question.
+            assert!(p.undo(), "{what}: one step back");
+        }
+
+        // Past the group -- the clip ends at 300 and the caption at 270, so
+        // from 300 on nothing is re-timed under the playhead: unmoved.
+        for at in [300u32, 301, 1_000] {
+            assert_eq!(
+                p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), at),
+                Some(at),
+                "at {at}: outside every member, unmoved"
+            );
+        }
+        // The boundary is exact: the held clip's own last frame (299) maps
+        // to its new one (149 -- the last frame inside [0, 150), where the
+        // shrunken clip's last source frame plays), and its first stays put.
+        assert_eq!(
+            p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), 299),
+            Some(149)
+        );
+        assert_eq!(
+            p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), 0),
+            Some(0)
+        );
+        // A spot the caption shares with the clip maps by the clip (it is
+        // what is *playing* there): the held clip's own proportion, which on
+        // this fixture is also its head.
+        assert_eq!(
+            p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), 90),
+            Some(45),
+            "the clip under the caption owns the spot"
+        );
+    }
+
+    /// A playhead inside another clip member of the group: that member keeps
+    /// its own head, so the mapping is by its proportion and not the held
+    /// clip's -- and the frame under the cursor is still the frame that was.
+    #[test]
+    fn a_re_rate_maps_a_second_clip_member_about_its_own_head() {
+        let mut p = Project::single(FILE, 300);
+        // A second clip, grouped with the first but starting 300 later: the
+        // head the group shares and its own differ by exactly that.
+        let v2 = p.add_lane(LaneKind::Video);
+        assert!(p.lift(Lane::A1, 0), "the sound half stands aside");
+        assert!(p.place(v2, 300, clip(300, 0, 300, 0)), "placed on v2");
+        p.group_all(&[(Lane::V1, 0), (v2, 0)]).expect("grouped");
+
+        let at = 450; // inside the second member, 150 past its head
+        let before = p.span_at(v2, at).and_then(|s| s.from);
+        let mapped = p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), at);
+        p.set_speed(Lane::V1, 0, Speed::from_permille(2000))
+            .expect("room for it");
+        let after = p.span_at(v2, mapped.unwrap()).and_then(|s| s.from);
+        assert_eq!(before, after, "the second member's own frame plays");
+        // ...and the mapping itself: 150 past its head halves, the head stays.
+        assert_eq!(mapped, Some(375));
     }
 
     /// The link counter a load seeds sits past every id the file names,

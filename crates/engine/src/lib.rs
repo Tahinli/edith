@@ -24,6 +24,7 @@ pub mod scale;
 pub mod scratch;
 pub mod silence;
 pub mod subtitle;
+pub(crate) mod map;
 pub(crate) mod stretch;
 pub mod tonemap;
 pub mod waveform;
