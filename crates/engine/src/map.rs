@@ -87,8 +87,16 @@ impl TimelineMap {
         if self.knots.is_empty() {
             return Some(frame);
         }
-        // Before the first knot the map was the identity on `[0, old_lo)`,
-        // which on the new axis is the straight run from 0 to the knot.
+        // Below the first knot the map is identity on the old axis *up to
+        // the piece's old lo*, which on the new axis is the run from 0 to
+        // the piece's new lo. A SHIFTED piece (new lo < old lo) puts part of
+        // that run inside the piece's own destination, so the lerp through
+        // the knot is right; an unshifted one has new lo == old lo and the
+        // lerp degenerates to identity -- either way the single run covers
+        // it, and a frame below min(old lo, new lo) is identity outright.
+        if frame < self.knots[0].0.min(self.knots[0].1) {
+            return Some(frame);
+        }
         if frame < self.knots[0].1 {
             return Some(lerp((0, 0), self.knots[0], frame));
         }
@@ -171,6 +179,32 @@ mod tests {
         assert_eq!(m.apply(150), 100, "inside collapses to the head");
         assert_eq!(m.apply(200), 101, "after shifts up tight");
         assert_eq!(m.shifted_total(), -99);
+    }
+
+    /// A SHIFTED piece -- one whose new span starts before its old one, the
+    /// shape a removal cut into the head of the timeline gives -- is the case
+    /// `invert`'s below-the-knot run exists for: identity before the piece,
+    /// exact on the knots, image-total through the shift, and the frames the
+    /// shift took below the piece's old lo their own inverses.
+    #[test]
+    fn a_shifted_piece_inverts_on_its_own_run() {
+        let m = TimelineMap::piece((30, 60), (15, 30));
+        assert_eq!(m.apply(0), 0, "identity before the piece");
+        assert_eq!(m.apply(29), 29);
+        assert_eq!(m.apply(30), 15, "the lo knot is exact");
+        assert_eq!(m.apply(59), 29, "the last frame of the piece");
+        assert_eq!(m.apply(60), 30, "identity at the shift the piece left");
+        assert_eq!(m.shifted_total(), -30);
+        for n in 0..60 {
+            let back = m.invert(n).expect("the image is total");
+            assert_eq!(m.apply(back), n, "new frame {n} round trips");
+        }
+        // ...and the run the shift opened below the piece's old lo is
+        // identity in both directions -- the frames `invert` used to walk
+        // into the piece's own lerp from the wrong end.
+        for f in 0..15 {
+            assert_eq!(m.invert(f), Some(f), "frame {f} is its own inverse");
+        }
     }
 
     /// Identity is the base: everything maps to itself, in both directions,
