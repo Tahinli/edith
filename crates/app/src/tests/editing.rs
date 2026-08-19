@@ -890,7 +890,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         // edit list either.
         let allowed = action == ActionId::CancelExport
             || action == ActionId::Theme
-            || action == ActionId::Fullscreen;
+            || action == ActionId::Fullscreen
+            || action == ActionId::SubtitleStyle;
         assert_eq!(
             whole(action, busy).yes(),
             allowed,
@@ -1206,6 +1207,7 @@ fn every_card_closes_without_the_keyboard() {
         "speed_card",
         "mix_card",
         "silence_card",
+        "subtitle_style_card",
     ] {
         let src = fn_body(card);
         assert!(

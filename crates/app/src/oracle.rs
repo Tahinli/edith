@@ -100,7 +100,9 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // reading one, which is the only state that dims the list above.
     // ...and whether that window fills the screen: also always there, also
     // touching no timeline, live through an export the same way.
-    if action == ActionId::Theme || action == ActionId::Fullscreen {
+    // ...and the cue plate's own font and size: a reading preference like the
+    // theme, never burned into an export, live the same way.
+    if action == ActionId::Theme || action == ActionId::Fullscreen || action == ActionId::SubtitleStyle {
         return Enable::Yes;
     }
     if action == ActionId::ShowActions {
