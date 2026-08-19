@@ -625,6 +625,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
@@ -998,6 +999,7 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
         link: Some(1),
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
@@ -1631,6 +1633,7 @@ fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: Default::default(),
         speed: Default::default(),
     };
