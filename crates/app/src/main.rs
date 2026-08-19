@@ -109,6 +109,10 @@ struct Player {
     /// top on reaching its end instead of stopping there. One flag for both,
     /// since only one of them is ever playing at a time.
     loop_on: bool,
+    /// The in/out mark an export is clipped to, half-open `[start, end)` in
+    /// timeline frames -- `None` for the whole timeline. Session state, like
+    /// the mark itself: never saved to a `.edith` ([`ExportSettings::range`]).
+    range: Option<(u32, u32)>,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -760,6 +764,7 @@ fn main() {
                     preview_playing: false,
                     player_fullscreen: false,
                     loop_on: false,
+                    range: None,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
