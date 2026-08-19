@@ -439,6 +439,17 @@ pub struct Clip {
     /// Timeline frames of ramp-down to silence at the clip's own end. Same
     /// promises as [`Clip::fade_in`].
     pub fade_out: u32,
+    /// Timeline frames of cross-dissolve into the clip immediately after this
+    /// one on the same video lane, at this clip's own end -- `0` for a hard
+    /// cut. Inline like [`Clip::fade_in`]/[`Clip::fade_out`] for the same
+    /// reason, and clamped the same way by its setter
+    /// ([`Project::set_transition_out`]): never wider than this clip's own
+    /// length, nor than the successor it dissolves into. Meaningless -- and
+    /// left as whatever it was -- the moment the next clip stops abutting
+    /// this one; a reader that cares checks adjacency itself rather than
+    /// trusting this field alone, exactly as a stored fade is trusted only
+    /// because a clip's own length is checked beside it.
+    pub transition_out: u32,
 }
 
 impl Clip {
@@ -881,6 +892,7 @@ impl Project {
         let clip = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -1263,6 +1275,7 @@ impl Project {
         let clip = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -2509,6 +2522,37 @@ impl Project {
         true
     }
 
+    /// Timeline frames of cross-dissolve the clip at `idx` of `lane` plays
+    /// into its successor, at its own end. `0` for an index that is not
+    /// there, same as a clip that has none.
+    pub fn transition_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.lane(lane).get(idx).map_or(0, |c| c.transition_out)
+    }
+
+    /// Sets it, clamped to the clip's own length and to how many frames its
+    /// successor on `lane` actually offers -- a dissolve can shrink a clip's
+    /// visible middle to nothing but never ask for more than the two clips
+    /// between them have. `false` -- no history -- unless `lane` is video,
+    /// `idx + 1` is in bounds, and the two clips are adjacent: the second's
+    /// [`Clip::start`] is exactly the first's [`Clip::end`], no gap between
+    /// them. One undo step like [`Project::set_fade_out`].
+    pub fn set_transition_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        if lane.kind != LaneKind::Video {
+            return false;
+        }
+        let clips = self.lane(lane);
+        let (Some(a), Some(b)) = (clips.get(idx), clips.get(idx + 1)) else {
+            return false;
+        };
+        if a.end() != b.start {
+            return false;
+        }
+        let cap = a.frames().min(b.frames());
+        self.snapshot();
+        self.lane_mut(lane).expect("checked above")[idx].transition_out = frames.min(cap);
+        true
+    }
+
     /// Crossfades the audio clip at `idx` of `lane` into the one immediately
     /// after it, over `frames` timeline frames: sets `idx`'s
     /// [`Clip::fade_out`] and its neighbour's [`Clip::fade_in`] to `frames`,
@@ -2957,9 +3001,16 @@ impl Project {
             // ends, flat -- there was no silence there to ramp out of.
             tail.fade_in = 0;
             tail.fade_out = tail.fade_out.min(tail.frames());
+            // A dissolve is a promise about the *end* edge, same as
+            // `fade_out`: only the half that kept the clip's original end
+            // (the tail) keeps it, re-clamped to its own now-shorter length;
+            // the head's new end is the cut the razor just made, which starts
+            // flat -- there was no successor to dissolve into there.
+            tail.transition_out = tail.transition_out.min(tail.frames());
             data.clips[idx].out_frame = tail.in_frame;
             data.clips[idx].link = orig[data_i];
             data.clips[idx].fade_out = 0;
+            data.clips[idx].transition_out = 0;
             data.clips[idx].fade_in = data.clips[idx].fade_in.min(data.clips[idx].frames());
             data.clips.insert(idx + 1, tail);
         }
@@ -3294,6 +3345,7 @@ impl Project {
         let clip = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start: timeline_frame,
             link: None,
             ..clip
@@ -3335,6 +3387,7 @@ impl Project {
         let clip = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start: timeline_frame,
             link: Some(self.new_link()),
             ..clip
@@ -3912,6 +3965,7 @@ impl Project {
         let clip = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start: at,
             link: Some(self.new_link()),
             ..clip
@@ -4987,6 +5041,7 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             out.push(Clip {
                 fade_in: 0,
                 fade_out: 0,
+                transition_out: 0,
                 out_frame: c.in_frame + keep.min(c.len()),
                 link: None,
                 ..c
@@ -5002,6 +5057,7 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             out.push(Clip {
                 fade_in: 0,
                 fade_out: 0,
+                transition_out: 0,
                 start: end,
                 in_frame: c.out_frame - keep.min(c.len()),
                 link: None,
@@ -5110,6 +5166,7 @@ mod tests {
         Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start,
             in_frame,
             out_frame,
@@ -5319,6 +5376,62 @@ mod tests {
         assert_eq!(v[0].fade_out, 0, "the cut edge it made starts flat");
         assert_eq!(v[1].fade_in, 0, "the cut edge it made starts flat");
         assert_eq!(v[1].fade_out, 15, "the right half's kept fade-out, unclamped: 15 frames fit in 15");
+    }
+
+    /// [`Project::set_transition_out`] refuses a non-video lane, a clip with
+    /// no successor, and two clips that do not touch, and otherwise clamps
+    /// the dissolve to the shorter of the two clips it spans.
+    #[test]
+    fn set_transition_out_only_dissolves_adjacent_video_clips() {
+        let mut p = Project::single(FILE, 20);
+        assert!(p.split(15), "a short 5-frame tail to clamp against");
+        assert!(
+            !p.set_transition_out(Lane::A1, 0, 5),
+            "audio is not a video lane"
+        );
+        assert!(
+            !p.set_transition_out(Lane::V1, 1, 5),
+            "there is no clip after idx 1"
+        );
+        assert!(
+            p.set_transition_out(Lane::V1, 0, 100),
+            "the two halves are adjacent"
+        );
+        assert_eq!(
+            p.transition_out_of(Lane::V1, 0),
+            5,
+            "clamped to the shorter neighbour's 5 frames"
+        );
+
+        // A gap between two clips is not adjacency, even on the video lane.
+        let mut p2 = Project::single(FILE, 1);
+        let v2 = p2.add_lane(LaneKind::Video);
+        assert!(p2.place(v2, 0, clip(0, 0, 3, 0)));
+        assert!(p2.place(v2, 5, clip(5, 3, 6, 0)), "a gap before this one");
+        assert!(!p2.set_transition_out(v2, 0, 5), "a gap is not adjacent");
+    }
+
+    /// The rule [`Project::write_split`] follows for [`Clip::transition_out`],
+    /// same shape as [`a_split_clamps_the_kept_fade_and_zeroes_the_cut_edge`]:
+    /// only the half that kept the clip's original *end* keeps the dissolve,
+    /// re-clamped to its own now-shorter length; the head the cut just made
+    /// has no successor to dissolve into and starts flat.
+    #[test]
+    fn a_split_clamps_the_tail_transition_and_zeroes_the_head() {
+        let mut p = Project::single(FILE, 20);
+        assert!(
+            !p.set_transition_out(Lane::V1, 0, 0),
+            "one clip on the lane, no successor to dissolve into yet"
+        );
+        // Give the clip a dissolve by hand, then cut it in two.
+        p.lane_mut(Lane::V1).unwrap()[0].transition_out = 15;
+        assert!(p.split(5));
+        let v = p.lane(Lane::V1);
+        assert_eq!(v[0].transition_out, 0, "the cut edge it made has no successor");
+        assert_eq!(
+            v[1].transition_out, 15,
+            "the tail's kept dissolve, unclamped: 15 frames fit in 15"
+        );
     }
 
     /// The music video's own path: the take comes apart into halves that carry
@@ -6501,15 +6614,18 @@ mod tests {
     /// table like the eq and the grade: there is nothing for a table to share.
     /// It costs the clip nothing at all -- the fields before it (a `usize`
     /// source and two `Option<u16>`s) already left the struct padded to 40
-    /// bytes, and the byte landed in that padding. `fade_in`/`fade_out` are the
-    /// two `u32`s after it, so those cost the clip a full word each: 48 bytes
-    /// total. This is the assert that says so: a clip that grows a word grows
-    /// every undo snapshot and every clipboard copy with it.
+    /// bytes, and the byte landed in that padding. `fade_in`/`fade_out` are two
+    /// `u32`s after it (48 bytes), and `transition_out` is a third word --
+    /// 52 bytes of fields, but the struct's own alignment is 8 (from the
+    /// `usize` source and the 8-byte `Option<u32>` link), so an odd number of
+    /// words after it pads out to the next multiple of 8: 56 bytes total.
+    /// This is the assert that says so: a clip that grows a word grows every
+    /// undo snapshot and every clipboard copy with it.
     #[test]
     fn a_fit_policy_costs_the_clip_no_word() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            48,
+            56,
             "Clip changed size: {} bytes",
             std::mem::size_of::<Clip>()
         );
@@ -6520,6 +6636,7 @@ mod tests {
     const PASTED: Clip = Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 100,
         out_frame: 102,
@@ -6594,6 +6711,7 @@ mod tests {
         let copied = Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             source: wav,
             ..PASTED
         };
@@ -7860,8 +7978,8 @@ mod tests {
     fn a_clip_is_still_a_small_copy() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            48,
-            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after"
+            56,
+            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after, 56 with the transition"
         );
     }
 
@@ -7945,6 +8063,7 @@ mod tests {
             vec![Clip {
                 fade_in: 0,
                 fade_out: 0,
+                transition_out: 0,
                 eq: Some(i),
                 ..video[0]
             }]
@@ -7983,6 +8102,7 @@ mod tests {
             vec![Clip {
                 fade_in: 0,
                 fade_out: 0,
+                transition_out: 0,
                 color: Some(i),
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
@@ -8043,6 +8163,7 @@ mod tests {
         let linked = |start, in_frame, out_frame, link| Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start,
             in_frame,
             out_frame,
@@ -8822,6 +8943,7 @@ mod tests {
         let one = |start: u32, end: u32, link| Clip {
             fade_in: 0,
             fade_out: 0,
+            transition_out: 0,
             start,
             in_frame: start,
             out_frame: end,

@@ -862,6 +862,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
     let clip = Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame,
         out_frame: in_frame + span,
