@@ -3037,6 +3037,47 @@ impl Project {
                 }
             })
             .collect();
+        // The picks are already one per lane (`seen`, above), but a pick's
+        // *existing* group can carry a second member onto a lane another
+        // pick (or another existing group in the merge) already occupies --
+        // two captions on one sub lane, say, each grouped with a different
+        // clip before this call. Merging both in would leave that lane with
+        // two members of one id, which `links_are_consistent` may never see:
+        // refused by name, before anything moves, rather than a group closed
+        // broken.
+        let labels = handles(&self.lanes);
+        let mut per_lane: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for (li, data) in self.lanes.iter().enumerate() {
+            let n = data.clips.iter().filter(|c| c.link.is_some() && links.contains(&c.link)).count()
+                + data.subs.iter().filter(|s| s.link.is_some() && links.contains(&s.link)).count();
+            if n > 0 {
+                per_lane.insert(li, n as u32);
+            }
+        }
+        // A pick that carries no link of its own is invisible to the scan
+        // above (there is no `Some` to match): it still claims its lane.
+        for &(lane, _) in picks {
+            let li = self.index(lane).expect("checked above");
+            per_lane.entry(li).or_insert(0);
+            if !self.lanes[li]
+                .clips
+                .iter()
+                .any(|c| c.link.is_some() && links.contains(&c.link))
+                && !self.lanes[li]
+                    .subs
+                    .iter()
+                    .any(|s| s.link.is_some() && links.contains(&s.link))
+            {
+                *per_lane.get_mut(&li).expect("just inserted") += 1;
+            }
+        }
+        if let Some((&li, _)) = per_lane.iter().find(|&(_, &n)| n > 1) {
+            return Err(format!(
+                "a group is one placement per lane: merging these groups would put two on {}",
+                labels[li].label()
+            )
+            .into());
+        }
         self.snapshot();
         let id = self.new_link();
         // Whatever any pick was grouped with comes along, for [`group`]'s
@@ -5759,6 +5800,55 @@ mod tests {
         let (loose_sub, loose_clip) = (p.sub_lane(s1)[0].link, p.lane(Lane::V1)[0].link);
         assert!(loose_sub.is_some() && loose_clip.is_some());
         assert_ne!(loose_sub, loose_clip);
+        assert!(links_are_consistent(&p.lanes).is_ok());
+    }
+
+    /// Two captions on one sub lane, each already grouped with a *different*
+    /// clip: `group_all` over both those clips would merge the two existing
+    /// groups into one id and leave both captions on `s1` carrying it --
+    /// `links_are_consistent`'s one-member-per-lane law broken the moment the
+    /// group closes. Refused by name, and nothing moves.
+    #[test]
+    fn group_all_refuses_a_merge_that_doubles_up_a_lane() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+        let v2 = p.add_lane(LaneKind::Video);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        assert!(p.place(v2, 0, clip(0, 0, 90, 0)));
+        p.place_sub(s1, 0, caption(0, 30)).expect("placed");
+        p.place_sub(s1, 30, caption(30, 30)).expect("placed");
+        // V1 grouped with the first caption, v2 with the second -- two
+        // separate groups, each already one member per lane.
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        p.group_all(&[(v2, 0), (s1, 1)]).expect("grouped");
+        let (v1_link, v2_link) = (p.lane(Lane::V1)[0].link, p.lane(v2)[0].link);
+
+        let history = p.history.len();
+        let err = p
+            .group_all(&[(Lane::V1, 0), (v2, 0)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one placement per lane"), "{err}");
+        assert_eq!(p.history.len(), history, "the refusal costs no undo step");
+        assert_eq!(p.lane(Lane::V1)[0].link, v1_link, "the first group untouched");
+        assert_eq!(p.lane(v2)[0].link, v2_link, "the second group untouched");
         assert!(links_are_consistent(&p.lanes).is_ok());
     }
 
