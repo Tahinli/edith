@@ -409,6 +409,14 @@ struct Player {
     /// Not persisted: this is a look, not a setting.
     export_grouped: bool,
     export_refusals_inline: bool,
+    /// Whether the card's Advanced pane -- codec, container, quality,
+    /// sound, encoder, subtitles, this machine -- is open under the primary
+    /// pane's destination and preset rows. Closed by default: most exports
+    /// are one of the bundled presets, and the fifteen-odd rows under them
+    /// are what a person who is not one of those goes looking for, kept
+    /// behind one row rather than eaten by the fold. Not persisted, like the
+    /// two switches above it -- this is a look, not a setting.
+    export_advanced_open: bool,
     /// Which quality row the card has picked, and the megabits typed against
     /// the custom one. Kept across closes, so a second export offers what the
     /// first one chose.
@@ -727,6 +735,7 @@ fn main() {
                     export_open: false,
                     export_grouped: true,
                     export_refusals_inline: false,
+                    export_advanced_open: false,
                     eq_open: None,
                     // Replaced by the clip's own curve the moment the card
                     // opens; nothing reads it before that.

@@ -259,6 +259,10 @@ impl Render for Player {
                         this.export_grouped = !this.export_grouped;
                     } else if key == "r" {
                         this.export_refusals_inline = !this.export_refusals_inline;
+                    } else if key == "s" {
+                        // The Advanced pane, by keyboard: the primary pane's
+                        // own row for it opens the same way a click does.
+                        this.export_advanced_open = !this.export_advanced_open;
                     } else if key == "n" {
                         // The custom row's field, by keyboard. The digits used
                         // to do this from anywhere in the card, which meant a
