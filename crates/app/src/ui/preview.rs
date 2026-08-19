@@ -56,7 +56,11 @@ impl Player {
                 .absolute()
                 .left_0()
                 .right_0()
-                .bottom_0()
+                // Above the transient bars, not over them: the bar's 24px hit
+                // area drawn on a one-line notice ate the notice's own "click
+                // to dismiss". The probe below the bars says how tall they
+                // came out this frame; zero with none up.
+                .bottom(self.notice_h.get())
                 .h(px(RULER_HIT_H))
                 .flex()
                 .flex_col()
