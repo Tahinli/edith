@@ -273,7 +273,9 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // A clock started against an empty timeline is a clock counting
         // nothing: the transport says so by being dim, which is what its own
         // ad-hoc boolean used to say before the oracle knew the question.
-        ActionId::Play if !ctx.playable => Enable::No("put a clip on a lane first"),
+        ActionId::Play | ActionId::Loop if !ctx.playable => {
+            Enable::No("put a clip on a lane first")
+        }
         // A rate applies to a clip of either kind and to its whole group, so
         // there is no lane it means nothing on, and the engine words the one
         // refusal there is (no room). Everything else is the editor's own and
