@@ -1579,13 +1579,14 @@ impl Player {
                             } else {
                                 FG_SECONDARY()
                             }))
-                            // The captions' own colour, dimmed on a lane whose
-                            // eye is shut: what is not being drawn over the
-                            // picture is still on the lane, and says so. Marked,
-                            // it takes the selection's colours instead, the same
+                            // A letterbox ground rather than the captions' own
+                            // colour: the box itself is where a sentence starts
+                            // and ends on the bed, and that is drawn by the cue
+                            // blocks below, not by the box's own fill. Marked,
+                            // it still takes the selection's colour, the same
                             // pair a marked clip takes -- what Delete will act
                             // on has one look on this bed and not two.
-                            .bg(rgb(if on { BG_SELECTED() } else { CLIP_TEXT() }))
+                            .bg(rgb(if on { BG_SELECTED() } else { BG_PANEL() }))
                             .when(!shown, |d| d.opacity(0.55))
                             .cursor_pointer()
                             .hover(|s| s.border_color(rgb(ACCENT_PRIMARY())))
@@ -1712,20 +1713,12 @@ impl Player {
                                         zone
                                     }),
                             )
-                            .when_some(label.filter(|_| show_label(vis_w)), |d, label| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left(px(vis_x))
-                                        .w(px(vis_w))
-                                        .h(px(LABEL_H))
-                                        .px(px(4.))
-                                        .truncate()
-                                        .text_size(px(10.))
-                                        .child(label),
-                                )
-                            })
+                            // No name drawn on the box itself: the cue blocks
+                            // now fill its full height, and a label sitting
+                            // over them fights the very thing this box exists
+                            // to show. The tooltip still carries the words
+                            // (`sub_tip`), and the ghost while dragging still
+                            // names the track (`ghost`, above).
                             // The way back off the lane is the way every other
                             // box takes: the Delete stroke on the marked caption
                             // and the Delete row of its own menu
@@ -1736,20 +1729,22 @@ impl Player {
                             // caption did not have.
                     }))
                     // ...and where the words actually are inside those boxes:
-                    // the cues this lane shows on *this* timeline, in a band
-                    // along the bottom of the row. A placement is a window of a
+                    // the cues this lane shows on *this* timeline, each its own
+                    // full-height block over the letterbox ground, inset a
+                    // pixel so the gap between two sentences is visible even
+                    // when they sit back to back. A placement is a window of a
                     // track, so a box is not full of speech -- and a lane whose
                     // marks are all in its first half is a caption dragged too
-                    // far, which is exactly what this band shows.
+                    // far, which is exactly what this shows.
                     .children(cues.into_iter().map(|(left, width)| {
                         div()
                             .absolute()
-                            .bottom_0()
-                            .h(px(4.))
+                            .top(px(1.))
+                            .bottom(px(1.))
                             .left(px(left))
                             .w(px(width))
                             .rounded(px(2.))
-                            .bg(rgb(BG_SELECTED()))
+                            .bg(rgb(CLIP_TEXT()))
                     }))
                     // What the silence card found, over the clips it found them
                     // in and over the waveform band that shows why: on the lane
