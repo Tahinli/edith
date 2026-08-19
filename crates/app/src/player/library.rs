@@ -233,6 +233,9 @@ impl Player {
             Ok(mut session) => {
                 session.drop_late_pictures(true);
                 session.set_gain(self.volume.gain());
+                // The button says "plays it" -- a preview that opens paused
+                // reads as a frozen picture, not as a player awaiting a click.
+                session.play();
                 self.preview_session = Some(session);
                 self.notify_user(
                     format!("PREVIEWING {} — not on the timeline; esc stops it", file_name(path))
