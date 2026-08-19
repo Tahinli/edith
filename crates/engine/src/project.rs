@@ -6882,6 +6882,7 @@ mod tests {
                 two(vec![c], vec![c]),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .expect("valid parts")
         };
@@ -7020,9 +7021,9 @@ mod tests {
         // A saved-and-loaded empty timeline is a project like any other, and it
         // still names the file its frame rate came from.
         assert!(p.lift(Lane::V1, 0));
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(sources.len(), 1, "source 0 survives an emptied timeline");
-        let back = Project::from_parts(sources, lanes, eq, color).expect("an empty project loads");
+        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("an empty project loads");
         assert_eq!(back.timeline_frames(), 0);
         assert_eq!(back.lanes().len(), 2, "and it kept its lanes");
     }
@@ -7196,7 +7197,7 @@ mod tests {
             (LaneKind::Video, vec![clip(0, 0, 3, 0), clip(10, 3, 6, 0)]),
             (LaneKind::Audio, vec![clip(0, 0, 3, 0)]),
         ];
-        let mut p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
+        let mut p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         let before = shape(&p);
 
         // Into the gap, exactly where it was let go -- nothing else moves.
@@ -7759,7 +7760,7 @@ mod tests {
         // Import a second file, undo it: source 1 is now an orphan.
         let mut p = two_sources();
         assert!(p.undo());
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(sources, vec![Source::new(FILE, 0)], "the orphan is gone");
         assert!(eq.is_empty(), "and a project with no equalizer writes none");
         assert!(color.is_empty(), "nor a colour it never graded with");
@@ -7775,7 +7776,7 @@ mod tests {
         assert_eq!(p.import(FILE2, 0), 1);
         assert_eq!(p.import("/nonexistent/c.mp4", 0), 2);
         assert!(p.append_clip(2, 4));
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(
             sources,
             vec![Source::new(FILE, 0), Source::new("/nonexistent/c.mp4", 0)]
@@ -7785,7 +7786,7 @@ mod tests {
             [0, 1]
         );
         // ...and what comes out is loadable, with the same timeline.
-        let reloaded = Project::from_parts(sources, lanes, eq, color).expect("from_parts");
+        let reloaded = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("from_parts");
         assert_eq!(reloaded.timeline_frames(), p.timeline_frames());
         assert_eq!(reloaded.sources().len(), 2);
     }
@@ -7836,8 +7837,8 @@ mod tests {
         );
         // What is left is a project that still loads, which is the whole point
         // of renumbering rather than leaving a hole.
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
-        Project::from_parts(sources, lanes, eq, color).expect("from_parts");
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
+        Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("from_parts");
     }
 
     /// The two edges of a removal: it retires the undo stack (the corner-cut on
@@ -7943,7 +7944,7 @@ mod tests {
         assert!(p.undo(), "back to the first setting");
         assert_eq!(p.eq_of(Lane::V1, 0), Some(&band_at(1)));
 
-        let (_, lanes, eq, _) = p.without_orphan_sources();
+        let (_, lanes, eq, _, _) = p.without_orphan_sources();
         assert_eq!(eq, vec![band_at(1)], "what nothing plays is not written");
         assert_eq!(lanes[0].1[0].eq, Some(0), "and the survivor renumbers");
         assert_eq!(lanes[0].1[1].eq, None);
@@ -7951,7 +7952,7 @@ mod tests {
         // One curve on three clips is one entry: settings that are equal share.
         assert!(p.set_eq(Lane::V1, 1, Some(band_at(1))));
         assert!(p.set_eq(Lane::A1, 2, Some(band_at(1))));
-        let (_, lanes, eq, _) = p.without_orphan_sources();
+        let (_, lanes, eq, _, _) = p.without_orphan_sources();
         assert_eq!(eq.len(), 1, "equal settings share their entry");
         assert_eq!(lanes[1].1[2].eq, Some(0));
         reloads(&p, "an equalizer that outlived an undo");
@@ -8076,7 +8077,7 @@ mod tests {
         assert!(p.undo(), "back to the first grade");
         assert_eq!(p.color_of(Lane::V1, 0), Some(&grade_at(1)));
 
-        let (_, lanes, _, color) = p.without_orphan_sources();
+        let (_, lanes, _, color, _) = p.without_orphan_sources();
         assert_eq!(
             color,
             vec![grade_at(1)],
@@ -8088,14 +8089,14 @@ mod tests {
         // One grade on three clips is one entry: settings that are equal share.
         assert!(p.set_color(Lane::V1, 1, Some(grade_at(1))));
         assert!(p.set_color(Lane::A1, 2, Some(grade_at(1))));
-        let (_, lanes, _, color) = p.without_orphan_sources();
+        let (_, lanes, _, color, _) = p.without_orphan_sources();
         assert_eq!(color.len(), 1, "equal grades share their entry");
         assert_eq!(lanes[1].1[2].color, Some(0));
         reloads(&p, "a colour that outlived an undo");
 
         // An equalizer and a grade on one clip are two independent tables.
         assert!(p.set_eq(Lane::V1, 0, Some(band_at(3))));
-        let (_, lanes, eq, color) = p.without_orphan_sources();
+        let (_, lanes, eq, color, _) = p.without_orphan_sources();
         assert_eq!((eq.len(), color.len()), (1, 1));
         assert_eq!((lanes[0].1[0].eq, lanes[0].1[0].color), (Some(0), Some(0)));
     }
@@ -8115,9 +8116,9 @@ mod tests {
 
     #[test]
     fn from_parts_has_no_history_and_checks_the_invariants() {
-        let (sources, lanes, eq, color) = three().without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = three().without_orphan_sources();
         let (video, audio) = (lanes[0].1.clone(), lanes[1].1.clone());
-        let mut p = Project::from_parts(sources.clone(), lanes.clone(), eq.clone(), color.clone())
+        let mut p = Project::from_parts(sources.clone(), lanes.clone(), eq.clone(), color.clone(), Vec::new())
             .expect("valid parts");
         assert_eq!(p.clips(), three().clips());
         assert!(!p.undo(), "a loaded project has nothing to undo");
@@ -8132,6 +8133,7 @@ mod tests {
                 two(video.clone(), Vec::new()),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .is_ok()
         );
@@ -8141,10 +8143,11 @@ mod tests {
                 two(Vec::new(), Vec::new()),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .is_ok()
         );
-        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new()).is_err());
+        assert!(Project::from_parts(sources.clone(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_err());
         let bad: [Vec<Clip>; 5] = [
             vec![clip(0, 0, 3, 1)],                   // source that is not there
             vec![clip(0, 3, 3, 0)],                   // empty clip
@@ -8159,6 +8162,7 @@ mod tests {
                     two(clips.clone(), Vec::new()),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 )
                 .is_err(),
                 "{clips:?}"
@@ -8167,6 +8171,7 @@ mod tests {
                 Project::from_parts(
                     sources.clone(),
                     two(video.clone(), clips.clone()),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 )
@@ -8181,6 +8186,7 @@ mod tests {
                         (LaneKind::Audio, audio.clone()),
                         (LaneKind::Video, clips),
                     ],
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 )
@@ -8204,6 +8210,7 @@ mod tests {
                 two(eqd(0), Vec::new()),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .is_err()
         );
@@ -8215,6 +8222,7 @@ mod tests {
                 two(eqd(0), Vec::new()),
                 vec![nan],
                 Vec::new(),
+                Vec::new(),
             )
             .is_err()
         );
@@ -8222,6 +8230,7 @@ mod tests {
             sources.clone(),
             two(eqd(0), Vec::new()),
             vec![band_at(1)],
+            Vec::new(),
             Vec::new(),
         )
         .expect("an eq the table holds");
@@ -8245,6 +8254,7 @@ mod tests {
                 two(graded(0), Vec::new()),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .is_err(),
             "a colour index no entry answers"
@@ -8258,6 +8268,7 @@ mod tests {
                     tint: f32::NAN,
                     ..grade_at(1)
                 }],
+                Vec::new(),
             )
             .is_err(),
             "a value the file format could not have written"
@@ -8267,12 +8278,13 @@ mod tests {
             two(graded(0), Vec::new()),
             Vec::new(),
             vec![grade_at(1)],
+            Vec::new(),
         )
         .expect("a colour the table holds");
         assert_eq!(loaded.color_of(Lane::V1, 0), Some(&grade_at(1)));
 
         // Group ids survive a load, and the next split gets a fresh one.
-        let mut p = Project::from_parts(sources, lanes, eq, color).expect("valid parts");
+        let mut p = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("valid parts");
         assert!(p.split(4));
         assert!(p.clips().iter().all(|c| c.link.is_some()));
     }
@@ -8308,7 +8320,7 @@ mod tests {
 
         // The door: a doubled id inside one lane, refused by name.
         let err = |video: Vec<Clip>, audio: Vec<Clip>| {
-            Project::from_parts(sources.clone(), two(video, audio), Vec::new(), Vec::new())
+            Project::from_parts(sources.clone(), two(video, audio), Vec::new(), Vec::new(), Vec::new())
                 .expect_err("refused")
                 .to_string()
         };
@@ -8343,14 +8355,15 @@ mod tests {
             two(vec![linked(0, 0, 5, 2)], vec![linked(0, 0, 3, 2)]),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(apart.is_ok(), "offsets within one group load: {apart:?}");
         // A one-sided link is *not* an error: it is what a lift leaves behind.
         let mut p = Project::single(FILE, 9);
         assert!(p.lift(Lane::A1, 0));
-        let (sources, lanes, eq, color) = p.clone().without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.clone().without_orphan_sources();
         assert!(
-            Project::from_parts(sources, lanes, eq, color).is_ok(),
+            Project::from_parts(sources, lanes, eq, color, Vec::new()).is_ok(),
             "a lifted lane's project has to load again"
         );
 
@@ -8745,8 +8758,8 @@ mod tests {
     /// handed back to the constructor a load goes through -- every lane of them,
     /// and the reloaded timeline has to be the same lanes in the same order.
     fn reloads(p: &Project, what: &str) {
-        let (sources, lanes, eq, color) = p.clone().without_orphan_sources();
-        match Project::from_parts(sources, lanes, eq, color) {
+        let (sources, lanes, eq, color, _transform) = p.clone().without_orphan_sources();
+        match Project::from_parts(sources, lanes, eq, color, Vec::new()) {
             Err(e) => panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes),
             Ok(back) => {
                 assert_eq!(back.lanes(), p.lanes(), "{what}: the lane list changed");
@@ -8996,12 +9009,12 @@ mod tests {
         invariants_hold(&p, "V2 over V1");
 
         // A save writes that order and a load takes it back.
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(
             lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [LaneKind::Video, LaneKind::Video, LaneKind::Audio]
         );
-        let back = Project::from_parts(sources, lanes, eq, color).expect("three lanes load");
+        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("three lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(shape(&back), shape(&p), "the same lane is still on top");
 
@@ -9133,7 +9146,7 @@ mod tests {
         let v2 = p.add_lane(LaneKind::Video);
         assert!(p.place(v2, 4, clip(0, 20, 32, 0)));
         let a2 = p.add_lane(LaneKind::Audio);
-        let (sources, lanes, eq, color) = p.without_orphan_sources();
+        let (sources, lanes, eq, color, _transform) = p.without_orphan_sources();
         assert_eq!(
             lanes.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
             [
@@ -9147,7 +9160,7 @@ mod tests {
         assert_eq!(lanes[2].1, p.lane(v2), "V2's clips are written");
         assert!(lanes[3].1.is_empty(), "and the empty A2 is still a lane");
         // ...and all four load again as the same four.
-        let back = Project::from_parts(sources, lanes, eq, color).expect("four lanes load");
+        let back = Project::from_parts(sources, lanes, eq, color, Vec::new()).expect("four lanes load");
         assert_eq!(back.lanes(), p.lanes());
         assert_eq!(back.lane(a2), p.lane(a2));
 
@@ -9240,7 +9253,7 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 5, 15, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -9285,7 +9298,7 @@ mod tests {
             (LaneKind::Video, vec![clip(10, 0, 10, 1)]),
             (LaneKind::Audio, vec![clip(0, 0, 30, 0)]),
         ];
-        let p = Project::from_parts(sources, holed, vec![], vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, holed, vec![], vec![], Vec::new()).expect("valid parts");
         assert_eq!(
             p.composite_spans_from(0),
             vec![
@@ -9333,7 +9346,7 @@ mod tests {
             (LaneKind::Audio, vec![clip(15, 0, 15, 1)]),
             (LaneKind::Audio, Vec::new()),
         ];
-        let p = Project::from_parts(sources, lanes, vec![], vec![]).expect("valid parts");
+        let p = Project::from_parts(sources, lanes, vec![], vec![], Vec::new()).expect("valid parts");
         let lists = p.audio_segments_from(0, FPS);
         assert_eq!(lists.len(), 2, "the empty lane is not mixed in");
         assert_eq!(lists[0], p.segments_from(0, FPS), "A1 is unchanged");
@@ -9350,6 +9363,7 @@ mod tests {
             ],
             vec![],
             vec![],
+            Vec::new(),
         )
         .expect("valid parts");
         assert_eq!(p.audio_segments_from(0, FPS), vec![vec![(None, 0.0, 1.0)]]);
