@@ -53,6 +53,7 @@ impl Player {
                 | ActionId::AddSubtitleLane
                 | ActionId::RemoveSubtitleLane
                 | ActionId::ImportSubtitles
+                | ActionId::Crossfade
         ) {
             self.mark_dirty();
         }
@@ -88,6 +89,7 @@ impl Player {
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),
             ActionId::Regroup => self.regroup(cx),
+            ActionId::Crossfade => self.crossfade_selected(cx),
             ActionId::Detach => self.detach(cx),
             ActionId::Group => self.group(cx),
             ActionId::Select => self.select_under_playhead(cx),
