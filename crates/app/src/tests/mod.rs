@@ -25,6 +25,7 @@ use super::{
     bitrate_detail, bitrate_refusal, can_add, cancels_export, clipboard_after_remove, color_snap, commit_mbps,
     containers,
     enable, envelope, eq_card_w, eq_freq, eq_freq_label, eq_spectrum, eq_x, eq_y,
+    escape_leaves_player_fullscreen,
     estimated_bytes, export_path, export_settings, format_key,
     format_line, format_refusal, fps_choices, fps_label, frac_along, frac_down, frame_at,
     frame_rate_ladder, histogram,
