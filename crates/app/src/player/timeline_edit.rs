@@ -1269,15 +1269,18 @@ impl Player {
     /// Where the playhead is, as the panel draws it: pinned to the out point
     /// once playback is done, and clamped to the drawn duration otherwise -- a
     /// tail being dragged draws past the timeline it is about to become.
+    ///
+    /// `self.transport()` answers for whichever session is active, which is
+    /// the preview while one is showing ([`Player::active_session`]) -- so a
+    /// preview reaching its own end must not be read as *this* (the
+    /// timeline's) playhead running out and snapping to `duration`. Gated on
+    /// there being no preview session, so the ruler keeps tracking
+    /// `self.session` -- untouched by a preview's own clock -- for as long as
+    /// one is up.
     pub(crate) fn playhead(&self, duration: f64) -> f64 {
-        if self.transport() == Transport::Ended {
-            duration
-        } else {
-            self.session
-                .as_ref()
-                .map_or(0., PlaybackSession::now)
-                .clamp(0., duration)
-        }
+        let ended = self.preview_session.is_none() && self.transport() == Transport::Ended;
+        let now = self.session.as_ref().map_or(0., PlaybackSession::now);
+        playhead_position(now, ended, duration)
     }
 
     /// One sample of whatever drag is in the hand: the equalizer's handle, a
