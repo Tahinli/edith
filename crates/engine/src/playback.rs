@@ -1561,6 +1561,7 @@ impl PlaybackSession {
             Some(Span {
                 start,
                 from: Some((source, in_frame)),
+                speed,
                 ..
             }) => {
                 // The stand-in where there is one and the switch is on, the
@@ -1603,15 +1604,37 @@ impl PlaybackSession {
                 // the project's own and constant across the span for that
                 // reason too.
                 let tone = self.project.tone();
+                // At faster than real time several source frames decode to the
+                // same timeline frame ([`Speed::timeline_at`]) and only the last
+                // of a run is ever shown; the worker skips converting the rest
+                // ([`crate::decode::skip_for_speed`]) rather than paying a full
+                // colour convert and scale for a picture nothing displays.
+                //
+                // corner-cut: correct only when this file plays at the
+                // timeline's own rate -- `skip_for_speed`'s own math is in the
+                // file's frame numbers, which a `Rate` conversion would make a
+                // different sequence than the timeline's. `Speed::NORMAL` (never
+                // skip) covers that rarer case exactly as every frame was
+                // delivered before this.
+                let decode_speed = if self.span_rate.is_real_time() {
+                    speed
+                } else {
+                    Speed::NORMAL
+                };
                 // The worker already decoding this very file takes the new span
                 // itself: no thread, no container parse, no VA-API init -- the
                 // whole of what a seek used to cost. It answers `None` for any
                 // other file (and for a worker whose thread has ended), and the
                 // deferred opener below is then exactly the path it always was.
-                if let Some((frames, backend)) =
-                    self.worker
-                        .reseek(&path, start_frame, end_frame, color, canvas(), tone)
-                {
+                if let Some((frames, backend)) = self.worker.reseek(
+                    &path,
+                    start_frame,
+                    end_frame,
+                    color,
+                    canvas(),
+                    tone,
+                    decode_speed,
+                ) {
                     self.frames = frames;
                     self.backend = backend;
                     self.span = span;
@@ -1624,6 +1647,7 @@ impl PlaybackSession {
                     color,
                     canvas(),
                     tone,
+                    decode_speed,
                 ))
             }
             // A gap: black for as long as it runs. An emptied timeline has no
