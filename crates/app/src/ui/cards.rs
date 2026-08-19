@@ -637,6 +637,22 @@ impl Player {
                                 .children(list),
                         )
                         .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(head))
+                        // The mark, in and out and how long that is -- only
+                        // when there is one: an unmarked export writes the
+                        // whole timeline, the summary it always had.
+                        .children(self.range.map(|(start, end)| {
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(FG_SECONDARY()))
+                                .child(format!(
+                                    "RANGE {}\u{2013}{} ({})",
+                                    timecode(f64::from(start) / self.fps, self.fps),
+                                    timecode(f64::from(end) / self.fps, self.fps),
+                                    timecode(f64::from(end - start) / self.fps, self.fps),
+                                ))
+                        }))
                         .child(
                             div()
                                 .flex_none()
