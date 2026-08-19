@@ -303,12 +303,16 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
             };
             match still {
                 true => Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     in_frame: 0,
                     out_frame: keep,
                     start: to,
                     ..clip
                 },
                 false => Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     in_frame: clip.out_frame - keep.min(clip.out_frame),
                     start: to,
                     ..clip
@@ -317,6 +321,8 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
         }
         Edge::End => match clip.speed.fit(to.saturating_sub(clip.start)) {
             Some(keep) => Clip {
+                fade_in: 0,
+                fade_out: 0,
                 out_frame: clip.in_frame + keep,
                 ..clip
             },
