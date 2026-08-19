@@ -19,9 +19,9 @@ pub(crate) const NOTICES_MAX: usize = 8;
 pub(crate) const NOTICE_MIN_W: f32 = 180.;
 
 /// The whole of the queue's policy, where it can be read at once and tested
-/// without a window: dedupe against the back, a ceiling, oldest out first.
-/// [`Player::notify_user`] is the door every message comes through; this is what
-/// the door does.
+/// without a window: dedupe against the back, a ceiling, oldest out first --
+/// except an export's own outcome, which jumps to the front. [`Player::notify_user`]
+/// is the door every message comes through; this is what the door does.
 pub(crate) fn push_notice(notices: &mut std::collections::VecDeque<SharedString>, message: SharedString) {
     // A repeat of what is already at the back is dropped -- holding a key that
     // refuses would otherwise fill the queue with one sentence, and the count on
@@ -32,7 +32,22 @@ pub(crate) fn push_notice(notices: &mut std::collections::VecDeque<SharedString>
     if notices.len() >= NOTICES_MAX {
         notices.pop_front();
     }
-    notices.push_back(message);
+    // Minutes of an export land here the moment it ends, and behind two or
+    // three progress lines (a proxy, a caption) queued while it ran, its own
+    // result would sit unseen several dismissals deep. It is the one thing a
+    // person started the export to read, so it goes to the front -- the
+    // notice showing now -- rather than the back of the line.
+    match is_completion(&message) {
+        true => notices.push_front(message),
+        false => notices.push_back(message),
+    }
+}
+
+/// An export's own outcome: the one class of notice that outranks whatever
+/// is already queued ([`push_notice`]). Named by the same prefixes
+/// [`crate::player::export`] writes them with.
+fn is_completion(message: &str) -> bool {
+    message.starts_with(EXPORT_DONE) || message.starts_with("EXPORT FAILED")
 }
 
 /// The tail an open/load notice grows when the file has sound the engine cannot
