@@ -982,6 +982,10 @@ impl Player {
                 // opening another clip is not a change of mind about that.
                 self.export_path = retarget(&export_path(path), self.format);
                 self.project_path = project_path(path);
+                // Derived, not opened: `project_path` here is a guess at where
+                // a save would land, not a file this window has any business
+                // writing an autosave beside until a manual save earns it.
+                self.autosave_armed = false;
                 self.name = file_name(path).into();
                 self.reset_after_reseek();
                 let name = file_name(path);
@@ -1260,6 +1264,9 @@ impl Player {
                     self.auto_proxies_on = session.auto_proxies();
                 }
                 self.project_path = path.to_path_buf();
+                // Opened from the `.edith` itself: the file this window will
+                // autosave beside is the one the user actually chose.
+                self.autosave_armed = true;
                 self.name = file_name(path).into();
                 // A copied clip names its source by index, which means a
                 // different file -- or none -- in another project.
@@ -1328,6 +1335,10 @@ impl Player {
                 }
                 self.autosave_dirty = false;
                 self.autosave_last_edit = None;
+                // A manual save is exactly the event this flag exists to
+                // require: whatever `project_path` was derived from, it now
+                // names a file the user just chose to write.
+                self.autosave_armed = true;
                 format!("SAVED {}", file_name(&self.project_path))
             }
             Some(Err(e)) => format!("SAVE FAILED: {e}"),
@@ -1381,6 +1392,17 @@ impl Player {
         self.recovery_sidecar = None;
     }
 
+    /// Answers the recovery notice with anything but `enter`: the sidecar is
+    /// discarded, on disk as well as in memory. Left behind, an unread
+    /// autosave from a scratch session would keep outdating the real project
+    /// it sits beside and reappear as "recovery" on every open of that file
+    /// (reference-editor behaviour: a declined backup is discarded, not kept
+    /// around to ask again). Pure at the path level so it needs no `Player`
+    /// to test -- a missing sidecar is not an error, only a no-op.
+    pub(crate) fn discard_sidecar(sidecar: &Path) {
+        let _ = std::fs::remove_file(sidecar);
+    }
+
     /// Whether `project_path` has a sidecar beside it that outdates the file
     /// itself: the sidecar exists, the project exists, and the sidecar's mtime
     /// is strictly the younger of the two. Pure and file-system-only -- no
@@ -1416,6 +1438,15 @@ impl Player {
         .detach();
     }
 
+    /// Whether a tick is allowed to write at all: armed (`project_path` names
+    /// a file this window opened or saved -- see `autosave_armed`), dirty,
+    /// and not mid-export. Pure and split out from [`autosave_tick`](Self::autosave_tick)
+    /// for the same reason [`recovery_offer`](Self::recovery_offer) is: a test
+    /// can ask it with three bools, with no `Player` to build.
+    fn autosave_gate(armed: bool, dirty: bool, exporting: bool) -> bool {
+        armed && dirty && !exporting
+    }
+
     /// One tick of the loop above. Writes the sidecar when an edit has been
     /// idle for [`AUTOSAVE_DEBOUNCE`] (the debounce) or dirty edits have gone
     /// unwritten for [`AUTOSAVE_PERIOD`] (the periodic safety net for a run
@@ -1425,7 +1456,7 @@ impl Player {
     /// write is not something a person can do anything about right now, and a
     /// modal over it would be worse than the risk it is guarding against.
     fn autosave_tick(&mut self, cx: &mut Context<Self>) {
-        if !self.autosave_dirty || self.exporting().is_some() {
+        if !Self::autosave_gate(self.autosave_armed, self.autosave_dirty, self.exporting().is_some()) {
             return;
         }
         let now = Instant::now();
@@ -1680,6 +1711,53 @@ mod autosave_tests {
             .set_modified(now - Duration::from_secs(60))
             .unwrap();
         assert_eq!(Player::recovery_offer(&project), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bug this module exists to close: a plain media open derives
+    /// `project_path` (a guess at where a save would land) but never arms
+    /// autosave for it -- so a dirty, never-saved scratch session writes no
+    /// sidecar beside whatever `.edith` that guess happens to name, even if
+    /// one already exists as somebody's real saved project.
+    #[test]
+    fn unarmed_session_never_writes_even_when_dirty() {
+        assert!(!Player::autosave_gate(false, true, false));
+    }
+
+    /// Both doors that earn the write: opening the `.edith` itself
+    /// (`install_project`) and a manual save (`save_project`), each setting
+    /// `autosave_armed = true` before this gate is ever asked again.
+    #[test]
+    fn armed_and_dirty_session_writes() {
+        assert!(Player::autosave_gate(true, true, false));
+        // Still withheld while an export is running, armed or not.
+        assert!(!Player::autosave_gate(true, true, true));
+        // Still withheld while clean, armed or not.
+        assert!(!Player::autosave_gate(true, false, false));
+    }
+
+    /// Declining the recovery notice (any key but `enter`, in
+    /// [`render::key handler`](crate::render)) discards the sidecar on disk,
+    /// not just the in-memory offer -- otherwise the same stale sidecar
+    /// outdates the project again on the very next open.
+    #[test]
+    fn declining_recovery_deletes_the_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "edith-autosave-decline-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("p.edith.autosave");
+        std::fs::write(&sidecar, b"stale").unwrap();
+
+        Player::discard_sidecar(&sidecar);
+        assert!(!sidecar.exists());
+
+        // A missing sidecar (already recovered, or declined twice) is a
+        // no-op, not an error.
+        Player::discard_sidecar(&sidecar);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
