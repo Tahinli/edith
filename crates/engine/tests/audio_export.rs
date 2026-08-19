@@ -61,6 +61,9 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// re-encodes today and once refused outright.
 fn mixed_project() -> Project {
     let clip = |start, source| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: 30,
@@ -83,6 +86,9 @@ fn mixed_project() -> Project {
             (
                 LaneKind::Video,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
+                    transition_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 90,
@@ -223,6 +229,7 @@ fn exports_the_timeline_as_a_wav() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(60)).expect("wav export");
     assert_eq!(handle.progress(), 1.0, "finished at full progress");
@@ -245,6 +252,7 @@ fn exports_the_timeline_as_a_flac() {
             format: Format::Flac,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(60)).expect("flac export");
     assert_eq!(handle.progress(), 1.0, "finished at full progress");
@@ -283,6 +291,7 @@ fn exports_the_timeline_as_an_mp3() {
             format: Format::Mp3,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(120)).expect("mp3 export");
     assert_eq!(handle.progress(), 1.0, "finished at full progress");
@@ -324,6 +333,9 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
     let song = asset("test_tone.mp3");
     let still = asset("test_still.png");
     let clip = |source, frames| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: frames,
@@ -357,7 +369,7 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
         color: Default::default(),
     };
     let out = out_path("still_song", "mp4");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(300)).expect("an mp4 of a still under a song");
 
     // Picture: two seconds of it, through the demuxer an import uses.
@@ -388,6 +400,9 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
 #[test]
 fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
@@ -423,7 +438,8 @@ fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
                 format: Format::Wav,
                 ..Default::default()
             },
-        );
+        None,
+    );
         wait(&handle, Duration::from_secs(60)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let (audio, samples) = decode(&out);
         let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
@@ -513,6 +529,7 @@ fn a_cancelled_audio_export_leaves_no_file() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     handle.cancel();
     let outcome = wait(&handle, Duration::from_secs(120));
@@ -597,7 +614,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                 audio_kbps: kbps,
                 ..Default::default()
             },
-        );
+        None,
+    );
         wait(&handle, Duration::from_secs(120)).expect("mp3 export");
         let got = mp3_declared_kbps(&out);
         println!("mp3 asked {kbps:?}, header says {got} kbps");
@@ -621,6 +639,9 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
             (
                 LaneKind::Video,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
+                    transition_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 60,
@@ -635,6 +656,9 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
             (
                 LaneKind::Audio,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
+                    transition_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 60,
@@ -669,7 +693,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                 audio_kbps: Some(want),
                 ..Default::default()
             },
-        );
+        None,
+    );
         wait(&handle, Duration::from_secs(300)).expect("an mp4 of a still under a song");
         let got = mp4_aac_kbps(&out, f64::from(RATE));
         println!("mp4 asked {want} kbps, the track measures {got:.1}");
@@ -689,6 +714,9 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
 #[test]
 fn a_silent_clip_exports_as_silence_over_its_own_span() {
     let clip = |start, source| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: 30,
@@ -723,6 +751,7 @@ fn a_silent_clip_exports_as_silence_over_its_own_span() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(60)).expect("wav export");
     let (audio, samples) = decode(&out);
@@ -757,6 +786,7 @@ fn a_silent_timeline_refuses_an_audio_export() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     let text = wait(&handle, Duration::from_secs(60))
         .expect_err("no audio to export")
@@ -779,6 +809,9 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
         vec![(
             LaneKind::Audio,
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
+                transition_out: 0,
                 start: 0,
                 in_frame: 0,
                 out_frame: 30,
@@ -805,6 +838,7 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(60)).expect("wav export of an AC-3 source");
 
@@ -846,6 +880,7 @@ fn exports_the_timeline_as_an_ogg_vorbis() {
             format: Format::Ogg,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(180)).expect("ogg export");
     assert_eq!(handle.progress(), 1.0, "finished at full progress");
@@ -904,6 +939,9 @@ fn a_mono_timeline_exports_as_dual_mono_ogg() {
         vec![(
             LaneKind::Audio,
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
+                transition_out: 0,
                 start: 0,
                 in_frame: 0,
                 out_frame: 30,
@@ -929,6 +967,7 @@ fn a_mono_timeline_exports_as_dual_mono_ogg() {
             format: Format::Ogg,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(180)).expect("ogg export of a mono timeline");
 

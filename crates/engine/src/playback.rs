@@ -618,6 +618,9 @@ impl PlaybackSession {
         // *video* open's pair of grouped clips: here there is no picture to
         // group the sound with, so the video lane starts empty.
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: meta.frame_count,
@@ -701,6 +704,9 @@ impl PlaybackSession {
             color: ColorDescription::default(),
         };
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
@@ -1095,8 +1101,8 @@ impl PlaybackSession {
     /// the format (or an equalized lane) forces. Pure -- no probe, no file
     /// opened -- so a card may ask it per repaint; the picture's half costs a
     /// plugin open and lives in [`crate::export::planned_video`].
-    pub fn planned_audio(&self, format: crate::export::Format) -> &'static str {
-        crate::export::planned_audio(&self.project, format)
+    pub fn planned_audio(&self, format: crate::export::Format, ranged: bool) -> &'static str {
+        crate::export::planned_audio(&self.project, format, ranged)
     }
 
     /// The timeline an export started right now would be run against, owned:
@@ -1146,8 +1152,12 @@ impl PlaybackSession {
     /// Why the sound's rate is not a choice for this timeline in this format --
     /// [`crate::export::audio_rate_refusal`], asked of the project a front-end
     /// is holding, and pure for the same reason.
-    pub fn audio_rate_refusal(&self, format: crate::export::Format) -> Option<&'static str> {
-        crate::export::audio_rate_refusal(&self.project, format)
+    pub fn audio_rate_refusal(
+        &self,
+        format: crate::export::Format,
+        ranged: bool,
+    ) -> Option<&'static str> {
+        crate::export::audio_rate_refusal(&self.project, format, ranged)
     }
 
     /// Why this session plays silent although the file has sound -- an audio
@@ -2548,6 +2558,47 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_fit(lane, idx, fit))
     }
 
+    /// Timeline frames of ramp-up from silence at the start of the clip at
+    /// `idx` of `lane`. `0` for an index that is not there.
+    pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.fade_in_of(lane, idx)
+    }
+
+    /// Sets that clip's fade-in, clamped to its own length. A sound-only
+    /// edit, same as an equalizer or a fader: no reseek needed.
+    pub fn set_fade_in(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_fade_in(lane, idx, frames))
+    }
+
+    /// Timeline frames of ramp-down to silence at the end of the clip at
+    /// `idx` of `lane`. `0` for an index that is not there.
+    pub fn fade_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.fade_out_of(lane, idx)
+    }
+
+    /// Sets that clip's fade-out. Same promises as [`Self::set_fade_in`].
+    pub fn set_fade_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_fade_out(lane, idx, frames))
+    }
+
+    /// Crossfades the audio clip at `idx` of `lane` into its neighbour, over
+    /// `frames`. Same promises as [`Project::crossfade`].
+    pub fn crossfade(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.crossfade(lane, idx, frames))
+    }
+
+    /// Timeline frames of dissolve at the end of the clip at `idx` of `lane`,
+    /// into its neighbour. `0` for an index that is not there.
+    pub fn transition_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.transition_out_of(lane, idx)
+    }
+
+    /// Sets that clip's dissolve into its neighbour, clamped to its own
+    /// length. A picture edit -- same as a grade or fit policy.
+    pub fn set_transition_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transition_out(lane, idx, frames))
+    }
+
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
     /// numbers and nothing else, so a copy stays valid after the clip it came
     /// from is deleted. `None` past the end.
@@ -2625,6 +2676,9 @@ impl PlaybackSession {
         let source = self.project.import(path, stream);
         self.note_frames(source, frames, rate);
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
+            transition_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: match image {
@@ -2798,6 +2852,12 @@ impl PlaybackSession {
     /// Undoes the last successful edit, and reseeks like a delete.
     pub fn undo(&mut self) -> bool {
         self.edit(Dirty::Both, Project::undo)
+    }
+
+    /// Redoes the last edit [`undo`](Self::undo) took back, and reseeks like
+    /// a delete.
+    pub fn redo(&mut self) -> bool {
+        self.edit(Dirty::Both, Project::redo)
     }
 
     /// Takes `path` into the **library**: it becomes a source of this session,
@@ -3248,6 +3308,10 @@ impl PlaybackSession {
             // speeded, which is the path that decodes the same samples it always
             // did.
             let speeds = self.project.audio_speeds_from(target, fps);
+            // ...and the fades, the same way again: a clip's own envelope runs
+            // inside its worker, after the rate and the equalizer, so a fade
+            // edit is audible at once exactly as an EQ edit is.
+            let fades = self.project.audio_fades_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
@@ -3277,11 +3341,12 @@ impl PlaybackSession {
             // one `pread` on a cold 25 GB film is seconds, and this is called
             // from a ruler drag ([`Audio::spawn_feeder_deferred`]).
             audio_running = audio.spawn_feeder_deferred(move || {
-                match AudioSession::open_mixed_streams_live(
+                match AudioSession::open_mixed_streams_live_fade(
                     &sources,
                     &segs,
                     &eqs,
                     &speeds,
+                    &fades,
                     &gains,
                     limiter,
                     Some(&worker_controls),

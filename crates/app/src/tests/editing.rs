@@ -615,6 +615,9 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     use keymap::{ActionId, Keymap};
     // Frames 30..90 of the timeline, taken from the head of its source.
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -655,6 +658,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // clip by any reading of the playhead, so "only from inside a clip"
     // there is a refusal claiming something the screen contradicts.
     let slow = Clip {
+        fade_in: 0,
+        fade_out: 0,
         speed: Speed::MIN,
         ..clip
     };
@@ -679,6 +684,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // engine's question. Group is offered on every clip, for that reason.
     assert!(!offered(&clip, v1, ActionId::Detach, 0));
     let grouped = Clip {
+        fade_in: 0,
+        fade_out: 0,
         link: Some(3),
         ..clip
     };
@@ -981,6 +988,9 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
 fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     use keymap::ActionId;
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -1611,6 +1621,9 @@ fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
 #[test]
 fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     let clip = |source: usize| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
@@ -2031,4 +2044,18 @@ fn frac_along_measures_from_the_elements_own_left_edge() {
     // Never painted reads as flat: an unpainted graph must not slam a band
     // to +12 dB on the first press.
     assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
+}
+
+/// A fade handle's pixels turn into frames at the bed's own scale, and a
+/// degenerate scale (nothing painted) turns into no movement at all.
+#[test]
+fn a_fade_drag_converts_pixels_to_frames_at_the_beds_scale() {
+    use crate::timeline_math::fade_delta_frames;
+    // 100 px/s at 25 fps: one second of pixels is one second of frames.
+    assert_eq!(fade_delta_frames(100., 100., 25.), 25);
+    // Signed: dragging back shrinks the fade by the same conversion.
+    assert_eq!(fade_delta_frames(-50., 100., 25.), -13);
+    // Nothing drawn to drag against moves nothing.
+    assert_eq!(fade_delta_frames(40., 0., 25.), 0);
+    assert_eq!(fade_delta_frames(40., -1., 25.), 0);
 }

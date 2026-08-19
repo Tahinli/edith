@@ -801,6 +801,9 @@ fn a_stills_trim_preview_grows_forward_like_the_commit() {
 #[test]
 fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
     let at = |start: u32| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: 30,

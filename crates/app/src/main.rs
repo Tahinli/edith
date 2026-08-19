@@ -109,6 +109,10 @@ struct Player {
     /// top on reaching its end instead of stopping there. One flag for both,
     /// since only one of them is ever playing at a time.
     loop_on: bool,
+    /// The in/out mark an export is clipped to, half-open `[start, end)` in
+    /// timeline frames -- `None` for the whole timeline. Session state, like
+    /// the mark itself: never saved to a `.edith` ([`ExportSettings::range`]).
+    range: Option<(u32, u32)>,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -273,6 +277,10 @@ struct Player {
     /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
     /// [`Trim`].
     trim: Option<Trim>,
+    /// A drag that started on a fade handle, tracked on the root for the same
+    /// reason a trim is: a 10 px square is not where the pointer stays. See
+    /// [`FadeDrag`].
+    fade_drag: Option<FadeDrag>,
     /// How far into the clip the last press on a box landed, in timeline
     /// frames: what a drag lets go of is the *point that was grabbed*, so the
     /// head lands that much in front of the pointer and the clip does not jump
@@ -385,6 +393,37 @@ struct Player {
     /// or the one derived beside the media it started as. Saving twice
     /// overwrites the same file rather than making a second one.
     project_path: PathBuf,
+    /// Whether an edit has landed since the sidecar last caught up with it --
+    /// set at every edit's own door ([`Player::mark_dirty`]) and cleared once
+    /// [`Player::autosave_tick`] has written it out. `project_path` itself is
+    /// never touched here: only [`Player::save_project`] writes the real file.
+    autosave_dirty: bool,
+    /// When the dirty flag above was last set, so a tick can debounce: a
+    /// sidecar write waits until the hand has been off the timeline for a
+    /// few seconds, rather than chasing every pointer sample of a drag.
+    autosave_last_edit: Option<Instant>,
+    /// When the sidecar was last actually written, so a long unbroken run of
+    /// edits still gets caught by the periodic safety net rather than being
+    /// debounced forever.
+    autosave_last_run: Option<Instant>,
+    /// A sidecar found newer than the project it sits beside, offered on the
+    /// notice bar the moment that project opens ([`Player::install_project`]).
+    /// The path is the sidecar's own, so accepting it needs nowhere else to
+    /// look; declining or answering any other key just drops it here --
+    /// `project_path` is never touched by either path, only a manual save
+    /// writes the real file.
+    recovery_sidecar: Option<PathBuf>,
+    /// Whether `project_path` names a file this window itself put there --
+    /// loaded from a `.edith` ([`Player::install_project`]) or written by a
+    /// manual save ([`Player::save_project`]) -- rather than one merely
+    /// derived beside an imported media file. [`Player::autosave_tick`]
+    /// requires it: a path derived from `media.mp4` names `media.edith`
+    /// whether or not that file is the user's own saved project, and writing
+    /// a sidecar beside a *foreign* `.edith` the user never opened is what
+    /// let a scratch timeline's autosave outdate and "recover" over a real
+    /// one. `mark_dirty` does not touch this -- an edit earns nothing an open
+    /// or save has not already granted.
+    autosave_armed: bool,
     /// Which stroke means what, and what every shortcut on screen is called.
     /// The one place either question is answered.
     keymap: Keymap,
@@ -740,6 +779,7 @@ fn main() {
                     preview_playing: false,
                     player_fullscreen: false,
                     loop_on: false,
+                    range: None,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
@@ -792,6 +832,7 @@ fn main() {
                     splits: Splits::default(),
                     split_drag: None,
                     trim: None,
+                    fade_drag: None,
                     grab: 0,
                     snap: true,
                     subs_on: true,
@@ -813,6 +854,11 @@ fn main() {
                     // export beside the picture, a save beside it too.
                     export_path: PathBuf::new(),
                     project_path: PathBuf::new(),
+                    autosave_dirty: false,
+                    autosave_last_edit: None,
+                    autosave_last_run: None,
+                    recovery_sidecar: None,
+                    autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,
                     keys_search: String::new(),
@@ -899,6 +945,7 @@ fn main() {
                 // Nothing else takes focus, and without it the key listener
                 // above is never reached.
                 window.focus(&player.read(cx).focus);
+                player.update(cx, |player, cx| player.start_autosave(cx));
                 player
             },
         )

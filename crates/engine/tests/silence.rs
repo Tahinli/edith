@@ -138,6 +138,9 @@ fn speed_mode_refuses_a_clip_that_laps_over_a_silence() {
     let lane = p.add_lane(LaneKind::Video);
     assert_eq!(lane.label(), "V2");
     let broll = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 20,
@@ -173,6 +176,9 @@ fn speed_mode_refuses_a_clip_that_laps_over_a_silence() {
 /// A clip covering the whole fixture, for a second track to carry.
 fn whole(source: usize, frames: u32) -> Clip {
     Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: frames,
@@ -381,6 +387,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         true,
         engine::export::EncoderSeat::default(),
         p.limiter(),
+        None,
         0,
     )
     .expect("save");

@@ -487,6 +487,9 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
     // what makes the proxy picture-only: the export walk codes the lanes it is
     // given and there is no sound among them.
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: meta.frame_count.max(1),
