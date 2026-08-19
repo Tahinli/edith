@@ -479,6 +479,31 @@ fn a_caption_grouped_with_a_clip_pairs_it_for_the_whole_take_question() {
     );
 }
 
+/// An ungrouped clip on a further lane (ord >= 1) is a layer, not a take: it
+/// sits over the timeline rather than in it, so deleting it lifts a hole
+/// rather than rippling one closed. Pins the `(_, 1..) => false` arm
+/// `whole_take` answers before it ever reaches the video/audio arms below.
+#[test]
+fn an_ungrouped_clip_on_a_further_lane_is_a_layer_not_a_take() {
+    use engine::project::LaneKind;
+
+    let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    session.set_gain(0.0);
+    let v2 = session.add_lane(LaneKind::Video);
+    assert!(session.move_clip_to(Lane::V1, 0, v2, 0), "V1 -> V2");
+    // Its old pairing with A1 came along with the move -- detach it, an
+    // ungrouped clip is exactly the case this arm is for.
+    assert!(session.ungroup(v2, 0));
+    assert!(
+        !whole_take(&session, v2, 0),
+        "an ungrouped clip on ord >= 1 is a layer, not a take"
+    );
+    // ...and its delete lifts, leaving the hole under it open: the take
+    // beneath (there is none here, but the lane) is untouched.
+    assert!(session.lift_clip(v2, 0));
+    assert!(session.lane_clips(v2).is_empty());
+}
+
 /// A caption anchor names the media half of its group: the video member for
 /// the cards that are about the picture, the audio member for the ones about
 /// the sound. A caption in no group names nothing -- which is what the cards'
