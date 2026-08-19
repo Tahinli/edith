@@ -80,6 +80,77 @@ impl Quality {
     }
 }
 
+/// The primary pane's one row: the format-and-quality bundles most exports
+/// actually are, named the way a person asks for one rather than by codec and
+/// megabits apart. Every bundle is still exactly a [`Format`] and a
+/// [`Quality`] the Advanced pane's own rows already know how to set -- this
+/// is a shortcut to the pair, not a third setting kept beside them, so a
+/// bundle picked here and a codec picked below never disagree about what is
+/// in force. `Custom` sets nothing; it only opens the Advanced pane, for a
+/// combination none of the bundles name.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum ExportPreset {
+    Web,
+    Small,
+    Master,
+    AudioOnly,
+    Custom,
+}
+
+impl ExportPreset {
+    pub(crate) const ALL: [ExportPreset; 5] = [
+        ExportPreset::Web,
+        ExportPreset::Small,
+        ExportPreset::Master,
+        ExportPreset::AudioOnly,
+        ExportPreset::Custom,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ExportPreset::Web => "Web",
+            ExportPreset::Small => "Small file",
+            ExportPreset::Master => "Master",
+            ExportPreset::AudioOnly => "Audio only",
+            ExportPreset::Custom => "Custom",
+        }
+    }
+
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            ExportPreset::Web => "H.264 · MP4 · medium quality — plays everywhere",
+            ExportPreset::Small => "AV1 · MP4 · low quality — smallest file",
+            ExportPreset::Master => "H.264 · MP4 · high quality — for re-editing later",
+            ExportPreset::AudioOnly => "FLAC — lossless sound, no picture",
+            ExportPreset::Custom => "pick a codec, quality and the rest below",
+        }
+    }
+
+    /// The format and quality this bundle sets, or `None` for `Custom` --
+    /// which changes nothing itself, it only opens the pane where the two are
+    /// set apart.
+    pub(crate) fn bundle(self) -> Option<(Format, Quality)> {
+        match self {
+            ExportPreset::Web => Some((Format::Mp4, Quality::Medium)),
+            ExportPreset::Small => Some((Format::Av1Mp4, Quality::Low)),
+            ExportPreset::Master => Some((Format::Mp4, Quality::High)),
+            ExportPreset::AudioOnly => Some((Format::Flac, Quality::Auto)),
+            ExportPreset::Custom => None,
+        }
+    }
+
+    /// Which bundle the card's current format and quality already are, or
+    /// `Custom` where they match none of them -- so the primary pane always
+    /// says something true about what is actually going to be written rather
+    /// than defaulting to a bundle nobody picked.
+    pub(crate) fn from_state(format: Format, quality: Quality) -> ExportPreset {
+        ExportPreset::ALL
+            .into_iter()
+            .find(|p| p.bundle() == Some((format, quality)))
+            .unwrap_or(ExportPreset::Custom)
+    }
+}
+
 /// The export card's format rows: the key that picks one, its name, and what it
 /// writes -- or, where this program cannot write it, the reason it cannot. A
 /// format with no entry at all would read as an oversight, and a menu of three
