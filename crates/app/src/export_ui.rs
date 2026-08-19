@@ -887,6 +887,9 @@ pub(crate) fn export_settings(
         // anybody.
         intra_only: false,
         keep_source_colour: false,
+        // Set by `start_export`, which knows the player's mark; this helper is
+        // also asked for the estimate alone, which has no range to give.
+        range: None,
     }
 }
 

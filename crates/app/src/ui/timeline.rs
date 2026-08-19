@@ -230,7 +230,25 @@ impl Player {
                                             .w(px(filled))
                                             .rounded(px(3.))
                                             .bg(rgb(ACCENT_PRIMARY())),
-                                    ),
+                                    )
+                                    // The export's own mark, in and out: drawn
+                                    // over the played fill rather than under it,
+                                    // so a range that starts behind the playhead
+                                    // still shows -- translucent, the same wash
+                                    // the silence marks use, so the ruler under
+                                    // it stays readable.
+                                    .children(self.range.map(|(start, end)| {
+                                        let left = self.scale.px_at(f64::from(start) / self.fps);
+                                        let right = self.scale.px_at(f64::from(end) / self.fps);
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .h_full()
+                                            .left(px(left))
+                                            .w(px((right - left).max(1.)))
+                                            .rounded(px(3.))
+                                            .bg(rgba(ACCENT_WASH()))
+                                    })),
                             ),
                     ),
             )
