@@ -21,8 +21,13 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
+
+/// The two proxy tests below share one film, and a proxy job is one per film:
+/// run together, whichever asks second is refused ("already being made"), and
+/// a cancel in one deletes what the other is asserting about. One at a time.
+static PROXY_FILM: Mutex<()> = Mutex::new(());
 
 use engine::export::ExportSettings;
 use engine::hw::HwEncoder;
@@ -912,6 +917,7 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
 /// hardware one buys is speed, and that is the ignored test below.
 #[test]
 fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
+    let _film = PROXY_FILM.lock().unwrap_or_else(|e| e.into_inner());
     let _seat = pin_software();
     let source = asset("test_av.mp4");
     let out = engine::proxy::path_for(&source).expect("a cache directory");
@@ -1047,6 +1053,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
 /// Software seat, like every default test here ([`pin_software`]).
 #[test]
 fn a_stopped_proxy_leaves_neither_a_stand_in_nor_half_of_one() {
+    let _film = PROXY_FILM.lock().unwrap_or_else(|e| e.into_inner());
     let _seat = pin_software();
     let source = asset("test_av.mp4");
     let out = engine::proxy::path_for(&source).expect("a cache directory");
