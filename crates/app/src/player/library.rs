@@ -210,15 +210,15 @@ impl Player {
     /// The row's own play button: opens `path` as a session of its own and
     /// shows it in place of the timeline's picture, without moving the
     /// timeline's playhead or touching its undo stack -- what a library
-    /// preview is. [`PlaybackSession::open`] already builds exactly this (a
-    /// one-clip session, ungraded, passthrough), so nothing new is asked of
-    /// the engine.
-    ///
-    /// corner-cut: opens the file's own first audio stream rather than the
-    /// row's particular one -- `PlaybackSession::open` takes no stream
-    /// argument. Ceiling: a remux with several audio tracks previews on its
-    /// first. Upgrade path: an engine door that opens a chosen stream.
-    pub(crate) fn open_preview(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+    /// preview is. [`PlaybackSession::open_with_audio_stream`] builds exactly
+    /// this (a one-clip session, ungraded, passthrough) bound to `stream`, the
+    /// row's own audio track rather than always the file's first.
+    pub(crate) fn open_preview(
+        &mut self,
+        path: &std::path::Path,
+        stream: usize,
+        cx: &mut Context<Self>,
+    ) {
         if self.exporting().is_some() {
             return;
         }
@@ -229,7 +229,7 @@ impl Player {
         if let Some(session) = self.session.as_mut() {
             session.pause();
         }
-        match PlaybackSession::open(path) {
+        match PlaybackSession::open_with_audio_stream(path, stream) {
             Ok(mut session) => {
                 session.drop_late_pictures(true);
                 session.set_gain(self.volume.gain());
