@@ -77,6 +77,7 @@ use crate::map::TimelineMap;
 use std::path::{Path, PathBuf};
 
 use crate::color::ColorParams;
+use crate::transform::TransformParams;
 use crate::eq::EqParams;
 use crate::limiter::{Limiter, db_to_linear};
 use crate::scale::FitPolicy;
@@ -413,6 +414,11 @@ pub struct Clip {
     /// plays ungraded. An index for [`Clip::eq`]'s reason, and with the same
     /// promises: `Copy`, append-only within a session, never dangling.
     pub color: Option<u16>,
+    /// Index into the project's transform table
+    /// ([`Project::transform_of`]/[`Project::set_transform`]), or `None` for a
+    /// clip that plays at its fit policy's own placement. An index for
+    /// [`Clip::color`]'s reason and with the same promises.
+    pub transform: Option<u16>,
     /// How this clip's picture meets a project canvas of another shape
     /// ([`crate::scale::FitPolicy`]). Inline rather than a table index like the
     /// two above: it is one byte with no parameters, so there is nothing for a
@@ -757,6 +763,7 @@ pub type Parts = (
     Vec<(LaneKind, Vec<Clip>)>,
     Vec<EqParams>,
     Vec<ColorParams>,
+    Vec<TransformParams>,
 );
 
 /// How many undo steps a project keeps. One gesture is one step, so 100 is past
@@ -778,6 +785,8 @@ pub struct Project {
     eq: Vec<EqParams>,
     /// The same, for [`Clip::color`].
     color: Vec<ColorParams>,
+    /// The same, for [`Clip::transform`].
+    transform: Vec<TransformParams>,
     /// Snapshots pushed *before* each successful edit; `undo` pops one. The
     /// whole lane list, so adding a lane undoes as well. Bounded by
     /// [`HISTORY_CAP`]: at the cap the oldest step goes.
@@ -817,6 +826,7 @@ impl Project {
             link: Some(0),
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
@@ -827,6 +837,7 @@ impl Project {
             lanes: LaneData::two_lanes(vec![clip], vec![clip]),
             eq: Vec::new(),
             color: Vec::new(),
+            transform: Vec::new(),
             history: Vec::new(),
             next_link: 1,
             subtitles: Vec::new(),
@@ -857,12 +868,16 @@ impl Project {
         lanes: Vec<(LaneKind, Vec<Clip>)>,
         eq: Vec<EqParams>,
         color: Vec<ColorParams>,
+        transform: Vec<TransformParams>,
     ) -> crate::Result<Self> {
         if let Some(bad) = eq.iter().position(|p| !finite(p)) {
             return Err(format!("eq {bad} holds a band that is not a finite number").into());
         }
         if let Some(bad) = color.iter().position(|p| !color_finite(p)) {
             return Err(format!("color {bad} holds a value that is not a finite number").into());
+        }
+        if let Some(bad) = transform.iter().position(|p| !transform_finite(p)) {
+            return Err(format!("transform {bad} holds a value that is not a finite number").into());
         }
         if lanes.is_empty() {
             return Err("no lanes at all: that is not a project".into());
@@ -927,6 +942,15 @@ impl Project {
                     )
                     .into());
                 }
+                if c.transform.is_some_and(|i| usize::from(i) >= transform.len()) {
+                    return Err(format!(
+                        "{name} clip at {} names transform {} of {}",
+                        c.start,
+                        c.transform.unwrap_or_default(),
+                        transform.len()
+                    )
+                    .into());
+                }
             }
             if !sorted_disjoint(&data.clips) {
                 return Err(format!("the {name} lane is out of order or overlaps itself").into());
@@ -956,6 +980,7 @@ impl Project {
             lanes,
             eq,
             color,
+            transform,
             history: Vec::new(),
             next_link,
             subtitles: Vec::new(),
@@ -1302,6 +1327,8 @@ impl Project {
         let mut eq = Vec::new();
         let mut moved_color = vec![None; self.color.len()];
         let mut color = Vec::new();
+        let mut moved_transform = vec![None; self.transform.len()];
+        let mut transform = Vec::new();
         let mut lanes = self.lanes.clone();
         for c in lanes.iter_mut().flat_map(|l| &mut l.clips) {
             let old = c.source;
@@ -1335,6 +1362,17 @@ impl Project {
                     }
                 });
             }
+            if let Some(old) = c.transform.map(usize::from) {
+                c.transform = Some(match moved_transform[old] {
+                    Some(new) => new,
+                    None => {
+                        transform.push(self.transform[old]);
+                        let new = (transform.len() - 1) as u16;
+                        moved_transform[old] = Some(new);
+                        new
+                    }
+                });
+            }
         }
         if sources.is_empty() {
             sources.extend(self.sources.first().cloned());
@@ -1348,6 +1386,7 @@ impl Project {
             lanes.into_iter().map(|l| (l.kind, l.clips)).collect(),
             eq,
             color,
+            transform,
         )
     }
 
@@ -2192,6 +2231,71 @@ impl Project {
         true
     }
 
+    /// How the clip at `idx` of `lane` is placed, or `None` for one at its fit
+    /// policy's own placement (and for an index that is not there) -- what the
+    /// renderer and the export ask before they place its picture.
+    pub fn transform_of(&self, lane: Lane, idx: usize) -> Option<&TransformParams> {
+        self.transform
+            .get(usize::from(self.lane(lane).get(idx)?.transform?))
+    }
+
+    /// [`set_color`](Self::set_color)'s twin for [`Clip::transform`]: one undo
+    /// step, `false` (and no history) for an index that is not there or a
+    /// value that is not finite, and equal settings share a table entry.
+    pub fn set_transform(&mut self, lane: Lane, idx: usize, params: Option<TransformParams>) -> bool {
+        self.write_transform(lane, idx, params, true)
+    }
+
+    /// [`set_transform`](Self::set_transform) without the undo step, for
+    /// [`set_color_live`](Self::set_color_live)'s reason: the samples inside
+    /// one drag on a position/scale/rotate/crop control are one undo, not one
+    /// per pixel.
+    pub fn set_transform_live(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<TransformParams>,
+    ) -> bool {
+        self.write_transform(lane, idx, params, false)
+    }
+
+    fn write_transform(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<TransformParams>,
+        snapshot: bool,
+    ) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        let slot = match params {
+            None => None,
+            Some(params) => {
+                if !transform_finite(&params) {
+                    return false;
+                }
+                Some(match self.transform.iter().position(|p| *p == params) {
+                    Some(at) => at as u16,
+                    // corner-cut: the 65535th *distinct* transform of one
+                    // session is refused rather than silently aliased,
+                    // exactly as `write_color` refuses the 65535th grade;
+                    // same upgrade path.
+                    None if self.transform.len() >= usize::from(u16::MAX) => return false,
+                    None => {
+                        self.transform.push(params);
+                        (self.transform.len() - 1) as u16
+                    }
+                })
+            }
+        };
+        if snapshot {
+            self.snapshot();
+        }
+        self.lane_mut(lane).expect("checked above")[idx].transform = slot;
+        true
+    }
+
     /// How fast the clip at `idx` of `lane` plays. [`Speed::NORMAL`] for an
     /// index that is not there, which is what every clip starts at anyway.
     pub fn speed_of(&self, lane: Lane, idx: usize) -> Speed {
@@ -2656,6 +2760,14 @@ impl Project {
     pub fn composite_color_at(&self, timeline_frame: u32) -> Option<&ColorParams> {
         let (lane, idx) = self.composite_clip_at(timeline_frame)?;
         self.color_of(lane, idx)
+    }
+
+    /// [`composite_color_at`](Self::composite_color_at)'s twin for
+    /// [`Clip::transform`]: `None` over a gap and for a clip at its fit
+    /// policy's own placement.
+    pub fn composite_transform_at(&self, timeline_frame: u32) -> Option<&TransformParams> {
+        let (lane, idx) = self.composite_clip_at(timeline_frame)?;
+        self.transform_of(lane, idx)
     }
 
     /// How the composite meets the project canvas at `timeline_frame`, so the
