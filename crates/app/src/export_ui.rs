@@ -484,6 +484,43 @@ pub(crate) fn resolution_choices(current: (u32, u32), native: (u32, u32)) -> Vec
         .collect()
 }
 
+/// The resolution list's rows before any file is open: [`RESOLUTIONS`] plain,
+/// with nothing marked unless a pick is already held
+/// ([`Player::pending_settings`]) -- there is no media size to cycle in
+/// beside them yet ([`resolution_choices`]'s `native`).
+pub(crate) fn pending_resolution_choices(pending: Option<(u32, u32)>) -> Vec<ChoiceRow> {
+    RESOLUTIONS
+        .into_iter()
+        .map(|(w, h)| {
+            (
+                Choice::Size(w, h),
+                format!("{h}p").into(),
+                format!("{w}x{h}").into(),
+                Some((w, h)) == pending,
+            )
+        })
+        .collect()
+}
+
+/// [`pending_resolution_choices`]'s sibling for the rate list.
+pub(crate) fn pending_fps_choices(pending: Option<f64>) -> Vec<ChoiceRow> {
+    FRAME_RATES
+        .into_iter()
+        .map(|fps| {
+            (
+                Choice::Fps(fps),
+                format!("{} fps", fps_label(fps)).into(),
+                match (fps - fps.round()).abs() < 0.001 {
+                    true => String::new(),
+                    false => "NTSC".to_string(),
+                }
+                .into(),
+                Some(fps) == pending,
+            )
+        })
+        .collect()
+}
+
 /// Every project frame rate on offer, slowest first: [`FRAME_RATES`] with the
 /// media's own cycled in at its place by speed, so a project already cut at a
 /// listed rate does not see it twice and the media's own rate -- the one a

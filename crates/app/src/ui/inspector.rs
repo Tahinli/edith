@@ -282,7 +282,10 @@ impl Player {
                         ZOOM_SLOT_W,
                         BG_RAISED(),
                         None,
-                        resolution.map_or_else(|| "Size".to_string(), |(_, h)| format!("{h}p")),
+                        match resolution.or(self.pending_settings.0) {
+                            Some((_, h)) => format!("{h}p"),
+                            None => "Size".to_string(),
+                        },
                         "the canvas every clip is composed onto, and the size the export comes out at",
                         ActionId::Resolution,
                         cx.listener(|this, event: &ClickEvent, _, cx| {
@@ -294,9 +297,10 @@ impl Player {
                         ZOOM_SLOT_W,
                         BG_RAISED(),
                         None,
-                        match self.session.is_some() {
-                            true => format!("{} fps", fps_label(self.fps)),
-                            false => "Rate".to_string(),
+                        match (self.session.is_some(), self.pending_settings.1) {
+                            (true, _) => format!("{} fps", fps_label(self.fps)),
+                            (false, Some(fps)) => format!("{} fps", fps_label(fps)),
+                            (false, None) => "Rate".to_string(),
                         },
                         "the rate the whole timeline is cut and written at",
                         ActionId::Resolution,

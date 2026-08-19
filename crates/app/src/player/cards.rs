@@ -14,8 +14,16 @@ impl Player {
             return;
         }
         let Some(session) = &mut self.session else {
-            self.notify_user("no timeline to resize — open a file first".into());
-            cx.notify();
+            // No media yet to derive a "native" size from: cycle the plain
+            // list and hold the pick until the first file opens
+            // ([`Player::install_media`]), the same way a size picked from
+            // the list does ([`apply_resolution`](Self::apply_resolution)).
+            let at = self
+                .pending_settings
+                .0
+                .and_then(|c| RESOLUTIONS.iter().position(|&s| s == c));
+            let (w, h) = RESOLUTIONS[at.map_or(0, |at| (at + 1) % RESOLUTIONS.len())];
+            self.apply_resolution(w, h, cx);
             return;
         };
         let (width, height) = next_resolution(session.resolution(), session.native_resolution());
@@ -23,13 +31,21 @@ impl Player {
     }
 
     /// The project resized, whichever asked: the stroke that steps to the next
-    /// size and the list that names one outright come through here.
+    /// size and the list that names one outright come through here. With no
+    /// timeline yet the size is held as [`Player::pending_settings`] instead of
+    /// being written anywhere -- there is no session to write it onto -- and
+    /// applied the moment the first one exists.
     pub(crate) fn apply_resolution(&mut self, width: u32, height: u32, cx: &mut Context<Self>) {
-        if let Some(session) = &mut self.session
-            && session.set_resolution(width, height)
-        {
-            self.notify_user(format!("PROJECT: {width}x{height}").into());
-            self.reset_after_reseek();
+        if let Some(session) = &mut self.session {
+            if session.set_resolution(width, height) {
+                self.notify_user(format!("PROJECT: {width}x{height}").into());
+                self.reset_after_reseek();
+            }
+        } else {
+            self.pending_settings.0 = Some((width, height));
+            self.notify_user(
+                format!("PROJECT: {width}x{height} — takes effect on the next file opened").into(),
+            );
         }
         cx.notify();
     }
@@ -41,12 +57,21 @@ impl Player {
     /// and the rate the app itself counts frames in follows, since every
     /// timecode, ruler mark and step key here is measured in it.
     pub(crate) fn apply_frame_rate(&mut self, fps: f64, cx: &mut Context<Self>) {
-        if let Some(session) = &mut self.session
-            && session.set_frame_rate(fps)
-        {
-            self.fps = session.meta().frame_rate;
-            self.notify_user(format!("PROJECT: {} fps", fps_label(fps)).into());
-            self.reset_after_reseek();
+        if let Some(session) = &mut self.session {
+            if session.set_frame_rate(fps) {
+                self.fps = session.meta().frame_rate;
+                self.notify_user(format!("PROJECT: {} fps", fps_label(fps)).into());
+                self.reset_after_reseek();
+            }
+        } else if fps.is_finite() && fps > 0.0 {
+            // Held the same way a resolution picked before any file is
+            // ([`apply_resolution`](Self::apply_resolution)): there is no
+            // timeline yet to cut at it.
+            self.pending_settings.1 = Some(fps);
+            self.notify_user(
+                format!("PROJECT: {} fps — takes effect on the next file opened", fps_label(fps))
+                    .into(),
+            );
         }
         cx.notify();
     }
@@ -143,7 +168,15 @@ impl Player {
                 .collect();
         }
         let Some(session) = &self.session else {
-            return Vec::new();
+            // Resolution and rate are reachable before any file is open --
+            // they hold as `pending_settings` until one is ([`apply_resolution`],
+            // [`apply_frame_rate`]) -- every other row still needs a session to
+            // have anything to offer.
+            return match of {
+                Pick::Resolution => pending_resolution_choices(self.pending_settings.0),
+                Pick::Fps => pending_fps_choices(self.pending_settings.1),
+                _ => Vec::new(),
+            };
         };
         match of {
             Pick::Resolution => {
