@@ -491,6 +491,8 @@ fn a_song_survives_a_save_and_a_reload() {
         Lane::A1,
         1.0,
         Clip {
+            fade_in: 0,
+            fade_out: 0,
             in_frame: 0,
             out_frame: 30,
             ..song

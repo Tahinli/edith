@@ -119,7 +119,7 @@ fn the_planned_encoders_are_the_ones_the_job_opens() {
             "{} · {}",
             engine::export::planned_video(session.meta(), &settings)
                 .expect("these formats carry picture"),
-            session.planned_audio(format)
+            session.planned_audio(format, false)
         );
         let out = out_path("planned", ext);
         let handle = session.export_to_with(&out, &settings);
@@ -268,7 +268,7 @@ fn audio_only_job_names_its_encoder(format: Format) {
         "an audio-only format has no video seat to name"
     );
     let session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
-    let planned = session.planned_audio(format);
+    let planned = session.planned_audio(format, false);
     let out = out_path("audio", format.ext());
     let handle = session.export_to_with(&out, &settings);
     let started = Instant::now();
@@ -299,24 +299,24 @@ fn audio_only_job_names_its_encoder(format: Format) {
 fn a_mixed_timeline_says_it_re_encodes_and_then_does() {
     let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
     assert_eq!(
-        session.planned_audio(Format::Mp4),
+        session.planned_audio(Format::Mp4, false),
         "AAC copy",
         "a timeline nobody has mixed is still a copy"
     );
     // A fader off unity...
     assert!(session.set_lane_gain_db(engine::project::Lane::A1, -3.0));
-    let planned = session.planned_audio(Format::Mp4);
+    let planned = session.planned_audio(Format::Mp4, false);
     assert!(planned.contains("encode"), "a faded lane: {planned}");
     // ...and back at unity it is a copy again: the answer follows the edit, it
     // is not a latch.
     assert!(session.set_lane_gain_db(engine::project::Lane::A1, 0.0));
-    assert_eq!(session.planned_audio(Format::Mp4), "AAC copy");
+    assert_eq!(session.planned_audio(Format::Mp4, false), "AAC copy");
     // ...and the limiter alone does it too.
     assert!(session.set_limiter(engine::limiter::Limiter {
         ceiling_db: -1.0,
         on: true,
     }));
-    assert_eq!(session.planned_audio(Format::Mp4), planned);
+    assert_eq!(session.planned_audio(Format::Mp4, false), planned);
 
     // ...and the job opens exactly that, which is the pin the whole file is
     // about: the encoders line published by the running export.

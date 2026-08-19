@@ -491,7 +491,7 @@ impl Player {
     /// sound: there is nothing to write either way.
     pub(crate) fn audio_rate_refusal(&self) -> Option<&'static str> {
         match &self.session {
-            Some(session) => session.audio_rate_refusal(self.format),
+            Some(session) => session.audio_rate_refusal(self.format, self.range.is_some()),
             None => Some("no sound to write"),
         }
     }
@@ -650,6 +650,7 @@ impl Player {
         // Set here rather than inside `export_settings`, which the card also
         // calls for the *estimate* and which nothing else needs a subtitle for.
         settings.subtitles = self.export_subs();
+        settings.range = self.range;
         let Some(session) = &mut self.session else {
             self.notify_user("NOTHING TO EXPORT — open a file first".into());
             cx.notify();

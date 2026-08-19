@@ -80,6 +80,14 @@ actions! {
     /// by what they are for.
     PrevSyncPoint,
     NextSyncPoint,
+    /// Marks the playhead as an export's in point. The out point wraps around
+    /// it if the mark lands past the current out ([`ordered_range`]).
+    SetIn,
+    /// The out point's pair. Ordered the same way against whatever in point
+    /// stands already.
+    SetOut,
+    /// Drops the mark: an export goes back to the whole timeline.
+    ClearRange,
     Export,
     Save,
     Copy,
@@ -104,6 +112,7 @@ actions! {
     ZoomOut,
     ZoomFit,
     Undo,
+    Redo,
     AddVideoLane,
     AddAudioLane,
     RemoveVideoLane,
@@ -121,6 +130,15 @@ actions! {
     Equalizer,
     Speed,
     Silence,
+    /// Crossfades the selected audio clip into its neighbour ([`Project::crossfade`]):
+    /// two adjacent clips picked on one lane, or a single pick faded into the
+    /// clip right after it.
+    Crossfade,
+    /// Dissolves the selected video clip into its neighbour
+    /// ([`Project::set_transition_out`]): two adjacent clips picked on one
+    /// lane, or a single pick dissolved into the clip right after it. A
+    /// second press on a clip that already dissolves removes it instead.
+    Dissolve,
     Mix,
     ToggleSnap,
     ToggleSubtitles,
@@ -170,6 +188,9 @@ impl ActionId {
             ActionId::GoEnd => "Go to the last frame",
             ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
             ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
+            ActionId::SetIn => "Mark in (export range)",
+            ActionId::SetOut => "Mark out (export range)",
+            ActionId::ClearRange => "Clear the export range",
             ActionId::Export => "Export",
             ActionId::Save => "Save",
             ActionId::Copy => "Copy",
@@ -194,6 +215,7 @@ impl ActionId {
             ActionId::ZoomOut => "Zoom out of the timeline",
             ActionId::ZoomFit => "Fit the whole timeline on screen",
             ActionId::Undo => "Undo",
+            ActionId::Redo => "Redo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
             ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
@@ -207,6 +229,8 @@ impl ActionId {
             ActionId::Equalizer => "Equalizer",
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
+            ActionId::Crossfade => "Crossfade into the next clip",
+            ActionId::Dissolve => "Dissolve into the next clip",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
@@ -235,6 +259,9 @@ impl ActionId {
             ActionId::GoEnd => "go-end",
             ActionId::PrevSyncPoint => "prev-sync-point",
             ActionId::NextSyncPoint => "next-sync-point",
+            ActionId::SetIn => "set-in",
+            ActionId::SetOut => "set-out",
+            ActionId::ClearRange => "clear-range",
             ActionId::Export => "export",
             ActionId::Save => "save",
             ActionId::Copy => "copy",
@@ -256,6 +283,7 @@ impl ActionId {
             ActionId::ZoomOut => "zoom-out",
             ActionId::ZoomFit => "zoom-fit",
             ActionId::Undo => "undo",
+            ActionId::Redo => "redo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
             ActionId::RemoveVideoLane => "remove-video-lane",
@@ -269,6 +297,8 @@ impl ActionId {
             ActionId::Equalizer => "equalizer",
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
+            ActionId::Crossfade => "crossfade",
+            ActionId::Dissolve => "dissolve",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
@@ -301,7 +331,10 @@ impl ActionId {
             | ActionId::GoStart
             | ActionId::GoEnd
             | ActionId::PrevSyncPoint
-            | ActionId::NextSyncPoint => Category::Playback,
+            | ActionId::NextSyncPoint
+            | ActionId::SetIn
+            | ActionId::SetOut
+            | ActionId::ClearRange => Category::Playback,
             ActionId::Copy
             | ActionId::Paste
             | ActionId::Select
@@ -319,7 +352,9 @@ impl ActionId {
             // The scan reads a clip's sound, but what it does is edit the
             // timeline the clip is on -- it is a clip card like the three
             // above it, opened on whichever half was picked.
-            | ActionId::Silence => Category::Clips,
+            | ActionId::Silence
+            | ActionId::Crossfade
+            | ActionId::Dissolve => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
             // Neither is how much of the timeline the panel shows: a zoom edits
@@ -353,6 +388,7 @@ impl ActionId {
             | ActionId::Detach
             | ActionId::Group
             | ActionId::Undo
+            | ActionId::Redo
             | ActionId::AddVideoLane
             | ActionId::AddAudioLane
             | ActionId::RemoveVideoLane
@@ -823,6 +859,16 @@ impl Keymap {
                 // step through the same timeline by the source's own grid.
                 b(ActionId::PrevSyncPoint, "[", true),
                 b(ActionId::NextSyncPoint, "]", true),
+                // The mark pair, on the letters every editor already means them
+                // by: bare, since a mark is set as often as a step and nothing
+                // else in this table answers to either.
+                b(ActionId::SetIn, "i", false),
+                b(ActionId::SetOut, "o", false),
+                // The clear takes the ctrl chord: not a stroke to hit setting
+                // one mark and reaching for the other. Free -- "u" bare is the
+                // silence card, and nothing else in this table answers to
+                // ctrl+u.
+                b(ActionId::ClearRange, "u", true),
                 b(ActionId::Export, "e", false),
                 b(ActionId::Save, "s", true),
                 b(ActionId::Copy, "c", true),
@@ -874,6 +920,9 @@ impl Keymap {
                 b(ActionId::ZoomFit, "0", true),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
+                // Bare "y" is SubtitleStyle's, so redo takes only the ctrl
+                // chord -- the conventional pairing with ctrl+z either way.
+                b(ActionId::Redo, "y", true),
                 // The unshifted initials of what they add. Both were free --
                 // the copy and paste chords are the *ctrl* ones -- and a track
                 // is added often enough to deserve a key that is one press.
@@ -919,6 +968,16 @@ impl Keymap {
                 // delete (x and delete) -- what it opens is a card that can cut
                 // forty places at once.
                 b(ActionId::Silence, "u", false),
+                // Crossfade takes ctrl+f: the mnemonic letter for "fade", with
+                // ctrl its own room now that plain "f" is the mix card's own
+                // (below) -- the same letter, the modifier telling them apart.
+                b(ActionId::Crossfade, "f", true),
+                // Dissolve takes ctrl+x: the join it draws on the timeline is
+                // an X (widgets.rs, dissolve_glyph) -- "d" itself is taken
+                // both plain (Detach) and, in the keymap's own rebind test,
+                // as the free chord it rebinds Delete onto, so this reaches
+                // for the shape instead of the word.
+                b(ActionId::Dissolve, "x", true),
                 // The mix card takes "f", for the faders on it: "m" would be
                 // the word but it is the monitoring mute, which is this
                 // machine's volume and not the project's -- two things one key
@@ -1231,7 +1290,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 57);
+        assert_eq!(k.entries().len(), 63);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
@@ -1255,6 +1314,9 @@ mod tests {
         assert_eq!(k.lookup("]", true), Some(ActionId::NextSyncPoint));
         assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
         assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
+        assert_eq!(k.lookup("i", false), Some(ActionId::SetIn));
+        assert_eq!(k.lookup("o", false), Some(ActionId::SetOut));
+        assert_eq!(k.lookup("u", true), Some(ActionId::ClearRange));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
         assert_eq!(k.lookup("c", true), Some(ActionId::Copy));
@@ -1276,6 +1338,7 @@ mod tests {
         assert_eq!(k.lookup("r", true), Some(ActionId::Resolution));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
+        assert_eq!(k.lookup("y", true), Some(ActionId::Redo));
         // The track keys are the bare letters; the ctrl ones stay copy/paste.
         assert_eq!(k.lookup("v", false), Some(ActionId::AddVideoLane));
         assert_eq!(k.lookup("a", false), Some(ActionId::AddAudioLane));

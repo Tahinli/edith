@@ -393,6 +393,22 @@ impl AudioSession {
         speeds: &[Option<crate::project::Stretch>],
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_multi_streams_speed_at_fade(sources, segs, eqs, speeds, &[], sample_rate)
+    }
+
+    /// [`open_multi_streams_speed_at`](Self::open_multi_streams_speed_at) with a
+    /// fade envelope per segment: `fades[i]` is what segment `i` plays through
+    /// ([`emit`]'s last effect, after the rate and the equalizer), built the
+    /// same way `eqs` and `speeds` are -- one entry per `segs`, a short list
+    /// meaning flat from there on.
+    pub fn open_multi_streams_speed_at_fade(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+        eqs: &[Option<EqParams>],
+        speeds: &[Option<crate::project::Stretch>],
+        fades: &[Option<crate::project::Fade>],
+        sample_rate: Option<u32>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         // The first source that could have a track, which is not always index 0:
         // a still image has none, and one at the front of the list (a save
         // renumbers, a library removal moves indexes) would be opened as a
@@ -571,6 +587,17 @@ impl AudioSession {
             })
             .collect();
 
+        // One [`crate::project::Fade`] per segment, exactly the eq and speed
+        // lists' rule: a short `fades` (the empty one every plain caller
+        // passes) means the rest play flat, and it is cloned rather than
+        // built here because [`Project::audio_fades_from`] already resolved
+        // each clip's own frame count against where this segment lands.
+        let fades: Vec<Option<crate::project::Fade>> = segments
+            .iter()
+            .enumerate()
+            .map(|(i, _)| fades.get(i).copied().flatten())
+            .collect();
+
         let (tx, rx) = sync_channel(32);
         thread::Builder::new()
             .name("audio-decode".into())
@@ -581,6 +608,7 @@ impl AudioSession {
                     segments,
                     eqs,
                     speeds,
+                    fades,
                     timeline,
                     tx,
                 })
@@ -690,7 +718,27 @@ impl AudioSession {
         limiter: Limiter,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        Self::open_mixed_streams_live(sources, lanes, eqs, speeds, gains, limiter, None, sample_rate)
+        Self::open_mixed_streams_master_at_fade(
+            sources, lanes, eqs, speeds, &[], gains, limiter, sample_rate,
+        )
+    }
+
+    /// [`open_mixed_streams_master_at`](Self::open_mixed_streams_master_at)
+    /// with a fade envelope per segment; see
+    /// [`open_mixed_streams_live_fade`](Self::open_mixed_streams_live_fade).
+    pub fn open_mixed_streams_master_at_fade(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+        fades: &[Vec<Option<crate::project::Fade>>],
+        gains: &[f32],
+        limiter: Limiter,
+        sample_rate: Option<u32>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_live_fade(
+            sources, lanes, eqs, speeds, fades, gains, limiter, None, sample_rate,
+        )
     }
 
     /// [`open_mixed_streams_master`](Self::open_mixed_streams_master) with the
@@ -711,17 +759,40 @@ impl AudioSession {
         live: Option<&Arc<MixControls>>,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_live_fade(
+            sources, lanes, eqs, speeds, &[], gains, limiter, live, sample_rate,
+        )
+    }
+
+    /// [`open_mixed_streams_live`](Self::open_mixed_streams_live) with a fade
+    /// envelope per segment as well: `fades[i]` is what segment `i` plays
+    /// through -- [`crate::Project::audio_fades_from`] is what builds it, off
+    /// the same walk the segments come from. A short or missing list means
+    /// the rest play flat, the eq list's rule.
+    pub fn open_mixed_streams_live_fade(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+        fades: &[Vec<Option<crate::project::Fade>>],
+        gains: &[f32],
+        limiter: Limiter,
+        live: Option<&Arc<MixControls>>,
+        sample_rate: Option<u32>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, ..] = lanes else {
             return Ok(None);
         };
         if !Self::is_mixed(lanes.len(), gains, limiter) {
             let flat = Vec::new();
             let plain = Vec::new();
-            return Self::open_multi_streams_speed_at(
+            let flat_fade = Vec::new();
+            return Self::open_multi_streams_speed_at_fade(
                 sources,
                 first,
                 eqs.first().unwrap_or(&flat),
                 speeds.first().unwrap_or(&plain),
+                fades.first().unwrap_or(&flat_fade),
                 sample_rate,
             );
         }
@@ -732,12 +803,14 @@ impl AudioSession {
             // agree by construction; `None` from any of them is a silent
             // timeline.
             let flat = Vec::new();
+            let flat_fade = Vec::new();
             let plain = Vec::new();
-            let Some((lane_meta, rx)) = Self::open_multi_streams_speed_at(
+            let Some((lane_meta, rx)) = Self::open_multi_streams_speed_at_fade(
                 sources,
                 segs,
                 eqs.get(i).unwrap_or(&flat),
                 speeds.get(i).unwrap_or(&plain),
+                fades.get(i).unwrap_or(&flat_fade),
                 sample_rate,
             )?
             else {
@@ -2820,6 +2893,10 @@ struct Worker {
     /// every segment of a project nobody has speeded or rate-mismatched, and
     /// the path that emits the decoder's own samples untouched.
     speeds: Vec<Option<Rate>>,
+    /// One per entry of `segments` again: that segment's gain envelope, or
+    /// `None` for one that plays flat -- [`emit`]'s last effect, run after
+    /// the rate and the equalizer.
+    fades: Vec<Option<crate::project::Fade>>,
     /// `start_sample` of the first chunk.
     timeline: u64,
     tx: SyncSender<AudioChunk>,
@@ -2953,8 +3030,16 @@ fn run(mut w: Worker) {
     let mut speeds = std::mem::take(&mut w.speeds);
     // ...and a short rate list is "real time from here on", for the same reason.
     speeds.resize_with(segments.len(), || None);
+    let mut fades = std::mem::take(&mut w.fades);
+    // ...and a short fade list is "flat from here on", the same rule again.
+    fades.resize_with(segments.len(), || None);
 
-    for ((seg, eq), speed) in segments.iter().zip(eqs.iter_mut()).zip(speeds.iter_mut()) {
+    for (((seg, eq), speed), fade) in segments
+        .iter()
+        .zip(eqs.iter_mut())
+        .zip(speeds.iter_mut())
+        .zip(fades.iter_mut())
+    {
         let Some(source) = seg.source else {
             // A gap: hand the device real silence rather than nothing at all,
             // in the same packet-sized chunks decoding produces, so `fed` and
@@ -2984,6 +3069,7 @@ fn run(mut w: Worker) {
                     seg,
                     eq.as_mut(),
                     speed,
+                    fade,
                     channels,
                     &mut timeline,
                     &w.tx,
@@ -2999,6 +3085,7 @@ fn run(mut w: Worker) {
                     seg,
                     eq.as_mut(),
                     speed,
+                    fade,
                     channels,
                     &mut timeline,
                     &w.tx,
@@ -3014,6 +3101,7 @@ fn run(mut w: Worker) {
                     seg,
                     eq.as_mut(),
                     speed,
+                    fade,
                     channels,
                     &mut timeline,
                     &w.tx,
@@ -3063,6 +3151,7 @@ fn run(mut w: Worker) {
                 seg,
                 eq.as_mut(),
                 speed.as_mut(),
+                fade.as_mut(),
                 pos,
                 next,
                 &mut timeline,
@@ -3115,6 +3204,7 @@ fn emit(
     seg: &Segment,
     eq: Option<&mut EqState>,
     speed: Option<&mut Rate>,
+    fade: Option<&mut crate::project::Fade>,
     pos: u64,
     next: u64,
     timeline: &mut u64,
@@ -3147,6 +3237,15 @@ fn emit(
     if let Some(eq) = eq {
         eq.process(interleaved);
     }
+    // The fade last, on the same output-rate samples the mix will hear: its
+    // frame counts are timeline frames ([`crate::project::Clip::fade_in`]),
+    // which is what a resample has already turned these into. The state
+    // walks forward with the segment across as many buffers as decoding
+    // takes, exactly as the equalizer's does.
+    if let Some(fade) = fade {
+        fade.apply(interleaved, channels);
+        fade.elapsed = fade.elapsed.saturating_add((interleaved.len() / channels) as u32);
+    }
     let chunk = AudioChunk {
         start_sample: *timeline,
         samples: std::mem::take(interleaved),
@@ -3164,6 +3263,7 @@ fn run_ac3(
     seg: &Segment,
     mut eq: Option<&mut EqState>,
     speed: &mut Option<Rate>,
+    fade: &mut Option<crate::project::Fade>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3206,6 +3306,7 @@ fn run_ac3(
             seg,
             eq.as_deref_mut(),
             speed.as_mut(),
+            fade.as_mut(),
             pos,
             next,
             timeline,
@@ -3227,6 +3328,7 @@ fn run_mkv_ac3(
     seg: &Segment,
     mut eq: Option<&mut EqState>,
     speed: &mut Option<Rate>,
+    fade: &mut Option<crate::project::Fade>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3268,6 +3370,7 @@ fn run_mkv_ac3(
             seg,
             eq.as_deref_mut(),
             speed.as_mut(),
+            fade.as_mut(),
             pos,
             next,
             timeline,
@@ -3294,6 +3397,7 @@ fn run_sym(
     seg: &Segment,
     mut eq: Option<&mut EqState>,
     speed: &mut Option<Rate>,
+    fade: &mut Option<crate::project::Fade>,
     channels: usize,
     timeline: &mut u64,
     tx: &SyncSender<AudioChunk>,
@@ -3342,6 +3446,7 @@ fn run_sym(
             seg,
             eq.as_deref_mut(),
             speed.as_mut(),
+            fade.as_mut(),
             pos,
             next,
             timeline,

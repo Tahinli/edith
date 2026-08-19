@@ -147,6 +147,9 @@ fn a_lane_refuses_the_files_it_cannot_hold_before_the_release_says_so() {
 #[test]
 fn the_marks_are_every_lane_the_playhead_and_the_start() {
     let clip = |start: u32, frames: u32, link| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: frames,

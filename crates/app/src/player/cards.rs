@@ -330,6 +330,7 @@ impl Player {
             false => session.set_color(lane, idx, grade),
         };
         if took {
+            self.mark_dirty();
             self.reset_after_reseek();
         }
         cx.notify();
@@ -482,7 +483,10 @@ impl Player {
                 false => session.set_speed(lane, idx, speed),
             };
             match wrote {
-                Ok(()) => self.reset_after_reseek(),
+                Ok(()) => {
+                    self.mark_dirty();
+                    self.reset_after_reseek();
+                }
                 Err(e) => self.notify_user(e.to_string().into()),
             }
         }
@@ -695,6 +699,10 @@ impl Player {
     /// ([`engine::PlaybackSession::set_lane_gain_db`]).
     pub(crate) fn nudge_mix(&mut self, steps: i32, cx: &mut Context<Self>) {
         let lanes = self.mix_lanes();
+        if self.session.is_none() {
+            return;
+        }
+        self.mark_dirty();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -1230,6 +1238,7 @@ impl Player {
         let params = (!self.eq_params.is_identity()).then(|| self.eq_params.clone());
         if let Some(session) = &mut self.session {
             session.set_eq(lane, idx, params);
+            self.mark_dirty();
         }
         // `set_eq` reseeks inside the engine -- that is what makes the change
         // audible at once -- and a reseek is what these flags are about.

@@ -519,7 +519,7 @@ impl Player {
             || {
                 self.session
                     .as_ref()
-                    .map_or("", |s| s.planned_audio(self.format))
+                    .map_or("", |s| s.planned_audio(self.format, self.range.is_some()))
             },
             |(_, audio)| audio,
         );
@@ -533,9 +533,10 @@ impl Player {
         );
         let size = estimated_bytes(
             settings.bitrate.filter(|_| self.format.has_video()),
-            self.session
-                .as_ref()
-                .map_or(0., PlaybackSession::timeline_duration),
+            self.session.as_ref().map_or(0., |s| match self.range {
+                Some((start, end)) => f64::from(end - start) / s.meta().frame_rate,
+                None => s.timeline_duration(),
+            }),
         );
         let head = summary_head(self.format, picture, audio);
         let tail = summary_tail(
@@ -637,6 +638,22 @@ impl Player {
                                 .children(list),
                         )
                         .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(head))
+                        // The mark, in and out and how long that is -- only
+                        // when there is one: an unmarked export writes the
+                        // whole timeline, the summary it always had.
+                        .children(self.range.map(|(start, end)| {
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(FG_SECONDARY()))
+                                .child(format!(
+                                    "RANGE {}\u{2013}{} ({})",
+                                    timecode(f64::from(start) / self.fps, self.fps),
+                                    timecode(f64::from(end) / self.fps, self.fps),
+                                    frames_timecode(end - start, self.fps),
+                                ))
+                        }))
                         .child(
                             div()
                                 .flex_none()
@@ -1637,7 +1654,7 @@ impl Player {
                                     "{speed} — {} source frames over {} on the timeline ({})",
                                     clip.len(),
                                     clip.frames(),
-                                    timecode(f64::from(clip.frames()) / self.fps, self.fps)
+                                    frames_timecode(clip.frames(), self.fps)
                                 )),
                         ),
                 ),

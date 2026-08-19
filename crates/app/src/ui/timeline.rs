@@ -64,11 +64,12 @@ impl Player {
                     &join_detail(
                         &self.live_decode(position, state.is_playing()),
                         &format!(
-                            "{} copy · {} paste · {} undo · click the bar to seek · drop a file \
-                             to import",
+                            "{} copy · {} paste · {} undo · {} redo · click the bar to seek · \
+                             drop a file to import",
                             key(ActionId::Copy),
                             key(ActionId::Paste),
-                            key(ActionId::Undo)
+                            key(ActionId::Undo),
+                            key(ActionId::Redo)
                         ),
                     ),
                 ),
@@ -230,7 +231,35 @@ impl Player {
                                             .w(px(filled))
                                             .rounded(px(3.))
                                             .bg(rgb(ACCENT_PRIMARY())),
-                                    ),
+                                    )
+                                    // The export's own mark, in and out: drawn
+                                    // over the played fill rather than under it,
+                                    // so a range that starts behind the playhead
+                                    // still shows -- translucent, the same wash
+                                    // the silence marks use, so the ruler under
+                                    // it stays readable.
+                                    .children(self.range.map(|(start, end)| {
+                                        let left = self.scale.px_at(f64::from(start) / self.fps);
+                                        let right = self.scale.px_at(f64::from(end) / self.fps);
+                                        // The wash alone is the played fill's own
+                                        // color at lower alpha, so once the
+                                        // playhead has passed the whole band the
+                                        // two blend to one flat color and the mark
+                                        // vanishes. A tick at each boundary, in
+                                        // the theme's foreground rather than its
+                                        // accent, reads over either background.
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .h_full()
+                                            .left(px(left))
+                                            .w(px((right - left).max(1.)))
+                                            .rounded(px(3.))
+                                            .bg(rgba(ACCENT_WASH()))
+                                            .border_l(px(2.))
+                                            .border_r(px(2.))
+                                            .border_color(rgb(FG_PRIMARY()))
+                                    })),
                             ),
                     ),
             )
@@ -1473,6 +1502,118 @@ impl Player {
                                         .child(inner),
                                 )
                             }))
+                            // The fades: a translucent wedge at each end an
+                            // audio clip ramps, drawn over the waveform the way
+                            // every editor shades a fade. Width comes straight
+                            // off the clip's own frames, never off the visible
+                            // slice -- unlike the waveform a wedge that starts
+                            // off the left edge of the bed still shades the
+                            // clip's own corner once scrolled back into view,
+                            // because `overflow_hidden` on the box already
+                            // clips it, and clamped to the box's own width so a
+                            // fade longer than a zoomed-in clip never draws
+                            // past its neighbour.
+                            .when(audio, |d| {
+                                let fade_in = self.shown_fade_in(lane, i, clip);
+                                let fade_out = self.shown_fade_out(lane, i, clip);
+                                d.children(
+                                    [
+                                        (fade_in > 0).then(|| {
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .h_full()
+                                                .w(px(scale
+                                                    .width_px(f64::from(fade_in) / self.fps)
+                                                    .min(width)))
+                                                .child(fade_wedge(true))
+                                        }),
+                                        (fade_out > 0).then(|| {
+                                            div()
+                                                .absolute()
+                                                .right_0()
+                                                .top_0()
+                                                .h_full()
+                                                .w(px(scale
+                                                    .width_px(f64::from(fade_out) / self.fps)
+                                                    .min(width)))
+                                                .child(fade_wedge(false))
+                                        }),
+                                    ]
+                                    .into_iter()
+                                    .flatten(),
+                                )
+                            })
+                            // The dissolve: a small X astride the join, drawn
+                            // over the last `transition_out` frames of this
+                            // clip's own box, whenever the next clip on the
+                            // lane actually abuts it -- the engine already
+                            // refuses `transition_out` on anything else
+                            // ([`Project::set_transition_out`]), but a moved
+                            // neighbour can leave a stale value behind, so
+                            // this checks the join itself rather than trust
+                            // the field alone.
+                            .when(
+                                lane.kind == LaneKind::Video
+                                    && clip.transition_out > 0
+                                    && clips.get(i + 1).is_some_and(|n| n.start == clip.end()),
+                                |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .right_0()
+                                            .top_0()
+                                            .h_full()
+                                            .w(px(scale
+                                                .width_px(f64::from(clip.transition_out) / self.fps)
+                                                .min(width)))
+                                            .child(dissolve_glyph()),
+                                    )
+                                },
+                            )
+                            // The fade handles: a small grab corner at each
+                            // *top* of an audio clip's box, sitting just
+                            // inside the [`EDGE_W`] trim strip rather than on
+                            // top of it -- [`FADE_HANDLE_H`] never reaches
+                            // past the label row, so a trim's own strip (the
+                            // box's *full* height) is still the whole of what
+                            // a press below the label starts. Gated on
+                            // [`trims`] like the trim strips themselves: a box
+                            // too small for an edge to trim by is too small
+                            // for a fade handle either.
+                            .when(audio && trims(span), |d| {
+                                d.children([Edge::Start, Edge::End].into_iter().map(|edge| {
+                                    let is_in = edge == Edge::Start;
+                                    let mut handle = div()
+                                        .absolute()
+                                        .top_0()
+                                        .w(px(FADE_HANDLE_W))
+                                        .h(px(FADE_HANDLE_H))
+                                        .occlude()
+                                        .cursor(CursorStyle::ResizeLeftRight)
+                                        .hover(|s| s.bg(rgb(ACCENT_PRIMARY())))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    this.start_fade_drag(
+                                                        lane,
+                                                        i,
+                                                        is_in,
+                                                        event.position.x,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        );
+                                    handle = match edge {
+                                        Edge::Start => handle.left(px(EDGE_W)),
+                                        Edge::End => handle.right(px(EDGE_W)),
+                                    };
+                                    handle
+                                }))
+                            })
                             // A speeded clip says so on the box, in the corner
                             // the label does not reach: the box's width alone
                             // cannot say whether a short clip is a trim or a

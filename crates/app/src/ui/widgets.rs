@@ -35,6 +35,75 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
     .size_full()
 }
 
+/// An audio clip's fade, drawn as a translucent wedge over its box: silent
+/// (full shade) at the clip's own edge, clear by the fade's far side --
+/// [`is_in`] mirrors it for the tail's ramp-down. The same `canvas` +
+/// `PathBuilder` idiom [`waveform`] draws its envelope with, filled with the
+/// same wash the in/out range already paints the bed with
+/// (`ACCENT_WASH`, timeline.rs), so a fade reads as one more overlay on this
+/// bed rather than a shape borrowed from somewhere else.
+pub(crate) fn fade_wedge(is_in: bool) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let (w, h) = (f32::from(s.width), f32::from(s.height));
+            if w <= 0. || h <= 0. {
+                return;
+            }
+            // A right triangle: the clip's silent corner (top of the clip's
+            // own edge) down to the bed and across to the fade's far side --
+            // the wedge shape every editor draws for a ramp.
+            let points = match is_in {
+                true => vec![
+                    point(o.x, o.y),
+                    point(o.x, o.y + px(h)),
+                    point(o.x + px(w), o.y + px(h)),
+                ],
+                false => vec![
+                    point(o.x + px(w), o.y),
+                    point(o.x + px(w), o.y + px(h)),
+                    point(o.x, o.y + px(h)),
+                ],
+            };
+            let mut path = PathBuilder::fill();
+            path.add_polygon(&points, true);
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(ACCENT_WASH()));
+            }
+        },
+    )
+    .size_full()
+}
+
+/// A video clip's dissolve into its neighbour, drawn as a small X astride the
+/// join -- the box it is given is the last [`Clip::transition_out`] frames of
+/// the clip's own width, so the mark sits right at the edge it dissolves
+/// through. Two strokes rather than [`fade_wedge`]'s fill: a dissolve is not
+/// a ramp to or from silence, it is two clips overlapping, and an X reads as
+/// a splice the way a wedge reads as a fade.
+pub(crate) fn dissolve_glyph() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, s) = (bounds.origin, bounds.size);
+            let (w, h) = (f32::from(s.width), f32::from(s.height));
+            if w <= 0. || h <= 0. {
+                return;
+            }
+            let mut path = PathBuilder::stroke(px(1.5));
+            path.move_to(point(o.x, o.y));
+            path.line_to(point(o.x + px(w), o.y + px(h)));
+            path.move_to(point(o.x + px(w), o.y));
+            path.line_to(point(o.x, o.y + px(h)));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgba(ACCENT_WASH()));
+            }
+        },
+    )
+    .size_full()
+}
+
 /// A toolbar button: its glyph, its name, and its key on hover. `id` only buys
 /// `on_click` and the tooltip -- it is still not focusable, so the root's own
 /// key listener keeps working after a press, and the click lands on mouse-up
