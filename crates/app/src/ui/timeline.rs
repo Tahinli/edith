@@ -64,11 +64,12 @@ impl Player {
                     &join_detail(
                         &self.live_decode(position, state.is_playing()),
                         &format!(
-                            "{} copy · {} paste · {} undo · click the bar to seek · drop a file \
-                             to import",
+                            "{} copy · {} paste · {} undo · {} redo · click the bar to seek · \
+                             drop a file to import",
                             key(ActionId::Copy),
                             key(ActionId::Paste),
-                            key(ActionId::Undo)
+                            key(ActionId::Undo),
+                            key(ActionId::Redo)
                         ),
                     ),
                 ),
