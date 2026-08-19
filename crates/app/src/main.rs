@@ -30,6 +30,8 @@ pub(crate) use interact::*;
 pub(crate) use layout::*;
 pub(crate) use library_meta::*;
 pub(crate) use menus::*;
+// The tests' door to the escape rule; render.rs calls it by its own name.
+#[cfg(test)]
 pub(crate) use render::escape_leaves_player_fullscreen;
 pub(crate) use notices::*;
 pub(crate) use oracle::*;
