@@ -37,6 +37,59 @@ impl Player {
         })
     }
 
+    /// The preview's own scrub bar, drawn low over the picture the way the
+    /// badge is drawn over its top: a preview has a duration and a playhead
+    /// like anything else on screen, and unlike the timeline's ruler
+    /// ([`Player::seek_bar`] is a different bar entirely, the "still
+    /// seeking" status line) it is the only way to jump around one with a
+    /// mouse -- `esc` and the arrow keys are the keyboard's own doors.
+    ///
+    /// The hit area is `RULER_HIT_H` (`HIT_MIN`, WCAG 2.5.8) tall and centred
+    /// on a 6 px track, the ruler's own idiom: a bar thin enough to read is
+    /// too thin to reliably click.
+    pub(crate) fn preview_scrub_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.preview_session.as_ref()?;
+        let filled = preview_progress_along(session.now(), session.timeline_duration());
+        Some(
+            div()
+                .id("preview-scrub")
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(RULER_HIT_H))
+                .flex()
+                .flex_col()
+                .justify_center()
+                .px(px(8.))
+                .cursor_pointer()
+                .tooltip(|_, cx| cx.new(|_| Tip("Seek — click or drag".into())).into())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.preview_scrubbing = true;
+                        this.preview_scrub_to(event.position.x, true, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(6.))
+                        .rounded(px(3.))
+                        .bg(rgba(SUB_SHADE()))
+                        .child(bounds_probe(self.preview_bar.clone()))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(filled))
+                                .rounded(px(3.))
+                                .bg(rgb(ACCENT_PRIMARY())),
+                        ),
+                ),
+        )
+    }
+
     /// The frame on screen right now, written to a PNG: `image` and its
     /// `as_bytes` are gpui's own cached copy of what was last handed to the
     /// atlas ([`Player::pump`]), so this reads no decoder and races nothing --
