@@ -252,6 +252,26 @@ impl Player {
         self.seek(target as f64 / fps, cx);
     }
 
+    /// [`scrub_to`](Player::scrub_to) for the preview's own seek bar: the
+    /// mapping is `preview_seek_seconds` rather than a `Scale`, because a
+    /// preview bar spans the file's whole length and never zooms. Seeks
+    /// through the ordinary [`Player::seek`], so it lands on
+    /// `preview_session` the same way the keyboard step does
+    /// ([`Player::active_session_mut`]) -- a preview's scrub never reaches
+    /// the timeline underneath it.
+    pub(crate) fn preview_scrub_to(&mut self, x: Pixels, commit: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.preview_session.as_ref() else {
+            return;
+        };
+        let t = preview_seek_seconds(x, self.preview_bar.get(), session.timeline_duration());
+        let target = (t * self.active_fps()) as u32;
+        if commit || scrub_due(target, self.last_target, self.last_scrub.elapsed()) {
+            self.last_target = target;
+            self.last_scrub = Instant::now();
+            self.seek(t, cx);
+        }
+    }
+
     /// Seeks to where the pointer sits along the ruler. `commit` is the press
     /// and the release, which must land exactly even when the throttle below
     /// would have skipped them.

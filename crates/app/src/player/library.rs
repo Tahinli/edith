@@ -185,6 +185,7 @@ impl Player {
         // timeline that has just stopped existing.
         self.scrubbing = false;
         self.volume_dragging = false;
+        self.preview_scrubbing = false;
         self.eq_dragging = false;
         self.speed_dragging = false;
         self.color_dragging = false;

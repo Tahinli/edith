@@ -656,6 +656,12 @@ impl Render for Player {
                                     // over it rather than under.
                                     .children(self.subtitle_overlay(position, window))
                                     .children(self.preview_badge(cx))
+                                    // The preview's own scrub bar, low over
+                                    // the picture the badge is drawn over the
+                                    // top of: drawn after both, so it sits
+                                    // above the subtitle plate and never
+                                    // under the badge's banner.
+                                    .children(self.preview_scrub_bar(cx))
                                     // The three transient lines hang off the
                                     // bottom of the picture rather than taking
                                     // a row of the column: a notice that
