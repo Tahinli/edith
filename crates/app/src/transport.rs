@@ -235,6 +235,21 @@ pub(crate) fn preview_progress_along(now: f64, duration: f64) -> f32 {
     (now / duration).clamp(0., 1.) as f32
 }
 
+/// Where the ruler draws the playhead, given whether *the timeline's own*
+/// session ([`Player::session`]) has played out. `ended` must answer for
+/// `session` specifically, never for [`Player::active_session`] -- a preview
+/// reaching *its* end is not the timeline's own playhead running out, and
+/// must not snap the ruler to `duration` while the timeline sits wherever it
+/// was left (a seek, mid-scrub, anywhere). `now` is `session`'s own clock,
+/// which a preview never touches.
+pub(crate) fn playhead_position(now: f64, ended: bool, duration: f64) -> f64 {
+    if ended {
+        duration
+    } else {
+        now.clamp(0., duration)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +271,20 @@ mod tests {
         // the end it left through.
         assert_eq!(preview_seek_seconds(px(0.), bar, 60.), 0.);
         assert_eq!(preview_seek_seconds(px(500.), bar, 60.), 60.);
+    }
+
+    /// Ended pins the ruler to the out point; short of that it tracks the
+    /// clock, clamped -- a tail dragged past the end must not walk the ruler
+    /// off the bed.
+    #[test]
+    fn playhead_position_pins_only_on_the_sessions_own_end() {
+        assert_eq!(playhead_position(8., false, 35.), 8.);
+        assert_eq!(playhead_position(35., true, 35.), 35.);
+        assert_eq!(playhead_position(40., false, 35.), 35.);
+        // A preview ending must not read as `ended` for this call at all --
+        // it is the caller's job to pass `false` while one is up, which is
+        // exactly what leaves the ruler on the timeline's own clock.
+        assert_eq!(playhead_position(8., false, 35.), 8.);
     }
 
     /// The fill tracks the played share exactly, and a duration of nothing
