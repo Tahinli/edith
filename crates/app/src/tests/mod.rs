@@ -57,7 +57,7 @@ use super::{
 use super::{
     SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_LINE_H, SUB_ROWS_H,
     SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box, sub_bottom,
-    carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
+    carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w,
     Subs, subtitle_detail, subtitle_notice, subtitle_tail,
     sub_pick_name, subtitle_rows, subtitle_toggle_notice, walk_subtitles,
 };

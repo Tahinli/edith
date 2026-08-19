@@ -43,7 +43,7 @@ use ui::widgets::*;
 use keymap::{ActionId, Keymap};
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -266,6 +266,13 @@ struct Player {
     /// like every other index here -- track 2 of one project is not track 2 of
     /// the next.
     sub_track: usize,
+    /// Which files' subtitle groups in the library are folded shut, keyed by
+    /// the group's own path -- the same key [`subtitle_rows`] groups on, so a
+    /// fold survives a track being added or removed off the file it belongs
+    /// to. Session-lifetime only: a fold is a "not looking at this one right
+    /// now", not a project setting, so it is never saved and every file opens
+    /// unfolded.
+    sub_folded: HashSet<PathBuf>,
     /// Which subtitle lane is *shown*: one of them and never two, the way a
     /// player has one subtitle track chosen at a time -- two hundred lanes of
     /// different words all drawn at once is two hundred plates over one
@@ -701,6 +708,7 @@ fn main() {
                     snap: true,
                     subs_on: true,
                     sub_track: 0,
+                    sub_folded: HashSet::new(),
                     sub_lane: None,
                     snap_cue: None,
                     ghost: None,

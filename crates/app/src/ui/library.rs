@@ -15,7 +15,7 @@ impl Player {
     /// the rest of this window: nothing in it takes focus, so the root keeps
     /// the keyboard and the play key still works after a row is clicked
     /// (ledger:182).
-    pub(crate) fn library(&self, width: f32, viewport_h: f32, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn library(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let exporting = self.exporting().is_some();
         let sources = self
             .session
@@ -484,7 +484,7 @@ impl Player {
             // it goes on no lane and is dragged nowhere -- but it is a thing the
             // timeline holds, and this is the list of those.
             .when(self.library_tab == LibraryTab::Text, |d| {
-                d.children(self.subtitle_section(width, viewport_h, cx))
+                d.children(self.subtitle_section(width, cx))
             })
             .child(control(
                 "add-asset",
