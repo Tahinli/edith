@@ -592,6 +592,17 @@ fn mastered(project: &Project) -> bool {
     project.limiter().is_active() || project.audio_gains().iter().any(|&g| g != 1.0)
 }
 
+/// Whether any audio clip has a fade -- [`equalized`]'s pair again: a fade is
+/// gain math on decoded samples ([`crate::project::Fade::apply`]), and a
+/// packet copy carries neither an equalizer nor a fade. An mp4 whose timeline
+/// has one is decoded and re-encoded so the fade actually reaches the file.
+fn faded(project: &Project) -> bool {
+    project
+        .audio_lanes()
+        .into_iter()
+        .any(|lane| project.lane(lane).iter().any(|c| c.fade_in > 0 || c.fade_out > 0))
+}
+
 /// The bitrate an export codes at: the caller's number clamped into what an
 /// asked-for rate may be ([`MAX_EXPLICIT_BITRATE`]), the derived one where there
 /// was none. Clamped rather than refused, for the reason [`Enc::open`] states.
@@ -736,6 +747,7 @@ fn forces_encode(project: &Project, ranged: bool) -> bool {
             .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
         || equalized(project)
         || mastered(project)
+        || faded(project)
 }
 
 /// What the sound is written by. Every audio encoder here is software -- there
@@ -1825,6 +1837,7 @@ fn encode_audio(
         &eqs,
         &speeds,
         &fades,
+        meta.frame_rate,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
@@ -2996,6 +3009,7 @@ fn run_audio(
         &eqs,
         &speeds,
         &fades,
+        meta.frame_rate,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
@@ -4895,6 +4909,24 @@ mod tests {
         assert_eq!(asked(21_000_000), 21_000_000, "past the derived range");
         assert_eq!(asked(999_000_000), MAX_EXPLICIT_BITRATE, "still bounded");
         assert_eq!(asked(1), MIN_BITRATE, "and floored");
+    }
+
+    /// A clip's fade takes the copy path away, exactly as an equalizer does:
+    /// a copied AAC packet cannot carry gain math nobody put in the file. The
+    /// bug this guards is [`forces_encode`] gating on `equalized`/`mastered`
+    /// but never checking a clip's own `fade_in`/`fade_out` at all -- the
+    /// default Web MP4 export then labelled and took the "AAC copy" path for
+    /// a project whose picture showed a fade, and the fade never reached the
+    /// file.
+    #[test]
+    fn a_fade_forces_the_audio_to_be_re_encoded() {
+        let mut project = Project::single("/nonexistent/film.mp4", 90);
+        assert!(!forces_encode(&project, false), "flat, so a copy is fine");
+        assert!(project.set_fade_in(crate::project::Lane::new(crate::project::LaneKind::Audio, 0), 0, 15));
+        assert!(
+            forces_encode(&project, false),
+            "a fade-in on the only clip must force a re-encode"
+        );
     }
 
     fn meta(width: u32, height: u32) -> VideoMeta {

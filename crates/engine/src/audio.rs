@@ -393,20 +393,25 @@ impl AudioSession {
         speeds: &[Option<crate::project::Stretch>],
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        Self::open_multi_streams_speed_at_fade(sources, segs, eqs, speeds, &[], sample_rate)
+        // No fades on this path, so the fps a `Fade` would be rescaled by is
+        // never read; any finite value does.
+        Self::open_multi_streams_speed_at_fade(sources, segs, eqs, speeds, &[], 1.0, sample_rate)
     }
 
     /// [`open_multi_streams_speed_at`](Self::open_multi_streams_speed_at) with a
     /// fade envelope per segment: `fades[i]` is what segment `i` plays through
     /// ([`emit`]'s last effect, after the rate and the equalizer), built the
     /// same way `eqs` and `speeds` are -- one entry per `segs`, a short list
-    /// meaning flat from there on.
+    /// meaning flat from there on. `fps` is the timeline rate each `Fade` was
+    /// built at ([`crate::Project::audio_fades_from`]) -- this is the one
+    /// place that rate meets the audio one ([`crate::project::Fade::scaled`]).
     pub fn open_multi_streams_speed_at_fade(
         sources: &[(PathBuf, usize)],
         segs: &[(Option<usize>, f64, f64)],
         eqs: &[Option<EqParams>],
         speeds: &[Option<crate::project::Stretch>],
         fades: &[Option<crate::project::Fade>],
+        fps: f64,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         // The first source that could have a track, which is not always index 0:
@@ -591,11 +596,15 @@ impl AudioSession {
         // lists' rule: a short `fades` (the empty one every plain caller
         // passes) means the rest play flat, and it is cloned rather than
         // built here because [`Project::audio_fades_from`] already resolved
-        // each clip's own frame count against where this segment lands.
+        // each clip's own frame count against where this segment lands --
+        // in timeline frames, though, which is `fps`-relative and not yet
+        // the rate `Fade::apply` will count samples at; `.scaled` re-counts
+        // it in frames of `meta.sample_rate` now that this is known.
+        let fade_ratio = f64::from(meta.sample_rate) / fps;
         let fades: Vec<Option<crate::project::Fade>> = segments
             .iter()
             .enumerate()
-            .map(|(i, _)| fades.get(i).copied().flatten())
+            .map(|(i, _)| fades.get(i).copied().flatten().map(|f| f.scaled(fade_ratio)))
             .collect();
 
         let (tx, rx) = sync_channel(32);
@@ -718,26 +727,30 @@ impl AudioSession {
         limiter: Limiter,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        // No fades on this path -- see `open_multi_streams_speed_at`'s same
+        // placeholder.
         Self::open_mixed_streams_master_at_fade(
-            sources, lanes, eqs, speeds, &[], gains, limiter, sample_rate,
+            sources, lanes, eqs, speeds, &[], 1.0, gains, limiter, sample_rate,
         )
     }
 
     /// [`open_mixed_streams_master_at`](Self::open_mixed_streams_master_at)
     /// with a fade envelope per segment; see
     /// [`open_mixed_streams_live_fade`](Self::open_mixed_streams_live_fade).
+    /// `fps` is [`open_multi_streams_speed_at_fade`](Self::open_multi_streams_speed_at_fade)'s.
     pub fn open_mixed_streams_master_at_fade(
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
         eqs: &[Vec<Option<EqParams>>],
         speeds: &[Vec<Option<crate::project::Stretch>>],
         fades: &[Vec<Option<crate::project::Fade>>],
+        fps: f64,
         gains: &[f32],
         limiter: Limiter,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         Self::open_mixed_streams_live_fade(
-            sources, lanes, eqs, speeds, fades, gains, limiter, None, sample_rate,
+            sources, lanes, eqs, speeds, fades, fps, gains, limiter, None, sample_rate,
         )
     }
 
@@ -759,8 +772,10 @@ impl AudioSession {
         live: Option<&Arc<MixControls>>,
         sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        // No fades on this path -- see `open_multi_streams_speed_at`'s same
+        // placeholder.
         Self::open_mixed_streams_live_fade(
-            sources, lanes, eqs, speeds, &[], gains, limiter, live, sample_rate,
+            sources, lanes, eqs, speeds, &[], 1.0, gains, limiter, live, sample_rate,
         )
     }
 
@@ -768,13 +783,15 @@ impl AudioSession {
     /// envelope per segment as well: `fades[i]` is what segment `i` plays
     /// through -- [`crate::Project::audio_fades_from`] is what builds it, off
     /// the same walk the segments come from. A short or missing list means
-    /// the rest play flat, the eq list's rule.
+    /// the rest play flat, the eq list's rule. `fps` is the timeline rate
+    /// those fades were built at ([`crate::project::Fade::scaled`]).
     pub fn open_mixed_streams_live_fade(
         sources: &[(PathBuf, usize)],
         lanes: &[Vec<(Option<usize>, f64, f64)>],
         eqs: &[Vec<Option<EqParams>>],
         speeds: &[Vec<Option<crate::project::Stretch>>],
         fades: &[Vec<Option<crate::project::Fade>>],
+        fps: f64,
         gains: &[f32],
         limiter: Limiter,
         live: Option<&Arc<MixControls>>,
@@ -793,6 +810,7 @@ impl AudioSession {
                 eqs.first().unwrap_or(&flat),
                 speeds.first().unwrap_or(&plain),
                 fades.first().unwrap_or(&flat_fade),
+                fps,
                 sample_rate,
             );
         }
@@ -811,6 +829,7 @@ impl AudioSession {
                 eqs.get(i).unwrap_or(&flat),
                 speeds.get(i).unwrap_or(&plain),
                 fades.get(i).unwrap_or(&flat_fade),
+                fps,
                 sample_rate,
             )?
             else {
