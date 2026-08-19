@@ -51,6 +51,9 @@ fn pin_software() {
     });
 }
 
+/// One export alone costs ~70 s software-seat on the machine of record, and
+/// the harness runs this binary's tests together -- the limit is a hang
+/// guard against a stuck export, never a speed claim.
 fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
     let started = Instant::now();
     while !handle.is_finished() {
@@ -155,7 +158,7 @@ fn exported_want(
             ..Default::default()
         },
     );
-    wait(&handle, Duration::from_secs(300)).expect("the export finishes");
+    wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     // The bar ends where it was told it would: the picture loop's own count and
     // the total published for it are one number ([`export::export_spans`]), so a
     // walk that ran past the media would show up here as well as in the file.
@@ -186,7 +189,7 @@ fn exported_mp4(name: &str, project: Project, picks: &[usize]) -> Scratch {
             ..Default::default()
         },
     );
-    wait(&handle, Duration::from_secs(300)).expect("the export finishes");
+    wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     out
 }
 
@@ -568,7 +571,7 @@ fn an_hevc_mp4_keeps_its_rewritten_entry_and_its_text() {
             ..Default::default()
         },
     );
-    wait(&handle, Duration::from_secs(300)).expect("the export finishes");
+    wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     let Some(listing) = ffmpeg_streams(&out) else {
         println!("no ffmpeg on this box: an mp4's tx3g has no other reader here");
         std::fs::remove_file(&out).unwrap();
@@ -660,7 +663,7 @@ fn more_tracks_than_a_block_can_number_are_refused_by_name() {
             ..Default::default()
         },
     );
-    let said = wait(&handle, Duration::from_secs(300))
+    let said = wait(&handle, Duration::from_secs(1800))
         .expect_err("a file that cannot be numbered is not written")
         .to_string();
     assert!(
@@ -1092,7 +1095,7 @@ fn more_lanes_than_a_block_can_number_are_refused_by_name() {
             ..Default::default()
         },
     );
-    let said = wait(&handle, Duration::from_secs(300))
+    let said = wait(&handle, Duration::from_secs(1800))
         .expect_err("a file that cannot be numbered is not written")
         .to_string();
     assert!(
