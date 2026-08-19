@@ -933,6 +933,19 @@ impl Player {
     ) -> String {
         match opened {
             Ok((mut session, subs)) => {
+                // A size and/or a rate picked before this file existed
+                // ([`Player::apply_resolution`], [`Player::apply_frame_rate`])
+                // are the project's from its very first frame -- the same
+                // precedence a `.edith`'s own saved settings already have over
+                // the scaffold ([`engine::PlaybackSession::open_project`]).
+                // Consumed once: a later file replacing this session finds
+                // nothing left pending.
+                if let Some((w, h)) = self.pending_settings.0.take() {
+                    session.set_resolution(w, h);
+                }
+                if let Some(fps) = self.pending_settings.1.take() {
+                    session.set_frame_rate(fps);
+                }
                 self.fps = session.meta().frame_rate;
                 // This window *is* the real-time viewer: a picture already past
                 // the clock is one `pump` takes off the channel and throws away,
@@ -1212,6 +1225,10 @@ impl Player {
         }
         let text = match opened {
             Ok(mut session) => {
+                // A `.edith` carries its own saved size and rate, read at
+                // [`engine::PlaybackSession::open_project`] -- a pick made
+                // before this project loaded is not this project's.
+                self.pending_settings = (None, None);
                 self.fps = session.meta().frame_rate;
                 // As at the file door above: the window watches in real time.
                 session.drop_late_pictures(true);
