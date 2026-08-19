@@ -134,6 +134,9 @@ actions! {
     /// toolbar's Theme button. It was a build feature once, which made it a
     /// choice only whoever compiled the binary could make.
     Theme,
+    /// The whole window, borderless over the screen: a player's own control,
+    /// on the platform's own toggle ([`gpui::Window::toggle_fullscreen`]).
+    Fullscreen,
     CancelExport,
     /// Opens the actions card -- the list every other action is on. A door of
     /// its own, because a card reachable only by a button in the panel is one a
@@ -197,6 +200,7 @@ impl ActionId {
             ActionId::ToggleProxies => "Proxies on / off for the picture",
             ActionId::ToggleAutoProxies => "Make proxies on import: on / off",
             ActionId::Theme => "Theme: the window's colours…",
+            ActionId::Fullscreen => "Fullscreen on / off",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
         }
@@ -255,6 +259,7 @@ impl ActionId {
             ActionId::ToggleProxies => "toggle-proxies",
             ActionId::ToggleAutoProxies => "toggle-auto-proxies",
             ActionId::Theme => "theme",
+            ActionId::Fullscreen => "fullscreen",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
         }
@@ -317,7 +322,10 @@ impl ActionId {
             | ActionId::ToggleAutoProxies
             // ...and what the whole window is painted in: it edits nothing at
             // all, it is what one is looking *with*.
-            | ActionId::Theme => Category::View,
+            | ActionId::Theme
+            // ...and whether that window fills the screen: a way of looking,
+            // same as the zoom and the theme beside it.
+            | ActionId::Fullscreen => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -884,6 +892,10 @@ impl Keymap {
                 // it is a preference set once, not a stroke wanted under a hand
                 // that is editing.
                 b(ActionId::Theme, "h", true),
+                // Every other player's key for it, and free here: nothing in
+                // this table answers to "f11" (gpui lowercases the keysym
+                // name it gets from xkb, same as "f1" below).
+                b(ActionId::Fullscreen, "f11", false),
                 // A chord, and the only escape in this table: bare `esc` is the
                 // stroke a hand throws at anything on screen, and throwing it
                 // at a running export used to delete an hour of encoding. The
@@ -1158,7 +1170,8 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 53);
+        assert_eq!(k.entries().len(), 54);
+        assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
