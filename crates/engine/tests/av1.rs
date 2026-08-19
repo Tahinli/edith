@@ -336,7 +336,7 @@ fn an_mp4_export_of_a_matroska_source_carries_its_sound() {
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
     let started = Instant::now();
     while !handle.is_finished() {
-        assert!(started.elapsed() < Duration::from_secs(300), "export hung");
+        assert!(started.elapsed() < Duration::from_secs(900), "export hung");
         std::thread::sleep(Duration::from_millis(20));
     }
     handle
@@ -410,7 +410,10 @@ fn exported(
 #[test]
 fn an_av1_export_reopens_through_our_own_demuxer() {
     let session = short_timeline(30.0);
-    let out = exported(&session, "sw", &av1_settings(), Duration::from_secs(300));
+    // The software encoder alone costs ~270 s for these 30 frames on the
+    // machine of record: 300 s left it one co-running test away from a
+    // timeout, so the budget is a hang guard, not a speed claim.
+    let out = exported(&session, "sw", &av1_settings(), Duration::from_secs(900));
 
     let (meta, mut demuxer) = Demuxer::open(&out).expect("reopen the export");
     assert_eq!(meta.codec, Codec::Av1, "an AV1 export is AV1");
@@ -472,7 +475,7 @@ fn an_av1_export_carries_the_timelines_sound_in_either_container() {
         let handle = session.export_to_with(&out, &settings);
         let started = Instant::now();
         while !handle.is_finished() {
-            assert!(started.elapsed() < Duration::from_secs(300), "export hung");
+            assert!(started.elapsed() < Duration::from_secs(900), "export hung");
             std::thread::sleep(Duration::from_millis(20));
         }
         handle.result().expect("outcome").expect("an AV1 export");
@@ -530,7 +533,7 @@ fn an_av1_export_decodes_back_into_the_pictures_that_went_in() {
         &session,
         "roundtrip",
         &av1_settings(),
-        Duration::from_secs(300),
+        Duration::from_secs(900),
     );
 
     let (_, frames) = DecodeSession::open(&out).expect("decode the export");
