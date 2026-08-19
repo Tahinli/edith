@@ -142,7 +142,7 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 14] = [
+pub(crate) const MENU_ITEMS: [ActionId; 15] = [
     ActionId::Cut,
     // The clipboard pair, which had no door but a chord: copy takes the clip the
     // menu names, and paste is the timeline's rather than this clip's -- the
@@ -160,6 +160,10 @@ pub(crate) const MENU_ITEMS: [ActionId; 14] = [
     // was clicked -- and a card only a stroke could open is one a pointer never
     // finds.
     ActionId::Silence,
+    // The dissolve is a video clip's own join, same door as the crossfade
+    // above it would be for sound -- a stroke-only pair, opened here on
+    // whichever half was clicked.
+    ActionId::Dissolve,
     ActionId::Color,
     ActionId::Fit,
     ActionId::ToggleMute,

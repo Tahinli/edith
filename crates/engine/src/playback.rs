@@ -2587,6 +2587,18 @@ impl PlaybackSession {
         self.edit(Dirty::Sound, |p| p.crossfade(lane, idx, frames))
     }
 
+    /// Timeline frames of dissolve at the end of the clip at `idx` of `lane`,
+    /// into its neighbour. `0` for an index that is not there.
+    pub fn transition_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.transition_out_of(lane, idx)
+    }
+
+    /// Sets that clip's dissolve into its neighbour, clamped to its own
+    /// length. A picture edit -- same as a grade or fit policy.
+    pub fn set_transition_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transition_out(lane, idx, frames))
+    }
+
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
     /// numbers and nothing else, so a copy stays valid after the clip it came
     /// from is deleted. `None` past the end.
