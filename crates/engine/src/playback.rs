@@ -456,13 +456,30 @@ impl PlaybackSession {
     /// Opens `path` and starts both decode workers. Only video failure is fatal:
     /// a file we cannot hear is still a file we can watch.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
+        Self::open_stream(path, 0)
+    }
+
+    /// Opens `path` exactly as [`open`](Self::open) does, but binds `stream` --
+    /// the index a library row names ([`crate::probe`]'s own numbering of a
+    /// file's audio tracks) -- as the one that keeps the clock and plays,
+    /// rather than always the first. What a library preview asks for when the
+    /// row *is* a particular stream, so a remux with several audio tracks
+    /// previews the one that was clicked.
+    pub fn open_with_audio_stream(
+        path: impl AsRef<Path>,
+        audio_stream: usize,
+    ) -> crate::Result<Self> {
+        Self::open_stream(path, audio_stream)
+    }
+
+    fn open_stream(path: impl AsRef<Path>, audio_stream: usize) -> crate::Result<Self> {
         let path = path.as_ref().to_path_buf();
         // A timeline is normally scaffolded from source 0's picture -- its size,
         // its frame rate, its clock. A song has none of that, so it scaffolds
         // the *canvas* instead and its own sound keeps the clock: an audio-only
         // project is a project like any other, it simply plays black.
         if crate::is_audio(&path) {
-            return Self::open_audio_only(&path);
+            return Self::open_audio_only(&path, audio_stream);
         }
         // A still is the other source with no timeline in it: it has a picture
         // (which becomes the canvas) but no rate and no length, so it too
@@ -488,9 +505,10 @@ impl PlaybackSession {
             // picked one for, exactly as it is a project nobody has graded.
             crate::tonemap::Preset::default(),
         )?;
-        // A file is opened on its first audio stream, like `Project::single`
-        // names it: nothing has picked one yet.
-        let (audio, audio_disabled) = open_audio(&path, 0);
+        // A file is opened on its first audio stream by default, like
+        // `Project::single` names it -- unless a caller through
+        // `open_with_audio_stream` picked another.
+        let (audio, audio_disabled) = open_audio(&path, audio_stream);
         let source = match audio {
             Some(_) => ClockSource::Audio,
             None => ClockSource::Wall,
@@ -566,7 +584,7 @@ impl PlaybackSession {
     /// picture nor a playable length is not a timeline, and that is what
     /// [`audio_frames`] answers -- the *device* is a different question, and a
     /// machine without one opens this like any other session, silently.
-    fn open_audio_only(path: &Path) -> crate::Result<Self> {
+    fn open_audio_only(path: &Path, stream: usize) -> crate::Result<Self> {
         let (width, height, frame_rate) = AUDIO_ONLY_CANVAS;
         let meta = VideoMeta {
             width,
@@ -584,7 +602,7 @@ impl PlaybackSession {
             // the default description is what it is drawn in.
             color: ColorDescription::default(),
         };
-        let (audio, audio_disabled) = open_audio(path, 0);
+        let (audio, audio_disabled) = open_audio(path, stream);
         // Through `from_parts` rather than `Project::single`, which is the
         // *video* open's pair of grouped clips: here there is no picture to
         // group the sound with, so the video lane starts empty.
@@ -3918,6 +3936,31 @@ mod tests {
             "refused in the layout's own words: {refused}"
         );
         assert_eq!(session.probes.len(), 2, "and nothing was opened to say so");
+    }
+
+    /// The door a library preview opens a chosen stream through: `test_multiaudio.mp4`
+    /// has stream 0 stereo and stream 1 mono
+    /// ([`crate::waveform::tests::each_stream_of_a_file_has_its_own_envelope`]
+    /// names the same fixture), so a session that actually bound the stream it
+    /// was asked for plays a different layout than one that did not -- and
+    /// plain [`PlaybackSession::open`] still lands on stream 0, unchanged.
+    #[test]
+    fn open_with_audio_stream_binds_the_named_track() {
+        let multi = asset("test_multiaudio.mp4");
+        let zero = PlaybackSession::open_with_audio_stream(&multi, 0).expect("stream 0 opens");
+        let one = PlaybackSession::open_with_audio_stream(&multi, 1).expect("stream 1 opens");
+        let default = PlaybackSession::open(&multi).expect("default open");
+        let (Some(a0), Some(a1), Some(ad)) =
+            (zero.audio.as_ref(), one.audio.as_ref(), default.audio.as_ref())
+        else {
+            // No audio device on this machine: nothing further to check --
+            // the device is the machine's business, not this door's.
+            return;
+        };
+        assert_eq!(a0.channels, 2, "stream 0 is the stereo pair");
+        assert_eq!(a1.channels, 1, "stream 1 is the mono track");
+        assert_ne!(a0.channels, a1.channels, "the two streams must differ");
+        assert_eq!(ad.channels, a0.channels, "open() still defaults to stream 0");
     }
 
     #[test]
