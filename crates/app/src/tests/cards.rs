@@ -1421,3 +1421,59 @@ fn the_export_estimate_answers_a_bar_that_went_backwards_with_a_guess() {
         );
     }
 }
+
+/// The primary pane's own round trip: every bundle's format-and-quality lands
+/// back on the preset that named it, so the row a person picked is the row
+/// the card shows picked. `Custom` is the one preset `bundle` names nothing
+/// for, and the one every pair outside the other four's must fall back to.
+#[test]
+fn every_preset_bundle_round_trips_through_from_state() {
+    for preset in ExportPreset::ALL {
+        match preset.bundle() {
+            Some((format, quality)) => {
+                assert_eq!(ExportPreset::from_state(format, quality), preset);
+            }
+            None => assert_eq!(preset, ExportPreset::Custom),
+        }
+    }
+    // A pair no bundle names -- the launch default before this batch's fix --
+    // reads as `Custom`, not as whichever preset happens to be first.
+    assert_eq!(
+        ExportPreset::from_state(Format::Mp4, Quality::Auto),
+        ExportPreset::Custom
+    );
+    // Master's bundle is HEVC/High, not H.264: an intra-only master is the one
+    // that keeps its own "for re-editing later" detail true.
+    assert_eq!(
+        ExportPreset::Master.bundle(),
+        Some((Format::HevcMp4, Quality::High))
+    );
+}
+
+/// The primary pane's own refusal: a bundle whose format this timeline cannot
+/// write reads exactly as a codec row does -- the reason in place of the
+/// detail, and no format-and-quality pair to land wrong once a click on a
+/// dimmed row is ignored.
+#[test]
+fn a_preset_over_a_picture_this_timeline_has_none_of_carries_the_codec_refusal() {
+    let mut session =
+        PlaybackSession::open(asset("test_tone.mp3")).expect("a song is a timeline");
+    session.set_gain(0.0);
+    let path = session.sources()[0].path.clone();
+    session.seek(1.0);
+    session
+        .place_stream_at(1.0, &path, 0, Some(Lane::A1))
+        .expect("its own file is on this timeline");
+    assert!(session.lane_clips(Lane::V1).is_empty(), "still no picture");
+
+    for preset in [ExportPreset::Web, ExportPreset::Small, ExportPreset::Master] {
+        let (format, _) = preset.bundle().expect("a real bundle");
+        assert!(
+            format_refusal(&session, format).is_some(),
+            "{preset:?}'s bundle is a picture format this audio-only timeline must refuse"
+        );
+    }
+    // Audio only's bundle is FLAC, which has no picture to refuse.
+    let (audio_format, _) = ExportPreset::AudioOnly.bundle().expect("a real bundle");
+    assert_eq!(format_refusal(&session, audio_format), None);
+}
