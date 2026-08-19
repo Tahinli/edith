@@ -61,6 +61,8 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// re-encodes today and once refused outright.
 fn mixed_project() -> Project {
     let clip = |start, source| Clip {
+        fade_in: 0,
+        fade_out: 0,
         start,
         in_frame: 0,
         out_frame: 30,
@@ -83,6 +85,8 @@ fn mixed_project() -> Project {
             (
                 LaneKind::Video,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 90,
@@ -324,6 +328,8 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
     let song = asset("test_tone.mp3");
     let still = asset("test_still.png");
     let clip = |source, frames| Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: frames,
@@ -388,6 +394,8 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
 #[test]
 fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
@@ -621,6 +629,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
             (
                 LaneKind::Video,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 60,
@@ -635,6 +645,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
             (
                 LaneKind::Audio,
                 vec![Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     start: 0,
                     in_frame: 0,
                     out_frame: 60,
@@ -689,6 +701,8 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
 #[test]
 fn a_silent_clip_exports_as_silence_over_its_own_span() {
     let clip = |start, source| Clip {
+        fade_in: 0,
+        fade_out: 0,
         start,
         in_frame: 0,
         out_frame: 30,
@@ -779,6 +793,8 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
         vec![(
             LaneKind::Audio,
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
                 start: 0,
                 in_frame: 0,
                 out_frame: 30,
@@ -904,6 +920,8 @@ fn a_mono_timeline_exports_as_dual_mono_ogg() {
         vec![(
             LaneKind::Audio,
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
                 start: 0,
                 in_frame: 0,
                 out_frame: 30,

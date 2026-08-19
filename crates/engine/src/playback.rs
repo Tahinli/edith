@@ -618,6 +618,8 @@ impl PlaybackSession {
         // *video* open's pair of grouped clips: here there is no picture to
         // group the sound with, so the video lane starts empty.
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: meta.frame_count,
@@ -701,6 +703,8 @@ impl PlaybackSession {
             color: ColorDescription::default(),
         };
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: place_frames(meta.frame_count, IMAGE_ONLY_RATE),
@@ -2625,6 +2629,8 @@ impl PlaybackSession {
         let source = self.project.import(path, stream);
         self.note_frames(source, frames, rate);
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: match image {
@@ -3254,6 +3260,10 @@ impl PlaybackSession {
             // speeded, which is the path that decodes the same samples it always
             // did.
             let speeds = self.project.audio_speeds_from(target, fps);
+            // ...and the fades, the same way again: a clip's own envelope runs
+            // inside its worker, after the rate and the equalizer, so a fade
+            // edit is audible at once exactly as an EQ edit is.
+            let fades = self.project.audio_fades_from(target, fps);
             // Each source on the stream it was placed with: what plays is what
             // the library row said, and what an export copies (`export::run`).
             let sources = self.project.audio_sources();
@@ -3283,11 +3293,12 @@ impl PlaybackSession {
             // one `pread` on a cold 25 GB film is seconds, and this is called
             // from a ruler drag ([`Audio::spawn_feeder_deferred`]).
             audio_running = audio.spawn_feeder_deferred(move || {
-                match AudioSession::open_mixed_streams_live(
+                match AudioSession::open_mixed_streams_live_fade(
                     &sources,
                     &segs,
                     &eqs,
                     &speeds,
+                    &fades,
                     &gains,
                     limiter,
                     Some(&worker_controls),
