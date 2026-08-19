@@ -153,6 +153,32 @@ fn a_second_message_queues_behind_the_first_instead_of_erasing_it() {
     assert_ne!(front, q.front().cloned());
 }
 
+/// An export's own outcome is what a person started it to read, so it must
+/// never sit behind two progress lines queued while it ran: it jumps to the
+/// front and is the one showing the moment it arrives.
+#[test]
+fn an_export_outcome_jumps_the_queue() {
+    let mut q = std::collections::VecDeque::new();
+    push_notice(&mut q, "PROXY READY for a.mp4 — Proxies on cuts on it".into());
+    push_notice(&mut q, "SUBTITLES b.srt — 1 track(s) in the palette".into());
+    push_notice(&mut q, format!("{EXPORT_DONE}out.mp4").into());
+    assert_eq!(q.len(), 3);
+    assert_eq!(
+        q.front().map(|n: &gpui::SharedString| n.as_ref()),
+        Some(format!("{EXPORT_DONE}out.mp4")).as_deref(),
+        "the export's result must be the notice showing, not third in line"
+    );
+
+    // A failed export is the same class: the outcome, whichever it was.
+    let mut q = std::collections::VecDeque::new();
+    push_notice(&mut q, "PROXY READY for a.mp4 — Proxies on cuts on it".into());
+    push_notice(&mut q, "EXPORT FAILED: disk full".into());
+    assert_eq!(
+        q.front().map(|n: &gpui::SharedString| n.as_ref()),
+        Some("EXPORT FAILED: disk full")
+    );
+}
+
 /// The bar colours itself off the words the message already opens with, so
 /// the tone cannot disagree with the sentence it labels.
 #[test]
