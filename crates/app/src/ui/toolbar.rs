@@ -337,6 +337,16 @@ impl Player {
                         ActionId::Undo,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.undo(cx)),
                     ))
+                    .child(self.action_control(
+                        "redo",
+                        0.,
+                        BG_RAISED(),
+                        None,
+                        "Redo",
+                        "brings the undone edit back",
+                        ActionId::Redo,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.redo(cx)),
+                    ))
                     .child(separator())
                     .child(group_label("Track"))
                     .child(self.action_control(
