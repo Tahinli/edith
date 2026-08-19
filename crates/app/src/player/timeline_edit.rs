@@ -1398,6 +1398,16 @@ impl Player {
             }
             return;
         }
+        // The preview's own scrub bar, tracked on the root for `scrubbing`'s
+        // reason: it is a short bar and the pointer leaves it at once.
+        if self.preview_scrubbing {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.preview_scrub_to(event.position.x, false, cx);
+            } else {
+                self.preview_scrubbing = false;
+            }
+            return;
+        }
         if !self.scrubbing {
             return;
         }
@@ -1467,6 +1477,10 @@ impl Player {
         }
         if std::mem::take(&mut self.volume_dragging) {
             self.drag_volume(event.position.x, cx);
+            return;
+        }
+        if std::mem::take(&mut self.preview_scrubbing) {
+            self.preview_scrub_to(event.position.x, true, cx);
             return;
         }
         if std::mem::take(&mut self.scrubbing) {

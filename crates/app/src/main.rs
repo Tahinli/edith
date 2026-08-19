@@ -383,6 +383,12 @@ struct Player {
     /// arrive at the root, so the bar's own geometry has to be readable there.
     volume_bar: Rc<Cell<Bounds<Pixels>>>,
     volume_dragging: bool,
+    /// Where the preview's own seek bar was last painted, and whether a hand
+    /// is on it -- `volume_bar`'s pair and `scrubbing`'s reason: the bar
+    /// spans the preview's whole length rather than a zoomed [`Scale`], so
+    /// it needs no `ruler` of its own, only its geometry.
+    preview_bar: Rc<Cell<Bounds<Pixels>>>,
+    preview_scrubbing: bool,
     /// The two stand-in switches ([`engine::proxy`]) as this window has them
     /// set: whether the picture is cut on the stand-ins, and whether an
     /// arriving film gets one made for it. Kept here for the volume's reason
@@ -720,6 +726,8 @@ fn main() {
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
                     volume_bar: Rc::default(),
+                    preview_bar: Rc::default(),
+                    preview_scrubbing: false,
                     volume_dragging: false,
                     // What a session comes up at, so the first one opened is
                     // pushed the values it already holds.
