@@ -1171,6 +1171,130 @@ impl Player {
         cx.notify();
     }
 
+    /// A press on a fade handle: the start of the drag that lengthens or
+    /// shortens the ramp at that end of an audio clip. Ctrl-free, unlike a
+    /// trim's press -- a fade handle sits inside the trim strip's own column
+    /// ([`FADE_HANDLE_W`]) and a ctrl-click there would be read as picking the
+    /// clip up rather than as the toggle it means on a trim.
+    pub(crate) fn start_fade_drag(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        is_in: bool,
+        x: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal() || self.exporting().is_some() {
+            return;
+        }
+        let Some(clip) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.lane_clips(lane).get(idx).copied())
+        else {
+            return;
+        };
+        self.pick((lane, idx), false, cx);
+        let start = match is_in {
+            true => clip.fade_in,
+            false => clip.fade_out,
+        };
+        self.fade_drag = Some(FadeDrag {
+            lane,
+            idx,
+            is_in,
+            press_x: x,
+            start,
+            to: start,
+            cap: clip.frames(),
+        });
+        cx.notify();
+    }
+
+    /// Where the pointer has pulled a fade handle to, in the fade's own
+    /// frames -- pulling away from the clip's edge lengthens the ramp for
+    /// both handles alike, which is why the tail's own delta is negated: its
+    /// handle sits at the *right* of the box, so a hand dragging left (toward
+    /// the body) is the same "make it longer" motion the head's handle reads
+    /// dragging right.
+    pub(crate) fn fade_drag_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(fade) = self.fade_drag else {
+            return;
+        };
+        let dx = f32::from(x) - f32::from(fade.press_x);
+        let dx = match fade.is_in {
+            true => dx,
+            false => -dx,
+        };
+        let delta = fade_delta_frames(dx, self.scale.pps, self.fps);
+        let to = (i64::from(fade.start) + delta).clamp(0, i64::from(fade.cap)) as u32;
+        self.fade_drag = Some(FadeDrag { to, ..fade });
+        cx.notify();
+    }
+
+    /// The release: one edit, one undo step, exactly as [`Player::commit_trim`]
+    /// pays for a trim. Autosave's own reason a fade drag has to call
+    /// [`Player::mark_dirty`] same as every other edit that reaches the
+    /// engine.
+    pub(crate) fn commit_fade(&mut self, cx: &mut Context<Self>) {
+        let Some(fade) = self.fade_drag.take() else {
+            return;
+        };
+        self.mark_dirty();
+        let set = self.session.as_mut().is_some_and(|session| match fade.is_in {
+            true => session.set_fade_in(fade.lane, fade.idx, fade.to),
+            false => session.set_fade_out(fade.lane, fade.idx, fade.to),
+        });
+        if set {
+            cx.notify();
+        }
+    }
+
+    /// The clip's fade-in as the drag is showing it: display only, same as
+    /// [`Player::trimmed`] -- the engine hears about it once, at the release.
+    pub(crate) fn shown_fade_in(&self, lane: Lane, idx: usize, clip: &Clip) -> u32 {
+        match self.fade_drag {
+            Some(f) if f.is_in && (f.lane, f.idx) == (lane, idx) => f.to,
+            _ => clip.fade_in,
+        }
+    }
+
+    /// [`Player::shown_fade_in`]'s twin, for the tail.
+    pub(crate) fn shown_fade_out(&self, lane: Lane, idx: usize, clip: &Clip) -> u32 {
+        match self.fade_drag {
+            Some(f) if !f.is_in && (f.lane, f.idx) == (lane, idx) => f.to,
+            _ => clip.fade_out,
+        }
+    }
+
+    /// Crossfades across the join the selection names: two picks on one audio
+    /// lane take the pair, one pick takes it and its right-hand neighbour. The
+    /// engine owns adjacency ([`Project::crossfade`]); a refusal is worded
+    /// here, in [`Player::regroup`]'s voice, because `false` is all it says.
+    pub(crate) fn crossfade_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some((lane, idx)) = (match self.selected.picks() {
+            [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
+            _ => self.selected.anchor(),
+        }) else {
+            self.notify_user("NOTHING TO CROSSFADE — select an audio clip that has a neighbour".into());
+            cx.notify();
+            return;
+        };
+        let frames = self.fps.round().max(1.) as u32;
+        if let Some(session) = &mut self.session {
+            if !session.crossfade(lane, idx, frames) {
+                self.notify_user(
+                    "NOTHING TO CROSSFADE — it takes two audio clips sitting end to end on one lane"
+                        .into(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// The clip as the drag is showing it: an edge under the pointer moves its
     /// own box, and the boxes of everything linked to it, before anything is
     /// committed. Display only -- the project is not touched until the release.
@@ -1370,6 +1494,16 @@ impl Player {
             }
             return;
         }
+        // A fade handle is [`FADE_HANDLE_W`] wide and the pointer leaves it
+        // on the first drag, same reason and same shape as a trim's own
+        // branch just above.
+        if self.fade_drag.is_some() {
+            match event.pressed_button {
+                Some(MouseButton::Left) => self.fade_drag_to(event.position.x, cx),
+                _ => self.commit_fade(cx),
+            }
+            return;
+        }
         // A colour slider is 4 px tall and the pointer leaves it just as
         // fast; every sample is live, so the release owes no write of
         // its own -- what the last sample set is what the clip carries.
@@ -1466,6 +1600,11 @@ impl Player {
             // written once -- one edit, one undo step.
             self.trim_to(event.position.x, cx);
             self.commit_trim(cx);
+            return;
+        }
+        if self.fade_drag.is_some() {
+            self.fade_drag_to(event.position.x, cx);
+            self.commit_fade(cx);
             return;
         }
         if std::mem::take(&mut self.color_dragging) {
