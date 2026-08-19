@@ -216,8 +216,13 @@ pub(crate) fn keys_filter(needle: &str, keymap: &Keymap) -> Vec<(usize, KeyRow)>
     if needle.is_empty() {
         return rows.collect();
     }
+    // A chord matches on whole keys, not substrings -- "f1" must not drag in
+    // "f11". A needle that spells a combination still matches the whole chord.
     let hit = |label: &str, chord: &str| {
-        label.to_lowercase().contains(&needle) || chord.to_lowercase().contains(&needle)
+        let chord = chord.to_lowercase();
+        label.to_lowercase().contains(&needle)
+            || chord.split([' ', '+']).any(|part| part == needle)
+            || (needle.contains(['+', ' ']) && chord.contains(&needle))
     };
     let mut out: Vec<(usize, KeyRow)> = Vec::new();
     // The heading above the row being looked at, until a row under it earns it
