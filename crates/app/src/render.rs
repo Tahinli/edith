@@ -95,7 +95,7 @@ impl Render for Player {
 
         div()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let ctrl = event.keystroke.modifiers.control;
                 // `is_held` is the auto-repeat, and a value is the one thing
@@ -474,8 +474,15 @@ impl Render for Player {
                         return;
                     }
                 }
+                // The innermost thing left on screen once no menu is up: a
+                // preview takes the picture over the timeline's own, and
+                // escape is its own way out, same as every card above it.
+                if key == ESCAPE && !ctrl && this.preview_session.is_some() {
+                    this.close_preview(cx);
+                    return;
+                }
                 if let Some(action) = action {
-                    this.act(action, cx);
+                    this.act(action, window, cx);
                 }
             }))
             // The whole window is the drop target: gpui turns an external file
@@ -561,7 +568,7 @@ impl Render for Player {
             // it. Nothing here moves when the state changes -- the regions are
             // fixed and the panels keep their room whether or not anything is
             // open in them.
-            .child(self.topbar(cx))
+            .child(self.topbar(window, cx))
             .child(
                 div()
                     .flex_1()
@@ -619,6 +626,7 @@ impl Render for Player {
                                     // After the picture, so the plate is drawn
                                     // over it rather than under.
                                     .children(self.subtitle_overlay(position, window))
+                                    .children(self.preview_badge(cx))
                                     // The three transient lines hang off the
                                     // bottom of the picture rather than taking
                                     // a row of the column: a notice that

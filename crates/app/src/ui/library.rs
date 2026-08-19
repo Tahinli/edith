@@ -170,14 +170,20 @@ impl Player {
             // name alone was, and the detail line under it ran on under the
             // switch and was cut mid-word -- and an unusable row draws no switch
             // and so pays nothing for one.
+            // Two switches now sit at the end of a usable row -- the preview
+            // play button beside the stand-in toggle -- so the text gives up
+            // twice the room it gave up for one.
             let text_w = row_text_w(width)
                 - match usable {
-                    true => HIT_MIN + 6.,
+                    true => 2. * (HIT_MIN + 6.),
                     false => 0.,
                 };
             let (path, stream) = (row.path.clone(), row.stream);
             let dragged = (path.clone(), stream);
             let menu_path = path.clone();
+            let preview_path = path.clone();
+            let preview_tip: SharedString =
+                format!("Preview {} — plays it without touching the timeline", row.name).into();
             div()
                 .id(("asset", i))
                 .flex_none()
@@ -282,6 +288,28 @@ impl Player {
                 // the window speaks says which way it is set -- lit like a
                 // picked row when there is one, dimmed like an unusable one
                 // when there is not.
+                .when(usable, |d| {
+                    d.child(
+                        div()
+                            .id(("preview-play", i))
+                            .flex_none()
+                            .w(px(HIT_MIN))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .text_size(px(11.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER())))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(preview_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_preview(&preview_path, cx);
+                            }))
+                            .child("▶"),
+                    )
+                })
                 .when(usable, |d| {
                     d.child(
                         div()

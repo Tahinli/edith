@@ -73,6 +73,17 @@ struct Player {
     /// waits: the first media import or project load is what fills it, and
     /// until then every action that needs a timeline says so instead of acting.
     session: Option<PlaybackSession>,
+    /// A library row's own file, opened and playing in place of the
+    /// timeline's picture, and never written to `session` or its undo stack:
+    /// a preview is watched, not edited. `Some` is what [`Player::pump`] and
+    /// [`Player::transport`] read first -- the timeline's own session and its
+    /// silence scan sit untouched underneath until this clears again
+    /// ([`Player::close_preview`]).
+    preview_session: Option<PlaybackSession>,
+    /// Whether the timeline was playing when a preview took it over
+    /// ([`Player::open_preview`] pauses it so the two sounds never overlap):
+    /// what [`Player::close_preview`] resumes, and only then.
+    preview_playing: bool,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -669,6 +680,8 @@ fn main() {
                     seek_since: None,
                     resynced: None,
                     session: None,
+                    preview_session: None,
+                    preview_playing: false,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),

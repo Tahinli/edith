@@ -134,11 +134,18 @@ actions! {
     /// toolbar's Theme button. It was a build feature once, which made it a
     /// choice only whoever compiled the binary could make.
     Theme,
+    /// The whole window, borderless over the screen: a player's own control,
+    /// on the platform's own toggle ([`gpui::Window::toggle_fullscreen`]).
+    Fullscreen,
     CancelExport,
     /// Opens the actions card -- the list every other action is on. A door of
     /// its own, because a card reachable only by a button in the panel is one a
     /// hand on the keyboard has to leave the keyboard for.
     ShowActions,
+    /// Saves the frame on screen to a PNG: whatever is showing, the timeline's
+    /// own picture or a library preview's, since both write through the one
+    /// `self.image` the atlas already holds.
+    Screenshot,
 }
 
 impl ActionId {
@@ -197,8 +204,10 @@ impl ActionId {
             ActionId::ToggleProxies => "Proxies on / off for the picture",
             ActionId::ToggleAutoProxies => "Make proxies on import: on / off",
             ActionId::Theme => "Theme: the window's colours…",
+            ActionId::Fullscreen => "Fullscreen on / off",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
+            ActionId::Screenshot => "Save the frame on screen as a PNG",
         }
     }
 
@@ -255,8 +264,10 @@ impl ActionId {
             ActionId::ToggleProxies => "toggle-proxies",
             ActionId::ToggleAutoProxies => "toggle-auto-proxies",
             ActionId::Theme => "theme",
+            ActionId::Fullscreen => "fullscreen",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
+            ActionId::Screenshot => "screenshot",
         }
     }
 
@@ -317,7 +328,10 @@ impl ActionId {
             | ActionId::ToggleAutoProxies
             // ...and what the whole window is painted in: it edits nothing at
             // all, it is what one is looking *with*.
-            | ActionId::Theme => Category::View,
+            | ActionId::Theme
+            // ...and whether that window fills the screen: a way of looking,
+            // same as the zoom and the theme beside it.
+            | ActionId::Fullscreen => Category::View,
             ActionId::Cut
             | ActionId::Regroup
             | ActionId::Detach
@@ -354,7 +368,11 @@ impl ActionId {
             ActionId::Save
             | ActionId::Export
             | ActionId::CancelExport
-            | ActionId::ShowActions => Category::File,
+            | ActionId::ShowActions
+            // It writes a file like the three above it, and touches no edit
+            // list -- what an export's own allow-list already means it stays
+            // out of, not what puts it in this heading.
+            | ActionId::Screenshot => Category::File,
         }
     }
 }
@@ -908,6 +926,10 @@ impl Keymap {
                 // it is a preference set once, not a stroke wanted under a hand
                 // that is editing.
                 b(ActionId::Theme, "h", true),
+                // Every other player's key for it, and free here: nothing in
+                // this table answers to "f11" (gpui lowercases the keysym
+                // name it gets from xkb, same as "f1" below).
+                b(ActionId::Fullscreen, "f11", false),
                 // A chord, and the only escape in this table: bare `esc` is the
                 // stroke a hand throws at anything on screen, and throwing it
                 // at a running export used to delete an hour of encoding. The
@@ -919,6 +941,9 @@ impl Keymap {
                 // (platform.rs:880, the keysym's own name lowercased) -- and
                 // not a letter, so it takes nothing away from the clip keys.
                 b(ActionId::ShowActions, "f1", false),
+                // "w" is free entirely, bare and ctrl both -- nothing else in
+                // this table answers to it.
+                b(ActionId::Screenshot, "w", false),
             ],
         }
     }
@@ -1182,7 +1207,9 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 53);
+        assert_eq!(k.entries().len(), 55);
+        assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
+        assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));

@@ -207,6 +207,70 @@ impl Player {
         self.seek_since = None;
     }
 
+    /// The row's own play button: opens `path` as a session of its own and
+    /// shows it in place of the timeline's picture, without moving the
+    /// timeline's playhead or touching its undo stack -- what a library
+    /// preview is. [`PlaybackSession::open`] already builds exactly this (a
+    /// one-clip session, ungraded, passthrough), so nothing new is asked of
+    /// the engine.
+    ///
+    /// corner-cut: opens the file's own first audio stream rather than the
+    /// row's particular one -- `PlaybackSession::open` takes no stream
+    /// argument. Ceiling: a remux with several audio tracks previews on its
+    /// first. Upgrade path: an engine door that opens a chosen stream.
+    pub(crate) fn open_preview(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        // The timeline would otherwise keep playing under the preview -- two
+        // soundtracks at once -- so it is paused here and resumed on the way
+        // out only if this is what paused it ([`Player::close_preview`]).
+        self.preview_playing = self.session.as_ref().is_some_and(PlaybackSession::is_playing);
+        if let Some(session) = self.session.as_mut() {
+            session.pause();
+        }
+        match PlaybackSession::open(path) {
+            Ok(mut session) => {
+                session.drop_late_pictures(true);
+                session.set_gain(self.volume.gain());
+                self.preview_session = Some(session);
+                self.notify_user(
+                    format!("PREVIEWING {} — not on the timeline; esc stops it", file_name(path))
+                        .into(),
+                );
+            }
+            Err(e) => self.notify_user(format!("PREVIEW FAILED: {e}").into()),
+        }
+        self.reset_after_reseek();
+        cx.notify();
+    }
+
+    /// The way out of a preview: `esc`, or the banner's own button. The
+    /// timeline was never pumped while the preview played, so its picture is
+    /// stale where it left off -- a reseek to the position it is already at
+    /// is what brings a fresh frame back, exactly as loading a project does.
+    pub(crate) fn close_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview_session.take().is_none() {
+            return;
+        }
+        self.notify_user("PREVIEW STOPPED — back to the timeline".into());
+        match self.session.as_ref().map(PlaybackSession::now) {
+            Some(now) => {
+                self.seek(now, cx);
+                if self.preview_playing {
+                    if let Some(session) = self.session.as_mut() {
+                        session.play();
+                    }
+                }
+            }
+            None => {
+                self.image = None;
+                cx.notify();
+            }
+        }
+        self.preview_playing = false;
+    }
+
     /// The rate and layout the whole timeline's audio is, taken from the stream
     /// of the first source that could have one: what a library row has to match
     /// to be placeable. `None` until that file has been probed, and then nothing
