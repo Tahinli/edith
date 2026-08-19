@@ -255,6 +255,15 @@ impl Render for Player {
                         // The save dialog, which was the one row here a
                         // keyboard could not open.
                         this.pick_destination(cx);
+                    } else if let Some(preset) = ExportPreset::ALL
+                        .into_iter()
+                        .find(|p| p.key() == key)
+                        // `Custom` shares `s` with Advanced below, which already
+                        // handles that key -- reaching it here too would only
+                        // race the same assignment against itself.
+                        .filter(|p| *p != ExportPreset::Custom)
+                    {
+                        this.pick_preset(preset);
                     } else if key == "g" {
                         this.export_grouped = !this.export_grouped;
                     } else if key == "r" {
