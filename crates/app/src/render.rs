@@ -8,7 +8,7 @@ impl Render for Player {
         // A file that has just been opened sits on its first frame with the
         // clock stopped: opening is not playing, whichever way the file
         // arrived. The play binding and the transport button start it.
-        if let Some(session) = &mut self.session {
+        if let Some(session) = self.active_session_mut() {
             session.tick();
         }
         self.pump(window);

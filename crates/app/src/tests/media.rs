@@ -1279,6 +1279,30 @@ fn a_second_session_playing_never_moves_the_first() {
     );
 }
 
+/// The frozen-preview regression: `render` used to call `tick` on
+/// `self.session` unconditionally, so a preview session's clock -- the one
+/// [`Player::pump`] actually reads while previewing -- was never advanced
+/// and the picture sat on frame 0 forever. The fix routes `tick` through
+/// [`Player::active_session_mut`], the same preview-first precedence
+/// `pump`/`transport` already use. This proves `tick` is what a session
+/// needs to keep its own clock honest, and that ticking one session leaves
+/// an untouched sibling exactly where it was -- so routing it through
+/// whichever session is active cannot disturb the other one.
+#[test]
+fn ticking_the_preview_session_never_moves_the_timeline() {
+    let mut timeline = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    timeline.seek(0.5);
+    let before = timeline.now();
+
+    let mut preview = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    preview.play();
+    // Stands in for what `render` now does every frame while a preview is
+    // showing: only the active session -- the preview -- gets ticked.
+    preview.tick();
+
+    assert_eq!(timeline.now(), before, "ticking the preview moved the timeline's clock");
+}
+
 /// [`bgra_to_rgba`] and [`save_screenshot`]'s own PNG write, round-tripped: a
 /// synthetic 2x2 frame -- one pixel per corner, alpha and channel order all
 /// distinct -- decodes back to the same pixels a viewer would see, in RGBA.
