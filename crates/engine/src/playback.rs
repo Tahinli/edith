@@ -1880,16 +1880,24 @@ impl PlaybackSession {
     /// [`delete_clip`](Self::delete_clip) for the caption the pick named: a
     /// caption in no group lifts exactly as [`lift_sub`](Self::lift_sub) lifts
     /// it -- no reseek, because nothing that plays has changed -- and a caption
-    /// in a group takes the group with it, which ripples the media members and
-    /// reseeks like a delete. `false` for a bad index.
+    /// in a group takes the group with it, which ripples every member's own
+    /// lane and reseeks like a delete. `false` for a bad index.
     pub fn delete_sub(&mut self, lane: Lane, idx: usize) -> bool {
         // Which of the two, asked before anything moves: the reseek a grouped
-        // delete owes is the whole difference between the paths.
-        match self.caption_grouped_with_clips(lane, idx) {
+        // delete owes is the whole difference between the paths. A group of
+        // captions alone (no clip on another lane) still ripples every
+        // member's *own* sub lane closed (`Project::delete_sub_in`, since
+        // cdc53a6), and a sub lane counts toward `timeline_frames` exactly
+        // like a clip lane does -- so the timeline can shrink out from under
+        // the playhead from a caption-only group too, not only a media one.
+        // `caption_grouped_with_clips` answers a narrower question than the
+        // one this dispatch needs; a caption carries a link at all only once
+        // grouped (`place_sub` always starts one at `None`), so that alone is
+        // "this delete ripples more than its own lane".
+        match self.sub_lane(lane).get(idx).is_some_and(|s| s.link.is_some()) {
             true => self.edit(Dirty::Both, |p| p.delete_sub_in(lane, idx)),
-            // A caption in no group -- or one grouped only with other captions,
-            // which lift and move nothing that plays -- is the lift it always
-            // was.
+            // A caption in no group is the plain lift that touches nothing
+            // else: no reseek owed.
             false => self.project.delete_sub_in(lane, idx),
         }
     }
