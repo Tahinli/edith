@@ -56,6 +56,7 @@ fn clip(start: u32, source: usize, frames: u32) -> Clip {
     Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: frames,

@@ -82,6 +82,7 @@ fn project(video: &Path, sound: &Path, sound_in: u32) -> Project {
     let clip = |source, in_frame, out_frame| Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame,
         out_frame,
@@ -425,6 +426,7 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
     let clip = |source, out_frame| Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame,
