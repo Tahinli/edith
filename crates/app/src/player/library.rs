@@ -949,6 +949,9 @@ impl Player {
                 if let Some(fps) = self.pending_settings.1.take() {
                     session.set_frame_rate(fps);
                 }
+                if let Some(rate) = self.pending_settings.2.take() {
+                    session.set_sample_rate(Some(rate));
+                }
                 self.fps = session.meta().frame_rate;
                 // This window *is* the real-time viewer: a picture already past
                 // the clock is one `pump` takes off the channel and throws away,
@@ -1231,7 +1234,7 @@ impl Player {
                 // A `.edith` carries its own saved size and rate, read at
                 // [`engine::PlaybackSession::open_project`] -- a pick made
                 // before this project loaded is not this project's.
-                self.pending_settings = (None, None);
+                self.pending_settings = (None, None, None);
                 self.fps = session.meta().frame_rate;
                 // As at the file door above: the window watches in real time.
                 session.drop_late_pictures(true);

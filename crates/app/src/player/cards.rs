@@ -76,6 +76,34 @@ impl Player {
         cx.notify();
     }
 
+    /// The project's mix cut at another rate: the list names one and this is
+    /// where it happens, the way [`apply_resolution`](Self::apply_resolution)
+    /// is for a size. Nothing to reseek here -- unlike a resolution or a rate,
+    /// this touches no picture and re-times nothing -- so the notice says the
+    /// truth about when it is heard: the next time the sound is rebuilt (a
+    /// seek, an edit, a reopen), not the stream already playing
+    /// ([`engine::PlaybackSession::set_sample_rate`]).
+    pub(crate) fn apply_sample_rate(&mut self, rate: Option<u32>, cx: &mut Context<Self>) {
+        let label = |rate: Option<u32>| rate.map_or("the source's own rate".to_string(), |r| format!("{r} Hz"));
+        if let Some(session) = &mut self.session {
+            session.set_sample_rate(rate);
+            self.notify_user(
+                format!(
+                    "PROJECT SOUND: {} — takes effect on the next seek, edit or reopen",
+                    label(rate)
+                )
+                .into(),
+            );
+        } else {
+            self.pending_settings.2 = rate;
+            self.notify_user(
+                format!("PROJECT SOUND: {} — takes effect on the next file opened", label(rate))
+                    .into(),
+            );
+        }
+        cx.notify();
+    }
+
     /// The project's HDR media shown another way: the list names a rendition and
     /// this is where it happens, the way [`apply_resolution`](Self::apply_resolution)
     /// is for a size. The engine remaps the frame under the playhead at once
@@ -117,6 +145,7 @@ impl Player {
         match choice {
             Choice::Size(w, h) => self.apply_resolution(w, h, cx),
             Choice::Fps(fps) => self.apply_frame_rate(fps, cx),
+            Choice::SampleRate(rate) => self.apply_sample_rate(rate, cx),
             Choice::Fit(lane, idx, fit) => self.apply_fit(lane, idx, fit, cx),
             Choice::Tone(preset) => self.apply_tone(preset, cx),
             // The project's, like the tone map above and unlike the palette
@@ -175,6 +204,7 @@ impl Player {
             return match of {
                 Pick::Resolution => pending_resolution_choices(self.pending_settings.0),
                 Pick::Fps => pending_fps_choices(self.pending_settings.1),
+                Pick::SampleRate => sample_rate_choices(self.pending_settings.2),
                 _ => Vec::new(),
             };
         };
@@ -183,6 +213,7 @@ impl Player {
                 resolution_choices(session.resolution(), session.native_resolution())
             }
             Pick::Fps => fps_choices(session.meta().frame_rate, session.native_frame_rate()),
+            Pick::SampleRate => sample_rate_choices(session.sample_rate()),
             Pick::Fit(lane, idx) => {
                 fit_choices(lane, idx, session.fit_of(lane, idx), session.resolution())
             }
