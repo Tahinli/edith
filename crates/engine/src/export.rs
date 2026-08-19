@@ -720,13 +720,17 @@ fn video_label(format: Format, hw: bool) -> &'static str {
 /// copy; a speeded lane is resampled; an equalizer is sample math. The other
 /// half -- whether the sources can be copied out of at all -- costs a file open
 /// each and belongs to [`copy_audio`], which may re-encode where this says copy.
-fn forces_encode(project: &Project) -> bool {
+fn forces_encode(project: &Project, ranged: bool) -> bool {
     let lanes: Vec<_> = project
         .audio_lanes()
         .into_iter()
         .filter(|&lane| !project.lane(lane).is_empty())
         .collect();
-    lanes.len() > 1
+    // A ranged export needs an exact offset and an exact length, which a copy
+    // of the source's own packets cannot give it ([`copy_audio`]) -- so a
+    // range marked at all always encodes, whatever the lanes look like.
+    ranged
+        || lanes.len() > 1
         || lanes
             .iter()
             .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
@@ -749,6 +753,7 @@ fn audio_label(
     format: Format,
     sound: bool,
     copied: Option<bool>,
+    ranged: bool,
 ) -> &'static str {
     if !sound {
         return "no sound to write";
@@ -758,7 +763,7 @@ fn audio_label(
         Format::Flac => "FLAC · SW (flacenc)",
         Format::Mp3 => "MP3 · SW (rusty_mp3)",
         Format::Ogg => "Vorbis · SW (rusty_vorbis)",
-        _ => match copied.unwrap_or(!forces_encode(project)) {
+        _ => match copied.unwrap_or(!forces_encode(project, ranged)) {
             true => "AAC copy",
             // A Matroska file gets Opus where the mix allows it -- 48 kHz and
             // stereo, which is every Opus source and most of everything else --
@@ -800,14 +805,19 @@ fn measured_audio_label(
         // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or the
         // mix was not the 48 kHz stereo that seat is measured in.
         (Some(false), false) if format.is_mkv() => "AAC · SW encode (rusty_aac)",
-        _ => audio_label(project, format, sound.is_some(), sound),
+        // `sound` is already what happened, not a prediction, so `copied` is
+        // filled in and `ranged` never reaches the branch that reads it.
+        _ => audio_label(project, format, sound.is_some(), sound, false),
     }
 }
 
 /// What [`start`] would write this timeline's sound with, before one is
-/// started. Pure: no probe and no file opened, so a card may ask it per repaint.
-pub fn planned_audio(project: &Project, format: Format) -> &'static str {
-    audio_label(project, format, has_sound(project), None)
+/// started. Pure: no probe and no file opened, so a card may ask it per
+/// repaint. `ranged` is whether the export a card is describing is bounded to
+/// a marked range -- a copy needs the source's own packets to *be* the file,
+/// which a range's exact offset and length rule out ([`copy_audio`]).
+pub fn planned_audio(project: &Project, format: Format, ranged: bool) -> &'static str {
+    audio_label(project, format, has_sound(project), None, ranged)
 }
 
 /// Why the sound's rate is nothing this timeline can be asked about in this
@@ -819,7 +829,7 @@ pub fn planned_audio(project: &Project, format: Format) -> &'static str {
 /// [`ExportSettings::audio_kbps`] like every other encode. So the value travels
 /// even where this refuses; what it cannot do is silently write a rate nobody
 /// picked.
-pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static str> {
+pub fn audio_rate_refusal(project: &Project, format: Format, ranged: bool) -> Option<&'static str> {
     match format {
         _ if !has_sound(project) => Some("no sound to write"),
         Format::Wav | Format::Flac => Some("lossless — the samples themselves, at no rate"),
@@ -831,7 +841,7 @@ pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static 
         // does not hold, which is the one thing this card is built not to do.
         Format::Ogg => Some("quality-coded — Vorbis holds no rate to pick"),
         Format::Mp3 => None,
-        _ if forces_encode(project) => None,
+        _ if forces_encode(project, ranged) => None,
         _ => Some("the source's own packets are copied — at the rate they hold"),
     }
 }
@@ -1287,14 +1297,20 @@ pub fn planned_seats(
     // a Matroska file has none -- so every mkv source re-encodes, however
     // untouched its lane is. Extension only, which is what `is_matroska`
     // reads, so this costs nothing beyond what is already open.
-    let copyable = !forces_encode(project)
+    let copyable = !forces_encode(project, settings.range.is_some())
         && !project
             .sources()
             .iter()
             .any(|source| crate::demux::is_matroska(&source.path));
     (
         video,
-        audio_label(project, settings.format, has_sound(project), Some(copyable)),
+        audio_label(
+            project,
+            settings.format,
+            has_sound(project),
+            Some(copyable),
+            settings.range.is_some(),
+        ),
     )
 }
 
@@ -2844,7 +2860,9 @@ fn run_audio(
     };
     // The picture path's line, for a file that is sound alone: there is sound
     // by the line above, so this names the encoder writing it.
-    *shared.encoders.lock().unwrap() = Some(audio_label(project, format, true, None).to_string());
+    *shared.encoders.lock().unwrap() = Some(
+        audio_label(project, format, true, None, settings.range.is_some()).to_string(),
+    );
     let channels = usize::from(audio.channels);
     let out_frames = settings.range.map_or(project.media_frames(), |(s, e)| {
         e.min(project.media_frames()).saturating_sub(s)

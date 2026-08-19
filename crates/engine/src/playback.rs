@@ -1099,8 +1099,8 @@ impl PlaybackSession {
     /// the format (or an equalized lane) forces. Pure -- no probe, no file
     /// opened -- so a card may ask it per repaint; the picture's half costs a
     /// plugin open and lives in [`crate::export::planned_video`].
-    pub fn planned_audio(&self, format: crate::export::Format) -> &'static str {
-        crate::export::planned_audio(&self.project, format)
+    pub fn planned_audio(&self, format: crate::export::Format, ranged: bool) -> &'static str {
+        crate::export::planned_audio(&self.project, format, ranged)
     }
 
     /// The timeline an export started right now would be run against, owned:
@@ -1150,8 +1150,12 @@ impl PlaybackSession {
     /// Why the sound's rate is not a choice for this timeline in this format --
     /// [`crate::export::audio_rate_refusal`], asked of the project a front-end
     /// is holding, and pure for the same reason.
-    pub fn audio_rate_refusal(&self, format: crate::export::Format) -> Option<&'static str> {
-        crate::export::audio_rate_refusal(&self.project, format)
+    pub fn audio_rate_refusal(
+        &self,
+        format: crate::export::Format,
+        ranged: bool,
+    ) -> Option<&'static str> {
+        crate::export::audio_rate_refusal(&self.project, format, ranged)
     }
 
     /// Why this session plays silent although the file has sound -- an audio

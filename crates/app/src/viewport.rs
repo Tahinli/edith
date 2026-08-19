@@ -288,6 +288,27 @@ pub(crate) fn timecode(t: f64, fps: f64) -> String {
     )
 }
 
+/// NLE timecode for a *duration* given as a frame count: the same
+/// `HH:MM:SS:FF` shape as [`timecode`], but built from the count directly
+/// rather than a float number of seconds. `timecode` truncates `(t - secs) *
+/// fps`, which loses a whole frame to float error on a duration derived from
+/// dividing a frame count by `fps` first (346 frames at 30 fps printed
+/// `00:00:11:15`, one short of the true `:16`); integer frame math has no
+/// such rounding to lose.
+pub(crate) fn frames_timecode(frames: u32, fps: f64) -> String {
+    let per_sec = (fps.ceil() as u64).max(1);
+    let frames = u64::from(frames);
+    let secs = frames / per_sec;
+    let frame = frames % per_sec;
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60,
+        frame
+    )
+}
+
 /// Wall clock for a progress line: `M:SS`, minutes past the hour included
 /// rather than an hours field nobody reads on an export.
 pub(crate) fn clock(secs: f32) -> String {

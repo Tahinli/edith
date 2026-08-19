@@ -241,6 +241,13 @@ impl Player {
                                     .children(self.range.map(|(start, end)| {
                                         let left = self.scale.px_at(f64::from(start) / self.fps);
                                         let right = self.scale.px_at(f64::from(end) / self.fps);
+                                        // The wash alone is the played fill's own
+                                        // color at lower alpha, so once the
+                                        // playhead has passed the whole band the
+                                        // two blend to one flat color and the mark
+                                        // vanishes. A tick at each boundary, in
+                                        // the theme's foreground rather than its
+                                        // accent, reads over either background.
                                         div()
                                             .absolute()
                                             .top_0()
@@ -249,6 +256,9 @@ impl Player {
                                             .w(px((right - left).max(1.)))
                                             .rounded(px(3.))
                                             .bg(rgba(ACCENT_WASH()))
+                                            .border_l(px(2.))
+                                            .border_r(px(2.))
+                                            .border_color(rgb(FG_PRIMARY()))
                                     })),
                             ),
                     ),

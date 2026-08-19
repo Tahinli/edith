@@ -491,7 +491,7 @@ impl Player {
     /// sound: there is nothing to write either way.
     pub(crate) fn audio_rate_refusal(&self) -> Option<&'static str> {
         match &self.session {
-            Some(session) => session.audio_rate_refusal(self.format),
+            Some(session) => session.audio_rate_refusal(self.format, self.range.is_some()),
             None => Some("no sound to write"),
         }
     }
