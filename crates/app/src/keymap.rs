@@ -146,6 +146,9 @@ actions! {
     /// own picture or a library preview's, since both write through the one
     /// `self.image` the atlas already holds.
     Screenshot,
+    /// The cue plate's font and size -- a person's own preference, kept
+    /// beside the theme and not the project, and opened the same way.
+    SubtitleStyle,
 }
 
 impl ActionId {
@@ -208,6 +211,7 @@ impl ActionId {
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
             ActionId::Screenshot => "Save the frame on screen as a PNG",
+            ActionId::SubtitleStyle => "Subtitle style: font and size…",
         }
     }
 
@@ -268,6 +272,7 @@ impl ActionId {
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
             ActionId::Screenshot => "screenshot",
+            ActionId::SubtitleStyle => "subtitle-style",
         }
     }
 
@@ -329,6 +334,9 @@ impl ActionId {
             // ...and what the whole window is painted in: it edits nothing at
             // all, it is what one is looking *with*.
             | ActionId::Theme
+            // ...and what the cue plate is drawn in: a person's own reading
+            // preference, same as the theme beside it.
+            | ActionId::SubtitleStyle
             // ...and whether that window fills the screen: a way of looking,
             // same as the zoom and the theme beside it.
             | ActionId::Fullscreen => Category::View,
@@ -944,6 +952,10 @@ impl Keymap {
                 // "w" is free entirely, bare and ctrl both -- nothing else in
                 // this table answers to it.
                 b(ActionId::Screenshot, "w", false),
+                // Bare "y" is free entirely, and unshifted: a preference
+                // opened as often as the theme, not a switch thrown once a
+                // session.
+                b(ActionId::SubtitleStyle, "y", false),
             ],
         }
     }
@@ -1207,9 +1219,10 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 55);
+        assert_eq!(k.entries().len(), 56);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
+        assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));

@@ -190,18 +190,19 @@ impl Player {
                         .px(px(6.))
                         .rounded(px(3.))
                         .bg(rgba(SUB_SHADE()))
-                        .text_size(px(SUB_TEXT))
+                        .text_size(px(self.sub_text))
                         .text_color(rgb(SUB_FG()))
                         .text_align(TextAlign::Center)
+                        .when_some(self.sub_family.clone(), |el, fam| el.font_family(fam))
                         // A line of the cue is a line on screen: the break the
                         // parser kept is not whitespace to be re-flowed. What a
                         // *long* line does is wrap inside its own div, which is
                         // what the width cap above is for.
-                        .children(
-                            cue.text
-                                .split('\n')
-                                .map(|line| div().min_h(px(SUB_LINE_H)).child(line.to_string())),
-                        )
+                        .children(cue.text.split('\n').map(|line| {
+                            div()
+                                .min_h(px(sub_line_h_for(self.sub_text)))
+                                .child(line.to_string())
+                        }))
                 })),
         )
     }

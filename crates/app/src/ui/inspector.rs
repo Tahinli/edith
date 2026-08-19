@@ -84,6 +84,7 @@ impl Player {
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
             .children(self.mix_card(cx))
+            .children(self.subtitle_style_card(cx))
     }
 
     /// What is marked, and the settings that belong to *it*. A dump of every
@@ -367,6 +368,16 @@ impl Player {
                         "a fader per track and the limiter over the sum of them",
                         ActionId::Mix,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
+                    ))
+                    .child(self.action_control(
+                        "inspect-subtitle-style",
+                        0.,
+                        BG_RAISED(),
+                        None,
+                        "Font",
+                        "the cue plate's own font and size",
+                        ActionId::SubtitleStyle,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_subtitle_style(cx)),
                     )),
             )
     }
