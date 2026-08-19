@@ -98,10 +98,20 @@ impl Player {
             // At the window's corner, since a stroke names no place -- and
             // [`menu_at`] keeps it on screen from there.
             ActionId::Theme => self.open_picker(Pick::Theme, Point::default(), cx),
-            // The platform's own toggle (gpui::Window::toggle_fullscreen); the
-            // window reports its own new state back through `is_fullscreen`,
-            // there is no local bool to keep in step with it.
-            ActionId::Fullscreen => window.toggle_fullscreen(),
+            // Not the window's own toggle alone -- every consumer video
+            // player fullscreens the *picture*, chrome and all, not just the
+            // OS frame around it -- so this flips both: `player_fullscreen`
+            // is what [`crate::render`] reads to draw the picture only, and
+            // the platform's own toggle is what actually grows the window to
+            // the monitor. The two are asked to agree rather than one being
+            // derived from the other, because a compositor keybind can move
+            // `window.is_fullscreen()` without this action ever firing.
+            ActionId::Fullscreen => {
+                self.player_fullscreen = !self.player_fullscreen;
+                if window.is_fullscreen() != self.player_fullscreen {
+                    window.toggle_fullscreen();
+                }
+            }
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}

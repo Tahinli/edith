@@ -49,9 +49,13 @@ impl Player {
     /// write a file on the right. Export is the one accented button in the
     /// window -- the primary action of an editor, where every consumer editor
     /// puts it -- and it keeps its rect while it is a Cancel.
-    pub(crate) fn topbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn topbar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let exporting = self.exporting().is_some();
-        let fullscreen = window.is_fullscreen();
+        // This button's own row is part of the chrome player fullscreen
+        // hides, so once it reads true the button is already off screen --
+        // F11 or Escape is what a person actually leaves by, which is why the
+        // hint below names both.
+        let fullscreen = self.player_fullscreen;
         div()
             .flex_none()
             .h(px(TOPBAR_H))
@@ -89,7 +93,7 @@ impl Player {
                     true => "Exit fullscreen",
                     false => "Fullscreen",
                 },
-                "fills the screen with the window, or gives it back",
+                "fills the screen with the picture; F11 or Escape gives it back",
                 ActionId::Fullscreen,
                 cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.act(ActionId::Fullscreen, window, cx)

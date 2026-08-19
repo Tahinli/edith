@@ -30,6 +30,7 @@ pub(crate) use interact::*;
 pub(crate) use layout::*;
 pub(crate) use library_meta::*;
 pub(crate) use menus::*;
+pub(crate) use render::escape_leaves_player_fullscreen;
 pub(crate) use notices::*;
 pub(crate) use oracle::*;
 pub(crate) use subs::*;
@@ -93,6 +94,14 @@ struct Player {
     /// ([`Player::open_preview`] pauses it so the two sounds never overlap):
     /// what [`Player::close_preview`] resumes, and only then.
     preview_playing: bool,
+    /// The picture alone, filling the window -- what `Fullscreen` gives every
+    /// consumer video player, and not what gpui's own `toggle_fullscreen`
+    /// gives on its own (the OS window, chrome and all). Kept apart from
+    /// `window.is_fullscreen()` because the two can fall out of step: a
+    /// compositor keybind changes the window's without this flag hearing
+    /// about it, so [`Player::act`] reconciles them rather than trusting
+    /// either alone.
+    player_fullscreen: bool,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -722,6 +731,7 @@ fn main() {
                     pending_settings: (None, None, None),
                     preview_session: None,
                     preview_playing: false,
+                    player_fullscreen: false,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),
