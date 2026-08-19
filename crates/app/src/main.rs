@@ -409,6 +409,17 @@ struct Player {
     /// `project_path` is never touched by either path, only a manual save
     /// writes the real file.
     recovery_sidecar: Option<PathBuf>,
+    /// Whether `project_path` names a file this window itself put there --
+    /// loaded from a `.edith` ([`Player::install_project`]) or written by a
+    /// manual save ([`Player::save_project`]) -- rather than one merely
+    /// derived beside an imported media file. [`Player::autosave_tick`]
+    /// requires it: a path derived from `media.mp4` names `media.edith`
+    /// whether or not that file is the user's own saved project, and writing
+    /// a sidecar beside a *foreign* `.edith` the user never opened is what
+    /// let a scratch timeline's autosave outdate and "recover" over a real
+    /// one. `mark_dirty` does not touch this -- an edit earns nothing an open
+    /// or save has not already granted.
+    autosave_armed: bool,
     /// Which stroke means what, and what every shortcut on screen is called.
     /// The one place either question is answered.
     keymap: Keymap,
@@ -842,6 +853,7 @@ fn main() {
                     autosave_last_edit: None,
                     autosave_last_run: None,
                     recovery_sidecar: None,
+                    autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,
                     keys_search: String::new(),

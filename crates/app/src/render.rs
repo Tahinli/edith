@@ -216,8 +216,8 @@ impl Render for Player {
                 if this.recovery_sidecar.is_some() {
                     if key == "enter" {
                         this.recover_from_sidecar(cx);
-                    } else {
-                        this.recovery_sidecar = None;
+                    } else if let Some(sidecar) = this.recovery_sidecar.take() {
+                        Player::discard_sidecar(&sidecar);
                     }
                 }
                 // Any key answers the message on the bar and brings the next of
