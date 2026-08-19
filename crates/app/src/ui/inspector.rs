@@ -310,6 +310,22 @@ impl Player {
                         }),
                     ))
                     .child(self.action_control(
+                        "sample-rate",
+                        ZOOM_SLOT_W,
+                        BG_RAISED(),
+                        None,
+                        match self.session.as_ref().map_or(self.pending_settings.2, |s| s.sample_rate()) {
+                            Some(rate) => format!("{rate} Hz"),
+                            None => "Source".to_string(),
+                        },
+                        "the rate the project's own sound mix is run at; source derives it from \
+                         the first audio source",
+                        ActionId::Resolution,
+                        cx.listener(|this, event: &ClickEvent, _, cx| {
+                            this.open_picker(Pick::SampleRate, event.position(), cx)
+                        }),
+                    ))
+                    .child(self.action_control(
                         "tonemap",
                         TONE_SLOT_W,
                         BG_RAISED(),
