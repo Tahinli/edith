@@ -487,6 +487,24 @@ impl Composer {
     }
 }
 
+/// Per-byte lerp of two same-sized I420 frames: `out = a + (b - a) * t`, on
+/// every plane. `t` is clamped to `[0, 1]` -- a caller ramping across a
+/// cross-dissolve window hands back an in-range fraction already, this is the
+/// backstop. `a`/`b`'s planes must be the same length pairwise (Y with Y, U
+/// with U, V with V); a mismatched pair panics rather than silently
+/// truncating a picture.
+pub fn blend_i420(a: (&[u8], &[u8], &[u8]), b: (&[u8], &[u8], &[u8]), t: f32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let t = t.clamp(0.0, 1.0);
+    let plane = |a: &[u8], b: &[u8]| -> Vec<u8> {
+        assert_eq!(a.len(), b.len(), "blend_i420: mismatched plane sizes");
+        a.iter()
+            .zip(b)
+            .map(|(&av, &bv)| (av as f32 + (bv as f32 - av as f32) * t).round() as u8)
+            .collect()
+    };
+    (plane(a.0, b.0), plane(a.1, b.1), plane(a.2, b.2))
+}
+
 /// Resizes `plane` to `len` and sets every byte to `value` -- a canvas reused
 /// across frames is refilled, not reallocated.
 fn fill(plane: &mut Vec<u8>, len: usize, value: u8) {
@@ -1096,5 +1114,24 @@ mod tests {
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
         println!("scale::Composer::place 1280x720 onto 1920x1080 Fit: {ms:.3} ms/frame");
+    }
+
+    /// [`blend_i420`] at the midpoint of two solid-colour frames lands exactly
+    /// on the 50/50 average, on every plane -- the synthetic stand-in for "the
+    /// dissolve's midpoint frame looks like the average colour" the export
+    /// path is built on.
+    #[test]
+    fn blend_i420_is_50_50_at_the_midpoint() {
+        let a = (vec![0u8; 16], vec![10u8; 4], vec![20u8; 4]);
+        let b = (vec![100u8; 16], vec![50u8; 4], vec![120u8; 4]);
+        let (y, u, v) = blend_i420((&a.0, &a.1, &a.2), (&b.0, &b.1, &b.2), 0.5);
+        assert!(y.iter().all(|&p| p == 50), "Y midpoint: {y:?}");
+        assert!(u.iter().all(|&p| p == 30), "U midpoint: {u:?}");
+        assert!(v.iter().all(|&p| p == 70), "V midpoint: {v:?}");
+        // The edges hand back each frame untouched.
+        let (y0, _, _) = blend_i420((&a.0, &a.1, &a.2), (&b.0, &b.1, &b.2), 0.0);
+        assert_eq!(y0, a.0);
+        let (y1, _, _) = blend_i420((&a.0, &a.1, &a.2), (&b.0, &b.1, &b.2), 1.0);
+        assert_eq!(y1, b.0);
     }
 }
