@@ -216,7 +216,8 @@ use crate::subtitle::SubtitleTrack;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 16";
+const MAGIC: &[u8] = b"edith 17";
+const MAGIC_V16: &[u8] = b"edith 16";
 const MAGIC_V15: &[u8] = b"edith 15";
 const MAGIC_V14: &[u8] = b"edith 14";
 const MAGIC_V13: &[u8] = b"edith 13";
@@ -296,6 +297,15 @@ pub struct Document {
     /// for a v14 file that leaves the line out, which both mean the seat this
     /// machine has -- the only choice those projects offered.
     pub encoder: crate::export::EncoderSeat,
+    /// The rate the project's *sound* is mixed and exported at, chosen rather
+    /// than probed. `None` for every dialect before v17 and for a v17 file that
+    /// leaves the line out, which both mean what they always did: the rate of
+    /// the first source that has any ([`crate::PlaybackSession::open_project`]'s
+    /// `first_audio_of`). Playback and export both resample every other source
+    /// to whichever rate this resolves to, exactly as they already resample a
+    /// source shot at another rate than the timeline's -- an explicit choice
+    /// here only changes what that timeline's own rate *is*.
+    pub sample_rate: Option<u32>,
     pub playhead: u32,
 }
 
@@ -321,6 +331,7 @@ pub fn save(
     auto_proxy: bool,
     encoder: crate::export::EncoderSeat,
     limiter: Limiter,
+    sample_rate: Option<u32>,
     playhead: u32,
 ) -> crate::Result<()> {
     let dir = project_dir(path);
@@ -335,7 +346,7 @@ pub fn save(
         .and_then(|mut f| {
             f.write_all(&emit(
                 &dir, sources, lanes, gains, subs, subtitles, eq, color, resolution, fps, tone,
-                proxy, auto_proxy, encoder, limiter, playhead,
+                proxy, auto_proxy, encoder, limiter, sample_rate, playhead,
             ))?;
             f.sync_all()
         })
@@ -383,6 +394,7 @@ fn emit(
     auto_proxy: bool,
     encoder: crate::export::EncoderSeat,
     limiter: Limiter,
+    sample_rate: Option<u32>,
     playhead: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -394,6 +406,12 @@ fn emit(
     // back as the very number, or every clip on it lands on another frame.
     if let Some(fps) = fps.filter(|f| f.is_finite() && *f > 0.0) {
         out.extend_from_slice(format!("fps {fps:?}\n").as_bytes());
+    }
+    // Beside it, and by the same rule: a project nobody chose a sound rate for
+    // is the mix the source's own probe always gave it, which is what leaving
+    // this line out still means.
+    if let Some(rate) = sample_rate.filter(|&r| (1_000..=384_000).contains(&r)) {
+        out.extend_from_slice(format!("samplerate {rate}\n").as_bytes());
     }
     // Beside the rate, and written only when it is not the default: a project
     // holding no HDR media has nothing to say here, and saying nothing is what
@@ -580,8 +598,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one whose captions may carry a group id...
-    let v16 = first == MAGIC;
+    // The one that carries an explicit sound rate...
+    let v17 = first == MAGIC;
+    // ...the one whose captions may carry a group id...
+    let v16 = v17 || first == MAGIC_V16;
     // ...the one that places the words it names...
     let v15 = v16 || first == MAGIC_V15;
     // ...the ones that say which encoder an export takes...
@@ -653,6 +673,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // still means.
         encoder: crate::export::EncoderSeat::default(),
         fps: None,
+        // Nothing before v17 chose a sound rate: the source's own probe is
+        // still what the mix is cut at, which is what `None` means everywhere
+        // else it reaches (`PlaybackSession::open_project`).
+        sample_rate: None,
         playhead: 0,
     };
     let mut playhead_seen = false;
@@ -707,6 +731,20 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         )
                     })?;
                 doc.fps = Some(fps);
+            }
+            b"samplerate" if v17 => {
+                if doc.sample_rate.is_some() || !doc.sources.is_empty() {
+                    return Err(format!(
+                        "line {n}: samplerate belongs once, before the sources"
+                    )
+                    .into());
+                }
+                let f = fields(rest, 1, "samplerate", n)?;
+                let rate = number(f[0], n)?;
+                if !(1_000..=384_000).contains(&rate) {
+                    return Err(format!("line {n}: {rate} Hz is not a sound rate").into());
+                }
+                doc.sample_rate = Some(rate);
             }
             b"tonemap" if v11 => {
                 if !doc.sources.is_empty() {
@@ -1395,6 +1433,7 @@ mod tests {
             true,
             crate::export::EncoderSeat::default(),
             Limiter::default(),
+            None,
             playhead,
         )
     }
@@ -1442,6 +1481,7 @@ mod tests {
             true,
             crate::export::EncoderSeat::default(),
             Limiter::default(),
+            None,
             0,
         );
         let text = String::from_utf8_lossy(&bytes);
@@ -1469,7 +1509,7 @@ mod tests {
                    video 1 0 0 30 0 - - - fit 1000\n";
         let old = parse(v9, &dir).expect("v9 still loads");
         assert_eq!(old.subtitles, Vec::new());
-        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 16\n"));
+        assert!(flat(&dir, &old.sources, &old.lanes, old.playhead).starts_with(b"edith 17\n"));
         // ...and the line itself is not a v9 line: a dialect may not be mixed.
         let mixed = parse(b"edith 9\nsource 0 a.mp4\nsubtitle - subs.srt\n", &dir)
             .unwrap_err()
@@ -1522,6 +1562,7 @@ mod tests {
             true,
             crate::export::EncoderSeat::default(),
             Limiter::default(),
+            None,
             0,
         );
         let text = String::from_utf8_lossy(&bytes);
@@ -1573,6 +1614,7 @@ mod tests {
                 true,
                 crate::export::EncoderSeat::default(),
                 Limiter::default(),
+                None,
                 0,
             )
         };
@@ -1636,6 +1678,7 @@ mod tests {
                 auto,
                 crate::export::EncoderSeat::default(),
                 Limiter::default(),
+                None,
                 0,
             )
         };
@@ -1701,6 +1744,7 @@ mod tests {
                 true,
                 seat,
                 Limiter::default(),
+                None,
                 0,
             )
         };
@@ -1749,6 +1793,72 @@ mod tests {
         }
     }
 
+    /// The v17 line: an explicit sound rate, written only when picked and read
+    /// back as the very number -- and a v16 file, which had no way to say one
+    /// and meant the source's own probe, still opens with `None`.
+    #[test]
+    fn the_sample_rate_round_trips_and_a_v16_file_leaves_it_derived() {
+        let dir = PathBuf::from("/proj");
+        let (_, sources, lanes) = doc();
+        let bytes = |rate| {
+            super::emit(
+                &dir,
+                &sources,
+                &lanes,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                (1280, 720),
+                None,
+                crate::tonemap::Preset::default(),
+                false,
+                true,
+                crate::export::EncoderSeat::default(),
+                Limiter::default(),
+                rate,
+                0,
+            )
+        };
+        // Unset is the line left out, so a project nobody has chosen a rate for
+        // is the bytes a v16 file was bar the version line.
+        let unset = bytes(None);
+        assert!(
+            !String::from_utf8_lossy(&unset).contains("samplerate"),
+            "no pick is the line left out: {}",
+            String::from_utf8_lossy(&unset)
+        );
+        assert_eq!(parse(&unset, &dir).expect("v17 parses").sample_rate, None);
+        for rate in [44_100, 48_000, 96_000] {
+            let written = bytes(Some(rate));
+            let text = String::from_utf8_lossy(&written).to_string();
+            assert!(text.contains(&format!("samplerate {rate}\n")), "{text}");
+            assert_eq!(
+                parse(&written, &dir).expect("v17 parses").sample_rate,
+                Some(rate)
+            );
+        }
+        // A v16 project had no rate of its own to say: the field comes back
+        // `None`, which is what "derive it from the source" already meant.
+        let v16 = b"edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+                    video 1 0 0 30 0 - - - fit 1000\n";
+        assert_eq!(parse(v16, &dir).expect("v16 still loads").sample_rate, None);
+        // ...and the line is not a v16 line: a dialect may not be mixed.
+        let mixed = parse(b"edith 16\nsource 0 a.mp4\nsamplerate 48000\n", &dir)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(mixed, "line 3: unknown keyword \"samplerate\"");
+        // A number out of a sound rate's range is a corrupt line, by name.
+        for line in ["samplerate 0\n", "samplerate 500000\n", "samplerate nope\n"] {
+            let file = format!("edith 17\nsource 0 a.mp4\n{line}");
+            assert!(
+                parse(file.as_bytes(), &dir).is_err(),
+                "{line:?} is not a sound rate line"
+            );
+        }
+    }
+
     /// The v11 line: the HDR rendition, written by name, read back as the very
     /// preset -- and the dialect before it, which had no way to say one and
     /// meant the published conversion.
@@ -1773,6 +1883,7 @@ mod tests {
                 true,
                 crate::export::EncoderSeat::default(),
                 Limiter::default(),
+                None,
                 0,
             );
             let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1866,7 +1977,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 12);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -1903,7 +2014,7 @@ mod tests {
         let bytes = flat(&dir, &sources, &lanes, 7);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 7\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 4 - - fit 1000\naudio 1\n\
              video 2 40 0 10 0 - - - fit 1000\naudio 2 0 0 30 0 4 - - fit 1000\n",
             "an empty lane is a line of its own; everything else is its clips"
@@ -2011,7 +2122,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &eq, &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls 1000.0:4.5:1.0:pk\n\
              eq 16777215.0:-0.1:3.918315e-39:hs\n\
              eq\n\
@@ -2115,7 +2226,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &color, (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              color 0.1:1.2:0.9:-0.3\n\
              color -1e-7:16777215.0:3.918315e-39:-0.0\n\
              color 0.0:1.0:1.0:0.0\n\
@@ -2180,7 +2291,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              eq 80.0:-3.0:0.707:ls\n\
              video 1 0 0 30 0 0 0 - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
@@ -2218,7 +2329,7 @@ mod tests {
         let bytes = emit(&dir, &sources, &lanes, &[], &[], (1280, 720), 0);
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 0\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 2000\nvideo 1 15 30 40 0 - - - fit 250\n\
              audio 1 0 0 30 0 - - - fit 2000\n",
             "the rate is the clip line's last field, in thousandths"
@@ -2247,7 +2358,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\naudio 1 0 0 30 0 0 - - fit 1000\n"
         );
         // A rate outside what the editor can set is a corrupt line, by name.
@@ -2293,11 +2404,12 @@ mod tests {
             true,
             crate::export::EncoderSeat::default(),
             limiter,
+            None,
             0,
         );
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
+            "edith 17\nplayhead 0\nresolution 1280 720\nfps 23.976023976023978\n\
              limiter -1.5 on\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n\
              audio 2 0 0 30 0 - - - fit 1000\n\
@@ -2329,7 +2441,7 @@ mod tests {
                 (1280, 720),
                 old.playhead
             )),
-            "edith 16\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 3\nresolution 1280 720\nsource 0 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
 
@@ -2493,7 +2605,7 @@ mod tests {
         assert!(old.eq.is_empty(), "nothing before v5 equalizes anything");
         assert_eq!(
             String::from_utf8_lossy(&flat(&dir, &old.sources, &old.lanes, old.playhead)),
-            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 2 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n"
@@ -2546,7 +2658,7 @@ mod tests {
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
         assert_eq!(
             String::from_utf8_lossy(&v5),
-            "edith 16\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
+            "edith 17\nplayhead 12\nresolution 1280 720\nsource 0 a.mp4\n\
              source 0 /elsewhere/b.mp4\n\
              video 1 0 0 30 0 0 - - fit 1000\nvideo 1 30 10 20 1 1 - - fit 1000\n\
              audio 1 0 0 30 0 0 - - fit 1000\n",
@@ -2578,7 +2690,7 @@ mod tests {
         // Saved again it is the current version, which round-trips to the
         // same document.
         let v5 = flat(&dir, &back.sources, &back.lanes, back.playhead);
-        assert!(v5.starts_with(b"edith 16\n"));
+        assert!(v5.starts_with(b"edith 17\n"));
         let again = parse(&v5, &dir).expect("v5 parses");
         assert_eq!(again.lanes, back.lanes);
         // A dialect may not be mixed: lane lines under v1, `clip` under v2.
@@ -2681,13 +2793,14 @@ mod tests {
             true,
             crate::export::EncoderSeat::default(),
             Limiter::default(),
+            None,
             0,
         )
         .expect("save");
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(
             String::from_utf8_lossy(&bytes),
-            "edith 16\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
+            "edith 17\nplayhead 0\nresolution 1280 720\nsource 1 a.mp4\n\
              video 1 0 0 30 0 - - - fit 1000\naudio 1 0 0 30 0 - - - fit 1000\n"
         );
         // Loading rejoins the *given* directory, so the file is reached by the
@@ -2732,10 +2845,10 @@ mod tests {
     #[test]
     fn a_wrong_first_line_is_refused_by_name() {
         let dir = PathBuf::from("/proj");
-        let err = parse(b"edith 17\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
+        let err = parse(b"edith 18\nsource 0 a.mp4\nvideo 0 0 5 0 -\n", &dir)
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "line 1: unsupported version 17");
+        assert_eq!(err, "line 1: unsupported version 18");
         for junk in [&b""[..], b"{}\n", b"source a.mp4\n"] {
             assert_eq!(
                 parse(junk, &dir).unwrap_err().to_string(),

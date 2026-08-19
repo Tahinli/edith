@@ -377,6 +377,22 @@ impl AudioSession {
         eqs: &[Option<EqParams>],
         speeds: &[Option<crate::project::Stretch>],
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_multi_streams_speed_at(sources, segs, eqs, speeds, None)
+    }
+
+    /// [`open_multi_streams_speed`] with the project's own rate, when one was
+    /// picked ([`crate::edith::Document::sample_rate`]), overriding the source's
+    /// derived one. The per-segment [`Rate`] chain below already conforms any
+    /// segment whose own rate differs from `meta.sample_rate`, so naming a rate
+    /// here costs nothing new -- it only changes which rate that chain conforms
+    /// *to*.
+    pub fn open_multi_streams_speed_at(
+        sources: &[(PathBuf, usize)],
+        segs: &[(Option<usize>, f64, f64)],
+        eqs: &[Option<EqParams>],
+        speeds: &[Option<crate::project::Stretch>],
+        sample_rate: Option<u32>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         // The first source that could have a track, which is not always index 0:
         // a still image has none, and one at the front of the list (a save
         // renumbers, a library removal moves indexes) would be opened as a
@@ -395,7 +411,7 @@ impl AudioSession {
         // The timeline's meta is that source's: policy makes every other source
         // match it, and the checks below hold them to that.
         let meta = AudioMeta {
-            sample_rate: first.sample_rate(),
+            sample_rate: sample_rate.unwrap_or_else(|| first.sample_rate()),
             channels: first.channels(),
             total_samples: first.total_samples(),
         };
@@ -658,7 +674,23 @@ impl AudioSession {
         gains: &[f32],
         limiter: Limiter,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
-        Self::open_mixed_streams_live(sources, lanes, eqs, speeds, gains, limiter, None)
+        Self::open_mixed_streams_master_at(sources, lanes, eqs, speeds, gains, limiter, None)
+    }
+
+    /// [`open_mixed_streams_master`] with the project's own rate
+    /// ([`crate::edith::Document::sample_rate`]) overriding the derived one, the
+    /// same rate every lane's meta agrees on ([`open_mixed_streams_live`]'s
+    /// invariant).
+    pub fn open_mixed_streams_master_at(
+        sources: &[(PathBuf, usize)],
+        lanes: &[Vec<(Option<usize>, f64, f64)>],
+        eqs: &[Vec<Option<EqParams>>],
+        speeds: &[Vec<Option<crate::project::Stretch>>],
+        gains: &[f32],
+        limiter: Limiter,
+        sample_rate: Option<u32>,
+    ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
+        Self::open_mixed_streams_live(sources, lanes, eqs, speeds, gains, limiter, None, sample_rate)
     }
 
     /// [`open_mixed_streams_master`](Self::open_mixed_streams_master) with the
@@ -677,6 +709,7 @@ impl AudioSession {
         gains: &[f32],
         limiter: Limiter,
         live: Option<&Arc<MixControls>>,
+        sample_rate: Option<u32>,
     ) -> crate::Result<Option<(AudioMeta, Receiver<AudioChunk>)>> {
         let [first, ..] = lanes else {
             return Ok(None);
@@ -684,11 +717,12 @@ impl AudioSession {
         if !Self::is_mixed(lanes.len(), gains, limiter) {
             let flat = Vec::new();
             let plain = Vec::new();
-            return Self::open_multi_streams_speed(
+            return Self::open_multi_streams_speed_at(
                 sources,
                 first,
                 eqs.first().unwrap_or(&flat),
                 speeds.first().unwrap_or(&plain),
+                sample_rate,
             );
         }
         let mut meta = None;
@@ -699,11 +733,12 @@ impl AudioSession {
             // timeline.
             let flat = Vec::new();
             let plain = Vec::new();
-            let Some((lane_meta, rx)) = Self::open_multi_streams_speed(
+            let Some((lane_meta, rx)) = Self::open_multi_streams_speed_at(
                 sources,
                 segs,
                 eqs.get(i).unwrap_or(&flat),
                 speeds.get(i).unwrap_or(&plain),
+                sample_rate,
             )?
             else {
                 return Ok(None);
