@@ -49,7 +49,8 @@ use super::{
     IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanKey, ScanPlan, SilenceScan, import_line,
     Landing, arrival, launch_queue, full_scan_key, silence_cached, slice_whole_levels,
     read_ahead, scan_plan, seek_line, silence_line, source_secs, stash_or_write,
-    repeats, resolution_choices, resolution_ladder, pending_resolution_choices, pending_fps_choices, span_label, tone_choices, tone_label,
+    repeats, resolution_choices, resolution_ladder, pending_resolution_choices, pending_fps_choices,
+    SAMPLE_RATES, sample_rate_choices, span_label, tone_choices, tone_label,
     clip_width, frames_of_us, trimmed_clip, trimmed_sub, trims, unscannable, unusable,
     visible_slice,
 };
