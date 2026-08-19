@@ -1058,11 +1058,13 @@ fn a_stopped_proxy_leaves_neither_a_stand_in_nor_half_of_one() {
 
     let job = engine::proxy::generate(&source).expect("start the proxy");
     // Stopped with the encoder really running: a flag set before the worker has
-    // opened anything tests the flag and not the stop.
+    // opened anything tests the flag and not the stop. Opening costs under a
+    // second alone, but the sibling exports of this binary can starve it for
+    // minutes -- the budget is a hang guard, not a speed claim.
     let opening = Instant::now();
     while job.encoder().is_none() && !job.is_finished() {
         assert!(
-            opening.elapsed() < Duration::from_secs(120),
+            opening.elapsed() < Duration::from_secs(600),
             "the encoder never opened"
         );
         std::thread::sleep(Duration::from_millis(10));
