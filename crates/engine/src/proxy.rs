@@ -497,12 +497,14 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
     let project = Project::from_parts(
         vec![Source::new(source, 0)],
         vec![(LaneKind::Video, vec![clip])],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )?;

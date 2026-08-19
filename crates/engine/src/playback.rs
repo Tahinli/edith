@@ -580,6 +580,7 @@ impl PlaybackSession {
             vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, Vec::new())],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )?;
         // Onto the emptied mapping: black picture, silence, zero duration.
         session.seek(0.);
@@ -628,12 +629,14 @@ impl PlaybackSession {
             link: None,
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
         let project = Project::from_parts(
             vec![Source::new(path, 0)],
             vec![(LaneKind::Video, Vec::new()), (LaneKind::Audio, vec![clip])],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )?;
@@ -714,6 +717,7 @@ impl PlaybackSession {
             link: None,
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
@@ -722,6 +726,7 @@ impl PlaybackSession {
         let project = Project::from_parts(
             vec![Source::new(path, 0)],
             vec![(LaneKind::Video, vec![clip]), (LaneKind::Audio, Vec::new())],
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )?;
@@ -1014,7 +1019,8 @@ impl PlaybackSession {
         // whole to reach one track: a film whose project names many of its
         // tracks is one walk here rather than one per row.
         let subtitles = crate::subtitle::open_all(&doc.subtitles);
-        let project = Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color)?
+        let project =
+            Project::from_parts(doc.sources, doc.lanes, doc.eq, doc.color, doc.transform)?
             .with_mix(&doc.gains, doc.limiter)
             .with_tone(doc.tone)
             // The palette before what is placed on it: a caption names a row of
@@ -1306,7 +1312,7 @@ impl PlaybackSession {
         if self.project.sources().is_empty() {
             return Err("this project names no file: there is nothing to save".into());
         }
-        let (sources, lanes, eq, color) = self.project.without_orphan_sources();
+        let (sources, lanes, eq, color, transform) = self.project.without_orphan_sources();
         let playhead = secs_to_frame(self.now(), self.meta.frame_rate)
             .min(self.project.timeline_frames().saturating_sub(1));
         crate::edith::save(
@@ -1326,6 +1332,7 @@ impl PlaybackSession {
             self.project.subtitles(),
             &eq,
             &color,
+            &transform,
             (self.meta.width, self.meta.height),
             // ...and the rate it was cut at, which nothing else in the file
             // says: a timeline of stills and songs used to come back at
@@ -2689,6 +2696,7 @@ impl PlaybackSession {
             link: None,
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
