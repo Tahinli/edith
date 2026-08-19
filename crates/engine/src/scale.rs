@@ -26,6 +26,8 @@
 //! chroma-sample bias that no eye finds and that a siting-aware kernel would fix
 //! in the same place the Lanczos upgrade goes.
 
+use crate::transform::TransformParams;
+
 /// Limited-range black: what an untouched canvas pixel is.
 pub const BLACK_Y: u8 = 16;
 /// Neutral chroma: 128 in both planes.
@@ -330,6 +332,130 @@ pub fn compose_i420(
     }
 }
 
+/// The source rect [`TransformParams`]'s crop fractions cut out of a `src_w` x
+/// `src_h` picture, chroma-grid aligned exactly as [`fit_rect`]'s rects are.
+/// Fractions are clamped to `0.0..=0.5` a side, so opposing crops can never
+/// meet or cross -- the smallest surviving rect is one chroma sample, for
+/// [`align`]'s reason.
+pub fn crop_rect(src_w: u32, src_h: u32, t: &TransformParams) -> Rect {
+    if src_w == 0 || src_h == 0 {
+        return Rect { x: 0, y: 0, w: 0, h: 0 };
+    }
+    let (cl, cr) = (t.crop_l.clamp(0.0, 0.5), t.crop_r.clamp(0.0, 0.5));
+    let (ct, cb) = (t.crop_t.clamp(0.0, 0.5), t.crop_b.clamp(0.0, 0.5));
+    let x0 = (f64::from(src_w) * f64::from(cl)).round() as u32;
+    let x1 = (f64::from(src_w) * (1.0 - f64::from(cr))).round() as u32;
+    let y0 = (f64::from(src_h) * f64::from(ct)).round() as u32;
+    let y1 = (f64::from(src_h) * (1.0 - f64::from(cb))).round() as u32;
+    let (x, w) = align(x0.min(src_w), x1.saturating_sub(x0), src_w);
+    let (y, h) = align(y0.min(src_h), y1.saturating_sub(y0), src_h);
+    Rect { x, y, w, h }
+}
+
+/// `dst` -- a placement [`fit_rect`] already worked out -- moved by
+/// [`TransformParams::pos_x`]/`pos_y` (canvas fractions, about `dst`'s own
+/// centre) and resized by `scale` (about that same centre), clamped onto the
+/// canvas and chroma-grid aligned like every other rect here.
+///
+/// corner-cut: a placement pushed partway off the canvas is clipped at the
+/// edge (what [`compose_i420`] already does to any rect), not wrapped or
+/// reflected -- there is no picture to draw once it is entirely off, and
+/// [`compose_i420`] already refuses that case by returning without a write.
+pub fn transformed_dst_rect(dst: Rect, t: &TransformParams, canvas_w: u32, canvas_h: u32) -> Rect {
+    if dst.is_empty() || canvas_w == 0 || canvas_h == 0 {
+        return dst;
+    }
+    let scale = if t.scale.is_finite() && t.scale > 0.0 {
+        f64::from(t.scale)
+    } else {
+        1.0
+    };
+    let new_w = ((f64::from(dst.w) * scale).round() as i64).clamp(1, i64::from(canvas_w));
+    let new_h = ((f64::from(dst.h) * scale).round() as i64).clamp(1, i64::from(canvas_h));
+    let pos_x = if t.pos_x.is_finite() { f64::from(t.pos_x) } else { 0.0 };
+    let pos_y = if t.pos_y.is_finite() { f64::from(t.pos_y) } else { 0.0 };
+    let cx = i64::from(dst.x) + i64::from(dst.w) / 2 + (f64::from(canvas_w) * pos_x).round() as i64;
+    let cy = i64::from(dst.y) + i64::from(dst.h) / 2 + (f64::from(canvas_h) * pos_y).round() as i64;
+    let x = (cx - new_w / 2).clamp(0, i64::from(canvas_w)) as u32;
+    let y = (cy - new_h / 2).clamp(0, i64::from(canvas_h)) as u32;
+    let (x, w) = align(x, new_w as u32, canvas_w);
+    let (y, h) = align(y, new_h as u32, canvas_h);
+    Rect { x, y, w, h }
+}
+
+/// Nearest 90-degree step `degrees` renders at: `0` (0deg), `1` (90deg
+/// clockwise), `2` (180deg) or `3` (270deg). Continuous rotation is not
+/// rendered at all -- see the [`crate::transform`] module docs -- so this is
+/// the one lossy step between what a project *stores* and what a frame
+/// *shows*. Non-finite folds to `0`.
+pub fn nearest_90_steps(degrees: f32) -> u8 {
+    if !degrees.is_finite() {
+        return 0;
+    }
+    let norm = degrees.rem_euclid(360.0);
+    ((norm / 90.0).round() as i64).rem_euclid(4) as u8
+}
+
+/// Rotates a tightly packed I420 frame by `steps` quarter turns clockwise
+/// (`steps % 4`; see [`nearest_90_steps`]). `0` and `2` keep the frame's
+/// shape, `1` and `3` swap it -- the chroma planes rotate the same way at
+/// their own `(w+1)/2` x `(h+1)/2` size, which stays exact because it is
+/// exactly the luma size's, swapped the same way.
+pub fn rotate_i420_90s(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    w: u32,
+    h: u32,
+    steps: u8,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32, u32) {
+    let steps = steps % 4;
+    if steps == 0 || w == 0 || h == 0 {
+        return (y.to_vec(), u.to_vec(), v.to_vec(), w, h);
+    }
+    let (cw, ch) = chroma_dims(w as usize, h as usize);
+    let (ry, rw, rh) = rotate_plane(y, w as usize, h as usize, steps);
+    let (ru, ..) = rotate_plane(u, cw, ch, steps);
+    let (rv, ..) = rotate_plane(v, cw, ch, steps);
+    (ry, ru, rv, rw as u32, rh as u32)
+}
+
+/// One tightly packed plane, rotated `steps` (1..=3) quarter turns clockwise.
+fn rotate_plane(src: &[u8], w: usize, h: usize, steps: u8) -> (Vec<u8>, usize, usize) {
+    match steps {
+        1 => {
+            let (nw, nh) = (h, w);
+            let mut out = vec![0u8; nw * nh];
+            for yp in 0..nh {
+                for xp in 0..nw {
+                    out[yp * nw + xp] = src[(h - 1 - xp) * w + yp];
+                }
+            }
+            (out, nw, nh)
+        }
+        2 => {
+            let mut out = vec![0u8; w * h];
+            for yp in 0..h {
+                for xp in 0..w {
+                    out[yp * w + xp] = src[(h - 1 - yp) * w + (w - 1 - xp)];
+                }
+            }
+            (out, w, h)
+        }
+        3 => {
+            let (nw, nh) = (h, w);
+            let mut out = vec![0u8; nw * nh];
+            for yp in 0..nh {
+                for xp in 0..nw {
+                    out[yp * nw + xp] = src[xp * w + (w - 1 - yp)];
+                }
+            }
+            (out, nw, nh)
+        }
+        _ => unreachable!("steps % 4 is 1, 2 or 3 here"),
+    }
+}
+
 /// One clip's pictures placed on the project canvas: the geometry, plus the
 /// buffers it composes into so a frame costs no allocation.
 ///
@@ -484,6 +610,98 @@ impl Composer {
         fill(kv, canvas_cw * canvas_ch, NEUTRAL_C);
         compose_i420(ky, ku, kv, w, h, pic_y, pic_u, pic_v, dst);
         (ky, ku, kv, self.width, self.height)
+    }
+
+    /// [`place`](Self::place) with a per-clip [`TransformParams`] applied on
+    /// top of the fit policy: the source is cropped to [`crop_rect`], rotated
+    /// by [`rotate_i420_90s`] to [`nearest_90_steps`] of `t.rotate`, fit to the
+    /// canvas exactly as an untransformed picture is, and the fitted
+    /// placement is then moved/resized by [`transformed_dst_rect`].
+    /// `t.is_identity()` takes the exact [`place`](Self::place) path.
+    ///
+    /// corner-cut: unlike `place`, this always allocates its crop and rotate
+    /// buffers fresh rather than reusing `self`'s -- the grade path already
+    /// pays the same per-frame cost for a graded clip
+    /// ([`crate::decode::Render::frame`]'s `graded` copy), so a transformed
+    /// clip follows that precedent instead of adding a second steady-state
+    /// buffer budget. Upgrade path if this shows up in a measurement: give
+    /// `Composer` its own crop/rotate scratch fields, sized once like `crop`
+    /// and `scaled` already are.
+    pub fn place_transformed(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        src_w: u32,
+        src_h: u32,
+        t: &TransformParams,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>, u32, u32) {
+        if t.is_identity() {
+            let (y, u, v, w, h) = self.place(y, u, v, src_w, src_h);
+            return (y.to_vec(), u.to_vec(), v.to_vec(), w, h);
+        }
+        // A pass-through canvas still has a picture to place a transform on;
+        // treat it as a canvas the exact size of the incoming picture, so a
+        // transformed clip at the project's own resolution still crops,
+        // rotates and moves instead of skipping straight through.
+        let (canvas_w, canvas_h) = if self.width == 0 || self.height == 0 {
+            (src_w, src_h)
+        } else {
+            (self.width, self.height)
+        };
+
+        let crop = crop_rect(src_w, src_h, t);
+        let mut buf = (Vec::new(), Vec::new(), Vec::new());
+        let (cy, cu, cv) = if (crop.w, crop.h) == (src_w, src_h) {
+            (y, u, v)
+        } else {
+            crop_i420(&mut buf, y, u, v, src_w as usize, src_h as usize, crop);
+            (&buf.0[..], &buf.1[..], &buf.2[..])
+        };
+
+        let steps = nearest_90_steps(t.rotate);
+        let (ry, ru, rv, rw, rh) = rotate_i420_90s(cy, cu, cv, crop.w, crop.h, steps);
+
+        let (dst, src) = fit_rect(rw, rh, canvas_w, canvas_h, self.policy);
+        let (rw_u, rh_u) = (rw as usize, rh as usize);
+        let (fy, fu, fv) = if (src.w, src.h) == (rw, rh) {
+            (&ry[..], &ru[..], &rv[..])
+        } else {
+            crop_i420(&mut buf, &ry, &ru, &rv, rw_u, rh_u, src);
+            (&buf.0[..], &buf.1[..], &buf.2[..])
+        };
+
+        let dst = transformed_dst_rect(dst, t, canvas_w, canvas_h);
+        let (sw, sh) = (src.w as usize, src.h as usize);
+        let (dw, dh) = (dst.w as usize, dst.h as usize);
+        let mut scaled = (Vec::new(), Vec::new(), Vec::new());
+        let (py, pu, pv) = if (sw, sh) == (dw, dh) {
+            (fy, fu, fv)
+        } else {
+            let (ccw, cch) = chroma_dims(dw, dh);
+            scaled.0.resize(dw * dh, 0);
+            scaled.1.resize(ccw * cch, 0);
+            scaled.2.resize(ccw * cch, 0);
+            scale_i420(
+                fy, fu, fv, sw, sh, &mut scaled.0, &mut scaled.1, &mut scaled.2, dw, dh,
+            );
+            (&scaled.0[..], &scaled.1[..], &scaled.2[..])
+        };
+
+        let (w, h) = (canvas_w as usize, canvas_h as usize);
+        let mut canvas = black_i420(w, h);
+        compose_i420(
+            &mut canvas.0,
+            &mut canvas.1,
+            &mut canvas.2,
+            w,
+            h,
+            py,
+            pu,
+            pv,
+            dst,
+        );
+        (canvas.0, canvas.1, canvas.2, canvas_w, canvas_h)
     }
 }
 
