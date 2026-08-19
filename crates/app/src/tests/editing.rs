@@ -617,6 +617,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     let clip = Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -989,6 +990,7 @@ fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     let clip = Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -1621,6 +1623,7 @@ fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     let clip = |source: usize| Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
