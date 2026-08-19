@@ -3347,6 +3347,7 @@ impl PlaybackSession {
                     &eqs,
                     &speeds,
                     &fades,
+                    fps,
                     &gains,
                     limiter,
                     Some(&worker_controls),

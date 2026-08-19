@@ -822,6 +822,29 @@ impl Fade {
             }
         }
     }
+
+    /// Every field re-counted at `ratio` frames-out per frame-in, rounded to
+    /// the nearest whole frame. [`Project::lane_fades_from`] builds a `Fade`
+    /// in *timeline* frames ([`Clip::fade_in`]'s own unit, the fps every clip
+    /// position is in) but [`Self::apply`] multiplies *audio* frames --
+    /// `channels`-wide sample blocks at whatever rate the mix is running at,
+    /// which is almost never the video's fps. Left unconverted, `elapsed` (an
+    /// audio-frame count) raced past `total`/`fade_out` (fps-frame counts) a
+    /// few milliseconds into any clip, so a fade-out silenced the rest of the
+    /// clip outright and a fade-in finished before a listener's ear caught up
+    /// -- audible on nothing shorter than a clip a few fps-frames long, which
+    /// is why 338 green tests never once ran the two curves out of step.
+    /// `ratio` is `sample_rate / fps`, applied once where the audio session
+    /// first learns its own rate ([`crate::AudioSession::open_multi_streams_speed_at_fade`]).
+    pub fn scaled(self, ratio: f64) -> Fade {
+        let conv = |f: u32| (f64::from(f) * ratio).round() as u32;
+        Fade {
+            elapsed: conv(self.elapsed),
+            fade_in: conv(self.fade_in),
+            fade_out: conv(self.fade_out),
+            total: conv(self.total),
+        }
+    }
 }
 
 /// What a save writes and a load takes back: the sources, every lane in

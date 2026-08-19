@@ -901,6 +901,195 @@ fn exports_the_timeline_as_an_ogg_vorbis() {
     std::fs::remove_file(&out).unwrap();
 }
 
+/// A synthetic 44.1 kHz stereo WAV of a constant-amplitude 440 Hz tone,
+/// `secs` long, as plain a RIFF header as `a_mono_timeline_exports_as_dual_mono_ogg`
+/// writes -- no fixture needed, since a fade's shape is a claim about level
+/// over time and a flat tone is the cleanest body to shape.
+fn tone_wav(path: &Path, secs: f64) {
+    let frames = (secs * f64::from(RATE)) as usize;
+    let data = (frames * 4) as u32; // stereo, 16-bit
+    let mut wav = Vec::with_capacity(44 + frames * 4);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 4).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&4u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data.to_le_bytes());
+    for i in 0..frames {
+        let t = i as f64 / f64::from(RATE);
+        let s = (0.8 * (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 32767.0) as i16;
+        wav.extend_from_slice(&s.to_le_bytes());
+        wav.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, &wav).expect("write the tone fixture");
+}
+
+/// Regression for the export that drew a fade in the UI and stored it on the
+/// clip but never carried it into the written file: a single clip with a
+/// 1.5 s fade-in, exported as a WAV, must actually be quiet at the start and
+/// rise across the ramp -- not the source's own flat level from sample zero.
+#[test]
+fn a_fade_in_reaches_the_exported_audio() {
+    let src = out_path("fadein_src", "wav");
+    tone_wav(&src, 3.0);
+    let fps = 30.0;
+    let clip = Clip {
+        fade_in: 45, // 1.5 s at 30 fps
+        fade_out: 0,
+        transition_out: 0,
+        start: 0,
+        in_frame: 0,
+        out_frame: 90, // 3.0 s at 30 fps
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    let project = Project::from_parts(
+        vec![Source::new(src.to_path_buf(), 0)],
+        vec![(LaneKind::Audio, vec![clip])],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a one-clip fade-in project");
+    let meta = engine::VideoMeta {
+        width: 1,
+        height: 1,
+        frame_rate: fps,
+        frame_count: 90,
+        codec: engine::Codec::H264,
+        color: Default::default(),
+    };
+    let out = out_path("fadein", "wav");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Wav,
+            ..Default::default()
+        },
+        None,
+    );
+    wait(&handle, Duration::from_secs(60)).expect("wav export of a faded clip");
+
+    let (audio, samples) = decode(&out);
+    let channels = usize::from(audio.channels);
+    let body = rms(&samples, channels, 2.0, 2.9);
+    let start = rms(&samples, channels, 0.0, 0.1);
+    let quarter = rms(&samples, channels, 0.3, 0.4);
+    let half = rms(&samples, channels, 0.7, 0.8);
+    let near_end = rms(&samples, channels, 1.35, 1.45);
+    println!(
+        "fade-in rms: start {start:.4} quarter {quarter:.4} half {half:.4} \
+         near-end {near_end:.4} body {body:.4}"
+    );
+    assert!(body > 0.3, "the tone's own body is audible: {body:.4}");
+    assert!(
+        start < body * 0.1,
+        "the very start is quiet: {start:.4} vs body {body:.4}"
+    );
+    assert!(quarter < half, "the envelope rises: {quarter:.4} -> {half:.4}");
+    assert!(
+        half < near_end,
+        "the envelope keeps rising into the ramp's end: {half:.4} -> {near_end:.4}"
+    );
+    assert!(
+        (near_end - body).abs() < body * 0.15,
+        "past the ramp the level settles at the body's own: {near_end:.4} vs {body:.4}"
+    );
+    std::fs::remove_file(&out).unwrap();
+    std::fs::remove_file(&src).unwrap();
+}
+
+/// Regression for the worse of the two bugs: a clip split in two and
+/// cross-faded at the join used to go silent for its *entire* remaining
+/// length once the fade's frame count (a handful of fps-frames) was read as
+/// a sample count (a mixed-rate quantity thousands of times larger) -- the
+/// gain curve's tail condition was true from a few milliseconds in to the
+/// end of the segment. The first half's own interior, well clear of either
+/// edge, must still be at the tone's own level.
+#[test]
+fn a_split_and_crossfaded_clip_has_no_muted_interior() {
+    let src = out_path("crossfade_src", "wav");
+    tone_wav(&src, 3.0);
+    let fps = 30.0;
+    let clip = |start, in_frame, out_frame| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
+        start,
+        in_frame,
+        out_frame,
+        source: 0,
+        link: None,
+        eq: None,
+        color: None,
+        fit: FitPolicy::default(),
+        speed: Speed::NORMAL,
+    };
+    // The clip split at 1.5 s (45 frames @ 30 fps) into two adjacent halves,
+    // exactly what `Project::split` leaves behind.
+    let mut project = Project::from_parts(
+        vec![Source::new(src.to_path_buf(), 0)],
+        vec![(
+            LaneKind::Audio,
+            vec![clip(0, 0, 45), clip(45, 45, 90)],
+        )],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("a split clip on one audio lane");
+    assert!(
+        project.crossfade(Lane::new(LaneKind::Audio, 0), 0, 15),
+        "adjacent halves cross-fade at their join"
+    );
+    let meta = engine::VideoMeta {
+        width: 1,
+        height: 1,
+        frame_rate: fps,
+        frame_count: 90,
+        codec: engine::Codec::H264,
+        color: Default::default(),
+    };
+    let out = out_path("crossfade", "wav");
+    let handle = engine::export::start(
+        project,
+        meta,
+        &out,
+        &ExportSettings {
+            format: Format::Wav,
+            ..Default::default()
+        },
+        None,
+    );
+    wait(&handle, Duration::from_secs(60)).expect("wav export of a cross-faded split");
+
+    let (audio, samples) = decode(&out);
+    let channels = usize::from(audio.channels);
+    // The source's own flat level, read off a stretch with no fade anywhere
+    // near it (the second half's own interior, past its fade-in).
+    let reference = rms(&samples, channels, 2.0, 2.9);
+    // The first half's interior: from just past 0 to well before its own
+    // fade-out starts at 1.0 s (45 - 15 frames = 30 frames @ 30 fps).
+    let interior = rms(&samples, channels, 0.1, 0.9);
+    println!("crossfade rms: interior {interior:.4} reference {reference:.4}");
+    assert!(
+        interior > reference * 0.7,
+        "the first half's interior is not muted: {interior:.4} vs reference {reference:.4}"
+    );
+    std::fs::remove_file(&out).unwrap();
+    std::fs::remove_file(&src).unwrap();
+}
+
 /// A **mono** timeline through the same door. `rusty_vorbis` ships one embedded
 /// setup header and it is a stereo profile -- a mono push is refused outright
 /// ("bad coupling channels") -- so `export::write_ogg` writes the mix as dual
