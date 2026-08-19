@@ -385,6 +385,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         true,
         engine::export::EncoderSeat::default(),
         p.limiter(),
+        None,
         0,
     )
     .expect("save");

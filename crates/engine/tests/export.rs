@@ -271,7 +271,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         color: Default::default(),
     };
     let out = out_path("mixed");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(600)).expect("export");
 
     let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen export");
@@ -347,7 +347,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
     )
     .expect("a one-source project on stream 1");
     let out = out_path("stream1");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(600)).expect("export");
 
     let (audio, _) = engine::AudioSession::open(&out)
@@ -429,7 +429,7 @@ fn multi_source_round_trip(name: &str, limit: Duration) {
     let out = out_path(name);
 
     let started = Instant::now();
-    let handle = engine::export::start(project.clone(), meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project.clone(), meta, &out, &ExportSettings::default(), None);
     wait(&handle, limit).expect("export");
     println!(
         "{name}: {total} frames of two sources in {:.2} s",
@@ -555,7 +555,7 @@ fn a_vanished_source_fails_the_export() {
 
     std::fs::remove_file(&doomed).expect("unlink the second source");
     let out = out_path("vanished");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     let result = wait(&handle, Duration::from_secs(60));
     let error = result.expect_err("an export of a missing file cannot succeed");
     println!("vanished source: {error}");
@@ -1415,7 +1415,7 @@ fn a_hardware_encoder_killed_mid_export_costs_the_file_nothing() {
     injected(Some("3"), None, || {
         // `Auto` is what an untouched export card sends: the seat that *may*
         // fall back, which is the whole question here.
-        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
         wait(&handle, Duration::from_secs(180)).expect("the export survived its encoder");
     });
 
@@ -1443,7 +1443,7 @@ fn a_hardware_encoder_killed_mid_export_never_pulls_the_bar_backwards() {
     let out = out_path("hw_child_abort_progress");
 
     let seen = injected(Some("3"), None, || {
-        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
         // Sampled far faster than the export writes, so the retry cannot slip
         // through between two reads.
         let started = Instant::now();
@@ -1498,7 +1498,7 @@ fn audio_pass_threads() -> usize {
 
 /// The busiest that crowd ever gets while `export` writes this project.
 fn busiest_audio_pass(project: Project, meta: engine::VideoMeta, out: &Path) -> usize {
-    let handle = engine::export::start(project, meta, out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, out, &ExportSettings::default(), None);
     let started = Instant::now();
     let mut most = 0;
     while !handle.is_finished() {
@@ -1600,7 +1600,7 @@ fn a_hardware_encoder_killed_at_its_open_is_simply_no_seat() {
     let out = out_path("hw_child_abort_init");
 
     injected(Some("init"), None, || {
-        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
         wait(&handle, Duration::from_secs(180)).expect("the export survived the open");
     });
 
@@ -1618,7 +1618,7 @@ fn a_hardware_encoder_killed_at_the_drain_costs_the_file_nothing() {
     let out = out_path("hw_child_abort_drain");
 
     injected(Some("drain"), None, || {
-        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
         wait(&handle, Duration::from_secs(180)).expect("the export survived the drain");
     });
 
@@ -1641,7 +1641,7 @@ fn a_hardware_encoder_that_stops_answering_is_killed_and_replaced() {
 
     let started = Instant::now();
     injected(None, Some("2"), || {
-        let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+        let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
         wait(&handle, Duration::from_secs(180)).expect("the export outlived the wedge");
     });
     println!(
@@ -1675,7 +1675,7 @@ fn an_export_that_asked_for_the_gpu_by_name_refuses_instead_of_falling_back() {
             seat: engine::export::EncoderSeat::Hardware,
             ..Default::default()
         };
-        let handle = engine::export::start(project, meta, &out, &settings);
+        let handle = engine::export::start(project, meta, &out, &settings, None);
         wait(&handle, Duration::from_secs(180))
             .expect_err("a named hardware seat that died is not written again in software")
     });

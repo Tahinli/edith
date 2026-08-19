@@ -157,6 +157,7 @@ fn exported_want(
             subtitles: picks.to_vec(),
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     // The bar ends where it was told it would: the picture loop's own count and
@@ -188,6 +189,7 @@ fn exported_mp4(name: &str, project: Project, picks: &[usize]) -> Scratch {
             subtitles: picks.to_vec(),
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     out
@@ -570,6 +572,7 @@ fn an_hevc_mp4_keeps_its_rewritten_entry_and_its_text() {
             subtitles: vec![1],
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(1800)).expect("the export finishes");
     let Some(listing) = ffmpeg_streams(&out) else {
@@ -662,6 +665,7 @@ fn more_tracks_than_a_block_can_number_are_refused_by_name() {
             subtitles: (0..over).collect(),
             ..Default::default()
         },
+        None,
     );
     let said = wait(&handle, Duration::from_secs(1800))
         .expect_err("a file that cannot be numbered is not written")
@@ -1094,6 +1098,7 @@ fn more_lanes_than_a_block_can_number_are_refused_by_name() {
             format: Format::Hevc,
             ..Default::default()
         },
+        None,
     );
     let said = wait(&handle, Duration::from_secs(1800))
         .expect_err("a file that cannot be numbered is not written")
