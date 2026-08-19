@@ -305,7 +305,7 @@ impl Player {
                             .tooltip(move |_, cx| cx.new(|_| Tip(preview_tip.clone())).into())
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.open_preview(&preview_path, cx);
+                                this.open_preview(&preview_path, stream, cx);
                             }))
                             .child("▶"),
                     )
