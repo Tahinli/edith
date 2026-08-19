@@ -14,6 +14,7 @@ use crate::colorspace::{ColorDescription, Matrix, Transfer};
 use crate::convert::{i420_to_bgra, i420_to_bgra_with};
 use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::hw::HwSession;
+use crate::project::Speed;
 use crate::scale::Composer;
 use crate::tonemap::{self, ToneMapper};
 
@@ -177,6 +178,12 @@ struct SpanCmd {
     color: ColorParams,
     canvas: Composer,
     tone: tonemap::Preset,
+    /// The clip's own playback speed ([`crate::project::Clip::speed`]), for
+    /// [`skip_for_speed`]: at faster than real time several source frames in a
+    /// row land on the same timeline frame, and only the last of a run is ever
+    /// shown. [`Speed::NORMAL`] for a file-level open ([`DecodeSession::open`]
+    /// and friends), which has no clip and skips nothing.
+    speed: Speed,
     tx: SyncSender<Frame>,
 }
 
@@ -211,6 +218,33 @@ impl Abort<'_> {
     fn late(&self, index: u32) -> bool {
         self.floor.load(Ordering::Relaxed) > index
     }
+}
+
+/// Whether the picture at source frame `due` (of a span starting at `start` and
+/// ending at `end`) is redundant *by construction* at `speed`, and its convert
+/// and send can be skipped without ever waiting on the playhead
+/// ([`Abort::late`]): at faster than real time several source frames in a row
+/// map to the same timeline frame ([`Speed::timeline_at`]), and only the last
+/// of such a run is ever shown -- the newest one always lands after the others
+/// in `try_frame`'s stamp comparison. Unlike a late drop this needs no run
+/// limit: the gap between two kept frames is at most `speed` source frames, so
+/// the picture stream this leaves is never silent, only sparser.
+///
+/// The last frame of the whole span is never skipped by this: it is the
+/// picture [`crate::project::Span::source_len`] was built to land exactly on,
+/// and this is what proves that promise here instead of trusting it blind.
+///
+/// corner-cut: `due` and `start` are the file's own frame numbers, so this
+/// is only correct when the file plays at the timeline's own rate
+/// ([`crate::project::Rate::is_real_time`]) -- callers pass [`Speed::NORMAL`]
+/// (never skip) otherwise. Upgrade path is composing `Rate` into this the way
+/// [`crate::project::Span::timeline_at`] does.
+fn skip_for_speed(speed: Speed, start: u32, due: u32, end: u32) -> bool {
+    if speed.is_normal() || due + 1 >= end {
+        return false;
+    }
+    let rel = due - start;
+    speed.timeline_at(rel) == speed.timeline_at(rel + 1)
 }
 
 impl Worker {
@@ -267,6 +301,7 @@ impl Worker {
     /// in `send`, and only then does it reach the command below. So the order at
     /// the call site is unchanged -- install the new receiver, and the old
     /// worker finds out by losing its consumer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reseek(
         &mut self,
         path: &Path,
@@ -275,6 +310,7 @@ impl Worker {
         color: ColorParams,
         canvas: Composer,
         tone: tonemap::Preset,
+        speed: Speed,
     ) -> Option<(Receiver<Frame>, BackendCell)> {
         let reuse = self.reuse.as_ref()?;
         if reuse.path != path || self.is_finished() {
@@ -297,6 +333,7 @@ impl Worker {
                 color,
                 canvas,
                 tone,
+                speed,
                 tx,
             })
             .ok()?;
@@ -615,6 +652,9 @@ impl DecodeSession {
                 color,
                 canvas,
                 tone,
+                // A file-level open has no clip and no speed to skip frames
+                // for: every picture in range is delivered, as it always was.
+                Speed::NORMAL,
             ),
         ))
     }
@@ -631,6 +671,7 @@ impl DecodeSession {
     /// carries a session on to the next span, which is exactly what a failed
     /// open did on this path before. Callers that must *tell* the user why --
     /// an import at the door -- keep the sync opener.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_worker_deferred(
         path: impl AsRef<Path>,
         start_frame: u32,
@@ -638,6 +679,7 @@ impl DecodeSession {
         color: ColorParams,
         canvas: Composer,
         tone: tonemap::Preset,
+        speed: Speed,
     ) -> FrameStream {
         span_worker(
             path.as_ref().to_path_buf(),
@@ -647,6 +689,7 @@ impl DecodeSession {
             color,
             canvas,
             tone,
+            speed,
         )
     }
 }
@@ -669,6 +712,7 @@ fn span_worker(
     color: ColorParams,
     canvas: Composer,
     tone: tonemap::Preset,
+    speed: Speed,
 ) -> FrameStream {
     // The depth is the size of the pictures this worker will *emit*, which for a
     // pass-through canvas is the stream's own -- and the sync opener has already
@@ -698,6 +742,7 @@ fn span_worker(
         color,
         canvas,
         tone,
+        speed,
         tx,
     };
     let worker_cancel = Arc::clone(&cancel);
@@ -876,6 +921,7 @@ fn run_span(
         color,
         canvas,
         tone,
+        speed,
         tx,
         ..
     } = cmd;
@@ -915,6 +961,7 @@ fn run_span(
             end,
             &mut render,
             abort,
+            speed,
         );
         // A *reused* session that produced nothing may simply be one this
         // reseek left where the driver would not follow; a session opened fresh
@@ -925,7 +972,7 @@ fn run_span(
             eprintln!("hardware decode produced nothing after a reseek; reopening at frame {start}");
             opened.hw = open_hw(path, start);
             if let Some(hw) = opened.hw.as_mut() {
-                decoded = run_hw(hw, &tx, start, end, &mut render, abort);
+                decoded = run_hw(hw, &tx, start, end, &mut render, abort, speed);
             }
         }
         if decoded {
@@ -944,7 +991,7 @@ fn run_span(
     }
     eprintln!("decode backend: software (rusty_h264)");
     backend.set(Backend::Software);
-    run(&mut opened.demuxer, &tx, start, end, &mut render, abort)
+    run(&mut opened.demuxer, &tx, start, end, &mut render, abort, speed)
 }
 
 /// One clip's pictures on their way to the renderer: graded, placed on the
@@ -1242,6 +1289,7 @@ fn run_hw(
     end_frame: u32,
     render: &mut Render,
     abort: &Abort,
+    speed: Speed,
 ) -> bool {
     let mut index = start_frame;
     // Pictures dropped for being late since the last one handed over; see
@@ -1255,8 +1303,19 @@ fn run_hw(
             Ok(Some((y, u, v, width, height))) => {
                 let due = index;
                 index += 1;
-                if abort.late(due) && skipped < LATE_RUN {
-                    skipped += 1;
+                if abort.late(due) {
+                    if skipped < LATE_RUN {
+                        skipped += 1;
+                    } else {
+                        skipped = 0;
+                        let frame = render.frame(due, y, u, v, width, height);
+                        if tx.send(frame).is_err() {
+                            return true; // consumer went away
+                        }
+                    }
+                } else if skip_for_speed(speed, start_frame, due, end_frame) {
+                    // Redundant by construction, not by lateness: no run limit
+                    // needed (see `skip_for_speed`).
                 } else {
                     skipped = 0;
                     let frame = render.frame(due, y, u, v, width, height);
@@ -1327,6 +1386,7 @@ mod tests {
             ColorParams::default(),
             Composer::passthrough(),
             tonemap::Preset::default(),
+            Speed::NORMAL,
         );
         let returned = start.elapsed();
         let frame = stream
@@ -1393,6 +1453,7 @@ mod tests {
                 ColorParams::default(),
                 Composer::passthrough(),
                 tonemap::Preset::default(),
+                Speed::NORMAL,
             );
             stream.worker.playhead(floor);
             let mut indices = Vec::new();
@@ -1424,6 +1485,36 @@ mod tests {
         assert!(
             caught_up.len() >= 4,
             "the worker went silent instead of dropping down to one in nine"
+        );
+    }
+
+    /// [`skip_for_speed`] on its own, with no worker or channel involved: at
+    /// 2x every other source frame maps onto the same timeline frame
+    /// ([`Speed::timeline_at`]), so `skip`/`keep` must alternate exactly, and
+    /// the last frame of the span (the one [`crate::project::Span::source_len`]
+    /// is built to land on) must never be skipped regardless of where the
+    /// alternation lands.
+    #[test]
+    fn skip_for_speed_alternates_at_2x_and_never_drops_the_last_frame() {
+        let speed = Speed::from_permille(2000);
+        let start = 100;
+        let end = 110;
+
+        let skips: Vec<bool> = (start..end)
+            .map(|due| skip_for_speed(speed, start, due, end))
+            .collect();
+        // Alternation holds up to (but not including) the span's last frame,
+        // which is special-cased below.
+        for pair in (start..end - 2).zip(skips.windows(2)) {
+            let (due, w) = pair;
+            assert_eq!(
+                w[0], !w[1],
+                "frame {due} and its successor should alternate skip/keep at 2x: {skips:?}"
+            );
+        }
+        assert!(
+            !skip_for_speed(speed, start, end - 1, end),
+            "the last frame of the span must never be skipped"
         );
     }
 
@@ -1471,6 +1562,7 @@ fn run(
     end_frame: u32,
     render: &mut Render,
     abort: &Abort,
+    speed: Speed,
 ) {
     // A decoder per span, and cheap: it is a parameter-set map and a picture
     // buffer, while the *demuxer* -- whose index cost seconds to build -- is the
@@ -1511,8 +1603,26 @@ fn run(
         }
         let due = index as u32;
         index += 1;
-        if abort.late(due) && skipped < LATE_RUN {
-            skipped += 1;
+        if abort.late(due) {
+            if skipped < LATE_RUN {
+                skipped += 1;
+            } else {
+                skipped = 0;
+                let frame = render.frame(
+                    due,
+                    &yuv.y,
+                    &yuv.u,
+                    &yuv.v,
+                    yuv.width as u32,
+                    yuv.height as u32,
+                );
+                if tx.send(frame).is_err() {
+                    break; // consumer went away
+                }
+            }
+        } else if skip_for_speed(speed, start_frame, due, end_frame) {
+            // Redundant by construction, not by lateness: no run limit needed
+            // (see `skip_for_speed`).
         } else {
             skipped = 0;
             let frame = render.frame(
