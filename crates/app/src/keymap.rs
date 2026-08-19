@@ -972,10 +972,12 @@ impl Keymap {
                 // ctrl its own room now that plain "f" is the mix card's own
                 // (below) -- the same letter, the modifier telling them apart.
                 b(ActionId::Crossfade, "f", true),
-                // Dissolve takes ctrl+d: the mnemonic letter for "dissolve",
-                // with ctrl its own room now that plain "d" is Detach's --
-                // the same letter, the modifier telling them apart.
-                b(ActionId::Dissolve, "d", true),
+                // Dissolve takes ctrl+x: the join it draws on the timeline is
+                // an X (widgets.rs, dissolve_glyph) -- "d" itself is taken
+                // both plain (Detach) and, in the keymap's own rebind test,
+                // as the free chord it rebinds Delete onto, so this reaches
+                // for the shape instead of the word.
+                b(ActionId::Dissolve, "x", true),
                 // The mix card takes "f", for the faders on it: "m" would be
                 // the word but it is the monitoring mute, which is this
                 // machine's volume and not the project's -- two things one key
