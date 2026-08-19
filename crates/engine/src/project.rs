@@ -2252,15 +2252,11 @@ impl Project {
         // separately, which is what let the two answers drift apart by a
         // frame.
         let (held_old, new) = (held.speed.as_f64(), speed.as_f64());
-        let scale = |f: u32| {
-            (f64::from(held.start) + (f64::from(f) - f64::from(held.start)) * held_old / new)
-                .round()
-                .clamp(0., f64::from(u32::MAX)) as u32
-        };
+        let scale = |f: u32| scaled_caption_frame(held.start, held_old, new, f);
         let retimed = |s: SubClip| {
             let map = TimelineMap::piece((s.start, s.end()), (scale(s.start), scale(s.end())));
             let start = map.apply(s.start);
-            let end = map.apply(s.end()).max(start + 1);
+            let end = map.apply(s.end()).max(start.saturating_add(1));
             SubClip { start, frames: end - start, ..s }
         };
         for &(l, i) in &members.clips {
@@ -2363,10 +2359,7 @@ impl Project {
                 // the held clip's proportion -- the offset the group keeps.
                 None => {
                     let s = self.lanes[l].subs.get(i)?;
-                    let held_start = f64::from(held.start);
-                    let scale = |f: u32| {
-                        (held_start + (f64::from(f) - held_start) * held_old / new).round() as u32
-                    };
+                    let scale = |f: u32| scaled_caption_frame(held.start, held_old, new, f);
                     (
                         (s.start, s.end()),
                         TimelineMap::piece((s.start, s.end()), (scale(s.start), scale(s.end()))),
@@ -4461,6 +4454,17 @@ fn handles(lanes: &[LaneData]) -> Vec<Lane> {
             }
         })
         .collect()
+}
+
+/// The one law a caption re-time scales by: frame `f` moves about the held
+/// clip's own start by the held clip's old-to-new rate ratio. [`write_speed`]
+/// commits it, [`Project::speeded_playhead`] previews it -- both build their
+/// [`TimelineMap`] piece from this single answer so the two cannot drift
+/// apart by a frame the way they once did.
+fn scaled_caption_frame(held_start: u32, held_old: f64, new: f64, f: u32) -> u32 {
+    (f64::from(held_start) + (f64::from(f) - f64::from(held_start)) * held_old / new)
+        .round()
+        .clamp(0., f64::from(u32::MAX)) as u32
 }
 
 /// Which source frame a clip plays at `timeline_frame`: its in-point plus the
