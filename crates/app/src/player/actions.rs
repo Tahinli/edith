@@ -89,6 +89,7 @@ impl Player {
             ActionId::Speed => self.open_speed(cx),
             ActionId::Silence => self.open_silence(cx),
             ActionId::Mix => self.open_mix(None, cx),
+            ActionId::SubtitleStyle => self.open_subtitle_style(cx),
             ActionId::ToggleSnap => self.toggle_snap(cx),
             ActionId::ToggleSubtitles => self.toggle_subtitles(cx),
             ActionId::ToggleProxies => self.toggle_proxies(cx),

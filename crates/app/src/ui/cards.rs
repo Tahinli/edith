@@ -1818,6 +1818,159 @@ impl Player {
         )
     }
 
+    /// The subtitle style card: the size stepper on top, the platform's own
+    /// font list scrolling under it -- a picker's rows and not a cycle, so a
+    /// hundred-odd families are each one click and not a hundred presses of
+    /// the same key. Nothing here is a clip's or the project's, the mix
+    /// card's shape for the same reason: app-global, kept in a file beside
+    /// the theme, and drawn straight off `self.sub_text` / `self.sub_family`
+    /// so a change is on the cue underneath before the card is closed.
+    pub(crate) fn subtitle_style_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.subtitle_style_open {
+            return None;
+        }
+        let size_row = div()
+            .id("subtitle-size-row")
+            .flex()
+            .flex_none()
+            .min_h(px(KEYS_ROW_H))
+            .items_center()
+            .justify_between()
+            .px(px(6.))
+            .rounded(px(3.))
+            .bg(rgb(match self.subtitle_style_field == 0 {
+                true => BG_SELECTED(),
+                false => BG_PANEL(),
+            }))
+            .child(div().text_color(rgb(FG_SECONDARY())).child("Size"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(format!("{:.0}px", self.sub_text))
+                    .children([-1, 1].map(|steps: i32| {
+                        div()
+                            .id(("subtitle-size-step", usize::from(steps > 0)))
+                            .flex_none()
+                            .w(px(HIT_MIN))
+                            .h(px(KEYS_ROW_H))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .bg(rgb(BG_PANEL()))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(BG_HOVER())))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.subtitle_style_field = 0;
+                                this.nudge_sub_size(steps, cx);
+                            }))
+                            .child(match steps > 0 {
+                                true => "+",
+                                false => "−",
+                            })
+                    })),
+            );
+        let default_row = div()
+            .id("subtitle-family-row-default")
+            .flex()
+            .flex_none()
+            .min_h(px(KEYS_ROW_H))
+            .items_center()
+            .px(px(6.))
+            .rounded(px(3.))
+            .bg(rgb(match self.subtitle_style_field == 1 {
+                true => BG_SELECTED(),
+                false => BG_PANEL(),
+            }))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(BG_HOVER())))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.set_sub_family(None, cx);
+            }))
+            .child("System default");
+        let family_rows = self.subtitle_fonts.iter().enumerate().map(|(n, name)| {
+            div()
+                .id(("subtitle-family-row", n))
+                .flex()
+                .flex_none()
+                .min_h(px(KEYS_ROW_H))
+                .items_center()
+                .px(px(6.))
+                .rounded(px(3.))
+                .bg(rgb(
+                    match (self.subtitle_style_field == n + 2, self.sub_family.as_deref() == Some(name.as_str())) {
+                        (true, _) | (false, true) => BG_SELECTED(),
+                        _ => BG_PANEL(),
+                    },
+                ))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(BG_HOVER())))
+                .on_click(cx.listener({
+                    let name = name.clone();
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.set_sub_family(Some(name.clone()), cx);
+                    }
+                }))
+                .child(name.clone())
+        });
+        Some(
+            scrim()
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(SCRIM()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(COLOR_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
+                        .max_h(px(360. - 24.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG_RAISED()))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .child("Subtitle style — font and size of the cue plate"),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(FG_SECONDARY()))
+                                .child(
+                                    "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes",
+                                ),
+                        )
+                        .child(size_row)
+                        .child(
+                            div()
+                                .id("subtitle-family-rows")
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .child(default_row)
+                                .children(family_rows),
+                        ),
+                ),
+        )
+    }
+
     /// The silence card: what the scan is looking for, what it found, and the
     /// two things that can be done about it.
     ///

@@ -510,6 +510,27 @@ struct Player {
     /// or its switch. The card's own focus, since nothing in it takes gpui's
     /// (ledger:182).
     mix_field: usize,
+    /// The cue plate's own size, in force this session and kept in
+    /// `~/.config/edith/subtitle-style` beside the keybindings -- an
+    /// app-global preference like the theme, since export never burns
+    /// subtitles into the picture. [`SUB_TEXT`] is the default it opens at,
+    /// never the value read at paint; [`sub_line_h`](Player::sub_line_h) is
+    /// what preview.rs reads for the line height, derived from this.
+    sub_text: f32,
+    /// Which family the cue plate draws in, or the platform default with
+    /// nothing picked -- `None` calls no [`gpui::Styled::font_family`] at
+    /// all, which is what leaves the window's own choice in force.
+    sub_family: Option<String>,
+    /// The subtitle style card is up.
+    subtitle_style_open: bool,
+    /// Which of its rows the arrow keys move: 0 is the size stepper, every
+    /// row after it a family in [`Self::subtitle_fonts`]. The card's own
+    /// focus, since nothing in it takes gpui's (ledger:182).
+    subtitle_style_field: usize,
+    /// Every family the platform can draw, asked for once when the card
+    /// opens and kept for as long as it is up: [`gpui::TextSystem::all_font_names`]
+    /// walks the whole font registry, which is not a repaint's business.
+    subtitle_fonts: Vec<String>,
     /// The silence card is up on this clip -- the lane it is on and its index
     /// there, exactly as the speed card's handle is.
     silence_open: Option<(Lane, usize)>,
@@ -628,6 +649,9 @@ fn main() {
     // itself. Silent on a missing or unreadable file -- the default is a whole
     // answer, and nothing of the user's is lost by it.
     ui::theme::load();
+    // The subtitle style the last session picked, same silence on a missing
+    // or unreadable file.
+    let (sub_family, sub_text) = load_subtitle_style();
     // Nothing named on the command line is read here. The first file makes the
     // timeline -- a `.edith` restores a whole one, anything else *is* one --
     // and the rest are imports like any other: rows in the library, dragged
@@ -778,6 +802,11 @@ fn main() {
                     pending_speed: None,
                     mix_open: false,
                     mix_field: 0,
+                    sub_text,
+                    sub_family,
+                    subtitle_style_open: false,
+                    subtitle_style_field: 0,
+                    subtitle_fonts: Vec::new(),
                     silence_open: None,
                     // The conservative defaults the engine documents: a first
                     // scan that leaves a little too much is one nobody undoes.

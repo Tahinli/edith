@@ -658,6 +658,57 @@ impl Player {
         cx.notify();
     }
 
+    /// Opens the subtitle style card: the platform's font list, asked for
+    /// once and kept while the card is up, and the size stepper beside it.
+    /// Nothing here is a clip's or even the project's -- it never reaches the
+    /// export, which never burns a cue into the picture -- so like the mix
+    /// card it opens with no timeline required and nothing to refuse.
+    pub(crate) fn open_subtitle_style(&mut self, cx: &mut Context<Self>) {
+        self.subtitle_fonts = cx.text_system().all_font_names();
+        self.subtitle_style_open = true;
+        self.subtitle_style_field = 0;
+        // One card at a time, the rule the other five follow.
+        self.keys_open = false;
+        self.export_open = false;
+        self.eq_open = None;
+        self.color_open = None;
+        self.speed_open = None;
+        self.mix_open = false;
+        self.close_silence();
+        self.context_menu = None;
+        cx.notify();
+    }
+
+    /// Picks a family outright -- a click on a row, the card's rule for a
+    /// list rather than a stepper. `None` is the top row, the platform's own
+    /// choice, which is what a family nobody can spell as a fallback would
+    /// leave silently wrong instead.
+    pub(crate) fn set_sub_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        self.sub_family = family;
+        self.keep_subtitle_style(cx);
+    }
+
+    /// One [`SUB_SIZE_STEP`] per keystroke or stepper press, clamped to
+    /// [`SUB_SIZE_RANGE`].
+    pub(crate) fn nudge_sub_size(&mut self, steps: i32, cx: &mut Context<Self>) {
+        self.sub_text = (self.sub_text + steps as f32 * SUB_SIZE_STEP)
+            .clamp(SUB_SIZE_RANGE.0, SUB_SIZE_RANGE.1);
+        self.keep_subtitle_style(cx);
+    }
+
+    /// Writes the style to disk and repaints: every change to either field
+    /// goes through here, so the file on disk and the plate on screen never
+    /// disagree about which session's edit is in force.
+    fn keep_subtitle_style(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = save_subtitle_style(self.sub_family.as_deref(), self.sub_text) {
+            let path = subtitle_style_path();
+            self.notify_user(
+                format!("SUBTITLE STYLE COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+            );
+        }
+        cx.notify();
+    }
+
     /// Closes it and drops the preview with it: marks left on the lane after
     /// the card is gone would name frames the next edit has already moved.
     pub(crate) fn close_silence(&mut self) {
@@ -1012,6 +1063,7 @@ impl Player {
             || self.speed_open.is_some()
             || self.silence_open.is_some()
             || self.mix_open
+            || self.subtitle_style_open
             || self.exporting().is_some()
     }
 
@@ -1042,6 +1094,7 @@ impl Player {
             self.close_silence();
         }
         self.mix_open = false;
+        self.subtitle_style_open = false;
     }
 
     /// Opens the equalizer on the selected clip. Audio only, and it says so

@@ -2,6 +2,57 @@
 
 use crate::*;
 
+/// One press of the size stepper, and how far it may be pushed: below
+/// [`SUB_SIZE_RANGE`].0 a plate is unreadable, above its top it eats the
+/// smallest picture the layout floor promises ([`the_subtitle_plate_and_lanes_fit_the_smallest_window`]).
+pub(crate) const SUB_SIZE_STEP: f32 = 1.;
+pub(crate) const SUB_SIZE_RANGE: (f32, f32) = (10., 28.);
+
+/// The cue's line height at `size`, on the ratio the defaults draw at
+/// ([`SUB_LINE_H`] over [`SUB_TEXT`]): a bigger cue wants a taller line, not
+/// just bigger letters on the old one.
+pub(crate) fn sub_line_h_for(size: f32) -> f32 {
+    size * SUB_LINE_H / SUB_TEXT
+}
+
+/// Where the subtitle style survives: beside the keybindings and the theme,
+/// same corner-cut persistence -- a torn write costs the style and nothing
+/// else, and [`load_subtitle_style`] falls back to the defaults on one.
+pub(crate) fn subtitle_style_path() -> PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("subtitle-style")
+}
+
+/// Two lines: the family (empty for the system default) and the size.
+/// Anything unreadable, missing or out of range leaves the defaults in
+/// force -- a subtitle style file is not the user's work, so a bad one is
+/// worth no message at startup, exactly as [`ui::theme::load`].
+pub(crate) fn load_subtitle_style() -> (Option<String>, f32) {
+    let Ok(text) = std::fs::read_to_string(subtitle_style_path()) else {
+        return (None, SUB_TEXT);
+    };
+    let mut lines = text.lines();
+    let family = lines.next().filter(|l| !l.is_empty()).map(str::to_string);
+    // A size this format could not have written means the file is not this
+    // format at all -- the family line is then noise too, not a font.
+    let Some(size) = lines
+        .next()
+        .and_then(|l| l.trim().parse::<f32>().ok())
+        .filter(|s| (SUB_SIZE_RANGE.0..=SUB_SIZE_RANGE.1).contains(s))
+    else {
+        return (None, SUB_TEXT);
+    };
+    (family, size)
+}
+
+/// Writes the style whole, the way [`ui::theme::save`] writes the palette.
+pub(crate) fn save_subtitle_style(family: Option<&str>, size: f32) -> std::io::Result<()> {
+    let path = subtitle_style_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, format!("{}\n{size}\n", family.unwrap_or("")))
+}
+
 /// Whether a dropped or named path is a subtitle file rather than media: the
 /// formats `engine::subtitle` parses, lowercased, for [`engine::is_audio`]'s
 /// reason -- the import door has to know which of the engine's two doors a file
