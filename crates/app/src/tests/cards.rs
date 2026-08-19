@@ -4,6 +4,17 @@
 use super::*;
 
 #[test]
+fn a_bare_escape_leaves_player_fullscreen_before_anything_under_it() {
+    // Fires while the picture-only layout is up, on the same bare escape
+    // every menu and preview close on -- and only that key: a chord, or an
+    // escape while not fullscreen, means nothing to it.
+    assert!(escape_leaves_player_fullscreen("escape", false, true));
+    assert!(!escape_leaves_player_fullscreen("escape", false, false));
+    assert!(!escape_leaves_player_fullscreen("escape", true, true));
+    assert!(!escape_leaves_player_fullscreen("q", false, true));
+}
+
+#[test]
 fn only_a_chord_gets_out_of_an_export() {
     use keymap::ActionId;
     // What this guards: bare escape is the stroke a hand throws at anything on
