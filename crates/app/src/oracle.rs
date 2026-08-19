@@ -128,6 +128,10 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
             | ActionId::VolumeDown
             | ActionId::ToggleProxies
             | ActionId::ToggleAutoProxies
+            // The project settings decide what the *next* file scaffolds as
+            // (`Player::pending_settings`), so refusing them before the first
+            // file was refusing them exactly when they mean the most.
+            | ActionId::Resolution
     ) {
         return match ctx.exporting {
             true => Enable::No("an export is running"),

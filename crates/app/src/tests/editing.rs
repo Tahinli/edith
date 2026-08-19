@@ -850,6 +850,9 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // picture is then decoded from -- so a person answers them before the first
     // file, and a switch that waited for one was a switch that came too late to
     // stop the encode it was about.
+    // ...and so do the project settings: they decide what the next file
+    // scaffolds as (`pending_settings`), so a gate that waited for a timeline
+    // refused them exactly when they mean the most.
     for editor_wide in [
         ActionId::ToggleSnap,
         ActionId::ToggleMute,
@@ -857,6 +860,7 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         ActionId::VolumeDown,
         ActionId::ToggleProxies,
         ActionId::ToggleAutoProxies,
+        ActionId::Resolution,
     ] {
         assert!(
             whole(editor_wide, Ctx::default()).yes(),
