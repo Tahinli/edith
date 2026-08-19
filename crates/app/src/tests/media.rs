@@ -293,6 +293,66 @@ fn a_second_film_does_not_cost_the_first_one_its_levels() {
     assert_eq!(source_secs(&half, 0.), (0., f64::INFINITY));
 }
 
+/// The background scan started at import ([`Player::cache_media`]) lands its
+/// whole-file levels under [`full_scan_key`], and that entry alone is what
+/// makes the card's own cache check answer "already read" for *every* clip
+/// cut from that source -- without the per-clip decode `start_silence_scan`
+/// used to be the only way to get one. The whole point of moving the scan to
+/// import: the card must find it warm.
+#[test]
+fn a_warm_whole_source_scan_answers_the_card_for_every_clip_cut_from_it() {
+    use std::sync::Arc;
+    let mut levels: std::collections::HashMap<ScanKey, Arc<Vec<f32>>> = std::collections::HashMap::new();
+    let clip_a = (PathBuf::from("/films/a.mkv"), 0, 300, 900);
+    let clip_b = (PathBuf::from("/films/a.mkv"), 0, 1_200, 1_800);
+    // Nothing yet -- neither clip's own read nor a background one.
+    assert!(!silence_cached(&levels, &clip_a));
+    assert!(!silence_cached(&levels, &clip_b));
+    // The background scan lands, once, before either half of the take was
+    // ever opened on the card.
+    levels.insert(full_scan_key(&clip_a.0, clip_a.1), Arc::new(vec![0.; 100]));
+    assert!(
+        silence_cached(&levels, &clip_a) && silence_cached(&levels, &clip_b),
+        "one whole-source entry answers for both halves of the take"
+    );
+    // A clip cut from a *different* file is not answered by it -- the
+    // sentinel is per (path, stream), exactly like every other scan key.
+    let other_file = (PathBuf::from("/films/b.mkv"), 0, 300, 900);
+    assert!(!silence_cached(&levels, &other_file));
+    // A clip's own exact read still counts too, same as before this existed.
+    levels.insert(clip_a.clone(), Arc::new(vec![-40.; 10]));
+    assert!(silence_cached(&levels, &clip_a));
+}
+
+/// What the card actually draws from a warm background scan: the same
+/// dBFS-per-window numbers a direct read of the clip's own stretch would
+/// have found, because window `k` of the whole file and window `k` of a read
+/// that started at second 0 name the same slice of the same source
+/// ([`slice_whole_levels`]'s whole contract). No decode in this test at
+/// all -- the numbers are synthetic and distinct per window so a wrong
+/// offset shows up as a wrong value, not a coincidentally-right one.
+#[test]
+fn a_clips_slice_of_the_whole_scan_is_the_windows_its_own_read_would_have_found() {
+    // 50 fps: one timeline frame is exactly one silence window
+    // (`engine::silence::WINDOWS_PER_SEC` is 50), so the arithmetic is exact
+    // and the test does not have to fight rounding to prove the offset.
+    let fps = 50.;
+    let whole: Vec<f32> = (0..40).map(|i| i as f32).collect();
+    let slice = slice_whole_levels(&whole, fps, 10, 20);
+    assert_eq!(slice, (10..20).map(|i| i as f32).collect::<Vec<f32>>());
+    // The clip's own in point is where its slice starts, not the file's:
+    // a take an hour into the film reads the same as one at its head.
+    assert_eq!(slice_whole_levels(&whole, fps, 0, 5), vec![0., 1., 2., 3., 4.]);
+    // Past what the background scan has read so far (still running, or
+    // cancelled) is not padded with zeroes -- the caller is told nothing is
+    // there yet, same as [`SilenceScan`]'s own cancel leaves a prefix.
+    assert_eq!(slice_whole_levels(&whole, fps, 35, 60), vec![35., 36., 37., 38., 39.]);
+    assert_eq!(slice_whole_levels(&whole, fps, 45, 60), Vec::<f32>::new());
+    // A rate that is not a rate reads nothing, the same refusal
+    // `source_secs` makes for a background scan's own range.
+    assert_eq!(slice_whole_levels(&whole, 0., 0, 10), Vec::<f32>::new());
+}
+
 /// The import door's split, which is what keeps the render thread out of a
 /// header walk: what the worker probed and what the landing registers add up
 /// to exactly the rows, lengths and refusals the in-place import lands.

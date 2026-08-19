@@ -560,7 +560,12 @@ impl Player {
                     clip.out_frame,
                 );
                 match scan_plan(
-                    self.silence_levels.contains_key(&key),
+                    // The whole-source background scan counts as "cached"
+                    // too: a card opened after import finds the levels a
+                    // repaint has already been decoding since the file
+                    // arrived ([`Player::cache_media`]), and `scan_silences`
+                    // is what slices this clip's stretch out of them.
+                    silence_cached(&self.silence_levels, &key),
                     self.silence_scan.as_ref().map(|scan| &scan.key),
                     &key,
                 ) {
@@ -769,16 +774,33 @@ impl Player {
         };
         // Nothing read yet: the worker is running and the card is drawing its
         // line. The marks arrive with the levels.
-        let Some(levels) = self
-            .silence_levels
-            .get(&(
-                source.path.clone(),
-                source.audio_stream,
-                clip.in_frame,
-                clip.out_frame,
-            ))
-            .cloned()
-        else {
+        //
+        // The clip's own read first -- an on-demand scan already asked for
+        // exactly this stretch -- and failing that, this clip's slice of the
+        // whole-source background scan ([`Player::cache_media`]), which is
+        // what makes the card answer at once for a file that arrived a
+        // repaint or two ago.
+        let key = (
+            source.path.clone(),
+            source.audio_stream,
+            clip.in_frame,
+            clip.out_frame,
+        );
+        let levels = match self.silence_levels.get(&key).cloned() {
+            Some(levels) => Some(levels),
+            None => self
+                .silence_levels
+                .get(&full_scan_key(&source.path, source.audio_stream))
+                .map(|whole| {
+                    Arc::new(slice_whole_levels(
+                        whole,
+                        self.fps,
+                        clip.in_frame,
+                        clip.out_frame,
+                    ))
+                }),
+        };
+        let Some(levels) = levels else {
             return;
         };
         self.silence_marks = engine::silence::timeline_regions(
