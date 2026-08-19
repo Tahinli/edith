@@ -173,15 +173,12 @@ pub(crate) const SUB_CUE_MIN_W: f32 = 2.;
 /// How much of the subtitle list in the library column is on screen at once,
 /// past which it scrolls -- the media list above it is what keeps the height.
 pub(crate) const SUB_ROWS_H: f32 = 3. * ROW_H;
-/// The row naming the file a block of tracks came out of. Shorter than a track
-/// row because nothing on it is clicked -- `HIT_MIN` binds targets and a header
-/// is a label, not a way in -- and drawn at all only where the column has the
-/// height to show tracks under it ([`sub_headers_fit`]).
-pub(crate) const SUB_HEAD_H: f32 = 18.;
-/// How much of the subtitle list is on screen at the 640x360 floor: one row,
-/// measured -- the section's own heading and the Add button under it take the
-/// rest of the 84 px the column has there.
-pub(crate) const SUB_ROWS_AT_FLOOR: f32 = ROW_H;
+/// The row naming the file a block of tracks came out of. Always drawn where
+/// there is more than one file -- the list already scrolls past `SUB_ROWS_H`,
+/// so a short window loses tracks under the fold rather than the name saying
+/// whose they are. A click folds it, so it binds `HIT_MIN` like every other
+/// target.
+pub(crate) const SUB_HEAD_H: f32 = HIT_MIN;
 /// How much of a subtitle row's width the file's name in front of the label may
 /// take. Half: which file and which language are both worth reading, and a name
 /// given the whole row is a row where the language is what gets truncated.

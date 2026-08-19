@@ -485,20 +485,17 @@ impl Player {
     /// Every row names the file it came out of itself, in words and in the tint
     /// that file's clips wear on the lanes -- but only where there is more than
     /// one file to tell apart, the way [`row_name`] numbers audio streams only
-    /// where a file gave several. Where the window is tall enough for it
-    /// ([`sub_headers_fit`]) each file's block is headed by its name as well: a
-    /// label and nothing more, no click and nothing to fold, so the rows under
-    /// it are the only things anybody has to aim at. At the 640x360 floor the
-    /// headers are gone and the rows still say whose they are.
+    /// where a file gave several. There, each file's block is headed by its
+    /// name as well, its swatch and its track count -- always, whatever the
+    /// window's height, since the list under it scrolls (`SUB_ROWS_H`) rather
+    /// than the header being the thing a short window drops. A click on a
+    /// header folds its rows shut (`Player::sub_folded`) and a second one opens
+    /// them back -- a fold and not a cycle, so what a click does never depends
+    /// on what the last one did.
     ///
     /// `None` when there are none -- an empty heading is a section about
     /// nothing.
-    pub(crate) fn subtitle_section(
-        &self,
-        width: f32,
-        viewport_h: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    pub(crate) fn subtitle_section(&self, width: f32, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let tracks = self.session.as_ref()?.subtitles();
         if tracks.is_empty() {
             return None;
@@ -510,16 +507,20 @@ impl Player {
         // One file's tracks need no prefix saying which file: it is the only
         // one, and every row would carry the same word.
         let several_files = groups.len() > 1;
-        let headed = several_files && sub_headers_fit(viewport_h);
+        let headed = several_files;
         let text_w = row_text_w(width);
         let rows: Vec<_> = groups
             .into_iter()
-            .map(|SubGroup { name, path, rows }| {
+            .enumerate()
+            .map(|(group_ord, SubGroup { name, path, rows })| {
                 // The file's own colour, the one its media rows and its clips
                 // wear -- and none at all for a standalone `.srt`, which came
                 // off no file on this timeline.
                 let tint = file_tint(self.sources(), &path);
+                let track_count = rows.len();
                 let numbered = rows.len() > 1;
+                let folded = self.sub_folded.contains(&path);
+                let fold_path = path.clone();
                 // The name twice over: all of it the header can hold, and the
                 // share of a row a prefix may take in front of the label.
                 let head = clip_middle(&name, text_w);
@@ -697,11 +698,13 @@ impl Player {
                     .flex_col()
                     .gap(px(2.))
                     // The header: which film these came out of, in words and not
-                    // in colour alone. No id, no click, nothing to fold -- a
-                    // label, which is why it is allowed under `HIT_MIN`.
+                    // in colour alone -- a click folds its rows shut and a
+                    // second click opens them, so it is its own `HIT_MIN`
+                    // target rather than a bare label.
                     .when(headed, |d| {
                         d.child(
                             div()
+                                .id(("subtitle-group-head", group_ord))
                                 .flex_none()
                                 .h(px(SUB_HEAD_H))
                                 .flex()
@@ -709,6 +712,24 @@ impl Player {
                                 .gap(px(6.))
                                 .text_size(px(10.))
                                 .text_color(rgb(FG_SECONDARY()))
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    match this.sub_folded.remove(&fold_path) {
+                                        true => {}
+                                        false => {
+                                            this.sub_folded.insert(fold_path.clone());
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                // Folded / open, in the same glyph a fold uses
+                                // everywhere else on this row list.
+                                .child(match folded {
+                                    true => "▸",
+                                    false => "▾",
+                                })
                                 .when_some(tint, |d, tint| {
                                     d.child(
                                         div()
@@ -719,10 +740,14 @@ impl Player {
                                             .bg(rgb(tint)),
                                     )
                                 })
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(head)),
+                                .child(div().flex_1().min_w(px(0.)).truncate().child(head))
+                                .child(match track_count {
+                                    1 => "1 track".to_string(),
+                                    n => format!("{n} tracks"),
+                                }),
                         )
                     })
-                    .children(rows)
+                    .when(!(headed && folded), |d| d.children(rows))
             })
             .collect();
         Some(
