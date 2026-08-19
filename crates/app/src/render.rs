@@ -687,12 +687,7 @@ impl Render for Player {
                                             .child(height_probe(self.notice_h.clone())),
                                     ),
                             )
-                            .child(self.transport_bar(
-                                position,
-                                state,
-                                window.viewport_size(),
-                                cx,
-                            )),
+                            .child(self.transport_bar(state, window.viewport_size(), cx)),
                     )
                     .child(divider(Split::Inspector, cx))
                     // The settings cards live in here rather than over the

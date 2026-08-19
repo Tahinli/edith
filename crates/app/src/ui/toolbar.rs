@@ -148,7 +148,6 @@ impl Player {
     /// and the reason the edit toolbar below is nothing but edit tools.
     pub(crate) fn transport_bar(
         &self,
-        position: f64,
         state: Transport,
         viewport: Size<Pixels>,
         cx: &mut Context<Self>,
@@ -209,12 +208,14 @@ impl Player {
                     .text_color(rgb(FG_PRIMARY()))
                     .child(format!(
                         "{} / {}",
-                        timecode(position, self.fps),
                         timecode(
-                            self.session
-                                .as_ref()
+                            self.active_session().map_or(0., PlaybackSession::now),
+                            self.active_fps()
+                        ),
+                        timecode(
+                            self.active_session()
                                 .map_or(0., PlaybackSession::timeline_duration),
-                            self.fps
+                            self.active_fps()
                         )
                     )),
             )
