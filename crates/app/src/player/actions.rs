@@ -252,7 +252,7 @@ impl Player {
             timeline: true,
             clipboard: self.clipboard.is_some(),
             subtitles: !session.subtitles().is_empty(),
-            playable: !nothing_to_play(Some(session)),
+            playable: !nothing_to_play(self.active_session()),
             exporting: self.exporting().is_some(),
             picks: picks.len(),
             pick_lanes,

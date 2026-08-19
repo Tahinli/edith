@@ -4,6 +4,27 @@
 use crate::*;
 
 impl Player {
+    /// The session the transport, the pump and the clock all read: the
+    /// preview while one is showing, the timeline otherwise -- never both, so
+    /// a preview is watched without moving the edit's own playhead. See
+    /// [`preview_session`](Player) for what stays untouched underneath.
+    pub(crate) fn active_session(&self) -> Option<&PlaybackSession> {
+        self.preview_session.as_ref().or(self.session.as_ref())
+    }
+
+    pub(crate) fn active_session_mut(&mut self) -> Option<&mut PlaybackSession> {
+        self.preview_session.as_mut().or(self.session.as_mut())
+    }
+
+    /// The active session's own frame rate rather than the timeline's: a
+    /// preview of a file shot at another rate clocks and steps at *its* rate,
+    /// not the edit's.
+    pub(crate) fn active_fps(&self) -> f64 {
+        self.preview_session
+            .as_ref()
+            .map_or(self.fps, |s| s.meta().frame_rate)
+    }
+
     /// Catches the display up to the clock: everything already due is taken off
     /// the channel and only the last of them is shown, which *is* the
     /// drop-when-behind policy. A frame that is not due yet waits in `held`, and
@@ -13,9 +34,16 @@ impl Player {
         // Where the transport was before this drain, so the crossing into
         // `Ended` can be recognised as the one transition it is.
         let was = self.transport();
+        let fps = self.active_fps();
         // No timeline, nothing to catch up to: the window is showing its empty
         // state and there is no decoder to drain.
-        let Some(session) = &mut self.session else {
+        // A direct field borrow rather than the `active_session_mut` helper: the
+        // rest of this function reads and writes other fields on `self`
+        // (`held`, `seek_since`, `dropped`, `displayed`, ...) alongside
+        // `session`, and only a borrow of the two Option fields themselves --
+        // not a call through a `&mut self` method -- lets the borrow checker
+        // see those as disjoint.
+        let Some(session) = self.preview_session.as_mut().or(self.session.as_mut()) else {
             return;
         };
         // Whether the span now decoding has yet to hand over a picture, read
@@ -24,7 +52,7 @@ impl Player {
         // reopen took -- is exactly what the resync below must not answer with
         // another reopen.
         let priming = session.picture_priming();
-        let target = session.now() * self.fps;
+        let target = session.now() * fps;
         let mut newest: Option<Frame> = None;
         // A frame the screen is owed: a seek's landing, and the one readiness
         // signal there is ([`Player::reset_after_reseek`]).
@@ -66,7 +94,7 @@ impl Player {
         // waiting on.
         let late = newest
             .as_ref()
-            .map_or(0., |f| (target - f64::from(f.index)) / self.fps);
+            .map_or(0., |f| (target - f64::from(f.index)) / fps);
 
         if let Some(frame) = newest {
             self.displayed += 1;
@@ -137,7 +165,7 @@ impl Player {
                 // empty space (measured: a 5 s timeline recognised its end at
                 // clock 17.5 s under a slow renderer). End of stream is left
                 // set, so this is still `Ended` and the next press restarts.
-                if let Some(session) = &mut self.session {
+                if let Some(session) = self.active_session_mut() {
                     session.halt_at_end();
                 }
                 let elapsed = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
@@ -145,7 +173,7 @@ impl Player {
                     "eof after {elapsed:.3}s wall: {} frames displayed, {} dropped, clock {:.3}s",
                     self.displayed,
                     self.dropped,
-                    self.session.as_ref().map_or(0., PlaybackSession::now)
+                    self.active_session().map_or(0., PlaybackSession::now)
                 );
             }
         }
@@ -156,7 +184,7 @@ impl Player {
     /// an edit past the end revives the picture) and so is the clock. A held
     /// frame is one still owed to the screen, so the end is not the end yet.
     pub(crate) fn transport(&self) -> Transport {
-        let Some(session) = &self.session else {
+        let Some(session) = self.active_session() else {
             return Transport::Stopped;
         };
         transport(
@@ -193,7 +221,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
-        let Some(session) = &mut self.session else {
+        let Some(session) = self.active_session_mut() else {
             return;
         };
         session.seek(t);
@@ -211,16 +239,17 @@ impl Player {
     /// edit, and nothing it does moves a clip index.
     pub(crate) fn step(&mut self, frames: i64, cx: &mut Context<Self>) {
         let ended = self.transport() == Transport::Ended;
-        let Some(session) = &self.session else {
+        let fps = self.active_fps();
+        let Some(session) = self.active_session() else {
             return;
         };
-        let last = ((session.timeline_duration() * self.fps).round() as i64 - 1).max(0);
+        let last = ((session.timeline_duration() * fps).round() as i64 - 1).max(0);
         let now = match ended {
             true => last,
-            false => i64::from(frame_at(session.now(), self.fps)),
+            false => i64::from(frame_at(session.now(), fps)),
         };
         let target = now.saturating_add(frames).clamp(0, last);
-        self.seek(target as f64 / self.fps, cx);
+        self.seek(target as f64 / fps, cx);
     }
 
     /// Seeks to where the pointer sits along the ruler. `commit` is the press
@@ -252,7 +281,7 @@ impl Player {
     /// that is the whole reason this is not just called from the key handler.
     /// Silent no-op with no timeline, or with a run that has no audio device.
     pub(crate) fn apply_volume(&self) {
-        if let Some(session) = &self.session {
+        if let Some(session) = self.active_session() {
             session.set_gain(self.volume.gain());
         }
     }
@@ -285,8 +314,8 @@ impl Player {
         // -- and it is Ended again by the next repaint, so no later press could
         // ever stop it: the button would read "Pause" and never pause. A delete
         // can empty the timeline mid-play, and that press must still stop it.
-        if nothing_to_play(self.session.as_ref()) {
-            match self.session.as_mut().filter(|s| s.is_playing()) {
+        if nothing_to_play(self.active_session()) {
+            match self.active_session_mut().filter(|s| s.is_playing()) {
                 Some(session) => session.pause(),
                 None => self.notify_user(NOTHING_TO_PLAY.into()),
             }
@@ -303,12 +332,12 @@ impl Player {
             // whichever asked, the transport was showing Play.
             state if state.restarts() => {
                 self.seek(0., cx);
-                if let Some(session) = &mut self.session {
+                if let Some(session) = self.active_session_mut() {
                     session.play();
                 }
             }
             _ => {
-                if let Some(session) = &mut self.session {
+                if let Some(session) = self.active_session_mut() {
                     session.toggle();
                     // A paused timeline animates nothing; this is the repaint
                     // that puts the new glyph up.

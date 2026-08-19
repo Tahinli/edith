@@ -461,6 +461,13 @@ impl Render for Player {
                         return;
                     }
                 }
+                // The innermost thing left on screen once no menu is up: a
+                // preview takes the picture over the timeline's own, and
+                // escape is its own way out, same as every card above it.
+                if key == ESCAPE && !ctrl && this.preview_session.is_some() {
+                    this.close_preview(cx);
+                    return;
+                }
                 if let Some(action) = action {
                     this.act(action, window, cx);
                 }
@@ -607,6 +614,7 @@ impl Render for Player {
                                     // After the picture, so the plate is drawn
                                     // over it rather than under.
                                     .children(self.subtitle_overlay(position, window))
+                                    .children(self.preview_badge(cx))
                                     // The three transient lines hang off the
                                     // bottom of the picture rather than taking
                                     // a row of the column: a notice that
