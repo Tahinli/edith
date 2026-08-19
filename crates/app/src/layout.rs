@@ -216,27 +216,6 @@ pub(crate) fn lanes_h(lanes: usize) -> f32 {
     }
 }
 
-/// How many whole lane rows a box this tall shows. At least one: a box too
-/// short for a single lane still shows part of one, and "0 shown" would count
-/// every lane there is as hidden.
-pub(crate) fn lanes_shown(box_h: f32) -> usize {
-    (((box_h + 8.) / (LANE_H + 8.)).floor() as usize).max(1)
-}
-
-/// How many rows are still below the fold *now*: the count the affordance says
-/// out loud, and the reason it is a function of the scroll rather than of the
-/// lane count alone. A line that keeps saying "2 more tracks below" after the
-/// user has scrolled to the last one is a line that has stopped being true, and
-/// an affordance nobody can make go away is read as a bug rather than as an
-/// instruction.
-///
-/// `scrolled` is how far down the column has been taken, in pixels. Rounded to
-/// the nearest row: a half-scrolled row is showing, so it is not below.
-pub(crate) fn rows_below(total: usize, box_h: f32, scrolled: f32) -> usize {
-    let past = ((scrolled / (LANE_H + 8.)).round().max(0.)) as usize;
-    total.saturating_sub(past + lanes_shown(box_h))
-}
-
 /// How tall one lane row is: [`LANE_H`] for a media track, [`SUB_LANE_H`] for
 /// a caption one -- the one place that answer is decided, since
 /// [`lanes_h_mixed`], [`lanes_shown_mixed`] and [`rows_below_mixed`] all walk

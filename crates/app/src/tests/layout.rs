@@ -74,31 +74,15 @@ fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
         "{} px of chrome and a lane will not fit {floor} px",
         timeline_fixed_h(true)
     );
-    // What is left over is measured in whole lanes, at least one.
-    assert_eq!(lanes_shown(LANE_H), 1);
-    assert_eq!(lanes_shown(LANE_H - 10.), 1);
-    assert_eq!(lanes_shown(2. * LANE_H + 8.), 2);
-
-    // Four tracks in a two-lane box: two are below, and each row scrolled
-    // past takes one off that count until none is left. This is the bug the
-    // graft fixes -- the count used to be `total - shown` forever, so the
-    // line still said "2 more below" with the last track on screen.
-    let box_h = 2. * LANE_H + 8.;
-    assert_eq!(rows_below(4, box_h, 0.), 2);
-    assert_eq!(rows_below(4, box_h, LANE_H + 8.), 1);
-    assert_eq!(rows_below(4, box_h, 2. * (LANE_H + 8.)), 0);
-    // Past the end (gpui clamps, but the arithmetic must not wrap).
-    assert_eq!(rows_below(4, box_h, 900.), 0);
-    // A project that fits says nothing at all.
-    assert_eq!(rows_below(2, box_h, 0.), 0);
-
-    // The same three questions once a lane in the stack is a thinner
+    // The lane questions, asked of the mixed math the render actually walks
+    // (the uniform lanes_shown/rows_below pair went with their last caller;
+    // a lane in the stack may be a thinner
     // caption one: a uniform stack answers exactly what the plain
     // functions above do, and a mixed one answers off the real heights,
     // never the media one alone.
     let uniform = [LaneKind::Video, LaneKind::Audio];
     assert_eq!(lanes_h_mixed(&uniform), lanes_h(2));
-    assert_eq!(lanes_shown_mixed(&uniform, LANE_H), lanes_shown(LANE_H));
+    assert_eq!(lanes_shown_mixed(&uniform, LANE_H), 1);
     let mixed = [LaneKind::Video, LaneKind::Audio, LaneKind::Subtitle];
     assert_eq!(
         lanes_h_mixed(&mixed),
@@ -411,7 +395,10 @@ fn the_scroll_strip_row_comes_and_goes_with_the_zoom() {
         // either face of the zoom boundary.
         let floor = split_size(Split::Timeline, Some(0.), 2, window, scroll);
         let box_h = floor - timeline_fixed_h(scroll);
-        assert!(2 > lanes_shown(box_h), "no line to pay for at the floor");
+        assert!(
+            2 > lanes_shown_mixed(&[LaneKind::Video, LaneKind::Audio], box_h),
+            "no line to pay for at the floor"
+        );
         assert!(
             box_h - LABEL_H - 8. >= LANE_H,
             "the floor leaves {} px for a {LANE_H} px lane",
@@ -1637,7 +1624,10 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     // ([`Player::timeline`]): what the affordance costs comes off the box, and
     // a whole lane is still standing under it.
     let lanes_box = floor - timeline_fixed_h(true);
-    assert!(2 > lanes_shown(lanes_box), "no line to pay for at the floor");
+    assert!(
+        2 > lanes_shown_mixed(&[LaneKind::Video, LaneKind::Audio], lanes_box),
+        "no line to pay for at the floor"
+    );
     assert!(
         lanes_box - LABEL_H - 8. >= LANE_H,
         "the floor leaves {} px for a {LANE_H} px lane",
