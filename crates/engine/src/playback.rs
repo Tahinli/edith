@@ -2800,6 +2800,12 @@ impl PlaybackSession {
         self.edit(Dirty::Both, Project::undo)
     }
 
+    /// Redoes the last edit [`undo`](Self::undo) took back, and reseeks like
+    /// a delete.
+    pub fn redo(&mut self) -> bool {
+        self.edit(Dirty::Both, Project::redo)
+    }
+
     /// Takes `path` into the **library**: it becomes a source of this session,
     /// with its length noted ([`file_frames`](Self::file_frames)), and nothing
     /// is placed on any lane. What reaches the timeline is decided afterwards,
