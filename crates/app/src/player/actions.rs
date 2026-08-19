@@ -105,6 +105,7 @@ impl Player {
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
             ActionId::ShowActions => self.show_actions(cx),
+            ActionId::Screenshot => self.take_screenshot(cx),
         }
     }
 
