@@ -116,6 +116,37 @@ pub(crate) struct Trim {
 /// still the body.
 pub(crate) const EDGE_W: f32 = 6.;
 
+/// A fade handle's own hit zone, at each *top* corner of an audio clip's box --
+/// never the trim strip's height, which is [`EDGE_W`] wide down the whole box
+/// ([`trims`]) and would swallow a fade press if the two overlapped. Sitting
+/// just inside the trim strip rather than on top of it, so one gesture is
+/// still exactly one thing: the outer [`EDGE_W`] column lengthens or shortens
+/// the clip, this small square at its top corner shapes the fade instead.
+pub(crate) const FADE_HANDLE_W: f32 = 10.;
+/// Only the label row's own height tall -- a fade handle reaching down into
+/// the waveform would sit on top of the body drag and the waveform's own
+/// tooltip both.
+pub(crate) const FADE_HANDLE_H: f32 = 10.;
+
+/// A fade handle being dragged: which clip, which end (`is_in` for the head's
+/// ramp-up, the tail's ramp-down otherwise), and the gesture's own state --
+/// `press_x` to measure the pixel delta from, `start` the fade length the
+/// press found, `to` what the drag is showing right now, `cap` the clip's own
+/// length in frames ([`Project::set_fade_in`]'s own clamp, so the drag never
+/// draws past what a release would refuse). One clip, no group: unlike a trim
+/// a fade never drags a neighbour, and unlike a caption it never wants a
+/// track's walls.
+#[derive(Clone, Copy)]
+pub(crate) struct FadeDrag {
+    pub(crate) lane: Lane,
+    pub(crate) idx: usize,
+    pub(crate) is_in: bool,
+    pub(crate) press_x: Pixels,
+    pub(crate) start: u32,
+    pub(crate) to: u32,
+    pub(crate) cap: u32,
+}
+
 /// Whether a clip box this wide gets its two trim strips at all. Below three
 /// handles wide the pair would occlude the whole box: every press on it would
 /// trim, and the clip could not be selected, dragged to another lane or picked
