@@ -1044,7 +1044,10 @@ fn export_spans(project: &Project, range: Option<(u32, u32)>) -> Vec<crate::proj
 /// here: a trim or a split since it was set leaves the stored number in
 /// place but not its meaning, so a stale one plays as the hard cut it now
 /// is rather than as a dissolve into a clip that no longer follows.
-fn dissolve_window(project: &Project, span: &crate::project::Span) -> Option<(usize, u32, u32, u32)> {
+pub(crate) fn dissolve_window(
+    project: &Project,
+    span: &crate::project::Span,
+) -> Option<(usize, u32, u32, u32)> {
     let (source, _) = span.from?;
     let (lane, idx) = project.composite_clip_at(span.start)?;
     let clips = project.lane(lane);
@@ -1076,7 +1079,7 @@ fn dissolve_window(project: &Project, span: &crate::project::Span) -> Option<(us
 /// a trace of A and the last still a trace of B -- the cut a hard transition
 /// would have made lands one frame *after* the window, at full B, rather than
 /// inside it.
-fn dissolve_weight(idx_in_window: u32, window: u32) -> f32 {
+pub(crate) fn dissolve_weight(idx_in_window: u32, window: u32) -> f32 {
     (idx_in_window + 1) as f32 / (window + 1) as f32
 }
 
