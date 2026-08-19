@@ -79,7 +79,7 @@ use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
 };
 use crate::project::{Lane, LaneKind, Project, Rate};
-use crate::scale::Composer;
+use crate::scale::{blend_i420, Composer};
 use crate::subtitle::{Cue, SubtitleTrack};
 use crate::tonemap::{self, ToneMapper};
 
@@ -1021,6 +1021,72 @@ fn export_spans(project: &Project, range: Option<(u32, u32)>) -> Vec<crate::proj
     spans
 }
 
+/// The cross-dissolve this span's tail owes its successor, or `None` for a
+/// hard cut. `(b_source, b_in_frame, window, b_start)`: which source and
+/// source frame the dissolve's B side starts reading, how many *output*
+/// frames the blend ramps across, and where B sits on the timeline (which is
+/// what its own grade and fit are keyed on, [`Project::composite_color_at`]
+/// and [`Project::composite_fit_at`]).
+///
+/// [`Clip::transition_out`] is trusted only after adjacency is checked again
+/// here: a trim or a split since it was set leaves the stored number in
+/// place but not its meaning, so a stale one plays as the hard cut it now
+/// is rather than as a dissolve into a clip that no longer follows.
+fn dissolve_window(project: &Project, span: &crate::project::Span) -> Option<(usize, u32, u32, u32)> {
+    let (source, _) = span.from?;
+    let (lane, idx) = project.composite_clip_at(span.start)?;
+    let clips = project.lane(lane);
+    let a = clips.get(idx)?;
+    if a.source != source || a.transition_out == 0 {
+        return None;
+    }
+    let b = clips.get(idx + 1)?;
+    if a.end() != b.start {
+        return None; // trimmed or split apart since the dissolve was set
+    }
+    // The span must run uninterrupted all the way to A's own end: a higher
+    // video lane taking over before that means there is no tail of A left
+    // here to blend into anything.
+    if span.start + span.len != a.end() {
+        return None;
+    }
+    let window = a
+        .transition_out
+        .min(a.frames())
+        .min(b.frames())
+        .min(span.len);
+    (window > 0).then_some((b.source, b.in_frame, window, b.start))
+}
+
+/// `B`'s weight in [`blend_i420`] at output frame `idx_in_window` of `window`
+/// (`idx_in_window < window`): a ramp from just above 0 to just below 1 that
+/// never actually reaches either end, so the first blended frame still shows
+/// a trace of A and the last still a trace of B -- the cut a hard transition
+/// would have made lands one frame *after* the window, at full B, rather than
+/// inside it.
+fn dissolve_weight(idx_in_window: u32, window: u32) -> f32 {
+    (idx_in_window + 1) as f32 / (window + 1) as f32
+}
+
+/// A dissolve's B side, open beside A's own decoder for this span's tail:
+/// its own decoder, and everything [`place_picture`] needs to put its frames
+/// on the same canvas, in the same space, graded the way B is graded rather
+/// than the way A is -- [`Project::composite_color_at`]/`composite_fit_at`
+/// asked at B's own start, not at the timeline position the blend writes to,
+/// which is still inside A's span.
+struct Dissolve<'a> {
+    /// How many output frames the blend ramps across.
+    window: u32,
+    /// The first output frame of this span's tail that is inside the window.
+    tail_start: u32,
+    decoder: ClipDecoder,
+    mapper: Option<&'a ToneMapper>,
+    remap: Option<(Matrix, Matrix)>,
+    grade: Option<crate::color::ColorParams>,
+    canvas: Composer,
+    graded: (Vec<u8>, Vec<u8>, Vec<u8>),
+}
+
 /// The track's cues where the *exported* timeline puts them, which is the only
 /// clock the file has: the export writes timeline frame 0 onwards and nothing
 /// else, exactly as the sound is mixed from frame 0 and resized to the
@@ -1553,6 +1619,20 @@ impl CopyPlan {
             // A gap is black frames, which only an encoder makes.
             let (source, in_frame) = span.from?;
             if !span.speed.is_normal() {
+                return None;
+            }
+            // A copied packet is the source's own picture, never a blend: a
+            // live dissolve on this span's tail forces the whole video track
+            // through the encoder, exactly as a grade or a speed does below.
+            //
+            // corner-cut: the whole file falls back rather than only the
+            // clips either side of the dissolve -- [`CopyPlan`] is already
+            // all-or-nothing per export ([`CopyPlan`]'s own doc comment
+            // states why), so one dissolve on a two-hour film re-encodes all
+            // of it. Upgrade path: splice a re-encoded region between two
+            // copied ones, which needs the sample-table writer that doc
+            // comment already names as the cost of a finer copy.
+            if dissolve_window(project, &span).is_some() {
                 return None;
             }
             // The grade playback shows, which a copied packet never went
@@ -2432,6 +2512,12 @@ fn run(
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
+        // Whether this span's tail dissolves into its successor -- decided
+        // before A's own decoder is opened, because it is what decides
+        // whether A may take the DMA fast path at all: the blend below needs
+        // A's pixels on the CPU, so a dissolving span never asks for a GPU
+        // buffer, not even outside its own window.
+        let dissolve = dissolve_window(project, &span);
         let (mut pictures, rate, in_frame, color, mapper) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
@@ -2450,7 +2536,8 @@ fn run(
                     && remap_into(Some(color), false, out_color.matrix).is_none()
                     && project
                         .composite_color_at(span.start)
-                        .is_none_or(|params| params.is_identity());
+                        .is_none_or(|params| params.is_identity())
+                    && dissolve.is_none();
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
@@ -2490,6 +2577,33 @@ fn run(
             meta.height,
             project.composite_fit_at(span.start),
         );
+        // B's own decoder, opened beside A's: the two streams come off their
+        // files together for exactly the frames the tail below blends, and
+        // nothing else in this span ever touches it.
+        let mut b = dissolve
+            .map(|(b_source, b_in_frame, window, b_start)| -> crate::Result<_> {
+                let entry = sources.get(b_source).ok_or_else(|| {
+                    format!("clip names source {b_source} of {}", sources.len())
+                })?;
+                let (b_rate, b_color, _peak) = rates[b_source];
+                let b_mapper = tone[b_source].as_ref();
+                let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
+                Ok(Dissolve {
+                    window,
+                    tail_start: span.len - window,
+                    decoder: ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?,
+                    mapper: b_mapper,
+                    remap: b_remap,
+                    grade: project.composite_color_at(b_start).copied(),
+                    canvas: Composer::new(
+                        meta.width,
+                        meta.height,
+                        project.composite_fit_at(b_start),
+                    ),
+                    graded: (Vec::new(), Vec::new(), Vec::new()),
+                })
+            })
+            .transpose()?;
         // Timeline frames, taken a *source* frame at a time: at a rate other
         // than real time the two are not the same count, and the span says which
         // source frame each timeline frame shows ([`Speed::source_at`]) -- the
@@ -2583,14 +2697,45 @@ fn run(
             // Once per timeline frame this source frame covers: one at real time
             // and faster, more when the clip is slowed -- the picture is already
             // graded and placed, so a held frame costs an encode and no decode.
-            for _ in 0..repeats {
-                let coded = match &frame {
-                    Frame::Dma(dma) => encoder.encode_dma(dma, settings.intra_only)?,
-                    Frame::Pixels(..) => {
-                        let (y, u, v, width, height) =
-                            placed.expect("a picture with pixels was placed");
-                        encoder.encode(y, u, v, width, height, settings.intra_only)?
+            for r in 0..repeats {
+                // Inside the window every *output* frame gets its own B
+                // picture -- decoded fresh here rather than once for the
+                // whole held A frame -- which is what makes a slowed A's
+                // tail still ramp one weight per frame shown rather than one
+                // per source frame.
+                let in_window = b.as_ref().is_some_and(|d| done_here + r >= d.tail_start);
+                let coded = match (&mut b, in_window) {
+                    (Some(d), true) => {
+                        let (ay, au, av, aw, ah) =
+                            placed.expect("a dissolving span always decodes to pixels");
+                        match d.decoder.next()? {
+                            // B's file ran out inside the window: A's own
+                            // picture carries the frame rather than the
+                            // export losing it.
+                            None => encoder.encode(ay, au, av, aw, ah, settings.intra_only)?,
+                            Some(Frame::Dma(_)) => {
+                                unreachable!("b's decoder was opened with no DMA want")
+                            }
+                            Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
+                                let (by, bu, bv, _, _) = place_picture(
+                                    by, bu, bv, bw, bh, d.grade, d.remap, d.mapper,
+                                    &mut d.graded, &mut d.canvas,
+                                );
+                                let idx_in_window = done_here + r - d.tail_start;
+                                let t = dissolve_weight(idx_in_window, d.window);
+                                let (y, u, v) = blend_i420((ay, au, av), (by, bu, bv), t);
+                                encoder.encode(&y, &u, &v, aw, ah, settings.intra_only)?
+                            }
+                        }
                     }
+                    _ => match &frame {
+                        Frame::Dma(dma) => encoder.encode_dma(dma, settings.intra_only)?,
+                        Frame::Pixels(..) => {
+                            let (y, u, v, width, height) =
+                                placed.expect("a picture with pixels was placed");
+                            encoder.encode(y, u, v, width, height, settings.intra_only)?
+                        }
+                    },
                 };
                 if let Some((au, key)) = coded {
                     write_video(
@@ -4847,5 +4992,55 @@ mod tests {
         assert!(refused.contains("even"), "{refused}");
         // ...and the even one it neighbours opens.
         assert!(Enc::open(&meta(1920, 1080), &settings).is_ok());
+    }
+
+    /// Weights ramp from just above 0 to just below 1 and never touch either
+    /// end -- the frame *after* the window is where a viewer would see plain
+    /// B, and the window itself never quite repeats a hard cut's own instant.
+    #[test]
+    fn dissolve_weight_ramps_strictly_between_zero_and_one() {
+        assert_eq!(dissolve_weight(0, 1), 0.5, "a one-frame window is the midpoint");
+        assert_eq!(dissolve_weight(0, 4), 0.2);
+        assert_eq!(dissolve_weight(1, 4), 0.4);
+        assert_eq!(dissolve_weight(2, 4), 0.6);
+        assert_eq!(dissolve_weight(3, 4), 0.8);
+    }
+
+    /// [`dissolve_window`] reads [`crate::project::Clip::transition_out`] back
+    /// only once adjacency is re-checked at render time: two clips a split
+    /// just made, still touching, still name B by its own source and its own
+    /// timeline start.
+    #[test]
+    fn dissolve_window_names_bs_source_in_frame_window_and_start() {
+        use crate::project::{Lane, Project};
+        let mut p = Project::single("/nonexistent/film.mkv", 20);
+        assert!(p.split(15));
+        assert!(p.set_transition_out(Lane::V1, 0, 5));
+        let spans = export_spans(&p, None);
+        let a_span = spans.iter().find(|s| s.start == 0).expect("clip A's span");
+        assert_eq!(
+            dissolve_window(&p, a_span),
+            Some((0, 15, 5, 15)),
+            "b's source, b's in_frame, the window, b's timeline start"
+        );
+    }
+
+    /// A `transition_out` set while two clips touched, then made stale by a
+    /// trim that opens a gap between them: the number is still in storage,
+    /// [`dissolve_window`] reads `None` from it, and the span renders as the
+    /// hard cut two clips that no longer touch actually are.
+    #[test]
+    fn a_stale_transition_out_after_a_trim_renders_as_a_hard_cut() {
+        use crate::project::{Edge, Lane, Project};
+        let mut p = Project::single("/nonexistent/film.mkv", 20);
+        assert!(p.split(15));
+        assert!(p.set_transition_out(Lane::V1, 0, 5));
+        assert!(p.trim(Lane::V1, 1, Edge::Start, 18, &[100]), "opens a gap");
+        let spans = export_spans(&p, None);
+        let a_span = spans.iter().find(|s| s.start == 0).expect("clip A's span");
+        assert!(
+            dissolve_window(&p, a_span).is_none(),
+            "b no longer abuts a; hard cut"
+        );
     }
 }
