@@ -648,8 +648,7 @@ impl Render for Player {
                                             // what it wants instead. The window
                                             // is already the drop target.
                                             .or_else(|| {
-                                                self.session
-                                                    .is_none()
+                                                (self.active_session().is_none())
                                                     .then(|| empty_hint().into_any_element())
                                             }),
                                     )

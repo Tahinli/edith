@@ -120,6 +120,9 @@ impl Player {
         let shown: Option<(Lane, Vec<engine::subtitle::Cue>)> = self
             .active_sub_lane()
             .filter(|_| self.subs_on)
+            // A preview is another file: the timeline's words over its
+            // picture would caption the wrong film.
+            .filter(|_| self.preview_session.is_none())
             .and_then(|lane| {
                 let cues = self.session.as_ref()?.sub_lane_cues(lane);
                 let now: Vec<_> = cues_at(&cues, at).into_iter().cloned().collect();
