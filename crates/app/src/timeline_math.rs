@@ -6,12 +6,17 @@ use crate::*;
 /// hole under it: a take is what the first pair of lanes carries between them,
 /// `V1`'s picture and the sound grouped with it, and dropping one moves the
 /// frames after it on every lane. A caption a hand grouped with the clip
-/// counts as its partner too: the group is what pairs, not the lane's kind.
+/// counts as its partner too: the group is what pairs, not the lane's kind --
+/// and a group answers `true` from *whichever* member's lane the question is
+/// asked from, added row or not, because a grouped delete
+/// ([`PlaybackSession::delete_clip`] -> `Project::delete_members`) closes
+/// every member's own lane by its own span already, not just the first pair's.
 ///
 /// Everything else is a half or a layer, and is *lifted* instead: a half whose
-/// picture was lifted (what a lift leaves behind) has no take to ripple, and a
-/// clip on a further lane is laid over the timeline rather than part of it --
-/// closing a hole under it would drag the take beneath out of step with it.
+/// picture was lifted (what a lift leaves behind) has no take to ripple, and an
+/// *ungrouped* clip on a further lane is laid over the timeline rather than
+/// part of it -- closing a hole under it would drag the take beneath out of
+/// step with it.
 pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> bool {
     let Some(clip) = session.lane_clips(lane).get(idx) else {
         return false;
@@ -29,6 +34,12 @@ pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> b
             .any(|link| link.is_some() && link == clip.link)
     };
     match (lane.kind, lane.ord) {
+        // A clip a hand grouped closes its own lane wherever it sits:
+        // `Project::delete_members` already cuts every member's own span out
+        // of its own lane, whichever lanes those are -- so a caption or clip
+        // grouped onto an added row closes its hole exactly as `V1`/`A1`'s
+        // first pair does, not just the pair itself.
+        _ if paired() => true,
         (_, 1..) => false,
         // The picture of a take -- unless the take has been taken apart: a
         // detached picture (a group id no other lane carries, which is also what
@@ -36,10 +47,12 @@ pub(crate) fn whole_take(session: &PlaybackSession, lane: Lane, idx: usize) -> b
         // under it would drag away the very half it was detached from. A clip in
         // no group at all is not a half but a placement, and on `V1` a placement
         // is the take there is.
-        (LaneKind::Video, _) => clip.link.is_none() || paired(),
+        (LaneKind::Video, _) => clip.link.is_none(),
         // The sound of a take, only while the take is still there: its group is
-        // carried by a clip on some other lane.
-        (LaneKind::Audio, _) => paired(),
+        // carried by a clip on some other lane. Reached only when `paired()` is
+        // already false, so this is always false -- kept as its own arm for the
+        // reason a lone `A1` clip is not a take, not because it does the work.
+        (LaneKind::Audio, _) => false,
         // A subtitle lane carries no `Clip` at all, so the lookup above already
         // returned: never a take, and never rippled as one.
         (LaneKind::Subtitle, _) => false,
