@@ -62,6 +62,11 @@ macro_rules! actions {
 
 actions! {
     Play,
+    /// Whether the active session -- the timeline or a library preview --
+    /// restarts from the top on reaching its end instead of stopping there.
+    /// Live exactly where Play is: a transport with nothing under it has
+    /// nothing to loop either.
+    Loop,
     StepBack,
     StepForward,
     JumpBack,
@@ -156,6 +161,7 @@ impl ActionId {
     pub fn label(self) -> &'static str {
         match self {
             ActionId::Play => "Play / Pause",
+            ActionId::Loop => "Loop the playhead's end",
             ActionId::StepBack => "One frame back",
             ActionId::StepForward => "One frame forward",
             ActionId::JumpBack => "One second back",
@@ -220,6 +226,7 @@ impl ActionId {
     fn name(self) -> &'static str {
         match self {
             ActionId::Play => "play",
+            ActionId::Loop => "loop",
             ActionId::StepBack => "step-back",
             ActionId::StepForward => "step-forward",
             ActionId::JumpBack => "jump-back",
@@ -286,6 +293,7 @@ impl ActionId {
     pub fn category(self) -> Category {
         match self {
             ActionId::Play
+            | ActionId::Loop
             | ActionId::StepBack
             | ActionId::StepForward
             | ActionId::JumpBack
@@ -793,6 +801,10 @@ impl Keymap {
         Keymap {
             bindings: vec![
                 b(ActionId::Play, "space", false),
+                // "r" for repeat, free and bare: its ctrl chord is already the
+                // project resolution, and the two read as a pair the way the
+                // mute and its level do.
+                b(ActionId::Loop, "r", false),
                 // Seeking without a pointer, on the keys every player already
                 // seeks with (gpui names them "left"/"right"/"home"/"end",
                 // platform.rs:872-877). The colour card reads the same arrows
@@ -1219,7 +1231,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 56);
+        assert_eq!(k.entries().len(), 57);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));

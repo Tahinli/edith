@@ -201,6 +201,23 @@ impl Player {
                 ActionId::Play,
                 cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_or_restart(cx)),
             ))
+            // Accented while on, the box the export button and the mute glyph
+            // both use for a state rather than a click: the pump reads
+            // `loop_on` itself at the one place it already knows the end was
+            // reached ([`Player::pump`]).
+            .child(self.action_control(
+                "loop",
+                0.,
+                match self.loop_on {
+                    true => ACCENT_PRIMARY(),
+                    false => BG_RAISED(),
+                },
+                None,
+                "Loop",
+                "restarts from the top on reaching the end, instead of stopping",
+                ActionId::Loop,
+                cx.listener(|this, _: &ClickEvent, window, cx| this.act(ActionId::Loop, window, cx)),
+            ))
             // One line, one fixed width: changing digits must not push the
             // strip around, and the clock is the one number that changes
             // sixty times a second.
