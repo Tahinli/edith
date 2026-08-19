@@ -214,3 +214,60 @@ pub(crate) fn seek_line(standing: Option<Duration>) -> Option<String> {
         clock(since.as_secs_f32())
     ))
 }
+
+/// Where along the preview's own seek bar a click landed, in seconds from
+/// the start: [`frac_along`]'s fraction of `duration`, since the bar spans
+/// the preview's whole length rather than a zoomed timeline `Scale` -- a
+/// preview does not zoom, so there is no bed narrower than the file to map
+/// into.
+pub(crate) fn preview_seek_seconds(x: Pixels, bar: Bounds<Pixels>, duration: f64) -> f64 {
+    f64::from(frac_along(x, bar)) * duration.max(0.)
+}
+
+/// How full the preview's seek bar is drawn, 0..1: the played share of the
+/// duration, clamped for the same reason [`frac_along`] clamps a click -- a
+/// clock a frame past the end must not overhang the track it is drawn on.
+/// Zero for a duration of nothing, rather than a NaN from dividing by it.
+pub(crate) fn preview_progress_along(now: f64, duration: f64) -> f32 {
+    if duration <= 0. {
+        return 0.;
+    }
+    (now / duration).clamp(0., 1.) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A click at either end of the bar lands exactly on the file's own
+    /// ends, the middle lands at half the duration, and a click past either
+    /// edge clamps to it rather than reading negative or past the end --
+    /// `frac_along`'s own clamp, carried through.
+    #[test]
+    fn preview_seek_seconds_maps_the_bar_to_the_file() {
+        let bar = Bounds {
+            origin: point(px(100.), px(0.)),
+            size: size(px(200.), px(HIT_MIN)),
+        };
+        assert_eq!(preview_seek_seconds(px(100.), bar, 60.), 0.);
+        assert_eq!(preview_seek_seconds(px(300.), bar, 60.), 60.);
+        assert_eq!(preview_seek_seconds(px(200.), bar, 60.), 30.);
+        // Off both ends -- the pointer left the bar, and the seek clamps to
+        // the end it left through.
+        assert_eq!(preview_seek_seconds(px(0.), bar, 60.), 0.);
+        assert_eq!(preview_seek_seconds(px(500.), bar, 60.), 60.);
+    }
+
+    /// The fill tracks the played share exactly, and a duration of nothing
+    /// -- no file open yet -- reads as an empty bar rather than a divide by
+    /// zero.
+    #[test]
+    fn preview_progress_along_is_the_played_share() {
+        assert_eq!(preview_progress_along(0., 60.), 0.);
+        assert_eq!(preview_progress_along(30., 60.), 0.5);
+        assert_eq!(preview_progress_along(60., 60.), 1.);
+        // Past the end clamps rather than overhanging the track.
+        assert_eq!(preview_progress_along(61., 60.), 1.);
+        assert_eq!(preview_progress_along(5., 0.), 0.);
+    }
+}
