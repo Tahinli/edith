@@ -119,8 +119,14 @@ impl TimelineMap {
         if frame < self.knots[0].0.min(self.knots[0].1) {
             return Some(frame);
         }
+        // Between old_lo and new_lo of an unanchored (shift-right / plain
+        // expansion) piece, `apply` never lands: old frames below old_lo
+        // stay identity (image 0..old_lo) and the piece's own image starts
+        // at new_lo > old_lo, leaving [old_lo, new_lo) a true hole. A
+        // shift-left's anchor knot ties old==new here, so this window is
+        // empty for it and the branch is never live.
         if frame < self.knots[0].1 {
-            return Some(lerp((0, 0), self.knots[0], frame));
+            return None;
         }
         let mut prev = self.knots[0];
         for &(o, n) in &self.knots {
@@ -248,6 +254,20 @@ mod tests {
         assert_piece_laws((30, 60), (15, 30), 200);
         assert_piece_laws((30, 60), (45, 90), 200);
         assert_piece_laws((100, 200), (100, 100), 500);
+    }
+
+    /// The hole a shift-right/expansion piece leaves in its own image: new
+    /// frames between old_lo and new_lo have no old frame that lands on
+    /// them, so `invert` must say so instead of fabricating one.
+    #[test]
+    fn invert_is_none_inside_a_pieces_own_hole() {
+        let m = TimelineMap::piece((30, 60), (45, 90));
+        for f in 30..45 {
+            assert_eq!(m.invert(f), None, "new frame {f} has no preimage");
+        }
+        // Just outside the hole, both ends still answer.
+        assert_eq!(m.invert(29), Some(29));
+        assert_eq!(m.invert(45), Some(30));
     }
 
     /// Identity is the base: everything maps to itself, in both directions,
