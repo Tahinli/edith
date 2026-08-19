@@ -280,6 +280,7 @@ fn a_wav_export_of_a_2x_timeline_matches_the_preview() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(120)).expect("wav export");
     let mut reader = hound::WavReader::open(&out).expect("read the export back");
@@ -316,7 +317,7 @@ fn an_mp4_export_resamples_a_speeded_sound_clip() {
         .expect("room enough");
     let heard = beep_at(&play(&project));
     let out = out_path("speeded", "mp4");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(180)).expect("an mp4 of a speeded sound clip");
     let (audio, chunks) = AudioSession::open(&out)
         .expect("reopen the export")
@@ -468,6 +469,7 @@ fn a_wav_export_of_a_2x_clip_keeps_the_beeps_pitch() {
             format: Format::Wav,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(120)).expect("wav export");
     let mut reader = hound::WavReader::open(&out).expect("read the export back");
@@ -528,7 +530,7 @@ fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
     assert_eq!(total, fast + 90, "45 fast frames then 90 slow ones");
 
     let out = out_path("honoured", "mp4");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(300)).expect("an mp4 export of a speeded picture");
     let (_, frames) = DecodeSession::open(&out).expect("reopen the export");
     let frames: Vec<_> = frames.into_iter().collect();
@@ -575,6 +577,7 @@ fn an_av1_export_honours_a_speeded_take_whole() {
             format: Format::Av1,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(600)).expect("an AV1 export of a speeded take");
     assert!(out.exists(), "AV1 never refuses a rate");

@@ -98,6 +98,7 @@ fn exported_mp4(name: &str) -> Scratch {
             subtitles: vec![0, 1],
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(300)).expect("the export finishes");
     out

@@ -266,7 +266,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
 
     let out = out_path("a2_only", "mp4");
     let (meta, _) = engine::demux::Demuxer::open(&source).unwrap();
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(300)).expect("export the A2-only timeline");
 
     let written = decoded_audio(&out);
@@ -323,7 +323,7 @@ fn two_audio_lanes_are_summed() {
             format: Format::Wav,
             ..Default::default()
         };
-        let handle = engine::export::start(project, meta, &out, &settings);
+        let handle = engine::export::start(project, meta, &out, &settings, None);
         wait(&handle, Duration::from_secs(120)).expect("wav export");
         let mut reader = hound::WavReader::open(&out).expect("reopen the wav");
         let spec = reader.spec();
@@ -377,7 +377,7 @@ fn two_audio_lanes_are_summed() {
     // this decodes both lanes and encodes the sum instead (`export::copy_audio`
     // routes to `encode_audio`), which is the same mix the WAV above measured.
     let out = out_path("mixed", "mp4");
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     wait(&handle, Duration::from_secs(180)).expect("an mp4 of two audio lanes");
     let (audio, chunks) = engine::AudioSession::open(&out)
         .expect("reopen the export")
