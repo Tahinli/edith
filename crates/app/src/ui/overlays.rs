@@ -304,14 +304,14 @@ impl Player {
                                 .when(!refusal.yes(), |d| d.opacity(0.4).cursor_not_allowed())
                                 .when(refusal.yes(), |d| {
                                     d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER()))).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.listener(move |this, _: &ClickEvent, window, cx| {
                                             // The card goes first: several of
                                             // these open a card of their own,
                                             // and every edit moves the indices
                                             // the menus are holding.
                                             this.keys_open = false;
                                             this.rebinding = None;
-                                            this.act(action, cx);
+                                            this.act(action, window, cx);
                                             cx.notify();
                                         }),
                                     )
@@ -578,7 +578,7 @@ impl Player {
                         .when(enabled, |d| {
                             d.cursor_pointer()
                                 .hover(|s| s.bg(rgb(BG_HOVER())))
-                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                                     // Closed first: the action moves the very
                                     // indices this menu is holding.
                                     this.context_menu = None;
@@ -594,7 +594,7 @@ impl Player {
                                             cx,
                                         );
                                     } else {
-                                        this.act(action, cx);
+                                        this.act(action, window, cx);
                                     }
                                 }))
                         })

@@ -2,6 +2,7 @@
 //! command line, the scans, the codecs offered, and the subtitles found.
 
 use super::*;
+use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
 /// The import line's own state machine, driven the way a repaint drives
 /// it: the worker writes a stage, the poll notices it changed and restarts
@@ -1183,4 +1184,86 @@ fn exactly_one_subtitle_lane_is_shown_whatever_the_pick_and_whatever_is_left() {
     assert_eq!(active_lane(Some(s3), &[s1, s2]), Some(s1));
     // A pick that is not a subtitle lane at all cannot name one either.
     assert_eq!(active_lane(Some(Lane::V1), &[s1, s2]), Some(s1));
+}
+
+/// A library preview's whole point ([`Player::open_preview`],
+/// [`Player::close_preview`]): the timeline's own session is untouched by
+/// one showing over it. `Player` cannot be built here -- it takes a gpui
+/// `Context`, which this test binary has no `TestAppContext` to hand it
+/// (see the crate's other tests for the same limit) -- so this exercises
+/// the two sessions `open_preview`/`close_preview` juggle directly: seeking
+/// and playing one, exactly as a preview session's own life does, leaves
+/// the other's position and clock exactly where they were.
+#[test]
+fn a_second_session_playing_never_moves_the_first() {
+    let mut timeline = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    timeline.seek(0.5);
+    let before = timeline.now();
+    let before_playing = timeline.is_playing();
+
+    // Stands in for the preview session `open_preview` opens over it.
+    let mut preview = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    preview.seek(1.0);
+    preview.play();
+
+    assert_eq!(timeline.now(), before, "the preview's seek moved the wrong session");
+    assert_eq!(
+        timeline.is_playing(),
+        before_playing,
+        "the preview's play moved the wrong session"
+    );
+}
+
+/// [`bgra_to_rgba`] and [`save_screenshot`]'s own PNG write, round-tripped: a
+/// synthetic 2x2 frame -- one pixel per corner, alpha and channel order all
+/// distinct -- decodes back to the same pixels a viewer would see, in RGBA.
+#[test]
+fn a_screenshot_frame_round_trips_through_its_png() {
+    // BGRA, gpui's own layout: red top-left, green top-right, blue
+    // bottom-left, and a half-alpha white bottom-right.
+    #[rustfmt::skip]
+    let bgra: Vec<u8> = vec![
+        0, 0, 255, 255,   0, 255, 0, 255,
+        255, 0, 0, 255,   255, 255, 255, 128,
+    ];
+    let rgba = bgra_to_rgba(&bgra);
+    assert_eq!(rgba[0..4], [255, 0, 0, 255], "red survives the channel swap");
+    assert_eq!(rgba[4..8], [0, 255, 0, 255], "green is unmoved by the swap");
+    assert_eq!(rgba[8..12], [0, 0, 255, 255], "blue swaps into place");
+    assert_eq!(rgba[12..16], [255, 255, 255, 128], "alpha is untouched");
+
+    let dir = std::env::temp_dir().join(format!("edith-screenshot-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let path = dir.join("roundtrip.png");
+    let buf = image::RgbaImage::from_raw(2, 2, rgba.clone()).expect("2x2 rgba buffer");
+    buf.save(&path).expect("png write");
+    let decoded = image::open(&path).expect("png read").to_rgba8();
+    assert_eq!(decoded.into_raw(), rgba, "the PNG round-trips the pixels exactly");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [`screenshot_path`]'s no-clobber rule: the same stem and timecode taken
+/// twice in a row lands on `-2`, and a third time on `-3` -- a screenshot
+/// never overwrites the one before it, unlike an export's own path.
+#[test]
+fn a_repeated_screenshot_name_gets_a_numeric_suffix() {
+    let dir = std::env::temp_dir().join(format!("edith-screenshot-suffix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let first = screenshot_path(&dir, "A Film", "00-01-02");
+    assert_eq!(first, dir.join("A Film-00-01-02.png"));
+    std::fs::write(&first, b"stand-in for a PNG").expect("write the first");
+
+    let second = screenshot_path(&dir, "A Film", "00-01-02");
+    assert_eq!(second, dir.join("A Film-00-01-02-2.png"));
+    std::fs::write(&second, b"stand-in for a PNG").expect("write the second");
+
+    let third = screenshot_path(&dir, "A Film", "00-01-02");
+    assert_eq!(third, dir.join("A Film-00-01-02-3.png"));
+
+    // A different timecode never collides with either of the above.
+    let elsewhere = screenshot_path(&dir, "A Film", "00-01-03");
+    assert_eq!(elsewhere, dir.join("A Film-00-01-03.png"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
