@@ -782,6 +782,10 @@ pub struct Project {
     /// whole lane list, so adding a lane undoes as well. Bounded by
     /// [`HISTORY_CAP`]: at the cap the oldest step goes.
     history: Vec<Vec<LaneData>>,
+    /// Lane lists `undo` has stepped past; `redo` pops one. Cleared by
+    /// [`Project::snapshot`], since a fresh edit invalidates whatever branch
+    /// the undone steps came from. Not saved to `.edith`, matching `history`.
+    redo: Vec<Vec<LaneData>>,
     /// Never rolled back by an undo: an id retired by an undone split must not
     /// come back and group two clips that were never together.
     next_link: u32,
@@ -828,6 +832,7 @@ impl Project {
             eq: Vec::new(),
             color: Vec::new(),
             history: Vec::new(),
+            redo: Vec::new(),
             next_link: 1,
             subtitles: Vec::new(),
             limiter: Limiter::default(),
@@ -957,6 +962,7 @@ impl Project {
             eq,
             color,
             history: Vec::new(),
+            redo: Vec::new(),
             next_link,
             subtitles: Vec::new(),
             limiter: Limiter::default(),
@@ -4210,6 +4216,13 @@ impl Project {
         self.history.len()
     }
 
+    /// How many redo steps are stacked: what the sweep asks to check `undo`
+    /// left a branch behind, and that a fresh edit clears it.
+    #[cfg(test)]
+    pub(crate) fn redo_len(&self) -> usize {
+        self.redo.len()
+    }
+
     /// Every part of the project that an edit can change, as comparable
     /// values: what the sweep's undo round-trip asks "byte identical?" of.
     #[cfg(test)]
@@ -4222,11 +4235,27 @@ impl Project {
     }
 
     /// Restore every lane from before the last successful edit -- the clips and
-    /// the lane list both. `false` when there is nothing left to undo.
+    /// the lane list both. `false` when there is nothing left to undo. Pushes
+    /// the lanes just left onto the redo stack, so [`Project::redo`] can walk
+    /// forward again.
     pub fn undo(&mut self) -> bool {
         match self.history.pop() {
             Some(prev) => {
-                self.lanes = prev;
+                self.redo.push(std::mem::replace(&mut self.lanes, prev));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Restore every lane from before the last [`Project::undo`] -- the
+    /// mirror of `undo`, walking the redo stack it fills. `false` when there
+    /// is nothing left to redo, which is also true after any fresh edit: a
+    /// new [`Project::snapshot`] clears the branch `undo` left behind.
+    pub fn redo(&mut self) -> bool {
+        match self.redo.pop() {
+            Some(next) => {
+                self.history.push(std::mem::replace(&mut self.lanes, next));
                 true
             }
             None => false,
@@ -4244,6 +4273,7 @@ impl Project {
             eq: self.eq.clone(),
             color: self.color.clone(),
             history: Vec::new(),
+            redo: Vec::new(),
             next_link: self.next_link,
             subtitles: self.subtitles.clone(),
             limiter: self.limiter,
@@ -4418,11 +4448,14 @@ impl Project {
 
     /// Pushes the undo snapshot. Every mutating method calls this once, *after*
     /// it has decided it will succeed -- a refusal must not cost an undo step.
+    /// Clears the redo stack: a fresh edit branches off from here, so whatever
+    /// `undo` had left to redo is no longer where this edit leads back to.
     fn snapshot(&mut self) {
         if self.history.len() == HISTORY_CAP {
             self.history.remove(0);
         }
         self.history.push(self.lanes.clone());
+        self.redo.clear();
     }
 
     fn new_link(&mut self) -> u32 {
@@ -6957,6 +6990,34 @@ mod tests {
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 9, 0)]);
         assert!(!p.undo(), "empty history");
         assert_eq!(shape(&p)[0], vec![clip(0, 0, 9, 0)]);
+    }
+
+    #[test]
+    fn redo_restores_exactly() {
+        let mut p = three();
+        assert!(p.delete(1));
+        let after_delete = p.parts();
+        assert!(p.undo());
+        assert!(p.redo());
+        assert_eq!(p.parts(), after_delete, "redo lands back byte-identical");
+        assert!(!p.redo(), "empty redo stack");
+    }
+
+    #[test]
+    fn edit_after_undo_empties_redo() {
+        let mut p = three();
+        assert!(p.delete(1));
+        assert!(p.undo());
+        assert_eq!(p.redo_len(), 1, "undo left a branch to redo");
+        assert!(p.split(1), "a fresh edit");
+        assert_eq!(p.redo_len(), 0, "the fresh edit clears it");
+        assert!(!p.redo(), "so redo has nothing left");
+    }
+
+    #[test]
+    fn redo_on_empty_stack_is_false() {
+        let mut p = three();
+        assert!(!p.redo(), "nothing has been undone yet");
     }
 
     /// Past the cap the *oldest* step goes, so a long session undoes exactly
