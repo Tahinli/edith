@@ -45,6 +45,7 @@ impl Player {
                 | ActionId::Delete
                 | ActionId::Lift
                 | ActionId::Undo
+                | ActionId::Redo
                 | ActionId::AddVideoLane
                 | ActionId::RemoveVideoLane
                 | ActionId::AddAudioLane
