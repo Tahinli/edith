@@ -220,10 +220,12 @@ use crate::limiter::Limiter;
 use crate::project::{Clip, Lane, LaneKind, Source, Speed, SubClip};
 use crate::scale::FitPolicy;
 use crate::subtitle::SubtitleTrack;
+use crate::transform::TransformParams;
 
 /// What [`save`] writes. Read support goes back to `edith 1`; see the module
 /// docs for what those dialects looked like.
-const MAGIC: &[u8] = b"edith 19";
+const MAGIC: &[u8] = b"edith 20";
+const MAGIC_V19: &[u8] = b"edith 19";
 const MAGIC_V18: &[u8] = b"edith 18";
 const MAGIC_V17: &[u8] = b"edith 17";
 const MAGIC_V16: &[u8] = b"edith 16";
@@ -265,6 +267,9 @@ pub struct Document {
     /// The colour table [`Clip::color`] indexes into, in file order. Empty for
     /// every dialect before v6.
     pub color: Vec<ColorParams>,
+    /// The transform table [`Clip::transform`] indexes into, in file order.
+    /// Empty for every dialect before v20.
+    pub transform: Vec<TransformParams>,
     /// The project's own picture size. `None` for every dialect before v7 and
     /// for a v7 file that leaves it out, which both mean "source 0's picture".
     pub resolution: Option<(u32, u32)>,
@@ -333,6 +338,7 @@ pub fn save(
     subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
+    transform: &[TransformParams],
     resolution: (u32, u32),
     fps: Option<f64>,
     tone: crate::tonemap::Preset,
@@ -354,8 +360,8 @@ pub fn save(
     let result = std::fs::File::create(&part)
         .and_then(|mut f| {
             f.write_all(&emit(
-                &dir, sources, lanes, gains, subs, subtitles, eq, color, resolution, fps, tone,
-                proxy, auto_proxy, encoder, limiter, sample_rate, playhead,
+                &dir, sources, lanes, gains, subs, subtitles, eq, color, transform, resolution,
+                fps, tone, proxy, auto_proxy, encoder, limiter, sample_rate, playhead,
             ))?;
             f.sync_all()
         })
@@ -396,6 +402,7 @@ fn emit(
     subtitles: &[SubtitleTrack],
     eq: &[EqParams],
     color: &[ColorParams],
+    transform: &[TransformParams],
     resolution: (u32, u32),
     fps: Option<f64>,
     tone: crate::tonemap::Preset,
@@ -504,6 +511,16 @@ fn emit(
             .as_bytes(),
         );
     }
+    // ...and the transform table, for the same reason and by the same rules.
+    for p in transform {
+        out.extend_from_slice(
+            format!(
+                "transform {:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\n",
+                p.pos_x, p.pos_y, p.scale, p.rotate, p.crop_l, p.crop_r, p.crop_t, p.crop_b
+            )
+            .as_bytes(),
+        );
+    }
     // Lane by lane rather than interleaved by time: a lane reads as a list, the
     // parser gets its sortedness check for free from the order it is in, and
     // the lanes come back out in the order they are displayed in.
@@ -556,9 +573,10 @@ fn emit(
             let link = c.link.map_or("-".to_string(), |l| l.to_string());
             let eq = c.eq.map_or("-".to_string(), |e| e.to_string());
             let color = c.color.map_or("-".to_string(), |e| e.to_string());
+            let transform = c.transform.map_or("-".to_string(), |e| e.to_string());
             out.extend_from_slice(
                 format!(
-                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {} {} {} {} {}\n",
+                    "{keyword} {ord} {} {} {} {} {link} {eq} {color} {} {} {} {} {} {transform}\n",
                     c.start,
                     c.in_frame,
                     c.out_frame,
@@ -610,8 +628,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
     // The dialects that wrote a source line without its stream field. Reading
     // one is the whole of what "an old project still opens" means here.
     let streamless = v1 || first == MAGIC_V2;
-    // The one that carries a per-clip cross-dissolve into its successor...
-    let v19 = first == MAGIC;
+    // The one that carries a per-clip transform (position/scale/rotate/crop)...
+    let v20 = first == MAGIC;
+    // ...the one that carries a per-clip cross-dissolve into its successor...
+    let v19 = v20 || first == MAGIC_V19;
     // ...the one that carries a per-clip fade envelope...
     let v18 = v19 || first == MAGIC_V18;
     // ...the one that carries an explicit sound rate...
@@ -668,6 +688,10 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
         // Nothing before v5 equalizes anything, and nothing before v6 grades.
         eq: Vec::new(),
         color: Vec::new(),
+        // Nothing before v20 places any clip anywhere but its fit policy's own
+        // spot: the identity transform is what leaving a clip's index out
+        // still means.
+        transform: Vec::new(),
         // Nothing before v7 has a resolution of its own: source 0's picture is
         // what those projects were, and `None` is how the loader is told so.
         resolution: None,
@@ -972,6 +996,30 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                     tint: float(parts[3], n)?,
                 });
             }
+            b"transform" if v20 => {
+                if doc.lanes.iter().any(|(_, clips)| !clips.is_empty()) {
+                    return Err(format!("line {n}: transform after a clip").into());
+                }
+                let f = fields(rest, 1, "transform", n)?;
+                let parts: Vec<&[u8]> = f[0].split(|&b| b == b':').collect();
+                if parts.len() != 8 {
+                    return Err(format!(
+                        "line {n}: transform wants 8 fields, found {}",
+                        parts.len()
+                    )
+                    .into());
+                }
+                doc.transform.push(TransformParams {
+                    pos_x: float(parts[0], n)?,
+                    pos_y: float(parts[1], n)?,
+                    scale: float(parts[2], n)?,
+                    rotate: float(parts[3], n)?,
+                    crop_l: float(parts[4], n)?,
+                    crop_r: float(parts[5], n)?,
+                    crop_t: float(parts[6], n)?,
+                    crop_b: float(parts[7], n)?,
+                });
+            }
             // v1: one lane, no placement, no groups. Every clip becomes one
             // grouped video+audio pair laid where the queue reached, which is
             // what the file always meant.
@@ -989,6 +1037,7 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         link: Some(doc.lanes[0].1.len() as u32),
                         eq: None,
                         color: None,
+                        transform: None,
                         fit: FitPolicy::default(),
                         speed: Speed::NORMAL,
                     },
@@ -1100,16 +1149,18 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                 if numbered && rest.is_empty() {
                     continue;
                 }
-                // v18 grew the two fade fields, v19 the transition one, v8
-                // the speed one, v7 the fit one, v6 the colour one and v5 the
-                // eq one; every older dialect ends at the link.
+                // v20 grew the transform field, v18 the two fade fields, v19
+                // the transition one, v8 the speed one, v7 the fit one, v6
+                // the colour one and v5 the eq one; every older dialect ends
+                // at the link.
                 let want = 5
                     + usize::from(v5)
                     + usize::from(v6)
                     + usize::from(v7)
                     + usize::from(v8)
                     + 2 * usize::from(v18)
-                    + usize::from(v19);
+                    + usize::from(v19)
+                    + usize::from(v20);
                 let f = fields(rest, want, "clip", n)?;
                 let in_frame = number(f[1], n)?;
                 let out_frame = number(f[2], n)?;
@@ -1134,6 +1185,12 @@ fn parse(data: &[u8], dir: &Path) -> crate::Result<Document> {
                         },
                         eq: table_index(f.get(5).copied(), doc.eq.len(), "eq", n)?,
                         color: table_index(f.get(6).copied(), doc.color.len(), "color", n)?,
+                        transform: table_index(
+                            f.get(12).copied(),
+                            doc.transform.len(),
+                            "transform",
+                            n,
+                        )?,
                         fit: fit_policy(f.get(7).copied(), n)?,
                         speed,
                     },

@@ -1308,6 +1308,7 @@ impl Project {
             link: Some(self.new_link()),
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
@@ -4593,6 +4594,7 @@ impl Project {
             lanes: self.lanes.clone(),
             eq: self.eq.clone(),
             color: self.color.clone(),
+            transform: self.transform.clone(),
             history: Vec::new(),
             redo: Vec::new(),
             next_link: self.next_link,
@@ -4932,6 +4934,20 @@ fn color_finite(p: &ColorParams) -> bool {
         && p.contrast.is_finite()
         && p.saturation.is_finite()
         && p.tint.is_finite()
+}
+
+/// The same for a transform: [`crate::scale`] clamps a non-finite value to
+/// identity at read time, but a value that cannot round-trip has no business
+/// reaching the model.
+fn transform_finite(p: &TransformParams) -> bool {
+    p.pos_x.is_finite()
+        && p.pos_y.is_finite()
+        && p.scale.is_finite()
+        && p.rotate.is_finite()
+        && p.crop_l.is_finite()
+        && p.crop_r.is_finite()
+        && p.crop_t.is_finite()
+        && p.crop_b.is_finite()
 }
 
 fn sorted_disjoint(clips: &[Clip]) -> bool {
@@ -5286,6 +5302,7 @@ mod tests {
             link: None,
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         }
@@ -6756,6 +6773,7 @@ mod tests {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::Fit,
         speed: Speed::NORMAL,
     };
@@ -8283,6 +8301,7 @@ mod tests {
             link: Some(link),
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
@@ -9063,6 +9082,7 @@ mod tests {
             link: Some(link),
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed: Speed::NORMAL,
         };
