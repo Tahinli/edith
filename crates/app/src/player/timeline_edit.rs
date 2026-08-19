@@ -282,6 +282,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        self.mark_dirty();
         let (Some((start, _)), Some(was)) = (
             self.drop_frame(from, idx, x),
             self.session
@@ -367,6 +368,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        self.mark_dirty();
         self.snap_cue = None;
         self.ghost = None;
         let at = self.place_frame(x).0;
@@ -450,6 +452,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        self.mark_dirty();
         self.snap_cue = None;
         self.ghost = None;
         let Some(idx) = self.dragged_sub(drag) else {
@@ -522,6 +525,7 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        self.mark_dirty();
         let lifted = self
             .session
             .as_mut()
@@ -1130,6 +1134,7 @@ impl Player {
         let Some(trim) = self.trim.take() else {
             return;
         };
+        self.mark_dirty();
         // A caption's edge reaches the engine through its own door, at this
         // timeline's rate. An `Ok` is *not* "something changed" -- an edge that
         // stopped at a wall it already stood against is `Ok` with no undo step
