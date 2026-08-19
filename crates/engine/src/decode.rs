@@ -1427,11 +1427,13 @@ mod tests {
             "the first frame arrived within the call ({first_frame:?} vs \
              {returned:?}), which cannot happen if the open is deferred"
         );
-        assert!(
-            returned < sync_returned,
-            "the deferred open ({returned:?}) cost as much as the sync one \
-             ({sync_returned:?}): the demux is still on the caller's thread"
-        );
+        // No `returned < sync_returned` here on purpose: on a loaded machine
+        // a thread spawn (what the deferred open pays) can cost more wall
+        // clock than a whole sync demux of a small fixture, and the race
+        // flaked one run in three under a parallel build. The two asserts
+        // above already pin the invariant -- the call returns in microseconds
+        // territory and the demux happens after it, on the worker.
+        let _ = sync_returned;
     }
 
     /// The late-picture policy, at the one place it is decided. A worker told
