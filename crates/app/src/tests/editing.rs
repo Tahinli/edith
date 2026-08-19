@@ -884,9 +884,13 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     for action in ActionId::ALL {
         // Nothing may touch the edit list while an export is reading it --
         // and the palette does not: it repaints this window and writes one
-        // word to the user's own config file, which is why it is the one
-        // action besides the cancel that stays live here.
-        let allowed = action == ActionId::CancelExport || action == ActionId::Theme;
+        // word to the user's own config file, which is why it is one of the
+        // actions besides the cancel that stay live here. Fullscreen is the
+        // same kind of thing: the platform's own window toggle, touching no
+        // edit list either.
+        let allowed = action == ActionId::CancelExport
+            || action == ActionId::Theme
+            || action == ActionId::Fullscreen;
         assert_eq!(
             whole(action, busy).yes(),
             allowed,

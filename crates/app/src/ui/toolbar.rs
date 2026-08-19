@@ -49,8 +49,9 @@ impl Player {
     /// write a file on the right. Export is the one accented button in the
     /// window -- the primary action of an editor, where every consumer editor
     /// puts it -- and it keeps its rect while it is a Cancel.
-    pub(crate) fn topbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn topbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let exporting = self.exporting().is_some();
+        let fullscreen = window.is_fullscreen();
         div()
             .flex_none()
             .h(px(TOPBAR_H))
@@ -76,6 +77,24 @@ impl Player {
                     .truncate()
                     .child(self.name.clone()),
             )
+            // The window's own control, in the fixed rect the mute button uses
+            // for the same reason (toolbar.rs:194-203): fullscreen swaps the
+            // word and the colour, never the box.
+            .child(self.action_control(
+                "fullscreen",
+                0.,
+                BG_RAISED(),
+                None,
+                match fullscreen {
+                    true => "Exit fullscreen",
+                    false => "Fullscreen",
+                },
+                "fills the screen with the window, or gives it back",
+                ActionId::Fullscreen,
+                cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.act(ActionId::Fullscreen, window, cx)
+                }),
+            ))
             .child(self.action_control(
                 "save",
                 0.,

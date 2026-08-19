@@ -98,7 +98,9 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // The window's own colours: there is always a window, and repainting it
     // touches no timeline -- so this one is live even while an export is
     // reading one, which is the only state that dims the list above.
-    if action == ActionId::Theme {
+    // ...and whether that window fills the screen: also always there, also
+    // touching no timeline, live through an export the same way.
+    if action == ActionId::Theme || action == ActionId::Fullscreen {
         return Enable::Yes;
     }
     if action == ActionId::ShowActions {

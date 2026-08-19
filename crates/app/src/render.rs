@@ -95,7 +95,7 @@ impl Render for Player {
 
         div()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 let ctrl = event.keystroke.modifiers.control;
                 // `is_held` is the auto-repeat, and a value is the one thing
@@ -462,7 +462,7 @@ impl Render for Player {
                     }
                 }
                 if let Some(action) = action {
-                    this.act(action, cx);
+                    this.act(action, window, cx);
                 }
             }))
             // The whole window is the drop target: gpui turns an external file
@@ -548,7 +548,7 @@ impl Render for Player {
             // it. Nothing here moves when the state changes -- the regions are
             // fixed and the panels keep their room whether or not anything is
             // open in them.
-            .child(self.topbar(cx))
+            .child(self.topbar(window, cx))
             .child(
                 div()
                     .flex_1()
