@@ -104,6 +104,7 @@ actions! {
     ZoomOut,
     ZoomFit,
     Undo,
+    Redo,
     AddVideoLane,
     AddAudioLane,
     RemoveVideoLane,
@@ -194,6 +195,7 @@ impl ActionId {
             ActionId::ZoomOut => "Zoom out of the timeline",
             ActionId::ZoomFit => "Fit the whole timeline on screen",
             ActionId::Undo => "Undo",
+            ActionId::Redo => "Redo",
             ActionId::AddVideoLane => "Add a video track",
             ActionId::AddAudioLane => "Add an audio track",
             ActionId::RemoveVideoLane => "Remove the last video track (it must be empty)",
@@ -256,6 +258,7 @@ impl ActionId {
             ActionId::ZoomOut => "zoom-out",
             ActionId::ZoomFit => "zoom-fit",
             ActionId::Undo => "undo",
+            ActionId::Redo => "redo",
             ActionId::AddVideoLane => "add-video-lane",
             ActionId::AddAudioLane => "add-audio-lane",
             ActionId::RemoveVideoLane => "remove-video-lane",
@@ -353,6 +356,7 @@ impl ActionId {
             | ActionId::Detach
             | ActionId::Group
             | ActionId::Undo
+            | ActionId::Redo
             | ActionId::AddVideoLane
             | ActionId::AddAudioLane
             | ActionId::RemoveVideoLane
@@ -874,6 +878,9 @@ impl Keymap {
                 b(ActionId::ZoomFit, "0", true),
                 b(ActionId::Undo, "z", false),
                 b(ActionId::Undo, "z", true),
+                // Bare "y" is SubtitleStyle's, so redo takes only the ctrl
+                // chord -- the conventional pairing with ctrl+z either way.
+                b(ActionId::Redo, "y", true),
                 // The unshifted initials of what they add. Both were free --
                 // the copy and paste chords are the *ctrl* ones -- and a track
                 // is added often enough to deserve a key that is one press.
@@ -1231,7 +1238,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 57);
+        assert_eq!(k.entries().len(), 58);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
@@ -1276,6 +1283,7 @@ mod tests {
         assert_eq!(k.lookup("r", true), Some(ActionId::Resolution));
         assert_eq!(k.lookup("z", false), Some(ActionId::Undo));
         assert_eq!(k.lookup("z", true), Some(ActionId::Undo));
+        assert_eq!(k.lookup("y", true), Some(ActionId::Redo));
         // The track keys are the bare letters; the ctrl ones stay copy/paste.
         assert_eq!(k.lookup("v", false), Some(ActionId::AddVideoLane));
         assert_eq!(k.lookup("a", false), Some(ActionId::AddAudioLane));
