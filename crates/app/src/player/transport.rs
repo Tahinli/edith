@@ -154,7 +154,20 @@ impl Player {
             // otherwise repaint at vsync forever. Held clear for as long as the
             // state does, not just on the crossing: nothing else is coming.
             self.seek_since = None;
-            if was != Transport::Ended {
+            if crosses_into_loop(was, Transport::Ended, self.loop_on) {
+                // The same door the restart button and key use
+                // ([`Player::toggle_or_restart`]), minus the `cx` that door
+                // spends only on a repaint -- the pump is already inside one.
+                // One seam of a one-frame seam: the restart is a fresh seek
+                // and its reopen, not a gapless splice.
+                if let Some(session) = self.active_session_mut() {
+                    session.seek(0.);
+                }
+                self.reset_after_reseek();
+                if let Some(session) = self.active_session_mut() {
+                    session.play();
+                }
+            } else if was != Transport::Ended {
                 // Ended is a *stopped* transport, so the clock stops with it,
                 // on the out point the timecode and the playhead have been
                 // showing all along. Nothing else ever stopped it: past the
@@ -379,6 +392,14 @@ pub(crate) fn resync_due(late: f64, last: Option<Instant>, priming: bool) -> boo
     !priming && should_resync(late, last)
 }
 
+/// Whether *this* repaint is the one crossing into `Ended` with loop on --
+/// the moment to restart rather than halt. `now` is always `Ended` at the one
+/// call site (it is inside that guard already), but taking it as a parameter
+/// keeps this checkable on its own instead of only through a live session.
+pub(crate) fn crosses_into_loop(was: Transport, now: Transport, loop_on: bool) -> bool {
+    now == Transport::Ended && was != Transport::Ended && loop_on
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +427,17 @@ mod tests {
             Some(Instant::now() - RESYNC_GAP - Duration::from_millis(1)),
             false
         ));
+    }
+
+    /// The crossing fires exactly once per end and only with the flag on --
+    /// not on every repaint the transport happens to sit at `Ended` through,
+    /// and not at all with loop off (which is the halt path this test would
+    /// otherwise silently stop covering).
+    #[test]
+    fn the_loop_restarts_only_on_the_crossing_with_loop_on() {
+        assert!(crosses_into_loop(Transport::Playing, Transport::Ended, true));
+        assert!(!crosses_into_loop(Transport::Playing, Transport::Ended, false));
+        assert!(!crosses_into_loop(Transport::Ended, Transport::Ended, true));
+        assert!(!crosses_into_loop(Transport::Ended, Transport::Playing, true));
     }
 }

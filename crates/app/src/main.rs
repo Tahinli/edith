@@ -104,6 +104,11 @@ struct Player {
     /// about it, so [`Player::act`] reconciles them rather than trusting
     /// either alone.
     player_fullscreen: bool,
+    /// Whether the active session -- the timeline or a library preview,
+    /// whichever [`Player::active_session`] is reading -- restarts from the
+    /// top on reaching its end instead of stopping there. One flag for both,
+    /// since only one of them is ever playing at a time.
+    loop_on: bool,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -734,6 +739,7 @@ fn main() {
                     preview_session: None,
                     preview_playing: false,
                     player_fullscreen: false,
+                    loop_on: false,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),

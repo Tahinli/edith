@@ -31,6 +31,12 @@ impl Player {
         }
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
+            // No session touched at all: the pump reads the flag itself at
+            // the one place that already knows the end was reached.
+            ActionId::Loop => {
+                self.loop_on = !self.loop_on;
+                cx.notify();
+            }
             ActionId::StepBack => self.step(-1, cx),
             ActionId::StepForward => self.step(1, cx),
             // A second is however many frames this timeline runs at.
