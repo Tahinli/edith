@@ -93,9 +93,10 @@ impl Player {
         // that crosses the line.
         let view = self.view();
         let scrollable = view.duration > view.span();
+        let kinds: Vec<LaneKind> = lanes.iter().map(|lane| lane.kind).collect();
         let region_h = self.split_px(Split::Timeline, viewport);
         let lanes_box = (region_h - timeline_fixed_h(scrollable)).max(LANE_H);
-        let overflows = lanes.len() > lanes_shown(lanes_box);
+        let overflows = lanes.len() > lanes_shown_mixed(&kinds, lanes_box);
         let lanes_box = match overflows {
             true => (lanes_box - LABEL_H - 8.).max(LANE_H),
             false => lanes_box,
@@ -108,7 +109,7 @@ impl Player {
         // strip below reads the same number, so a thumb dragged there and a
         // count the affordance lets go of cannot disagree.
         let scrolled = -f32::from(self.lanes_scroll.offset().y);
-        let below = rows_below(lanes.len(), lanes_box, scrolled);
+        let below = rows_below_mixed(&kinds, lanes_box, scrolled);
         // The stack's own scrollbar: the thumb is the visible share of the
         // lane rows, read straight off the column's own scroll state -- the
         // box, the fold and how far down it has been taken are all the
@@ -870,11 +871,23 @@ impl Player {
                 .collect(),
             _ => Vec::new(),
         };
+        // Thinner than a media lane's ([`SUB_LANE_H`]), so its header has room
+        // for one `HIT_MIN` target and not the two a stacked eye-and-remove
+        // pair would need -- the right button carries the remove instead, the
+        // same door a caption's own box already answers to (`sub_tip`), so a
+        // track that used to have its own × still has one, just not a second
+        // row to draw it in.
         let eye_tip: SharedString = match shown {
-            true => format!("{name} is the track shown over the picture"),
+            true => format!(
+                "{name} is the track shown over the picture — the right button removes it, empty \
+                 first, and {} brings it back",
+                self.keymap.display(ActionId::Undo)
+            ),
             false => format!(
                 "Click to show {name} over the picture instead — one subtitle track is drawn at a \
-                 time, and an export carries every one of them"
+                 time, and an export carries every one of them; the right button removes it, empty \
+                 first, and {} brings it back",
+                self.keymap.display(ActionId::Undo)
             ),
         }
         .into();
@@ -909,7 +922,7 @@ impl Player {
         .into();
         div()
             .flex_none()
-            .h(px(LANE_H))
+            .h(px(lane_h(lane.kind)))
             .flex()
             .gap(px(HEADER_GAP))
             // A header let go anywhere along this row lands the track in the
@@ -989,12 +1002,17 @@ impl Player {
                         // `HIT_MIN` tall like the mix button it sits where.
                         // The lit dot and the accent tell the shown lane from
                         // the rest of a stack of them at a glance.
+                        // One line, not name-over-dot: at `SUB_LANE_H` the
+                        // whole header is one `HIT_MIN` target, and the
+                        // shown/hidden state is already the colour, the
+                        // background and the border below -- a second line
+                        // saying the same thing again is a line this row no
+                        // longer has the height to spare.
                         false if sub => div()
                             .id(("show-lane", lane.ord))
                             .flex_1()
                             .w_full()
                             .flex()
-                            .flex_col()
                             .items_center()
                             .justify_center()
                             .rounded(px(3.))
@@ -1011,15 +1029,20 @@ impl Player {
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.show_sub_lane(lane, cx)
                             }))
-                            .child(name.clone())
-                            .child(
-                                div()
-                                    .text_size(px(9.))
-                                    .child(match shown {
-                                        true => "◉",
-                                        false => "○",
-                                    }),
+                            // The remove door a stacked second row used to be,
+                            // on the same button now: the right button is
+                            // already how a caption's own box takes itself
+                            // off the lane (`sub_tip`), so the header answers
+                            // to it too rather than spending a second
+                            // `HIT_MIN` row on a thin lane that has none to
+                            // spare.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                    this.remove_lane(lane, cx)
+                                }),
                             )
+                            .child(name.clone())
                             .into_any_element(),
                         false => div()
                             .flex_1()
@@ -1028,29 +1051,33 @@ impl Player {
                             .child(name.clone())
                             .into_any_element(),
                     })
-                    // The one thing a header does: take this track away again.
-                    // A `HIT_MIN` target rather than a glyph-sized one, and it
-                    // stays put on a track holding clips instead of hiding --
-                    // the refusal names them, and a control that vanishes
-                    // teaches nothing.
-                    .child(
-                        div()
-                            .id(remove_id)
-                            .flex_none()
-                            .w_full()
-                            .h(px(HIT_MIN))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER())))
-                            .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.remove_lane(lane, cx)
-                            }))
-                            .child("×"),
-                    ),
+                    // The one thing a media header does: take this track away
+                    // again. A `HIT_MIN` target rather than a glyph-sized one,
+                    // and it stays put on a track holding clips instead of
+                    // hiding -- the refusal names them, and a control that
+                    // vanishes teaches nothing. A subtitle lane's remove lives
+                    // on the eye button instead ([`eye_tip`]) -- this row is
+                    // thin enough for one `HIT_MIN` target, not two.
+                    .when(!sub, |d| {
+                        d.child(
+                            div()
+                                .id(remove_id)
+                                .flex_none()
+                                .w_full()
+                                .h(px(HIT_MIN))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .tooltip(move |_, cx| cx.new(|_| Tip(remove_tip.clone())).into())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.remove_lane(lane, cx)
+                                }))
+                                .child("×"),
+                        )
+                    }),
             )
             .child(
                 // Clips are placed at their own start rather than queued edge

@@ -21,6 +21,21 @@ pub(crate) const PANEL_H: f32 = 220.;
 /// timeline that pushes the video off the window is not a timeline.
 pub(crate) const LANES_MAX: usize = 6;
 pub(crate) const LANE_H: f32 = 48.;
+/// A caption lane's own height, thinner than a media one: a subtitle box
+/// carries a name, a rate badge and the cue band under it
+/// ([`Player::lane_row`]) and none of a clip's waveform or its full-height
+/// plate, so the strip that used to draw the whole row's worth of nothing is
+/// the regression this constant undoes.
+///
+/// Floored at [`HIT_MIN`] rather than the 20 px a first pass at "thin" landed
+/// on: the header's show/hide eye is the row's one surviving click target
+/// once the remove button moves off it onto the right button
+/// ([`Player::lane_row`]), and that eye fills the row's full height -- so
+/// anything under `HIT_MIN` here is a WCAG 2.5.8 target shrunk to chase a
+/// pixel count, not a thinner lane. This is the whole gap between the two
+/// harness variants the task asked for: 20 is not shippable at all, 24 is,
+/// so 24 is the only variant landed.
+pub(crate) const SUB_LANE_H: f32 = HIT_MIN;
 /// The lane header column: wide enough for `V1`/`A1` and fixed, so both lanes
 /// and the ruler above them start at the same pixel and are the same width --
 /// one x-to-time mapping for the whole timeline. `HEADER_GAP` is part of that
@@ -225,6 +240,70 @@ pub(crate) fn rows_below(total: usize, box_h: f32, scrolled: f32) -> usize {
     total.saturating_sub(past + lanes_shown(box_h))
 }
 
+/// How tall one lane row is: [`LANE_H`] for a media track, [`SUB_LANE_H`] for
+/// a caption one -- the one place that answer is decided, since
+/// [`lanes_h_mixed`], [`lanes_shown_mixed`] and [`rows_below_mixed`] all walk
+/// off it and a track drawn at one height and measured at another is a fold
+/// line that lands on the wrong row.
+pub(crate) fn lane_h(kind: LaneKind) -> f32 {
+    match kind {
+        LaneKind::Subtitle => SUB_LANE_H,
+        LaneKind::Video | LaneKind::Audio => LANE_H,
+    }
+}
+
+/// [`lanes_h`] for a real stack of lanes rather than a bare count: a project
+/// with a caption track in it is shorter than that many `LANE_H` rows, and
+/// the column, the fold and the affordance below it all have to agree on
+/// exactly how much shorter, or "N more below" is answering a box nothing
+/// draws at.
+pub(crate) fn lanes_h_mixed(kinds: &[LaneKind]) -> f32 {
+    match kinds.len() {
+        0 => 0.,
+        n => kinds.iter().copied().map(lane_h).sum::<f32>() + (n - 1) as f32 * 8.,
+    }
+}
+
+/// [`lanes_shown`] for a real stack: the largest prefix of `kinds` whose
+/// drawn height still fits `box_h`, on the same boundary [`lanes_shown`]
+/// draws it at (`lanes_h(k) <= box_h`) -- so a uniform stack answers exactly
+/// what [`lanes_shown`] already did, and a mixed one answers the row count
+/// its own heights actually reach.
+pub(crate) fn lanes_shown_mixed(kinds: &[LaneKind], box_h: f32) -> usize {
+    (0..=kinds.len())
+        .rev()
+        .find(|&k| lanes_h_mixed(&kinds[..k]) <= box_h)
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// [`rows_below`] for a real stack: `scrolled` read against each row's own
+/// top rather than a uniform `LANE_H + 8` stride, so a column with a thin
+/// caption track in it still says the true count once that track has
+/// scrolled by.
+pub(crate) fn rows_below_mixed(kinds: &[LaneKind], box_h: f32, scrolled: f32) -> usize {
+    // Row `k`'s own top, in the same units `scrolled` is given in: nothing
+    // for the first row, and every row before it plus the gap that follows
+    // each one for the rest.
+    let top = |k: usize| -> f32 {
+        match k {
+            0 => 0.,
+            k => lanes_h_mixed(&kinds[..k]) + 8.,
+        }
+    };
+    let past = (0..=kinds.len())
+        .min_by(|&a, &b| {
+            (scrolled - top(a))
+                .abs()
+                .partial_cmp(&(scrolled - top(b)).abs())
+                .unwrap()
+        })
+        .unwrap_or(0);
+    kinds
+        .len()
+        .saturating_sub(past + lanes_shown_mixed(kinds, box_h))
+}
+
 /// The same question for a column whose rows are not one height -- the
 /// inspector's sections -- answered in pixels off what the scroll itself
 /// reports: how far it may still be taken (`max_offset`) less how far it has
@@ -409,6 +488,15 @@ pub(crate) fn split_bounds(
         // lane's own pixels, and the one lane the floor promises is a header
         // cut in half.
         Split::Timeline => (
+            // `LANE_H` even though the first lane could be a thinner caption
+            // one: a floor is a *minimum*, so the only failure mode of
+            // reading it off the tallest kind is a seam that refuses to go
+            // quite as small as it technically could -- never a lane clipped
+            // short of its own row. corner-cut: exact per-kind floor would
+            // read `session.lanes()[0].kind`, which `split_bounds` is not
+            // handed; ceiling is one drawn-too-tall pixel at the very floor
+            // of a caption-only project, upgrade is threading the real lane
+            // list through here the way [`lanes_h_mixed`] already takes it.
             timeline_fixed_h(scroll)
                 + LANE_H
                 + match lanes > 1 {

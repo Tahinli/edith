@@ -92,6 +92,28 @@ fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
     // A project that fits says nothing at all.
     assert_eq!(rows_below(2, box_h, 0.), 0);
 
+    // The same three questions once a lane in the stack is a thinner
+    // caption one: a uniform stack answers exactly what the plain
+    // functions above do, and a mixed one answers off the real heights,
+    // never the media one alone.
+    let uniform = [LaneKind::Video, LaneKind::Audio];
+    assert_eq!(lanes_h_mixed(&uniform), lanes_h(2));
+    assert_eq!(lanes_shown_mixed(&uniform, LANE_H), lanes_shown(LANE_H));
+    let mixed = [LaneKind::Video, LaneKind::Audio, LaneKind::Subtitle];
+    assert_eq!(
+        lanes_h_mixed(&mixed),
+        2. * LANE_H + SUB_LANE_H + 2. * 8.,
+        "a caption lane is not counted as a full LANE_H row"
+    );
+    // A box exactly tall enough for the two media lanes and no more: the
+    // thinner third lane still does not fit above it.
+    assert_eq!(lanes_shown_mixed(&mixed, lanes_h(2)), 2);
+    // ...and with room for the caption lane too, all three show and
+    // nothing is below the fold.
+    assert_eq!(lanes_shown_mixed(&mixed, lanes_h_mixed(&mixed)), 3);
+    assert_eq!(rows_below_mixed(&mixed, lanes_h_mixed(&mixed), 0.), 0);
+    assert_eq!(rows_below_mixed(&mixed, lanes_h(2), 0.), 1);
+
     // The inspector's rows are not one height, so its own line is measured
     // in pixels off the scroll instead: gpui keeps the offset negative going
     // down, and at the bottom the two cancel out exactly.
@@ -216,6 +238,11 @@ fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
     assert!(CONTROL_H >= HIT_MIN);
     assert!(RULER_HIT_H >= HIT_MIN);
     assert!(LANE_H >= HIT_MIN);
+    // A caption lane's header carries exactly one hit target now (the
+    // show/hide eye; remove moved to its right button), and that target
+    // fills the whole row -- so the row is never allowed to undercut the
+    // target it *is*.
+    assert!(SUB_LANE_H >= HIT_MIN);
     // A clip box is a hit target too, and its two trim strips occlude it:
     // on a box narrower than the pair there is no body left to press, so
     // the clip cannot be selected, dragged or menued at all -- which is
