@@ -236,6 +236,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
     let clip = |source: usize, start: u32| engine::Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: 10,
@@ -320,6 +321,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
     let whole = engine::Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: meta.frame_count,
