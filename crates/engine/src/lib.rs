@@ -29,6 +29,7 @@ pub(crate) mod map;
 mod sweep;
 pub(crate) mod stretch;
 pub mod tonemap;
+pub mod transform;
 pub mod waveform;
 
 pub use audio::{
