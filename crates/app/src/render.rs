@@ -434,6 +434,36 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The subtitle style card, the same way again: row 0 is the
+                // size stepper (←→ moves it, held or pressed, the mix card's
+                // rule) and every row after it a family in
+                // `subtitle_fonts` -- ↑↓ walk the whole list and `enter`
+                // picks the one the arrows are on, since a hand with no
+                // mouse still has to be able to leave the platform default.
+                if this.subtitle_style_open {
+                    // Row 0 is the size stepper, row 1 the platform default,
+                    // and every row after it a family in `subtitle_fonts`.
+                    let rows = 2 + this.subtitle_fonts.len();
+                    if key == ESCAPE {
+                        this.subtitle_style_open = false;
+                    } else if key == "down" {
+                        this.subtitle_style_field = (this.subtitle_style_field + 1) % rows;
+                    } else if key == "up" {
+                        this.subtitle_style_field =
+                            (this.subtitle_style_field + rows - 1) % rows;
+                    } else if key == "right" {
+                        this.nudge_sub_size(1, cx);
+                    } else if key == "left" {
+                        this.nudge_sub_size(-1, cx);
+                    } else if key == "enter" && this.subtitle_style_field == 1 {
+                        this.set_sub_family(None, cx);
+                    } else if key == "enter" && this.subtitle_style_field > 1 {
+                        let family = this.subtitle_fonts[this.subtitle_style_field - 2].clone();
+                        this.set_sub_family(Some(family), cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // A clip menu names an index, and every edit below moves
                 // indices -- so a stroke closes it before it acts. Escape means
                 // that and nothing else, which is the `esc` the keys menu
