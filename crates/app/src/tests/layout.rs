@@ -175,7 +175,7 @@ fn an_inspector_section_occludes_no_timeline() {
     // leave this rule reading a file the render is no longer in.
     let render = source_from("impl Render for Player");
     for card in [
-        "eq_card", "color_card", "speed_card", "silence_card", "mix_card",
+        "eq_card", "color_card", "speed_card", "silence_card", "mix_card", "subtitle_style_card",
     ] {
         assert!(
             inspector.contains(&format!("self.{card}(")),

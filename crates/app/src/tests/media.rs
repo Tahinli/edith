@@ -2,6 +2,9 @@
 //! command line, the scans, the codecs offered, and the subtitles found.
 
 use super::*;
+use crate::subs::{
+    load_subtitle_style, save_subtitle_style, sub_line_h_for, subtitle_style_path, SUB_SIZE_RANGE,
+};
 use crate::ui::preview::{bgra_to_rgba, screenshot_path};
 
 /// The import line's own state machine, driven the way a repaint drives
@@ -899,6 +902,68 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
     // A header folds its group on a click now, so it binds `HIT_MIN` like
     // every other target rather than being let off it as a bare label.
     assert!(SUB_HEAD_H >= HIT_MIN);
+}
+
+/// The subtitle style file, round-tripped through a scratch config directory
+/// -- the same corner-cut persistence as the theme and the keybindings, kept
+/// to the same test the load/save pair earns: a save followed by a load reads
+/// back what was written, a file that never existed leaves the defaults in
+/// force, and a file that exists but says nothing readable does too rather
+/// than crashing a startup on someone else's edit of the file.
+#[test]
+fn the_subtitle_style_file_round_trips_or_falls_back_to_defaults() {
+    let dir = std::env::temp_dir().join(format!(
+        "edith-subtitle-style-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Scoped to this test alone: no other test reads XDG_CONFIG_HOME or the
+    // subtitle-style file it names, so this narrow, restored mutation of the
+    // process environment cannot race another test's own file.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+
+    // Nothing written yet: the defaults, not a crash on a missing file.
+    assert_eq!(load_subtitle_style(), (None, SUB_TEXT));
+
+    // A save, read back whole: family and size both.
+    save_subtitle_style(Some("Iosevka"), 22.).unwrap();
+    assert_eq!(
+        load_subtitle_style(),
+        (Some("Iosevka".to_string()), 22.)
+    );
+
+    // The platform default (`None`) round-trips too, and is not a family
+    // called "".
+    save_subtitle_style(None, 14.).unwrap();
+    assert_eq!(load_subtitle_style(), (None, 14.));
+
+    // A file present but unreadable as this format -- a stray edit, or bytes
+    // from a future version -- leaves the defaults in force rather than
+    // failing the window that opens over it.
+    std::fs::write(subtitle_style_path(), "not a number\n9999\n").unwrap();
+    assert_eq!(load_subtitle_style(), (None, SUB_TEXT));
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The cue's line height scales with its size, on the same ratio the defaults
+/// draw at -- a bigger plate wants more room per line, not letters growing
+/// inside an unchanged one.
+#[test]
+fn the_cue_line_height_scales_with_its_size() {
+    assert_eq!(sub_line_h_for(SUB_TEXT), SUB_LINE_H);
+    // Twice the size is twice the line height, on the same ratio.
+    assert_eq!(sub_line_h_for(SUB_TEXT * 2.), SUB_LINE_H * 2.);
+    // Always at least the text itself, across the whole size range: a line
+    // shorter than its own text would clip it.
+    for size in [SUB_SIZE_RANGE.0, SUB_TEXT, SUB_SIZE_RANGE.1] {
+        assert!(sub_line_h_for(size) >= size);
+    }
 }
 
 /// What the rows of both lists do with a name too long for the column: two
