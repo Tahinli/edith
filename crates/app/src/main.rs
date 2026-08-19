@@ -73,6 +73,15 @@ struct Player {
     /// waits: the first media import or project load is what fills it, and
     /// until then every action that needs a timeline says so instead of acting.
     session: Option<PlaybackSession>,
+    /// A resolution and/or frame rate picked before any file exists to derive
+    /// them from -- what [`Player::cycle_resolution`] and its fps sibling edit
+    /// instead of refusing, with nothing open yet. Applied as the explicit
+    /// override [`engine::PlaybackSession::set_resolution`]/`set_frame_rate`
+    /// already are for a `.edith`'s own saved values ([`Player::install_media`])
+    /// the moment the first session exists, and cleared there: consumed once,
+    /// the way a project's own saved settings are read once at
+    /// [`engine::PlaybackSession::open_project`].
+    pending_settings: (Option<(u32, u32)>, Option<f64>),
     /// A library row's own file, opened and playing in place of the
     /// timeline's picture, and never written to `session` or its undo stack:
     /// a preview is watched, not edited. `Some` is what [`Player::pump`] and
@@ -680,6 +689,7 @@ fn main() {
                     seek_since: None,
                     resynced: None,
                     session: None,
+                    pending_settings: (None, None),
                     preview_session: None,
                     preview_playing: false,
                     // Full and unmuted, which is what the session it was just
