@@ -407,6 +407,16 @@ pub struct PlaybackSession {
     /// two switches above, and read by the front end: the engine starts no
     /// export of its own.
     encoder_seat: crate::export::EncoderSeat,
+    /// The rate this project's mix was picked to run at
+    /// ([`crate::edith::Document::sample_rate`]), overriding the one the first
+    /// audio source would otherwise hand the mixer. `None` -- every project
+    /// before the field existed, and any project nobody has picked one for --
+    /// leaves the derived rate alone. Saved with the project like the switches
+    /// above it, and read by the front end: the engine picks no rate of its own.
+    ///
+    /// Setting it takes effect at the next audio rebuild (a seek, an edit, a
+    /// reopen); there is no live resample of an audio device already playing.
+    sample_rate: Option<u32>,
 }
 
 /// What an edit dirtied -- which half of the pipeline has to be rebuilt for the
@@ -545,6 +555,7 @@ impl PlaybackSession {
             proxies: false,
             auto_proxies: true,
             encoder_seat: crate::export::EncoderSeat::default(),
+            sample_rate: None,
         })
     }
 
@@ -663,6 +674,7 @@ impl PlaybackSession {
             proxies: false,
             auto_proxies: true,
             encoder_seat: crate::export::EncoderSeat::default(),
+            sample_rate: None,
         })
     }
 
@@ -745,6 +757,7 @@ impl PlaybackSession {
             proxies: false,
             auto_proxies: true,
             encoder_seat: crate::export::EncoderSeat::default(),
+            sample_rate: None,
         })
     }
 
@@ -1053,6 +1066,7 @@ impl PlaybackSession {
             // ...and which encoder it exports with, which is the seat this
             // machine has for every dialect before v14.
             encoder_seat: doc.encoder,
+            sample_rate: doc.sample_rate,
         };
         // The scaffolding above opened source 0 from its first frame and the
         // whole of its audio; this puts both onto the clip the playhead is
@@ -1324,6 +1338,10 @@ impl PlaybackSession {
             // again after a reload.
             self.encoder_seat,
             self.project.limiter(),
+            // ...and the rate the mix was picked to run at, for the same
+            // reason: a project delivered at a chosen rate is delivered at it
+            // again after a reload.
+            self.sample_rate,
             playhead,
         )
     }
@@ -2293,6 +2311,20 @@ impl PlaybackSession {
         self.encoder_seat = seat;
     }
 
+    /// The rate this project's mix was picked to run at
+    /// ([`Self::set_sample_rate`]), or `None` for the rate the first audio
+    /// source derives it to.
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.sample_rate
+    }
+
+    /// Pick the mix's own rate, overriding the derived one. Nothing to reseek
+    /// here: it takes effect at the next audio rebuild (a seek, an edit, a
+    /// reopen), not on the device already playing.
+    pub fn set_sample_rate(&mut self, rate: Option<u32>) {
+        self.sample_rate = rate;
+    }
+
     /// Whether an imported film that wants a stand-in gets one made for it
     /// there and then ([`Self::set_auto_proxies`]).
     pub fn auto_proxies(&self) -> bool {
@@ -3236,6 +3268,10 @@ impl PlaybackSession {
             // more -- the open runs on the feeder.
             let mixed = crate::audio::AudioSession::is_mixed(segs.len(), &gains, limiter);
             let worker_controls = Arc::clone(&controls);
+            // ...and the rate the mix runs at, if the project picked one: the
+            // same override [`crate::edith::save`] writes and [`Self::open_project`]
+            // reads back.
+            let sample_rate = self.sample_rate;
             // ...and the open itself -- every track a segment names, its packet
             // table, its priming -- happens there too. That is the whole point:
             // one `pread` on a cold 25 GB film is seconds, and this is called
@@ -3249,6 +3285,7 @@ impl PlaybackSession {
                     &gains,
                     limiter,
                     Some(&worker_controls),
+                    sample_rate,
                 ) {
                     Ok(Some((_, rx))) => Some(rx),
                     // A silent timeline, and a source that will not open: both
@@ -3327,7 +3364,13 @@ impl PlaybackSession {
         out: &Path,
         settings: &crate::export::ExportSettings,
     ) -> crate::ExportHandle {
-        crate::export::start(self.project.export_snapshot(), self.meta, out, settings)
+        crate::export::start(
+            self.project.export_snapshot(),
+            self.meta,
+            out,
+            settings,
+            self.sample_rate,
+        )
     }
 
     /// Moves the clock forward; the caller runs this once per rendered frame.
@@ -3773,6 +3816,32 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// A picked project rate overrides the derived one, and its absence leaves
+    /// the source's own -- the seam every explicit-sample-rate caller
+    /// (playback rebuild, both export encoders) goes through
+    /// ([`crate::AudioSession::open_multi_streams_speed_at`]). The per-segment
+    /// conform chain resamples to whatever `meta` names, so the meta *is* the
+    /// behaviour.
+    #[test]
+    fn a_picked_sample_rate_overrides_the_derived_one() {
+        let file = asset("test_av.mp4");
+        let sources = [(file, 0)];
+        let segs = [(Some(0), 0., 1.)];
+        let derived = crate::AudioSession::open_multi_streams_speed_at(&sources, &segs, &[], &[], None)
+            .expect("open the fixture")
+            .expect("the fixture has sound")
+            .0
+            .sample_rate;
+        let picked =
+            crate::AudioSession::open_multi_streams_speed_at(&sources, &segs, &[], &[], Some(32000))
+                .expect("open the fixture")
+                .expect("the fixture has sound")
+                .0
+                .sample_rate;
+        assert_ne!(derived, 32000, "a fixture at the picked rate proves nothing");
+        assert_eq!(picked, 32000);
     }
 
     /// Which source the timeline's sound is opened on -- the one rule
