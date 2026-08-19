@@ -2552,6 +2552,35 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_fit(lane, idx, fit))
     }
 
+    /// Timeline frames of ramp-up from silence at the start of the clip at
+    /// `idx` of `lane`. `0` for an index that is not there.
+    pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.fade_in_of(lane, idx)
+    }
+
+    /// Sets that clip's fade-in, clamped to its own length. A sound-only
+    /// edit, same as an equalizer or a fader: no reseek needed.
+    pub fn set_fade_in(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_fade_in(lane, idx, frames))
+    }
+
+    /// Timeline frames of ramp-down to silence at the end of the clip at
+    /// `idx` of `lane`. `0` for an index that is not there.
+    pub fn fade_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.project.fade_out_of(lane, idx)
+    }
+
+    /// Sets that clip's fade-out. Same promises as [`Self::set_fade_in`].
+    pub fn set_fade_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.set_fade_out(lane, idx, frames))
+    }
+
+    /// Crossfades the audio clip at `idx` of `lane` into its neighbour, over
+    /// `frames`. Same promises as [`Project::crossfade`].
+    pub fn crossfade(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        self.edit(Dirty::Sound, |p| p.crossfade(lane, idx, frames))
+    }
+
     /// The clip at `idx` -- what a caller copies. It is a pair of source frame
     /// numbers and nothing else, so a copy stays valid after the clip it came
     /// from is deleted. `None` past the end.

@@ -277,6 +277,10 @@ struct Player {
     /// `scrubbing`'s reason: a 6 px strip is not where the pointer stays. See
     /// [`Trim`].
     trim: Option<Trim>,
+    /// A drag that started on a fade handle, tracked on the root for the same
+    /// reason a trim is: a 10 px square is not where the pointer stays. See
+    /// [`FadeDrag`].
+    fade_drag: Option<FadeDrag>,
     /// How far into the clip the last press on a box landed, in timeline
     /// frames: what a drag lets go of is the *point that was grabbed*, so the
     /// head lands that much in front of the pointer and the clip does not jump
@@ -828,6 +832,7 @@ fn main() {
                     splits: Splits::default(),
                     split_drag: None,
                     trim: None,
+                    fade_drag: None,
                     grab: 0,
                     snap: true,
                     subs_on: true,
