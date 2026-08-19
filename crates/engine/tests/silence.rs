@@ -140,6 +140,7 @@ fn speed_mode_refuses_a_clip_that_laps_over_a_silence() {
     let broll = Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 20,
@@ -177,6 +178,7 @@ fn whole(source: usize, frames: u32) -> Clip {
     Clip {
         fade_in: 0,
         fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: frames,
