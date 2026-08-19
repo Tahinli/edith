@@ -92,6 +92,28 @@ fn the_line_about_what_is_below_the_fold_counts_what_is_still_below_it() {
     // A project that fits says nothing at all.
     assert_eq!(rows_below(2, box_h, 0.), 0);
 
+    // The same three questions once a lane in the stack is a thinner
+    // caption one: a uniform stack answers exactly what the plain
+    // functions above do, and a mixed one answers off the real heights,
+    // never the media one alone.
+    let uniform = [LaneKind::Video, LaneKind::Audio];
+    assert_eq!(lanes_h_mixed(&uniform), lanes_h(2));
+    assert_eq!(lanes_shown_mixed(&uniform, LANE_H), lanes_shown(LANE_H));
+    let mixed = [LaneKind::Video, LaneKind::Audio, LaneKind::Subtitle];
+    assert_eq!(
+        lanes_h_mixed(&mixed),
+        2. * LANE_H + SUB_LANE_H + 2. * 8.,
+        "a caption lane is not counted as a full LANE_H row"
+    );
+    // A box exactly tall enough for the two media lanes and no more: the
+    // thinner third lane still does not fit above it.
+    assert_eq!(lanes_shown_mixed(&mixed, lanes_h(2)), 2);
+    // ...and with room for the caption lane too, all three show and
+    // nothing is below the fold.
+    assert_eq!(lanes_shown_mixed(&mixed, lanes_h_mixed(&mixed)), 3);
+    assert_eq!(rows_below_mixed(&mixed, lanes_h_mixed(&mixed), 0.), 0);
+    assert_eq!(rows_below_mixed(&mixed, lanes_h(2), 0.), 1);
+
     // The inspector's rows are not one height, so its own line is measured
     // in pixels off the scroll instead: gpui keeps the offset negative going
     // down, and at the bottom the two cancel out exactly.
@@ -216,6 +238,11 @@ fn nothing_clickable_is_smaller_than_the_wcag_minimum() {
     assert!(CONTROL_H >= HIT_MIN);
     assert!(RULER_HIT_H >= HIT_MIN);
     assert!(LANE_H >= HIT_MIN);
+    // A caption lane's header carries exactly one hit target now (the
+    // show/hide eye; remove moved to its right button), and that target
+    // fills the whole row -- so the row is never allowed to undercut the
+    // target it *is*.
+    assert!(SUB_LANE_H >= HIT_MIN);
     // A clip box is a hit target too, and its two trim strips occlude it:
     // on a box narrower than the pair there is no body left to press, so
     // the clip cannot be selected, dragged or menued at all -- which is
@@ -1097,6 +1124,46 @@ fn subtitle_rows_group_a_source_however_they_were_added() {
         "the group carries the path the tint is asked by"
     );
     assert_eq!(file_tint(&sources, &groups[2].path), None);
+    // What a header's "N tracks" says: the group's own row count, which is
+    // 2, 2, 1 here -- a film that gave several tracks and a standalone
+    // `.srt` that gave exactly one.
+    assert_eq!(
+        groups.iter().map(|g| g.rows.len()).collect::<Vec<_>>(),
+        [2, 2, 1]
+    );
+    // A standalone `.srt` is already its own group, named after its own
+    // file ("late", not lumped under some catch-all "External" bucket) --
+    // there is no sourceless case for a header to special-case.
+    assert_eq!(groups[2].name, "late");
+    assert_eq!(groups[2].path, PathBuf::from("/subs/late.srt"));
+}
+
+/// The fold a click on a header sets is keyed by [`SubGroup::path`]
+/// (`Player::sub_folded`), so it has to survive the very thing regrouping
+/// is for: a second track landing on a file already in the list, or one
+/// being removed from it. The group's path is the fold's whole identity,
+/// so it must not move under either.
+#[test]
+fn a_groups_fold_key_survives_a_track_arriving_or_leaving_its_file() {
+    let before = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+    ];
+    let after_add = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+    ];
+    let (before_groups, after_groups) = (subtitle_rows(&before), subtitle_rows(&after_add));
+    assert_eq!(before_groups[0].path, after_groups[0].path, "a's key held");
+    assert_eq!(before_groups[1].path, after_groups[1].path, "b's key held");
+    // The group a second track landed on grew; the other did not move.
+    assert_eq!(after_groups[0].rows.len(), 2);
+    assert_eq!(after_groups[1].rows.len(), 1);
+    // Removing that same track back off leaves the original key and count.
+    let after_remove = subtitle_rows(&before);
+    assert_eq!(after_remove[0].path, before_groups[0].path);
+    assert_eq!(after_remove[0].rows.len(), 1);
 }
 
 /// What the strip header, the section heading and the toggle's notice all
@@ -1189,6 +1256,42 @@ fn the_text_tab_carries_the_add_subtitles_door() {
         crate::LibraryTab::Text.empty().contains("Add subtitles"),
         "{}",
         crate::LibraryTab::Text.empty()
+    );
+}
+
+/// A source's group header in the library must not vanish on a short
+/// window: it is drawn whenever there is more than one source
+/// (`several_files`), never gated on the viewport's height, and the list
+/// under it is what scrolls instead ([`SUB_ROWS_H`]). And it has to be a
+/// real fold, not the click-cycling pattern this codebase has already
+/// thrown out once: one click toggles `sub_folded` shut or open, it never
+/// steps through more than those two states.
+#[test]
+fn a_subtitle_group_header_is_never_gated_on_window_height() {
+    let timeline = src_text("ui/timeline.rs");
+    assert!(
+        !timeline.contains("sub_headers_fit"),
+        "the header is still gated on the viewport's height"
+    );
+    let at = timeline
+        .find("let headed = ")
+        .expect("no `headed` computed in subtitle_section");
+    let line = &timeline[at..(at + 80).min(timeline.len())];
+    assert!(
+        line.contains("several_files") && !line.contains("viewport"),
+        "headed depends on something other than the file count: {line}"
+    );
+    // The header is a click target that flips membership in a set --
+    // `remove` else `insert` -- not a value stepped through several states.
+    let head_at = timeline
+        .find("subtitle-group-head")
+        .expect("no id on the group header");
+    let block = &timeline[head_at..(head_at + 2400).min(timeline.len())];
+    assert!(block.contains("sub_folded.remove"), "no fold-open path: {block}");
+    assert!(block.contains("sub_folded.insert"), "no fold-shut path: {block}");
+    assert!(
+        block.contains("\"1 track\"") || block.contains("tracks"),
+        "the header does not say how many tracks it holds: {block}"
     );
 }
 
