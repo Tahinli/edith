@@ -1277,6 +1277,33 @@ fn the_resolution_and_rate_lists_work_before_any_file_is_open() {
     assert!(picked[3].3);
 }
 
+/// The sample-rate list: "source" first and marked whenever nothing is
+/// picked -- true both before any file is open ([`Player::pending_settings`])
+/// and once a session exists with no override ([`PlaybackSession::sample_rate`]
+/// returning `None`) -- then every offered rate, exactly one marked once one
+/// is picked.
+#[test]
+fn the_sample_rate_list_marks_source_with_nothing_picked() {
+    let none = sample_rate_choices(None);
+    assert_eq!(none.len(), SAMPLE_RATES.len() + 1);
+    assert_eq!(none[0].0, Choice::SampleRate(None));
+    assert!(none[0].3, "source is the row in force with nothing picked");
+    assert_eq!(
+        none.iter().filter(|(.., picked)| *picked).count(),
+        1,
+        "exactly one row marked"
+    );
+    for ((choice, label, ..), rate) in none.iter().skip(1).zip(SAMPLE_RATES) {
+        assert_eq!(*choice, Choice::SampleRate(Some(rate)));
+        assert_eq!(label.as_ref(), format!("{rate} Hz"));
+    }
+
+    let picked = sample_rate_choices(Some(SAMPLE_RATES[1]));
+    assert!(!picked[0].3, "source no longer in force");
+    assert_eq!(picked.iter().filter(|(.., picked)| *picked).count(), 1);
+    assert!(picked[2].3);
+}
+
 #[test]
 fn the_export_card_fits_the_smallest_window() {
     // Same 640x360 floor the keybindings card is measured against: the

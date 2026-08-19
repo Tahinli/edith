@@ -49,6 +49,10 @@ pub(crate) struct Picker {
 pub(crate) enum Pick {
     Resolution,
     Fps,
+    /// The rate the project's own mix runs at
+    /// ([`engine::PlaybackSession::set_sample_rate`]). Opened from the panel,
+    /// beside the resolution and rate it shares a row style with.
+    SampleRate,
     Fit(Lane, usize),
     /// What the export's *sound* is coded at. Opened from the card's Sound row,
     /// which is the only place it means anything.
@@ -77,6 +81,9 @@ pub(crate) enum Pick {
 pub(crate) enum Choice {
     Size(u32, u32),
     Fps(f64),
+    /// `None` is "source" -- the rate derived from the first audio source,
+    /// [`engine::PlaybackSession::set_sample_rate`]'s own default.
+    SampleRate(Option<u32>),
     Fit(Lane, usize, FitPolicy),
     AudioRate(u32),
     Tone(Preset),
