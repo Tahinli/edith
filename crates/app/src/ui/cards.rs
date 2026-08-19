@@ -141,26 +141,32 @@ impl Player {
         list.push(destination);
         let current_preset = ExportPreset::from_state(self.format, self.quality);
         for (i, preset) in ExportPreset::ALL.into_iter().enumerate() {
+            // A bundle whose format this timeline refuses (an audio-only edit
+            // against Web, Small or Master) is the same kind of row the codec
+            // rows already carry: dimmed, unclickable, its reason in place of
+            // the detail -- not bright and pickable over a click that would
+            // only bounce off `set_format`'s own guard.
+            let refusal = preset
+                .bundle()
+                .and_then(|(format, _)| self.session.as_ref().and_then(|s| format_refusal(s, format)));
+            let detail: SharedString = match &refusal {
+                Some(why) => why.clone().into(),
+                None => preset.detail().into(),
+            };
             let mut r = entry(
                 ("preset", i),
-                "",
+                preset.key(),
                 preset.label().into(),
-                preset.detail().into(),
+                detail,
                 preset == current_preset,
-                true,
+                refusal.is_none(),
             );
-            r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                match preset.bundle() {
-                    Some((format, quality)) => {
-                        this.set_format(format);
-                        this.quality = quality;
-                    }
-                    // Custom sets nothing -- it only opens the pane where the
-                    // codec and the quality are picked apart.
-                    None => this.export_advanced_open = true,
-                }
-                cx.notify();
-            }));
+            if refusal.is_none() {
+                r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.pick_preset(preset);
+                    cx.notify();
+                }));
+            }
             list.push(r.into_any_element());
         }
         let advanced_detail = match self.export_advanced_open {
@@ -601,9 +607,19 @@ impl Player {
                                         SharedString::from(format!("Custom bitrate {}", edit.detail()))
                                     }
                                     (None, Some(notice)) => notice.clone(),
-                                    (None, None) => "the keys are on the rows · enter exports · \
-                                                     a click away or esc closes · g/r change the layout"
-                                        .into(),
+                                    // `g`/`r` only do anything once Advanced is
+                                    // open -- they moved off the front pane with
+                                    // the rows they reshape -- so a shut pane
+                                    // advertises `s` instead of a pair of keys
+                                    // with nothing on screen for them to touch.
+                                    (None, None) => match self.export_advanced_open {
+                                        true => "the keys are on the rows · enter exports · \
+                                                 a click away or esc closes · g/r change the layout"
+                                            .into(),
+                                        false => "the keys are on the rows · enter exports · \
+                                                 a click away or esc closes · s for Advanced"
+                                            .into(),
+                                    },
                                 }),
                         )
                         // Capped and scrolling like the keybindings list: the

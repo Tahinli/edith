@@ -116,11 +116,28 @@ impl ExportPreset {
         }
     }
 
+    /// The key that picks this row, none of the sixteen the card's other rows
+    /// already own (`n`, the digits, the codec row's `m/a/h/w/f/p/o`, and
+    /// `c/q/b/e/d/g/r/s`): a letter out of the name itself where its initial is
+    /// one of those (`smaLl`, `masTer`, `aUdio`), and a free one where every
+    /// letter in the name already belongs to another row (`Web`'s w, e and b
+    /// all are). `Custom` shares Advanced's own `s` -- the row does exactly what
+    /// that key already does, not a second name for a third thing.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            ExportPreset::Web => "v",
+            ExportPreset::Small => "l",
+            ExportPreset::Master => "t",
+            ExportPreset::AudioOnly => "u",
+            ExportPreset::Custom => "s",
+        }
+    }
+
     pub(crate) fn detail(self) -> &'static str {
         match self {
             ExportPreset::Web => "H.264 · MP4 · medium quality — plays everywhere",
             ExportPreset::Small => "AV1 · MP4 · low quality — smallest file",
-            ExportPreset::Master => "H.264 · MP4 · high quality — for re-editing later",
+            ExportPreset::Master => "HEVC · MP4 · high quality — intra-only, for re-editing later",
             ExportPreset::AudioOnly => "FLAC — lossless sound, no picture",
             ExportPreset::Custom => "pick a codec, quality and the rest below",
         }
@@ -133,7 +150,10 @@ impl ExportPreset {
         match self {
             ExportPreset::Web => Some((Format::Mp4, Quality::Medium)),
             ExportPreset::Small => Some((Format::Av1Mp4, Quality::Low)),
-            ExportPreset::Master => Some((Format::Mp4, Quality::High)),
+            // HEVC, not H.264: a master is for cutting again later, and HEVC's
+            // intra-only rows say why that is the one that keeps its promise --
+            // every frame already a cut point, where H.264's are not.
+            ExportPreset::Master => Some((Format::HevcMp4, Quality::High)),
             ExportPreset::AudioOnly => Some((Format::Flac, Quality::Auto)),
             ExportPreset::Custom => None,
         }

@@ -773,9 +773,12 @@ fn main() {
                     // Empty until the first frame is pumped, which draws as a
                     // flat line rather than as a shape nothing measured.
                     histogram: [[0; HIST_BINS]; 3],
-                    // What an export is until someone says otherwise: the
-                    // bitrate the picture asks for.
-                    quality: Quality::Auto,
+                    // What an export is until someone says otherwise: the Web
+                    // bundle, so `ExportPreset::from_state` opens on a real
+                    // preset rather than a `Custom` nobody picked -- `Auto`
+                    // paired with `Format::default()`'s MP4 matched no bundle
+                    // at all.
+                    quality: Quality::Medium,
                     custom_mbps: 0,
                     mbps_edit: None,
                     // ...and the rate the sound has always been written at.
