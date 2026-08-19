@@ -177,8 +177,70 @@ impl Player {
             })
             .detach();
         }
+        // The silence card's own decode, started here instead of at the card
+        // -- a whole source, off the render thread, the moment it arrives
+        // rather than the moment somebody opens the card on it
+        // ([`Player::start_silence_scan`] used to be the only door and cost
+        // the card its first fifty seconds). Landed under `full_scan_key` in
+        // the very map the card reads, so `scan_silences` finds it warm.
+        //
+        // A still has no sound to read, and `silence_bg`'s presence is the
+        // dedupe: a source already scanning, already scanned, or scanned and
+        // then removed mid-read (its entry stays until the scan notices the
+        // cancel) is not started twice. Gathered here, off `session`, for
+        // `starting`'s own reason: starting one below takes `self` mutably
+        // and `session` is a borrow of it.
+        let silence_starting: Vec<(PathBuf, usize)> = session
+            .sources()
+            .iter()
+            .map(|s| (s.path.clone(), s.audio_stream))
+            .filter(|key| {
+                !engine::is_image(&key.0)
+                    && !self.silence_bg.contains_key(key)
+                    && !self
+                        .silence_levels
+                        .contains_key(&full_scan_key(&key.0, key.1))
+            })
+            .collect();
         for path in starting {
             self.start_proxy_for(&path, cx);
+        }
+        for key in silence_starting {
+            let progress = Arc::new(engine::silence::Progress::default());
+            self.silence_bg.insert(key.clone(), Arc::clone(&progress));
+            let scan = cx.background_executor().spawn({
+                let (path, stream, progress) = (key.0.clone(), key.1, Arc::clone(&progress));
+                async move {
+                    engine::silence::levels_with_progress(&path, stream, (0., f64::INFINITY), &progress)
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let landed = scan.await;
+                this.update(cx, |this, cx| {
+                    this.silence_bg.remove(&key);
+                    // Cancelled means the source was removed while this read
+                    // was running: half a file's levels answer for a source
+                    // that is not on the list any more.
+                    if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Ok(Some(levels)) = landed {
+                        this.silence_levels
+                            .insert(full_scan_key(&key.0, key.1), Arc::new(levels));
+                        // A card already open and waiting on this very source
+                        // draws its marks the moment they land, same as an
+                        // on-demand scan does.
+                        this.scan_silences();
+                        cx.notify();
+                    }
+                    // `Ok(None)` (no audio track) and `Err` are left unrecorded:
+                    // the card's own on-demand scan is what a person waiting on
+                    // this file actually sees, and it gives the same answer
+                    // (`unscannable`/`SCAN FAILED`) when it is opened.
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
