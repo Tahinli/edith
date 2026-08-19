@@ -3778,6 +3778,48 @@ mod tests {
         assert!(audio_source_of(&[]).is_none(), "and no file at all");
     }
 
+    /// What a front end's "resolution/rate picked before any file is open"
+    /// setting costs the engine: nothing new. `open` then `set_resolution`/
+    /// `set_frame_rate` right after construction -- the app's technique for
+    /// applying a pre-import pick to the session it just made, mirroring
+    /// [`PlaybackSession::open_project`]'s own `doc.resolution`/`doc.fps`
+    /// override -- lands exactly where either setter lands it whenever it is
+    /// called, and a later `import` of another file leaves both untouched: an
+    /// import registers a source and its length, and never writes `meta.width`,
+    /// `meta.height` or `meta.frame_rate`.
+    #[test]
+    fn a_pre_import_setting_survives_construction_and_a_later_import() {
+        let mut session = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        let native = session.native_resolution();
+        let native_fps = session.native_frame_rate();
+        // The explicit picks a pre-import setting would apply, distinct from
+        // the fixture's own so a no-op would be caught.
+        let (picked_w, picked_h) = (1920, 1080);
+        assert_ne!((picked_w, picked_h), native, "the test needs a real change");
+        let picked_fps = 24.0;
+        assert_ne!(picked_fps, native_fps, "the test needs a real change");
+        assert!(session.set_resolution(picked_w, picked_h));
+        assert!(session.set_frame_rate(picked_fps));
+        assert_eq!(session.resolution(), (picked_w, picked_h));
+        assert_eq!(session.meta().frame_rate, picked_fps);
+
+        // A second file joining the timeline is exactly the case the front end
+        // worried a later import could silently override the explicit pick --
+        // it cannot, because `import` never touches the canvas.
+        session
+            .import(&asset("test_av2.mp4"))
+            .expect("av2 matches the timeline it was set to");
+        assert_eq!(
+            session.resolution(),
+            (picked_w, picked_h),
+            "an import must not move the project's own canvas size"
+        );
+        assert_eq!(
+            session.meta().frame_rate, picked_fps,
+            "an import must not move the project's own rate"
+        );
+    }
+
     /// The seam between the two lists a source index reaches: dropping a file
     /// from the library shortens `sources`, and `counts` -- the frame length
     /// per source, which is what a trim is walled by -- has to lose the same

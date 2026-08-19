@@ -1250,6 +1250,33 @@ fn a_choice_list_offers_every_value_and_fits_the_smallest_window() {
     );
 }
 
+/// The two settings a resolution/rate pick reaches with no file open yet:
+/// the plain list, since there is no media size to cycle in beside it, with
+/// nothing marked until a pending pick exists and exactly that row marked
+/// once it does -- the same shape [`resolution_choices`]/[`fps_choices`]
+/// have once a session exists, minus the media's own rung.
+#[test]
+fn the_resolution_and_rate_lists_work_before_any_file_is_open() {
+    let none = pending_resolution_choices(None);
+    assert_eq!(none.len(), RESOLUTIONS.len());
+    assert!(none.iter().all(|(.., picked)| !picked), "nothing picked yet");
+    for ((choice, label, detail, _), size) in none.iter().zip(RESOLUTIONS) {
+        assert_eq!(*choice, Choice::Size(size.0, size.1));
+        assert_eq!(label.as_ref(), format!("{}p", size.1));
+        assert_eq!(detail.as_ref(), format!("{}x{}", size.0, size.1));
+    }
+    let picked = pending_resolution_choices(Some(RESOLUTIONS[2]));
+    assert_eq!(picked.iter().filter(|(.., picked)| *picked).count(), 1);
+    assert!(picked[2].3);
+
+    let none = pending_fps_choices(None);
+    assert_eq!(none.len(), FRAME_RATES.len());
+    assert!(none.iter().all(|(.., picked)| !picked));
+    let picked = pending_fps_choices(Some(FRAME_RATES[3]));
+    assert_eq!(picked.iter().filter(|(.., picked)| *picked).count(), 1);
+    assert!(picked[3].3);
+}
+
 #[test]
 fn the_export_card_fits_the_smallest_window() {
     // Same 640x360 floor the keybindings card is measured against: the
