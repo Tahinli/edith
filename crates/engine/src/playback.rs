@@ -257,6 +257,42 @@ impl Audio {
     }
 }
 
+/// The cross-dissolve a span's tail owes its successor, tracked from the
+/// moment [`PlaybackSession::start_span`] opens A's own decoder until a later
+/// `start_span` throws it away. What decides there *is* one mirrors
+/// [`crate::export::dissolve_window`] exactly, on the very same span, so a
+/// preview blends the window an export would render -- but B's own decoder
+/// opens only once the playhead actually reaches it
+/// ([`PlaybackSession::open_dissolve_b`]), rather than for the whole span:
+/// most of a dissolving clip is never in the window, and a viewer who pauses
+/// or seeks away before the tail never pays for a decoder nobody sees.
+struct Dissolve {
+    /// The first *timeline* frame inside the window.
+    tail_start: u32,
+    /// How many output frames the blend ramps across.
+    window: u32,
+    b_source: usize,
+    b_in_frame: u32,
+    /// Where B sits on the timeline -- what its own grade and fit are keyed
+    /// on ([`Project::composite_color_at`], `composite_fit_at`), the same
+    /// `b_start` [`crate::export`] grades B's side of the same dissolve by.
+    b_start: u32,
+    /// B's live decode, once open; `None` before the playhead reaches the
+    /// window.
+    b: Option<DissolveB>,
+}
+
+/// B's own worker, decoding beside A's for the length of the window.
+struct DissolveB {
+    frames: Receiver<Frame>,
+    worker: Worker,
+    /// The last frame B handed over: a tick that lands between two of B's
+    /// pictures still has one to blend A against, the same "keep showing the
+    /// last one" policy A's own channel gets from the app's own pump -- done
+    /// here instead, because B never leaves the engine to be pumped.
+    held: Option<Frame>,
+}
+
 /// A file opened for playback. Starts paused at t=0; call [`PlaybackSession::play`].
 pub struct PlaybackSession {
     /// The *timeline's* parameters, not any one file's: its frame rate and codec
@@ -368,6 +404,13 @@ pub struct PlaybackSession {
     /// is late by exactly this window's length with another restart of it
     /// ([`picture_priming`](Self::picture_priming)).
     span_priming: bool,
+    /// The cross-dissolve the current span's tail owes its successor, if any
+    /// ([`crate::export::dissolve_window`], the same test an export makes of
+    /// the same span) -- and, once the playhead has reached the window, B's
+    /// own decoder, opened beside A's exactly as [`crate::export`] opens one
+    /// for the render. `None` for a span with no dissolve out, which is every
+    /// span most of the time.
+    dissolve: Option<Dissolve>,
     /// The last clip has been played out; see [`PlaybackSession::is_eos`].
     eos: bool,
     /// The mix the running mixer is reading, when there is one: what lets a
@@ -547,6 +590,7 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            dissolve: None,
             eos: false,
             mix: None,
             priming: false,
@@ -669,6 +713,7 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            dissolve: None,
             eos: false,
             mix: None,
             priming: false,
@@ -755,6 +800,7 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            dissolve: None,
             eos: false,
             mix: None,
             priming: false,
@@ -1059,6 +1105,7 @@ impl PlaybackSession {
             span_rate: Rate::REAL_TIME,
             span,
             span_priming: true,
+            dissolve: None,
             eos: false,
             mix: None,
             priming: false,
@@ -1393,6 +1440,32 @@ impl PlaybackSession {
                     // The first picture out of the span now decoding ends its
                     // prime ([`Self::span_priming`]).
                     self.span_priming = false;
+                    // Inside the dissolve window this span's tail owes its
+                    // successor, if any: B's own decoder, graded and placed
+                    // exactly as an export would place it, blended over A's
+                    // already-converted picture -- the one blend point every
+                    // path to the screen goes through, playing or scrubbed,
+                    // since both drain this same channel one frame at a time.
+                    if self
+                        .dissolve
+                        .as_ref()
+                        .is_some_and(|d| frame.index >= d.tail_start)
+                    {
+                        self.open_dissolve_b();
+                    }
+                    if let Some(d) = self.dissolve.as_mut()
+                        && frame.index >= d.tail_start
+                        && let Some(b) = d.b.as_mut()
+                    {
+                        while let Ok(bf) = b.frames.try_recv() {
+                            b.held = Some(bf);
+                        }
+                        if let Some(bf) = &b.held {
+                            let idx_in_window = (frame.index - d.tail_start).min(d.window - 1);
+                            let t = crate::export::dissolve_weight(idx_in_window, d.window);
+                            frame.bgra = blend_bgra(&frame.bgra, &bf.bgra, t);
+                        }
+                    }
                     return Some(frame);
                 }
                 Err(TryRecvError::Empty) => return None,
@@ -1562,6 +1635,34 @@ impl PlaybackSession {
     /// video that is now the worker's own doing -- it opens the file, so it is
     /// the one that finds out -- and nothing on this thread waits to hear it.
     fn start_span(&mut self, span: Option<Span>) {
+        // The outgoing span's own dissolve, if it ever opened B's decoder:
+        // that decoder's pictures were for a window this span is leaving
+        // (played through, paused before, or seeked away from), and never
+        // for the one about to start -- parked in `retired` exactly like the
+        // picture worker below, so joining it costs this thread nothing.
+        if let Some(Dissolve { b: Some(b), .. }) = self.dissolve.take() {
+            let mut worker = b.worker;
+            worker.cancel();
+            self.retired.push(worker);
+            self.retired.retain(|w| !w.is_finished());
+        }
+        // What the *new* span's own tail owes its successor -- checked here,
+        // once, rather than every tick: adjacency can only change on an edit,
+        // and every edit that could touches this span starts it over
+        // ([`crate::export::dissolve_window`] makes the identical check for
+        // the same reason, on export).
+        self.dissolve = span.and_then(|s| {
+            crate::export::dissolve_window(&self.project, &s).map(
+                |(b_source, b_in_frame, window, b_start)| Dissolve {
+                    tail_start: s.start + s.len - window,
+                    window,
+                    b_source,
+                    b_in_frame,
+                    b_start,
+                    b: None,
+                },
+            )
+        });
         // Which file's frames the worker about to be opened will number its
         // pictures in: the span's own source, and real time for a gap, whose
         // black worker counts timeline frames already. Set before the open,
@@ -1730,6 +1831,55 @@ impl PlaybackSession {
         self.backend = stream.backend;
         self.retire(stream.worker);
         self.span = span;
+    }
+
+    /// Opens B's own decoder for the current span's dissolve, the first time
+    /// [`try_frame`](Self::try_frame) sees the playhead inside the window --
+    /// a no-op once it is already open, or if this span has no dissolve at
+    /// all. Everything [`start_span`](Self::start_span) works out for A's own
+    /// decoder, worked out again for B: the stand-in switch
+    /// ([`Self::picture_path`]), the file's own frame numbering
+    /// ([`Self::rates`]), and B's *own* grade and fit, asked at B's own start
+    /// on the timeline rather than at the position the blend writes to
+    /// (still inside A's span) -- the same asymmetry
+    /// [`crate::export`]'s own `Dissolve` is built with.
+    fn open_dissolve_b(&mut self) {
+        let Some(d) = &self.dissolve else { return };
+        if d.b.is_some() {
+            return;
+        }
+        let (source, in_frame, window, b_start) = (d.b_source, d.b_in_frame, d.window, d.b_start);
+        let path = self.picture_path(source);
+        let rate = self.rates.get(source).copied().unwrap_or(Rate::REAL_TIME);
+        let start_frame = rate.source_at(in_frame);
+        let end_frame = rate.source_at(in_frame + window);
+        let color = self
+            .project
+            .composite_color_at(b_start)
+            .copied()
+            .unwrap_or_default();
+        let canvas = Composer::new(
+            self.meta.width,
+            self.meta.height,
+            self.project.composite_fit_at(b_start),
+        );
+        let tone = self.project.tone();
+        let stream = DecodeSession::open_worker_deferred(
+            &path,
+            start_frame,
+            end_frame,
+            color,
+            canvas,
+            tone,
+            Speed::NORMAL,
+        );
+        if let Some(d) = self.dissolve.as_mut() {
+            d.b = Some(DissolveB {
+                frames: stream.frames,
+                worker: stream.worker,
+                held: None,
+            });
+        }
     }
 
     /// Length of the edited timeline in seconds -- what a ruler shows, and it
@@ -3872,15 +4022,66 @@ fn secs_to_frame(secs: f64, fps: f64) -> u32 {
     (secs * fps + 1e-6).floor().max(0.0) as u32
 }
 
+/// Per-byte lerp of two same-sized BGRA8 frames -- [`crate::scale::blend_i420`]'s
+/// interleaved-buffer twin. By the time a picture reaches [`try_frame`]
+/// (`PlaybackSession::try_frame`) it is already colour-converted for the
+/// screen, so there are no separate Y/U/V planes left to blend, only the one
+/// buffer; straight alpha survives the lerp untouched (255 against 255 is
+/// still 255). `t` is B's weight, [`crate::export::dissolve_weight`]'s own
+/// convention.
+fn blend_bgra(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
+    let t = t.clamp(0.0, 1.0);
+    assert_eq!(a.len(), b.len(), "blend_bgra: mismatched frame sizes");
+    a.iter()
+        .zip(b)
+        .map(|(&av, &bv)| (av as f32 + (bv as f32 - av as f32) * t).round() as u8)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Lane, PlaybackSession, Source, audio_source_of, secs_to_frame};
+    use super::{Edge, Lane, PlaybackSession, Source, audio_source_of, blend_bgra, secs_to_frame};
     use std::path::PathBuf;
 
     fn asset(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets")
             .join(name)
+    }
+
+    /// `blend_bgra` at the two ends and the midpoint of its weight -- `t=0` is
+    /// pure A, `t=1` is pure B, `t=0.5` rounds each byte to its own midpoint.
+    /// Straight alpha (255 in both) survives every weight, which is the one
+    /// channel a wrong blend would otherwise fog.
+    #[test]
+    fn blend_bgra_interpolates_every_byte_including_alpha() {
+        let a = [10u8, 20, 30, 255];
+        let b = [110u8, 120, 130, 255];
+        assert_eq!(blend_bgra(&a, &b, 0.0), a);
+        assert_eq!(blend_bgra(&a, &b, 1.0), b);
+        assert_eq!(blend_bgra(&a, &b, 0.5), [60, 70, 80, 255]);
+    }
+
+    /// The dissolve window's own edges, in the units [`PlaybackSession::start_span`]
+    /// computes them in: a `tail_start` of `span.start + span.len - window`
+    /// puts the very first output frame of the window at `idx_in_window == 0`
+    /// and the very last at `window - 1`, clamped rather than overrun by a
+    /// frame that lands exactly on the span's own end -- the same off-by-one
+    /// a stray `%` or unclamped subtraction would have shown on screen as a
+    /// blend that never quite reached full B.
+    #[test]
+    fn dissolve_window_edges_index_zero_to_window_minus_one() {
+        let (span_start, span_len, window) = (100u32, 30u32, 10u32);
+        let tail_start = span_start + span_len - window;
+        assert_eq!(tail_start, 120);
+        let idx_in_window = |frame: u32| (frame - tail_start).min(window - 1);
+        assert_eq!(idx_in_window(120), 0, "first frame of the window");
+        assert_eq!(idx_in_window(129), 9, "last frame of the window");
+        assert_eq!(
+            idx_in_window(130),
+            9,
+            "one past the span's own end clamps rather than panics"
+        );
     }
 
     /// A picked project rate overrides the derived one, and its absence leaves
