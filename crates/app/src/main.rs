@@ -385,6 +385,26 @@ struct Player {
     /// or the one derived beside the media it started as. Saving twice
     /// overwrites the same file rather than making a second one.
     project_path: PathBuf,
+    /// Whether an edit has landed since the sidecar last caught up with it --
+    /// set at every edit's own door ([`Player::mark_dirty`]) and cleared once
+    /// [`Player::autosave_tick`] has written it out. `project_path` itself is
+    /// never touched here: only [`Player::save_project`] writes the real file.
+    autosave_dirty: bool,
+    /// When the dirty flag above was last set, so a tick can debounce: a
+    /// sidecar write waits until the hand has been off the timeline for a
+    /// few seconds, rather than chasing every pointer sample of a drag.
+    autosave_last_edit: Option<Instant>,
+    /// When the sidecar was last actually written, so a long unbroken run of
+    /// edits still gets caught by the periodic safety net rather than being
+    /// debounced forever.
+    autosave_last_run: Option<Instant>,
+    /// A sidecar found newer than the project it sits beside, offered on the
+    /// notice bar the moment that project opens ([`Player::install_project`]).
+    /// The path is the sidecar's own, so accepting it needs nowhere else to
+    /// look; declining or answering any other key just drops it here --
+    /// `project_path` is never touched by either path, only a manual save
+    /// writes the real file.
+    recovery_sidecar: Option<PathBuf>,
     /// Which stroke means what, and what every shortcut on screen is called.
     /// The one place either question is answered.
     keymap: Keymap,
@@ -813,6 +833,10 @@ fn main() {
                     // export beside the picture, a save beside it too.
                     export_path: PathBuf::new(),
                     project_path: PathBuf::new(),
+                    autosave_dirty: false,
+                    autosave_last_edit: None,
+                    autosave_last_run: None,
+                    recovery_sidecar: None,
                     keymap: keymap.clone(),
                     keys_open: false,
                     keys_search: String::new(),
@@ -899,6 +923,7 @@ fn main() {
                 // Nothing else takes focus, and without it the key listener
                 // above is never reached.
                 window.focus(&player.read(cx).focus);
+                player.update(cx, |player, cx| player.start_autosave(cx));
                 player
             },
         )

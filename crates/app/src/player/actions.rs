@@ -29,6 +29,32 @@ impl Player {
             // answer with a line about exports.
             Enable::Hidden(_) => return,
         }
+        // The one choke point for every action that changes what a save would
+        // write: the timeline's clips, the tracks that hold them, the subtitle
+        // tracks. Marked before the match rather than once per arm below --
+        // an autosave a beat early over a refusal (nothing to regroup, say)
+        // costs nothing a real edit would not have earned anyway, and one list
+        // here is the whole answer instead of fifteen scattered calls.
+        if matches!(
+            action,
+            ActionId::Paste
+                | ActionId::Cut
+                | ActionId::Regroup
+                | ActionId::Detach
+                | ActionId::Group
+                | ActionId::Delete
+                | ActionId::Lift
+                | ActionId::Undo
+                | ActionId::AddVideoLane
+                | ActionId::RemoveVideoLane
+                | ActionId::AddAudioLane
+                | ActionId::RemoveAudioLane
+                | ActionId::AddSubtitleLane
+                | ActionId::RemoveSubtitleLane
+                | ActionId::ImportSubtitles
+        ) {
+            self.mark_dirty();
+        }
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
             // No session touched at all: the pump reads the flag itself at

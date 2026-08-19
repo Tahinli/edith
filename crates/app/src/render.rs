@@ -207,6 +207,19 @@ impl Render for Player {
                 {
                     return;
                 }
+                // The recovery notice is the one bar that reads a key as more
+                // than "answered": `enter` loads the sidecar it named, and
+                // every other key declines it -- the way any other key
+                // dismisses any other notice. Asked before the generic
+                // dismiss below shares the same door with it, not instead of
+                // it: this recovers or declines, that pops the bar.
+                if this.recovery_sidecar.is_some() {
+                    if key == "enter" {
+                        this.recover_from_sidecar(cx);
+                    } else {
+                        this.recovery_sidecar = None;
+                    }
+                }
                 // Any key answers the message on the bar and brings the next of
                 // them up, whatever it was -- and owes
                 // the repaint itself: a notice no longer keeps the render loop

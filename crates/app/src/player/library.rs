@@ -3,6 +3,12 @@
 
 use crate::*;
 
+/// How long an edit must sit idle before the sidecar catches up with it.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// The longest a run of edits with no gap between them goes unsaved: the
+/// periodic half of "debounced + periodic".
+const AUTOSAVE_PERIOD: Duration = Duration::from_secs(60);
+
 impl Player {
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
@@ -1282,7 +1288,19 @@ impl Player {
                 // reaches the screen the way a seek's does. The old picture is
                 // released by the swap in `pump`, as after any other seek.
                 self.reset_after_reseek();
-                format!("LOADED {}{}", file_name(path), silent.unwrap_or_default())
+                // Offered right after the load it is about, on top of the
+                // "LOADED" line rather than instead of it: a person deciding
+                // whether to recover still gets to see what they *did* open.
+                self.recovery_sidecar = Self::recovery_offer(path);
+                let recovery = self.recovery_sidecar.as_ref().map(|_| {
+                    " — a newer autosave was found: enter recovers it, any other key keeps this"
+                });
+                format!(
+                    "LOADED {}{}{}",
+                    file_name(path),
+                    silent.unwrap_or_default(),
+                    recovery.unwrap_or_default()
+                )
             }
             Err(e) => format!("OPEN FAILED: {e}"),
         };
@@ -1299,12 +1317,140 @@ impl Player {
             .as_ref()
             .map(|session| session.save_project(&self.project_path));
         let text = match saved {
-            Some(Ok(())) => format!("SAVED {}", file_name(&self.project_path)),
+            Some(Ok(())) => {
+                // The manual save is now the newest copy of the timeline, so
+                // the sidecar's job is done -- left behind it would outlive
+                // its use and, if it later grew younger than a *later* manual
+                // save through some clock oddity, could be offered as
+                // "recovery" over a file that already holds everything it did.
+                if let Some(sidecar) = Self::autosave_path(&self.project_path) {
+                    let _ = std::fs::remove_file(sidecar);
+                }
+                self.autosave_dirty = false;
+                self.autosave_last_edit = None;
+                format!("SAVED {}", file_name(&self.project_path))
+            }
             Some(Err(e)) => format!("SAVE FAILED: {e}"),
             None => "NOTHING TO SAVE — open a file first".to_string(),
         };
         eprintln!("{text}");
         self.notify_user(text.into());
+        cx.notify();
+    }
+
+    /// Marks that an edit has landed since the sidecar last caught up, and
+    /// when: the door every edit that funnels through [`Player::act`] or a
+    /// timeline gesture calls on its way through. Cheap and safe to call on a
+    /// refusal too -- an autosave a beat early costs nothing a real edit
+    /// would not have earned anyway.
+    pub(crate) fn mark_dirty(&mut self) {
+        self.autosave_dirty = true;
+        self.autosave_last_edit = Some(Instant::now());
+    }
+
+    /// Where the autosave for `project_path` lives: beside it, named after it.
+    /// A project with no path yet (nothing saved, nothing opened) has nowhere
+    /// beside it to write to, so autosave sits out until the first manual
+    /// save gives it one -- the same file the recovery check on open reads.
+    fn autosave_path(project_path: &Path) -> Option<PathBuf> {
+        (!project_path.as_os_str().is_empty()).then(|| {
+            let mut name = project_path.as_os_str().to_owned();
+            name.push(".autosave");
+            PathBuf::from(name)
+        })
+    }
+
+    /// Answers the recovery notice with `enter`: opens the sidecar
+    /// [`recovery_sidecar`](Self::recovery_sidecar) named and installs it the
+    /// same way any other `.edith` lands, but naming the *real* project's
+    /// path -- so the sidecar's contents replace the timeline in memory while
+    /// `project_path` keeps pointing at the user's own file, exactly as it did
+    /// before this call. Nothing here ever writes that file: the next thing to
+    /// touch it is still only a manual save.
+    pub(crate) fn recover_from_sidecar(&mut self, cx: &mut Context<Self>) {
+        let Some(sidecar) = self.recovery_sidecar.take() else {
+            return;
+        };
+        let project_path = self.project_path.clone();
+        let opened = PlaybackSession::open_project(&sidecar).map_err(|e| e.to_string());
+        self.install_project(&project_path, opened, cx);
+        // `install_project` just re-ran the same mtime check on its way in and
+        // found the same sidecar still younger (recovering writes nothing to
+        // either file) -- offering the recovery it was just asked for right
+        // back would be the one loop in this feature.
+        self.recovery_sidecar = None;
+    }
+
+    /// Whether `project_path` has a sidecar beside it that outdates the file
+    /// itself: the sidecar exists, the project exists, and the sidecar's mtime
+    /// is strictly the younger of the two. Pure and file-system-only -- no
+    /// session, no `Player` -- so [`install_project`](Self::install_project)
+    /// asks it before anything is loaded and a test can ask it with nothing
+    /// but two paths on disk. A missing project file (a `.edith` opened for
+    /// the first time from somewhere else) or a missing/older sidecar both
+    /// answer `None`: there is nothing here a person did not just open on
+    /// their own.
+    fn recovery_offer(project_path: &Path) -> Option<PathBuf> {
+        let sidecar = Self::autosave_path(project_path)?;
+        let project_mtime = std::fs::metadata(project_path).and_then(|m| m.modified()).ok()?;
+        let sidecar_mtime = std::fs::metadata(&sidecar).and_then(|m| m.modified()).ok()?;
+        (sidecar_mtime > project_mtime).then_some(sidecar)
+    }
+
+    /// Starts the one background loop that ticks the autosave: every five
+    /// seconds, forever, for as long as the window is up. Cheap to run idle --
+    /// a tick with nothing dirty does nothing but reschedule itself -- so one
+    /// loop for the window's whole life is simpler than arming and disarming
+    /// a timer around every edit.
+    pub(crate) fn start_autosave(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .await;
+                if this.update(cx, |this, cx| this.autosave_tick(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One tick of the loop above. Writes the sidecar when an edit has been
+    /// idle for [`AUTOSAVE_DEBOUNCE`] (the debounce) or dirty edits have gone
+    /// unwritten for [`AUTOSAVE_PERIOD`] (the periodic safety net for a run
+    /// that never goes idle), and never while an export is running -- the two
+    /// would fight the same disk and the same worker for nothing an export
+    /// needs. Failure is a stderr line, never a notice: a sidecar losing a
+    /// write is not something a person can do anything about right now, and a
+    /// modal over it would be worse than the risk it is guarding against.
+    fn autosave_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.autosave_dirty || self.exporting().is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let idle = self
+            .autosave_last_edit
+            .map_or(true, |t| now.duration_since(t) >= AUTOSAVE_DEBOUNCE);
+        let overdue = self
+            .autosave_last_run
+            .map_or(true, |t| now.duration_since(t) >= AUTOSAVE_PERIOD);
+        if !idle && !overdue {
+            return;
+        }
+        let Some(sidecar) = Self::autosave_path(&self.project_path) else {
+            return;
+        };
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        match session.save_project(&sidecar) {
+            Ok(()) => {
+                self.autosave_dirty = false;
+                self.autosave_last_run = Some(now);
+            }
+            Err(e) => eprintln!("AUTOSAVE FAILED: {e}"),
+        }
         cx.notify();
     }
 
@@ -1416,6 +1562,7 @@ impl Player {
             cx.notify();
             return;
         };
+        self.mark_dirty();
         if moved != lane {
             self.selected.clear();
             self.context_menu = None;
@@ -1475,5 +1622,65 @@ impl Player {
                 cx.notify();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod autosave_tests {
+    use super::*;
+
+    /// The three answers [`Player::recovery_offer`] gives, off nothing but a
+    /// project file and a sidecar's mtimes: younger sidecar offers it, an
+    /// older one or none at all offers nothing. Nowhere near a `Player` or a
+    /// `PlaybackSession` -- the helper reads only the filesystem, which is
+    /// what makes it askable from a test at all ([`Player`] needs a
+    /// `gpui::TestAppContext` this repo has no way to build).
+    #[test]
+    fn recovery_offer_reads_only_the_newer_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "edith-autosave-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("p.edith");
+        let sidecar = dir.join("p.edith.autosave");
+
+        // Neither file exists yet.
+        assert_eq!(Player::recovery_offer(&project), None);
+
+        std::fs::write(&project, b"project").unwrap();
+        // A project with no sidecar beside it: nothing to offer.
+        assert_eq!(Player::recovery_offer(&project), None);
+
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        let now = std::time::SystemTime::now();
+        // Sidecar written after the project (the ordinary case: an edit
+        // landed since the last manual save) -- offered.
+        std::fs::File::open(&project)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(60))
+            .unwrap();
+        std::fs::File::open(&sidecar)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+        assert_eq!(Player::recovery_offer(&project), Some(sidecar.clone()));
+
+        // The sidecar left over from *before* the last manual save (the save
+        // that answered it, per `Player::save_project`, deletes it -- but an
+        // older one left by some other means must not be offered as newer
+        // than a file it predates).
+        std::fs::File::open(&project)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+        std::fs::File::open(&sidecar)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(Player::recovery_offer(&project), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
