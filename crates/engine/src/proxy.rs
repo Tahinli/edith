@@ -524,6 +524,9 @@ fn started(source: &Path, only_if: fn(&VideoMeta) -> bool) -> crate::Result<Opti
             bitrate: Some(bitrate),
             ..Default::default()
         },
+        // A stand-in keeps its film's own rate: the override is the
+        // timeline's affair, not the proxy's.
+        None,
     );
     Ok(Some(Job {
         out,

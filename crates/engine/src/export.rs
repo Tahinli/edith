@@ -443,6 +443,7 @@ pub fn start(
     meta: VideoMeta,
     out: &Path,
     settings: &ExportSettings,
+    sample_rate: Option<u32>,
 ) -> ExportHandle {
     let settings = settings.clone();
     let shared = Arc::new(Shared {
@@ -498,7 +499,7 @@ pub fn start(
             )
             .into()),
             format if format.has_video() => {
-                let first = run(&project, &meta, &part, &worker, &settings);
+                let first = run(&project, &meta, &part, &worker, &settings, sample_rate);
                 match first {
                     // The hardware encoder's *process* died under the driver
                     // ([`crate::hwproc`]) -- the editor is still here, and the
@@ -525,12 +526,12 @@ pub fn start(
                         // run backwards.
                         let mut software = settings.clone();
                         software.seat = EncoderSeat::Software;
-                        run(&project, &meta, &part, &worker, &software)
+                        run(&project, &meta, &part, &worker, &software, sample_rate)
                     }
                     other => other,
                 }
             }
-            _ => run_audio(&project, &meta, &part, &worker, &settings),
+            _ => run_audio(&project, &meta, &part, &worker, &settings, sample_rate),
         };
         let result = written.and_then(|()| std::fs::rename(&part, &out).map_err(Into::into));
         if result.is_err() {
@@ -1309,6 +1310,7 @@ fn copy_audio(
     kbps: u32,
     mkv: bool,
     shared: &Shared,
+    sample_rate: Option<u32>,
 ) -> crate::Result<Option<ExportAudio>> {
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
@@ -1350,7 +1352,7 @@ fn copy_audio(
         }
     }
     let [segments] = &lanes[..] else {
-        return encode_audio(project, meta, kbps, mkv, shared);
+        return encode_audio(project, meta, kbps, mkv, shared, sample_rate);
     };
     // ...and the same list names *which* lane those clips sit on, which is the
     // only way to ask what has been done to them.
@@ -1388,7 +1390,7 @@ fn copy_audio(
     // such a lane would write it at unity and unlimited, silently.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
     if speeded || equalized(project) || mastered(project) {
-        return encode_audio(project, meta, kbps, mkv, shared);
+        return encode_audio(project, meta, kbps, mkv, shared, sample_rate);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
     // inside a Matroska file (readable, but not out of a sample table this walks
@@ -1408,7 +1410,7 @@ fn copy_audio(
             // (they are not in a sample table) and every one of them re-encodes.
             opus_pre_skip: None,
         })),
-        Err(_) => encode_audio(project, meta, kbps, mkv, shared),
+        Err(_) => encode_audio(project, meta, kbps, mkv, shared, sample_rate),
     }
 }
 
@@ -1663,6 +1665,7 @@ fn encode_audio(
     kbps: u32,
     mkv: bool,
     shared: &Shared,
+    sample_rate: Option<u32>,
 ) -> crate::Result<Option<ExportAudio>> {
     let sources = project.audio_sources();
     let segs = project.audio_segments_from(0, meta.frame_rate);
@@ -1673,13 +1676,14 @@ fn encode_audio(
     // is written, and which minutes went where is the first question asked of a
     // slow export. Three lines an export, so they stay on.
     let mixed = std::time::Instant::now();
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
         &sources,
         &segs,
         &eqs,
         &speeds,
         &project.audio_gains(),
         project.limiter(),
+        sample_rate,
     )?
     else {
         return Ok(None); // no audio to write, exactly as a copy of nothing is
@@ -2138,6 +2142,7 @@ fn run(
     out: &Path,
     shared: &Arc<Shared>,
     settings: &ExportSettings,
+    sample_rate: Option<u32>,
 ) -> crate::Result<()> {
     // The media's length and not the timeline's: a caption placed past the last
     // picture holds the *timeline* open ([`Project::timeline_frames`]) and there
@@ -2205,6 +2210,7 @@ fn run(
                     audio_kbps_of(&settings),
                     settings.format.is_mkv(),
                     &shared,
+                    sample_rate,
                 )
             })?
     };
@@ -2743,6 +2749,7 @@ fn run_audio(
     out: &Path,
     shared: &Shared,
     settings: &ExportSettings,
+    sample_rate: Option<u32>,
 ) -> crate::Result<()> {
     let format = settings.format;
     let sources = project.audio_sources();
@@ -2762,13 +2769,14 @@ fn run_audio(
     // limiter out of it. The same opener playback's feeder reads from, so a
     // file is written at the levels it was heard at -- there is no second
     // place here that could mix it differently.
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
         &sources,
         &segs,
         &eqs,
         &speeds,
         &project.audio_gains(),
         project.limiter(),
+        sample_rate,
     )?
     else {
         return Err("this timeline has no audio to export".into());
