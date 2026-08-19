@@ -370,19 +370,6 @@ pub(crate) fn clip_middle(name: &str, width: f32) -> String {
     )
 }
 
-/// Whether the subtitle list has the height to name each file over its tracks.
-/// A header is worth its own height only where there are still tracks under it
-/// to read: at the 640x360 floor the list is one row tall, and a header there
-/// would name a film and show none of it -- so at the floor there are no
-/// headers and the rows say which file they came from themselves.
-///
-/// The window's height answers it on its own: the row above the picture and the
-/// panel under it are fixed, so every pixel the window gains past the floor is a
-/// pixel this column gains.
-pub(crate) fn sub_headers_fit(viewport_h: f32) -> bool {
-    SUB_ROWS_AT_FLOOR + (viewport_h - 360.).max(0.) >= SUB_HEAD_H + 2. * ROW_H
-}
-
 /// What the window is called: the program, and what is open in it. The name is
 /// what the header shows, so an empty window says the program alone rather than
 /// "no file open — edith".

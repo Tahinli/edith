@@ -1124,6 +1124,46 @@ fn subtitle_rows_group_a_source_however_they_were_added() {
         "the group carries the path the tint is asked by"
     );
     assert_eq!(file_tint(&sources, &groups[2].path), None);
+    // What a header's "N tracks" says: the group's own row count, which is
+    // 2, 2, 1 here -- a film that gave several tracks and a standalone
+    // `.srt` that gave exactly one.
+    assert_eq!(
+        groups.iter().map(|g| g.rows.len()).collect::<Vec<_>>(),
+        [2, 2, 1]
+    );
+    // A standalone `.srt` is already its own group, named after its own
+    // file ("late", not lumped under some catch-all "External" bucket) --
+    // there is no sourceless case for a header to special-case.
+    assert_eq!(groups[2].name, "late");
+    assert_eq!(groups[2].path, PathBuf::from("/subs/late.srt"));
+}
+
+/// The fold a click on a header sets is keyed by [`SubGroup::path`]
+/// (`Player::sub_folded`), so it has to survive the very thing regrouping
+/// is for: a second track landing on a file already in the list, or one
+/// being removed from it. The group's path is the fold's whole identity,
+/// so it must not move under either.
+#[test]
+fn a_groups_fold_key_survives_a_track_arriving_or_leaving_its_file() {
+    let before = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+    ];
+    let after_add = [
+        sub("/films/a.mkv", Some(1), "eng"),
+        sub("/films/b.mkv", Some(1), "eng"),
+        sub("/films/a.mkv", Some(2), "fre"),
+    ];
+    let (before_groups, after_groups) = (subtitle_rows(&before), subtitle_rows(&after_add));
+    assert_eq!(before_groups[0].path, after_groups[0].path, "a's key held");
+    assert_eq!(before_groups[1].path, after_groups[1].path, "b's key held");
+    // The group a second track landed on grew; the other did not move.
+    assert_eq!(after_groups[0].rows.len(), 2);
+    assert_eq!(after_groups[1].rows.len(), 1);
+    // Removing that same track back off leaves the original key and count.
+    let after_remove = subtitle_rows(&before);
+    assert_eq!(after_remove[0].path, before_groups[0].path);
+    assert_eq!(after_remove[0].rows.len(), 1);
 }
 
 /// What the strip header, the section heading and the toggle's notice all
@@ -1216,6 +1256,42 @@ fn the_text_tab_carries_the_add_subtitles_door() {
         crate::LibraryTab::Text.empty().contains("Add subtitles"),
         "{}",
         crate::LibraryTab::Text.empty()
+    );
+}
+
+/// A source's group header in the library must not vanish on a short
+/// window: it is drawn whenever there is more than one source
+/// (`several_files`), never gated on the viewport's height, and the list
+/// under it is what scrolls instead ([`SUB_ROWS_H`]). And it has to be a
+/// real fold, not the click-cycling pattern this codebase has already
+/// thrown out once: one click toggles `sub_folded` shut or open, it never
+/// steps through more than those two states.
+#[test]
+fn a_subtitle_group_header_is_never_gated_on_window_height() {
+    let timeline = src_text("ui/timeline.rs");
+    assert!(
+        !timeline.contains("sub_headers_fit"),
+        "the header is still gated on the viewport's height"
+    );
+    let at = timeline
+        .find("let headed = ")
+        .expect("no `headed` computed in subtitle_section");
+    let line = &timeline[at..(at + 80).min(timeline.len())];
+    assert!(
+        line.contains("several_files") && !line.contains("viewport"),
+        "headed depends on something other than the file count: {line}"
+    );
+    // The header is a click target that flips membership in a set --
+    // `remove` else `insert` -- not a value stepped through several states.
+    let head_at = timeline
+        .find("subtitle-group-head")
+        .expect("no id on the group header");
+    let block = &timeline[head_at..(head_at + 2400).min(timeline.len())];
+    assert!(block.contains("sub_folded.remove"), "no fold-open path: {block}");
+    assert!(block.contains("sub_folded.insert"), "no fold-shut path: {block}");
+    assert!(
+        block.contains("\"1 track\"") || block.contains("tracks"),
+        "the header does not say how many tracks it holds: {block}"
     );
 }
 
