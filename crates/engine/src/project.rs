@@ -2246,14 +2246,22 @@ impl Project {
         let Some(held) = self.lane(lane).get(idx).copied() else {
             return Err(format!("there is no clip {idx} on {}", lane.label()).into());
         };
-        let (old, new) = (f64::from(held.frames()), f64::from(speed.frames(held.len())));
-        let ratio = new / old.max(1.);
-        let retimed = |s: SubClip| SubClip {
-            start: ((f64::from(s.start) - f64::from(held.start)) * ratio + f64::from(held.start))
+        // The same per-member piece `speeded_playhead` builds for this op,
+        // asked here instead of read there -- a caption's length comes from
+        // the map's own ends (`end - start`), never `round(len * ratio)`
+        // separately, which is what let the two answers drift apart by a
+        // frame.
+        let (held_old, new) = (held.speed.as_f64(), speed.as_f64());
+        let scale = |f: u32| {
+            (f64::from(held.start) + (f64::from(f) - f64::from(held.start)) * held_old / new)
                 .round()
-                .clamp(0., f64::from(u32::MAX)) as u32,
-            frames: (f64::from(s.frames) * ratio).round().clamp(1., f64::from(u32::MAX)) as u32,
-            ..s
+                .clamp(0., f64::from(u32::MAX)) as u32
+        };
+        let retimed = |s: SubClip| {
+            let map = TimelineMap::piece((s.start, s.end()), (scale(s.start), scale(s.end())));
+            let start = map.apply(s.start);
+            let end = map.apply(s.end()).max(start + 1);
+            SubClip { start, frames: end - start, ..s }
         };
         for &(l, i) in &members.clips {
             let clips = &self.lanes[l].clips;
@@ -5335,6 +5343,125 @@ mod tests {
             "the piece behind slides up by what the region gave back"
         );
         assert!(subs_sorted_disjoint(&p.lanes[p.index(s1).unwrap()].subs));
+    }
+
+    /// [`Project::speeded_playhead`]'s caption arm fires only when the
+    /// playhead is inside a caption member and outside every clip member --
+    /// a shape every other fixture avoids by keeping its caption inside the
+    /// held clip. Here the caption overhangs the clip's tail, and the
+    /// playhead standing in that overhang is answered by the caption's own
+    /// piece: it scales about the held clip's head by the held clip's own
+    /// proportion, same as [`write_speed`](Project::write_speed) re-times it.
+    #[test]
+    fn the_caption_arm_answers_a_playhead_in_the_overhang_past_its_clip() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        let mut p = Project::single(FILE, 90).with_subtitles(vec![track()]);
+        let s1 = p.add_lane(LaneKind::Subtitle);
+        // The caption spans [80, 100) -- ten frames past the clip's own end
+        // at 90 -- grouped with the clip so it re-times by the clip's ratio.
+        p.place_sub(s1, 80, caption(80, 20)).expect("placed");
+        p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+        // At 2x the clip halves to 45 frames; the overhang frame 95, which
+        // no clip member's old span reaches, is the caption's own question:
+        // half of 95 is 47.5, rounded to 48.
+        assert_eq!(
+            p.speeded_playhead(Lane::V1, 0, Speed::from_permille(2000), 95),
+            Some(48),
+            "the overhang frame answers through the caption's own piece"
+        );
+    }
+
+    /// `write_speed` and `speeded_playhead` are two questions of the SAME
+    /// map ([`map`]'s architecture law): a caption's landed span comes from
+    /// the map's own ends, and the playhead standing at the caption's own
+    /// last frame before the write has to land exactly where the write put
+    /// it -- across clip lengths and rates that round differently, and an
+    /// odd-length caption straddling the clip's own tail edge, the corner
+    /// where `write_speed` used to answer a frame short.
+    #[test]
+    fn write_speed_and_speeded_playhead_agree_at_a_captions_own_last_frame() {
+        let caption = |start: u32, frames: u32| SubClip {
+            start,
+            frames,
+            track: 0,
+            in_us: 0,
+            out_us: i64::from(frames) * 1_000_000,
+            link: None,
+        };
+        let track = || SubtitleTrack {
+            path: FILE.into(),
+            track: None,
+            language: "eng".into(),
+            name: String::new(),
+            label: "eng".into(),
+            cues: Vec::new(),
+            bitmap: false,
+            refused: None,
+        };
+        for &len in &[90u32, 91, 177, 300, 301] {
+            for &permille in &[500u16, 2000, 2500, 3000] {
+                let mut p = Project::single(FILE, len).with_subtitles(vec![track()]);
+                let s1 = p.add_lane(LaneKind::Subtitle);
+                // An odd-length caption straddling the clip's tail edge: its
+                // own last frame lands past the held clip.
+                let c_start = len.saturating_sub(3);
+                p.place_sub(s1, c_start, caption(c_start, 7)).expect("placed");
+                p.group_all(&[(Lane::V1, 0), (s1, 0)]).expect("grouped");
+                let speed = Speed::from_permille(permille);
+                let last = c_start + 7 - 1;
+                let mapped = p
+                    .speeded_playhead(Lane::V1, 0, speed, last)
+                    .expect("the caption is there");
+                if p.set_speed(Lane::V1, 0, speed).is_err() {
+                    continue; // a refusal changes nothing: not this law's cell
+                }
+                let landed = p.sub_lane(s1)[0];
+                if permille >= 1000 {
+                    // A speed-up compresses the timeline: many old frames
+                    // share one new frame, so the caption's own last old
+                    // frame lands flush with the write's own boundary --
+                    // the exact law [`write_speed`]'s worked drift-fix case
+                    // is stated against.
+                    assert_eq!(
+                        mapped,
+                        landed.end() - 1,
+                        "len {len} permille {permille}: the playhead at the caption's own \
+                         last frame lands where the write actually put it"
+                    );
+                } else {
+                    // A slow-down expands it: one old frame becomes several
+                    // new ones, and `apply` answers where that frame's own
+                    // block *starts*, not where the caption's last new
+                    // frame (the end of that same block) sits -- a
+                    // one-frame gap inherent to the piece's own semantics,
+                    // not a drift between the two callers. Both still have
+                    // to agree the answer sits inside the caption the write
+                    // actually landed.
+                    assert!(
+                        (landed.start..landed.end()).contains(&mapped),
+                        "len {len} permille {permille}: the playhead lands inside the \
+                         caption the write actually put ({landed:?}), got {mapped}"
+                    );
+                }
+            }
+        }
     }
 
     /// A grouped caption's cues re-time with its clip: the placement's window
