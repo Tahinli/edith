@@ -1757,10 +1757,13 @@ fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
     for lane in back.lanes() {
         assert_eq!(back.lane_clips(lane), session.lane_clips(lane), "{lane:?}");
     }
-    // Delete on the layer is a lift: it is laid over the timeline, so
-    // closing a hole under it would drag the take beneath out of step with
-    // it. The take on the first pair is still a take, and still ripples.
-    assert!(!whole_take(&session, v2, 0));
+    // The drop grouped `V2` with the `A2` it added -- a take, same as the
+    // first pair's, just on an added row -- so Delete would close both their
+    // own lanes too (`Project::delete_members`), not drag the first pair out
+    // of step: `delete_members` ripples only a member's own lane. Lift is
+    // tested directly here instead, to check its own hole-left-open law
+    // without going through the Delete key's routing.
+    assert!(whole_take(&session, v2, 0));
     assert!(whole_take(&session, Lane::V1, 0));
     assert!(whole_take(&session, Lane::A1, 0));
     assert_eq!(a2.label(), "A2");
@@ -1795,6 +1798,60 @@ fn a_track_can_be_added_dropped_on_edited_and_taken_back() {
     assert_eq!(session.lanes(), vec![Lane::V1, Lane::A1]);
     assert_eq!(session.lane_clips(Lane::V1).len(), 1);
     assert_eq!(format_refusal(&session, Format::Mp4), None);
+}
+
+/// A caption grouped with a clip on an *added* lane closes its lane's hole
+/// too, not just the first pair's: the same law commit `cdc53a6` gave `V1`
+/// (`whole_take` -> `Project::delete_members`) has to hold from every anchor
+/// a Delete can be clicked from, or a grouped caption on `V2`/subtitle
+/// survives its clip as an orphan link. `whole_take` used to answer `false`
+/// for any lane with `ord >= 1` no matter what it was grouped with, which
+/// routed `Player::delete_selected` to `lift_clip` -- the clip's own lane
+/// left a hole, and the caption it was grouped with was never touched at
+/// all.
+#[test]
+fn a_grouped_clip_on_an_added_lane_closes_its_hole_with_its_caption() {
+    use engine::project::LaneKind;
+
+    let (mut session, sub_lane) = with_subtitle_lane();
+    let v2 = session.add_lane(LaneKind::Video);
+    let path = session.sources()[0].path.clone();
+    assert!(
+        session
+            .place_stream_at(0.0, &path, 0, Some(v2))
+            .expect("its own file is on this timeline")
+    );
+    session
+        .place_sub(sub_lane, 0, one_second(0))
+        .expect("the caption goes down");
+    session
+        .group_all(&[(v2, 0), (sub_lane, 0)])
+        .expect("a clip on an added lane and a caption are a group");
+
+    // The group pairs the clip for the whole-take question from its own
+    // lane, `ord >= 1` or not.
+    assert!(whole_take(&session, v2, 0));
+
+    // Two clips after the group's own -- something to close the hole
+    // against on the caption's lane too.
+    session
+        .place_sub(sub_lane, 60, one_second(60))
+        .expect("a second caption after it");
+    assert_eq!(session.sub_lane(sub_lane).len(), 2);
+
+    // `Player::delete_selected` calls exactly this door once `whole_take`
+    // says yes -- the fix is that it now reaches it from `v2` too.
+    assert!(session.delete_clip(v2, 0));
+    assert!(session.lane_clips(v2).is_empty(), "the clip is gone");
+    assert_eq!(
+        session.sub_lane(sub_lane).len(),
+        1,
+        "its grouped caption went with it, not left as an orphan"
+    );
+    assert_eq!(
+        session.sub_lane(sub_lane)[0].start, 30,
+        "and the hole under it closed: the caption after it slid up"
+    );
 }
 
 #[test]
