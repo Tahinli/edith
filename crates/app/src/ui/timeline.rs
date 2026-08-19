@@ -1492,6 +1492,91 @@ impl Player {
                                         .child(inner),
                                 )
                             }))
+                            // The fades: a translucent wedge at each end an
+                            // audio clip ramps, drawn over the waveform the way
+                            // every editor shades a fade. Width comes straight
+                            // off the clip's own frames, never off the visible
+                            // slice -- unlike the waveform a wedge that starts
+                            // off the left edge of the bed still shades the
+                            // clip's own corner once scrolled back into view,
+                            // because `overflow_hidden` on the box already
+                            // clips it, and clamped to the box's own width so a
+                            // fade longer than a zoomed-in clip never draws
+                            // past its neighbour.
+                            .when(audio, |d| {
+                                let fade_in = self.shown_fade_in(lane, i, clip);
+                                let fade_out = self.shown_fade_out(lane, i, clip);
+                                d.children(
+                                    [
+                                        (fade_in > 0).then(|| {
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .h_full()
+                                                .w(px(scale
+                                                    .width_px(f64::from(fade_in) / self.fps)
+                                                    .min(width)))
+                                                .child(fade_wedge(true))
+                                        }),
+                                        (fade_out > 0).then(|| {
+                                            div()
+                                                .absolute()
+                                                .right_0()
+                                                .top_0()
+                                                .h_full()
+                                                .w(px(scale
+                                                    .width_px(f64::from(fade_out) / self.fps)
+                                                    .min(width)))
+                                                .child(fade_wedge(false))
+                                        }),
+                                    ]
+                                    .into_iter()
+                                    .flatten(),
+                                )
+                            })
+                            // The fade handles: a small grab corner at each
+                            // *top* of an audio clip's box, sitting just
+                            // inside the [`EDGE_W`] trim strip rather than on
+                            // top of it -- [`FADE_HANDLE_H`] never reaches
+                            // past the label row, so a trim's own strip (the
+                            // box's *full* height) is still the whole of what
+                            // a press below the label starts. Gated on
+                            // [`trims`] like the trim strips themselves: a box
+                            // too small for an edge to trim by is too small
+                            // for a fade handle either.
+                            .when(audio && trims(span), |d| {
+                                d.children([Edge::Start, Edge::End].into_iter().map(|edge| {
+                                    let is_in = edge == Edge::Start;
+                                    let mut handle = div()
+                                        .absolute()
+                                        .top_0()
+                                        .w(px(FADE_HANDLE_W))
+                                        .h(px(FADE_HANDLE_H))
+                                        .occlude()
+                                        .cursor(CursorStyle::ResizeLeftRight)
+                                        .hover(|s| s.bg(rgb(ACCENT_PRIMARY())))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    this.start_fade_drag(
+                                                        lane,
+                                                        i,
+                                                        is_in,
+                                                        event.position.x,
+                                                        cx,
+                                                    );
+                                                },
+                                            ),
+                                        );
+                                    handle = match edge {
+                                        Edge::Start => handle.left(px(EDGE_W)),
+                                        Edge::End => handle.right(px(EDGE_W)),
+                                    };
+                                    handle
+                                }))
+                            })
                             // A speeded clip says so on the box, in the corner
                             // the label does not reach: the box's width alone
                             // cannot say whether a short clip is a trim or a
