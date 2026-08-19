@@ -1130,3 +1130,31 @@ fn exactly_one_subtitle_lane_is_shown_whatever_the_pick_and_whatever_is_left() {
     // A pick that is not a subtitle lane at all cannot name one either.
     assert_eq!(active_lane(Some(Lane::V1), &[s1, s2]), Some(s1));
 }
+
+/// A library preview's whole point ([`Player::open_preview`],
+/// [`Player::close_preview`]): the timeline's own session is untouched by
+/// one showing over it. `Player` cannot be built here -- it takes a gpui
+/// `Context`, which this test binary has no `TestAppContext` to hand it
+/// (see the crate's other tests for the same limit) -- so this exercises
+/// the two sessions `open_preview`/`close_preview` juggle directly: seeking
+/// and playing one, exactly as a preview session's own life does, leaves
+/// the other's position and clock exactly where they were.
+#[test]
+fn a_second_session_playing_never_moves_the_first() {
+    let mut timeline = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    timeline.seek(0.5);
+    let before = timeline.now();
+    let before_playing = timeline.is_playing();
+
+    // Stands in for the preview session `open_preview` opens over it.
+    let mut preview = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+    preview.seek(1.0);
+    preview.play();
+
+    assert_eq!(timeline.now(), before, "the preview's seek moved the wrong session");
+    assert_eq!(
+        timeline.is_playing(),
+        before_playing,
+        "the preview's play moved the wrong session"
+    );
+}
