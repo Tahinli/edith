@@ -2042,3 +2042,17 @@ fn frac_along_measures_from_the_elements_own_left_edge() {
     // to +12 dB on the first press.
     assert_eq!(frac_down(px(50.), Bounds::default()), 0.5);
 }
+
+/// A fade handle's pixels turn into frames at the bed's own scale, and a
+/// degenerate scale (nothing painted) turns into no movement at all.
+#[test]
+fn a_fade_drag_converts_pixels_to_frames_at_the_beds_scale() {
+    use crate::timeline_math::fade_delta_frames;
+    // 100 px/s at 25 fps: one second of pixels is one second of frames.
+    assert_eq!(fade_delta_frames(100., 100., 25.), 25);
+    // Signed: dragging back shrinks the fade by the same conversion.
+    assert_eq!(fade_delta_frames(-50., 100., 25.), -13);
+    // Nothing drawn to drag against moves nothing.
+    assert_eq!(fade_delta_frames(40., 0., 25.), 0);
+    assert_eq!(fade_delta_frames(40., -1., 25.), 0);
+}

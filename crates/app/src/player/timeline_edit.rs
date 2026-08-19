@@ -1267,6 +1267,34 @@ impl Player {
         }
     }
 
+    /// Crossfades across the join the selection names: two picks on one audio
+    /// lane take the pair, one pick takes it and its right-hand neighbour. The
+    /// engine owns adjacency ([`Project::crossfade`]); a refusal is worded
+    /// here, in [`Player::regroup`]'s voice, because `false` is all it says.
+    pub(crate) fn crossfade_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some((lane, idx)) = (match self.selected.picks() {
+            [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
+            _ => self.selected.anchor(),
+        }) else {
+            self.notify_user("NOTHING TO CROSSFADE — select an audio clip that has a neighbour".into());
+            cx.notify();
+            return;
+        };
+        let frames = self.fps.round().max(1.) as u32;
+        if let Some(session) = &mut self.session {
+            if !session.crossfade(lane, idx, frames) {
+                self.notify_user(
+                    "NOTHING TO CROSSFADE — it takes two audio clips sitting end to end on one lane"
+                        .into(),
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// The clip as the drag is showing it: an edge under the pointer moves its
     /// own box, and the boxes of everything linked to it, before anything is
     /// committed. Display only -- the project is not touched until the release.

@@ -130,6 +130,10 @@ actions! {
     Equalizer,
     Speed,
     Silence,
+    /// Crossfades the selected audio clip into its neighbour ([`Project::crossfade`]):
+    /// two adjacent clips picked on one lane, or a single pick faded into the
+    /// clip right after it.
+    Crossfade,
     Mix,
     ToggleSnap,
     ToggleSubtitles,
@@ -220,6 +224,7 @@ impl ActionId {
             ActionId::Equalizer => "Equalizer",
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
+            ActionId::Crossfade => "Crossfade into the next clip",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
@@ -286,6 +291,7 @@ impl ActionId {
             ActionId::Equalizer => "equalizer",
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
+            ActionId::Crossfade => "crossfade",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
@@ -339,7 +345,8 @@ impl ActionId {
             // The scan reads a clip's sound, but what it does is edit the
             // timeline the clip is on -- it is a clip card like the three
             // above it, opened on whichever half was picked.
-            | ActionId::Silence => Category::Clips,
+            | ActionId::Silence
+            | ActionId::Crossfade => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
             // Neither is how much of the timeline the panel shows: a zoom edits
@@ -953,6 +960,10 @@ impl Keymap {
                 // delete (x and delete) -- what it opens is a card that can cut
                 // forty places at once.
                 b(ActionId::Silence, "u", false),
+                // Crossfade takes ctrl+f: the mnemonic letter for "fade", with
+                // ctrl its own room now that plain "f" is the mix card's own
+                // (below) -- the same letter, the modifier telling them apart.
+                b(ActionId::Crossfade, "f", true),
                 // The mix card takes "f", for the faders on it: "m" would be
                 // the word but it is the monitoring mute, which is this
                 // machine's volume and not the project's -- two things one key
@@ -1265,7 +1276,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 61);
+        assert_eq!(k.entries().len(), 62);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
