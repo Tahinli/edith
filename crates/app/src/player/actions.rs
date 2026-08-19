@@ -7,7 +7,7 @@ impl Player {
     /// What an action does, wherever it was asked for -- a stroke, or the clip
     /// menu item that names the same action. One table, so the two can never
     /// come to mean different things.
-    pub(crate) fn act(&mut self, action: ActionId, cx: &mut Context<Self>) {
+    pub(crate) fn act(&mut self, action: ActionId, window: &mut Window, cx: &mut Context<Self>) {
         // Two doors, one oracle. This used to be the asymmetry the whole
         // toolbar was built on: the buttons dimmed themselves off
         // [`enable`] while the keyboard walked straight past it, so with no
@@ -97,10 +97,15 @@ impl Player {
             // At the window's corner, since a stroke names no place -- and
             // [`menu_at`] keeps it on screen from there.
             ActionId::Theme => self.open_picker(Pick::Theme, Point::default(), cx),
+            // The platform's own toggle (gpui::Window::toggle_fullscreen); the
+            // window reports its own new state back through `is_fullscreen`,
+            // there is no local bool to keep in step with it.
+            ActionId::Fullscreen => window.toggle_fullscreen(),
             // Nothing to cancel while nothing is exporting; the export guard in
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
             ActionId::ShowActions => self.show_actions(cx),
+            ActionId::Screenshot => self.take_screenshot(cx),
         }
     }
 
@@ -248,7 +253,7 @@ impl Player {
             timeline: true,
             clipboard: self.clipboard.is_some(),
             subtitles: !session.subtitles().is_empty(),
-            playable: !nothing_to_play(Some(session)),
+            playable: !nothing_to_play(self.active_session()),
             exporting: self.exporting().is_some(),
             picks: picks.len(),
             pick_lanes,
