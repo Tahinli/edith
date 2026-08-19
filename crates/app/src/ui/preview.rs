@@ -1,8 +1,80 @@
 //! The picture: what is drawn over it and what is read off it.
 
 use crate::*;
+use std::path::{Path, PathBuf};
 
 impl Player {
+    /// The one thing that says a preview is up rather than the timeline: a
+    /// banner over the top of the picture, and a click of its own -- the
+    /// keyboard has `esc`, and a hand with only a mouse needs a way out too.
+    pub(crate) fn preview_badge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        self.preview_session.is_some().then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.))
+                .p(px(4.))
+                .bg(rgba(SUB_SHADE()))
+                .text_size(px(11.))
+                .text_color(rgb(FG_PRIMARY()))
+                .child("PREVIEW — not on the timeline")
+                .child(
+                    div()
+                        .id("preview-stop")
+                        .px(px(6.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .bg(rgb(BG_RAISED()))
+                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
+                        .child("Stop (esc)"),
+                )
+        })
+    }
+
+    /// The frame on screen right now, written to a PNG: `image` and its
+    /// `as_bytes` are gpui's own cached copy of what was last handed to the
+    /// atlas ([`Player::pump`]), so this reads no decoder and races nothing --
+    /// works during preview or on the timeline, whichever is showing.
+    pub(crate) fn take_screenshot(&mut self, cx: &mut Context<Self>) {
+        let no_frame = || "NO FRAME TO SAVE — nothing is showing yet".to_string();
+        let Some(image) = self.image.clone() else {
+            self.notify_user(no_frame().into());
+            cx.notify();
+            return;
+        };
+        let Some(bytes) = image.as_bytes(0) else {
+            self.notify_user(no_frame().into());
+            cx.notify();
+            return;
+        };
+        let size = image.size(0);
+        let stem = self
+            .active_session()
+            .and_then(|s| s.sources().first())
+            .map_or_else(|| self.name.to_string(), |s| file_name(&s.path));
+        let stem = std::path::Path::new(&stem)
+            .file_stem()
+            .map_or(stem.clone(), |s| s.to_string_lossy().into_owned());
+        let tc = timecode(
+            self.active_session().map_or(0., PlaybackSession::now),
+            self.active_fps(),
+        )
+        .replace(':', "-");
+        let text = match save_screenshot(bytes, size.width.0 as u32, size.height.0 as u32, &stem, &tc)
+        {
+            Ok(path) => format!("SAVED {}", path.display()),
+            Err(e) => format!("SCREENSHOT FAILED: {e}"),
+        };
+        self.notify_user(text.into());
+        cx.notify();
+    }
+
     /// The cues the *subtitle lanes* put on screen at `at`, over the picture and
     /// nothing else: bottom-centred where every player puts them, white on a
     /// plate so the film underneath cannot swallow them, and each cue its own
@@ -200,4 +272,66 @@ impl Player {
             _ => format!("{} decode", decode_label(codec, backend)),
         }
     }
+}
+
+/// `~/Pictures/edith`, or `.` with no `HOME` -- [`keymap::config_path_in`]'s
+/// own fallback, for the same reason: a screenshot has to land somewhere even
+/// on a machine with no desktop environment set up.
+pub(crate) fn screenshots_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("Pictures")
+        .join("edith")
+}
+
+/// Where a screenshot goes: `stem-tc.png` in `dir`, or the same name with a
+/// numeric suffix if that one is already taken -- a screenshot never
+/// overwrites another the way an export overwrites its own path.
+pub(crate) fn screenshot_path(dir: &Path, stem: &str, tc: &str) -> PathBuf {
+    let base = format!("{stem}-{tc}");
+    let first = dir.join(format!("{base}.png"));
+    if !first.exists() {
+        return first;
+    }
+    let mut n = 2;
+    loop {
+        let path = dir.join(format!("{base}-{n}.png"));
+        if !path.exists() {
+            return path;
+        }
+        n += 1;
+    }
+}
+
+/// The swap every BGRA frame needs to become the RGBA a PNG writes: gpui's
+/// atlas is BGRA with straight alpha ([`Player::sub_picture`]'s own comment),
+/// and `image::save` writes RGBA.
+pub(crate) fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut out = bgra.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    out
+}
+
+/// Writes `bgra` (`w`x`h`, gpui's own layout) to a fresh PNG under
+/// [`screenshots_dir`], creating the directory if this is the first one.
+/// Never called on the render thread's own budget for more than a channel
+/// swap and one `image::save` -- there is no decode here, only a copy already
+/// in memory.
+pub(crate) fn save_screenshot(
+    bgra: &[u8],
+    w: u32,
+    h: u32,
+    stem: &str,
+    tc: &str,
+) -> Result<PathBuf, String> {
+    let dir = screenshots_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = screenshot_path(&dir, stem, tc);
+    let rgba = bgra_to_rgba(bgra);
+    let buf = image::RgbaImage::from_raw(w, h, rgba)
+        .ok_or_else(|| "frame buffer sized w*h*4".to_string())?;
+    buf.save(&path).map_err(|e| e.to_string())?;
+    Ok(path)
 }
