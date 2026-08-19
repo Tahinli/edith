@@ -66,6 +66,8 @@ fn track() -> SubtitleTrack {
 
 fn clip(start: u32, in_frame: u32, out_frame: u32) -> Clip {
     Clip {
+        fade_in: 0,
+        fade_out: 0,
         start,
         in_frame,
         out_frame,
