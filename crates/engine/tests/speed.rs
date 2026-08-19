@@ -516,6 +516,8 @@ fn an_mp4_export_honours_a_speeded_picture_across_a_rate_change() {
             Lane::V1,
             fast,
             Clip {
+                fade_in: 0,
+                fade_out: 0,
                 speed: Speed::NORMAL,
                 ..whole
             }

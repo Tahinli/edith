@@ -295,6 +295,8 @@ mod tests {
 
     fn clip(start: u32, in_frame: u32, out_frame: u32, speed: Speed) -> Clip {
         Clip {
+            fade_in: 0,
+            fade_out: 0,
             start,
             in_frame,
             out_frame,

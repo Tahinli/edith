@@ -615,6 +615,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     use keymap::{ActionId, Keymap};
     // Frames 30..90 of the timeline, taken from the head of its source.
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -655,6 +657,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // clip by any reading of the playhead, so "only from inside a clip"
     // there is a refusal claiming something the screen contradicts.
     let slow = Clip {
+        fade_in: 0,
+        fade_out: 0,
         speed: Speed::MIN,
         ..clip
     };
@@ -679,6 +683,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
     // engine's question. Group is offered on every clip, for that reason.
     assert!(!offered(&clip, v1, ActionId::Detach, 0));
     let grouped = Clip {
+        fade_in: 0,
+        fade_out: 0,
         link: Some(3),
         ..clip
     };
@@ -981,6 +987,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
 fn a_menu_offers_only_what_applies_and_is_drawn_inside_the_window() {
     use keymap::ActionId;
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 30,
         in_frame: 0,
         out_frame: 60,
@@ -1611,6 +1619,8 @@ fn removing_a_row_is_refused_while_it_plays_and_takes_the_row_away() {
 #[test]
 fn a_copied_clip_is_renumbered_or_dropped_when_a_row_leaves_the_library() {
     let clip = |source: usize| Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: 30,
