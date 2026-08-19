@@ -1545,6 +1545,33 @@ impl Player {
                                     .flatten(),
                                 )
                             })
+                            // The dissolve: a small X astride the join, drawn
+                            // over the last `transition_out` frames of this
+                            // clip's own box, whenever the next clip on the
+                            // lane actually abuts it -- the engine already
+                            // refuses `transition_out` on anything else
+                            // ([`Project::set_transition_out`]), but a moved
+                            // neighbour can leave a stale value behind, so
+                            // this checks the join itself rather than trust
+                            // the field alone.
+                            .when(
+                                lane.kind == LaneKind::Video
+                                    && clip.transition_out > 0
+                                    && clips.get(i + 1).is_some_and(|n| n.start == clip.end()),
+                                |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .right_0()
+                                            .top_0()
+                                            .h_full()
+                                            .w(px(scale
+                                                .width_px(f64::from(clip.transition_out) / self.fps)
+                                                .min(width)))
+                                            .child(dissolve_glyph()),
+                                    )
+                                },
+                            )
                             // The fade handles: a small grab corner at each
                             // *top* of an audio clip's box, sitting just
                             // inside the [`EDGE_W`] trim strip rather than on

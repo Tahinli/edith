@@ -1295,6 +1295,41 @@ impl Player {
         cx.notify();
     }
 
+    /// Dissolves the join the selection names, into or back out of it: two
+    /// picks on one video lane take the pair, one pick takes it and its
+    /// right-hand neighbour. If the leading clip already carries a dissolve
+    /// this removes it (`0` frames) instead of widening it -- a toggle, same
+    /// key either way. The engine owns adjacency ([`Project::set_transition_out`]);
+    /// a refusal is worded here, in [`Player::crossfade_selected`]'s voice.
+    pub(crate) fn dissolve_selected(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some((lane, idx)) = (match self.selected.picks() {
+            [a, b] if a.0 == b.0 && a.1.abs_diff(b.1) == 1 => Some((a.0, a.1.min(b.1))),
+            _ => self.selected.anchor(),
+        }) else {
+            self.notify_user("NOTHING TO DISSOLVE — select a video clip that has a neighbour".into());
+            cx.notify();
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            cx.notify();
+            return;
+        };
+        let removing = session.transition_out_of(lane, idx) > 0;
+        let frames = if removing { 0 } else { self.fps.round().max(1.) as u32 };
+        if !session.set_transition_out(lane, idx, frames) {
+            self.notify_user(
+                "NOTHING TO DISSOLVE — it takes two video clips sitting end to end on one lane"
+                    .into(),
+            );
+        } else if removing {
+            self.notify_user("DISSOLVE REMOVED — the clips cut again".into());
+        }
+        cx.notify();
+    }
+
     /// The clip as the drag is showing it: an edge under the pointer moves its
     /// own box, and the boxes of everything linked to it, before anything is
     /// committed. Display only -- the project is not touched until the release.
