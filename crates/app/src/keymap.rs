@@ -80,6 +80,14 @@ actions! {
     /// by what they are for.
     PrevSyncPoint,
     NextSyncPoint,
+    /// Marks the playhead as an export's in point. The out point wraps around
+    /// it if the mark lands past the current out ([`ordered_range`]).
+    SetIn,
+    /// The out point's pair. Ordered the same way against whatever in point
+    /// stands already.
+    SetOut,
+    /// Drops the mark: an export goes back to the whole timeline.
+    ClearRange,
     Export,
     Save,
     Copy,
@@ -171,6 +179,9 @@ impl ActionId {
             ActionId::GoEnd => "Go to the last frame",
             ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
             ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
+            ActionId::SetIn => "Mark in (export range)",
+            ActionId::SetOut => "Mark out (export range)",
+            ActionId::ClearRange => "Clear the export range",
             ActionId::Export => "Export",
             ActionId::Save => "Save",
             ActionId::Copy => "Copy",
@@ -237,6 +248,9 @@ impl ActionId {
             ActionId::GoEnd => "go-end",
             ActionId::PrevSyncPoint => "prev-sync-point",
             ActionId::NextSyncPoint => "next-sync-point",
+            ActionId::SetIn => "set-in",
+            ActionId::SetOut => "set-out",
+            ActionId::ClearRange => "clear-range",
             ActionId::Export => "export",
             ActionId::Save => "save",
             ActionId::Copy => "copy",
@@ -304,7 +318,10 @@ impl ActionId {
             | ActionId::GoStart
             | ActionId::GoEnd
             | ActionId::PrevSyncPoint
-            | ActionId::NextSyncPoint => Category::Playback,
+            | ActionId::NextSyncPoint
+            | ActionId::SetIn
+            | ActionId::SetOut
+            | ActionId::ClearRange => Category::Playback,
             ActionId::Copy
             | ActionId::Paste
             | ActionId::Select
@@ -827,6 +844,16 @@ impl Keymap {
                 // step through the same timeline by the source's own grid.
                 b(ActionId::PrevSyncPoint, "[", true),
                 b(ActionId::NextSyncPoint, "]", true),
+                // The mark pair, on the letters every editor already means them
+                // by: bare, since a mark is set as often as a step and nothing
+                // else in this table answers to either.
+                b(ActionId::SetIn, "i", false),
+                b(ActionId::SetOut, "o", false),
+                // The clear takes the ctrl chord: not a stroke to hit setting
+                // one mark and reaching for the other. Free -- "u" bare is the
+                // silence card, and nothing else in this table answers to
+                // ctrl+u.
+                b(ActionId::ClearRange, "u", true),
                 b(ActionId::Export, "e", false),
                 b(ActionId::Save, "s", true),
                 b(ActionId::Copy, "c", true),
@@ -1238,7 +1265,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 58);
+        assert_eq!(k.entries().len(), 61);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
@@ -1262,6 +1289,9 @@ mod tests {
         assert_eq!(k.lookup("]", true), Some(ActionId::NextSyncPoint));
         assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
         assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
+        assert_eq!(k.lookup("i", false), Some(ActionId::SetIn));
+        assert_eq!(k.lookup("o", false), Some(ActionId::SetOut));
+        assert_eq!(k.lookup("u", true), Some(ActionId::ClearRange));
         assert_eq!(k.lookup("e", false), Some(ActionId::Export));
         assert_eq!(k.lookup("s", true), Some(ActionId::Save));
         assert_eq!(k.lookup("c", true), Some(ActionId::Copy));
