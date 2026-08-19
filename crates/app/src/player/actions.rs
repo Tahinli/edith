@@ -29,6 +29,35 @@ impl Player {
             // answer with a line about exports.
             Enable::Hidden(_) => return,
         }
+        // The one choke point for every action that changes what a save would
+        // write: the timeline's clips, the tracks that hold them, the subtitle
+        // tracks. Marked before the match rather than once per arm below --
+        // an autosave a beat early over a refusal (nothing to regroup, say)
+        // costs nothing a real edit would not have earned anyway, and one list
+        // here is the whole answer instead of fifteen scattered calls.
+        if matches!(
+            action,
+            ActionId::Paste
+                | ActionId::Cut
+                | ActionId::Regroup
+                | ActionId::Detach
+                | ActionId::Group
+                | ActionId::Delete
+                | ActionId::Lift
+                | ActionId::Undo
+                | ActionId::Redo
+                | ActionId::AddVideoLane
+                | ActionId::RemoveVideoLane
+                | ActionId::AddAudioLane
+                | ActionId::RemoveAudioLane
+                | ActionId::AddSubtitleLane
+                | ActionId::RemoveSubtitleLane
+                | ActionId::ImportSubtitles
+                | ActionId::Crossfade
+                | ActionId::Dissolve
+        ) {
+            self.mark_dirty();
+        }
         match action {
             ActionId::Play => self.toggle_or_restart(cx),
             // No session touched at all: the pump reads the flag itself at
@@ -49,12 +78,20 @@ impl Player {
             // where the next one is depends on the file rather than on the rate.
             ActionId::PrevSyncPoint => self.jump_sync(false, cx),
             ActionId::NextSyncPoint => self.jump_sync(true, cx),
+            ActionId::SetIn => self.set_in(cx),
+            ActionId::SetOut => self.set_out(cx),
+            ActionId::ClearRange => {
+                self.range = None;
+                cx.notify();
+            }
             ActionId::Export => self.open_export(cx),
             ActionId::Save => self.save_project(cx),
             ActionId::Copy => self.copy_selected(),
             ActionId::Paste => self.paste(cx),
             ActionId::Cut => self.cut(cx),
             ActionId::Regroup => self.regroup(cx),
+            ActionId::Crossfade => self.crossfade_selected(cx),
+            ActionId::Dissolve => self.dissolve_selected(cx),
             ActionId::Detach => self.detach(cx),
             ActionId::Group => self.group(cx),
             ActionId::Select => self.select_under_playhead(cx),
@@ -73,6 +110,7 @@ impl Player {
             ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
             ActionId::ZoomFit => self.zoom_fit(cx),
             ActionId::Undo => self.undo(cx),
+            ActionId::Redo => self.redo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
             // The last track of that kind: the one the add key put there, so the
@@ -382,8 +420,39 @@ impl Player {
         cx.notify();
     }
 
+    /// Marks the playhead as an export's in point. `ordered_range` keeps the
+    /// pair legal whichever one lands past the other.
+    pub(crate) fn set_in(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let at = frame_at(session.now(), self.fps);
+        let out = self.range.map_or(at, |(_, e)| e);
+        self.range = Some(ordered_range(at, out));
+        cx.notify();
+    }
+
+    /// The out point's pair.
+    pub(crate) fn set_out(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let at = frame_at(session.now(), self.fps);
+        let start = self.range.map_or(at, |(s, _)| s);
+        self.range = Some(ordered_range(start, at));
+        cx.notify();
+    }
+
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
+            self.reset_after_reseek();
+        }
+        self.selected.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.session.as_mut().is_some_and(PlaybackSession::redo) {
             self.reset_after_reseek();
         }
         self.selected.clear();
@@ -428,5 +497,32 @@ impl Player {
         };
         eprintln!("{text}");
         self.notify_user(text.into());
+    }
+}
+
+/// The half-open range a mark and a mark make, in either order: a person's two
+/// keystrokes are not promised to land in order, so this is what turns
+/// whichever came second into the pair `Player::start_export` wants a range in
+/// -- and never an empty one, since a single frame marked in and out twice is
+/// still a frame to export.
+pub(crate) fn ordered_range(a: u32, b: u32) -> (u32, u32) {
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    if start == end {
+        (start, start + 1)
+    } else {
+        (start, end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ordered_range;
+
+    #[test]
+    fn ordered_range_never_empty_and_swaps_a_reversed_pair() {
+        assert_eq!(ordered_range(5, 10), (5, 10));
+        assert_eq!(ordered_range(10, 5), (5, 10));
+        assert_eq!(ordered_range(7, 7), (7, 8));
+        assert_eq!(ordered_range(0, 0), (0, 1));
     }
 }

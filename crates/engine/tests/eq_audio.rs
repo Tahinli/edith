@@ -54,6 +54,9 @@ fn boost() -> EqParams {
 
 fn clip(start: u32, source: usize, frames: u32) -> Clip {
     Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start,
         in_frame: 0,
         out_frame: frames,
@@ -298,7 +301,8 @@ fn the_audio_only_exports_carry_the_same_boost_playback_does() {
                     format,
                     ..Default::default()
                 },
-            );
+        None,
+    );
             wait(&handle, Duration::from_secs(60)).expect("an audio-only export");
             written.push(decode(&out));
             std::fs::remove_file(&out).unwrap();
@@ -338,7 +342,7 @@ fn an_mp4_export_carries_the_boost_a_packet_copy_could_not() {
     for (name, project) in [("flat", &flat), ("eqd", &eqd)] {
         let out = out_path(name, "mp4");
         let settings = ExportSettings::default();
-        let handle = engine::export::start(project.clone(), meta(), &out, &settings);
+        let handle = engine::export::start(project.clone(), meta(), &out, &settings, None);
         wait(&handle, Duration::from_secs(180)).expect("an equalized timeline exports as mp4");
         written.push(decode(&out));
         std::fs::remove_file(&out).unwrap();

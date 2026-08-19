@@ -303,12 +303,16 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
             };
             match still {
                 true => Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     in_frame: 0,
                     out_frame: keep,
                     start: to,
                     ..clip
                 },
                 false => Clip {
+                    fade_in: 0,
+                    fade_out: 0,
                     in_frame: clip.out_frame - keep.min(clip.out_frame),
                     start: to,
                     ..clip
@@ -317,6 +321,8 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
         }
         Edge::End => match clip.speed.fit(to.saturating_sub(clip.start)) {
             Some(keep) => Clip {
+                fade_in: 0,
+                fade_out: 0,
                 out_frame: clip.in_frame + keep,
                 ..clip
             },
@@ -331,6 +337,20 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
 /// (`Project::trim_sub_room`). Never zero: a placement of no frames is the one
 /// [`Project::place_sub`] refuses as empty, and a track shorter than a frame is
 /// still a caption somebody dragged.
+/// A fade handle's drag, turned into timeline frames: `dx` pixels at `pps`
+/// pixels per second, at `fps` frames per second -- the one conversion a
+/// fade-in or fade-out handle needs, and the app-side twin of every other
+/// pixel-to-frame door on this bed ([`Scale::time_at`]). Zero for a
+/// degenerate scale (nothing drawn to drag against), never negative on its
+/// own -- the caller adds this to the fade's length before clamping to the
+/// clip's own room, so a delta can still shrink a fade by coming back signed.
+pub(crate) fn fade_delta_frames(dx: f32, pps: f64, fps: f64) -> i64 {
+    if pps <= 0. {
+        return 0;
+    }
+    ((f64::from(dx) / pps) * fps).round() as i64
+}
+
 pub(crate) fn frames_of_us(us: i64, fps: f64) -> u32 {
     match fps.is_finite() && fps > 0. {
         true => ((us as f64) * fps / 1e6)

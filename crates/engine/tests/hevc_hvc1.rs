@@ -127,7 +127,7 @@ fn an_hvc1_source_exports_as_h264() {
     let project = Project::single(asset(HVC1), meta.frame_count);
     let out = Scratch::file("ve_export_hvc1", "mp4");
 
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     let started = Instant::now();
     while !handle.is_finished() {
         assert!(started.elapsed() < Duration::from_secs(120), "export hung");

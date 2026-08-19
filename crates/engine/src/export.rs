@@ -79,7 +79,7 @@ use crate::mux::{
     AudioParams, Av1Params, CopyParams, HevcParams, MkvMuxer, Mp4Muxer, SubParams, VideoParams,
 };
 use crate::project::{Lane, LaneKind, Project, Rate};
-use crate::scale::Composer;
+use crate::scale::{blend_i420, Composer};
 use crate::subtitle::{Cue, SubtitleTrack};
 use crate::tonemap::{self, ToneMapper};
 
@@ -367,6 +367,11 @@ pub struct ExportSettings {
     /// A delivery export must leave it off: an mp4 in BT.2020 PQ is a file for
     /// this editor to read back, not one to hand anybody.
     pub keep_source_colour: bool,
+    /// Half-open `[start, end)` in timeline frames, or `None` for the whole
+    /// timeline -- what every caller wrote before there was a choice, so an
+    /// export nobody has marked in or out on writes the same bytes it always
+    /// did. Session state, like the mark itself: never saved to a `.edith`.
+    pub range: Option<(u32, u32)>,
 }
 
 struct Shared {
@@ -715,13 +720,17 @@ fn video_label(format: Format, hw: bool) -> &'static str {
 /// copy; a speeded lane is resampled; an equalizer is sample math. The other
 /// half -- whether the sources can be copied out of at all -- costs a file open
 /// each and belongs to [`copy_audio`], which may re-encode where this says copy.
-fn forces_encode(project: &Project) -> bool {
+fn forces_encode(project: &Project, ranged: bool) -> bool {
     let lanes: Vec<_> = project
         .audio_lanes()
         .into_iter()
         .filter(|&lane| !project.lane(lane).is_empty())
         .collect();
-    lanes.len() > 1
+    // A ranged export needs an exact offset and an exact length, which a copy
+    // of the source's own packets cannot give it ([`copy_audio`]) -- so a
+    // range marked at all always encodes, whatever the lanes look like.
+    ranged
+        || lanes.len() > 1
         || lanes
             .iter()
             .any(|&lane| project.lane(lane).iter().any(|c| !c.speed.is_normal()))
@@ -744,6 +753,7 @@ fn audio_label(
     format: Format,
     sound: bool,
     copied: Option<bool>,
+    ranged: bool,
 ) -> &'static str {
     if !sound {
         return "no sound to write";
@@ -753,7 +763,7 @@ fn audio_label(
         Format::Flac => "FLAC · SW (flacenc)",
         Format::Mp3 => "MP3 · SW (rusty_mp3)",
         Format::Ogg => "Vorbis · SW (rusty_vorbis)",
-        _ => match copied.unwrap_or(!forces_encode(project)) {
+        _ => match copied.unwrap_or(!forces_encode(project, ranged)) {
             true => "AAC copy",
             // A Matroska file gets Opus where the mix allows it -- 48 kHz and
             // stereo, which is every Opus source and most of everything else --
@@ -795,14 +805,19 @@ fn measured_audio_label(
         // Opus: the fidelity gate sent it to AAC ([`OPUS_MIN_FIDELITY`]), or the
         // mix was not the 48 kHz stereo that seat is measured in.
         (Some(false), false) if format.is_mkv() => "AAC · SW encode (rusty_aac)",
-        _ => audio_label(project, format, sound.is_some(), sound),
+        // `sound` is already what happened, not a prediction, so `copied` is
+        // filled in and `ranged` never reaches the branch that reads it.
+        _ => audio_label(project, format, sound.is_some(), sound, false),
     }
 }
 
 /// What [`start`] would write this timeline's sound with, before one is
-/// started. Pure: no probe and no file opened, so a card may ask it per repaint.
-pub fn planned_audio(project: &Project, format: Format) -> &'static str {
-    audio_label(project, format, has_sound(project), None)
+/// started. Pure: no probe and no file opened, so a card may ask it per
+/// repaint. `ranged` is whether the export a card is describing is bounded to
+/// a marked range -- a copy needs the source's own packets to *be* the file,
+/// which a range's exact offset and length rule out ([`copy_audio`]).
+pub fn planned_audio(project: &Project, format: Format, ranged: bool) -> &'static str {
+    audio_label(project, format, has_sound(project), None, ranged)
 }
 
 /// Why the sound's rate is nothing this timeline can be asked about in this
@@ -814,7 +829,7 @@ pub fn planned_audio(project: &Project, format: Format) -> &'static str {
 /// [`ExportSettings::audio_kbps`] like every other encode. So the value travels
 /// even where this refuses; what it cannot do is silently write a rate nobody
 /// picked.
-pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static str> {
+pub fn audio_rate_refusal(project: &Project, format: Format, ranged: bool) -> Option<&'static str> {
     match format {
         _ if !has_sound(project) => Some("no sound to write"),
         Format::Wav | Format::Flac => Some("lossless — the samples themselves, at no rate"),
@@ -826,7 +841,7 @@ pub fn audio_rate_refusal(project: &Project, format: Format) -> Option<&'static 
         // does not hold, which is the one thing this card is built not to do.
         Format::Ogg => Some("quality-coded — Vorbis holds no rate to pick"),
         Format::Mp3 => None,
-        _ if forces_encode(project) => None,
+        _ if forces_encode(project, ranged) => None,
         _ => Some("the source's own packets are copied — at the rate they hold"),
     }
 }
@@ -961,7 +976,8 @@ fn lane_subtitles(project: &Project, fps: f64) -> Vec<SubParams> {
 }
 
 /// The composite spans an export *writes*: [`Project::composite_spans_from`]
-/// cut to where the media runs out ([`Project::media_frames`]).
+/// cut to where the media runs out ([`Project::media_frames`]), and, with
+/// `range` set, to that window too.
 ///
 /// The walk itself is the timeline's ([`Project::timeline_frames`]), because a
 /// caption placed past the last picture holds the timeline open under it and
@@ -971,14 +987,104 @@ fn lane_subtitles(project: &Project, fps: f64) -> Vec<SubParams> {
 /// the frame count [`run`] publishes, the cues [`lane_subtitles`] clips and the
 /// blocks [`CopyPlan`] copies are then the same number by construction, which
 /// is what makes [`planned_lanes`]' "cut off there" true of the file.
-fn export_spans(project: &Project) -> Vec<crate::project::Span> {
+///
+/// `span.start` stays the *project's* own timeline coordinate throughout --
+/// what [`Project::composite_color_at`] and its fit sibling are keyed on -- so
+/// a caller writing a range-relative output shifts it at the one place that
+/// actually emits a position (`CopyPlan`'s own region, since the encode loop
+/// counts pictures rather than reading `span.start` for its output clock).
+/// Trimming the left edge mid-span moves `from`'s source frame by
+/// [`Speed::source_at`], the same mapping a legal cut is placed by.
+fn export_spans(project: &Project, range: Option<(u32, u32)>) -> Vec<crate::project::Span> {
     let end = project.media_frames();
     let mut spans = project.composite_spans_from(0);
     spans.retain(|span| span.start < end);
     for span in &mut spans {
         span.len = span.len.min(end - span.start);
     }
+    let Some((r_start, r_end)) = range else {
+        return spans;
+    };
+    let r_end = r_end.min(end).max(r_start);
+    spans.retain(|span| span.start < r_end && span.start + span.len > r_start);
+    for span in &mut spans {
+        if span.start < r_start {
+            let cut = r_start - span.start;
+            if let Some((source, in_frame)) = span.from {
+                span.from = Some((source, in_frame + span.speed.source_at(cut)));
+            }
+            span.len -= cut;
+            span.start = r_start;
+        }
+        span.len = span.len.min(r_end - span.start);
+    }
     spans
+}
+
+/// The cross-dissolve this span's tail owes its successor, or `None` for a
+/// hard cut. `(b_source, b_in_frame, window, b_start)`: which source and
+/// source frame the dissolve's B side starts reading, how many *output*
+/// frames the blend ramps across, and where B sits on the timeline (which is
+/// what its own grade and fit are keyed on, [`Project::composite_color_at`]
+/// and [`Project::composite_fit_at`]).
+///
+/// [`Clip::transition_out`] is trusted only after adjacency is checked again
+/// here: a trim or a split since it was set leaves the stored number in
+/// place but not its meaning, so a stale one plays as the hard cut it now
+/// is rather than as a dissolve into a clip that no longer follows.
+fn dissolve_window(project: &Project, span: &crate::project::Span) -> Option<(usize, u32, u32, u32)> {
+    let (source, _) = span.from?;
+    let (lane, idx) = project.composite_clip_at(span.start)?;
+    let clips = project.lane(lane);
+    let a = clips.get(idx)?;
+    if a.source != source || a.transition_out == 0 {
+        return None;
+    }
+    let b = clips.get(idx + 1)?;
+    if a.end() != b.start {
+        return None; // trimmed or split apart since the dissolve was set
+    }
+    // The span must run uninterrupted all the way to A's own end: a higher
+    // video lane taking over before that means there is no tail of A left
+    // here to blend into anything.
+    if span.start + span.len != a.end() {
+        return None;
+    }
+    let window = a
+        .transition_out
+        .min(a.frames())
+        .min(b.frames())
+        .min(span.len);
+    (window > 0).then_some((b.source, b.in_frame, window, b.start))
+}
+
+/// `B`'s weight in [`blend_i420`] at output frame `idx_in_window` of `window`
+/// (`idx_in_window < window`): a ramp from just above 0 to just below 1 that
+/// never actually reaches either end, so the first blended frame still shows
+/// a trace of A and the last still a trace of B -- the cut a hard transition
+/// would have made lands one frame *after* the window, at full B, rather than
+/// inside it.
+fn dissolve_weight(idx_in_window: u32, window: u32) -> f32 {
+    (idx_in_window + 1) as f32 / (window + 1) as f32
+}
+
+/// A dissolve's B side, open beside A's own decoder for this span's tail:
+/// its own decoder, and everything [`place_picture`] needs to put its frames
+/// on the same canvas, in the same space, graded the way B is graded rather
+/// than the way A is -- [`Project::composite_color_at`]/`composite_fit_at`
+/// asked at B's own start, not at the timeline position the blend writes to,
+/// which is still inside A's span.
+struct Dissolve<'a> {
+    /// How many output frames the blend ramps across.
+    window: u32,
+    /// The first output frame of this span's tail that is inside the window.
+    tail_start: u32,
+    decoder: ClipDecoder,
+    mapper: Option<&'a ToneMapper>,
+    remap: Option<(Matrix, Matrix)>,
+    grade: Option<crate::color::ColorParams>,
+    canvas: Composer,
+    graded: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 /// The track's cues where the *exported* timeline puts them, which is the only
@@ -1257,14 +1363,20 @@ pub fn planned_seats(
     // a Matroska file has none -- so every mkv source re-encodes, however
     // untouched its lane is. Extension only, which is what `is_matroska`
     // reads, so this costs nothing beyond what is already open.
-    let copyable = !forces_encode(project)
+    let copyable = !forces_encode(project, settings.range.is_some())
         && !project
             .sources()
             .iter()
             .any(|source| crate::demux::is_matroska(&source.path));
     (
         video,
-        audio_label(project, settings.format, has_sound(project), Some(copyable)),
+        audio_label(
+            project,
+            settings.format,
+            has_sound(project),
+            Some(copyable),
+            settings.range.is_some(),
+        ),
     )
 }
 
@@ -1311,7 +1423,17 @@ fn copy_audio(
     mkv: bool,
     shared: &Shared,
     sample_rate: Option<u32>,
+    range: Option<(u32, u32)>,
 ) -> crate::Result<Option<ExportAudio>> {
+    // A ranged export needs an exact offset and an exact length, which a
+    // packet copy cannot give -- it carries whole segments named by
+    // `audio_segments_from(0, ..)`, not an arbitrary window into them. The
+    // decoded path already resamples per segment, so it is the one that can
+    // start and stop anywhere; this falls to it exactly as a speeded or
+    // equalized lane already does.
+    if range.is_some() {
+        return encode_audio(project, meta, kbps, mkv, shared, sample_rate, range);
+    }
     // The segments name their source, and the copy carries its packet-rounding
     // debt across a source join exactly as across a cut, so a timeline spanning
     // files stays in sync. A source whose AAC parameters disagree with the
@@ -1352,7 +1474,7 @@ fn copy_audio(
         }
     }
     let [segments] = &lanes[..] else {
-        return encode_audio(project, meta, kbps, mkv, shared, sample_rate);
+        return encode_audio(project, meta, kbps, mkv, shared, sample_rate, None);
     };
     // ...and the same list names *which* lane those clips sit on, which is the
     // only way to ask what has been done to them.
@@ -1390,7 +1512,7 @@ fn copy_audio(
     // such a lane would write it at unity and unlimited, silently.
     let speeded = project.lane(lane).iter().any(|c| !c.speed.is_normal());
     if speeded || equalized(project) || mastered(project) {
-        return encode_audio(project, meta, kbps, mkv, shared, sample_rate);
+        return encode_audio(project, meta, kbps, mkv, shared, sample_rate, None);
     }
     // What is left is a copy the *sources* may still not be able to give: AAC
     // inside a Matroska file (readable, but not out of a sample table this walks
@@ -1410,7 +1532,7 @@ fn copy_audio(
             // (they are not in a sample table) and every one of them re-encodes.
             opus_pre_skip: None,
         })),
-        Err(_) => encode_audio(project, meta, kbps, mkv, shared, sample_rate),
+        Err(_) => encode_audio(project, meta, kbps, mkv, shared, sample_rate, None),
     }
 }
 
@@ -1471,7 +1593,9 @@ struct CopyRegion {
     source: usize,
     /// Blocks of that source, in the file's own decode order.
     blocks: std::ops::Range<usize>,
-    /// The timeline frame the region's first picture is shown at.
+    /// The *output* frame the region's first picture is shown at -- the
+    /// project's own timeline frame less the range's own start, since a
+    /// ranged export's file starts a fresh clock at zero.
     start: u32,
 }
 
@@ -1489,10 +1613,26 @@ impl CopyPlan {
         let mut sources: Vec<Option<MkvDemuxer>> = (0..entries.len()).map(|_| None).collect();
         let mut declared: Option<(Vec<u8>, ColorDescription)> = None;
         let mut regions: Vec<CopyRegion> = Vec::new();
-        for span in export_spans(project) {
+        let r_start = settings.range.map_or(0, |(s, _)| s);
+        for span in export_spans(project, settings.range) {
+            let out_start = span.start - r_start;
             // A gap is black frames, which only an encoder makes.
             let (source, in_frame) = span.from?;
             if !span.speed.is_normal() {
+                return None;
+            }
+            // A copied packet is the source's own picture, never a blend: a
+            // live dissolve on this span's tail forces the whole video track
+            // through the encoder, exactly as a grade or a speed does below.
+            //
+            // corner-cut: the whole file falls back rather than only the
+            // clips either side of the dissolve -- [`CopyPlan`] is already
+            // all-or-nothing per export ([`CopyPlan`]'s own doc comment
+            // states why), so one dissolve on a two-hour film re-encodes all
+            // of it. Upgrade path: splice a re-encoded region between two
+            // copied ones, which needs the sample-table writer that doc
+            // comment already names as the cost of a finer copy.
+            if dissolve_window(project, &span).is_some() {
                 return None;
             }
             // The grade playback shows, which a copied packet never went
@@ -1554,14 +1694,14 @@ impl CopyPlan {
                     if last.source == source
                         && last.blocks.end == start
                         && last.start + (last.blocks.end - last.blocks.start) as u32
-                            == span.start =>
+                            == out_start =>
                 {
                     last.blocks.end = end;
                 }
                 _ => regions.push(CopyRegion {
                     source,
                     blocks: start..end,
-                    start: span.start,
+                    start: out_start,
                 }),
             }
         }
@@ -1666,21 +1806,25 @@ fn encode_audio(
     mkv: bool,
     shared: &Shared,
     sample_rate: Option<u32>,
+    range: Option<(u32, u32)>,
 ) -> crate::Result<Option<ExportAudio>> {
     let sources = project.audio_sources();
-    let segs = project.audio_segments_from(0, meta.frame_rate);
-    let eqs = project.audio_eqs_from(0, meta.frame_rate);
-    let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    let offset = range.map_or(0, |(s, _)| s);
+    let segs = project.audio_segments_from(offset, meta.frame_rate);
+    let eqs = project.audio_eqs_from(offset, meta.frame_rate);
+    let speeds = project.audio_speeds_from(offset, meta.frame_rate);
+    let fades = project.audio_fades_from(offset, meta.frame_rate);
     // Coarse stage timers, in the same voice as `export video: copy` below: an
     // export of a feature film spends minutes in here before a byte of picture
     // is written, and which minutes went where is the first question asked of a
     // slow export. Three lines an export, so they stay on.
     let mixed = std::time::Instant::now();
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at_fade(
         &sources,
         &segs,
         &eqs,
         &speeds,
+        &fades,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
@@ -1700,10 +1844,12 @@ fn encode_audio(
     // whole samples on its own, so the sum can miss by a sample or two and a
     // source that ran out early would leave the track short under a picture
     // that is not. One resize settles both, as [`run_audio`]'s does.
-    let total = (f64::from(project.media_frames()) / meta.frame_rate
-        * f64::from(audio.sample_rate))
-    .round() as usize
-        * channels;
+    let out_frames = range.map_or(project.media_frames(), |(s, e)| {
+        e.min(project.media_frames()).saturating_sub(s)
+    });
+    let total =
+        (f64::from(out_frames) / meta.frame_rate * f64::from(audio.sample_rate)).round() as usize
+            * channels;
     let mut samples: Vec<f32> = Vec::with_capacity(total);
     for chunk in chunks {
         // The only place a cancelled export can be answered before the whole
@@ -2151,7 +2297,12 @@ fn run(
     // trailing silence over a frozen last frame. The export ends with the last
     // picture or sound, the cues are cut off there ([`lane_subtitles`]), and
     // [`planned_subtitles`] says so before the button is pressed.
-    let total = project.media_frames();
+    // The range's own length where one is marked, the media's otherwise --
+    // `export_spans` walks the same window, so `done` ends on this `total`
+    // exactly as it always did.
+    let total = settings
+        .range
+        .map_or(project.media_frames(), |(s, e)| e.min(project.media_frames()).saturating_sub(s));
     // The two preview switches are the H.264 mp4 pair's alone. Only that
     // container carries a colour of its own back out ([`write_video`] tags it
     // there), so asking any other for a source-space file would write pictures
@@ -2211,6 +2362,7 @@ fn run(
                     settings.format.is_mkv(),
                     &shared,
                     sample_rate,
+                    settings.range,
                 )
             })?
     };
@@ -2355,11 +2507,17 @@ fn run(
     // past it under a trailing caption -- and *which* lane a span comes from is
     // `composite_spans_from`'s answer, the same one playback shows, so an
     // export is what was watched.
-    for span in export_spans(project) {
+    for span in export_spans(project, settings.range) {
         // Every clip reopens its own source file at its own in point; the
         // encoder is *not* reopened, so the export is one continuous stream
         // whose GOP boundaries need not line up with the cuts -- nor with the
         // file boundaries, which are just cuts that change the path.
+        // Whether this span's tail dissolves into its successor -- decided
+        // before A's own decoder is opened, because it is what decides
+        // whether A may take the DMA fast path at all: the blend below needs
+        // A's pixels on the CPU, so a dissolving span never asks for a GPU
+        // buffer, not even outside its own window.
+        let dissolve = dissolve_window(project, &span);
         let (mut pictures, rate, in_frame, color, mapper) = match span.from {
             Some((source, in_frame)) => {
                 let entry = sources
@@ -2378,7 +2536,8 @@ fn run(
                     && remap_into(Some(color), false, out_color.matrix).is_none()
                     && project
                         .composite_color_at(span.start)
-                        .is_none_or(|params| params.is_identity());
+                        .is_none_or(|params| params.is_identity())
+                    && dissolve.is_none();
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
                 // file's numbering is used -- the span's are the timeline's.
@@ -2418,6 +2577,33 @@ fn run(
             meta.height,
             project.composite_fit_at(span.start),
         );
+        // B's own decoder, opened beside A's: the two streams come off their
+        // files together for exactly the frames the tail below blends, and
+        // nothing else in this span ever touches it.
+        let mut b = dissolve
+            .map(|(b_source, b_in_frame, window, b_start)| -> crate::Result<_> {
+                let entry = sources.get(b_source).ok_or_else(|| {
+                    format!("clip names source {b_source} of {}", sources.len())
+                })?;
+                let (b_rate, b_color, _peak) = rates[b_source];
+                let b_mapper = tone[b_source].as_ref();
+                let b_remap = remap_into(Some(b_color), b_mapper.is_some(), out_color.matrix);
+                Ok(Dissolve {
+                    window,
+                    tail_start: span.len - window,
+                    decoder: ClipDecoder::open(&entry.path, b_rate.source_at(b_in_frame), None)?,
+                    mapper: b_mapper,
+                    remap: b_remap,
+                    grade: project.composite_color_at(b_start).copied(),
+                    canvas: Composer::new(
+                        meta.width,
+                        meta.height,
+                        project.composite_fit_at(b_start),
+                    ),
+                    graded: (Vec::new(), Vec::new(), Vec::new()),
+                })
+            })
+            .transpose()?;
         // Timeline frames, taken a *source* frame at a time: at a rate other
         // than real time the two are not the same count, and the span says which
         // source frame each timeline frame shows ([`Speed::source_at`]) -- the
@@ -2511,14 +2697,45 @@ fn run(
             // Once per timeline frame this source frame covers: one at real time
             // and faster, more when the clip is slowed -- the picture is already
             // graded and placed, so a held frame costs an encode and no decode.
-            for _ in 0..repeats {
-                let coded = match &frame {
-                    Frame::Dma(dma) => encoder.encode_dma(dma, settings.intra_only)?,
-                    Frame::Pixels(..) => {
-                        let (y, u, v, width, height) =
-                            placed.expect("a picture with pixels was placed");
-                        encoder.encode(y, u, v, width, height, settings.intra_only)?
+            for r in 0..repeats {
+                // Inside the window every *output* frame gets its own B
+                // picture -- decoded fresh here rather than once for the
+                // whole held A frame -- which is what makes a slowed A's
+                // tail still ramp one weight per frame shown rather than one
+                // per source frame.
+                let in_window = b.as_ref().is_some_and(|d| done_here + r >= d.tail_start);
+                let coded = match (&mut b, in_window) {
+                    (Some(d), true) => {
+                        let (ay, au, av, aw, ah) =
+                            placed.expect("a dissolving span always decodes to pixels");
+                        match d.decoder.next()? {
+                            // B's file ran out inside the window: A's own
+                            // picture carries the frame rather than the
+                            // export losing it.
+                            None => encoder.encode(ay, au, av, aw, ah, settings.intra_only)?,
+                            Some(Frame::Dma(_)) => {
+                                unreachable!("b's decoder was opened with no DMA want")
+                            }
+                            Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
+                                let (by, bu, bv, _, _) = place_picture(
+                                    by, bu, bv, bw, bh, d.grade, d.remap, d.mapper,
+                                    &mut d.graded, &mut d.canvas,
+                                );
+                                let idx_in_window = done_here + r - d.tail_start;
+                                let t = dissolve_weight(idx_in_window, d.window);
+                                let (y, u, v) = blend_i420((ay, au, av), (by, bu, bv), t);
+                                encoder.encode(&y, &u, &v, aw, ah, settings.intra_only)?
+                            }
+                        }
                     }
+                    _ => match &frame {
+                        Frame::Dma(dma) => encoder.encode_dma(dma, settings.intra_only)?,
+                        Frame::Pixels(..) => {
+                            let (y, u, v, width, height) =
+                                placed.expect("a picture with pixels was placed");
+                            encoder.encode(y, u, v, width, height, settings.intra_only)?
+                        }
+                    },
                 };
                 if let Some((au, key)) = coded {
                     write_video(
@@ -2753,27 +2970,32 @@ fn run_audio(
 ) -> crate::Result<()> {
     let format = settings.format;
     let sources = project.audio_sources();
-    let segs = project.audio_segments_from(0, meta.frame_rate);
+    let offset = settings.range.map_or(0, |(s, _)| s);
+    let segs = project.audio_segments_from(offset, meta.frame_rate);
     // The equalizers with them, so what is written is what is heard down to the
     // filter: the worker applies them per segment before the lanes are summed
     // ([`AudioSession::open_mixed_streams_eq`]), which is the same choke point
     // playback's feeder reads from -- there is no second place here that could
     // apply them differently.
-    let eqs = project.audio_eqs_from(0, meta.frame_rate);
+    let eqs = project.audio_eqs_from(offset, meta.frame_rate);
     // ...and the rates with them, for exactly the same reason: a speeded clip is
     // resampled inside the worker playback feeds from, so a WAV of a timeline at
     // 2x is half as long and holds the samples that were heard -- not a
     // second pass here that could disagree with what the ear got.
-    let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    let speeds = project.audio_speeds_from(offset, meta.frame_rate);
+    // ...and the fades with them, the same choke-point reason again: a clip's
+    // envelope runs inside the worker playback feeds from too.
+    let fades = project.audio_fades_from(offset, meta.frame_rate);
     // ...and the mix over both: each lane's volume into the sum, the master
     // limiter out of it. The same opener playback's feeder reads from, so a
     // file is written at the levels it was heard at -- there is no second
     // place here that could mix it differently.
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at_fade(
         &sources,
         &segs,
         &eqs,
         &speeds,
+        &fades,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
@@ -2783,11 +3005,15 @@ fn run_audio(
     };
     // The picture path's line, for a file that is sound alone: there is sound
     // by the line above, so this names the encoder writing it.
-    *shared.encoders.lock().unwrap() = Some(audio_label(project, format, true, None).to_string());
+    *shared.encoders.lock().unwrap() = Some(
+        audio_label(project, format, true, None, settings.range.is_some()).to_string(),
+    );
     let channels = usize::from(audio.channels);
-    let frames = (f64::from(project.media_frames()) / meta.frame_rate
-        * f64::from(audio.sample_rate))
-    .round() as u64;
+    let out_frames = settings.range.map_or(project.media_frames(), |(s, e)| {
+        e.min(project.media_frames()).saturating_sub(s)
+    });
+    let frames =
+        (f64::from(out_frames) / meta.frame_rate * f64::from(audio.sample_rate)).round() as u64;
     let total = frames as usize * channels;
     // corner-cut: the whole export sits in memory (4 bytes a sample, so ~23 MB
     // per minute of 48 kHz stereo). `flacenc::MemSource` wants it that way and
@@ -4621,6 +4847,25 @@ mod tests {
     }
 
     #[test]
+    fn export_spans_clips_to_the_marked_range_keeping_absolute_start() {
+        let project = Project::single("/nonexistent/film.mkv", 150);
+        // The whole timeline, unmarked: one span, the source's own length.
+        let whole = export_spans(&project, None);
+        assert_eq!(whole.len(), 1);
+        assert_eq!((whole[0].start, whole[0].len), (0, 150));
+        // A range wholly inside the span: `start` stays the timeline's own
+        // coordinate ([`composite_color_at`] needs that), and the length is
+        // exactly what the mark asked for.
+        let clipped = export_spans(&project, Some((30, 100)));
+        assert_eq!(clipped.len(), 1);
+        assert_eq!((clipped[0].start, clipped[0].len), (30, 70));
+        // A range past the end of the media clamps to it rather than reading
+        // short on the wrong side.
+        let past_end = export_spans(&project, Some((100, 500)));
+        assert_eq!((past_end[0].start, past_end[0].len), (100, 50));
+    }
+
+    #[test]
     fn bitrate_clamps_at_both_ends() {
         let meta = |width, height, frame_rate| VideoMeta {
             width,
@@ -4747,5 +4992,55 @@ mod tests {
         assert!(refused.contains("even"), "{refused}");
         // ...and the even one it neighbours opens.
         assert!(Enc::open(&meta(1920, 1080), &settings).is_ok());
+    }
+
+    /// Weights ramp from just above 0 to just below 1 and never touch either
+    /// end -- the frame *after* the window is where a viewer would see plain
+    /// B, and the window itself never quite repeats a hard cut's own instant.
+    #[test]
+    fn dissolve_weight_ramps_strictly_between_zero_and_one() {
+        assert_eq!(dissolve_weight(0, 1), 0.5, "a one-frame window is the midpoint");
+        assert_eq!(dissolve_weight(0, 4), 0.2);
+        assert_eq!(dissolve_weight(1, 4), 0.4);
+        assert_eq!(dissolve_weight(2, 4), 0.6);
+        assert_eq!(dissolve_weight(3, 4), 0.8);
+    }
+
+    /// [`dissolve_window`] reads [`crate::project::Clip::transition_out`] back
+    /// only once adjacency is re-checked at render time: two clips a split
+    /// just made, still touching, still name B by its own source and its own
+    /// timeline start.
+    #[test]
+    fn dissolve_window_names_bs_source_in_frame_window_and_start() {
+        use crate::project::{Lane, Project};
+        let mut p = Project::single("/nonexistent/film.mkv", 20);
+        assert!(p.split(15));
+        assert!(p.set_transition_out(Lane::V1, 0, 5));
+        let spans = export_spans(&p, None);
+        let a_span = spans.iter().find(|s| s.start == 0).expect("clip A's span");
+        assert_eq!(
+            dissolve_window(&p, a_span),
+            Some((0, 15, 5, 15)),
+            "b's source, b's in_frame, the window, b's timeline start"
+        );
+    }
+
+    /// A `transition_out` set while two clips touched, then made stale by a
+    /// trim that opens a gap between them: the number is still in storage,
+    /// [`dissolve_window`] reads `None` from it, and the span renders as the
+    /// hard cut two clips that no longer touch actually are.
+    #[test]
+    fn a_stale_transition_out_after_a_trim_renders_as_a_hard_cut() {
+        use crate::project::{Edge, Lane, Project};
+        let mut p = Project::single("/nonexistent/film.mkv", 20);
+        assert!(p.split(15));
+        assert!(p.set_transition_out(Lane::V1, 0, 5));
+        assert!(p.trim(Lane::V1, 1, Edge::Start, 18, &[100]), "opens a gap");
+        let spans = export_spans(&p, None);
+        let a_span = spans.iter().find(|s| s.start == 0).expect("clip A's span");
+        assert!(
+            dissolve_window(&p, a_span).is_none(),
+            "b no longer abuts a; hard cut"
+        );
     }
 }

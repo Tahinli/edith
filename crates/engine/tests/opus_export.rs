@@ -80,6 +80,9 @@ fn wait(handle: &ExportHandle, limit: Duration) -> engine::Result<()> {
 /// `sound_in` seconds into that file: an edit, so nothing here can be a copy.
 fn project(video: &Path, sound: &Path, sound_in: u32) -> Project {
     let clip = |source, in_frame, out_frame| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame,
         out_frame,
@@ -122,6 +125,7 @@ fn export(name: &str, project: Project, video: &Path) -> Scratch {
             format: Format::Hevc,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(600)).expect("the export finishes");
     out
@@ -420,6 +424,9 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
     let (meta, _) = engine::demux::Demuxer::open(&video).expect("probe the picture");
     let frames = meta.frame_count;
     let clip = |source, out_frame| Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame: 0,
         out_frame,
@@ -451,6 +458,7 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
             format: Format::Hevc,
             ..Default::default()
         },
+        None,
     );
     let line = {
         wait(&handle, Duration::from_secs(600)).expect("the export finishes");

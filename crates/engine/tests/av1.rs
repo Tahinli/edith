@@ -333,7 +333,7 @@ fn an_mp4_export_of_a_matroska_source_carries_its_sound() {
     let project = Project::single(asset("test_av1.mkv"), 15);
     let out = Scratch::file("ve_export_av1", "mp4");
 
-    let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
+    let handle = engine::export::start(project, meta, &out, &ExportSettings::default(), None);
     let started = Instant::now();
     while !handle.is_finished() {
         assert!(started.elapsed() < Duration::from_secs(900), "export hung");

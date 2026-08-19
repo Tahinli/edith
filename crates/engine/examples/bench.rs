@@ -860,6 +860,9 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         .min(meta.frame_count.max(1));
     let in_frame = (meta.frame_count / 10).min(meta.frame_count.saturating_sub(span));
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
+        transition_out: 0,
         start: 0,
         in_frame,
         out_frame: in_frame + span,
@@ -902,7 +905,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
     let mut notes = Vec::new();
     let budget = Instant::now();
     for _ in 0..reps.max(1) {
-        let handle = engine::export::start(project.clone(), meta, &out, &settings);
+        let handle = engine::export::start(project.clone(), meta, &out, &settings, None);
         let t = Instant::now();
         let mut capped = false;
         // The highest the bar was ever seen at, not wherever it happens to
