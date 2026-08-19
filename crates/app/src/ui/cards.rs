@@ -121,6 +121,75 @@ impl Player {
                 .into_any_element()
         };
         let mut list: Vec<AnyElement> = Vec::new();
+        // The primary pane: destination first (the one thing every export
+        // needs regardless of what it is), then the bundles most exports
+        // actually are, then the button to the rest. Everything under it is
+        // exactly the codec, quality, sound and encoder rows the old flat
+        // card opened on -- a bundle here only sets the same two fields the
+        // Advanced pane's own Format and Quality rows set, so nothing here
+        // is a setting of its own to fall out of step with them.
+        let destination = entry(
+            ("destination", 0),
+            "d",
+            "Destination".into(),
+            file_name(&self.export_path).into(),
+            false,
+            true,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
+        .into_any_element();
+        list.push(destination);
+        let current_preset = ExportPreset::from_state(self.format, self.quality);
+        for (i, preset) in ExportPreset::ALL.into_iter().enumerate() {
+            let mut r = entry(
+                ("preset", i),
+                "",
+                preset.label().into(),
+                preset.detail().into(),
+                preset == current_preset,
+                true,
+            );
+            r = r.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                match preset.bundle() {
+                    Some((format, quality)) => {
+                        this.set_format(format);
+                        this.quality = quality;
+                    }
+                    // Custom sets nothing -- it only opens the pane where the
+                    // codec and the quality are picked apart.
+                    None => this.export_advanced_open = true,
+                }
+                cx.notify();
+            }));
+            list.push(r.into_any_element());
+        }
+        let advanced_detail = match self.export_advanced_open {
+            true => "codec, container, quality, sound, encoder, subtitles — s collapses them"
+                .to_string(),
+            false => "codec, container, quality, sound, encoder, subtitles — s for the rows"
+                .to_string(),
+        };
+        list.push(
+            entry(
+                ("export-advanced", 0),
+                "s",
+                "Advanced".into(),
+                advanced_detail.into(),
+                self.export_advanced_open,
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.export_advanced_open = !this.export_advanced_open;
+                cx.notify();
+            }))
+            .into_any_element(),
+        );
+        // Everything from here down is the Advanced pane: the codec, its
+        // container, the quality rows, sound, encoder, subtitles, the two
+        // display switches and what this machine can encode with -- all of
+        // it built exactly as the flat card built it, only not pushed at all
+        // while the pane is shut.
+        if self.export_advanced_open {
         if self.export_grouped {
             list.push(header("FORMAT"));
         }
@@ -347,16 +416,6 @@ impl Player {
             )
             .into_any_element(),
         );
-        let destination = entry(
-            ("destination", 0),
-            "d",
-            "Destination".into(),
-            file_name(&self.export_path).into(),
-            false,
-            true,
-        )
-        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.pick_destination(cx)))
-        .into_any_element();
         // The card's own two layout switches. They were `g` and `r` and nothing
         // else, while the status line under the title advertised both of them:
         // a hand on the mouse read what they do and had nothing to press.
@@ -396,12 +455,6 @@ impl Player {
             }))
             .into_any_element(),
         );
-        match self.export_grouped {
-            true => list.push(destination),
-            // Flat: the same rows with no headers over them, and the
-            // destination back at the top where the card used to open with it.
-            false => list.insert(0, destination),
-        }
         if !self.export_refusals_inline && !refusals.is_empty() {
             // Last, and one line: the reason travels with the name (a footer
             // that only listed them would be the "why not?" the rows exist to
@@ -442,6 +495,7 @@ impl Player {
             self.hw_caps.clone().unwrap_or_else(|| "asking…".into())
         )));
         list.push(note(format!("Built in: {}", engine::caps::software())));
+        } // self.export_advanced_open
         // What the rows add up to, which is the one thing that has to be right:
         // codec, box, size, rate, sound, where it goes and about how big. Two
         // lines, outside the scrolling list, so it is on screen whatever the
