@@ -79,6 +79,13 @@ impl Player {
             .map(|session| session.remove_source(path, stream));
         let text = match removed {
             Some(Ok(idx)) => {
+                // Tells a running background scan of this source nobody wants
+                // its levels any more, and drops the entry that was standing
+                // in the way of a re-add starting a fresh one
+                // ([`Player::cache_media`]'s dedupe reads presence here).
+                if let Some(scan) = self.silence_bg.remove(&(path.to_path_buf(), stream)) {
+                    scan.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 // The picked row may be the one that just went, and the engine
                 // reseeks, so this owes the flag reset like every other edit.
                 if self.selected_asset.as_ref() == Some(&(path.to_path_buf(), stream)) {
@@ -164,6 +171,15 @@ impl Player {
         self.syncs.clear();
         // Scanned off sources that are not in the library any more.
         self.silence_levels.clear();
+        // ...and every background read still chasing one of them: cancelled
+        // rather than merely dropped, so a landing closure over a gone window
+        // does not write into a `silence_levels` the next session starts
+        // empty (`Player::cache_media`'s spawn checks this flag before it
+        // inserts).
+        for scan in self.silence_bg.values() {
+            scan.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.silence_bg.clear();
         // Every gesture in flight, dropped for `reset_after_reseek`'s reason
         // (it drops the trim below): a drag holds a bar, a clip or a band of a
         // timeline that has just stopped existing.

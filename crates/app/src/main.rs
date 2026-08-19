@@ -520,6 +520,13 @@ struct Player {
     /// The scan a worker is running for the card, if one is. `None` means the
     /// card is drawing numbers it already has.
     silence_scan: Option<SilenceScan>,
+    /// Whole-source background scans in flight, keyed the same as
+    /// [`Self::silence_levels`]'s own whole-source entries
+    /// ([`full_scan_key`]). Started at import ([`Player::cache_media`]) so a
+    /// card opened later finds the levels already read; presence here is what
+    /// stops a re-add of the same source from starting a second one, and its
+    /// [`engine::silence::Progress::cancel`] is what a removed source is told.
+    silence_bg: HashMap<(PathBuf, usize), Arc<engine::silence::Progress>>,
     /// Which of the card's four sliders the arrow keys and a drag move. The
     /// card's own focus, since nothing in it takes gpui's (ledger:182).
     color_band: usize,
@@ -756,6 +763,7 @@ fn main() {
                     silence_marks: Vec::new(),
                     silence_levels: HashMap::new(),
                     silence_scan: None,
+                    silence_bg: HashMap::new(),
                     color_open: None,
                     color_band: 0,
                     color_dragging: false,
