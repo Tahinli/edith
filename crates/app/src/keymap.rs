@@ -438,7 +438,19 @@ fn codec_chord() -> String {
         .join(" / ")
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 30]> = std::sync::LazyLock::new(|| {
+/// The preset row's keys, from [`crate::ExportPreset::key`] -- `Custom`
+/// excepted, which shares Advanced's own `s` and so is that row's line, not a
+/// second one here.
+fn preset_chord() -> String {
+    crate::ExportPreset::ALL
+        .into_iter()
+        .filter(|p| *p != crate::ExportPreset::Custom)
+        .map(|p| p.key())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+pub static FIXED: std::sync::LazyLock<[Fixed; 32]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -516,6 +528,18 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 30]> = std::sync::LazyLock::new(||
             label: "Choose where the export is written",
             category: Category::File,
             reach: Reach::Click("destination"),
+        },
+        Fixed {
+            chord: preset_chord(),
+            label: "Pick an export bundle: Web, Small file, Master or Audio only",
+            category: Category::File,
+            reach: Reach::Click("preset"),
+        },
+        Fixed {
+            chord: "s".into(),
+            label: "Export card: open or close the Advanced pane",
+            category: Category::File,
+            reach: Reach::Click("export-advanced"),
         },
         Fixed {
             chord: "g".into(),
