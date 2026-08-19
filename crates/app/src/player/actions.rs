@@ -73,6 +73,7 @@ impl Player {
             ActionId::ZoomOut => self.zoom(1. / ZOOM_STEP, None, cx),
             ActionId::ZoomFit => self.zoom_fit(cx),
             ActionId::Undo => self.undo(cx),
+            ActionId::Redo => self.redo(cx),
             ActionId::AddVideoLane => self.add_lane(LaneKind::Video, cx),
             ActionId::AddAudioLane => self.add_lane(LaneKind::Audio, cx),
             // The last track of that kind: the one the add key put there, so the
@@ -384,6 +385,14 @@ impl Player {
 
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
         if self.session.as_mut().is_some_and(PlaybackSession::undo) {
+            self.reset_after_reseek();
+        }
+        self.selected.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.session.as_mut().is_some_and(PlaybackSession::redo) {
             self.reset_after_reseek();
         }
         self.selected.clear();
