@@ -891,19 +891,13 @@ fn the_subtitle_plate_and_lanes_fit_the_smallest_window() {
     // taking the media list's room.
     assert_eq!(SUB_ROWS_H / ROW_H, 3.);
     assert!(ROW_H >= HIT_MIN, "a subtitle row is clicked to pick it");
-    // At the floor there are no group headers at all: the list is one row
-    // tall there, and a header would name a film and then show none of it.
-    // The rows go on naming their own file, so nothing is lost by it.
-    assert!(!sub_headers_fit(360.), "a header at the floor eats the track");
-    // At the size the window opens on there is room for a header and the
-    // tracks under it, which is the only condition it is drawn on.
-    assert!(sub_headers_fit(720.));
-    // ...and where it is drawn it fits inside the same capped list, header
-    // and two rows under it, without the tracks losing their budget.
+    // A header is always drawn with more than one file, floor included: the
+    // list scrolls past `SUB_ROWS_H` instead of a short window losing the
+    // name saying whose tracks these are.
     assert!(SUB_HEAD_H + 2. * ROW_H <= SUB_ROWS_H);
-    // A header takes no click -- there is nothing to fold and nothing to
-    // aim at -- which is the only reason it may be under `HIT_MIN`.
-    assert!(SUB_HEAD_H < HIT_MIN && SUB_HEAD_H > 0.);
+    // A header folds its group on a click now, so it binds `HIT_MIN` like
+    // every other target rather than being let off it as a bare label.
+    assert!(SUB_HEAD_H >= HIT_MIN);
 }
 
 /// What the rows of both lists do with a name too long for the column: two

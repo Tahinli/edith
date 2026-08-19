@@ -556,7 +556,6 @@ impl Render for Player {
                     .flex()
                     .child(self.library(
                         self.split_px(Split::Library, window.viewport_size()),
-                        f32::from(window.viewport_size().height),
                         cx,
                     ))
                     // The seams, one per pair of regions: what a hand drags to

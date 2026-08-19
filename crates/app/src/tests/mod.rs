@@ -17,6 +17,7 @@ use super::{
     Format, HEADER_GAP, HEADER_H, HEADER_W, HIST_BINS, HIST_H, HIST_SAMPLES, HIT_MIN,
     KEYS_ROW_H, KEYS_ROWS_H, KEYS_W, KeyRow, LABEL_H, LABEL_MIN_W, LANE_H, LANES_MAX,
     LIBRARY_MAX_W, LIBRARY_MIN_W, Lane, MENU_ITEMS, MENU_PAD, MENU_ROW_H,
+    SUB_LANE_H, lanes_h_mixed, lanes_shown_mixed, rows_below_mixed,
     MBPS_DIGITS, MBPS_MAX, MBPS_MIN, MB_FLOOR, MENU_W, NO_FILE, NumberEdit, PANEL_H, ROW_ITEMS, RowCtx, RowItem,
     Quality, ROW_H, RULER_HIT_H, SCROLL_NOTCH_SHARE, SILENCE_ROWS,
     SOURCE_TINTS, SPEED_PRESETS, SPEED_STEP, BG_RAISED, SWATCH_W, Source, Speed, StreamInfo,
@@ -56,7 +57,7 @@ use super::{
 use super::{
     SUB_BOTTOM, SUB_CUE_MIN_W, SUB_HEAD_H, SUB_LINE_H, SUB_ROWS_H,
     SUB_STEM_SHARE, SUB_TEXT, clip_middle, cue_box, sub_bottom,
-    carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w, sub_headers_fit,
+    carries_subtitles, cues_at, file_tint, is_subtitle, lang_human, row_text_w,
     Subs, subtitle_detail, subtitle_notice, subtitle_tail,
     sub_pick_name, subtitle_rows, subtitle_toggle_notice, walk_subtitles,
 };
