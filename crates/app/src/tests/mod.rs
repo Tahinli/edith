@@ -46,7 +46,7 @@ use super::{
     fit_choices, landing, lane_refuses, library_rows, live_idx, next_fit, next_resolution,
     note_progress, px_along,
     IMPORT_STALL, Import, ImportStage, SEEK_STALL, ScanKey, ScanPlan, SilenceScan, import_line,
-    Landing, arrival, launch_queue,
+    Landing, arrival, launch_queue, full_scan_key, silence_cached, slice_whole_levels,
     read_ahead, scan_plan, seek_line, silence_line, source_secs, stash_or_write,
     repeats, resolution_choices, resolution_ladder, span_label, tone_choices, tone_label,
     clip_width, frames_of_us, trimmed_clip, trimmed_sub, trims, unscannable, unusable,

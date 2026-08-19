@@ -361,6 +361,45 @@ pub(crate) fn source_secs(key: &ScanKey, fps: f64) -> (f64, f64) {
     }
 }
 
+/// The [`ScanKey`] a background scan lands its whole-file levels under: every
+/// frame the source has, so one entry answers for every clip cut from it. A
+/// sentinel `out_frame` rather than a fourth map, because [`ScanKey`] is
+/// already what [`Player::silence_levels`] is keyed by -- a clip can never
+/// itself claim `u32::MAX` as its own `out_frame`, so the two never collide.
+pub(crate) fn full_scan_key(path: &Path, stream: usize) -> ScanKey {
+    (path.to_path_buf(), stream, 0, u32::MAX)
+}
+
+/// The clip's own stretch of a whole-source scan, in the same dBFS windows
+/// [`engine::silence::levels`] would have decoded for it directly: window `k`
+/// of both is the same [`engine::silence::WINDOWS_PER_SEC`]th of a second from
+/// the start of the file, so slicing costs no decode and reads the same
+/// numbers the on-demand scan would have. Empty past the end of what the
+/// background read has landed so far -- a scan still running answers with
+/// what it has, same as [`SilenceScan`]'s own cancel does.
+pub(crate) fn slice_whole_levels(whole: &[f32], fps: f64, in_frame: u32, out_frame: u32) -> Vec<f32> {
+    if !(fps.is_finite() && fps > 0.) {
+        return Vec::new();
+    }
+    let window = f64::from(engine::silence::WINDOWS_PER_SEC);
+    let start = ((f64::from(in_frame) / fps) * window) as usize;
+    let end = (((f64::from(out_frame) / fps) * window).ceil() as usize).min(whole.len());
+    match start < end {
+        true => whole[start..end].to_vec(),
+        false => Vec::new(),
+    }
+}
+
+/// Whether the card may draw `key`'s marks as arithmetic rather than start a
+/// worker for it: its own exact read, or -- new since the scan moved to
+/// import -- the whole-source background scan its file is cut from
+/// ([`Player::cache_media`]). One function so `Player::open_silence`'s plan
+/// and `Player::scan_silences`' lookup share the one contract for what
+/// "cached" means, instead of two copies that could drift.
+pub(crate) fn silence_cached(levels: &std::collections::HashMap<ScanKey, Arc<Vec<f32>>>, key: &ScanKey) -> bool {
+    levels.contains_key(key) || levels.contains_key(&full_scan_key(&key.0, key.1))
+}
+
 /// What the silence card says while its worker reads. Unlike an import this
 /// one *has* a fraction -- a decode knows how far into the sound it has come --
 /// so the line is where it is up to, out of what the header claims the track is
