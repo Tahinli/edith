@@ -255,10 +255,23 @@ impl Render for Player {
                         // The save dialog, which was the one row here a
                         // keyboard could not open.
                         this.pick_destination(cx);
+                    } else if let Some(preset) = ExportPreset::ALL
+                        .into_iter()
+                        .find(|p| p.key() == key)
+                        // `Custom` shares `s` with Advanced below, which already
+                        // handles that key -- reaching it here too would only
+                        // race the same assignment against itself.
+                        .filter(|p| *p != ExportPreset::Custom)
+                    {
+                        this.pick_preset(preset);
                     } else if key == "g" {
                         this.export_grouped = !this.export_grouped;
                     } else if key == "r" {
                         this.export_refusals_inline = !this.export_refusals_inline;
+                    } else if key == "s" {
+                        // The Advanced pane, by keyboard: the primary pane's
+                        // own row for it opens the same way a click does.
+                        this.export_advanced_open = !this.export_advanced_open;
                     } else if key == "n" {
                         // The custom row's field, by keyboard. The digits used
                         // to do this from anywhere in the card, which meant a

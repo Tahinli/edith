@@ -376,8 +376,10 @@ impl Player {
 
     /// A format row was clicked. The destination follows it at once -- a WAV
     /// written to a path ending in `.mp4` is a file every player will lie
-    /// about -- keeping whatever stem the save dialog last left there.
-    pub(crate) fn set_format(&mut self, format: Format) {
+    /// about -- keeping whatever stem the save dialog last left there. `false`
+    /// on a refusal, so a caller that has more than the format to write (a
+    /// preset's own quality) knows not to write the rest of it either.
+    pub(crate) fn set_format(&mut self, format: Format) -> bool {
         // The one door both the row and its initial go through, so a format the
         // card greys out cannot be picked by keyboard either.
         if let Some(why) = self
@@ -386,10 +388,28 @@ impl Player {
             .and_then(|session| format_refusal(session, format))
         {
             self.notify_user(format!("NOT {} — {why}", format_label(format)).into());
-            return;
+            return false;
         }
         self.format = format;
         self.export_path = retarget(&self.export_path, format);
+        true
+    }
+
+    /// A preset row, by click or by its own key. `Custom` opens the pane where
+    /// the codec and the quality are picked apart and changes nothing itself;
+    /// the rest are exactly the bundle they name -- and nothing at all on a
+    /// refusal, because [`set_format`](Self::set_format) already fired the
+    /// banner and a quality written after it declined would be a row that
+    /// looks picked over a format that was not.
+    pub(crate) fn pick_preset(&mut self, preset: ExportPreset) {
+        match preset.bundle() {
+            Some((format, quality)) => {
+                if self.set_format(format) {
+                    self.quality = quality;
+                }
+            }
+            None => self.export_advanced_open = true,
+        }
     }
 
     /// The container row: the same codec in the other box, which retargets the
