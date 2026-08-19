@@ -179,6 +179,16 @@ impl Player {
             .border_t_1()
             .border_color(rgb(STROKE_DIVIDER()))
             .child(self.action_control(
+                "screenshot",
+                0.,
+                BG_RAISED(),
+                None,
+                "Shot",
+                "saves the frame on screen as a PNG in ~/Pictures/edith",
+                ActionId::Screenshot,
+                cx.listener(|this, _: &ClickEvent, _, cx| this.take_screenshot(cx)),
+            ))
+            .child(self.action_control(
                 "transport",
                 40.,
                 BG_RAISED(),

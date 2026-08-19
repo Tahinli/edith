@@ -142,6 +142,10 @@ actions! {
     /// its own, because a card reachable only by a button in the panel is one a
     /// hand on the keyboard has to leave the keyboard for.
     ShowActions,
+    /// Saves the frame on screen to a PNG: whatever is showing, the timeline's
+    /// own picture or a library preview's, since both write through the one
+    /// `self.image` the atlas already holds.
+    Screenshot,
 }
 
 impl ActionId {
@@ -203,6 +207,7 @@ impl ActionId {
             ActionId::Fullscreen => "Fullscreen on / off",
             ActionId::CancelExport => "Cancel export",
             ActionId::ShowActions => "All actions and their keys…",
+            ActionId::Screenshot => "Save the frame on screen as a PNG",
         }
     }
 
@@ -262,6 +267,7 @@ impl ActionId {
             ActionId::Fullscreen => "fullscreen",
             ActionId::CancelExport => "cancel-export",
             ActionId::ShowActions => "show-actions",
+            ActionId::Screenshot => "screenshot",
         }
     }
 
@@ -362,7 +368,11 @@ impl ActionId {
             ActionId::Save
             | ActionId::Export
             | ActionId::CancelExport
-            | ActionId::ShowActions => Category::File,
+            | ActionId::ShowActions
+            // It writes a file like the three above it, and touches no edit
+            // list -- what an export's own allow-list already means it stays
+            // out of, not what puts it in this heading.
+            | ActionId::Screenshot => Category::File,
         }
     }
 }
@@ -907,6 +917,9 @@ impl Keymap {
                 // (platform.rs:880, the keysym's own name lowercased) -- and
                 // not a letter, so it takes nothing away from the clip keys.
                 b(ActionId::ShowActions, "f1", false),
+                // "w" is free entirely, bare and ctrl both -- nothing else in
+                // this table answers to it.
+                b(ActionId::Screenshot, "w", false),
             ],
         }
     }
@@ -1170,8 +1183,9 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 54);
+        assert_eq!(k.entries().len(), 55);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
+        assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
         assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
