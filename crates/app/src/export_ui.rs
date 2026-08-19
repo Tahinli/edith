@@ -30,6 +30,42 @@ pub(crate) const FRAME_RATES: [f64; 8] = [
     60.,
 ];
 
+/// The project sound rates the list offers, slowest first. Unlike
+/// [`RESOLUTIONS`] and [`FRAME_RATES`] there is no media rate to cycle in
+/// beside them: a source's own rate is not a number this list has to name to
+/// offer it, since [`Choice::SampleRate`]`(None)` -- "source" -- already means
+/// exactly that, whatever the number turns out to be.
+pub(crate) const SAMPLE_RATES: [u32; 3] = [44_100, 48_000, 96_000];
+
+/// The sound-rate list's rows: "source" first -- the derived rate, and the
+/// row in force with nothing picked -- then every rate on offer, the one in
+/// force marked. The same rows serve [`Pick::SampleRate`] with a session and
+/// without one: `current` is [`PlaybackSession::sample_rate`] or
+/// [`Player::pending_settings`]`.2`, and `None` means the same thing either
+/// way -- nothing picked yet.
+pub(crate) fn sample_rate_choices(current: Option<u32>) -> Vec<ChoiceRow> {
+    let mut rows = vec![(
+        Choice::SampleRate(None),
+        "Source".into(),
+        "the first audio source's own rate".into(),
+        current.is_none(),
+    )];
+    rows.extend(SAMPLE_RATES.into_iter().map(|rate| {
+        (
+            Choice::SampleRate(Some(rate)),
+            format!("{rate} Hz").into(),
+            match rate {
+                48_000 => "video standard".to_string(),
+                44_100 => "CD/audio standard".to_string(),
+                _ => "high-resolution".to_string(),
+            }
+            .into(),
+            current == Some(rate),
+        )
+    }));
+    rows
+}
+
 /// What the export card offers, top to bottom. Bitrate is the only thing the
 /// encoder actually takes: the codec and the container are what this program
 /// can write and nothing else, so the card states them rather than offering
