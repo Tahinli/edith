@@ -3,6 +3,88 @@
 
 use crate::*;
 
+/// Whether a stroke leaves player fullscreen. Bare escape does, the same
+/// stroke every card and menu in this window answers to -- and it is
+/// answered *first*: the picture-only layout is the chrome itself missing,
+/// not a card drawn over it, so it goes before a menu close or a preview
+/// close gets a look at the same key. See the call site in [`Player::render`]
+/// for the deliberate order this buys with a preview open underneath.
+pub(crate) fn escape_leaves_player_fullscreen(key: &str, ctrl: bool, player_fullscreen: bool) -> bool {
+    key == ESCAPE && !ctrl && player_fullscreen
+}
+
+impl Player {
+    /// The picture region alone: the image, the subtitle cue plate, the
+    /// preview badge and the three transient bars over its bottom edge.
+    /// Its own method so player fullscreen ([`Player::act`]) can stand it up
+    /// as the window's only child without a second copy of what it draws.
+    fn picture_area(
+        &mut self,
+        position: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_hidden()
+            // The bed the cue plate is placed against: it hangs off the
+            // bottom of the picture region, which is the one box that is the
+            // picture and nothing else.
+            .relative()
+            .flex()
+            .justify_center()
+            .items_center()
+            .bg(rgb(BG_CANVAS()))
+            .children(
+                self.image
+                    .clone()
+                    .map(|i| {
+                        img(i)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain)
+                            .into_any_element()
+                    })
+                    // With no file open the letterbox is the whole region,
+                    // and a black rectangle says only that something is
+                    // broken -- so it says what it wants instead. The window
+                    // is already the drop target.
+                    .or_else(|| {
+                        (self.active_session().is_none())
+                            .then(|| empty_hint().into_any_element())
+                    }),
+            )
+            // After the picture, so the plate is drawn over it rather than
+            // under.
+            .children(self.subtitle_overlay(position, window))
+            .children(self.preview_badge(cx))
+            // The three transient lines hang off the bottom of the picture
+            // rather than taking a row of the column: a notice that arrives
+            // must not push the transport, the toolbar and the timeline down
+            // by its own height -- which is a control moving with state, on
+            // every control below it at once.
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .children(self.import_bar(cx))
+                    .children(self.seek_bar())
+                    .children(self.notice_bar(cx))
+                    // How tall the lot came out, for the cue plate above to
+                    // step over ([`sub_bottom`]) -- the bars are over the
+                    // picture, and a message drawn across the line being
+                    // read loses both of them. Zero with no bar up, since
+                    // this box is then empty.
+                    .child(height_probe(self.notice_h.clone())),
+            )
+    }
+}
+
 impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A file that has just been opened sits on its first frame with the
@@ -36,6 +118,16 @@ impl Render for Player {
         if title != self.titled {
             window.set_window_title(&title);
             self.titled = title;
+        }
+        // A compositor keybind (the window manager's own fullscreen, not
+        // ours) can drop `window.is_fullscreen()` without ever going through
+        // [`Player::act`] -- the picture-only layout below must not survive
+        // that on its own, or the chrome never comes back. Only the *leaving*
+        // direction is reconciled here: the platform going fullscreen behind
+        // our back is not this editor asking for the picture-only layout, so
+        // it is left alone rather than guessed at.
+        if self.player_fullscreen && !window.is_fullscreen() {
+            self.player_fullscreen = false;
         }
         // No shadow flag: the session is the only truth about play state, and
         // [`Player::transport`] is the one place it is read.
@@ -477,6 +569,21 @@ impl Render for Player {
                 // the keys before anything under it does: ↑↓ walk it, enter
                 // takes the row, and escape falls through to the close below --
                 // the same three strokes every list in this editor answers.
+                // The picture-only layout is the outermost thing on screen --
+                // it is the chrome itself that is missing, not a card drawn
+                // over it -- so its own escape is answered before any menu or
+                // preview below gets a look at the stroke. Deliberate order:
+                // with a preview open *and* the player fullscreen, the first
+                // Escape only leaves fullscreen (the preview keeps playing,
+                // now behind the chrome again), and it takes a second Escape
+                // to stop the preview -- one stroke, one effect, same as
+                // every other card in this chain.
+                if escape_leaves_player_fullscreen(key, ctrl, this.player_fullscreen) {
+                    this.player_fullscreen = false;
+                    window.toggle_fullscreen();
+                    cx.notify();
+                    return;
+                }
                 if let Some(mut picker) = this.picker {
                     let rows = this.choices(picker.of);
                     if !rows.is_empty() && matches!(key, "up" | "down" | "enter") {
@@ -598,107 +705,53 @@ impl Render for Player {
             // it. Nothing here moves when the state changes -- the regions are
             // fixed and the panels keep their room whether or not anything is
             // open in them.
-            .child(self.topbar(window, cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .child(self.library(
-                        self.split_px(Split::Library, window.viewport_size()),
-                        cx,
-                    ))
-                    // The seams, one per pair of regions: what a hand drags to
-                    // give a panel more room and its neighbour less
-                    // ([`divider`]).
-                    .child(divider(Split::Library, cx))
+            // Player fullscreen: the picture and nothing else -- what
+            // `Fullscreen` gives every consumer video player. The four-region
+            // layout is skipped rather than hidden under it (a hidden library
+            // and inspector would still lay out and take the split's own
+            // room), and the picture div itself is untouched either way --
+            // [`Player::picture_area`] is the same call in both arms.
+            .when(self.player_fullscreen, |d| {
+                d.child(self.picture_area(position, window, cx))
+            })
+            .when(!self.player_fullscreen, |d| {
+                d.child(self.topbar(window, cx))
                     .child(
                         div()
                             .flex_1()
-                            .min_w(px(0.))
+                            .min_h(px(0.))
                             .flex()
-                            .flex_col()
+                            .child(self.library(
+                                self.split_px(Split::Library, window.viewport_size()),
+                                cx,
+                            ))
+                            // The seams, one per pair of regions: what a hand
+                            // drags to give a panel more room and its
+                            // neighbour less ([`divider`]).
+                            .child(divider(Split::Library, cx))
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_h(px(0.))
-                                    .overflow_hidden()
-                                    // The bed the cue plate is placed against:
-                                    // it hangs off the bottom of the picture
-                                    // region, which is the one box that is the
-                                    // picture and nothing else.
-                                    .relative()
+                                    .min_w(px(0.))
                                     .flex()
-                                    .justify_center()
-                                    .items_center()
-                                    .bg(rgb(BG_CANVAS()))
-                                    .children(
-                                        self.image
-                                            .clone()
-                                            .map(|i| {
-                                                img(i)
-                                                    .size_full()
-                                                    .object_fit(gpui::ObjectFit::Contain)
-                                                    .into_any_element()
-                                            })
-                                            // With no file open the letterbox
-                                            // is the whole region, and a black
-                                            // rectangle says only that
-                                            // something is broken -- so it says
-                                            // what it wants instead. The window
-                                            // is already the drop target.
-                                            .or_else(|| {
-                                                (self.active_session().is_none())
-                                                    .then(|| empty_hint().into_any_element())
-                                            }),
-                                    )
-                                    // After the picture, so the plate is drawn
-                                    // over it rather than under.
-                                    .children(self.subtitle_overlay(position, window))
-                                    .children(self.preview_badge(cx))
-                                    // The three transient lines hang off the
-                                    // bottom of the picture rather than taking
-                                    // a row of the column: a notice that
-                                    // arrives must not push the transport, the
-                                    // toolbar and the timeline down by its own
-                                    // height -- which is a control moving with
-                                    // state, on every control below it at once.
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .bottom_0()
-                                            .left_0()
-                                            .right_0()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.))
-                                            .children(self.import_bar(cx))
-                                            .children(self.seek_bar())
-                                            .children(self.notice_bar(cx))
-                                            // How tall the lot came out, for the
-                                            // cue plate above to step over
-                                            // ([`sub_bottom`]) -- the bars are
-                                            // over the picture, and a message
-                                            // drawn across the line being read
-                                            // loses both of them. Zero with no
-                                            // bar up, since this box is then
-                                            // empty.
-                                            .child(height_probe(self.notice_h.clone())),
-                                    ),
+                                    .flex_col()
+                                    .child(self.picture_area(position, window, cx))
+                                    .child(self.transport_bar(state, window.viewport_size(), cx)),
                             )
-                            .child(self.transport_bar(state, window.viewport_size(), cx)),
+                            .child(divider(Split::Inspector, cx))
+                            // The settings cards live in here rather than over
+                            // the timeline: adjusting a clip must not hide the
+                            // clip.
+                            .child(self.inspector(window.viewport_size(), cx)),
                     )
-                    .child(divider(Split::Inspector, cx))
-                    // The settings cards live in here rather than over the
-                    // timeline: adjusting a clip must not hide the clip.
-                    .child(self.inspector(window.viewport_size(), cx)),
-            )
-            // Above the toolbar rather than under it: the toolbar is a fixed
-            // strip belonging to the timeline, so the pair moves as one and the
-            // edge the hand is pulling is the edge under the pointer.
-            .child(divider(Split::Timeline, cx))
-            .child(self.toolbar(cx))
-            .child(self.timeline(position, state, window.viewport_size(), cx))
+                    // Above the toolbar rather than under it: the toolbar is
+                    // a fixed strip belonging to the timeline, so the pair
+                    // moves as one and the edge the hand is pulling is the
+                    // edge under the pointer.
+                    .child(divider(Split::Timeline, cx))
+                    .child(self.toolbar(cx))
+                    .child(self.timeline(position, state, window.viewport_size(), cx))
+            })
             // Over the region they were opened on, and under the modal cards:
             // they are only ever up while none of those is (`modal`).
             .children(self.context_card(window.viewport_size(), cx))
