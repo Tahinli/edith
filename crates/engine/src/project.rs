@@ -430,6 +430,15 @@ pub struct Clip {
     /// changes is how many *timeline* frames that range is spread over
     /// ([`Clip::frames`]).
     pub speed: Speed,
+    /// Timeline frames of ramp-up from silence at the clip's own start, inline
+    /// like [`Clip::fit`] and [`Clip::speed`] for the same reason: one small
+    /// number with nothing to share, and every consumer (mixer, exporter) wants
+    /// it sitting right next to the frame range it shapes. Clamped to the
+    /// clip's own length by the setter -- never wider than the clip is long.
+    pub fade_in: u32,
+    /// Timeline frames of ramp-down to silence at the clip's own end. Same
+    /// promises as [`Clip::fade_in`].
+    pub fade_out: u32,
 }
 
 impl Clip {
@@ -748,6 +757,62 @@ pub struct Stretch {
     pub timeline_secs: f64,
 }
 
+/// What one audio segment's gain envelope is: [`Project::audio_fades_from`]
+/// builds it off the clip's own [`Clip::fade_in`]/[`Clip::fade_out`], resolved
+/// against where in the *clip* -- not the segment, which may start mid-clip
+/// on a seek -- this segment's first frame lands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fade {
+    /// How many of the clip's own frames already played before this
+    /// segment's first frame: `0` unless playback started mid-clip.
+    pub elapsed: u32,
+    /// The clip's [`Clip::fade_in`].
+    pub fade_in: u32,
+    /// The clip's [`Clip::fade_out`].
+    pub fade_out: u32,
+    /// The clip's own [`Clip::frames`] -- the envelope's whole width, of
+    /// which this segment may only cover the tail.
+    pub total: u32,
+}
+
+impl Fade {
+    /// The gain at clip-relative frame `pos`, an equal-power curve on each
+    /// edge that plays through unchanged (gain `1.0`) wherever neither ramp
+    /// reaches: `sin(t * pi/2)` for `t` the fraction of the way through the
+    /// ramp, so a fade lands on silence at its very first (or very last)
+    /// frame and reaches unity smoothly rather than at a constant slope --
+    /// the same curve [`Project::crossfade`] relies on to keep two clips'
+    /// sum around one level through the join. Both ramps multiply where a
+    /// clip is short enough for them to overlap.
+    fn gain_at(self, pos: u32) -> f32 {
+        let mut g = 1.0f32;
+        if self.fade_in > 0 && pos < self.fade_in {
+            let t = pos as f32 / self.fade_in as f32;
+            g *= (t * std::f32::consts::FRAC_PI_2).sin();
+        }
+        if self.fade_out > 0 {
+            let out_start = self.total.saturating_sub(self.fade_out);
+            if pos >= out_start {
+                let remaining = self.total.saturating_sub(pos);
+                let t = remaining as f32 / self.fade_out as f32;
+                g *= (t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin();
+            }
+        }
+        g
+    }
+
+    /// Multiplies `frames` in place -- `channels`-wide interleaved samples,
+    /// starting at this segment's own frame `0` -- by [`Self::gain_at`].
+    pub fn apply(self, frames: &mut [f32], channels: usize) {
+        for (i, block) in frames.chunks_mut(channels).enumerate() {
+            let g = self.gain_at(self.elapsed.saturating_add(i as u32));
+            for s in block {
+                *s *= g;
+            }
+        }
+    }
+}
+
 /// What a save writes and a load takes back: the sources, every lane in
 /// display order with its kind, and the equalizer and colour tables their clips
 /// index into -- [`Project::without_orphan_sources`] out,
@@ -810,6 +875,8 @@ impl Project {
     /// is clamped to one frame.
     pub fn single(path: impl AsRef<Path>, frame_count: u32) -> Self {
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: 0,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -1188,6 +1255,8 @@ impl Project {
         self.snapshot();
         let start = self.timeline_frames();
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start,
             in_frame: 0,
             out_frame: frame_count.max(1),
@@ -2396,6 +2465,76 @@ impl Project {
         true
     }
 
+    /// Timeline frames of ramp-up from silence at the start of the clip at
+    /// `idx` of `lane`. `0` for an index that is not there, same as a clip
+    /// that has none.
+    pub fn fade_in_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.lane(lane).get(idx).map_or(0, |c| c.fade_in)
+    }
+
+    /// Sets it, clamped to the clip's own length ([`Clip::frames`]) -- a fade
+    /// can shrink a clip's audible middle to nothing but never ask for more
+    /// ramp than the clip has frames. One undo step like [`Project::set_fit`],
+    /// and `false` (no history) for an index that is not there.
+    pub fn set_fade_in(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        self.snapshot();
+        let clip = &mut self.lane_mut(lane).expect("checked above")[idx];
+        clip.fade_in = frames.min(clip.frames());
+        true
+    }
+
+    /// Timeline frames of ramp-down to silence at the end of the clip at
+    /// `idx` of `lane`. Same promise as [`Project::fade_in_of`].
+    pub fn fade_out_of(&self, lane: Lane, idx: usize) -> u32 {
+        self.lane(lane).get(idx).map_or(0, |c| c.fade_out)
+    }
+
+    /// Sets it. Same promises as [`Project::set_fade_in`].
+    pub fn set_fade_out(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        if idx >= self.lane(lane).len() {
+            return false;
+        }
+        self.snapshot();
+        let clip = &mut self.lane_mut(lane).expect("checked above")[idx];
+        clip.fade_out = frames.min(clip.frames());
+        true
+    }
+
+    /// Crossfades the audio clip at `idx` of `lane` into the one immediately
+    /// after it, over `frames` timeline frames: sets `idx`'s
+    /// [`Clip::fade_out`] and its neighbour's [`Clip::fade_in`] to `frames`,
+    /// each clamped to its own clip's length. `false` -- no history -- unless
+    /// `lane` is audio, `idx + 1` is in bounds, and the two clips are
+    /// adjacent: the second's [`Clip::start`] is exactly the first's
+    /// [`Clip::end`], no gap between them.
+    ///
+    /// This is the whole mechanism, not a stand-in for one: a *real*
+    /// cross-fade -- both takes heard at once, blending -- is what two clips
+    /// **overlapping** on separate lanes already get for free from the
+    /// mixer's own per-lane sum ([`crate::audio::open_mixed_streams_master`]).
+    /// This call only shapes the edges of two clips already sitting
+    /// end-to-end on *one* lane, so the join between them fades like one did.
+    pub fn crossfade(&mut self, lane: Lane, idx: usize, frames: u32) -> bool {
+        if lane.kind != LaneKind::Audio {
+            return false;
+        }
+        let clips = self.lane(lane);
+        let (Some(a), Some(b)) = (clips.get(idx), clips.get(idx + 1)) else {
+            return false;
+        };
+        if a.end() != b.start {
+            return false;
+        }
+        self.snapshot();
+        let clips = self.lane_mut(lane).expect("checked above");
+        clips[idx].fade_out = frames.min(clips[idx].frames());
+        clips[idx + 1].fade_in = frames.min(clips[idx + 1].frames());
+        true
+    }
+
     /// Every frame number on every lane rewritten onto a timeline counted at
     /// another rate: `k` is old timeline frames per new one, `counts` is how
     /// long each source is on the *new* timeline (indexed as
@@ -2804,8 +2943,18 @@ impl Project {
             tail.in_frame = split_source(&tail, timeline_frame).expect("splittable said so");
             tail.start = timeline_frame;
             tail.link = right_of(orig[data_i]);
+            // A split makes a new edge for each half, and a fade is a promise
+            // about an edge: only the half that *kept* the original edge
+            // keeps that fade, re-clamped to its own now-shorter length (a
+            // cut inside the ramp shortens it, never leaves it pointing past
+            // the clip it is on); the edge the cut itself made starts, or
+            // ends, flat -- there was no silence there to ramp out of.
+            tail.fade_in = 0;
+            tail.fade_out = tail.fade_out.min(tail.frames());
             data.clips[idx].out_frame = tail.in_frame;
             data.clips[idx].link = orig[data_i];
+            data.clips[idx].fade_out = 0;
+            data.clips[idx].fade_in = data.clips[idx].fade_in.min(data.clips[idx].frames());
             data.clips.insert(idx + 1, tail);
         }
         true
@@ -3137,6 +3286,8 @@ impl Project {
         }
         self.snapshot();
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: timeline_frame,
             link: None,
             ..clip
@@ -3176,6 +3327,8 @@ impl Project {
             self.lanes.push(LaneData::new(LaneKind::Audio, Vec::new()));
         }
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: timeline_frame,
             link: Some(self.new_link()),
             ..clip
@@ -3751,6 +3904,8 @@ impl Project {
         }
         self.snapshot();
         let clip = Clip {
+            fade_in: 0,
+            fade_out: 0,
             start: at,
             link: Some(self.new_link()),
             ..clip
@@ -4416,6 +4571,42 @@ impl Project {
             .collect()
     }
 
+    /// The fade envelope each of [`audio_segments_from`](Project::audio_segments_from)'s
+    /// segments plays through: the same lanes in the same order, one entry per
+    /// segment, `None` where the segment is a gap or its clip has neither a
+    /// [`Clip::fade_in`] nor a [`Clip::fade_out`]. Parallel list for
+    /// [`audio_eqs_from`](Project::audio_eqs_from)'s reason.
+    pub fn audio_fades_from(&self, timeline_frame: u32, fps: f64) -> Vec<Vec<Option<Fade>>> {
+        self.audio_lanes()
+            .into_iter()
+            .map(|lane| self.lane_fades_from(lane, timeline_frame, fps))
+            .collect()
+    }
+
+    /// [`audio_fades_from`](Project::audio_fades_from) for one lane, matching
+    /// [`lane_segments_from`](Project::lane_segments_from) entry for entry.
+    pub fn lane_fades_from(&self, lane: Lane, timeline_frame: u32, fps: f64) -> Vec<Option<Fade>> {
+        if !(fps.is_finite() && fps > 0.0) {
+            return Vec::new();
+        }
+        self.spans_from(lane, timeline_frame)
+            .iter()
+            .map(|span| {
+                let (idx, _) = self.map(lane, span.start)?;
+                let clip = self.lane(lane).get(idx)?;
+                (clip.fade_in > 0 || clip.fade_out > 0).then(|| Fade {
+                    // `span.len` is the clip's own remaining frames from
+                    // `span.start` on -- shorter than `clip.frames()` only
+                    // when this is the first span of a seek mid-clip.
+                    elapsed: clip.frames().saturating_sub(span.len),
+                    fade_in: clip.fade_in,
+                    fade_out: clip.fade_out,
+                    total: clip.frames(),
+                })
+            })
+            .collect()
+    }
+
     /// Pushes the undo snapshot. Every mutating method calls this once, *after*
     /// it has decided it will succeed -- a refusal must not cost an undo step.
     fn snapshot(&mut self) {
@@ -4761,6 +4952,8 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             && c.start < start
         {
             out.push(Clip {
+                fade_in: 0,
+                fade_out: 0,
                 out_frame: c.in_frame + keep.min(c.len()),
                 link: None,
                 ..c
@@ -4774,6 +4967,8 @@ fn clear(clips: &mut Vec<Clip>, start: u32, end: u32) {
             && c.end() > end
         {
             out.push(Clip {
+                fade_in: 0,
+                fade_out: 0,
                 start: end,
                 in_frame: c.out_frame - keep.min(c.len()),
                 link: None,
@@ -4880,6 +5075,8 @@ mod tests {
     /// A contiguous placement, group id ignored: what most assertions compare.
     fn clip(start: u32, in_frame: u32, out_frame: u32, source: usize) -> Clip {
         Clip {
+            fade_in: 0,
+            fade_out: 0,
             start,
             in_frame,
             out_frame,
@@ -5006,6 +5203,89 @@ mod tests {
             p.lane(Lane::A1)[0].link,
             "and the rejoined clip is one group again"
         );
+    }
+
+    /// [`Fade::gain_at`]'s curve at the edges and in the middle: silence at
+    /// the very first frame of a fade-in, unity at its last, equal-power
+    /// (`sin(pi/4)`) at its midpoint, and unity anywhere neither ramp reaches
+    /// at all.
+    #[test]
+    fn gain_at_is_silent_at_a_fades_edge_and_unity_in_the_body() {
+        let f = Fade {
+            elapsed: 0,
+            fade_in: 10,
+            fade_out: 10,
+            total: 40,
+        };
+        assert_eq!(f.gain_at(0), 0.0, "silence at the very first frame");
+        assert_eq!(f.gain_at(10), 1.0, "unity the frame the ramp ends");
+        let midpoint = std::f32::consts::FRAC_PI_2 * 0.5;
+        assert!(
+            (f.gain_at(5) - midpoint.sin()).abs() < 1e-6,
+            "equal-power midpoint is sin(pi/4)"
+        );
+        assert_eq!(f.gain_at(20), 1.0, "unchanged in the body, past either ramp");
+        // The fade-out is the same curve, mirrored, counting down from the
+        // clip's end: unity at the frame the ramp starts, the same
+        // equal-power midpoint, and -- since `total` itself is one past the
+        // clip's last valid frame -- the very last frame is one step short of
+        // the silence a fade-in's own frame `0` lands on exactly.
+        assert_eq!(f.gain_at(30), 1.0, "unity the frame the fade-out starts");
+        assert!(
+            (f.gain_at(35) - midpoint.sin()).abs() < 1e-6,
+            "the fade-out's own equal-power midpoint"
+        );
+        assert!(
+            (f.gain_at(39) - (std::f32::consts::FRAC_PI_2 * 0.1).sin()).abs() < 1e-6,
+            "one step short of silence at the clip's last playable frame"
+        );
+    }
+
+    /// [`Project::crossfade`] refuses a non-audio lane and two clips that are
+    /// not adjacent, and otherwise sets the shared edge's fades and nothing
+    /// else.
+    #[test]
+    fn crossfade_only_joins_adjacent_audio_clips() {
+        let mut p = Project::single(FILE, 20);
+        assert!(p.split(10));
+        assert!(
+            !p.crossfade(Lane::V1, 0, 5),
+            "video is not an audio lane"
+        );
+        assert!(
+            !p.crossfade(Lane::A1, 1, 5),
+            "there is no clip after idx 1"
+        );
+        assert!(p.crossfade(Lane::A1, 0, 5), "the two halves are adjacent");
+        let a = p.lane(Lane::A1);
+        assert_eq!(a[0].fade_out, 5);
+        assert_eq!(a[1].fade_in, 5);
+        assert_eq!(a[0].fade_in, 0);
+        assert_eq!(a[1].fade_out, 0);
+
+        // A gap between two clips is not adjacency, even on an audio lane.
+        let mut p2 = Project::single(FILE, 1);
+        let a2 = p2.add_lane(LaneKind::Audio);
+        assert!(p2.place(a2, 0, clip(0, 0, 3, 0)));
+        assert!(p2.place(a2, 5, clip(5, 3, 6, 0)), "a gap before this one");
+        assert!(!p2.crossfade(a2, 0, 5), "a gap is not adjacent");
+    }
+
+    /// The rule [`Project::write_split`] follows for the edge the razor makes:
+    /// the left half keeps its old [`Clip::fade_in`] (clamped to its new,
+    /// shorter length) and loses its [`Clip::fade_out`]; the right half is the
+    /// mirror image.
+    #[test]
+    fn a_split_clamps_the_kept_fade_and_zeroes_the_cut_edge() {
+        let mut p = Project::single(FILE, 20);
+        assert!(p.set_fade_in(Lane::V1, 0, 15));
+        assert!(p.set_fade_out(Lane::V1, 0, 15));
+        assert!(p.split(5));
+        let v = p.lane(Lane::V1);
+        assert_eq!(v[0].fade_in, 5, "the left half's kept fade-in, clamped to 5 frames");
+        assert_eq!(v[0].fade_out, 0, "the cut edge it made starts flat");
+        assert_eq!(v[1].fade_in, 0, "the cut edge it made starts flat");
+        assert_eq!(v[1].fade_out, 15, "the right half's kept fade-out, unclamped: 15 frames fit in 15");
     }
 
     /// The music video's own path: the take comes apart into halves that carry
@@ -6188,14 +6468,15 @@ mod tests {
     /// table like the eq and the grade: there is nothing for a table to share.
     /// It costs the clip nothing at all -- the fields before it (a `usize`
     /// source and two `Option<u16>`s) already left the struct padded to 40
-    /// bytes, and the byte landed in that padding. This is the assert that says
-    /// so: a clip that grew a word grew every undo snapshot and every clipboard
-    /// copy with it.
+    /// bytes, and the byte landed in that padding. `fade_in`/`fade_out` are the
+    /// two `u32`s after it, so those cost the clip a full word each: 48 bytes
+    /// total. This is the assert that says so: a clip that grows a word grows
+    /// every undo snapshot and every clipboard copy with it.
     #[test]
     fn a_fit_policy_costs_the_clip_no_word() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            40,
+            48,
             "Clip changed size: {} bytes",
             std::mem::size_of::<Clip>()
         );
@@ -6204,6 +6485,8 @@ mod tests {
     /// The clip a copy would hand back: source `[100, 102)`, unrelated to
     /// anything in `three()` so it is recognisable wherever it lands.
     const PASTED: Clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 0,
         in_frame: 100,
         out_frame: 102,
@@ -6276,6 +6559,8 @@ mod tests {
         let mut p = three();
         let wav = p.import("/nonexistent/song.wav", 0);
         let copied = Clip {
+            fade_in: 0,
+            fade_out: 0,
             source: wav,
             ..PASTED
         };
@@ -7514,8 +7799,8 @@ mod tests {
     fn a_clip_is_still_a_small_copy() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
-            40,
-            "Clip changed size -- 32 before the colour index, 40 after"
+            48,
+            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after"
         );
     }
 
@@ -7597,6 +7882,8 @@ mod tests {
         // format could not have written, are refused at this door too.
         let eqd = |i: u16| {
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
                 eq: Some(i),
                 ..video[0]
             }]
@@ -7633,6 +7920,8 @@ mod tests {
         // The same two refusals for a colour, at the same door.
         let graded = |i: u16| {
             vec![Clip {
+                fade_in: 0,
+                fade_out: 0,
                 color: Some(i),
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
@@ -7691,6 +7980,8 @@ mod tests {
     fn a_link_id_is_never_two_clips_of_one_lane() {
         let sources = vec![Source::new(FILE, 0)];
         let linked = |start, in_frame, out_frame, link| Clip {
+            fade_in: 0,
+            fade_out: 0,
             start,
             in_frame,
             out_frame,
@@ -8468,6 +8759,8 @@ mod tests {
     fn a_group_may_span_any_lane() {
         let lane = |kind, clips: Vec<Clip>| LaneData::new(kind, clips);
         let one = |start: u32, end: u32, link| Clip {
+            fade_in: 0,
+            fade_out: 0,
             start,
             in_frame: start,
             out_frame: end,

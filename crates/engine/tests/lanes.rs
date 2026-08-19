@@ -235,6 +235,8 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
     pin_software();
     let source = asset("test_av.mp4");
     let clip = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: 0,
         in_frame: 0,
         out_frame: TOTAL,
@@ -296,6 +298,8 @@ fn two_audio_lanes_are_summed() {
     let one_lane = Project::single(asset("test_av.mp4"), TOTAL);
     let mut project = one_lane.clone();
     let doubled = Clip {
+        fade_in: 0,
+        fade_out: 0,
         start: TOP_IN,
         in_frame: TOP_IN,
         out_frame: TOP_OUT,
@@ -553,6 +557,8 @@ fn a_paste_never_touches_the_captions() {
 
     let clip = *project.lane(Lane::V1).first().expect("V1 holds the film");
     let pasted = Clip {
+        fade_in: 0,
+        fade_out: 0,
         out_frame: 30,
         ..clip
     };

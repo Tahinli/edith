@@ -1671,16 +1671,18 @@ fn encode_audio(
     let segs = project.audio_segments_from(0, meta.frame_rate);
     let eqs = project.audio_eqs_from(0, meta.frame_rate);
     let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    let fades = project.audio_fades_from(0, meta.frame_rate);
     // Coarse stage timers, in the same voice as `export video: copy` below: an
     // export of a feature film spends minutes in here before a byte of picture
     // is written, and which minutes went where is the first question asked of a
     // slow export. Three lines an export, so they stay on.
     let mixed = std::time::Instant::now();
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at_fade(
         &sources,
         &segs,
         &eqs,
         &speeds,
+        &fades,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
@@ -2765,15 +2767,19 @@ fn run_audio(
     // 2x is half as long and holds the samples that were heard -- not a
     // second pass here that could disagree with what the ear got.
     let speeds = project.audio_speeds_from(0, meta.frame_rate);
+    // ...and the fades with them, the same choke-point reason again: a clip's
+    // envelope runs inside the worker playback feeds from too.
+    let fades = project.audio_fades_from(0, meta.frame_rate);
     // ...and the mix over both: each lane's volume into the sum, the master
     // limiter out of it. The same opener playback's feeder reads from, so a
     // file is written at the levels it was heard at -- there is no second
     // place here that could mix it differently.
-    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at(
+    let Some((audio, chunks)) = AudioSession::open_mixed_streams_master_at_fade(
         &sources,
         &segs,
         &eqs,
         &speeds,
+        &fades,
         &project.audio_gains(),
         project.limiter(),
         sample_rate,
