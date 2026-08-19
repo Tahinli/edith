@@ -134,6 +134,11 @@ actions! {
     /// two adjacent clips picked on one lane, or a single pick faded into the
     /// clip right after it.
     Crossfade,
+    /// Dissolves the selected video clip into its neighbour
+    /// ([`Project::set_transition_out`]): two adjacent clips picked on one
+    /// lane, or a single pick dissolved into the clip right after it. A
+    /// second press on a clip that already dissolves removes it instead.
+    Dissolve,
     Mix,
     ToggleSnap,
     ToggleSubtitles,
@@ -225,6 +230,7 @@ impl ActionId {
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
             ActionId::Crossfade => "Crossfade into the next clip",
+            ActionId::Dissolve => "Dissolve into the next clip",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
             ActionId::ToggleSubtitles => "Subtitles on / off over the picture",
@@ -292,6 +298,7 @@ impl ActionId {
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
             ActionId::Crossfade => "crossfade",
+            ActionId::Dissolve => "dissolve",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
             ActionId::ToggleSubtitles => "toggle-subtitles",
@@ -346,7 +353,8 @@ impl ActionId {
             // timeline the clip is on -- it is a clip card like the three
             // above it, opened on whichever half was picked.
             | ActionId::Silence
-            | ActionId::Crossfade => Category::Clips,
+            | ActionId::Crossfade
+            | ActionId::Dissolve => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
             // Neither is how much of the timeline the panel shows: a zoom edits
@@ -964,6 +972,10 @@ impl Keymap {
                 // ctrl its own room now that plain "f" is the mix card's own
                 // (below) -- the same letter, the modifier telling them apart.
                 b(ActionId::Crossfade, "f", true),
+                // Dissolve takes ctrl+d: the mnemonic letter for "dissolve",
+                // with ctrl its own room now that plain "d" is Detach's --
+                // the same letter, the modifier telling them apart.
+                b(ActionId::Dissolve, "d", true),
                 // The mix card takes "f", for the faders on it: "m" would be
                 // the word but it is the monitoring mute, which is this
                 // machine's volume and not the project's -- two things one key
@@ -1276,7 +1288,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 62);
+        assert_eq!(k.entries().len(), 63);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
