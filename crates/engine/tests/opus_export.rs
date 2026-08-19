@@ -124,6 +124,7 @@ fn export(name: &str, project: Project, video: &Path) -> Scratch {
             format: Format::Hevc,
             ..Default::default()
         },
+        None,
     );
     wait(&handle, Duration::from_secs(600)).expect("the export finishes");
     out
@@ -455,6 +456,7 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
             format: Format::Hevc,
             ..Default::default()
         },
+        None,
     );
     let line = {
         wait(&handle, Duration::from_secs(600)).expect("the export finishes");
