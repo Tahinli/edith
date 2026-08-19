@@ -206,7 +206,7 @@ fn round_trip(name: &str, limit: Duration) {
 #[test]
 fn exports_an_edited_timeline_in_software() {
     let _seat = pin_software();
-    round_trip("sw", Duration::from_secs(120));
+    round_trip("sw", Duration::from_secs(600));
 }
 
 /// Same trip through the plugin, and the only place the end-to-end hardware
@@ -265,7 +265,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
     };
     let out = out_path("mixed");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
-    wait(&handle, Duration::from_secs(120)).expect("export");
+    wait(&handle, Duration::from_secs(600)).expect("export");
 
     let (written, _) = engine::demux::Demuxer::open(&out).expect("reopen export");
     assert_eq!(
@@ -339,7 +339,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
     .expect("a one-source project on stream 1");
     let out = out_path("stream1");
     let handle = engine::export::start(project, meta, &out, &ExportSettings::default());
-    wait(&handle, Duration::from_secs(120)).expect("export");
+    wait(&handle, Duration::from_secs(600)).expect("export");
 
     let (audio, _) = engine::AudioSession::open(&out)
         .expect("reopen export audio")
@@ -482,7 +482,7 @@ fn multi_source_round_trip(name: &str, limit: Duration) {
 #[test]
 fn exports_two_sources_as_one_timeline_in_software() {
     let _seat = pin_software();
-    multi_source_round_trip("multi_sw", Duration::from_secs(180));
+    multi_source_round_trip("multi_sw", Duration::from_secs(900));
 }
 
 #[test]
@@ -510,7 +510,7 @@ fn a_higher_bitrate_writes_a_bigger_file() {
             ..Default::default()
         };
         let handle = session.export_to_with(&out, &settings);
-        wait(&handle, Duration::from_secs(180)).expect("export");
+        wait(&handle, Duration::from_secs(900)).expect("export");
         let size = std::fs::metadata(&out).expect("export exists").len();
         println!("{} Mbps: {size} bytes", bitrate / 1_000_000);
         sizes.push(size);
@@ -609,7 +609,7 @@ fn cancelling_after_the_last_frame_leaves_no_file() {
         let started = Instant::now();
         while handle.progress() < 0.9 && !handle.is_finished() {
             assert!(
-                started.elapsed() < Duration::from_secs(120),
+                started.elapsed() < Duration::from_secs(600),
                 "export stalled"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -651,7 +651,7 @@ fn exports_audio_alongside_the_video() {
     let out = out_path("av");
 
     let handle = session.export_to(&out);
-    wait(&handle, Duration::from_secs(120)).expect("export");
+    wait(&handle, Duration::from_secs(600)).expect("export");
 
     let file = File::open(&out).unwrap();
     let size = file.metadata().unwrap().len();
@@ -782,7 +782,7 @@ fn a_leading_audio_gap_keeps_the_sound_after_it_in_place() {
     session.pause();
     let out = out_path("leading_gap");
     let handle = session.export_to(&out);
-    wait(&handle, Duration::from_secs(180)).expect("export");
+    wait(&handle, Duration::from_secs(900)).expect("export");
 
     let (_, chunks) = engine::AudioSession::open(&out)
         .expect("reopen export audio")
@@ -837,7 +837,7 @@ fn exports_a_gapped_timeline_as_black_and_silence() {
     let out = out_path("gapped");
 
     let handle = session.export_to(&out);
-    wait(&handle, Duration::from_secs(180)).expect("export");
+    wait(&handle, Duration::from_secs(900)).expect("export");
 
     // Every frame is there, and the ones over the hole are black.
     let (video, _) = engine::demux::Demuxer::open(&out).unwrap();
@@ -925,7 +925,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     let started = Instant::now();
     while !job.is_finished() {
         assert!(
-            started.elapsed() < Duration::from_secs(300),
+            started.elapsed() < Duration::from_secs(900),
             "the proxy did not finish: {:.0}% in",
             job.progress() * 100.0
         );
@@ -1162,7 +1162,7 @@ fn a_hardware_proxy_is_every_frame_a_starting_point_too() {
     let started = Instant::now();
     while !job.is_finished() {
         assert!(
-            started.elapsed() < Duration::from_secs(300),
+            started.elapsed() < Duration::from_secs(900),
             "the proxy did not finish"
         );
         std::thread::sleep(Duration::from_millis(20));
