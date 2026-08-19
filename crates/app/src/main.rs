@@ -81,7 +81,7 @@ struct Player {
     /// the moment the first session exists, and cleared there: consumed once,
     /// the way a project's own saved settings are read once at
     /// [`engine::PlaybackSession::open_project`].
-    pending_settings: (Option<(u32, u32)>, Option<f64>),
+    pending_settings: (Option<(u32, u32)>, Option<f64>, Option<u32>),
     /// A library row's own file, opened and playing in place of the
     /// timeline's picture, and never written to `session` or its undo stack:
     /// a preview is watched, not edited. `Some` is what [`Player::pump`] and
@@ -713,7 +713,7 @@ fn main() {
                     seek_since: None,
                     resynced: None,
                     session: None,
-                    pending_settings: (None, None),
+                    pending_settings: (None, None, None),
                     preview_session: None,
                     preview_playing: false,
                     // Full and unmuted, which is what the session it was just
