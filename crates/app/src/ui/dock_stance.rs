@@ -468,9 +468,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 )),
         )
         .child({
-            let style = mono(9., FontWeight::MEDIUM);
+            // FAULT 2: metadata, not a row -- DESIGN §3's 9.5-10px band via
+            // the named constant (a bespoke 9px literal was neither the
+            // metadata size nor any other named role), and the quietest text
+            // in the dock: ink3, tight leading so it never competes with the
+            // 10.5px source rows above it.
+            let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
             div()
                 .flex_none()
+                .line_height(relative(1.25))
                 .font(style.font)
                 .text_size(style.size)
                 .text_color(rgb(INK3()))

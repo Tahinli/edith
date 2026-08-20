@@ -21,7 +21,8 @@ const GLYPH_SIZE: f32 = 13.;
 fn group_head(label: &str) -> impl IntoElement {
     div()
         .flex_none()
-        .pt(px(10.))
+        .pt(px(6.))
+        .line_height(relative(1.1))
         .type_style(type_scale::head())
         .text_color(rgb(INK3()))
         .child(label.to_uppercase())
@@ -63,32 +64,104 @@ fn glyph(
         .items_center()
         .gap(px(1.))
         .px(px(4.))
-        .py(px(2.))
+        .py(px(1.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
         .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
         .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
         .when(on, |d| {
             d.cursor_pointer()
-                .hover(|s| s.bg(rgb(DARK_RAISED())))
+                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.act(action, window, cx)
                 }))
         })
         .child(
             div()
-                .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::MEDIUM))
+                .line_height(relative(1.05))
+                // FAULT 1: the glyph is the loudest thing in its row -- BOLD,
+                // not the MEDIUM weight the chord beneath it also wears.
+                .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::BOLD))
                 .text_color(rgb(if active { INK1() } else { INK2() }))
                 .child(glyph),
         )
         .child(
             div()
+                .line_height(relative(1.05))
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
                 ))
                 .text_color(rgb(INK3()))
                 .child(compact),
+        )
+}
+
+/// The trim control (MOCK-SPEC "Spine"): one row read as ONE control with
+/// two strokes, not two identical `±1` boxes each carrying its own `[`/`]`
+/// chord underneath (the shipped defect this replaces). `−1`/`+1` distinguish
+/// the two strokes visually where a doubled `±1` couldn't; the chord line
+/// beneath is shared and shows both strokes together (`[ ]`), the way the
+/// mock's single `±1` / `[ ]` pair reads as one thing, not two.
+fn trim_control(active: bool, player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let half = |id: &'static str, txt: &'static str, action: ActionId, cx: &mut Context<Player>| {
+        let enabled = player.enable(action, None);
+        let full = player.keymap.display(action);
+        let say: SharedString = match enabled.why() {
+            Some(why) => format!("{full} — {why}"),
+            None => format!("{full} — {}", action.label()),
+        }
+        .into();
+        let on = enabled.yes();
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(2.))
+            .rounded(px(3.))
+            .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
+            .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
+            .when(on, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.act(action, window, cx)
+                    }))
+            })
+            .child(
+                div()
+                    .line_height(relative(1.05))
+                    .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::BOLD))
+                    .text_color(rgb(if active { INK1() } else { INK2() }))
+                    .child(txt),
+            )
+    };
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(1.))
+        .px(px(4.))
+        .py(px(1.))
+        .rounded(px(3.))
+        .when(active, |d| d.bg(rgb(DARK_RAISED())))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.))
+                .child(half("spine-trim-in", "−1", ActionId::TrimIn, cx))
+                .child(half("spine-trim-out", "+1", ActionId::TrimOut, cx)),
+        )
+        .child(
+            div()
+                .line_height(relative(1.05))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK3()))
+                .child("[ ]"),
         )
 }
 
@@ -128,10 +201,12 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .flex()
         .flex_col()
         .items_center()
-        // FAULT 2: rows close under their group head, real space (the group
+        // FAULT 1: rows close under their group head, real space (the group
         // head's own `pt`) only between one group and the next -- not one
-        // uniform gap stretching every row down the window.
-        .gap(px(2.))
+        // uniform gap stretching every row down the window. The gap itself
+        // is now the smallest gpui will draw (1px) rather than the 2px that
+        // still read as "spread" against the mock's tight top-third rail.
+        .gap(px(1.))
         .overflow_y_scroll()
         .child(group_head("edit"))
         .child(glyph("spine-split", "||", ActionId::Cut, false, player, cx))
@@ -142,24 +217,7 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             glyph("spine-cut-prev", "‹", ActionId::WalkCutPrev, false, player, cx),
             glyph("spine-cut-next", "›", ActionId::WalkCutNext, false, player, cx),
         ))
-        .child(pair(
-            glyph(
-                "spine-trim-in",
-                "±1",
-                ActionId::TrimIn,
-                player.loop_trim.is_some(),
-                player,
-                cx,
-            ),
-            glyph(
-                "spine-trim-out",
-                "±1",
-                ActionId::TrimOut,
-                player.loop_trim.is_some(),
-                player,
-                cx,
-            ),
-        ))
+        .child(trim_control(player.loop_trim.is_some(), player, cx))
         .child(glyph(
             "spine-loop-trim",
             "↻",
