@@ -13,6 +13,7 @@ use crate::ui::bench_stance;
 use crate::ui::dock_stance;
 use crate::ui::timeband_stance;
 use crate::ui::spine_stance;
+use crate::ui::type_scale::{self, Typeset};
 
 /// Left rail, full height (DESIGN §5).
 const SPINE_W: f32 = 56.;
@@ -35,7 +36,7 @@ const DOCK_W: f32 = 280.;
 fn section_head(label: &str) -> impl IntoElement {
     div()
         .flex_none()
-        .text_size(px(9.))
+        .type_style(type_scale::head())
         .text_color(rgb(INK3()))
         .child(label.to_uppercase())
 }
@@ -52,14 +53,19 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
         .gap(px(2.))
         .py(px(6.))
         .rounded(px(3.))
-        .text_size(px(13.))
+        .type_style(type_scale::label(13., gpui::FontWeight::MEDIUM))
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
         .child(
             div()
-                .text_size(px(9.5))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
-                .child(player.keymap.display(action)),
+                // FAULT 1: the badge shows the primary chord, compact --
+                // same rule as every glyph in `spine_stance`.
+                .child(player.keymap.chord(action)),
         )
 }
 
@@ -112,7 +118,7 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                     KeyRow::Head(category) => div()
                         .flex_none()
                         .pt(px(4.))
-                        .text_size(px(9.))
+                        .type_style(type_scale::head())
                         .text_color(rgb(INK3()))
                         .child(category.label().to_uppercase())
                         .into_any_element(),
@@ -120,9 +126,27 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                         .flex()
                         .justify_between()
                         .gap(px(12.))
-                        .text_size(px(9.5))
-                        .child(div().text_color(rgb(INK2())).child(action.label()))
-                        .child(div().text_color(rgb(INK3())).child(player.keymap.display(action)))
+                        .child(
+                            div()
+                                .type_style(type_scale::label(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK2()))
+                                .child(action.label()),
+                        )
+                        .child(
+                            div()
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                                // The keys overlay is the full-truth surface
+                                // (FAULT 1): every chord an action answers to,
+                                // not the badge's primary-only compact form.
+                                .child(player.keymap.display(action)),
+                        )
                         .into_any_element(),
                     KeyRow::Fixed(i) => {
                         let f = &keymap::FIXED[i];
@@ -130,9 +154,24 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                             .flex()
                             .justify_between()
                             .gap(px(12.))
-                            .text_size(px(9.5))
-                            .child(div().text_color(rgb(INK2())).child(f.label))
-                            .child(div().text_color(rgb(INK3())).child(f.chord.clone()))
+                            .child(
+                                div()
+                                    .type_style(type_scale::label(
+                                        type_scale::CHORD_METADATA_MIN_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
+                                    .text_color(rgb(INK2()))
+                                    .child(f.label),
+                            )
+                            .child(
+                                div()
+                                    .type_style(type_scale::mono(
+                                        type_scale::CHORD_METADATA_MIN_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
+                                    .text_color(rgb(INK3()))
+                                    .child(f.chord.clone()),
+                            )
                             .into_any_element()
                     }
                 })),
@@ -278,7 +317,7 @@ fn notice_plate(message: SharedString) -> impl IntoElement {
         // shape as the legacy notice bar's own tone stripe (`notice_bar`).
         .border_l(px(3.))
         .border_color(rgb(notice_severity(&message)))
-        .text_size(px(10.))
+        .type_style(type_scale::label(10., gpui::FontWeight::MEDIUM))
         .text_color(rgb(INK1()))
         .child(message)
 }
@@ -308,18 +347,49 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
         .gap(px(14.))
         .px(px(12.))
         .child(section_head("ledger"))
-        .child(div().text_size(px(9.5)).text_color(rgb(INK1())).child(identity))
+        // MOCK-SPEC.md "Ledger": "All mono" -- project identity, last
+        // action, export progress and position are all what the film/project
+        // says, not the room's own voice.
+        .child(
+            div()
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK1()))
+                .child(identity),
+        )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_size(px(9.5))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
                 .child(last_action),
         )
-        .children(export.map(|e| div().text_size(px(9.5)).text_color(rgb(INK2())).child(e)))
-        .child(div().flex_none().text_size(px(9.5)).text_color(rgb(INK2())).child(tc))
+        .children(export.map(|e| {
+            div()
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK2()))
+                .child(e)
+        }))
+        .child(
+            div()
+                .flex_none()
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK2()))
+                .child(tc),
+        )
 }
 
 /// The dock: the only side panel, right, fixed width, carrying the Src/Clip

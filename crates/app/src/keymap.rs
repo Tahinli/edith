@@ -877,6 +877,26 @@ impl Chord {
         }
     }
 
+    /// The spelling a badge with room for one token reads (MOCK-SPEC.md
+    /// "Spine": `del`, `z`, not `x or delete`, `ctrl+z`): `^` in place of
+    /// `ctrl+`, and the handful of key names whose everyday short form isn't
+    /// gpui's own (`delete` -> `del`, `escape` -> `esc`, `space` -> `spc`).
+    /// [`Chord::pretty`] stays the keys overlay's own spelling -- this is for
+    /// a glyph badge, not the full truth.
+    pub fn compact(&self) -> String {
+        let key = match self.key.as_str() {
+            "escape" => "esc",
+            "delete" => "del",
+            "space" => "spc",
+            other => other,
+        };
+        if self.ctrl {
+            format!("^{key}")
+        } else {
+            key.to_string()
+        }
+    }
+
     /// Whether the file can carry this stroke and read it back as itself. gpui
     /// reports strokes this format cannot spell -- shift+= arrives as the key
     /// `"+"`, which is the chord grammar's own separator -- and binding one
@@ -1213,6 +1233,20 @@ impl Keymap {
         } else {
             strokes.join(" or ")
         }
+    }
+
+    /// The primary chord for `action`, compact ([`Chord::compact`]) -- a
+    /// badge that has room for one token, not [`Keymap::display`]'s sentence.
+    /// The first bound stroke wins (`defaults`' own insertion order, and
+    /// `rebind_action`'s "makes `chord` the whole of what reaches `action`"
+    /// leaves at most one anyway); an action with no stroke reads `--`
+    /// rather than the unbound sentence, since a badge is not a warning.
+    pub fn chord(&self, action: ActionId) -> String {
+        self.bindings
+            .iter()
+            .find(|b| b.action == action)
+            .map(|b| b.chord.compact())
+            .unwrap_or_else(|| "--".to_string())
     }
 
     /// Every binding, in display order.
@@ -1740,6 +1774,20 @@ mod tests {
         assert_eq!(k.display(ActionId::ShowActions), "?");
         assert_eq!(k.display(ActionId::ToggleSubtitles), "t");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
+    }
+
+    /// [`Keymap::chord`] is the badge's one token, not [`Keymap::display`]'s
+    /// sentence: the primary (first-bound) stroke only, `^` for ctrl, and the
+    /// short names a glyph badge actually has room for.
+    #[test]
+    fn chord_is_the_primary_stroke_compact() {
+        let k = Keymap::defaults();
+        assert_eq!(k.chord(ActionId::Delete), "x");
+        assert_eq!(k.chord(ActionId::Undo), "z");
+        assert_eq!(k.chord(ActionId::AddFiles), "^o");
+        assert_eq!(k.chord(ActionId::CancelExport), "^esc");
+        assert_eq!(k.chord(ActionId::Play), "spc");
+        assert_eq!(whole("edith-keys 1\n").chord(ActionId::Cut), "--");
     }
 
     /// The one row of [`FIXED`] that speaks for a whole table elsewhere: it
