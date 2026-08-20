@@ -213,7 +213,6 @@ impl Player {
         let out = keymap::Chord {
             key: ESCAPE.to_string(),
             ctrl: false,
-            shift: false,
         }
         .pretty();
         // Every action there is, under its heading, and the strokes the modal

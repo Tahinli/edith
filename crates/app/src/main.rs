@@ -129,13 +129,6 @@ struct Player {
     /// [`should_loop_restart`] with one field instead of asking whether the
     /// mode is on and then separately what the window is.
     loop_trim: Option<(u32, u32)>,
-    /// Whether the stroke [`Player::act`] is running for was held with shift
-    /// -- the odometer's stride (DESIGN.md §6: bare walks one cut, shift
-    /// strides ten). Set by the key handler right before `act`, since
-    /// [`ActionId`] carries no modifier of its own (`.` and `shift+.` are the
-    /// same [`ActionId::WalkCutNext`], by design -- see keymap.rs's own
-    /// `bshift`) and nothing else here reads it.
-    walk_shift: bool,
     /// Timeline seconds -> frame index, so the clock can be compared to what
     /// the decoder hands over.
     fps: f64,
@@ -829,7 +822,6 @@ fn main() {
                     loop_on: false,
                     range: None,
                     loop_trim: None,
-                    walk_shift: false,
                     // Full and unmuted, which is what the session it was just
                     // handed is already set to: nothing to push at startup.
                     volume: Volume::default(),

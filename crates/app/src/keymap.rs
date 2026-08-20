@@ -81,10 +81,20 @@ actions! {
     PrevSyncPoint,
     NextSyncPoint,
     /// Walks to the next cut (DESIGN.md §6): the odometer the cut readout
-    /// counts against. Shift strides ten cuts instead of one.
+    /// counts against.
     WalkCutNext,
-    /// The pair's other half, one cut earlier. Shift strides ten.
+    /// The pair's other half, one cut earlier.
     WalkCutPrev,
+    /// [`ActionId::WalkCutNext`]'s stride-ten (DESIGN.md §6's "shift"): its
+    /// own action, not a modifier read off `WalkCutNext`, because gpui 0.2.2
+    /// never delivers a shift modifier alongside `.`/`,` (see [`Chord`]'s
+    /// doc) -- the *only* channel a stroke has back to [`Player::act`] is
+    /// which [`ActionId`] the keymap resolved it to, so the stride the
+    /// platform can't spell as a modifier is spelled as its own bound key
+    /// (`>`, what shift+. actually types) instead.
+    WalkCutNext10,
+    /// The pair's other half (`<`, what shift+, actually types).
+    WalkCutPrev10,
     /// Marks the playhead as an export's in point. The out point wraps around
     /// it if the mark lands past the current out ([`ordered_range`]).
     SetIn,
@@ -145,11 +155,12 @@ actions! {
     Crossfade,
     /// No-aim trim of the subject cut's in point, frame detents, at any zoom
     /// (DESIGN.md §6), on its designed bare `[`. [`ActionId::SelectPrev`]
-    /// moved to shift+[ to free it -- see keymap.rs's own defaults.
+    /// moved to `{` (what shift+[ actually types) to free it -- see
+    /// keymap.rs's own defaults.
     TrimIn,
     /// The pair's other half, the subject cut's out point, on its designed
-    /// bare `]` -- [`ActionId::SelectNext`] moved to shift+] for the same
-    /// reason.
+    /// bare `]` -- [`ActionId::SelectNext`] moved to `}` (what shift+]
+    /// actually types) for the same reason.
     TrimOut,
     /// Loop-trim: loops around the subject cut while trimming it (DESIGN.md
     /// §6, "the modernized Avid trim mode").
@@ -208,8 +219,10 @@ impl ActionId {
             ActionId::GoEnd => "Go to the last frame",
             ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
             ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
-            ActionId::WalkCutNext => "Walk to the next cut (shift: ten cuts)",
-            ActionId::WalkCutPrev => "Walk to the previous cut (shift: ten cuts)",
+            ActionId::WalkCutNext => "Walk to the next cut",
+            ActionId::WalkCutPrev => "Walk to the previous cut",
+            ActionId::WalkCutNext10 => "Walk ten cuts forward",
+            ActionId::WalkCutPrev10 => "Walk ten cuts back",
             ActionId::SetIn => "Mark in (export range)",
             ActionId::SetOut => "Mark out (export range)",
             ActionId::ClearRange => "Clear the export range",
@@ -287,6 +300,8 @@ impl ActionId {
             ActionId::NextSyncPoint => "next-sync-point",
             ActionId::WalkCutNext => "walk-cut-next",
             ActionId::WalkCutPrev => "walk-cut-prev",
+            ActionId::WalkCutNext10 => "walk-cut-next-10",
+            ActionId::WalkCutPrev10 => "walk-cut-prev-10",
             ActionId::SetIn => "set-in",
             ActionId::SetOut => "set-out",
             ActionId::ClearRange => "clear-range",
@@ -366,6 +381,8 @@ impl ActionId {
             | ActionId::NextSyncPoint
             | ActionId::WalkCutNext
             | ActionId::WalkCutPrev
+            | ActionId::WalkCutNext10
+            | ActionId::WalkCutPrev10
             | ActionId::SetIn
             | ActionId::SetOut
             | ActionId::ClearRange => Category::Playback,
@@ -796,27 +813,35 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(||
     ]
 });
 
-/// A stroke as the key handler sees it: gpui's key name plus the two
-/// modifiers this editor binds. Nothing else is a chord here -- alt is part
-/// of the key name gpui reports, and a third modifier would need the file
+/// A stroke as the key handler sees it: gpui's key name plus the one
+/// modifier this editor binds. Nothing else is a chord here -- alt is part
+/// of the key name gpui reports, and a second modifier would need the file
 /// format to grow before it could be spelled.
+///
+/// There is no `shift` field. gpui 0.2.2 (linux/platform.rs:909-917) clears
+/// the shift modifier for any single-char key whose upper and lower case are
+/// the same -- every symbol key (`,` `.` `[` `]` `/` `=` ...) -- so a chord
+/// carrying `shift` could never be struck for any of them; the shifted
+/// stroke arrives instead as the key it types (`shift+.` is the key `>`).
+/// The one place this editor wanted shift on a symbol (the odometer's
+/// stride-ten, DESIGN.md §6) is bound on that literal key instead
+/// (`keymap.rs`'s own `defaults`), and a non-symbol key that wants shift
+/// (the EQ card's arrows) reads `event.keystroke.modifiers.shift` straight
+/// off the keystroke, upstream of this struct entirely -- so the field had
+/// zero production callers and is gone rather than kept dead.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Chord {
     pub key: String,
     pub ctrl: bool,
-    pub shift: bool,
 }
 
 impl Chord {
-    /// The file's spelling, and the only one [`parse`] accepts back. Ctrl
-    /// always comes before shift, so a chord round-trips through one spelling
-    /// and not two.
+    /// The file's spelling, and the only one [`parse`] accepts back.
     fn text(&self) -> String {
-        match (self.ctrl, self.shift) {
-            (true, true) => format!("ctrl+shift+{}", self.key),
-            (true, false) => format!("ctrl+{}", self.key),
-            (false, true) => format!("shift+{}", self.key),
-            (false, false) => self.key.clone(),
+        if self.ctrl {
+            format!("ctrl+{}", self.key)
+        } else {
+            self.key.clone()
         }
     }
 
@@ -830,11 +855,10 @@ impl Chord {
         } else {
             &self.key
         };
-        match (self.ctrl, self.shift) {
-            (true, true) => format!("ctrl+shift+{key}"),
-            (true, false) => format!("ctrl+{key}"),
-            (false, true) => format!("shift+{key}"),
-            (false, false) => key.to_string(),
+        if self.ctrl {
+            format!("ctrl+{key}")
+        } else {
+            key.to_string()
         }
     }
 
@@ -848,18 +872,14 @@ impl Chord {
         Chord::parse(&self.text(), 0).is_ok_and(|round_trip| round_trip == *self)
     }
 
-    /// Strict: exactly one optional `ctrl+`, then one optional `shift+`, then
-    /// a key gpui could have reported. A spelling this cannot emit back
-    /// unchanged is refused rather than normalised, because the round-trip is
-    /// what makes the file editable by hand at all.
+    /// Strict: exactly one optional `ctrl+`, then a key gpui could have
+    /// reported. A spelling this cannot emit back unchanged is refused
+    /// rather than normalised, because the round-trip is what makes the file
+    /// editable by hand at all.
     fn parse(text: &str, n: usize) -> Result<Self, String> {
-        let (ctrl, rest) = match text.strip_prefix("ctrl+") {
+        let (ctrl, key) = match text.strip_prefix("ctrl+") {
             Some(rest) => (true, rest),
             None => (false, text),
-        };
-        let (shift, key) = match rest.strip_prefix("shift+") {
-            Some(key) => (true, key),
-            None => (false, rest),
         };
         if key.is_empty()
             || key.contains(' ')
@@ -871,7 +891,6 @@ impl Chord {
         Ok(Chord {
             key: key.to_string(),
             ctrl,
-            shift,
         })
     }
 }
@@ -901,15 +920,6 @@ impl Keymap {
             chord: Chord {
                 key: key.to_string(),
                 ctrl,
-                shift: false,
-            },
-        };
-        let bshift = |action, key: &str| Binding {
-            action,
-            chord: Chord {
-                key: key.to_string(),
-                ctrl: false,
-                shift: true,
             },
         };
         Keymap {
@@ -938,11 +948,17 @@ impl Keymap {
                 b(ActionId::PrevSyncPoint, "[", true),
                 b(ActionId::NextSyncPoint, "]", true),
                 // The cut odometer (DESIGN.md §6): bare walks one cut, shift
-                // strides ten. Both were free.
+                // strides ten. gpui 0.2.2 (linux/platform.rs:909-917) clears
+                // the shift modifier for any single-char key whose upper and
+                // lower case are the same -- every one of these symbols --
+                // so `shift+.` never arrives; what arrives instead is the
+                // key the shifted stroke actually types, `>`/`<`. Bound
+                // directly, on the same physical chord, since that is what
+                // the platform hands the key handler.
                 b(ActionId::WalkCutNext, ".", false),
-                bshift(ActionId::WalkCutNext, "."),
                 b(ActionId::WalkCutPrev, ",", false),
-                bshift(ActionId::WalkCutPrev, ","),
+                b(ActionId::WalkCutNext10, ">", false),
+                b(ActionId::WalkCutPrev10, "<", false),
                 // The mark pair, on the letters every editor already means them
                 // by: bare, since a mark is set as often as a step and nothing
                 // else in this table answers to either.
@@ -968,16 +984,19 @@ impl Keymap {
                 b(ActionId::Detach, "d", false),
                 b(ActionId::Group, "g", true),
                 // Selection without a pointer. Tab is what a keyboard already
-                // means by "move on to the next thing", and the two brackets
+                // means by "move on to the next thing", and the two braces
                 // are the pair either side of it in the lane -- shift+tab is
                 // the obvious partner and is unspellable here, since a chord
                 // carries only ctrl and `parse` refuses an uppercase key. Bare
                 // brackets are DESIGN.md §6's own trim pair now, so selection
-                // takes the shifted chord: same two keys, the modifier telling
-                // "walk the lane" apart from "trim the cut".
+                // takes the braces the shifted brackets actually type: same
+                // two keys, telling "walk the lane" apart from "trim the cut".
                 b(ActionId::Select, "tab", false),
-                bshift(ActionId::SelectNext, "]"),
-                bshift(ActionId::SelectPrev, "["),
+                // Same platform fact as the odometer above: shift+] never
+                // arrives as shift+], it arrives as the key `}` (and shift+[
+                // as `{`) -- bound on the literal the platform delivers.
+                b(ActionId::SelectNext, "}", false),
+                b(ActionId::SelectPrev, "{", false),
                 // Select-all, on the chord every editor and every text field
                 // already means it by -- which is why the audio-lane removal
                 // below had to move off ctrl+a: a stroke that universal was
@@ -1064,10 +1083,11 @@ impl Keymap {
                 // (below) -- the same letter, the modifier telling them apart.
                 b(ActionId::Crossfade, "f", true),
                 // DESIGN.md §6's own chords: bare `[` `]` are the no-aim trim
-                // pair. SelectPrev/SelectNext moved to shift+[ shift+] above
-                // to make room -- the bare bracket trims the subject cut,
-                // the shifted one walks the selection past it, so the family
-                // reads as one idea under one pair of keys.
+                // pair. SelectPrev/SelectNext moved to `{` `}` above to make
+                // room -- the bare bracket trims the subject cut, the brace
+                // (what the shifted bracket actually types) walks the
+                // selection past it, so the family reads as one idea under
+                // one pair of keys.
                 b(ActionId::TrimIn, "[", false),
                 b(ActionId::TrimOut, "]", false),
                 // Loop-trim (DESIGN.md §6, "the modernized Avid trim mode"):
@@ -1133,20 +1153,12 @@ impl Keymap {
     }
 
     /// What a stroke means, if anything. `key` is gpui's key name and `ctrl` its
-    /// control modifier -- the pair the key handler already matches on.
+    /// control modifier -- the pair the key handler already matches on. There
+    /// is no shift parameter: see [`Chord`]'s own doc for why.
     pub fn lookup(&self, key: &str, ctrl: bool) -> Option<ActionId> {
-        self.lookup_shifted(key, ctrl, false)
-    }
-
-    /// [`Keymap::lookup`] plus the shift modifier, for a stroke like
-    /// `shift+.` (the cut odometer's stride-ten). The key handler does not
-    /// pass shift yet -- that is the dispatch task's wiring, not this one's --
-    /// so every current caller goes through the two-argument [`Keymap::lookup`]
-    /// above and only ever reaches an unshifted chord.
-    pub fn lookup_shifted(&self, key: &str, ctrl: bool, shift: bool) -> Option<ActionId> {
         self.bindings
             .iter()
-            .find(|b| b.chord.ctrl == ctrl && b.chord.shift == shift && b.chord.key == key)
+            .find(|b| b.chord.ctrl == ctrl && b.chord.key == key)
             .map(|b| b.action)
     }
 
@@ -1386,7 +1398,6 @@ mod tests {
         Chord {
             key: key.to_string(),
             ctrl,
-            shift: false,
         }
     }
 
@@ -1402,18 +1413,13 @@ mod tests {
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
         assert_eq!(k.entries().len(), 71);
-        // The cut odometer: bare walks one, shift strides ten.
+        // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
+        // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
         assert_eq!(k.lookup(",", false), Some(ActionId::WalkCutPrev));
         assert_eq!(k.lookup("/", false), Some(ActionId::LoopTrim));
-        assert_eq!(
-            k.lookup_shifted(".", false, true),
-            Some(ActionId::WalkCutNext)
-        );
-        assert_eq!(
-            k.lookup_shifted(",", false, true),
-            Some(ActionId::WalkCutPrev)
-        );
+        assert_eq!(k.lookup(">", false), Some(ActionId::WalkCutNext10));
+        assert_eq!(k.lookup("<", false), Some(ActionId::WalkCutPrev10));
         // The trim pair, on its designed bare brackets (DESIGN.md §6).
         assert_eq!(k.lookup("[", false), Some(ActionId::TrimIn));
         assert_eq!(k.lookup("]", false), Some(ActionId::TrimOut));
@@ -1438,14 +1444,8 @@ mod tests {
         // the sync points a cut has to land on to be copied.
         assert_eq!(k.lookup("[", true), Some(ActionId::PrevSyncPoint));
         assert_eq!(k.lookup("]", true), Some(ActionId::NextSyncPoint));
-        assert_eq!(
-            k.lookup_shifted("]", false, true),
-            Some(ActionId::SelectNext)
-        );
-        assert_eq!(
-            k.lookup_shifted("[", false, true),
-            Some(ActionId::SelectPrev)
-        );
+        assert_eq!(k.lookup("}", false), Some(ActionId::SelectNext));
+        assert_eq!(k.lookup("{", false), Some(ActionId::SelectPrev));
         assert_eq!(k.lookup("i", false), Some(ActionId::SetIn));
         assert_eq!(k.lookup("o", false), Some(ActionId::SetOut));
         assert_eq!(k.lookup("u", true), Some(ActionId::ClearRange));
@@ -1460,14 +1460,8 @@ mod tests {
         assert_eq!(k.lookup("g", true), Some(ActionId::Group));
         // The keyboard's way onto a clip, and the pair that walks the lane.
         assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
-        assert_eq!(
-            k.lookup_shifted("]", false, true),
-            Some(ActionId::SelectNext)
-        );
-        assert_eq!(
-            k.lookup_shifted("[", false, true),
-            Some(ActionId::SelectPrev)
-        );
+        assert_eq!(k.lookup("}", false), Some(ActionId::SelectNext));
+        assert_eq!(k.lookup("{", false), Some(ActionId::SelectPrev));
         assert_eq!(k.lookup("x", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
@@ -1675,16 +1669,20 @@ mod tests {
         assert_eq!(k.display(ActionId::Undo), "ctrl+z");
         assert_eq!(k.lookup("z", false), None);
         // The action keeps its place in the display order, and the file keeps
-        // reading in that order too. Deduped, because WalkCutNext/WalkCutPrev
-        // still carry their own two default chords each (untouched by this
-        // test's rebinds) and so appear twice running.
+        // reading in that order too. Deduped only for safety -- both actions
+        // this test rebinds (Delete and Undo) started with two default
+        // chords each, but both rebinds above collapse them to one, so no
+        // action here still appears twice.
         let mut order: Vec<_> = k.entries().iter().map(|b| b.action).collect();
         order.dedup();
         assert_eq!(order, ActionId::ALL);
         assert_eq!(emit(&k), emit(&whole(&emit(&k))));
-        // Every action is single-bound except WalkCutNext/WalkCutPrev, still
-        // two chords each -- one line per action, plus those two extras.
-        assert_eq!(k.entries().len(), ActionId::ALL.len() + 2);
+        // With Delete and Undo both collapsed to one chord, every action is
+        // single-bound: one line each. The stride-10 walk
+        // (WalkCutNext10/WalkCutPrev10) is its own action now, each bound to
+        // exactly one literal chord (`>`/`<`), not a second chord on
+        // WalkCutNext/WalkCutPrev.
+        assert_eq!(k.entries().len(), ActionId::ALL.len());
     }
 
     #[test]
