@@ -25,7 +25,27 @@ impl Player {
             self.seek(f64::from(at) / self.fps, cx);
         }
         if let Some(session) = &mut self.session {
-            session.cut_at(f64::from(at) / self.fps);
+            // The ledger's last action (DESIGN §5) reads the notice queue's
+            // back, and a split used to leave nothing there -- two clips
+            // appeared on the bench while the ledger still named whatever
+            // came before. `NOTICE_TELL`'s grey "told you" (§8) self-fades,
+            // so this does not linger over the picture; it just gives the
+            // ledger something true to say. Held `,`/`.`/`[`/`]` (walk, trim)
+            // stay silent on purpose -- those fire many times a second and a
+            // notice per keystroke would turn the ledger into a firehose,
+            // exactly what §8's "one at a time" is against; a single `s` is
+            // not that.
+            // The legacy room has no ledger reading this queue and never
+            // notified on a split before -- gated so that room's behaviour
+            // stays exactly as it was.
+            let cut = session.cut_at(f64::from(at) / self.fps);
+            if self.darkroom {
+                if cut {
+                    self.notify_user("SPLIT".into());
+                } else {
+                    self.notify_user("NOTHING TO SPLIT — the playhead is already on a cut".into());
+                }
+            }
         }
         self.selected.clear();
         cx.notify();

@@ -123,7 +123,14 @@ impl Player {
                     .gap(px(2.))
                     .children(self.import_bar(cx))
                     .children(self.seek_bar())
-                    .children(self.notice_bar(cx))
+                    // DESIGN §8: no full-width bar over the picture, ever.
+                    // The darkroom stance has its own §8-conformant notice
+                    // plate above the ledger (`ui::stance::notice_plate`) --
+                    // this legacy bar would otherwise paint a second,
+                    // picture-covering copy of the same notice underneath
+                    // it. The legacy (non-darkroom) room keeps this bar
+                    // exactly as it was.
+                    .children((!self.darkroom).then(|| self.notice_bar(cx)).flatten())
                     // How tall the lot came out, for the cue plate above to
                     // step over ([`sub_bottom`]) -- the bars are over the
                     // picture, and a message drawn across the line being
