@@ -378,7 +378,7 @@ impl Player {
                         0.,
                         BG_RAISED(),
                         None,
-                        "+ S",
+                        "+ C",
                         "adds a subtitle track under the ones there",
                         ActionId::AddSubtitleLane,
                         cx.listener(|this, _: &ClickEvent, _, cx| {

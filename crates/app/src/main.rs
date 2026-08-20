@@ -213,6 +213,12 @@ struct Player {
     /// filter box: the categories are what the media *is*, and every editor
     /// this one is measured against splits its pool the same way.
     library_tab: LibraryTab,
+    /// Which of the darkroom dock's Src/Clip tabs is showing (DESIGN §5).
+    /// `Player`-owned rather than the process-global static it used to be
+    /// (VIOLATION 3), and persisted the way `ui::theme`'s pick is
+    /// (`ui::dock_stance::load`/`save`) so "a room reopens exactly as left"
+    /// survives a quit and relaunch, not just this window.
+    pub(crate) dock_src_active: bool,
     /// What is known about each source's audio, taken once and kept. Keyed on
     /// the path *and stream* -- two streams of one file are two envelopes -- and
     /// the key is inserted the moment the decode is *started*: presence means
@@ -860,6 +866,7 @@ fn main() {
                     library_menu: None,
                     selected_asset: None,
                     library_tab: LibraryTab::Media,
+                    dock_src_active: ui::dock_stance::load(),
                     waves: HashMap::new(),
                     proxies: HashMap::new(),
                     streams: HashMap::new(),

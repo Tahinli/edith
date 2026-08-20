@@ -2102,3 +2102,23 @@ fn should_loop_restart_only_at_the_windows_far_edge() {
     assert!(should_loop_restart(61, Some((30, 60))), "past it restarts too");
     assert!(!should_loop_restart(60, None), "loop-trim off restarts nothing");
 }
+
+/// The paused-then-started repro this predicate was blamed for and cleared
+/// of: `should_loop_restart` takes no play/pause state at all, so resting
+/// exactly at the window's far edge -- as a transport paused after playing
+/// through the cut once, or paused right on arrival by a scrub -- reads
+/// "restart" from the predicate alone regardless. The bug that froze a
+/// paused-then-`space`d transport at the loop's start frame was not this: it
+/// was `Player::toggle_loop_trim` forcing `session.play()` on arm, so the
+/// user's own next `space` toggled straight back to paused. It is
+/// `Player::pump`'s `session.is_playing()` guard around this call that must
+/// hold a paused transport off the seek until playback actually starts.
+#[test]
+fn should_loop_restart_is_play_state_blind_the_pump_gates_it() {
+    use crate::timeline_math::should_loop_restart;
+    assert!(
+        should_loop_restart(60, Some((30, 60))),
+        "the predicate alone can't tell paused-at-the-edge from playing-\
+         into-it -- that distinction is pump's is_playing() guard, not this"
+    );
+}
