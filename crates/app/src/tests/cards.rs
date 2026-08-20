@@ -1633,3 +1633,44 @@ fn a_preset_over_a_picture_this_timeline_has_none_of_carries_the_codec_refusal()
     let (audio_format, _) = ExportPreset::AudioOnly.bundle().expect("a real bundle");
     assert_eq!(format_refusal(&session, audio_format), None);
 }
+
+/// The stacking-scrims bug: opening the speed card while the colour card was
+/// up left both up at once, because each `open_*` cleared a different
+/// hand-picked subset of the other flags rather than all of them. The fix is
+/// one path (`Player::close_card`, the single list of every flag that means
+/// "a card is up") that every opener calls before setting its own -- so this
+/// pins that *every* opener routes through it, found by name in the source
+/// rather than hand-listed, which is what let a seventh and eighth card slip
+/// through the ad-hoc version unnoticed.
+#[test]
+fn every_card_opener_closes_every_other_card_through_one_path() {
+    let cards_src = src_text("player/cards.rs");
+    let mut openers = Vec::new();
+    let mut rest = cards_src.as_str();
+    let mut scanned_from = 0usize;
+    while let Some(at) = rest.find("fn open_") {
+        let after = &rest[at + "fn ".len()..];
+        let name_end = after.find('(').expect("a fn's parens");
+        openers.push(after[..name_end].to_string());
+        scanned_from += at + "fn ".len() + name_end;
+        rest = &cards_src[scanned_from..];
+    }
+    // `open_picker` opens a small dropdown (a resolution/fps/fit choice
+    // list), not one of the seven full-window plates `close_card` lists --
+    // it is not part of this invariant.
+    openers.retain(|name| name != "open_picker");
+    assert!(
+        openers.len() >= 7,
+        "expected at least the seven card openers (eq/color/transform/speed/silence/mix/subtitle_style), found {openers:?}"
+    );
+    for name in &openers {
+        let body = fn_body(name);
+        assert!(
+            body.contains("self.close_card();"),
+            "{name} never calls close_card() -- it may be clearing its own \
+             hand-picked subset of the other cards again, which is exactly \
+             what let two cards stack on screen at once (open speed, then \
+             colour, and both stayed up)"
+        );
+    }
+}
