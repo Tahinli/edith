@@ -1554,6 +1554,16 @@ impl Player {
             }
             return;
         }
+        // The transform card's sliders, [`Self::color_dragging`]'s own reason.
+        if self.transform_dragging {
+            if event.pressed_button == Some(MouseButton::Left) {
+                self.drag_transform(event.position.x, false, cx);
+            } else {
+                self.transform_dragging = false;
+                self.flush_drag(cx);
+            }
+            return;
+        }
         // The speed bar, the same 4 px and the same live writes: the
         // press took the undo step and every sample since is live.
         if self.speed_dragging {
@@ -1649,6 +1659,11 @@ impl Player {
             // flush is what makes "exactly" true while the worker is
             // still busy -- the sample above would only be held.
             self.drag_color(event.position.x, false, cx);
+            self.flush_drag(cx);
+            return;
+        }
+        if std::mem::take(&mut self.transform_dragging) {
+            self.drag_transform(event.position.x, false, cx);
             self.flush_drag(cx);
             return;
         }
