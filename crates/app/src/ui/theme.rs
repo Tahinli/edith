@@ -78,10 +78,16 @@ macro_rules! palette {
             Palette { $($name: nord::$name,)+ },
             Palette { $($name: gruvbox::$name,)+ },
             Palette { $($name: dracula::$name,)+ },
+            Palette { $($name: darkroom::$name,)+ },
         ];
 
         $(
             #[allow(non_snake_case)]
+            // corner-cut: the Darkroom substrate roles (INK1.. SAFELIGHT_GLYPH)
+            // have no call site yet -- this task owns theme.rs only and wires
+            // the table, not the paints. Ceiling: drop this attribute once the
+            // render-side task in the same DESIGN §12 package reads them.
+            #[allow(dead_code)]
             #[inline]
             pub fn $name() -> $ty { palette().$name }
         )+
@@ -124,6 +130,22 @@ palette! {
     EQ_FILL_INK: u32,
     EQ_BELL_INK: u32,
     HIST_INK: [u32; 3],
+    // -- Darkroom token substrate (DESIGN.md §2) --------------------------------
+    INK1: u32,
+    INK2: u32,
+    INK3: u32,
+    INK4: u32,
+    DARK_CANVAS: u32,
+    DARK_PANEL: u32,
+    DARK_RAISED: u32,
+    DARK_HAIRLINE: u32,
+    DARK_SEAM: u32,
+    LAMP_WHITE: u32,
+    NOTICE_TELL: u32,
+    NOTICE_LOOK: u32,
+    NOTICE_DECIDE: u32,
+    SAFELIGHT_GROUND: u32,
+    SAFELIGHT_GLYPH: u32,
 }
 
 /// Which family a person picked. An enum and not a bool: the door in the
@@ -143,13 +165,14 @@ pub enum PaletteId {
     Nord,
     Gruvbox,
     Dracula,
+    Darkroom,
 }
 
 impl PaletteId {
     /// Display order -- the picker lists them in it, and the index into
     /// [`PALETTES`] *is* the position in it, so this order and that array are
     /// the same order or every colour is wrong.
-    pub const ALL: [PaletteId; 12] = [
+    pub const ALL: [PaletteId; 13] = [
         PaletteId::Cool,
         PaletteId::Warm,
         PaletteId::Forest,
@@ -162,6 +185,7 @@ impl PaletteId {
         PaletteId::Nord,
         PaletteId::Gruvbox,
         PaletteId::Dracula,
+        PaletteId::Darkroom,
     ];
 
     /// What the button and the picker row call it.
@@ -179,6 +203,7 @@ impl PaletteId {
             PaletteId::Nord => "Nord",
             PaletteId::Gruvbox => "Gruvbox",
             PaletteId::Dracula => "Dracula",
+            PaletteId::Darkroom => "Darkroom",
         }
     }
 
@@ -201,6 +226,7 @@ impl PaletteId {
             PaletteId::Nord => "polar night, frost accent",
             PaletteId::Gruvbox => "retro brown, gruvbox orange",
             PaletteId::Dracula => "dracula ground, pink accent",
+            PaletteId::Darkroom => "dark ground, no chrome hue",
         }
     }
 
@@ -220,6 +246,7 @@ impl PaletteId {
             PaletteId::Nord => "nord",
             PaletteId::Gruvbox => "gruvbox",
             PaletteId::Dracula => "dracula",
+            PaletteId::Darkroom => "darkroom",
         }
     }
 
@@ -371,6 +398,22 @@ pub mod cool {
     pub const EQ_FILL_INK: u32 = 0x22d3ee26;
     pub const EQ_BELL_INK: u32 = 0x22d3ee66;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family A: a warm consumer-editor ground (Movavi's bed, CapCut's saturation)
@@ -435,6 +478,22 @@ pub mod warm {
     pub const EQ_FILL_INK: u32 = 0xff7a4526;
     pub const EQ_BELL_INK: u32 = 0xff7a4566;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family C: the ground itself green, dark enough that a graded frame is still
@@ -503,6 +562,22 @@ pub mod forest {
     /// The three channel inks are the picture's own R, G and B: they mean the
     /// same thing in every family, so they are the same numbers in every family.
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family D: an indigo ground with one lavender accent -- the cold end of the
@@ -562,6 +637,22 @@ pub mod violet {
     pub const EQ_FILL_INK: u32 = 0xa78bfa26;
     pub const EQ_BELL_INK: u32 = 0xa78bfa66;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family E: a ground with no cast at all -- the neutral one, for grading, where
@@ -622,6 +713,22 @@ pub mod rose {
     pub const EQ_FILL_INK: u32 = 0xfb718526;
     pub const EQ_BELL_INK: u32 = 0xfb718566;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family F: a graphite ground -- neutral, a touch warm -- under one gold
@@ -682,6 +789,22 @@ pub mod amber {
     pub const EQ_FILL_INK: u32 = 0xfbbf2426;
     pub const EQ_BELL_INK: u32 = 0xfbbf2466;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family G: a blue-black ground -- deeper and bluer than `cool`'s neutral --
@@ -739,6 +862,22 @@ pub mod ocean {
     pub const EQ_FILL_INK: u32 = 0x38bdf826;
     pub const EQ_BELL_INK: u32 = 0x38bdf866;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family H: the crisp one. A near-black blue ground with the widest ink range
@@ -799,6 +938,22 @@ pub mod ice {
     pub const EQ_FILL_INK: u32 = 0xa5f3fc26;
     pub const EQ_BELL_INK: u32 = 0xa5f3fc66;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family I: a dark plum ground under one orchid accent -- the warm end of the
@@ -857,6 +1012,22 @@ pub mod orchid {
     pub const EQ_FILL_INK: u32 = 0xd946ef26;
     pub const EQ_BELL_INK: u32 = 0xd946ef66;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family J: Nord, the arctic palette (arcticicestudio/nord, MIT) -- Polar
@@ -930,6 +1101,22 @@ pub mod nord {
     pub const EQ_FILL_INK: u32 = 0x88c0d026;
     pub const EQ_BELL_INK: u32 = 0x88c0d066;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family K: Gruvbox dark (morhetz/gruvbox, MIT) -- the retro brown-grey ground
@@ -996,6 +1183,22 @@ pub mod gruvbox {
     pub const EQ_FILL_INK: u32 = 0xfe801926;
     pub const EQ_BELL_INK: u32 = 0xfe801966;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
 }
 
 /// Family L: Dracula (dracula/dracula-theme, MIT) -- its background, current
@@ -1056,6 +1259,104 @@ pub mod dracula {
     pub const EQ_FILL_INK: u32 = 0xff79c626;
     pub const EQ_BELL_INK: u32 = 0xff79c666;
     pub const HIST_INK: [u32; 3] = [0xE0_5A_5A, 0x5A_D0_7A, 0x5A_9A_E0];
+    // -- Darkroom token substrate: aliased onto this family's nearest role -----
+    pub const INK1: u32 = FG_PRIMARY;
+    pub const INK2: u32 = FG_SECONDARY;
+    pub const INK3: u32 = FG_DISABLED;
+    pub const INK4: u32 = FG_DISABLED;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    pub const DARK_SEAM: u32 = SCRIM;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = STATUS_SUCCESS;
+    pub const NOTICE_LOOK: u32 = STATUS_WARNING;
+    pub const NOTICE_DECIDE: u32 = STATUS_ERROR;
+    pub const SAFELIGHT_GROUND: u32 = BG_CANVAS;
+    pub const SAFELIGHT_GLYPH: u32 = ACCENT_PRIMARY;
+}
+
+/// Family M: Darkroom (DESIGN.md §2) -- the thirteenth family and the room the
+/// redesign is named after. Chrome is achromatic: every pre-existing role below
+/// is a grey, distinguished by luminance rather than hue ("loudness is
+/// luminance"); the only colour anywhere in this family sits on the roles
+/// DESIGN.md actually gives one -- the amber safelight glyph and the two loud
+/// notice tones. Everything else is the token substrate itself, taken verbatim
+/// from the spec table.
+pub mod darkroom {
+    // -- surfaces -----------------------------------------------------------
+    pub const BG_CANVAS: u32 = 0x050607;
+    pub const BG_PANEL: u32 = 0x0e1013;
+    pub const BG_RAISED: u32 = 0x15181c;
+    pub const BG_TIMELINE: u32 = 0x08090b;
+    pub const BG_HOVER: u32 = 0x2a2e33;
+    pub const BG_HOVER_DIM: u32 = 0x1c1f24;
+    pub const BG_SELECTED: u32 = 0x2e3237;
+    pub const SCRIM: u32 = 0x050607cc;
+    pub const SCRIM_LIGHT: u32 = 0x05060755;
+
+    // -- strokes --------------------------------------------------------------
+    pub const STROKE_DIVIDER: u32 = 0x22262b;
+    /// "Focus/selection ring = 1px ink1 (lamp-adjacent, not coloured)."
+    pub const STROKE_SELECTED: u32 = INK1;
+
+    // -- text -------------------------------------------------------------------
+    pub const FG_PRIMARY: u32 = INK1;
+    pub const FG_SECONDARY: u32 = INK2;
+    pub const FG_DISABLED: u32 = INK4;
+
+    // -- interaction --------------------------------------------------------
+    pub const ACCENT_PRIMARY: u32 = INK2;
+    pub const ACCENT_HOVER: u32 = INK1;
+    pub const ACCENT_PLAYHEAD: u32 = LAMP_WHITE;
+    pub const ACCENT_WASH: u32 = 0x9ba3ac55;
+
+    // -- clip kinds (luminance steps, no hue -- held under the grey that still
+    // carries FG_SECONDARY at 3:1, WCAG 1.4.11) -------------------------------
+    pub const CLIP_VIDEO: u32 = 0x343434;
+    pub const CLIP_AUDIO: u32 = 0x3d3d3d;
+    pub const CLIP_IMAGE: u32 = 0x464646;
+    pub const CLIP_TEXT: u32 = 0x4f4f4f;
+
+    pub const SOURCE_TINTS: [u32; 4] = [0x5e656d, 0x767e87, 0x8e97a1, 0xa6afb9];
+
+    // -- feedback -------------------------------------------------------------
+    pub const STATUS_ERROR: u32 = NOTICE_DECIDE;
+    pub const STATUS_WARNING: u32 = NOTICE_LOOK;
+    pub const STATUS_SUCCESS: u32 = INK1;
+    pub const STATUS_PROGRESS: u32 = ACCENT_PRIMARY;
+    pub const DROP_REFUSE: u32 = NOTICE_DECIDE;
+
+    // -- subtitles --------------------------------------------------------------
+    pub const SUB_FG: u32 = LAMP_WHITE;
+    pub const SUB_SHADE: u32 = 0x000000cc;
+
+    // -- the equalizer graph and the histogram -------------------------------
+    pub const EQ_GRID: u32 = 0x22262b;
+    pub const EQ_SPECTRUM_INK: u32 = 0x9ba3ac66;
+    pub const EQ_FILL_INK: u32 = 0x9ba3ac26;
+    pub const EQ_BELL_INK: u32 = 0x9ba3ac66;
+    pub const HIST_INK: [u32; 3] = [0x767e87, 0x9ba3ac, 0xc7cdd3];
+
+    // -- Darkroom token substrate (DESIGN.md §2, verbatim) -----------------------
+    pub const INK1: u32 = 0xe6e9ec;
+    pub const INK2: u32 = 0x9ba3ac;
+    pub const INK3: u32 = 0x5e656d;
+    pub const INK4: u32 = 0x3c4249;
+    pub const DARK_CANVAS: u32 = BG_CANVAS;
+    pub const DARK_PANEL: u32 = BG_PANEL;
+    pub const DARK_RAISED: u32 = BG_RAISED;
+    pub const DARK_HAIRLINE: u32 = STROKE_DIVIDER;
+    /// Seam: `rgba(0,0,0,.7)`, encoded the way `SCRIM`/`SCRIM_LIGHT` are --
+    /// `0xRRGGBBAA` -- so `0xb3` (179/255 ~= 0.702) is the closest byte to 70%.
+    pub const DARK_SEAM: u32 = 0x000000b3;
+    pub const LAMP_WHITE: u32 = 0xffffff;
+    pub const NOTICE_TELL: u32 = 0x5e656d;
+    pub const NOTICE_LOOK: u32 = 0xd1b564;
+    pub const NOTICE_DECIDE: u32 = 0xc85050;
+    pub const SAFELIGHT_GROUND: u32 = 0x0a0908;
+    pub const SAFELIGHT_GLYPH: u32 = 0xff9d57;
 }
 
 /// The box a button's glyph sits in, whatever the glyph happens to measure: the

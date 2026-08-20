@@ -162,6 +162,13 @@ impl Player {
             ActionId::CancelExport => {}
             ActionId::ShowActions => self.show_actions(cx),
             ActionId::Screenshot => self.take_screenshot(cx),
+            // Cut machinery (DESIGN.md §6): keymap.rs/oracle.rs plumbing only
+            // so far -- a later task wires these to real behaviour.
+            ActionId::WalkCutNext
+            | ActionId::WalkCutPrev
+            | ActionId::TrimIn
+            | ActionId::TrimOut
+            | ActionId::LoopTrim => {}
         }
     }
 
@@ -472,6 +479,7 @@ impl Player {
         let chord = keymap::Chord {
             key: key.to_string(),
             ctrl,
+            shift: false,
         };
         // Only a stroke the file can spell and read back as itself: gpui reports
         // "+" for shift+=, which is the chord grammar's separator, so binding it

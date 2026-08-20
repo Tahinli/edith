@@ -257,6 +257,19 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         ActionId::Copy | ActionId::Delete | ActionId::Lift if ctx.clip.is_none() => {
             Enable::No("click a clip first")
         }
+        // The cut machinery (DESIGN.md §6): the odometer, the trim pair and
+        // the loop-trim all act on the subject cut, and with none marked
+        // there is nothing to walk, trim or loop -- named the same way the
+        // three above it refuse an empty mark.
+        ActionId::WalkCutNext
+        | ActionId::WalkCutPrev
+        | ActionId::TrimIn
+        | ActionId::TrimOut
+        | ActionId::LoopTrim
+            if ctx.clip.is_none() =>
+        {
+            Enable::No("no subject cut")
+        }
         ActionId::Paste if !ctx.clipboard => Enable::No("nothing copied yet"),
         // Nothing to draw over the picture, so nothing to switch off: the
         // library says how subtitles arrive, and this row would flip a state
