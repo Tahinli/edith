@@ -17,6 +17,7 @@ use crate::hw::HwSession;
 use crate::project::Speed;
 use crate::scale::Composer;
 use crate::tonemap::{self, ToneMapper};
+use crate::transform::TransformParams;
 
 /// One decoded picture, ready to hand to a renderer.
 pub struct Frame {
@@ -176,6 +177,7 @@ struct SpanCmd {
     start: u32,
     end: u32,
     color: ColorParams,
+    transform: TransformParams,
     canvas: Composer,
     tone: tonemap::Preset,
     /// The clip's own playback speed ([`crate::project::Clip::speed`]), for
@@ -308,6 +310,7 @@ impl Worker {
         start: u32,
         end: u32,
         color: ColorParams,
+        transform: TransformParams,
         canvas: Composer,
         tone: tonemap::Preset,
         speed: Speed,
@@ -331,6 +334,7 @@ impl Worker {
                 start,
                 end,
                 color,
+                transform,
                 canvas,
                 tone,
                 speed,
@@ -433,6 +437,9 @@ impl DecodeSession {
             start_frame,
             end_frame,
             ColorParams::default(),
+            // No clip, no transform either: the file-level API hands back the
+            // pictures the file holds, untouched.
+            TransformParams::default(),
             // No project, no canvas: the file-level API hands back the
             // pictures the file holds, at the size it holds them.
             Composer::passthrough(),
@@ -512,6 +519,7 @@ impl DecodeSession {
         start_frame: u32,
         len: u32,
         color: ColorParams,
+        transform: TransformParams,
         canvas: Composer,
     ) -> crate::Result<FrameStream> {
         let still = Still::open(path)?;
@@ -538,6 +546,7 @@ impl DecodeSession {
         // the project is watching.
         let first = Render::new(
             color,
+            transform,
             ColorDescription::default(),
             canvas,
             tonemap::Preset::default(),
@@ -610,6 +619,7 @@ impl DecodeSession {
         start_frame: u32,
         end_frame: u32,
         color: ColorParams,
+        transform: TransformParams,
         canvas: Composer,
         tone: tonemap::Preset,
     ) -> crate::Result<(VideoMeta, FrameStream)> {
@@ -650,6 +660,7 @@ impl DecodeSession {
                 start_frame,
                 end_frame,
                 color,
+                transform,
                 canvas,
                 tone,
                 // A file-level open has no clip and no speed to skip frames
@@ -677,6 +688,7 @@ impl DecodeSession {
         start_frame: u32,
         end_frame: u32,
         color: ColorParams,
+        transform: TransformParams,
         canvas: Composer,
         tone: tonemap::Preset,
         speed: Speed,
@@ -687,6 +699,7 @@ impl DecodeSession {
             start_frame,
             end_frame,
             color,
+            transform,
             canvas,
             tone,
             speed,
@@ -710,6 +723,7 @@ fn span_worker(
     start_frame: u32,
     end_frame: u32,
     color: ColorParams,
+    transform: TransformParams,
     canvas: Composer,
     tone: tonemap::Preset,
     speed: Speed,
@@ -740,6 +754,7 @@ fn span_worker(
         start: start_frame,
         end: end_frame,
         color,
+        transform,
         canvas,
         tone,
         speed,
@@ -919,6 +934,7 @@ fn run_span(
         start,
         end,
         color,
+        transform,
         canvas,
         tone,
         speed,
@@ -947,7 +963,7 @@ fn run_span(
     // The stream's own colour and peak brightness: properties of the stream, so
     // neither can change while one range decodes -- but the grade, the canvas
     // and the rendition are the *span's*, so this is built per span.
-    let mut render = Render::new(color, opened.meta.color, canvas, tone, opened.peak);
+    let mut render = Render::new(color, transform, opened.meta.color, canvas, tone, opened.peak);
     if let Some(reused) = opened.position_hw(path, start) {
         // Cancelled during the init (or the seek): leave without decoding.
         if abort.hit() {
@@ -1007,6 +1023,9 @@ fn run_span(
 /// project resolution, byte for byte and allocation for allocation.
 struct Render {
     color: ColorParams,
+    /// This clip's placement, on top of whatever the canvas's own fit policy
+    /// already does ([`crate::scale::Composer::place_transformed`]).
+    transform: TransformParams,
     /// What the source's samples mean -- the stream's own matrix and range,
     /// which is what the conversion below is done in rather than the BT.601 it
     /// used to assume of every file.
@@ -1021,6 +1040,10 @@ struct Render {
     /// across the worker's whole range. Empty unless the clip needs one: it is
     /// tone-mapped in place, graded in place, or both.
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
+    /// Where [`Composer::place_transformed`]'s owned picture lands, so a
+    /// transformed frame's planes live as long as `self` -- matching what
+    /// [`Composer::place`] already hands back by borrowing `self.canvas`.
+    placed: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 /// What [`Render::frame`] converts a tone-mapped picture in: the tone map's
@@ -1038,6 +1061,7 @@ impl Render {
     /// reference rendition reads (see [`tonemap::Preset`]).
     fn new(
         color: ColorParams,
+        transform: TransformParams,
         desc: ColorDescription,
         canvas: Composer,
         preset: tonemap::Preset,
@@ -1045,6 +1069,7 @@ impl Render {
     ) -> Self {
         Self {
             color,
+            transform,
             desc,
             canvas,
             // corner-cut: the ceiling is that the map reads limited-range codes
@@ -1058,6 +1083,7 @@ impl Render {
                 Transfer::Hlg => Some(ToneMapper::new(tonemap::Transfer::Hlg, preset, peak)),
             },
             graded: (Vec::new(), Vec::new(), Vec::new()),
+            placed: (Vec::new(), Vec::new(), Vec::new()),
         }
     }
 
@@ -1071,6 +1097,12 @@ impl Render {
         height: u32,
     ) -> Frame {
         let passthrough = self.canvas.is_passthrough(width, height);
+        // A transform still has a picture to place even where the canvas
+        // itself would hand this size back untouched -- moving, scaling,
+        // rotating or cropping a passthrough-sized clip is still a placement,
+        // and must not be silently dropped by the fused conversion below.
+        let transform_active = !self.transform.is_identity();
+        let skip_placement = passthrough && !transform_active;
         // Everything that has to happen to the samples before the canvas sees
         // them, on one copy: the tone map (HDR streams only) and, unless the
         // conversion below can fuse it, the grade. An SDR stream that is either
@@ -1080,7 +1112,8 @@ impl Render {
         // picture a viewer is shown, so its brightness and saturation mean what
         // they say in the SDR the tone map just produced, not in the 10-stop
         // HDR the file was in.
-        let (y, u, v, desc) = if self.tone.is_some() || (!passthrough && !self.color.is_identity())
+        let (y, u, v, desc) = if self.tone.is_some()
+            || (!skip_placement && !self.color.is_identity())
         {
             let (gy, gu, gv) = &mut self.graded;
             gy.clear();
@@ -1104,7 +1137,7 @@ impl Render {
         } else {
             (y, u, v, self.desc)
         };
-        if passthrough {
+        if skip_placement {
             return Frame {
                 index,
                 width,
@@ -1120,7 +1153,15 @@ impl Render {
                 ),
             };
         }
-        let (y, u, v, width, height) = self.canvas.place(y, u, v, width, height);
+        let (y, u, v, width, height) = if transform_active {
+            let (py, pu, pv, w, h) = self
+                .canvas
+                .place_transformed(y, u, v, width, height, &self.transform);
+            self.placed = (py, pu, pv);
+            (&self.placed.0[..], &self.placed.1[..], &self.placed.2[..], w, h)
+        } else {
+            self.canvas.place(y, u, v, width, height)
+        };
         Frame {
             index,
             width,
@@ -1384,6 +1425,7 @@ mod tests {
             0,
             u32::MAX,
             ColorParams::default(),
+            TransformParams::default(),
             Composer::passthrough(),
             tonemap::Preset::default(),
             Speed::NORMAL,
@@ -1405,6 +1447,7 @@ mod tests {
             0,
             u32::MAX,
             ColorParams::default(),
+            TransformParams::default(),
             Composer::passthrough(),
             tonemap::Preset::default(),
         )
@@ -1453,6 +1496,7 @@ mod tests {
                 0,
                 u32::MAX,
                 ColorParams::default(),
+                TransformParams::default(),
                 Composer::passthrough(),
                 tonemap::Preset::default(),
                 Speed::NORMAL,
@@ -1536,6 +1580,7 @@ mod tests {
             0,
             u32::MAX,
             ColorParams::default(),
+            TransformParams::default(),
             Composer::passthrough(),
             tonemap::Preset::default(),
         )
