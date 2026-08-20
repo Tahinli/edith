@@ -540,8 +540,13 @@ impl Player {
 
     /// Loop-trim (DESIGN.md §6, `/`): loops the transport around the subject
     /// cut's own span while `[`/`]` move its edges -- the modernized Avid
-    /// trim mode. Off again drops the window and leaves playback running,
-    /// exactly as it was found.
+    /// trim mode. Neither direction touches play/pause: off drops the window
+    /// and leaves playback exactly as it was found, and on arms the window
+    /// without forcing a play -- a forced `session.play()` here used to start
+    /// the clock as a side effect of arming, which left a paused transport
+    /// already playing when the user's own `space` arrived next; that press
+    /// then read as a toggle and paused it right back, pinned at the loop's
+    /// start frame. Space is what starts it, playing or not.
     pub(crate) fn toggle_loop_trim(&mut self, cx: &mut Context<Self>) {
         if self.loop_trim.take().is_some() {
             self.notify_user("LOOP-TRIM OFF".into());
@@ -554,9 +559,6 @@ impl Player {
         self.loop_trim = self.cut_span(lane, idx);
         if self.loop_trim.is_some() {
             self.notify_user("LOOP-TRIM ON — looping the subject cut while you trim".into());
-            if let Some(session) = self.active_session_mut() {
-                session.play();
-            }
         }
         cx.notify();
     }

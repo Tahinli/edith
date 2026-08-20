@@ -60,6 +60,82 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
         )
 }
 
+/// A ghost command whose stride-10 sibling is the same command at a
+/// different scale (DESIGN §4): one glyph, both chords shown beside each
+/// other rather than a second glyph -- the cheap fix VIOLATION 1 asked for,
+/// reusing the ghost grammar instead of a new widget.
+fn ghost_dual(player: &Player, glyph: &str, action: ActionId, stride: ActionId) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(2.))
+        .py(px(6.))
+        .rounded(px(3.))
+        .text_size(px(13.))
+        .text_color(rgb(INK2()))
+        .child(glyph.to_string())
+        .child(
+            div()
+                .flex()
+                .gap(px(4.))
+                .text_size(px(9.5))
+                .text_color(rgb(INK3()))
+                .child(player.keymap.display(action))
+                .child(player.keymap.display(stride)),
+        )
+}
+
+/// The keys overlay (DESIGN §9, §12 step 7): every bound command as one
+/// chord-and-label row, plate-styled per §4 ("readouts are plates"), shown
+/// while [`Player::keys_open`] is set (the same field/guard the legacy
+/// modal already used -- `Player::show_actions` sets it, `Player::close_card`
+/// clears it on `esc`, both already wired through the darkroom's key
+/// handler below).
+///
+/// corner-cut: DESIGN §9 wants chords surfaced *in place beside their
+/// controls* across every region, dimming the room one fill step; this is
+/// one list plate instead, anchored over the bench/ledger footprint so it
+/// never reaches the screen. Ceiling: DESIGN §12 step 7's full geographic
+/// pass (each region draws its own rows when `keys_open`).
+fn keys_overlay(player: &Player) -> impl IntoElement {
+    div()
+        .id("stance-keys-overlay")
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .h(px(BENCH_H + LEDGER_H))
+        .bg(rgba(SCRIM()))
+        .flex()
+        .child(
+            div()
+                .m_auto()
+                .max_h(px(BENCH_H + LEDGER_H - 16.))
+                .max_w(px(420.))
+                .overflow_hidden()
+                .p(px(10.))
+                .rounded(px(4.))
+                .bg(rgb(DARK_PANEL()))
+                .border_1()
+                .border_color(rgba(DARK_SEAM()))
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(section_head("all commands · esc to close"))
+                .children(player.keymap.entries().iter().map(|b| {
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap(px(12.))
+                        .text_size(px(9.5))
+                        .child(div().text_color(rgb(INK2())).child(b.action.label()))
+                        .child(div().text_color(rgb(INK3())).child(b.chord.pretty()))
+                })),
+        )
+}
+
 /// The spine: 56px, left, full height. Every command as ghost glyph + chord,
 /// grouped by task frequency (DESIGN §5) -- transport first (every second),
 /// then the cut machinery (DESIGN §6, every cut), then the split and the one
@@ -80,30 +156,44 @@ fn spine(player: &Player) -> impl IntoElement {
         .gap(px(4.))
         .child(section_head("spine"))
         .child(ghost(player, "▶", ActionId::Play))
-        .child(ghost(player, "‹", ActionId::WalkCutPrev))
-        .child(ghost(player, "›", ActionId::WalkCutNext))
+        .child(ghost_dual(player, "‹", ActionId::WalkCutPrev, ActionId::WalkCutPrev10))
+        .child(ghost_dual(player, "›", ActionId::WalkCutNext, ActionId::WalkCutNext10))
+        .child(ghost(player, "{", ActionId::SelectPrev))
+        .child(ghost(player, "}", ActionId::SelectNext))
         .child(ghost(player, "[", ActionId::TrimIn))
         .child(ghost(player, "]", ActionId::TrimOut))
         .child(ghost(player, "↻", ActionId::LoopTrim))
         .child(ghost(player, "✂", ActionId::Cut))
+        .child(ghost(player, "?", ActionId::ShowActions))
 }
 
 /// The picture region: top of the centre column, takes the remaining space,
-/// never occluded (DESIGN §5). Reuses [`Player::picture_area`] rather than a
-/// second image element -- the darkroom draws the same picture the legacy
-/// tree does -- and layers the two-up OUT|IN judging over it at rest on a
-/// cut (DESIGN §6).
+/// never occluded (DESIGN §5, §11 check 6). Reuses [`Player::picture_area`]
+/// rather than a second image element -- the darkroom draws the same picture
+/// the legacy tree does -- and, at rest on a cut, letterboxes it by stacking
+/// the two-up OUT|IN judging *below* it as a flex sibling (DESIGN §6) rather
+/// than layering plates over it: the picture's own `flex_1` shrinks to make
+/// room, so every picture pixel that is drawn stays visible.
 fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
+    let two_up = player.two_up().map(IntoElement::into_any_element);
     div()
         .id("stance-screen")
         .flex_1()
         .min_h(px(0.))
-        .relative()
+        .flex()
+        .flex_col()
         // §4: room chrome takes 0 radius.
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
-        .child(player.picture_area(position, window, cx))
-        .children(player.two_up())
+        .child(
+            div()
+                .id("stance-picture")
+                .flex_1()
+                .min_h(px(0.))
+                .relative()
+                .child(player.picture_area(position, window, cx)),
+        )
+        .children(two_up)
 }
 
 /// Fixed-height strip under the screen: timecode leads, ghost transport, cut
@@ -272,12 +362,12 @@ pub(crate) fn render(
                 return;
             }
             if let Some(action) = this.keymap.lookup(key, ctrl) {
-                // hook: §12 step 7 -- the keys overlay and the export card
-                // (and the notice plates that would announce an export's
-                // progress) have no stance surface yet, so the two actions
-                // that only ever show up there are suppressed here rather
-                // than left to open a card nothing on screen can draw.
-                if matches!(action, ActionId::ShowActions | ActionId::Export) {
+                // hook: §12 step 7 -- the export card (and the notice plates
+                // that would announce an export's progress) has no stance
+                // surface yet, so it is suppressed here rather than left to
+                // open a card nothing on screen can draw. `ShowActions` now
+                // has one ([`keys_overlay`]) so it is no longer on this list.
+                if action == ActionId::Export {
                     return;
                 }
                 this.act(action, window, cx);
@@ -290,6 +380,7 @@ pub(crate) fn render(
         .child(
             div()
                 .id("stance-centre")
+                .relative()
                 .flex_1()
                 .min_w(px(0.))
                 .flex()
@@ -297,7 +388,8 @@ pub(crate) fn render(
                 .child(screen(player, position, window, cx))
                 .child(time_band(player))
                 .child(bench(player, cx))
-                .child(ledger()),
+                .child(ledger())
+                .when(player.keys_open, |el| el.child(keys_overlay(player))),
         )
         .child(dock(player, window_h, cx))
 }

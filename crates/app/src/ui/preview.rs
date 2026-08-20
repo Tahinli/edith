@@ -310,12 +310,19 @@ impl Player {
         }
     }
 
-    /// Two-up OUT|IN judging (DESIGN.md §6): drawn over the screen only when
-    /// the playhead rests exactly on one edge of the subject cut -- the
-    /// outgoing clip's tail beside the incoming one's head, whichever edge
-    /// the playhead is on. `None` off a cut, off the darkroom path, or with
-    /// nothing marked, so the legacy picture and a mid-clip darkroom picture
-    /// both draw untouched.
+    /// Two-up OUT|IN judging (DESIGN.md §6): drawn *in* the screen, below the
+    /// picture, only when the playhead rests exactly on one edge of the
+    /// subject cut -- the outgoing clip's tail beside the incoming one's
+    /// head, whichever edge the playhead is on. `None` off a cut, off the
+    /// darkroom path, or with nothing marked, so the legacy picture and a
+    /// mid-clip darkroom picture both draw untouched.
+    ///
+    /// DESIGN §5 "never covered" / §11 check 6: this used to be an
+    /// `absolute()` plate pair over the bottom of the screen, blacking out
+    /// real picture pixels. The caller (`ui::stance::screen`) now lays this
+    /// out as a flex sibling *below* the picture instead of layering it on
+    /// top, so the picture's own `flex_1` shrinks to make room -- a
+    /// letterbox band, not an occlusion.
     ///
     /// corner-cut: each side names its neighbour (source, timecode) on a
     /// plate rather than decoding its edge frame into a second picture --
@@ -384,10 +391,12 @@ impl Player {
         };
         Some(
             div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
+                .id("two-up")
+                .flex_none()
+                .w_full()
+                .bg(rgb(DARK_PANEL()))
+                .border_t_1()
+                .border_color(rgba(DARK_SEAM()))
                 .flex()
                 .gap(px(1.))
                 .p(px(8.))

@@ -4,15 +4,34 @@
 
 use crate::*;
 
-/// corner-cut: which dock tab is showing lives in a module-level flag rather
-/// than a `Player` field, because the stance's other regions (spine, screen,
-/// time band) are being threaded onto `Player` by a second builder in this
-/// same pass and a shared struct is not a safe place for two agents to land
-/// fields at once. Ceiling: fold into a `Player::dock_tab` field once that
-/// pass lands, so DESIGN §5's "a room reopens exactly as left ... dock tab"
-/// continuity (session save/load) can reach it -- today the flag resets with
-/// the process.
-static DOCK_SRC_ACTIVE: AtomicBool = AtomicBool::new(true);
+/// Where the dock tab pick lives: one word beside the theme and the
+/// keybindings (`ui::theme::config_path`/`save`/`load` is the exact pattern
+/// this follows -- a small, silent, config-file round trip is the mechanism
+/// this editor already uses for a preference that outlives the window, and
+/// the playhead's own continuity lives in the *project* file, which a dock
+/// tab pick is not: it is not part of the timeline, so it does not belong in
+/// a `.edith`).
+pub(crate) fn config_path() -> std::path::PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("dock-tab")
+}
+
+/// The pick from the last session, if there was one. Anything unreadable or
+/// unknown leaves the default (`Src`) in force, exactly as a bad theme file
+/// does -- neither is the user's work, so neither is worth a startup notice.
+pub(crate) fn load() -> bool {
+    std::fs::read_to_string(config_path())
+        .map(|text| text.trim() != "Clip")
+        .unwrap_or(true)
+}
+
+/// Writes the pick. One word, written whole.
+fn save(src_active: bool) {
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, if src_active { "Src\n" } else { "Clip\n" });
+}
 
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
 /// `ink3` beside it, read live off the keymap so it can never drift from the
@@ -80,8 +99,9 @@ fn dock_tab(id: &'static str, label: &'static str, active: bool, cx: &mut Contex
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_RAISED())))
-        .on_click(cx.listener(move |_this, _: &ClickEvent, _, cx| {
-            DOCK_SRC_ACTIVE.store(label == "Src", Ordering::Relaxed);
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.dock_src_active = label == "Src";
+            save(this.dock_src_active);
             cx.notify();
         }))
         .child(label)
@@ -202,7 +222,7 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
 /// Sources hands off to `library.rs`'s own row anatomy and ladder; Clip's
 /// param rows are whatever their card already draws at this width.
 pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
-    let src_active = DOCK_SRC_ACTIVE.load(Ordering::Relaxed);
+    let src_active = player.dock_src_active;
     div()
         .id("stance-dock-body")
         .flex_1()
