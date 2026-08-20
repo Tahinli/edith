@@ -214,6 +214,7 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
                 .id("stance-picture")
                 .flex_1()
                 .min_h(px(0.))
+                .flex()
                 .relative()
                 .child(player.picture_area(position, window, cx)),
         )
