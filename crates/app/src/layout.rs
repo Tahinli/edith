@@ -382,14 +382,37 @@ pub(crate) const PPS_DEFAULT: f64 = 40.;
 
 // -- the seams between the regions, and where a hand has dragged them ---------
 
-/// Which divider a hand has hold of. The three seams the main layout has --
-/// library|picture, picture|inspector and the timeline's top edge -- and so the
-/// only three sizes in this window a person sets rather than is given.
+/// Which divider a hand has hold of. The legacy tree's three seams --
+/// library|picture, picture|inspector and the timeline's top edge -- plus the
+/// darkroom's own two, dock|centre and time-band|bench: `stance.rs`'s own
+/// `BENCH_H`/`DOCK_W` doc comments named this exact fold as the fix for
+/// "fields are not stretchable" before this diff existed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Split {
     Library,
     Inspector,
     Timeline,
+    Dock,
+    Bench,
+}
+
+impl Split {
+    /// The two persisted seams -- library/inspector/timeline stay
+    /// unpersisted, out of this diff's scope, same as before it. Read by
+    /// [`load_stance_splits`] and [`save_stance_splits`] together so the
+    /// two can never learn a different set of keys from each other, the
+    /// gap a sixth region would otherwise fall through silently.
+    const PERSISTED: [Split; 2] = [Split::Dock, Split::Bench];
+
+    fn key(self) -> &'static str {
+        match self {
+            Split::Library => "library",
+            Split::Inspector => "inspector",
+            Split::Timeline => "timeline",
+            Split::Dock => "dock",
+            Split::Bench => "bench",
+        }
+    }
 }
 
 /// How wide a divider is drawn *and* hit. Wider than the 1 px stroke it stands
@@ -409,6 +432,57 @@ pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
 /// timeline is asking on purpose, and the picture still keeps most of a third.
 pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
 
+/// The room the ledger's own top border (`ui::stance::ledger`'s
+/// `.border_t_1()`) needs kept clear below the bench's own last content
+/// pixel. The ledger sits at a *fixed* distance from the window's own foot
+/// (`ui::stance::LEDGER_H`), not from wherever the bench's content happens
+/// to end, so if the bench's last lane row reaches exactly as far as the
+/// ledger's own top row, the ledger's border -- later in the same flex
+/// column, so it paints over whatever is already there -- wins the shared
+/// pixel rather than sitting cleanly below it. Driven, at [`BENCH_MIN_H`]'s
+/// own third clip: `bench=95` (the stack's exact content need, no spare row)
+/// still lost A1's status dot's last row to the rule; `bench=96` (one row of
+/// clearance) drew it whole. The 95-vs-96 tension is this term, not a
+/// rounding accident -- a bench exactly as tall as its content still shares
+/// its last row with the ledger's border.
+const LEDGER_SEAM_CLEARANCE: f32 = 1.;
+
+/// The least the darkroom's bench may be dragged to: derived, not measured,
+/// from the same stack `ui::stance::bench` and `ui::bench_stance::render`
+/// actually build, top to bottom --
+/// [`crate::ui::stance::BENCH_CHROME_H`] (the "bench" section head's real
+/// line box, plus the bench div's own top border and top padding -- see its
+/// own doc comment) + [`crate::ui::bench_stance::RULER_H`] (the pinned
+/// ruler) + [`crate::ui::bench_stance::ROW_GAP`] (the gap `bench-content`'s
+/// flex column puts between the ruler and the lane column) + two lane rows
+/// at [`crate::ui::bench_stance::LANE_MIN_H`] each (the darkroom's own floor
+/// of two lanes -- V1, A1, `bench_stance::render`'s own no-session
+/// fallback) + one more `ROW_GAP` between those two rows (`bench-lanes`'s
+/// own flex gap) + [`LEDGER_SEAM_CLEARANCE`] (the row the ledger's own
+/// border needs kept clear, see its own doc comment). Below this the
+/// `bench-lanes` column asks for more height than `bench-content`'s flex_1
+/// gives it, and since that column scrolls rather than clips visibly, the
+/// shortfall comes off the bottom row's own pixels unscrolled -- A1's
+/// clip-bar border and status dot, first. `LANE_MIN_H` itself is derived
+/// from what a lane head actually draws (its own doc comment), not a number
+/// copied from nowhere: an earlier floor of `82.` used a `LANE_MIN_H` of
+/// `18.` that fit only the lane label and let every lane's status dot
+/// overflow into the row beneath it, invisible everywhere but the last
+/// lane, which has no next row to spill into and clipped straight into the
+/// ledger instead.
+///
+/// A third driven pass at the next floor (`94.`, `BENCH_CHROME_H` still
+/// undercounted at `20.`) clipped A1's dot again, by one row -- two 1px
+/// causes stacked, not one 2px guess: `BENCH_CHROME_H`'s own undercount
+/// (`20.` vs its real `21.`) and this term, `LEDGER_SEAM_CLEARANCE`, which
+/// the formula never carried at all. `21 + 22 + 2 + 48 + 2 + 1` = `96.`.
+pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
+    + crate::ui::bench_stance::RULER_H
+    + crate::ui::bench_stance::ROW_GAP
+    + 2. * crate::ui::bench_stance::LANE_MIN_H
+    + crate::ui::bench_stance::ROW_GAP
+    + LEDGER_SEAM_CLEARANCE;
+
 /// What a hand has done to the three seams: the size it dragged each panel to,
 /// or `None` where nobody has touched one and the window's own share still
 /// answers. Held in the model and not recomputed, so a size outlives the
@@ -419,6 +493,8 @@ pub(crate) struct Splits {
     library: Option<f32>,
     inspector: Option<f32>,
     timeline: Option<f32>,
+    dock: Option<f32>,
+    bench: Option<f32>,
 }
 
 impl Splits {
@@ -427,6 +503,8 @@ impl Splits {
             Split::Library => self.library,
             Split::Inspector => self.inspector,
             Split::Timeline => self.timeline,
+            Split::Dock => self.dock,
+            Split::Bench => self.bench,
         }
     }
 
@@ -435,8 +513,60 @@ impl Splits {
             Split::Library => &mut self.library,
             Split::Inspector => &mut self.inspector,
             Split::Timeline => &mut self.timeline,
+            Split::Dock => &mut self.dock,
+            Split::Bench => &mut self.bench,
         } = Some(size);
     }
+}
+
+/// Where the darkroom's own two dragged sizes live -- dock and bench, the
+/// only pair with a hand on them so far. Same small, silent round trip as
+/// [`crate::ui::dock_stance`]'s tab pick: unreadable or absent leaves both
+/// `None`, which [`split_size`] already reads as "give it the window's own
+/// share".
+pub(crate) fn stance_splits_config_path() -> std::path::PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("stance-splits")
+}
+
+pub(crate) fn load_stance_splits() -> Splits {
+    load_stance_splits_from(&stance_splits_config_path())
+}
+
+/// One `split=pixels` line per touched seam, read from `path` -- factored out
+/// of [`load_stance_splits`] so a test can round-trip a scratch file instead
+/// of the real config.
+pub(crate) fn load_stance_splits_from(path: &std::path::Path) -> Splits {
+    let mut splits = Splits::default();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let Ok(px) = value.trim().parse::<f32>() else { continue };
+            let Some(split) = Split::PERSISTED.into_iter().find(|s| s.key() == key) else {
+                continue;
+            };
+            splits.set(split, px);
+        }
+    }
+    splits
+}
+
+/// Writes the sizes a hand has actually dragged -- the legacy three stay
+/// unpersisted, as they already were before this diff (out of its scope).
+/// Walks [`Split::PERSISTED`] rather than a hand-written `if let` per field,
+/// so a region added there needs no second, separately-maintained list here.
+pub(crate) fn save_stance_splits(splits: &Splits) {
+    save_stance_splits_to(splits, &stance_splits_config_path());
+}
+
+pub(crate) fn save_stance_splits_to(splits: &Splits, path: &std::path::Path) {
+    let text: String = Split::PERSISTED
+        .into_iter()
+        .filter_map(|split| splits.get(split).map(|px| format!("{}={px}\n", split.key())))
+        .collect();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
 }
 
 /// How small a panel may be dragged and how large: the floor is the size it
@@ -454,6 +584,23 @@ pub(crate) fn split_bounds(
     match split {
         Split::Library => (LIBRARY_MIN_W, w * SIDE_MAX_FRAC),
         Split::Inspector => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
+        // The dock is the darkroom's one side column -- same shape as the
+        // legacy inspector's, so it takes the legacy inspector's own floor
+        // and ceiling rather than a second pair that would only ever agree.
+        Split::Dock => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
+        // The bench is the darkroom's own timeline, but its ceiling is not
+        // [`Split::Timeline`]'s window-share one: a bench that swallows
+        // `TIMELINE_MAX_SHARE` of a 720p window leaves the screen and its
+        // scale plate only 100px, which is not a picture any more. The
+        // ceiling instead leaves the screen and time band their own fixed
+        // 160px -- room for the scale plate, the picture and a sliver of
+        // letterbox -- and `BENCH_MIN_H` still wins the clamp on anything
+        // shorter than that.
+        Split::Bench => (
+            BENCH_MIN_H,
+            (h - crate::ui::stance::TIME_BAND_H - crate::ui::stance::LEDGER_H - 160.)
+                .max(BENCH_MIN_H),
+        ),
         // One whole lane under the chrome, the scrollbar strip's row included
         // while there is one to draw ([`timeline_fixed_h`]): a timeline
         // shorter than that is a ruler with nothing beneath it. A second
@@ -497,6 +644,8 @@ pub(crate) fn split_size(
         Split::Library => library_w(w),
         Split::Inspector => inspector_w(w),
         Split::Timeline => timeline_h(lanes, scroll).min(h * TIMELINE_SHARE),
+        Split::Dock => crate::ui::stance::DOCK_W,
+        Split::Bench => crate::ui::stance::BENCH_H,
     };
     // The floor wins a window too small to honour both ends: a panel at its
     // floor is still a panel, and `clamp` panics outright on a ceiling under
@@ -517,6 +666,11 @@ pub(crate) fn split_drag_size(split: Split, at: Point<Pixels>, window: Size<Pixe
         // This seam sits above the edit toolbar, which is a fixed height: what
         // is under the pointer is the toolbar and the timeline together.
         Split::Timeline => h - y - TOOLBAR_H - SPLIT_W / 2.,
+        // The dock sits on the same right edge the inspector does.
+        Split::Dock => w - x - SPLIT_W / 2.,
+        // The bench sits above the fixed ledger strip, the bench's own
+        // reason the timeline's formula reads the toolbar.
+        Split::Bench => h - y - crate::ui::stance::LEDGER_H - SPLIT_W / 2.,
     }
 }
 
