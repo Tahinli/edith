@@ -567,7 +567,7 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
 /// The dock: the only side panel, right, fixed width, carrying the Src/Clip
 /// tab pair (DESIGN §5). The frame is drawn here; `dock_stance.rs` owns the
 /// tab row and both tabs' content (DESIGN §12 step 4).
-fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
+fn dock(player: &Player, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-dock")
         .flex_none()
@@ -578,7 +578,7 @@ fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl Int
         .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
-        .child(dock_stance::render(player, DOCK_W, window_h, cx))
+        .child(dock_stance::render(player, DOCK_W, window_size, cx))
 }
 
 /// The whole stance: spine, screen, time band, bench, ledger, dock, in the
@@ -780,5 +780,5 @@ pub(crate) fn render(
                 .children(player.export_progress_card(cx))
                 .children(player.picker_card(window_size, cx)),
         )
-        .child(dock(player, window_h, cx))
+        .child(dock(player, window_size, cx))
 }

@@ -44,6 +44,28 @@ fn save(src_active: bool) {
     let _ = std::fs::write(path, if src_active { "Src\n" } else { "Clip\n" });
 }
 
+/// Whether the room's one open param card is maximized -- the same
+/// small-file round trip as the dock tab pick above, its own word beside it
+/// ("a room reopens exactly as left", DESIGN.md:135), so a maximized EQ stays
+/// maximized across a close and reopen of the whole room, not just the card.
+pub(crate) fn maximized_config_path() -> std::path::PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("card-maximized")
+}
+
+pub(crate) fn load_maximized() -> bool {
+    std::fs::read_to_string(maximized_config_path())
+        .map(|text| text.trim() == "1")
+        .unwrap_or(false)
+}
+
+pub(crate) fn save_maximized(maximized: bool) {
+    let path = maximized_config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, if maximized { "1\n" } else { "0\n" });
+}
+
 /// The Sources tab's four sort chips (MOCK-SPEC "Dock" §3). `Recent` is the
 /// library's own arrival order -- the only order this editor tracks without
 /// a fourth field to keep it in.
@@ -502,8 +524,8 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 /// these onto. Drag-while-playing and every other gesture on a row is
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
-fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
-    let room = size(px(width), window_h);
+fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
+    let _ = width;
     let none_open = player.eq_open.is_none()
         && player.color_open.is_none()
         && player.transform_open.is_none()
@@ -596,19 +618,19 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
                 .min_h(px(0.))
                 .px(px(8.))
                 .pb(px(8.))
-                .children(player.eq_card(room, cx))
-                .children(player.color_card(cx))
-                .children(player.transform_card(cx))
-                .children(player.speed_card(cx))
-                .children(player.silence_card(cx))
-                .children(player.mix_card(cx))
+                .children(player.eq_card(window_size, cx))
+                .children(player.color_card(window_size, cx))
+                .children(player.transform_card(window_size, cx))
+                .children(player.speed_card(window_size, cx))
+                .children(player.silence_card(window_size, cx))
+                .children(player.mix_card(window_size, cx))
                 // Subtitle style has no verb row of its own here (see the
                 // comment above the ghost verbs) but its card still has to
                 // be mounted somewhere in the darkroom or its chord (`y`)
                 // opens an invisible modal (GAP 2) -- this is that mount,
                 // painted in the Clip tab like the six cards beside it until
                 // the subtitle lane grows the header that is its real home.
-                .children(player.subtitle_style_card(cx))
+                .children(player.subtitle_style_card(window_size, cx))
                 // A plate, not bare space: DESIGN §11's "states" checklist --
                 // nothing picked reads as a hint, not as a hole in the panel.
                 .when(none_open, |d| {
@@ -638,7 +660,7 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
 /// pair). What degrades *inside* fixed width is the two tabs' own content:
 /// Sources scrolls its own row list; Clip's param rows are whatever their
 /// card already draws at this width.
-pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
+pub(crate) fn render(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
     let src_active = player.dock_src_active;
     div()
         .id("stance-dock-body")
@@ -660,6 +682,6 @@ pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Con
         )
         .child(match src_active {
             true => sources_tab(player, cx).into_any_element(),
-            false => clip_tab(player, width, window_h, cx).into_any_element(),
+            false => clip_tab(player, width, window_size, cx).into_any_element(),
         })
 }
