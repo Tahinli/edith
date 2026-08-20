@@ -38,6 +38,7 @@ use super::{
     px_below, STATUS_SUCCESS, STATUS_WARNING, notice_tone,
     proxies_to_start, push_notice, typed, unseen_paths, unseen_sources,
     whole_take, window_title,
+    OVERLAID, tip_may_paint,
 };
 
 use super::{
