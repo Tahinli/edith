@@ -3,7 +3,7 @@
 use crate::*;
 use crate::ui::widgets::*;
 use crate::ui::type_scale::Typeset;
-use crate::ui::stance::below_picture_floor;
+use crate::ui::stance::menu_floor;
 
 impl Player {
     /// The media library: a row per source the timeline knows, in the order
@@ -684,12 +684,12 @@ impl Player {
             }
         }
         // Placed by the height it is drawn to, and drawn to what the window has
-        // room for -- the clip menu's rule, one function for all three.
-        let list_h = menu_rows_h(rows.len(), viewport);
-        let mut at = menu.at;
-        if darkroom {
-            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
-        }
+        // room for -- the clip menu's rule, one function for all three. The
+        // floor clamp and the room the list sizes against are `menu_floor`'s,
+        // so a menu taller than the footprint scrolls instead of climbing
+        // back over the picture.
+        let (at, room) = menu_floor(menu.at, viewport, darkroom);
+        let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();
         Some(
