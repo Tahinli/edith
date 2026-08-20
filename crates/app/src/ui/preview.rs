@@ -225,7 +225,7 @@ impl Player {
                     .left_0()
                     .right_0()
                     .flex()
-                    .child(img(image).flex_1().h_full().object_fit(gpui::ObjectFit::Contain)),
+                    .child(letterboxed_image(image)),
             );
         }
         Some(
@@ -332,41 +332,55 @@ impl Player {
     /// neighbour's edge frame ([`engine::PlaybackSession::video_source_frame_at`]
     /// is the same lookup [`Player::live_decode`] already makes) in place of
     /// the plate's text.
+    ///
+    /// Always the same fixed-height markup while the darkroom is up, at rest
+    /// on a cut or not -- `.invisible()` (`Visibility::Hidden`, confirmed in
+    /// `gpui_macros::styles::visibility_style_methods`: painting is skipped,
+    /// the layout box is not) keeps the strip's room reserved instead of
+    /// collapsing it, which is what let the picture's own `flex_1` above it
+    /// resize on every cut walk (404px resting on a cut, 335px a frame off
+    /// one, springing back on the very next). Only `!self.darkroom` still
+    /// returns `None`: the legacy tree never reserved this room and does not
+    /// start now.
     pub(crate) fn two_up(&self) -> Option<impl IntoElement> {
         if !self.darkroom {
             return None;
         }
-        let (lane, idx) = self.selected.anchor()?;
-        let session = self.session.as_ref()?;
-        let clips = session.lane_clips(lane);
-        let clip = clips.get(idx)?;
-        let now = frame_at(session.now(), self.fps);
-        let name_of = |source: usize| {
-            session
-                .sources()
-                .get(source)
-                .map_or_else(|| "?".to_string(), |s| file_name(&s.path))
-        };
-        // Which edge, if either, the playhead is resting on -- the one
-        // question "at rest on a cut" is.
-        let (out_label, in_label) = if now == clip.start {
-            let out = idx
-                .checked_sub(1)
-                .and_then(|i| clips.get(i))
-                .map_or("— nothing before it".to_string(), |c| {
-                    format!("{} @{}", name_of(c.source), c.end())
-                });
-            (out, format!("{} @{}", name_of(clip.source), clip.start))
-        } else if now == clip.end() {
-            let inn = clips
-                .get(idx + 1)
-                .map_or("— nothing after it".to_string(), |c| {
-                    format!("{} @{}", name_of(c.source), c.start)
-                });
-            (format!("{} @{}", name_of(clip.source), clip.end()), inn)
-        } else {
-            return None;
-        };
+        let resting = (|| {
+            let (lane, idx) = self.selected.anchor()?;
+            let session = self.session.as_ref()?;
+            let clips = session.lane_clips(lane);
+            let clip = clips.get(idx)?;
+            let now = frame_at(session.now(), self.fps);
+            let name_of = |source: usize| {
+                session
+                    .sources()
+                    .get(source)
+                    .map_or_else(|| "?".to_string(), |s| file_name(&s.path))
+            };
+            // Which edge, if either, the playhead is resting on -- the one
+            // question "at rest on a cut" is.
+            if now == clip.start {
+                let out = idx
+                    .checked_sub(1)
+                    .and_then(|i| clips.get(i))
+                    .map_or("— nothing before it".to_string(), |c| {
+                        format!("{} @{}", name_of(c.source), c.end())
+                    });
+                Some((out, format!("{} @{}", name_of(clip.source), clip.start)))
+            } else if now == clip.end() {
+                let inn = clips
+                    .get(idx + 1)
+                    .map_or("— nothing after it".to_string(), |c| {
+                        format!("{} @{}", name_of(c.source), c.start)
+                    });
+                Some((format!("{} @{}", name_of(clip.source), clip.end()), inn))
+            } else {
+                None
+            }
+        })();
+        let on_cut = resting.is_some();
+        let (out_label, in_label) = resting.unwrap_or_default();
         let plate = |label: &str, text: String| {
             div()
                 .flex_1()
@@ -400,6 +414,7 @@ impl Player {
                 .flex()
                 .gap(px(1.))
                 .p(px(8.))
+                .when(!on_cut, |d| d.invisible())
                 .child(plate("OUT", out_label))
                 .child(plate("IN", in_label)),
         )
