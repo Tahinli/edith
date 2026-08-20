@@ -1026,7 +1026,7 @@ fn a_proxy_is_picture_only_every_frame_a_starting_point_and_cached() {
     session.set_proxies(true);
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 16\n"), "{text}");
+    assert!(text.starts_with("edith 20\n"), "{text}");
     assert!(text.contains("\nproxy on\n"), "{text}");
     let reopened = PlaybackSession::open_project(&project).expect("load");
     assert!(reopened.proxies(), "the switch came back on");
