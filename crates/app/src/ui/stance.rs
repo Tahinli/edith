@@ -98,11 +98,14 @@ fn ghost_dual(player: &Player, glyph: &str, action: ActionId, stride: ActionId) 
 /// fill step for as long as the key is held, never a latch (DESIGN §9: "no
 /// modal cheat-sheet").
 ///
-/// corner-cut: DESIGN §9 wants chords surfaced *in place beside their
-/// controls* across every region; this is one scrolling list plate instead,
-/// anchored over the bench/ledger footprint so it never reaches the screen.
+/// corner-cut, named explicitly in DESIGN §9's own 2026-08-20 amendment
+/// rather than silently shipped against the section's original text: it
+/// wants chords surfaced *in place beside their controls* across every
+/// region, and this is one scrolling list plate instead, anchored over the
+/// bench/ledger footprint so it never reaches the screen (§11.6 holds).
 /// Ceiling: DESIGN §12 step 7's full geographic pass (each region draws its
-/// own rows while held).
+/// own rows while held) -- §9's amendment names the 56 actions still
+/// without a home.
 fn keys_overlay(player: &Player) -> impl IntoElement {
     div()
         .id("stance-keys-overlay")

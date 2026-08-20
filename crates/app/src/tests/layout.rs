@@ -1837,3 +1837,32 @@ fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
         );
     }
 }
+
+/// DESIGN §8: "No full-width bars, no covering the picture, ever." The
+/// darkroom stance (`ui::stance::screen`) draws
+/// [`Player::picture_area`](crate::Player::picture_area) directly, so a
+/// notice surface that reaches into that method unconditionally reaches the
+/// picture on the darkroom path too -- measured live covering the bottom 10%
+/// of the frame (rows 300-333 of 335) *underneath* the stance's own
+/// §8-conformant plate (`ui::stance::notice_plate`), which drew the same
+/// notice a second time above the ledger. The legacy (non-darkroom) room
+/// keeps its full-width `notice_bar` exactly as it always has -- this only
+/// pins the darkroom path off it.
+#[test]
+fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
+    let body = fn_body("picture_area");
+    assert!(
+        body.contains("self.notice_bar(cx)"),
+        "picture_area no longer draws notice_bar at all; re-check the darkroom gate still applies"
+    );
+    let at = body.find("self.notice_bar(cx)").expect("checked above");
+    // Whatever gates the call, it has to name `darkroom` and it has to be
+    // upstream of the call itself -- a gate written after the call, or one
+    // that never mentions the flag, is not a gate on this method.
+    let before = &body[..at];
+    assert!(
+        before.contains("self.darkroom") || before.contains("!self.darkroom"),
+        "notice_bar in picture_area is not gated on self.darkroom any more -- \
+         the darkroom stance would paint it over the picture again"
+    );
+}
