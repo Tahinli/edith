@@ -432,31 +432,56 @@ pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
 /// timeline is asking on purpose, and the picture still keeps most of a third.
 pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
 
+/// The room the ledger's own top border (`ui::stance::ledger`'s
+/// `.border_t_1()`) needs kept clear below the bench's own last content
+/// pixel. The ledger sits at a *fixed* distance from the window's own foot
+/// (`ui::stance::LEDGER_H`), not from wherever the bench's content happens
+/// to end, so if the bench's last lane row reaches exactly as far as the
+/// ledger's own top row, the ledger's border -- later in the same flex
+/// column, so it paints over whatever is already there -- wins the shared
+/// pixel rather than sitting cleanly below it. Driven, at [`BENCH_MIN_H`]'s
+/// own third clip: `bench=95` (the stack's exact content need, no spare row)
+/// still lost A1's status dot's last row to the rule; `bench=96` (one row of
+/// clearance) drew it whole. The 95-vs-96 tension is this term, not a
+/// rounding accident -- a bench exactly as tall as its content still shares
+/// its last row with the ledger's border.
+const LEDGER_SEAM_CLEARANCE: f32 = 1.;
+
 /// The least the darkroom's bench may be dragged to: derived, not measured,
 /// from the same stack `ui::stance::bench` and `ui::bench_stance::render`
 /// actually build, top to bottom --
-/// [`crate::ui::stance::BENCH_CHROME_H`] (the "bench" section head and its
-/// padding) + [`crate::ui::bench_stance::RULER_H`] (the pinned ruler) +
-/// [`crate::ui::bench_stance::ROW_GAP`] (the gap `bench-content`'s flex
-/// column puts between the ruler and the lane column) + two lane rows at
-/// [`crate::ui::bench_stance::LANE_MIN_H`] each (the darkroom's own floor of
-/// two lanes -- V1, A1, `bench_stance::render`'s own no-session fallback)
-/// + one more `ROW_GAP` between those two rows (`bench-lanes`'s own flex
-/// gap). Below this the `bench-lanes` column asks for more height than
-/// `bench-content`'s flex_1 gives it, and since that column scrolls rather
-/// than clips visibly, the shortfall comes off the bottom row's own pixels
-/// unscrolled -- A1's clip-bar border and status dot, first. `LANE_MIN_H`
-/// itself is now derived from what a lane head actually draws (its own
-/// doc comment), not a number copied from nowhere: an earlier floor of
-/// `82.` used a `LANE_MIN_H` of `18.` that fit only the lane label and let
-/// every lane's status dot overflow into the row beneath it, invisible
-/// everywhere but the last lane, which has no next row to spill into and
-/// clipped straight into the ledger instead.
+/// [`crate::ui::stance::BENCH_CHROME_H`] (the "bench" section head's real
+/// line box, plus the bench div's own top border and top padding -- see its
+/// own doc comment) + [`crate::ui::bench_stance::RULER_H`] (the pinned
+/// ruler) + [`crate::ui::bench_stance::ROW_GAP`] (the gap `bench-content`'s
+/// flex column puts between the ruler and the lane column) + two lane rows
+/// at [`crate::ui::bench_stance::LANE_MIN_H`] each (the darkroom's own floor
+/// of two lanes -- V1, A1, `bench_stance::render`'s own no-session
+/// fallback) + one more `ROW_GAP` between those two rows (`bench-lanes`'s
+/// own flex gap) + [`LEDGER_SEAM_CLEARANCE`] (the row the ledger's own
+/// border needs kept clear, see its own doc comment). Below this the
+/// `bench-lanes` column asks for more height than `bench-content`'s flex_1
+/// gives it, and since that column scrolls rather than clips visibly, the
+/// shortfall comes off the bottom row's own pixels unscrolled -- A1's
+/// clip-bar border and status dot, first. `LANE_MIN_H` itself is derived
+/// from what a lane head actually draws (its own doc comment), not a number
+/// copied from nowhere: an earlier floor of `82.` used a `LANE_MIN_H` of
+/// `18.` that fit only the lane label and let every lane's status dot
+/// overflow into the row beneath it, invisible everywhere but the last
+/// lane, which has no next row to spill into and clipped straight into the
+/// ledger instead.
+///
+/// A third driven pass at the next floor (`94.`, `BENCH_CHROME_H` still
+/// undercounted at `20.`) clipped A1's dot again, by one row -- two 1px
+/// causes stacked, not one 2px guess: `BENCH_CHROME_H`'s own undercount
+/// (`20.` vs its real `21.`) and this term, `LEDGER_SEAM_CLEARANCE`, which
+/// the formula never carried at all. `21 + 22 + 2 + 48 + 2 + 1` = `96.`.
 pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
     + crate::ui::bench_stance::RULER_H
     + crate::ui::bench_stance::ROW_GAP
     + 2. * crate::ui::bench_stance::LANE_MIN_H
-    + crate::ui::bench_stance::ROW_GAP;
+    + crate::ui::bench_stance::ROW_GAP
+    + LEDGER_SEAM_CLEARANCE;
 
 /// What a hand has done to the three seams: the size it dragged each panel to,
 /// or `None` where nobody has touched one and the window's own share still
