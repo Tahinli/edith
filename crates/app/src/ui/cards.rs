@@ -20,6 +20,21 @@ fn dark_row_label(text: impl Into<SharedString>, picked: bool) -> Div {
         .child(text.into())
 }
 
+/// A transform row's value with its unit: degrees for rotation, `×` for
+/// scale (a multiplier, not a fraction of the frame), percent for
+/// position/crop (both are a fraction of the frame's own size) -- the bare
+/// `{value:.2}` this used to print could not tell a percent from a
+/// multiplier apart.
+fn transform_row_value(band: usize, value: f32) -> String {
+    if band == ROTATE_BAND {
+        format!("{value:.0}°")
+    } else if band == SCALE_BAND {
+        format!("{value:.2}×")
+    } else {
+        format!("{:.0}%", value * 100.)
+    }
+}
+
 /// A row's value -- what the film/the setting *says*, mono per §3.
 fn dark_row_value(text: impl Into<SharedString>) -> Div {
     div()
@@ -30,8 +45,13 @@ fn dark_row_value(text: impl Into<SharedString>) -> Div {
 
 /// A card's own head line: the verb in Archivo (§3 section-head casing) and,
 /// where there is one, the clip it names in mono beside it -- "which clip"
-/// is metadata about the footage, not the room's own voice.
-fn dark_card_head(verb: &str, meta: Option<SharedString>) -> Div {
+/// is metadata about the footage, not the room's own voice. `help`, when
+/// given, is the card's own how-to sentence -- it used to sit under the
+/// head as a permanent line (a terminal-screen row of prose the user named
+/// directly); now it rides a `?` glyph beside the head and only shows on
+/// hover, the same hover-only convention [`dock_stance::ghost_verb`]
+/// already uses for a verb's own description.
+fn dark_card_head(verb: &str, meta: Option<SharedString>, help: Option<SharedString>) -> Div {
     div()
         .flex_none()
         .px(px(6.))
@@ -49,6 +69,15 @@ fn dark_card_head(verb: &str, meta: Option<SharedString>) -> Div {
                 .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
                 .text_color(rgb(INK3()))
                 .child(m)
+        }))
+        .children(help.map(|h| {
+            div()
+                .id("card-head-help")
+                .flex_none()
+                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .text_color(rgb(INK3()))
+                .tooltip(move |_, cx| cx.new(|_| Tip(h.clone())).into())
+                .child("?")
         }))
 }
 
@@ -1065,7 +1094,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Exporting", None)))
+                        .when(dark, |d| d.child(dark_card_head("Exporting", None, None)))
                         .when(!dark, |d| d.child(div().flex_none().px(px(6.)).child("Exporting")))
                         // The bar itself: the same number as the percentage
                         // below it, and it only ever moves forward -- the
@@ -1490,6 +1519,7 @@ impl Player {
                                     d.child(dark_card_head(
                                         "Equalizer",
                                         Some(format!("{} clip {}", lane.label(), idx + 1).into()),
+                                        Some("drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()),
                                     ))
                                 })
                                 .when(!dark, |d| {
@@ -1499,10 +1529,8 @@ impl Player {
                                         idx + 1
                                     )))
                                 })
-                                .when(dark, |d| {
-                                    d.child(dark_help(self.notices.front().cloned().unwrap_or_else(|| {
-                                        "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
-                                    })))
+                                .when(dark && self.notices.front().is_some(), |d| {
+                                    d.child(dark_help(self.notices.front().cloned().unwrap_or_default()))
                                 })
                                 .when(!dark, |d| {
                                     d.child(
@@ -1924,11 +1952,11 @@ impl Player {
                     .child(
                         div()
                             .w(px(44.))
-                            .when(dark, |d| d.child(dark_row_value(format!("{value:.2}"))))
+                            .when(dark, |d| d.child(dark_row_value(format!("{:.0}%", value * 100.))))
                             .when(!dark, |d| {
                                 d.text_size(px(11.))
                                     .text_color(rgb(FG_SECONDARY()))
-                                    .child(format!("{value:.2}"))
+                                    .child(format!("{:.0}%", value * 100.))
                             }),
                     )
             })
@@ -1963,7 +1991,9 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Colour", Some(head_meta.clone()))))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Colour", Some(head_meta.clone()), Some(help_text.into())))
+                        })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
                                 "Colour — {} clip {}",
@@ -1971,7 +2001,6 @@ impl Player {
                                 idx + 1
                             )))
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2105,17 +2134,11 @@ impl Player {
                     )
                     .child(
                         div().w(px(44.)).when(dark, |d| {
-                            d.child(dark_row_value(match i == ROTATE_BAND {
-                                true => format!("{value:.0}°"),
-                                false => format!("{value:.2}"),
-                            }))
+                            d.child(dark_row_value(transform_row_value(i, value)))
                         }).when(!dark, |d| {
                             d.text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY()))
-                                .child(match i == ROTATE_BAND {
-                                    true => format!("{value:.0}°"),
-                                    false => format!("{value:.2}"),
-                                })
+                                .child(transform_row_value(i, value))
                         }),
                     )
             })
@@ -2149,7 +2172,9 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Transform", Some(head_meta.clone()))))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Transform", Some(head_meta.clone()), Some(help_text.into())))
+                        })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
                                 "Transform — {} clip {}",
@@ -2157,7 +2182,6 @@ impl Player {
                                 idx + 1
                             )))
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2287,7 +2311,9 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()))))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()), Some(help_text.into())))
+                        })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
                                 "Speed (tape) — {} clip {}",
@@ -2295,7 +2321,6 @@ impl Player {
                                 idx + 1
                             )))
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2520,7 +2545,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Mix", None)))
+                        .when(dark, |d| d.child(dark_card_head("Mix", None, Some(help_text.into()))))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2529,7 +2554,6 @@ impl Player {
                                     .child("Mix — track volumes and the master limiter"),
                             )
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2724,7 +2748,9 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Subtitle style", None)))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Subtitle style", None, Some(help_text.into())))
+                        })
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2733,7 +2759,6 @@ impl Player {
                                     .child("Subtitle style — font and size of the cue plate"),
                             )
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2968,7 +2993,9 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Silences", Some(head_meta.clone()))))
+                        .when(dark, |d| {
+                            d.child(dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into())))
+                        })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
                                 "Silences — {} clip {}",
@@ -2976,7 +3003,6 @@ impl Player {
                                 idx + 1
                             )))
                         })
-                        .when(dark, |d| d.child(dark_help(help_text)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
