@@ -29,8 +29,22 @@
 
 use crate::*;
 
-/// The pinned ruler's own height, above the lane stack.
-const RULER_H: f32 = 10.;
+/// The pinned ruler's own height, above the lane stack -- tall enough for a
+/// tick line plus a mono `MM:SS` label under it (DESIGN §5's "tick marks with
+/// mono ink3 timecodes").
+const RULER_H: f32 = 22.;
+/// The stops a tick interval is picked from (DESIGN §5, the previous
+/// builder's own note): the smallest one whose pixel width at the current
+/// zoom still clears [`TICK_MIN_PX`].
+const TICK_STOPS: [f64; 13] = [
+    0.5, 1., 2., 5., 10., 15., 30., 60., 120., 300., 600., 1800., 3600.,
+];
+/// The floor a tick's pixel spacing must clear before its label is legible
+/// mono text at 8px.
+const TICK_MIN_PX: f64 = 64.;
+/// The playhead timecode plate's own width, wide enough for `HH:MM:SS:FF`
+/// mono at 10px plus the plate's padding.
+const PLATE_W: f32 = 74.;
 /// The pinned track-head column, DESIGN §5's "track heads" -- narrower than
 /// the legacy timeline's `HEADER_W` since a darkroom lane carries no mix/eye
 /// button yet (deferred with the rest of the header's verbs).
@@ -66,6 +80,27 @@ enum Tier {
 fn mmss(secs: f64) -> String {
     let s = secs.max(0.).round() as u64;
     format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// `MM:SS` zero-padded on both fields, the ruler's own tick label (mock:
+/// `00:30`, `01:00`, `01:30`) -- distinct from [`mmss`]'s unpadded minutes,
+/// which reads right in a trim delta but not lined up under evenly spaced
+/// ticks.
+fn tick_mmss(secs: f64) -> String {
+    let s = secs.max(0.).round() as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// The tick spacing at `pps` pixels per second: the smallest [`TICK_STOPS`]
+/// entry whose pixel width still clears [`TICK_MIN_PX`], so labels never
+/// crowd into soup as the bed zooms in and never thin to nothing zoomed out
+/// (the far stop, an hour, is the last one there is).
+fn tick_interval(pps: f64) -> f64 {
+    TICK_STOPS
+        .iter()
+        .copied()
+        .find(|&i| i * pps >= TICK_MIN_PX)
+        .unwrap_or(3600.)
 }
 
 /// A clip's thumbnail, filling its box. `Cover` rather than `Contain`: a clip
@@ -302,6 +337,12 @@ fn lane_row(
         .enumerate()
         .map(|(idx, clip)| clip_box(player, lane, idx, clip, scale, picks, pick_links, cx))
         .collect();
+    // DESIGN §5's lane heads: "a small ink dot under each head, coloured by
+    // the lane's source ink" -- the first clip's source stands for the lane,
+    // since a lane with several sources still needs one dot, not a legend.
+    let dot = clips
+        .first()
+        .map_or_else(INK4, |clip| source_tint(clip.source));
     div()
         .id(("bench-lane", lane.ord * 10 + lane.kind as usize))
         .flex_none()
@@ -314,12 +355,15 @@ fn lane_row(
                 .w(px(HEAD_W))
                 .h_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap(px(2.))
                 .bg(rgb(DARK_PANEL()))
                 .text_size(px(9.5))
                 .text_color(rgb(INK2()))
-                .child(lane.label()),
+                .child(lane.label())
+                .child(div().flex_none().w(px(4.)).h(px(4.)).rounded(px(2.)).bg(rgb(dot))),
         )
         .child(
             // The bed: a drop target for the Sources tab (`AssetDrag`,
@@ -359,6 +403,21 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
     for &lane in &lanes {
         rows.push(lane_row(player, lane, h, scale, &picks, &pick_links, cx));
     }
+    // Ruler ticks (DESIGN §5): the interval is the smallest [`TICK_STOPS`]
+    // entry whose pixel spacing still clears [`TICK_MIN_PX`], walked from the
+    // first tick at or after the bed's left edge to the bed's right edge.
+    // Guarded on `pps > 0` -- a zero scale (no session yet) has no interval
+    // that ever advances past the bed's own width, which would loop forever.
+    let mut ticks = Vec::new();
+    if scale.pps > 0. {
+        let interval = tick_interval(scale.pps);
+        let mut t = (scale.start / interval).ceil() * interval;
+        while scale.px_at(t) <= bed_w {
+            ticks.push((scale.px_at(t).max(0.), tick_mmss(t)));
+            t += interval;
+        }
+    }
+    let playhead_tc = crate::viewport::timecode(position, player.fps);
     div()
         .id("bench-content")
         .flex_1()
@@ -369,9 +428,10 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
         .gap(px(ROW_GAP))
         .child(
             // Pinned ruler: click/drag to seek (reuses `Player::scrub_to`,
-            // the same call the legacy ruler makes), the playhead's own
-            // lamp-white line (DESIGN §1 law 3 -- the only other legal use
-            // of pure white besides the splice).
+            // the same call the legacy ruler makes), tick marks with mono
+            // `ink3` timecodes (DESIGN §5), and the playhead's own lamp-white
+            // line (DESIGN §1 law 3 -- the only other legal use of pure
+            // white besides the splice).
             div()
                 .id("bench-ruler")
                 .flex_none()
@@ -379,7 +439,7 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                 .ml(px(HEAD_W))
                 .relative()
                 .rounded(px(2.))
-                .bg(rgb(DARK_HAIRLINE()))
+                .bg(rgb(DARK_PANEL()))
                 .cursor_pointer()
                 .child(bounds_probe(player.ruler.clone()))
                 .on_mouse_down(
@@ -389,13 +449,25 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                         this.scrub_to(event.position.x, true, cx);
                     }),
                 )
-                .child(
+                .children(ticks.into_iter().map(|(x, label)| {
                     div()
-                        .h_full()
-                        .w(px(filled))
-                        .rounded(px(2.))
-                        .bg(rgb(INK1())),
-                )
+                        .absolute()
+                        .top_0()
+                        .left(px(x))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .child(div().w(px(1.)).h(px(4.)).bg(rgb(INK3())))
+                                .child(
+                                    div()
+                                        .text_size(px(8.))
+                                        .text_color(rgb(INK3()))
+                                        .child(label),
+                                ),
+                        )
+                }))
                 .child(
                     div()
                         .absolute()
@@ -404,6 +476,25 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                         .left(px(filled))
                         .w(px(1.))
                         .bg(rgb(LAMP_WHITE())),
+                )
+                .child(
+                    // The pinned playhead timecode plate, DESIGN §5's own
+                    // "playhead's own timecode in a plate at the left edge" --
+                    // always at `left_0`, never following the scrubbed x, so
+                    // it never overlaps the picture region above it.
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(px(PLATE_W))
+                        .flex()
+                        .items_center()
+                        .px(px(4.))
+                        .bg(rgb(DARK_CANVAS()))
+                        .text_size(px(10.))
+                        .text_color(rgb(INK1()))
+                        .child(playhead_tc),
                 ),
         )
         .child(

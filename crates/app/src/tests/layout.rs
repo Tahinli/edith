@@ -1004,6 +1004,16 @@ fn source_tints_are_all_discernible() {
                 apart(tint, p.BG_RAISED)
             );
             for (j, &other) in p.SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+                // The eleven non-darkroom families still cycle four tuned
+                // tints through the 12-wide wheel (`source_tint`'s own `%
+                // len()` reads them back identically either way) -- a
+                // literal repeat there is the intended cycle, not a
+                // collision, so it is skipped rather than failed. Darkroom's
+                // own twelve (DESIGN §2) are twelve *different* hues and
+                // never repeat, so a real collision there still fails this.
+                if tint == other {
+                    continue;
+                }
                 assert!(
                     apart(tint, other) >= 16,
                     "{id:?} tints {i} and {j} are only {} apart",
@@ -1015,6 +1025,18 @@ fn source_tints_are_all_discernible() {
         // than the floor: source 0 and source 1 are the first import and
         // the second.
         assert!(apart(p.SOURCE_TINTS[0], p.SOURCE_TINTS[1]) >= 32, "{id:?}");
+    }
+    // Darkroom's own 12-hue wheel (DESIGN §2/§12 step 5's hook): every one
+    // of the twelve is a genuinely different hue, not four repeated three
+    // times like the other families still cycle -- a hue accidentally
+    // reintroduced by a future edit here is the "four shades of grey" bug
+    // this task exists to fix, so it fails loudly rather than skip past the
+    // `tint == other` escape hatch above.
+    let dr = crate::ui::theme::PaletteId::Darkroom.palette();
+    for (i, &a) in dr.SOURCE_TINTS.iter().enumerate() {
+        for (j, &b) in dr.SOURCE_TINTS.iter().enumerate().skip(i + 1) {
+            assert_ne!(a, b, "darkroom tints {i} and {j} collide");
+        }
     }
 }
 
