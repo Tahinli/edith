@@ -2,6 +2,8 @@
 
 use crate::*;
 use crate::ui::widgets::*;
+use crate::ui::type_scale::Typeset;
+use crate::ui::stance::below_picture_floor;
 
 impl Player {
     /// The media library: a row per source the timeline knows, in the order
@@ -551,7 +553,11 @@ impl Player {
     ) -> Option<impl IntoElement> {
         let menu = self.library_menu.clone()?;
         let path = menu.path.clone();
-        let row = |n: usize| {
+        // DESIGN §9: the same plate row treatment `Player::context_card`
+        // draws with -- one function, so a copy-paste sibling menu cannot
+        // drift from it (darkroom only; `OLD_GUI=1` is unchanged).
+        let darkroom = self.darkroom;
+        let row = move |n: usize| {
             div()
                 .id(("library-menu", n))
                 .flex()
@@ -561,6 +567,22 @@ impl Player {
                 .gap(px(12.))
                 .px(px(6.))
                 .rounded(px(3.))
+                .when(darkroom, |d| {
+                    d.type_style(crate::ui::type_scale::label(
+                        crate::ui::type_scale::LABEL_ROW_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK2()))
+                })
+        };
+        let chord_style = |d: Div| -> Div {
+            d.when(darkroom, |d| {
+                d.type_style(crate::ui::type_scale::mono(
+                    crate::ui::type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK3()))
+            })
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         // What every item of this menu is answered from, read once.
@@ -618,14 +640,14 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(
+                        .child(chord_style(
                             div()
                                 .min_w(px(0.))
                                 .truncate()
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(value),
+                                .text_color(rgb(FG_SECONDARY())),
                         )
+                        .child(value))
                         .into_any_element(),
                 );
             }
@@ -641,11 +663,13 @@ impl Player {
                     row(rows.len())
                         .child(item.label())
                         .child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(refusal.why().unwrap_or_else(|| item.hint())),
+                            chord_style(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(FG_SECONDARY())),
+                            )
+                            .child(refusal.why().unwrap_or_else(|| item.hint())),
                         )
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
                         .when(enabled, |d| {
@@ -662,7 +686,11 @@ impl Player {
         // Placed by the height it is drawn to, and drawn to what the window has
         // room for -- the clip menu's rule, one function for all three.
         let list_h = menu_rows_h(rows.len(), viewport);
-        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
+        let mut at = menu.at;
+        if darkroom {
+            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
+        }
+        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();
         Some(
             scrim()
