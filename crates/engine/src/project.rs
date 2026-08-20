@@ -6748,6 +6748,9 @@ mod tests {
     /// 52 bytes of fields, but the struct's own alignment is 8 (from the
     /// `usize` source and the 8-byte `Option<u32>` link), so an odd number of
     /// words after it pads out to the next multiple of 8: 56 bytes total.
+    /// The transform index is a third `Option<u16>`, same reason as the eq and
+    /// colour ones before it -- it lands in bytes already spent on padding, so
+    /// the struct still costs 56.
     /// This is the assert that says so: a clip that grows a word grows every
     /// undo snapshot and every clipboard copy with it.
     #[test]
@@ -8104,13 +8107,15 @@ mod tests {
     /// Not a claim about correctness but about cost: a clip is copied on every
     /// paste, every undo snapshot and every lane clone, so its size is worth
     /// knowing. The eq index fit the padding a `Copy` clip already had; the
-    /// colour one did not, and the struct grew a word.
+    /// colour one did not, and the struct grew a word. The transform index is
+    /// a third `Option<u16>`, and it fits the padding the fit policy and the
+    /// transition byte already left behind, so the struct did not grow again.
     #[test]
     fn a_clip_is_still_a_small_copy() {
         assert_eq!(
             std::mem::size_of::<Clip>(),
             56,
-            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after, 56 with the transition"
+            "Clip changed size -- 32 before the colour index, 40 before the fades, 48 after, 56 with the transition, still 56 with the transform index"
         );
     }
 
