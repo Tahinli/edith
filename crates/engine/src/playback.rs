@@ -536,7 +536,11 @@ impl PlaybackSession {
     }
 
     fn open_stream(path: impl AsRef<Path>, audio_stream: usize) -> crate::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        // Canonical from the first byte: the project canonicalizes every
+        // source ([`Source::new`]), and [`Worker::reseek`] reuses a decoder
+        // only when the paths match textually -- a raw path here would make
+        // every later picture edit pay a full reopen instead of a seek.
+        let path = crate::project::canonical(path.as_ref());
         // A timeline is normally scaffolded from source 0's picture -- its size,
         // its frame rate, its clock. A song has none of that, so it scaffolds
         // the *canvas* instead and its own sound keeps the clock: an audio-only
@@ -4135,7 +4139,9 @@ fn blend_bgra(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Lane, PlaybackSession, Source, audio_source_of, blend_bgra, secs_to_frame};
+    use super::{
+        Edge, Lane, PlaybackSession, Source, TransformParams, audio_source_of, blend_bgra, secs_to_frame,
+    };
     use std::path::PathBuf;
 
     fn asset(name: &str) -> PathBuf {
@@ -4463,5 +4469,48 @@ mod tests {
         // Mid-frame positions still floor, and negatives clamp.
         assert_eq!(secs_to_frame(10.5 / 30.0, 30.0), 10);
         assert_eq!(secs_to_frame(-0.2, 30.0), 0);
+    }
+
+    /// A paused transform nudge -- `set_transform_live` at the position the
+    /// picture already stands on -- never pays a full decoder restart: the
+    /// worker is reused (`Worker::reseek`), never replaced
+    /// (`PlaybackSession::retire`), so `restarts()` does not move. Guards the
+    /// path a card's live edits go through against a future change routing
+    /// them back through `seek`/a fresh worker, and a gap left between two
+    /// edits (a person's think-time between nudges) longer than the *old*
+    /// hardware-idle window still counts zero restarts -- a decoder worker
+    /// outliving its span is not a "restart" this counter (or a caller) sees,
+    /// whatever the hardware session inside it did.
+    #[test]
+    fn a_paused_transform_nudge_reuses_the_worker_not_a_restart() {
+        let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open the fixture");
+        s.set_gain(0.0);
+        let poll = |s: &mut PlaybackSession| -> crate::decode::Frame {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(f) = s.try_frame() {
+                    return f;
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame within 20s");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let first = poll(&mut s);
+        let before = s.restarts();
+
+        // A gap past the pre-fix 2s hardware-idle window: the whole point of
+        // widening it is that a nudge landing here still reuses the worker.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+
+        let clip = s.video_clip_at(s.now()).expect("a clip under the playhead");
+        let params = TransformParams {
+            scale: 1.2,
+            ..Default::default()
+        };
+        assert!(s.set_transform_live(clip.0, clip.1, Some(params)), "the edit took");
+        let next = poll(&mut s);
+
+        assert_eq!(before, s.restarts(), "a live transform edit must reuse the worker");
+        assert_eq!(next.index, first.index, "paused: same timeline position before and after");
     }
 }
