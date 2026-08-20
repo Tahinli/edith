@@ -491,10 +491,7 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .font(style.font)
                 .text_size(style.size)
                 .text_color(rgb(INK3()))
-                .child(
-                    "drag a row to a lane · ↵ add at playhead · double-click plays in screen · \
-                     right-click the dot to re-ink a source (rare — lives out of the way)",
-                )
+                .child("drag · ↵ add · double-click plays")
         })
 }
 
