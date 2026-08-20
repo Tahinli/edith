@@ -41,6 +41,15 @@ const RING_FULL_WAIT: Duration = Duration::from_millis(10);
 /// for the millisecond or two it lasts.
 const FLUSH_WAIT: Duration = Duration::from_millis(1);
 
+/// How long [`try_frame`](PlaybackSession::try_frame) blocks the caller
+/// waiting for B's first picture when the playhead lands in a dissolve
+/// window before B's eager-opened decoder ([`start_span`](PlaybackSession::start_span))
+/// has one ready -- a seek straight into the window, mostly. Above the 98 ms
+/// worst-case VA-API init measured for a picture open, so an eager-opened B
+/// almost never actually waits the full budget; a source B cannot decode at
+/// all pays this once per span rather than freezing the preview outright.
+const DISSOLVE_B_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// The timeline a file with no picture scaffolds: 1080p at 30 fps, H.264 --
 /// nothing was shot on it, so it is the canvas a *later* import meets rather
 /// than a description of the song. H.264 because it is the one codec that
@@ -1472,6 +1481,18 @@ impl PlaybackSession {
                         while let Ok(bf) = b.frames.try_recv() {
                             b.held = Some(bf);
                         }
+                        // The window's first tick, with B's decoder not yet
+                        // caught up: a paused or scrubbed preview gets no
+                        // later tick to correct itself on (nothing is due
+                        // while the clock is frozen -- `Player::pump`), so
+                        // this is the one chance to blend rather than show A
+                        // alone. Bounded so a source B cannot decode never
+                        // freezes the preview -- eager-opened in
+                        // `start_span`, B is normally already warm here and
+                        // this waits on nothing at all.
+                        if b.held.is_none() {
+                            b.held = b.frames.recv_timeout(DISSOLVE_B_TIMEOUT).ok();
+                        }
                         if let Some(bf) = &b.held {
                             let idx_in_window = (frame.index - d.tail_start).min(d.window - 1);
                             let t = crate::export::dissolve_weight(idx_in_window, d.window);
@@ -1675,6 +1696,18 @@ impl PlaybackSession {
                 },
             )
         });
+        // B's decoder opens now, at the start of the *span*, rather than
+        // waiting for the playhead to reach the window: the window is about a
+        // second, which is exactly the head start a decoder open (VA-API
+        // init measured 98ms worst case) needs to have a first picture ready
+        // by the time playback -- or a seek straight into the window -- asks
+        // for one. Without this a paused seek into the window met a `held`
+        // that was still `None` and nothing ever asked again
+        // (`try_frame`'s bounded wait below is the last-resort backstop for a
+        // seek that lands inside the window before this head start pays off).
+        if self.dissolve.is_some() {
+            self.open_dissolve_b();
+        }
         // Which file's frames the worker about to be opened will number its
         // pictures in: the span's own source, and real time for a gap, whose
         // black worker counts timeline frames already. Set before the open,
@@ -4328,6 +4361,67 @@ mod tests {
         assert_eq!(a1.channels, 1, "stream 1 is the mono track");
         assert_ne!(a0.channels, a1.channels, "the two streams must differ");
         assert_eq!(ad.channels, a0.channels, "open() still defaults to stream 0");
+    }
+
+    /// The bug this regression pins: a preview paused (or scrubbed) to a
+    /// frame inside a dissolve window used to show plain A forever, because
+    /// B's decoder only opened on the tick that landed in the window and
+    /// nothing polled `try_frame` again while the clock stood still
+    /// (`Player::pump` only drains while playing or a seek is owed, and one
+    /// delivered frame clears "owed"). Two clips of real fixtures, touching,
+    /// with a dissolve set on the join -- seeking into the window and taking
+    /// exactly one frame (no play, no second tick) must already show a blend:
+    /// the same position with the dissolve turned off must differ from it.
+    #[test]
+    fn a_single_paused_tick_inside_the_dissolve_window_is_already_blended() {
+        let window = 6u32;
+        let build = |transition: u32| {
+            let mut s = PlaybackSession::open(asset("test_av.mp4")).expect("open a");
+            s.set_gain(0.0);
+            s.import(&asset("test_av2.mp4")).expect("av2 matches");
+            let end = s.timeline_duration();
+            assert!(
+                s.place_stream_at(end, &asset("test_av2.mp4"), 0, None)
+                    .expect("av2, placed right after a")
+            );
+            if transition > 0 {
+                assert!(s.set_transition_out(Lane::V1, 0, transition));
+            }
+            s
+        };
+        let mut on = build(window);
+        let mut off = build(0);
+
+        let fps = on.meta().frame_rate;
+        let clip0_len = on.lane_clips(Lane::V1)[0].len();
+        assert!(clip0_len > window, "the fixture needs to outlast the window");
+        let mid_of_window = clip0_len - window / 2;
+        let t = f64::from(mid_of_window) / fps;
+
+        // One seek, then one frame -- exactly what a paused preview's single
+        // repaint asks the engine for. Polled rather than taken on the first
+        // call because the seek itself just restarted the decoder
+        // (`start_span`) and its first picture is not synchronous; once
+        // *a* frame lands this is the one tick under test.
+        let frame_at = |s: &mut PlaybackSession| -> crate::decode::Frame {
+            s.seek(t);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(f) = s.try_frame() {
+                    return f;
+                }
+                assert!(std::time::Instant::now() < deadline, "no frame within 20s of the seek");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+
+        let off_frame = frame_at(&mut off);
+        let on_frame = frame_at(&mut on);
+        assert_eq!(on_frame.index, off_frame.index, "same timeline position");
+        assert_ne!(
+            on_frame.bgra, off_frame.bgra,
+            "paused inside the window, the dissolve must already show B blended in"
+        );
     }
 
     #[test]
