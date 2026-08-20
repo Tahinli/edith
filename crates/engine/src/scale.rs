@@ -352,35 +352,85 @@ pub fn crop_rect(src_w: u32, src_h: u32, t: &TransformParams) -> Rect {
     Rect { x, y, w, h }
 }
 
-/// `dst` -- a placement [`fit_rect`] already worked out -- moved by
+/// `dst` -- a placement [`fit_rect`] already worked out, paired with the `src`
+/// rect (inside a `src_w` x `src_h` picture) it is sourced from -- moved by
 /// [`TransformParams::pos_x`]/`pos_y` (canvas fractions, about `dst`'s own
-/// centre) and resized by `scale` (about that same centre), clamped onto the
-/// canvas and chroma-grid aligned like every other rect here.
+/// centre) and resized by `scale` (about that same centre).
 ///
-/// corner-cut: a placement pushed partway off the canvas is clipped at the
-/// edge (what [`compose_i420`] already does to any rect), not wrapped or
-/// reflected -- there is no picture to draw once it is entirely off, and
-/// [`compose_i420`] already refuses that case by returning without a write.
-pub fn transformed_dst_rect(dst: Rect, t: &TransformParams, canvas_w: u32, canvas_h: u32) -> Rect {
-    if dst.is_empty() || canvas_w == 0 || canvas_h == 0 {
-        return dst;
+/// Translation and scale never distort the picture: the placed box keeps the
+/// aspect its size and `scale` give it, full stop. What moving it off-canvas
+/// does is clip -- the part of the box that falls outside `0..canvas_w` /
+/// `0..canvas_h` is dropped, and the matching fraction of `src` is trimmed
+/// off the same sides, so what remains on screen is an unscaled slice of the
+/// source, not the whole source squeezed into whatever box survived
+/// clamping. Both rects come back chroma-grid aligned like every other rect
+/// here; a placement pushed entirely off the canvas comes back as two empty
+/// rects, which is what [`compose_i420`] already treats as nothing to draw.
+pub fn transformed_dst_rect(
+    dst: Rect,
+    src: Rect,
+    src_w: u32,
+    src_h: u32,
+    t: &TransformParams,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> (Rect, Rect) {
+    let empty = Rect { x: 0, y: 0, w: 0, h: 0 };
+    if dst.is_empty() || src.is_empty() || canvas_w == 0 || canvas_h == 0 {
+        return (dst, src);
     }
     let scale = if t.scale.is_finite() && t.scale > 0.0 {
         f64::from(t.scale)
     } else {
         1.0
     };
-    let new_w = ((f64::from(dst.w) * scale).round() as i64).clamp(1, i64::from(canvas_w));
-    let new_h = ((f64::from(dst.h) * scale).round() as i64).clamp(1, i64::from(canvas_h));
+    // Bounded well above any real canvas so the src-trim ratios below cannot
+    // overflow i64, however extreme a stored scale value is.
+    let cap_w = i64::from(canvas_w.max(1)) * 1024;
+    let cap_h = i64::from(canvas_h.max(1)) * 1024;
+    let new_w = ((f64::from(dst.w) * scale).round() as i64).clamp(1, cap_w);
+    let new_h = ((f64::from(dst.h) * scale).round() as i64).clamp(1, cap_h);
     let pos_x = if t.pos_x.is_finite() { f64::from(t.pos_x) } else { 0.0 };
     let pos_y = if t.pos_y.is_finite() { f64::from(t.pos_y) } else { 0.0 };
     let cx = i64::from(dst.x) + i64::from(dst.w) / 2 + (f64::from(canvas_w) * pos_x).round() as i64;
     let cy = i64::from(dst.y) + i64::from(dst.h) / 2 + (f64::from(canvas_h) * pos_y).round() as i64;
-    let x = (cx - new_w / 2).clamp(0, i64::from(canvas_w)) as u32;
-    let y = (cy - new_h / 2).clamp(0, i64::from(canvas_h)) as u32;
-    let (x, w) = align(x, new_w as u32, canvas_w);
-    let (y, h) = align(y, new_h as u32, canvas_h);
-    Rect { x, y, w, h }
+    // The full box the transform describes, unclamped -- it may start
+    // negative or run past either edge, which is exactly what "moved off the
+    // canvas" means.
+    let bx = cx - new_w / 2;
+    let by = cy - new_h / 2;
+
+    // How much of that box, in the box's own pixels, falls outside the
+    // canvas on each side.
+    let left = (-bx).clamp(0, new_w);
+    let top = (-by).clamp(0, new_h);
+    let right = (bx + new_w - i64::from(canvas_w)).clamp(0, new_w);
+    let bottom = (by + new_h - i64::from(canvas_h)).clamp(0, new_h);
+    if left + right >= new_w || top + bottom >= new_h {
+        return (empty, empty);
+    }
+
+    let dst_x = (bx + left).clamp(0, i64::from(canvas_w)) as u32;
+    let dst_y = (by + top).clamp(0, i64::from(canvas_h)) as u32;
+    let (dst_x, dst_w) = align(dst_x, (new_w - left - right) as u32, canvas_w);
+    let (dst_y, dst_h) = align(dst_y, (new_h - top - bottom) as u32, canvas_h);
+
+    // The same fraction trimmed off `src`, on the matching side: uniform
+    // scale means the ratio of trimmed-box-pixels to source-pixels is the
+    // same on both axes as the ratio of the box's own size to `src`'s.
+    let src_left = i64::from(src.w) * left / new_w;
+    let src_right = i64::from(src.w) * right / new_w;
+    let src_top = i64::from(src.h) * top / new_h;
+    let src_bottom = i64::from(src.h) * bottom / new_h;
+    let src_x = src.x + src_left as u32;
+    let src_y = src.y + src_top as u32;
+    let (src_x, src_w_) = align(src_x, src.w.saturating_sub((src_left + src_right) as u32), src_w);
+    let (src_y, src_h_) = align(src_y, src.h.saturating_sub((src_top + src_bottom) as u32), src_h);
+
+    (
+        Rect { x: dst_x, y: dst_y, w: dst_w, h: dst_h },
+        Rect { x: src_x, y: src_y, w: src_w_, h: src_h_ },
+    )
 }
 
 /// Nearest 90-degree step `degrees` renders at: `0` (0deg), `1` (90deg
@@ -616,7 +666,9 @@ impl Composer {
     /// top of the fit policy: the source is cropped to [`crop_rect`], rotated
     /// by [`rotate_i420_90s`] to [`nearest_90_steps`] of `t.rotate`, fit to the
     /// canvas exactly as an untransformed picture is, and the fitted
-    /// placement is then moved/resized by [`transformed_dst_rect`].
+    /// placement is then moved/resized/clipped by [`transformed_dst_rect`],
+    /// which also trims the matching slice off the source rect so an
+    /// off-canvas move clips instead of squeezing.
     /// `t.is_identity()` takes the exact [`place`](Self::place) path.
     ///
     /// corner-cut: unlike `place`, this always allocates its crop and rotate
@@ -651,27 +703,41 @@ impl Composer {
         };
 
         let crop = crop_rect(src_w, src_h, t);
-        let mut buf = (Vec::new(), Vec::new(), Vec::new());
+        let mut buf1 = (Vec::new(), Vec::new(), Vec::new());
         let (cy, cu, cv) = if (crop.w, crop.h) == (src_w, src_h) {
             (y, u, v)
         } else {
-            crop_i420(&mut buf, y, u, v, src_w as usize, src_h as usize, crop);
-            (&buf.0[..], &buf.1[..], &buf.2[..])
+            crop_i420(&mut buf1, y, u, v, src_w as usize, src_h as usize, crop);
+            (&buf1.0[..], &buf1.1[..], &buf1.2[..])
         };
 
+        // No rotation is the overwhelmingly common case (a move or a scale,
+        // never a quarter turn); `rotate_i420_90s` always copies its whole
+        // picture even at zero steps, so that copy -- three full-resolution
+        // planes, every decoded frame -- is skipped here rather than paid on
+        // a transform that never rotates. This is the settle-lag fix: it is
+        // what made a plain position/scale edit visibly slower to catch up
+        // to than a colour grade, which never copies the picture at all.
         let steps = nearest_90_steps(t.rotate);
-        let (ry, ru, rv, rw, rh) = rotate_i420_90s(cy, cu, cv, crop.w, crop.h, steps);
+        let rot_buf;
+        let (ry, ru, rv, rw, rh) = if steps == 0 {
+            (cy, cu, cv, crop.w, crop.h)
+        } else {
+            rot_buf = rotate_i420_90s(cy, cu, cv, crop.w, crop.h, steps);
+            (&rot_buf.0[..], &rot_buf.1[..], &rot_buf.2[..], rot_buf.3, rot_buf.4)
+        };
 
         let (dst, src) = fit_rect(rw, rh, canvas_w, canvas_h, self.policy);
+        let (dst, src) = transformed_dst_rect(dst, src, rw, rh, t, canvas_w, canvas_h);
         let (rw_u, rh_u) = (rw as usize, rh as usize);
+        let mut buf2 = (Vec::new(), Vec::new(), Vec::new());
         let (fy, fu, fv) = if (src.w, src.h) == (rw, rh) {
-            (&ry[..], &ru[..], &rv[..])
+            (ry, ru, rv)
         } else {
-            crop_i420(&mut buf, &ry, &ru, &rv, rw_u, rh_u, src);
-            (&buf.0[..], &buf.1[..], &buf.2[..])
+            crop_i420(&mut buf2, ry, ru, rv, rw_u, rh_u, src);
+            (&buf2.0[..], &buf2.1[..], &buf2.2[..])
         };
 
-        let dst = transformed_dst_rect(dst, t, canvas_w, canvas_h);
         let (sw, sh) = (src.w as usize, src.h as usize);
         let (dw, dh) = (dst.w as usize, dst.h as usize);
         let mut scaled = (Vec::new(), Vec::new(), Vec::new());
@@ -1382,30 +1448,66 @@ mod tests {
     }
 
     /// A placement moved by `pos_x`/`pos_y` (canvas fractions about its own
-    /// centre) and resized by `scale`, both about that same centre.
+    /// centre) and resized by `scale`, both about that same centre. Neither
+    /// case here clips, so the source rect comes back untouched.
     #[test]
     fn transformed_dst_rect_at_pos_and_scale() {
         let dst = Rect { x: 0, y: 0, w: 100, h: 100 };
+        let src = Rect { x: 0, y: 0, w: 100, h: 100 };
         // Moved a quarter of the canvas to the right, untouched vertically.
         let moved = TransformParams {
             pos_x: 0.25,
             ..Default::default()
         };
         assert_eq!(
-            transformed_dst_rect(dst, &moved, 200, 200),
-            Rect { x: 50, y: 0, w: 100, h: 100 },
+            transformed_dst_rect(dst, src, 100, 100, &moved, 200, 200),
+            (Rect { x: 50, y: 0, w: 100, h: 100 }, src),
             "25% of a 200-wide canvas is 50 pixels, about the placement's own centre"
         );
-        // Doubled in place: the centre stays, the box fills the canvas.
+        // Doubled in place, box already centred on the canvas: the centre
+        // stays, the box fills the canvas, nothing clips.
+        let centred_dst = Rect { x: 50, y: 50, w: 100, h: 100 };
         let grown = TransformParams {
             scale: 2.0,
             ..Default::default()
         };
         assert_eq!(
-            transformed_dst_rect(dst, &grown, 200, 200),
-            Rect { x: 0, y: 0, w: 200, h: 200 },
+            transformed_dst_rect(centred_dst, src, 100, 100, &grown, 200, 200),
+            (Rect { x: 0, y: 0, w: 200, h: 200 }, src),
             "a 100x100 box doubled about its own centre on a 200x200 canvas fills it"
         );
+    }
+
+    /// The defect this replaces: a positive offset used to SHRINK the dst
+    /// rect (squeezing the whole source into what remained) and a negative
+    /// offset used to render pixel-identical to the identity (the clamp at 0
+    /// killed it). Real translation keeps the box's size and clips instead:
+    /// the src rect trims by the same fraction that fell off-canvas, on the
+    /// side that fell off, and the surviving box size never shrinks below
+    /// what `scale` alone gives it.
+    #[test]
+    fn transformed_dst_rect_clips_instead_of_squeezing() {
+        let dst = Rect { x: 0, y: 0, w: 100, h: 100 };
+        let src = Rect { x: 0, y: 0, w: 100, h: 100 };
+        // +30% of a 100-wide canvas: the box moves 30px right, half of it
+        // (50px) falls off the right edge -- half the source is trimmed off
+        // its right, not the whole source squeezed into 70px.
+        let pos = TransformParams { pos_x: 0.30, ..Default::default() };
+        let (d, s) = transformed_dst_rect(dst, src, 100, 100, &pos, 100, 100);
+        assert_eq!(d, Rect { x: 30, y: 0, w: 70, h: 100 }, "dst size must not shrink below what clipping removes");
+        assert_eq!(s, Rect { x: 0, y: 0, w: 70, h: 100 }, "src trims off its right, does not squeeze");
+
+        // -30%: symmetric on the left, and no longer identical to identity.
+        let neg = TransformParams { pos_x: -0.30, ..Default::default() };
+        let (d, s) = transformed_dst_rect(dst, src, 100, 100, &neg, 100, 100);
+        assert_eq!(d, Rect { x: 0, y: 0, w: 70, h: 100 });
+        assert_eq!(s, Rect { x: 30, y: 0, w: 70, h: 100 }, "src trims off its left");
+        assert_ne!((d, s), (dst, src), "a negative offset must move the picture, not no-op");
+
+        // Fully off canvas: both rects empty.
+        let gone = TransformParams { pos_x: 2.0, ..Default::default() };
+        let (d, s) = transformed_dst_rect(dst, src, 100, 100, &gone, 100, 100);
+        assert!(d.is_empty() && s.is_empty(), "wholly off-canvas has nothing to draw");
     }
 
     /// [`nearest_90_steps`] rounds to the closest quarter turn and folds a
@@ -1461,42 +1563,125 @@ mod tests {
         assert_eq!((ry, rw, rh), (y, w as u32, h as u32), "four quarter turns is the identity");
     }
 
-    /// [`Composer::place_transformed`] at compose level: a picture placed with
-    /// a `pos_x` offset lands its marked pixel shifted by exactly that many
-    /// canvas pixels, with black everywhere else.
-    #[test]
-    fn place_transformed_shifts_a_marked_pixel() {
-        let (src_w, src_h) = (64u32, 64u32);
-        let (y, u, v) = (
-            vec![200u8; (src_w * src_h) as usize],
-            vec![NEUTRAL_C; ((src_w / 2) * (src_h / 2)) as usize],
-            vec![NEUTRAL_C; ((src_w / 2) * (src_h / 2)) as usize],
-        );
-        let mut canvas = Composer::new(src_w, src_h, FitPolicy::Fit);
-        // Identity: a pass-through-shaped placement, fills the whole canvas.
-        let (iy, _, _, iw, ih) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &TransformParams::default());
-        assert_eq!((iw, ih), (src_w, src_h));
-        assert!(iy.iter().all(|&p| p == 200), "identity fills the canvas");
+    /// A 64x64 Y plane split down the middle: columns 0..32 are 200, 32..64
+    /// are 40. A vertical edge to track through a horizontal move.
+    fn vsplit_64() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y = (0..64 * 64).map(|i| if i % 64 < 32 { 200u8 } else { 40u8 }).collect();
+        (y, vec![NEUTRAL_C; 32 * 32], vec![NEUTRAL_C; 32 * 32])
+    }
 
-        // Moved a quarter of the canvas to the right: the left half is black,
-        // the right half (minus the strip pushed off the edge) is the picture.
-        let moved = TransformParams {
-            pos_x: 0.25,
-            ..Default::default()
-        };
-        let (my, _, _, mw, mh) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &moved);
-        assert_eq!((mw, mh), (src_w, src_h), "canvas size never changes");
-        let shift = (f64::from(src_w) * 0.25).round() as usize;
-        for row in 0..mh as usize {
-            let r = &my[row * mw as usize..][..mw as usize];
-            assert!(
-                r[..shift].iter().all(|&p| p == BLACK_Y),
-                "row {row}: black ahead of the shifted picture"
-            );
-            assert!(
-                r[shift..].iter().all(|&p| p == 200),
-                "row {row}: the picture fills the rest, shifted right"
-            );
+    /// Same split, but across rows: 0..32 are 200, 32..64 are 40 -- an edge
+    /// to track through a vertical move.
+    fn hsplit_64() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y = (0..64 * 64).map(|i| if i / 64 < 32 { 200u8 } else { 40u8 }).collect();
+        (y, vec![NEUTRAL_C; 32 * 32], vec![NEUTRAL_C; 32 * 32])
+    }
+
+    /// [`Composer::place_transformed`] at compose level, with the exact
+    /// defect the geometry used to have: a positive `pos_x` squeezed the
+    /// whole source into a shrunk box (content narrower, not just displaced)
+    /// and a negative one rendered pixel-identical to the identity. These
+    /// assert on the DISPLACED CONTENT (where the source's own edge lands),
+    /// not on any rect field, so a squeeze that happens to leave rect sizes
+    /// looking plausible cannot pass silently.
+    #[test]
+    fn place_transformed_displaces_content_not_just_a_rect() {
+        let (src_w, src_h) = (64u32, 64u32);
+        let (y, u, v) = vsplit_64();
+        let mut canvas = Composer::new(src_w, src_h, FitPolicy::Fit);
+
+        // Identity: the source's own edge stays at column 32, everywhere.
+        let (iy, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &TransformParams::default());
+        for row in 0..64 {
+            let r = &iy[row * 64..][..64];
+            assert!(r[..32].iter().all(|&p| p == 200) && r[32..].iter().all(|&p| p == 40), "row {row}: {r:?}");
+        }
+
+        // +25%: the box moves right by 16 and does NOT shrink -- content
+        // width stays 64 (the source's own 32/32 split), clipped to what
+        // still fits. The edge (originally at box-column 32) now sits at
+        // canvas column 16 + 32 = 48, not squeezed inward.
+        let plus = TransformParams { pos_x: 0.25, ..Default::default() };
+        let (py, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &plus);
+        for row in 0..64 {
+            let r = &py[row * 64..][..64];
+            assert!(r[..16].iter().all(|&p| p == BLACK_Y), "row {row} left of box: {r:?}");
+            assert!(r[16..48].iter().all(|&p| p == 200), "row {row} squeezed inward: {r:?}");
+            assert!(r[48..].iter().all(|&p| p == 40), "row {row} edge moved: {r:?}");
+        }
+
+        // -25%: mirror image -- this used to be pixel-identical to identity.
+        let minus = TransformParams { pos_x: -0.25, ..Default::default() };
+        let (ny, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &minus);
+        assert_ne!(ny, iy, "a negative offset must move the picture, not no-op");
+        for row in 0..64 {
+            let r = &ny[row * 64..][..64];
+            assert!(r[..16].iter().all(|&p| p == 200), "row {row}: {r:?}");
+            assert!(r[16..48].iter().all(|&p| p == 40), "row {row}: {r:?}");
+            assert!(r[48..].iter().all(|&p| p == BLACK_Y), "row {row} right of box: {r:?}");
+        }
+
+        // Wholly off-canvas: nothing to draw, all black.
+        let gone = TransformParams { pos_x: 2.0, ..Default::default() };
+        let (gy, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &gone);
+        assert!(gy.iter().all(|&p| p == BLACK_Y), "off-canvas must render background");
+    }
+
+    /// The same defect on the vertical axis: `pos_y` moves content up/down,
+    /// clipped, never squeezed.
+    #[test]
+    fn place_transformed_displaces_content_vertically() {
+        let (src_w, src_h) = (64u32, 64u32);
+        let (y, u, v) = hsplit_64();
+        let mut canvas = Composer::new(src_w, src_h, FitPolicy::Fit);
+
+        let plus = TransformParams { pos_y: 0.25, ..Default::default() };
+        let (py, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &plus);
+        for row in 0..16 {
+            assert!(py[row * 64..][..64].iter().all(|&p| p == BLACK_Y), "row {row} above the box");
+        }
+        for row in 16..48 {
+            assert!(py[row * 64..][..64].iter().all(|&p| p == 200), "row {row} squeezed: {:?}", &py[row * 64..][..4]);
+        }
+        for row in 48..64 {
+            assert!(py[row * 64..][..64].iter().all(|&p| p == 40), "row {row} edge moved");
+        }
+
+        let minus = TransformParams { pos_y: -0.25, ..Default::default() };
+        let (ny, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &minus);
+        for row in 0..16 {
+            assert!(ny[row * 64..][..64].iter().all(|&p| p == 200), "row {row}");
+        }
+        for row in 16..48 {
+            assert!(ny[row * 64..][..64].iter().all(|&p| p == 40), "row {row}");
+        }
+        for row in 48..64 {
+            assert!(ny[row * 64..][..64].iter().all(|&p| p == BLACK_Y), "row {row} below the box");
+        }
+    }
+
+    /// Position and scale together: a halved box moved right must place its
+    /// (also halved) content at the moved-and-scaled location, not squeeze
+    /// the full source into whatever survived clamping.
+    #[test]
+    fn place_transformed_displaces_content_with_scale() {
+        let (src_w, src_h) = (64u32, 64u32);
+        let (y, u, v) = vsplit_64();
+        let mut canvas = Composer::new(src_w, src_h, FitPolicy::Fit);
+        // scale 0.5, pos_x +0.25: box becomes 32x32 at canvas (32, 16),
+        // fully on-canvas. The source's column-32 edge, halved, sits at
+        // box-local column 16, i.e. canvas column 32 + 16 = 48.
+        let t = TransformParams { scale: 0.5, pos_x: 0.25, ..Default::default() };
+        let (sy, ..) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &t);
+        for row in 0..64 {
+            let r = &sy[row * 64..][..64];
+            let inside = (16..48).contains(&row);
+            let want_bg = if inside { r[0] } else { BLACK_Y };
+            assert_eq!(want_bg, BLACK_Y, "row {row} col 0 outside the box: {r:?}");
+            if inside {
+                assert!(r[40].abs_diff(200) <= 1, "row {row} col 40 should be the left half: {r:?}");
+                assert!(r[56].abs_diff(40) <= 1, "row {row} col 56 should be the right half: {r:?}");
+            }
         }
     }
 }
