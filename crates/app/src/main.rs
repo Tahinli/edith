@@ -75,6 +75,12 @@ use gpui::{
 };
 
 struct Player {
+    /// DESIGN.md §12 step 2: the stance skeleton behind `EDITH_DARKROOM`, read
+    /// once at startup ([`main`]) and never toggled at runtime -- a mid-session
+    /// flip would mean every region rebuilding under the pointer, which is not
+    /// this flag's job. [`crate::render`] branches its one `Render::render` on
+    /// it; nothing else reads it.
+    darkroom: bool,
     /// The timeline, once there is one. A run with no file opens without it and
     /// waits: the first media import or project load is what fills it, and
     /// until then every action that needs a timeline says so instead of acting.
@@ -739,6 +745,13 @@ fn main() {
     // itself. Silent on a missing or unreadable file -- the default is a whole
     // answer, and nothing of the user's is lost by it.
     ui::theme::load();
+    // DESIGN.md §1: "the room is the film's" -- darkroom mode owns the
+    // palette outright, so the saved pick above is overridden the moment the
+    // flag is read, once, before the first paint.
+    let darkroom = std::env::var("EDITH_DARKROOM").is_ok();
+    if darkroom {
+        ui::theme::set(ui::theme::PaletteId::Darkroom);
+    }
     // The subtitle style the last session picked, same silence on a missing
     // or unreadable file.
     let (sub_family, sub_text) = load_subtitle_style();
@@ -787,6 +800,7 @@ fn main() {
             |window, cx| {
                 let queue = queue.clone();
                 let player = cx.new(|cx| Player {
+                    darkroom,
                     // Nothing to wait for yet: the file named on the command
                     // line is still queued, and the repaint that carries its
                     // poster frame to the screen is asked for when it lands
