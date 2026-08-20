@@ -409,14 +409,14 @@ fn the_equalizer_graph_puts_a_band_where_a_drag_reads_it_and_fits_the_smallest_w
 
     // The card fits the smallest window and takes the room a bigger one has
     // -- it is a graph, and the width *is* the frequency resolution.
-    assert!(eq_card_w(640.) <= 640. - 24., "card too wide for 640");
-    assert!(eq_card_w(1280.) > eq_card_w(640.), "card ignores the window");
-    assert_eq!(eq_card_w(1920.), EQ_W_MAX, "card grows without end");
-    assert!(eq_card_w(320.) >= KEYS_W, "card narrower than a row of text");
+    assert!(eq_card_w(640., false) <= 640. - 24., "card too wide for 640");
+    assert!(eq_card_w(1280., false) > eq_card_w(640., false), "card ignores the window");
+    assert_eq!(eq_card_w(1920., false), EQ_W_MAX, "card grows without end");
+    assert!(eq_card_w(320., false) >= KEYS_W, "card narrower than a row of text");
     // At the smallest window the graph is still a graph: three across for
     // one down, so an octave is wide enough to put a handle in.
     assert!(
-        eq_card_w(640.) - 24. >= 3. * EQ_GRAPH_H,
+        eq_card_w(640., false) - 24. >= 3. * EQ_GRAPH_H,
         "graph too square to aim at"
     );
 
@@ -1710,10 +1710,118 @@ fn a_cards_own_help_paints_while_the_card_is_open_but_the_ui_under_it_stays_quie
     // plain `Tip`, or this whole fix is undone by construction.
     let cards_src = src_text("ui/cards.rs");
     let head_fn_at = cards_src.find("fn dark_card_head(").expect("dark_card_head");
-    let head_fn = &cards_src[head_fn_at..head_fn_at + 1200];
+    // 1200 was wide enough before this session's maximize glyph/tooltip
+    // (`.when(maximize.is_some(), ...)` + its own `OverlayTip`) grew the
+    // function ahead of the help tooltip this test is actually pinning.
+    let head_fn = &cards_src[head_fn_at..head_fn_at + 2400];
     assert!(
         head_fn.contains("OverlayTip(h.clone())"),
         "dark_card_head's own `?` tooltip no longer builds an OverlayTip -- the \
          card-head help is unreadable again while its card is open"
     );
+}
+
+/// "Maximize a card in place" changes size only, never the relative
+/// semantics a value is drawn against: `eq_x`/`eq_y` map into `0..1` of
+/// whatever box they are given, so a wider/taller EQ card is genuinely more
+/// dB/Hz resolution, not the same graph stretched. This is the layout half
+/// of that claim -- `eq_x`/`eq_y` themselves take no size argument at all
+/// (they answer in `0..1`), so there is nothing about them a maximize could
+/// have broken; what a maximize is allowed to touch is `eq_card_w`/
+/// `eq_graph_h`'s own ceiling.
+#[test]
+fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
+    // Below the old EQ_W_MAX ceiling, maximized and not agree -- there is
+    // room for both without the ceiling mattering yet.
+    assert_eq!(eq_card_w(600., false), eq_card_w(600., true));
+    // Past it, only the maximized card keeps growing: the ceiling this
+    // session's fix drops.
+    assert!(
+        eq_card_w(1920., true) > eq_card_w(1920., false),
+        "maximized EQ card no longer drops the EQ_W_MAX ceiling"
+    );
+    assert_eq!(
+        eq_graph_h(true),
+        EQ_GRAPH_MAX_H,
+        "maximized EQ graph no longer grows to EQ_GRAPH_MAX_H"
+    );
+    assert!(
+        eq_graph_h(true) > eq_graph_h(false),
+        "maximized EQ graph is not actually taller than the resting one"
+    );
+    // The mapping itself never sees "maximized" -- a bigger box is more
+    // resolution because the same 0..1 fraction now spans more pixels, not
+    // because the fraction itself moved.
+    assert_eq!(eq_x(1000.), eq_x(1000.));
+    assert_eq!(eq_y(0.), eq_y(0.));
+}
+
+/// DESIGN's "a maximized scrim covers only the bench/ledger/time-band band,
+/// never the picture": the floor a maximized card's `.top()` is pinned to
+/// must leave exactly the picture's own height above it, for any bench
+/// height a hand has dragged the seam to -- not just the untouched
+/// `BENCH_H` default. `below_picture_floor` takes the live bench height as
+/// its own second argument (the seam feature merged onto this branch), so
+/// this checks the real two-argument signature rather than a stale one-arg
+/// assumption.
+#[test]
+fn a_maximized_card_can_never_rise_above_the_picture_no_matter_the_bench_height() {
+    use crate::ui::stance::{LEDGER_H, TIME_BAND_H, below_picture_floor};
+    let viewport_h = 1080.;
+    for bench_h in [140., 200., 400.] {
+        assert_eq!(
+            below_picture_floor(viewport_h, bench_h) + TIME_BAND_H + bench_h + LEDGER_H,
+            viewport_h,
+            "below_picture_floor's floor plus the band below the picture no \
+             longer adds back up to the window -- a maximized scrim could rise \
+             into the picture"
+        );
+    }
+    // A bench dragged tall enough to eat the whole window still clamps at
+    // zero rather than going negative and reporting free room that is not
+    // there.
+    assert_eq!(below_picture_floor(300., 5000.), 0.);
+}
+
+/// The maximize flag's own small round trip (`dock_stance.rs`'s own doc
+/// comment: "the same small-file round trip as the dock tab pick", "a room
+/// reopens exactly as left"): saved, read back, and silently defaulted to
+/// `false` on a corrupt or absent file -- never a startup crash or notice
+/// over the user's own work, the same rule `load_subtitle_style`'s own test
+/// (`tests/media.rs`) already pins for its sibling config file. `XDG_CONFIG_HOME`
+/// is the existing scratch-path override every config-round-trip test in
+/// this crate already uses; there is no maximize-specific override to
+/// invent.
+#[test]
+fn a_maximized_card_reopens_exactly_as_left_across_a_restart() {
+    let dir = std::env::temp_dir().join(format!(
+        "edith-test-maximized-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Scoped to this test alone, the same reasoning `tests/media.rs`'s own
+    // XDG_CONFIG_HOME mutation gives: nothing else reads this file.
+    unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+
+    // Nothing written yet: the default (not maximized), not a crash on a
+    // missing file.
+    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+
+    crate::ui::dock_stance::save_maximized(true);
+    assert_eq!(crate::ui::dock_stance::load_maximized(), true);
+
+    crate::ui::dock_stance::save_maximized(false);
+    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+
+    // A file from a future/corrupt version leaves the default in force
+    // rather than failing the room that opens over it.
+    std::fs::write(crate::ui::dock_stance::maximized_config_path(), "not a bool\n").unwrap();
+    assert_eq!(crate::ui::dock_stance::load_maximized(), false);
+
+    unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    std::fs::remove_dir_all(&dir).ok();
 }

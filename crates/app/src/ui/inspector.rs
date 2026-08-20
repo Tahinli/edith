@@ -80,12 +80,12 @@ impl Player {
                 )
             })
             .children(self.eq_card(room, cx))
-            .children(self.color_card(cx))
-            .children(self.transform_card(cx))
-            .children(self.speed_card(cx))
-            .children(self.silence_card(cx))
-            .children(self.mix_card(cx))
-            .children(self.subtitle_style_card(cx))
+            .children(self.color_card(room, cx))
+            .children(self.transform_card(room, cx))
+            .children(self.speed_card(room, cx))
+            .children(self.silence_card(room, cx))
+            .children(self.mix_card(room, cx))
+            .children(self.subtitle_style_card(room, cx))
     }
 
     /// What is marked, and the settings that belong to *it*. A dump of every
