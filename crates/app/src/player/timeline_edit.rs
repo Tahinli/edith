@@ -1651,6 +1651,13 @@ impl Player {
         }
         if let Some(split) = self.split_drag.take() {
             self.drag_split(split, event.position, window, cx);
+            // The darkroom's own two seams outlive the window: written once,
+            // on the release that ends the gesture, the same small-file
+            // round trip `ui::dock_stance`'s tab pick uses -- not on every
+            // sample in between, which `drag_move` above never owed a write.
+            if matches!(split, Split::Dock | Split::Bench) {
+                save_stance_splits(&self.splits);
+            }
             return;
         }
         if std::mem::take(&mut self.eq_dragging) {

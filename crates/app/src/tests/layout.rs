@@ -1736,6 +1736,61 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     );
 }
 
+/// The darkroom's own two seams (`Split::Dock`, `Split::Bench`): a hand may
+/// not drag either past its floor or its ceiling, the same promise
+/// [`a_dragged_divider_stops_before_either_panel_disappears`] makes for the
+/// legacy three.
+#[test]
+fn the_darkroom_seams_stop_before_either_side_disappears() {
+    use crate::ui::theme::INSPECTOR_MIN_W;
+    use crate::{
+        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, split_drag_size, split_size,
+    };
+    use gpui::{point, px, size};
+
+    let window = size(px(1280.), px(720.));
+    // Untouched, each answers its own stance default.
+    assert_eq!(
+        split_size(Split::Dock, None, 2, window, false),
+        crate::ui::stance::DOCK_W
+    );
+    assert_eq!(
+        split_size(Split::Bench, None, 2, window, false),
+        crate::ui::stance::BENCH_H
+    );
+    // Dragged, it is what the hand asked for...
+    assert_eq!(split_size(Split::Dock, Some(400.), 2, window, false), 400.);
+    assert_eq!(split_size(Split::Bench, Some(300.), 2, window, false), 300.);
+    // ...and never past the floor...
+    assert_eq!(
+        split_size(Split::Dock, Some(0.), 2, window, false),
+        INSPECTOR_MIN_W
+    );
+    assert_eq!(
+        split_size(Split::Bench, Some(0.), 2, window, false),
+        BENCH_MIN_H
+    );
+    // ...nor the ceiling.
+    assert_eq!(
+        split_size(Split::Dock, Some(9000.), 2, window, false),
+        1280. * SIDE_MAX_FRAC
+    );
+    assert_eq!(
+        split_size(Split::Bench, Some(9000.), 2, window, false),
+        720. * TIMELINE_MAX_SHARE
+    );
+    // The pointer turned into a size, half a strip off for the same reason
+    // the legacy seams read it that way.
+    assert_eq!(
+        split_drag_size(Split::Dock, point(px(1000.), px(400.)), window),
+        280. - SPLIT_W / 2.
+    );
+    assert_eq!(
+        split_drag_size(Split::Bench, point(px(300.), px(500.)), window),
+        220. - crate::ui::stance::LEDGER_H - SPLIT_W / 2.
+    );
+}
+
 /// Every seam in the main layout has a handle on it, and every region draws
 /// itself at the size that handle sets: a region still measuring itself off the
 /// window's own share is a panel whose divider moves nothing.
@@ -1745,6 +1800,13 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
     for split in ["Split::Library", "Split::Inspector", "Split::Timeline"] {
         assert!(
             render.contains(&format!("divider({split}")),
+            "{split} has no divider to drag"
+        );
+    }
+    let stance = src_text("ui/stance.rs");
+    for split in ["Split::Dock", "Split::Bench"] {
+        assert!(
+            stance.contains(&format!("divider({split}")),
             "{split} has no divider to drag"
         );
     }

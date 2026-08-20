@@ -670,7 +670,7 @@ impl Player {
         // footprint (`room`), not the whole window, so a menu taller than
         // the footprint scrolls inside its own plate instead of walking its
         // clamped top edge back up over the picture ([`menu_floor`]).
-        let (at, room) = menu_floor(menu.at, viewport, self.darkroom);
+        let (at, room) = menu_floor(menu.at, viewport, self.darkroom, self.split_px(Split::Bench, viewport));
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source
@@ -832,7 +832,7 @@ impl Player {
             .collect();
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
-        let (at, room) = menu_floor(picker.at, viewport, darkroom);
+        let (at, room) = menu_floor(picker.at, viewport, darkroom, self.split_px(Split::Bench, viewport));
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         Some(
