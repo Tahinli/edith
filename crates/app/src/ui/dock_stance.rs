@@ -116,53 +116,15 @@ fn ghost_verb(
         )
 }
 
-/// A row in the IMPORT section: a ghost verb that has no [`ActionId`] of its
-/// own to read a chord off. `Add files`/`Paste path` have no keymap binding
-/// -- nearly every ctrl+letter in this editor's table is already spoken for
-/// (`git grep '", true)'` in `keymap.rs` turns up every letter but a handful),
-/// and giving either one a fresh global chord is a keymap-wide decision --
-/// which strokes move, which don't -- outside one dock diff. The verb still
-/// works by click; the chord badge is honest about there being none rather
-/// than inventing one MOCK-SPEC's `^o`/`^v` never actually bind to.
-///
-/// corner-cut: no chord. Ceiling: a keymap diff that clears two ctrl slots
-/// (or two bare ones -- neither Import nor "paste a path" has ever had a key
-/// in this editor) and threads `ActionId`s for both through `oracle::enable`
-/// and `Player::act`, at which point this calls [`ghost_verb`] instead.
-fn import_verb(
-    id: &'static str,
-    label: &'static str,
-    hint: &'static str,
-    on: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_between()
-        .h(px(CONTROL_H))
-        .px(px(8.))
-        .rounded(px(3.))
-        .text_color(rgb(INK2()))
-        .tooltip(move |_, cx| cx.new(|_| Tip(hint.into())).into())
-        .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
-        .when(on, |d| {
-            d.cursor_pointer()
-                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
-                .on_click(on_click)
-        })
-        .child(label)
-        .child(div().flex_none().text_size(px(9.5)).text_color(rgb(INK3())).child("—"))
-}
-
 /// One tab of the Src/Clip pair (MOCK-SPEC "Dock": no pill, no fill, no
 /// rounded button -- a 1px `ink1` top rule and `ink1` text mark the showing
-/// tab; the resting one is `ink3`). `chord` is decorative, not bound: tab
-/// switching has no gesture named in the charter's four, so it is drawn but
-/// not wired to a global key, exactly `import_verb`'s reasoning above.
-fn dock_tab(id: &'static str, label: &'static str, chord: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
+/// tab; the resting one is `ink3`). The mock's own trailing letters (`L`,
+/// `I`) are dropped rather than bound: both bare keys are already this
+/// editor's own busiest edit strokes (`l` lifts a clip, `i` marks in), and
+/// DESIGN §11's frequency check puts a lift and a mark far ahead of a tab
+/// switch -- wearing a chord this room does not answer to would be exactly
+/// the lie DESIGN §4 forbids, so the letters go instead.
+fn dock_tab(id: &'static str, label: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id(id)
         .flex_1()
@@ -187,7 +149,6 @@ fn dock_tab(id: &'static str, label: &'static str, chord: &'static str, active: 
                 .text_color(rgb(if active { INK1() } else { INK3() }))
                 .child(label),
         )
-        .child(div().text_color(rgb(INK3())).child(chord))
 }
 
 /// A 9px uppercase Archivo section head, `ink3` (DESIGN §3).
@@ -463,18 +424,22 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .flex_none()
                 .flex()
                 .flex_col()
-                .child(import_verb(
+                .child(ghost_verb(
                     "dock-import-files",
                     "Add files",
+                    ActionId::AddFiles,
+                    false,
                     "adds a file to this list — or drop one on the window",
-                    player.exporting().is_none(),
+                    player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
                 ))
-                .child(import_verb(
+                .child(ghost_verb(
                     "dock-paste-path",
                     "Paste path",
+                    ActionId::PasteFilePath,
+                    false,
                     "imports the file named on the clipboard",
-                    player.exporting().is_none(),
+                    player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
                 )),
         )
@@ -610,8 +575,8 @@ pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Con
                 .px(px(8.))
                 .border_b_1()
                 .border_color(rgb(DARK_HAIRLINE()))
-                .child(dock_tab("dock-tab-src", "SOURCES", "L", src_active, cx))
-                .child(dock_tab("dock-tab-clip", "CLIP", "I", !src_active, cx)),
+                .child(dock_tab("dock-tab-src", "SOURCES", src_active, cx))
+                .child(dock_tab("dock-tab-clip", "CLIP", !src_active, cx)),
         )
         .child(match src_active {
             true => sources_tab(player, cx).into_any_element(),

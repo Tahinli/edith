@@ -132,6 +132,11 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
             // (`Player::pending_settings`), so refusing them before the first
             // file was refusing them exactly when they mean the most.
             | ActionId::Resolution
+            // The dock's import pair: how a first file gets in at all, so
+            // both are live with no timeline open, exactly like the two
+            // stand-in switches above.
+            | ActionId::AddFiles
+            | ActionId::PasteFilePath
     ) {
         return match ctx.exporting {
             true => Enable::No("an export is running"),

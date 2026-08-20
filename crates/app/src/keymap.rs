@@ -143,6 +143,13 @@ actions! {
     /// track to that list places nothing -- the pair above it is what makes the
     /// timeline row a caption can land on.
     ImportSubtitles,
+    /// The dock's own `Add files` verb (MOCK-SPEC "Dock" IMPORT section):
+    /// the file chooser, same door [`crate::Player::pick_and_import`] and a
+    /// drop on the window already use.
+    AddFiles,
+    /// The dock's `Paste path` verb: imports whatever file the OS clipboard
+    /// names ([`crate::Player::paste_file_path`]).
+    PasteFilePath,
     ToggleMute,
     VolumeUp,
     VolumeDown,
@@ -259,6 +266,8 @@ impl ActionId {
             ActionId::AddSubtitleLane => "Add a subtitle track",
             ActionId::RemoveSubtitleLane => "Remove the last subtitle track (it must be empty)",
             ActionId::ImportSubtitles => "Add subtitles from a file…",
+            ActionId::AddFiles => "Add files…",
+            ActionId::PasteFilePath => "Paste path (import the file it names)",
             ActionId::ToggleMute => "Mute / Unmute",
             ActionId::VolumeUp => "Volume up",
             ActionId::VolumeDown => "Volume down",
@@ -335,6 +344,8 @@ impl ActionId {
             ActionId::AddSubtitleLane => "add-subtitle-lane",
             ActionId::RemoveSubtitleLane => "remove-subtitle-lane",
             ActionId::ImportSubtitles => "import-subtitles",
+            ActionId::AddFiles => "add-files",
+            ActionId::PasteFilePath => "paste-file-path",
             ActionId::ToggleMute => "toggle-mute",
             ActionId::VolumeUp => "volume-up",
             ActionId::VolumeDown => "volume-down",
@@ -479,7 +490,11 @@ impl ActionId {
             // It writes a file like the three above it, and touches no edit
             // list -- what an export's own allow-list already means it stays
             // out of, not what puts it in this heading.
-            | ActionId::Screenshot => Category::File,
+            | ActionId::Screenshot
+            // The dock's import pair brings a file *in*, the same heading a
+            // file going *out* (Export, Save) already sits under.
+            | ActionId::AddFiles
+            | ActionId::PasteFilePath => Category::File,
         }
     }
 }
@@ -1066,6 +1081,18 @@ impl Keymap {
                 // track to the timeline, so it is not the bare "s": ctrl+i, the
                 // i of import, free and next to nothing that deletes.
                 b(ActionId::ImportSubtitles, "i", true),
+                // The dock's own import pair (MOCK-SPEC "Dock" IMPORT
+                // section). Add files takes the chord the mock draws, ^o
+                // (freed above): it is the burst-use command an editor
+                // reaches for constantly, where the setting it displaces is
+                // thrown once a project. Paste path stays off ^v -- that
+                // chord is the timeline's own Paste, asked for far more
+                // often while cutting than a clipboard path is pasted while
+                // importing -- and takes ctrl+l instead, the browser's own
+                // "go to this location" chord, which is what pasting a path
+                // to jump straight to a file already is.
+                b(ActionId::AddFiles, "o", true),
+                b(ActionId::PasteFilePath, "l", true),
                 b(ActionId::ToggleMute, "m", false),
                 // The unshifted pair, which is what gpui reports for those two
                 // keys ("=" and "-", platform.rs:862): the volume keys every
@@ -1123,11 +1150,13 @@ impl Keymap {
                 // thrown once for a whole session rather than one wanted under
                 // a hand -- the theme takes ctrl+h for that reason.
                 b(ActionId::ToggleProxies, "p", true),
-                // Making them takes the key next to it, ctrl+o: the pair is one
-                // subject and the two chords are under the same finger, and
-                // every letter of the word itself is spoken for ("a" adds an
-                // audio lane, ctrl+a selects everything).
-                b(ActionId::ToggleAutoProxies, "o", true),
+                // ctrl+o moved to Add files (below, with `ImportSubtitles` --
+                // display order follows [`ActionId::ALL`]) per DESIGN §11's
+                // frequency check: a burst-use import command over a
+                // once-a-project setting. The auto-proxy switch takes "m"
+                // instead, free and still a stand-in word ("make" -- what
+                // the switch decides is whether one gets made on import).
+                b(ActionId::ToggleAutoProxies, "m", true),
                 // The theme takes ctrl+h -- the h of the word, since "t" is the
                 // subtitles and ctrl+t takes one off -- and a ctrl chord because
                 // it is a preference set once, not a stroke wanted under a hand
@@ -1420,7 +1449,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 71);
+        assert_eq!(k.entries().len(), 73);
         // The cut odometer: bare walks one, `<`/`>` (what shift+,/shift+.
         // actually type) strides ten.
         assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
@@ -1435,7 +1464,9 @@ mod tests {
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
-        assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
+        assert_eq!(k.lookup("m", true), Some(ActionId::ToggleAutoProxies));
+        assert_eq!(k.lookup("o", true), Some(ActionId::AddFiles));
+        assert_eq!(k.lookup("l", true), Some(ActionId::PasteFilePath));
         assert_eq!(k.lookup("?", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
