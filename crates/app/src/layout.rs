@@ -396,6 +396,25 @@ pub(crate) enum Split {
     Bench,
 }
 
+impl Split {
+    /// The two persisted seams -- library/inspector/timeline stay
+    /// unpersisted, out of this diff's scope, same as before it. Read by
+    /// [`load_stance_splits`] and [`save_stance_splits`] together so the
+    /// two can never learn a different set of keys from each other, the
+    /// gap a sixth region would otherwise fall through silently.
+    const PERSISTED: [Split; 2] = [Split::Dock, Split::Bench];
+
+    fn key(self) -> &'static str {
+        match self {
+            Split::Library => "library",
+            Split::Inspector => "inspector",
+            Split::Timeline => "timeline",
+            Split::Dock => "dock",
+            Split::Bench => "bench",
+        }
+    }
+}
+
 /// How wide a divider is drawn *and* hit. Wider than the 1 px stroke it stands
 /// in for: a seam nobody can put a pointer on is a seam nobody can drag, which
 /// is why every editor that ships this draws a strip rather than the hairline
@@ -413,10 +432,11 @@ pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
 /// timeline is asking on purpose, and the picture still keeps most of a third.
 pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
 
-/// The least the darkroom's bench may be dragged to: a section head and one
-/// [`LANE_H`] row -- [`bench_stance::render`]'s own floor, read here rather
-/// than duplicated so the seam and the region it drags never disagree.
-pub(crate) const BENCH_MIN_H: f32 = 20. + LANE_H;
+/// The least the darkroom's bench may be dragged to: driven and measured
+/// against a real project -- below this the V1 lane's own chip clips and
+/// the A1 lane drops off the bench entirely, which a floor exists to make
+/// unreachable.
+pub(crate) const BENCH_MIN_H: f32 = 80.;
 
 /// What a hand has done to the three seams: the size it dragged each panel to,
 /// or `None` where nobody has touched one and the window's own share still
@@ -464,32 +484,40 @@ pub(crate) fn stance_splits_config_path() -> std::path::PathBuf {
 }
 
 pub(crate) fn load_stance_splits() -> Splits {
+    load_stance_splits_from(&stance_splits_config_path())
+}
+
+/// One `split=pixels` line per touched seam, read from `path` -- factored out
+/// of [`load_stance_splits`] so a test can round-trip a scratch file instead
+/// of the real config.
+pub(crate) fn load_stance_splits_from(path: &std::path::Path) -> Splits {
     let mut splits = Splits::default();
-    if let Ok(text) = std::fs::read_to_string(stance_splits_config_path()) {
+    if let Ok(text) = std::fs::read_to_string(path) {
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             let Ok(px) = value.trim().parse::<f32>() else { continue };
-            match key {
-                "dock" => splits.dock = Some(px),
-                "bench" => splits.bench = Some(px),
-                _ => {}
-            }
+            let Some(split) = Split::PERSISTED.into_iter().find(|s| s.key() == key) else {
+                continue;
+            };
+            splits.set(split, px);
         }
     }
     splits
 }
 
-/// Writes the two sizes a hand has actually dragged -- the legacy three stay
+/// Writes the sizes a hand has actually dragged -- the legacy three stay
 /// unpersisted, as they already were before this diff (out of its scope).
+/// Walks [`Split::PERSISTED`] rather than a hand-written `if let` per field,
+/// so a region added there needs no second, separately-maintained list here.
 pub(crate) fn save_stance_splits(splits: &Splits) {
-    let mut text = String::new();
-    if let Some(d) = splits.dock {
-        text += &format!("dock={d}\n");
-    }
-    if let Some(b) = splits.bench {
-        text += &format!("bench={b}\n");
-    }
-    let path = stance_splits_config_path();
+    save_stance_splits_to(splits, &stance_splits_config_path());
+}
+
+pub(crate) fn save_stance_splits_to(splits: &Splits, path: &std::path::Path) {
+    let text: String = Split::PERSISTED
+        .into_iter()
+        .filter_map(|split| splits.get(split).map(|px| format!("{}={px}\n", split.key())))
+        .collect();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -515,11 +543,19 @@ pub(crate) fn split_bounds(
         // legacy inspector's, so it takes the legacy inspector's own floor
         // and ceiling rather than a second pair that would only ever agree.
         Split::Dock => (INSPECTOR_MIN_W, w * SIDE_MAX_FRAC),
-        // The bench is the darkroom's own timeline: [`Split::Timeline`]'s
-        // ceiling share, and a floor tall enough for a section head and one
-        // lane row -- `bench_stance::render` draws exactly that pair, and
-        // nothing shorter leaves the lane a whole row.
-        Split::Bench => (BENCH_MIN_H, h * TIMELINE_MAX_SHARE),
+        // The bench is the darkroom's own timeline, but its ceiling is not
+        // [`Split::Timeline`]'s window-share one: a bench that swallows
+        // `TIMELINE_MAX_SHARE` of a 720p window leaves the screen and its
+        // scale plate only 100px, which is not a picture any more. The
+        // ceiling instead leaves the screen and time band their own fixed
+        // 160px -- room for the scale plate, the picture and a sliver of
+        // letterbox -- and `BENCH_MIN_H` still wins the clamp on anything
+        // shorter than that.
+        Split::Bench => (
+            BENCH_MIN_H,
+            (h - crate::ui::stance::TIME_BAND_H - crate::ui::stance::LEDGER_H - 160.)
+                .max(BENCH_MIN_H),
+        ),
         // One whole lane under the chrome, the scrollbar strip's row included
         // while there is one to draw ([`timeline_fixed_h`]): a timeline
         // shorter than that is a ruler with nothing beneath it. A second
