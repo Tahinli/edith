@@ -510,7 +510,10 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
     let none_open = player.eq_open.is_none()
         && player.color_open.is_none()
         && player.transform_open.is_none()
-        && player.speed_open.is_none();
+        && player.speed_open.is_none()
+        && player.silence_open.is_none()
+        && !player.mix_open
+        && !player.subtitle_style_open;
     div()
         .id("dock-clip")
         .flex_1()
@@ -561,6 +564,32 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
                     "the bands this clip's sound is filtered through",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_eq(cx)),
+                ))
+                // Silence and Mix: two more verbs over param rows, GAP 2's
+                // fix for "the card had a key but no way in" -- the same
+                // ghost-verb-over-inline-card anatomy the four above already
+                // use, not a new pattern. Subtitle style is *not* here: its
+                // natural home is beside the subtitle lane it edits
+                // (`bench_stance.rs`, another builder's file this session);
+                // it stays reachable by its chord until that lane grows a
+                // header to hang a verb on.
+                .child(ghost_verb(
+                    "dock-verb-silence",
+                    "Silence",
+                    ActionId::Silence,
+                    player.silence_open.is_some(),
+                    "scans for quiet stretches to cut or speed up",
+                    player,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.open_silence(cx)),
+                ))
+                .child(ghost_verb(
+                    "dock-verb-mix",
+                    "Mix",
+                    ActionId::Mix,
+                    player.mix_open,
+                    "track volumes and the limiter",
+                    player,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
                 )),
         )
         .child(
@@ -574,6 +603,15 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
                 .children(player.color_card(cx))
                 .children(player.transform_card(cx))
                 .children(player.speed_card(cx))
+                .children(player.silence_card(cx))
+                .children(player.mix_card(cx))
+                // Subtitle style has no verb row of its own here (see the
+                // comment above the ghost verbs) but its card still has to
+                // be mounted somewhere in the darkroom or its chord (`y`)
+                // opens an invisible modal (GAP 2) -- this is that mount,
+                // painted in the Clip tab like the six cards beside it until
+                // the subtitle lane grows the header that is its real home.
+                .children(player.subtitle_style_card(cx))
                 // A plate, not bare space: DESIGN §11's "states" checklist --
                 // nothing picked reads as a hint, not as a hole in the panel.
                 .when(none_open, |d| {

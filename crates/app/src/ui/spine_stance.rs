@@ -35,11 +35,18 @@ fn group_head(label: &str) -> impl IntoElement {
 /// §4): borderless, hover is one fill step, active is `ink1` + fill, and a
 /// refused verb greys with its reason on hover rather than disappearing
 /// (DESIGN §8) -- the same oracle door `dock_stance::ghost_verb` opens.
+/// `quiet` demotes a row a whole ink step (DESIGN §2's ink-demotion rule,
+/// applied per this task's charter to the once-a-session/once-a-project
+/// acts -- theme, proxies, screenshot, fullscreen -- rather than to a
+/// re-inking gesture): glyph reads `ink3` instead of `ink2`, its chord
+/// `ink4` instead of `ink3`, so the ROOM group sits visibly quieter than
+/// the burst-use groups above it without a second widget shape.
 fn glyph(
     id: &'static str,
     glyph: &'static str,
     action: ActionId,
     active: bool,
+    quiet: bool,
     player: &Player,
     cx: &mut Context<Player>,
 ) -> impl IntoElement + use<> {
@@ -82,7 +89,13 @@ fn glyph(
                 // FAULT 1: the glyph is the loudest thing in its row -- BOLD,
                 // not the MEDIUM weight the chord beneath it also wears.
                 .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::BOLD))
-                .text_color(rgb(if active { INK1() } else { INK2() }))
+                .text_color(rgb(if active {
+                    INK1()
+                } else if quiet {
+                    INK3()
+                } else {
+                    INK2()
+                }))
                 .child(glyph),
         )
         .child(
@@ -92,7 +105,7 @@ fn glyph(
                     type_scale::CHORD_METADATA_MIN_PX,
                     gpui::FontWeight::MEDIUM,
                 ))
-                .text_color(rgb(INK3()))
+                .text_color(rgb(if quiet { INK4() } else { INK3() }))
                 .child(compact),
         )
 }
@@ -209,13 +222,13 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .gap(px(1.))
         .overflow_y_scroll()
         .child(group_head("edit"))
-        .child(glyph("spine-split", "||", ActionId::Cut, false, player, cx))
-        .child(glyph("spine-delete", "⊂⊃", ActionId::Delete, false, player, cx))
-        .child(glyph("spine-undo", "↺", ActionId::Undo, false, player, cx))
+        .child(glyph("spine-split", "||", ActionId::Cut, false, false, player, cx))
+        .child(glyph("spine-delete", "⊂⊃", ActionId::Delete, false, false, player, cx))
+        .child(glyph("spine-undo", "↺", ActionId::Undo, false, false, player, cx))
         .child(group_head("cut"))
         .child(pair(
-            glyph("spine-cut-prev", "‹", ActionId::WalkCutPrev, false, player, cx),
-            glyph("spine-cut-next", "›", ActionId::WalkCutNext, false, player, cx),
+            glyph("spine-cut-prev", "‹", ActionId::WalkCutPrev, false, false, player, cx),
+            glyph("spine-cut-next", "›", ActionId::WalkCutNext, false, false, player, cx),
         ))
         .child(trim_control(player.loop_trim.is_some(), player, cx))
         .child(glyph(
@@ -223,6 +236,21 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             "↻",
             ActionId::LoopTrim,
             player.loop_trim.is_some(),
+            false,
+            player,
+            cx,
+        ))
+        // ToggleSnap (homeless per this task's audit): editing-adjacent --
+        // it decides where a drag lands (keymap.rs's own category puts it
+        // under Editing, not View) -- so it earns the CUT group beside the
+        // trim/loop-trim it changes the feel of, not the quiet ROOM cluster
+        // below. Active fill mirrors loop-trim's own on/off convention.
+        .child(glyph(
+            "spine-toggle-snap",
+            "Sn",
+            ActionId::ToggleSnap,
+            player.snap,
+            false,
             player,
             cx,
         ))
@@ -236,12 +264,53 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         // less than walking/trimming cuts above it.
         .child(group_head("view"))
         .child(pair(
-            glyph("spine-zoom-out", "−", ActionId::ZoomOut, false, player, cx),
-            glyph("spine-zoom-in", "+", ActionId::ZoomIn, false, player, cx),
+            glyph("spine-zoom-out", "−", ActionId::ZoomOut, false, false, player, cx),
+            glyph("spine-zoom-in", "+", ActionId::ZoomIn, false, false, player, cx),
         ))
-        .child(glyph("spine-zoom-fit", "⊡", ActionId::ZoomFit, false, player, cx))
+        .child(glyph("spine-zoom-fit", "⊡", ActionId::ZoomFit, false, false, player, cx))
         .child(group_head("track"))
-        .child(glyph("spine-add-video", "+V", ActionId::AddVideoLane, false, player, cx))
-        .child(glyph("spine-add-audio", "+A", ActionId::AddAudioLane, false, player, cx))
+        .child(glyph("spine-add-video", "+V", ActionId::AddVideoLane, false, false, player, cx))
+        .child(glyph("spine-add-audio", "+A", ActionId::AddAudioLane, false, false, player, cx))
+        // The subtitle trio (homeless per this task's audit): AddSubtitleLane
+        // joins +V/+A on the same "+letter" grammar per this task's own
+        // instruction ("+S joins +V/+A in TRACK"); remove/import are "the
+        // subtitle work" the instruction says to place them beside, so they
+        // share the row underneath rather than each eating a full row (the
+        // same space-saving `pair` the walk-cuts and zoom in/out already
+        // use). ToggleSubtitles (whether the cues draw over the picture at
+        // all) is the fourth subtitle-lane command with no home anywhere in
+        // the darkroom -- filed here too, "CC" being the glyph every player
+        // already uses for exactly this toggle, rather than in the quiet
+        // ROOM cluster below: cue visibility is judged shot to shot, closer
+        // in frequency to a view toggle used often than to a once-a-session
+        // preference.
+        .child(glyph("spine-add-subtitle", "+S", ActionId::AddSubtitleLane, false, false, player, cx))
+        .child(pair(
+            glyph("spine-remove-subtitle", "−S", ActionId::RemoveSubtitleLane, false, false, player, cx),
+            glyph("spine-import-subtitles", "↓S", ActionId::ImportSubtitles, false, false, player, cx),
+        ))
+        .child(glyph("spine-toggle-subtitles", "CC", ActionId::ToggleSubtitles, player.subs_on, false, player, cx))
+        // ROOM: the once-a-session/once-a-project acts this task's charter
+        // names explicitly (theme, proxies, screenshot, fullscreen) -- ink-
+        // demoted (`quiet: true`) and paired two-to-a-row to keep the group
+        // cheap, the same "rare acts live out of the way" pattern DESIGN §2
+        // names for re-inking, applied here to the spine's own bottom
+        // instead of a right-click menu (these four are toggled/fired by a
+        // click, not by picking a source dot, so a context menu is not
+        // their shape). Left off this list: Save, which sits beside Export
+        // in the time band instead (see timeband_stance.rs) because the
+        // ledger already gives the saved/unsaved state a home there, and
+        // keymap.rs's own `Category::File` files Save beside Export and
+        // Screenshot on the strength of what each one writes.
+        .child(group_head("room"))
+        .child(pair(
+            glyph("spine-theme", "H", ActionId::Theme, false, true, player, cx),
+            glyph("spine-proxies", "P", ActionId::ToggleProxies, player.proxies_on, true, player, cx),
+        ))
+        .child(pair(
+            glyph("spine-auto-proxies", "AP", ActionId::ToggleAutoProxies, player.auto_proxies_on, true, player, cx),
+            glyph("spine-fullscreen", "FS", ActionId::Fullscreen, false, true, player, cx),
+        ))
+        .child(glyph("spine-screenshot", "Sh", ActionId::Screenshot, false, true, player, cx))
         .child(div().flex_1())
 }

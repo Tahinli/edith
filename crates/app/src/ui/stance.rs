@@ -600,6 +600,18 @@ pub(crate) fn render(
                 cx.notify();
                 return;
             }
+            // The param cards' own key branches (arrows nudge the focused
+            // slider, digits pick an EQ band, `r` resets, card verbs) --
+            // `Player::param_card_key` (`player/cards.rs`), the same
+            // function `render.rs`'s legacy handler now calls too, so this
+            // is not a second copy of that logic (DESIGN §6: "drag while
+            // playing... `r` resets"). Asked before the generic modal guard
+            // below so a card open in the darkroom is not just a key-eating
+            // black box the way the old uniform guard made it.
+            if this.param_card_key(key, event.keystroke.modifiers.shift, cx) {
+                cx.notify();
+                return;
+            }
             // Same modal guard the legacy handler's rebinding/keys_open/
             // export_open/exporting/colour/transform/speed/EQ/silence/mix/
             // subtitle-style/menu chain (`render.rs`) amounts to, read as

@@ -233,6 +233,18 @@ fn clip_box(
                 this.pick((lane, idx), event.modifiers.control, cx);
             }),
         )
+        // The right button selects exactly as the left one does -- the menu
+        // acts on the clip it names -- then hangs the clip menu at the
+        // pointer (DESIGN §9's "verbs of the thing under the cursor"). Same
+        // call and same surface the legacy timeline's clip box opens
+        // (`ui/timeline.rs`'s `Player::open_menu`; the card itself is
+        // `context_card`, already mounted at `stance.rs:695`).
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.open_menu(lane, idx, event.position, cx);
+            }),
+        )
         // Dragged, it moves: to the frame and the lane it is let go over
         // (`Player::move_clip`, `ClipDrag`) -- the same payload and the same
         // ghost tooltip `ui/timeline.rs`'s own clip box drags.
@@ -262,6 +274,15 @@ fn clip_box(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 this.start_trim(lane, idx, edge, event.modifiers.control, cx);
+                            }),
+                        )
+                        // Occluded, so the box's own right-button listener
+                        // never fires here: the same menu, opened by the same
+                        // call, exactly as the legacy clip's edge strip does.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.open_menu(lane, idx, event.position, cx);
                             }),
                         );
                     zone = match edge {
@@ -385,6 +406,129 @@ fn clip_box(
         )
 }
 
+/// A placed caption's box, on a subtitle lane: [`clip_box`]'s twin, minus the
+/// thumbnail/waveform trace a caption has none of (DESIGN §6 -- "the subtitle
+/// cue edge IS a cut", so the same selection ring, drag, edge-trim and
+/// right-click menu a clip gets apply here too). Reused rather than
+/// reimplemented: `Player::trimmed_sub`/`SubDrag`/`sub_pick_name`/`cue_box`,
+/// the same plumbing `ui/timeline.rs`'s own caption box already drives.
+fn sub_box(
+    player: &Player,
+    lane: Lane,
+    idx: usize,
+    sub: &SubClip,
+    scale: Scale,
+    picks: &[(Lane, usize)],
+    pick_links: &[Option<u32>],
+    cx: &mut Context<Player>,
+) -> impl IntoElement + use<> {
+    let placed = *sub;
+    let shown = player.trimmed_sub(lane, idx, placed);
+    let (start, len) = (
+        f64::from(shown.start) / player.fps,
+        f64::from(shown.frames) / player.fps,
+    );
+    let span = scale.width_px(len);
+    let width = clip_width(span);
+    let left = scale.px_at(start);
+    let on = marked((lane, idx), placed.link, picks, pick_links);
+    // Where in this window the track's own cues actually fall
+    // (`PlaybackSession::sub_lane_cues`, the same map the export and the
+    // picture's own plate go through).
+    let cues: Vec<(f32, f32)> = player.session.as_ref().map_or_else(Vec::new, |s| {
+        s.sub_lane_cues(lane).iter().map(|cue| cue_box(scale, cue)).collect()
+    });
+    let label = player
+        .session
+        .as_ref()
+        .and_then(|s| sub_pick_name(s.subtitles(), placed.track));
+    let ghost: SharedString = label.unwrap_or_else(|| lane.label()).into();
+    div()
+        .id(("bench-sub", lane.ord * 1000 + idx))
+        .absolute()
+        .top_0()
+        .h_full()
+        .left(px(left))
+        .w(px(width))
+        .overflow_hidden()
+        .rounded(px(0.))
+        .bg(rgb(DARK_PANEL()))
+        .when(on, |d| d.border_1().border_color(rgb(INK1())))
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.pick((lane, idx), event.modifiers.control, cx);
+            }),
+        )
+        // Same door a clip's box opens its menu by (DESIGN §9).
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.open_menu(lane, idx, event.position, cx);
+            }),
+        )
+        .on_drag(SubDrag { lane, idx, sub: placed }, {
+            let ghost = ghost.clone();
+            move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+        })
+        // The same edge-trim strips a clip gets, on the same [`trims`] floor.
+        .children(
+            [Edge::Start, Edge::End]
+                .into_iter()
+                .filter(|_| trims(span))
+                .map(|edge| {
+                    let mut zone = div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(px(EDGE_W))
+                        .occlude()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .hover(|s| s.bg(rgb(INK1())))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.start_trim(lane, idx, edge, event.modifiers.control, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.open_menu(lane, idx, event.position, cx);
+                            }),
+                        );
+                    zone = match edge {
+                        Edge::Start => zone.left_0(),
+                        Edge::End => zone.right_0(),
+                    };
+                    zone
+                }),
+        )
+        // The cues themselves: where in this window the track's words fall,
+        // each its own full-height block over the letterbox ground -- a
+        // placement is a window of a track, not full of speech.
+        .children(cues.into_iter().map(|(cl, cw)| {
+            div()
+                .absolute()
+                .top(px(1.))
+                .bottom(px(1.))
+                .left(px(cl))
+                .w(px(cw))
+                .rounded(px(0.))
+                .bg(rgb(CLIP_TEXT()))
+        }))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(1.))
+                .bg(rgb(LAMP_WHITE())),
+        )
+}
+
 /// One lane row: pinned head + bed of clips, DESIGN §5's "lanes V/A/S", drawn
 /// at the compressed height [`row_h`] gives it.
 fn lane_row(
@@ -405,6 +549,20 @@ fn lane_row(
         .iter()
         .enumerate()
         .map(|(idx, clip)| clip_box(player, lane, idx, clip, scale, picks, pick_links, cx))
+        .collect();
+    // The bed's other kind of box: a subtitle lane holds no `Clip` at all
+    // (`LaneKind::Subtitle`'s own doc), so this is empty everywhere but S1..
+    // and `boxes` above is empty on a subtitle lane -- one row draws whichever
+    // list it was given.
+    let subs: Vec<SubClip> = player
+        .session
+        .as_ref()
+        .map_or(&[][..], |s| s.sub_lane(lane))
+        .to_vec();
+    let sub_boxes: Vec<_> = subs
+        .iter()
+        .enumerate()
+        .map(|(idx, sub)| sub_box(player, lane, idx, sub, scale, picks, pick_links, cx))
         .collect();
     // DESIGN §5's lane heads: "a small ink dot under each head, coloured by
     // the lane's source ink" -- the first clip's source stands for the lane,
@@ -478,6 +636,13 @@ fn lane_row(
                     };
                     this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                 }))
+                // A caption already on a lane moves along it, or onto another
+                // subtitle track, exactly as a clip does (`Player::move_sub`,
+                // the same call `ui/timeline.rs`'s own bed makes).
+                .drag_over::<SubDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+                .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
+                    this.move_sub(drag, lane, window.mouse_position().x, cx);
+                }))
                 // The wheel, matched to the legacy timeline's own mapping:
                 // ctrl+wheel zooms about the pointer, a bare wheel scrolls
                 // the bed along the film (`Player::timeline_wheel`). Stopped
@@ -487,7 +652,8 @@ fn lane_row(
                     cx.stop_propagation();
                     this.timeline_wheel(event, cx);
                 }))
-                .children(boxes),
+                .children(boxes)
+                .children(sub_boxes),
         )
 }
 
