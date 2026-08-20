@@ -212,6 +212,16 @@ impl Player {
                         cx.listener(|this, _: &ClickEvent, _, cx| this.open_color(cx)),
                     ))
                     .child(self.action_control(
+                        "inspect-transform",
+                        0.,
+                        BG_RAISED(),
+                        None,
+                        "Transform",
+                        "position, scale, rotation and crop for this clip",
+                        ActionId::Transform,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_transform(cx)),
+                    ))
+                    .child(self.action_control(
                         "inspect-eq",
                         0.,
                         BG_RAISED(),
