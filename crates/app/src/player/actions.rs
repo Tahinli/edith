@@ -168,6 +168,8 @@ impl Player {
             // to read.
             ActionId::WalkCutNext => self.walk_cut(true, cx),
             ActionId::WalkCutPrev => self.walk_cut(false, cx),
+            ActionId::WalkCutNext10 => self.walk_cut_stride(true, 10, cx),
+            ActionId::WalkCutPrev10 => self.walk_cut_stride(false, 10, cx),
             // `[` `]` close in on the clip like the brackets they are: `[`
             // trims a frame off the head, `]` a frame off the tail -- no-aim,
             // frame detents, clamped to the room the engine already answers
@@ -460,11 +462,20 @@ impl Player {
     }
 
     /// The odometer (DESIGN.md §6, `,` `.`): the subject cut steps to its
-    /// neighbour along its own lane, [`walk_shift`](Player) striding ten
-    /// instead of one, clamped rather than wrapping at either end
-    /// ([`walk_cut`]). The playhead follows it there, which is what puts the
-    /// screen at rest on the new cut for the two-up to draw.
+    /// neighbour along its own lane, one at a time, clamped rather than
+    /// wrapping at either end ([`walk_cut`]). The playhead follows it there,
+    /// which is what puts the screen at rest on the new cut for the two-up
+    /// to draw.
     pub(crate) fn walk_cut(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.walk_cut_stride(forward, 1, cx);
+    }
+
+    /// [`Player::walk_cut`] with an explicit stride -- ten for
+    /// [`ActionId::WalkCutNext10`]/[`ActionId::WalkCutPrev10`], its own
+    /// bound key (DESIGN.md §6's "shift") rather than a modifier read off
+    /// the bare walk, since gpui never delivers shift alongside `.`/`,`
+    /// (see [`crate::keymap::Chord`]'s doc).
+    pub(crate) fn walk_cut_stride(&mut self, forward: bool, stride: usize, cx: &mut Context<Self>) {
         let Some((lane, idx)) = self.selected.anchor() else {
             return;
         };
@@ -472,7 +483,6 @@ impl Player {
             return;
         };
         let clips = session.lane_clips(lane);
-        let stride = if self.walk_shift { 10 } else { 1 };
         let next = walk_cut(idx, clips.len(), forward, stride);
         let at = clips.get(next).map(|c| f64::from(c.start) / self.fps);
         self.select((lane, next), cx);
@@ -578,7 +588,6 @@ impl Player {
         let chord = keymap::Chord {
             key: key.to_string(),
             ctrl,
-            shift: false,
         };
         // Only a stroke the file can spell and read back as itself: gpui reports
         // "+" for shift+=, which is the chord grammar's separator, so binding it
