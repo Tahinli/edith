@@ -2636,6 +2636,36 @@ impl PlaybackSession {
         self.edit(Dirty::Picture, |p| p.set_color_live(lane, idx, params))
     }
 
+    /// Where the clip at `idx` of `lane` is placed -- [`color_of`](Self::color_of)'s
+    /// twin for geometry instead of grade.
+    pub fn transform_of(&self, lane: Lane, idx: usize) -> Option<&TransformParams> {
+        self.project.transform_of(lane, idx)
+    }
+
+    /// Moves/scales/rotates/crops that clip, or takes the placement off with
+    /// `None` -- [`set_color`](Self::set_color)'s twin, one undo step and one
+    /// reseek.
+    pub fn set_transform(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<TransformParams>,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transform(lane, idx, params))
+    }
+
+    /// The same placement and the same reseek without the undo step
+    /// ([`Project::set_transform_live`]) -- [`set_color_live`](Self::set_color_live)'s
+    /// twin for a slider drag.
+    pub fn set_transform_live(
+        &mut self,
+        lane: Lane,
+        idx: usize,
+        params: Option<TransformParams>,
+    ) -> bool {
+        self.edit(Dirty::Picture, |p| p.set_transform_live(lane, idx, params))
+    }
+
     /// The project's resolution: what every clip is composed onto, what the
     /// window is sized to and what an export writes -- *not* any one file's.
     /// It starts as source 0's picture, which is what a project meant before it

@@ -81,6 +81,7 @@ impl Player {
             })
             .children(self.eq_card(room, cx))
             .children(self.color_card(cx))
+            .children(self.transform_card(cx))
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
             .children(self.mix_card(cx))
@@ -209,6 +210,16 @@ impl Player {
                         "exposure, contrast, saturation and temperature",
                         ActionId::Color,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.open_color(cx)),
+                    ))
+                    .child(self.action_control(
+                        "inspect-transform",
+                        0.,
+                        BG_RAISED(),
+                        None,
+                        "Transform",
+                        "position, scale, rotation and crop for this clip",
+                        ActionId::Transform,
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.open_transform(cx)),
                     ))
                     .child(self.action_control(
                         "inspect-eq",

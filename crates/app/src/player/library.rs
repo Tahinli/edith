@@ -168,6 +168,7 @@ impl Player {
         self.library_menu = None;
         self.eq_open = None;
         self.color_open = None;
+        self.transform_open = None;
         self.speed_open = None;
         self.close_silence();
         self.waves.clear();
@@ -196,6 +197,8 @@ impl Player {
         self.speed_dragging = false;
         self.color_dragging = false;
         self.pending_color = None;
+        self.transform_dragging = false;
+        self.pending_transform = None;
         self.pending_speed = None;
         self.displayed = 0;
         self.dropped = 0;
@@ -1279,6 +1282,7 @@ impl Player {
                 self.context_menu = None;
                 self.eq_open = None;
                 self.color_open = None;
+                self.transform_open = None;
                 // Marks are timeline frames of the timeline that was.
                 self.close_silence();
                 // A different set of sources: the row that was picked is not
@@ -1541,6 +1545,7 @@ impl Player {
                 self.context_menu = None;
                 self.eq_open = None;
                 self.color_open = None;
+                self.transform_open = None;
                 self.speed_open = None;
                 self.close_silence();
                 // The shown lane with them: a `Lane` is a position among
@@ -1599,6 +1604,7 @@ impl Player {
             self.context_menu = None;
             self.eq_open = None;
             self.color_open = None;
+            self.transform_open = None;
             self.speed_open = None;
             self.close_silence();
             // The shown lane with them: a `Lane` is a position among its
