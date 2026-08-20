@@ -1967,3 +1967,22 @@ fn settings_project_and_editor_sections_open_disjoint_doors() {
         assert!(!editor_body.contains(path_fn), "EDITOR section touches {path_fn} directly");
     }
 }
+
+/// With no project open, a PROJECT row must not fall back to a bare noun
+/// ("Size"/"Rate"/"HDR") standing in the value slot -- it reads as a value
+/// while carrying none. This binary has no `TestAppContext` to actually
+/// render the page with `player.session` empty, so this is a source scan
+/// for the fallback strings the bug shipped as, same as the guard above it.
+#[test]
+fn settings_project_rows_have_no_bare_noun_placeholder() {
+    let source = src_text("ui/settings_stance.rs");
+    let project_start = source.find("fn project_section(").expect("the project section");
+    let editor_start = source.find("fn editor_section(").expect("the editor section");
+    let project_body = &source[project_start..editor_start];
+    for placeholder in ["\"Size\".to_string()", "\"Rate\".to_string()", "\"HDR\".to_string()"] {
+        assert!(
+            !project_body.contains(placeholder),
+            "a PROJECT row fell back to the bare noun {placeholder} -- it reads as a value with no project open"
+        );
+    }
+}
