@@ -3,6 +3,18 @@
 
 use crate::*;
 
+/// Whether a seam that just lost its drag owes a disk write -- exactly the
+/// two persisted seams ([`Split::PERSISTED`]), same rule `drag_release`'s own
+/// `matches!` already lived by. Pulled out to its own free function, taking
+/// no `Context`, so [`Player::drag_left_window`]'s save-on-leave guard is
+/// checkable without a `TestAppContext` this test binary has none of (see
+/// `tests/media.rs`'s own note on the same limit) -- the wiring that calls it
+/// from a live `MouseExitEvent` still cannot be, and is proven by driving
+/// instead.
+pub(crate) fn split_drag_owes_save(split: Option<Split>) -> bool {
+    matches!(split, Some(Split::Dock) | Some(Split::Bench))
+}
+
 impl Player {
     /// Splits the clip under the playhead. Metadata only: the timeline->source
     /// mapping is unchanged, so nothing reseeks and no flag is touched.
@@ -1479,6 +1491,32 @@ impl Player {
     /// where it sits (`Hitbox::is_hovered`, window.rs:788), so while a card is
     /// up the root is not hovered anywhere under it and hears none of this: the
     /// press set a value and the drag then froze on it.
+    /// The one event a release outside the window's own surface is
+    /// guaranteed to raise: Wayland (and X11) tell a client its pointer has
+    /// left, unconditionally, whether or not a button is down
+    /// (`wl_pointer::Event::Leave`, gpui's `platform/linux/wayland/client.rs`)
+    /// -- but a `Button::Released` that lands *after* that Leave is never
+    /// forwarded at all, because gpui only dispatches it to the window that
+    /// is still `mouse_focused_window`, and Leave just cleared that. So the
+    /// seam's own release handler (`drag_release`, bound to `on_mouse_up`)
+    /// can be skipped entirely by a drag that ends outside the frame, and
+    /// `drag_move`'s "next incidental motion" fallback above only fires once
+    /// the pointer comes back -- which a restart before that motion, or a
+    /// release the user never revisits, may never do. This is the one
+    /// dependable earlier moment: the size a `Split::Dock`/`Split::Bench`
+    /// drag is holding right now is exactly what a release beyond this
+    /// instant would have kept, since no further sample can arrive from
+    /// outside the surface, so it is saved here rather than left to chance.
+    /// Wired at the root via [`Player::mount_mouse_exit_listener`]'s
+    /// `window.on_mouse_event`, the low-level door `Interactivity`'s fluent
+    /// `on_mouse_*` builders do not expose for `MouseExitEvent`.
+    pub(crate) fn drag_left_window(&mut self, cx: &mut Context<Self>) {
+        if split_drag_owes_save(self.split_drag) {
+            save_stance_splits(&self.splits);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn drag_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1518,9 +1556,16 @@ impl Player {
             match event.pressed_button {
                 Some(MouseButton::Left) => self.drag_split(split, event.position, window, cx),
                 // Released outside the window: the up below never came, so this
-                // is where the gesture ends. Nothing is owed -- every move has
-                // already been written.
-                _ => self.split_drag = None,
+                // is where the gesture ends. The size is already written to
+                // `self.splits`, but the darkroom's two persisted seams still
+                // owe the save `drag_release` would have paid -- without it
+                // the drag holds for the session and reverts on restart.
+                _ => {
+                    self.split_drag = None;
+                    if split_drag_owes_save(Some(split)) {
+                        save_stance_splits(&self.splits);
+                    }
+                }
             }
             return;
         }
@@ -1651,6 +1696,13 @@ impl Player {
         }
         if let Some(split) = self.split_drag.take() {
             self.drag_split(split, event.position, window, cx);
+            // The darkroom's own two seams outlive the window: written once,
+            // on the release that ends the gesture, the same small-file
+            // round trip `ui::dock_stance`'s tab pick uses -- not on every
+            // sample in between, which `drag_move` above never owed a write.
+            if split_drag_owes_save(Some(split)) {
+                save_stance_splits(&self.splits);
+            }
             return;
         }
         if std::mem::take(&mut self.eq_dragging) {
@@ -1718,8 +1770,21 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let viewport = window.viewport_size();
+        let raw = split_drag_size(split, at, viewport);
+        // Clamped here, through the same door [`Player::split_px`] draws
+        // through, at the one place a hand's pick ever reaches
+        // `self.splits` -- so what a later save writes to disk is never a
+        // number the seam itself would have refused to draw at. A floor
+        // enforced only on read still leaves a `bench=-1` line in the file.
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or(2, |session| session.lanes().len());
+        let view = self.view();
+        let scroll = view.duration > view.span();
         self.splits
-            .set(split, split_drag_size(split, at, window.viewport_size()));
+            .set(split, split_size(split, Some(raw), lanes, viewport, scroll));
         cx.notify();
     }
 }

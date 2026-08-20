@@ -688,7 +688,7 @@ impl Player {
         // floor clamp and the room the list sizes against are `menu_floor`'s,
         // so a menu taller than the footprint scrolls instead of climbing
         // back over the picture.
-        let (at, room) = menu_floor(menu.at, viewport, darkroom);
+        let (at, room) = menu_floor(menu.at, viewport, darkroom, self.split_px(Split::Bench, viewport));
         let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = path.display().to_string().into();
