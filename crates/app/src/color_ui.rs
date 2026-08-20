@@ -9,7 +9,7 @@ pub(crate) const COLOR_BANDS: [(&str, f32, f32); 4] = [
     ("Brightness", -1., 1.),
     ("Contrast", 0., 2.),
     ("Saturation", 0., 2.),
-    ("Tint (cool–warm)", -1., 1.),
+    ("Tint", -1., 1.),
 ];
 
 /// A press of a nudge key: a fortieth of a band's range, so a slider crosses it
