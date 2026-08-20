@@ -35,6 +35,12 @@ pub(crate) const LEDGER_H: f32 = 28.;
 /// The dock's untouched width -- [`Split::Dock`]'s own default, the same
 /// role [`BENCH_H`] plays for the bench.
 pub(crate) const DOCK_W: f32 = 280.;
+/// What [`bench`] spends above `bench_stance::render`'s own content: the
+/// section head (`type_scale::head`, 10px Archivo) plus its `py(4.)` top and
+/// bottom padding. Named and `pub(crate)` rather than the `- 20.` it used to
+/// be inlined as, so `layout::BENCH_MIN_H` can add it into its own
+/// derivation instead of guessing it back out.
+pub(crate) const BENCH_CHROME_H: f32 = 20.;
 
 /// The lowest a menu's top edge may sit and still land inside the
 /// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
@@ -452,7 +458,7 @@ fn bench(player: &mut Player, bench_h: f32, cx: &mut Context<Player>) -> impl In
         .px(px(12.))
         .py(px(4.))
         .child(section_head("bench"))
-        .child(bench_stance::render(player, bench_h - 20., cx))
+        .child(bench_stance::render(player, bench_h - BENCH_CHROME_H, cx))
 }
 
 /// Which of the three §8 severities a notice's own words carry. Reuses
@@ -473,22 +479,40 @@ fn notice_severity(message: &str) -> u32 {
     }
 }
 
-/// A notice plate (DESIGN §8): one at a time, rising above the ledger, its
+/// [`notice_plate`]'s own `bottom` offset, pulled out as a pure function so
+/// a `TestAppContext`-less test binary (this crate's own, no live `Context`
+/// to mount a real `notice_plate` in) can still check the plate never lands
+/// over the bench, for any `bench_h` -- without duplicating the arithmetic
+/// by hand and risking the two drifting apart.
+pub(crate) fn notice_bottom_offset(bench_h: f32) -> f32 {
+    LEDGER_H + bench_h + 6.
+}
+
+/// A notice plate (DESIGN §8): one at a time, rising above the *bench*, its
 /// severity a 3px left spine rather than a colour flood. Fed by the same
 /// [`Player::notify_user`]/`notices` queue the legacy bar reads
 /// ([`Player::notice_bar`]) -- no second notice channel. Dismissal is
 /// already wired: [`render`]'s `on_key_down` calls `dismiss_notice()` on
 /// every stroke, the same door the legacy handler uses.
 ///
+/// Anchored off `bench_h` rather than a fixed offset off the ledger: at the
+/// bench's floor a fixed `LEDGER_H + 6.` bottom offset put the plate right
+/// over the V1/A1 lane chips -- a transient message hiding the lanes for as
+/// long as it sat there. Floating it `bench_h` further up puts its bottom
+/// edge at the bench's own *top* edge for any bench height, so it always
+/// sits in the divider/time-band's slack above the bench rather than over
+/// the lanes, and never has to reserve room in the bench itself for a
+/// message that is not always there.
+///
 /// corner-cut: amber's "carries a jump action" is not wired -- the queue
 /// only ever held plain text, no structured jump target, in either the
 /// legacy bar or here. Ceiling: give `notify_user` an optional jump payload
 /// once a call site actually has one to carry.
-fn notice_plate(message: SharedString) -> impl IntoElement {
+fn notice_plate(message: SharedString, bench_h: f32) -> impl IntoElement {
     div()
         .id("stance-notice")
         .absolute()
-        .bottom(px(LEDGER_H + 6.))
+        .bottom(px(notice_bottom_offset(bench_h)))
         .left(px(12.))
         .max_w(px(360.))
         .flex()
@@ -809,7 +833,7 @@ pub(crate) fn render(
                 .child(bench(player, bench_h, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.front().cloned(), |el, n| {
-                    el.child(notice_plate(n))
+                    el.child(notice_plate(n, bench_h))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
                 // The two menus (DESIGN §9: "verbs of the thing under the

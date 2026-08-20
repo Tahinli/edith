@@ -1792,6 +1792,59 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
     );
 }
 
+/// At the bench's floor, both default lanes' rows actually fit inside the
+/// `bench-lanes` column `bench_stance::render` gives them -- not just each
+/// row's own clamped height, but their *sum plus the gap between them*,
+/// since `bench-lanes` scrolls rather than clipping visibly and a sum that
+/// overruns the column loses its bottom row's pixels off-screen, unscrolled
+/// (this session's F1: the A1 lane's clip-bar border and status dot, cut by
+/// ~2px at the old `BENCH_MIN_H = 80.`).
+#[test]
+fn both_default_lanes_fit_the_bench_at_its_floor() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H, row_h};
+    use crate::ui::stance::BENCH_CHROME_H;
+
+    let box_h = BENCH_MIN_H - BENCH_CHROME_H;
+    let avail = box_h - RULER_H - ROW_GAP;
+    let h = row_h(2, avail);
+    assert_eq!(h, LANE_MIN_H, "the floor should give both lanes exactly their own minimum -- no more, no less");
+    let content = 2. * h + ROW_GAP;
+    assert!(
+        content <= avail + 1e-4,
+        "the two lane rows ({content}px) overrun the column ({avail}px) -- \
+         the bottom lane's pixels get cut, unscrolled"
+    );
+}
+
+/// The notice plate's own anchor ([`crate::ui::stance::notice_bottom_offset`])
+/// keeps it off the bench, at *any* bench height -- not merely the floor --
+/// because its bottom offset always lands at or above the bench's own top
+/// edge. `Player`'s live tree has no `TestAppContext` in this binary to mount
+/// a real `notice_plate` in and read its painted bounds back, so this checks
+/// the pure geometry the anchor is built from instead (F2: previously the
+/// plate sat at a fixed `LEDGER_H + 6.` off the ledger and covered the
+/// V1/A1 lane chips whenever the bench was short enough for the plate's own
+/// height to reach past it).
+#[test]
+fn the_notice_plate_cannot_reach_the_bench_at_any_height() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::stance::{BENCH_H, LEDGER_H, notice_bottom_offset};
+
+    for bench_h in [BENCH_MIN_H, BENCH_H, 400.] {
+        let notice_bottom = notice_bottom_offset(bench_h);
+        // The bench sits directly above the ledger in the centre column, so
+        // its own top edge (measured the same way, from the column's foot)
+        // is exactly `LEDGER_H + bench_h`.
+        let bench_top = LEDGER_H + bench_h;
+        assert!(
+            notice_bottom >= bench_top,
+            "notice bottom {notice_bottom} sits below the bench's top {bench_top} \
+             at bench_h={bench_h} -- the plate can cover a lane row"
+        );
+    }
+}
+
 /// A round trip through the file: what is saved is what the next load reads
 /// back, one seam touched and the other left at its default -- a scratch
 /// path, not the real config, the same isolation `keymap::tests`' own
