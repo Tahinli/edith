@@ -500,6 +500,11 @@ struct Player {
     /// pointer: a stroke or a click meant for a row must not also cut the
     /// timeline.
     keys_open: bool,
+    /// The settings page is up (`?` overlay's sibling, but a latch rather
+    /// than a hold -- it carries clickable rows, not a glance-and-release
+    /// list). Cleared by [`Player::close_card`], the one reset list every
+    /// opener routes through.
+    settings_open: bool,
     /// What has been typed into the card's search box, which is the card's own
     /// input exactly as the export card's digits are (nothing in it takes
     /// focus, so the root's key handler is the field). Emptied every time the
@@ -944,6 +949,7 @@ fn main() {
                     autosave_armed: false,
                     keymap: keymap.clone(),
                     keys_open: false,
+                    settings_open: false,
                     keys_search: String::new(),
                     keys_scroll: ScrollHandle::new(),
                     lanes_scroll: ScrollHandle::new(),
