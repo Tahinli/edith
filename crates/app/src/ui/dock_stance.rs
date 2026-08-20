@@ -12,6 +12,8 @@
 //! [`clip_middle`]...), only the anatomy around them is new.
 
 use crate::*;
+use crate::ui::type_scale::{self, head, label, mono};
+use gpui::FontWeight;
 
 /// Where the dock tab pick lives: one word beside the theme and the
 /// keybindings (`ui::theme::config_path`/`save`/`load` is the exact pattern
@@ -73,7 +75,7 @@ impl DockSort {
 /// hover instead of disappearing (§8).
 fn ghost_verb(
     id: &'static str,
-    label: &'static str,
+    verb_label: &'static str,
     action: ActionId,
     active: bool,
     hint: &str,
@@ -88,6 +90,8 @@ fn ghost_verb(
     }
     .into();
     let on = enabled.yes();
+    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     div()
         .id(id)
         .flex_none()
@@ -98,7 +102,6 @@ fn ghost_verb(
         .px(px(8.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
-        .text_color(rgb(if active { INK1() } else { INK2() }))
         .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
         .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
         .when(on, |d| {
@@ -106,11 +109,18 @@ fn ghost_verb(
                 .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                 .on_click(on_click)
         })
-        .child(label)
+        .child(
+            div()
+                .font(label_style.font)
+                .text_size(label_style.size)
+                .text_color(rgb(if active { INK1() } else { INK2() }))
+                .child(verb_label),
+        )
         .child(
             div()
                 .flex_none()
-                .text_size(px(9.5))
+                .font(chord_style.font)
+                .text_size(chord_style.size)
                 .text_color(rgb(if active { INK1() } else { INK3() }))
                 .child(key),
         )
@@ -124,7 +134,8 @@ fn ghost_verb(
 /// DESIGN §11's frequency check puts a lift and a mark far ahead of a tab
 /// switch -- wearing a chord this room does not answer to would be exactly
 /// the lie DESIGN §4 forbids, so the letters go instead.
-fn dock_tab(id: &'static str, label: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
+fn dock_tab(id: &'static str, label_text: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
+    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
     div()
         .id(id)
         .flex_1()
@@ -135,27 +146,28 @@ fn dock_tab(id: &'static str, label: &'static str, active: bool, cx: &mut Contex
         .pt(px(6.))
         .pb(px(6.))
         .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
-        .text_size(px(10.5))
-        .text_color(rgb(if active { INK1() } else { INK3() }))
         .cursor_pointer()
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.dock_src_active = label == "SOURCES";
+            this.dock_src_active = label_text == "SOURCES";
             save(this.dock_src_active);
             cx.notify();
         }))
         .child(
             div()
-                .text_size(px(10.5))
+                .font(style.font)
+                .text_size(style.size)
                 .text_color(rgb(if active { INK1() } else { INK3() }))
-                .child(label),
+                .child(label_text),
         )
 }
 
 /// A 9px uppercase Archivo section head, `ink3` (DESIGN §3).
 fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
+    let style = head();
     div()
         .flex_none()
-        .text_size(px(9.))
+        .font(style.font)
+        .text_size(style.size)
         .text_color(rgb(INK3()))
         .child(text.into())
 }
@@ -271,31 +283,37 @@ fn source_row(player: &Player, i: usize, row: &Row, placed: usize, picked: bool,
                             )
                         }),
                 )
-                .child(
+                .child({
+                    let style = mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     div()
                         .flex_1()
                         .min_w(px(0.))
                         .truncate()
-                        .text_size(px(10.5))
+                        .font(style.font)
+                        .text_size(style.size)
                         .text_color(rgb(INK1()))
-                        .child(name),
-                )
-                .child(
+                        .child(name)
+                })
+                .child({
+                    let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
                     div()
                         .flex_none()
-                        .text_size(px(9.5))
+                        .font(style.font)
+                        .text_size(style.size)
                         .text_color(rgb(INK3()))
-                        .child(usage),
-                ),
+                        .child(usage)
+                }),
         )
-        .child(
+        .child({
+            let style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
             div()
                 .pl(px(14.))
                 .truncate()
-                .text_size(px(9.5))
+                .font(style.font)
+                .text_size(style.size)
                 .text_color(rgb(INK3()))
-                .child(under),
-        )
+                .child(under)
+        })
 }
 
 /// The Sources tab, built off MOCK-SPEC.md's "Dock" section: count line,
@@ -345,12 +363,14 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .p(px(8.))
         .overflow_y_scroll()
         .child(section_head(format!("SOURCES · {total} · {unused_count} UNUSED")))
-        .child(
+        .child({
+            let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
             div()
                 .id("dock-filter")
                 .flex_none()
                 .cursor_text()
-                .text_size(px(10.))
+                .font(style.font)
+                .text_size(style.size)
                 .text_color(rgb(if player.dock_filter_edit { INK1() } else { INK3() }))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.dock_filter_edit = true;
@@ -359,8 +379,8 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .child(match player.dock_filter.is_empty() {
                     true => "⌕ type to filter — name, codec, unused…".to_string(),
                     false => format!("⌕ {filter_text}"),
-                }),
-        )
+                })
+        })
         .child(
             div()
                 .flex_none()
@@ -368,13 +388,15 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .gap(px(4.))
                 .children(DockSort::ALL.map(|sort| {
                     let on = sort == player.dock_sort;
+                    let style = label(9.5, FontWeight::MEDIUM);
                     div()
                         .id(("dock-sort", sort as usize))
                         .flex_none()
                         .px(px(6.))
                         .py(px(2.))
                         .rounded(px(3.))
-                        .text_size(px(9.5))
+                        .font(style.font)
+                        .text_size(style.size)
                         .when(on, |d| d.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
                         .when(!on, |d| d.text_color(rgb(INK3())))
                         .cursor_pointer()
@@ -396,9 +418,11 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .gap(px(2.))
                 .overflow_y_scroll()
                 .when(rows.is_empty(), |d| {
+                    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     d.child(
                         div()
-                            .text_size(px(10.5))
+                            .font(style.font)
+                            .text_size(style.size)
                             .text_color(rgb(INK3()))
                             .child(match player.dock_filter.is_empty() {
                                 true => "No sources yet — Add files, or drop one on the window".to_string(),
@@ -443,16 +467,18 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                     cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
                 )),
         )
-        .child(
+        .child({
+            let style = mono(9., FontWeight::MEDIUM);
             div()
                 .flex_none()
-                .text_size(px(9.))
+                .font(style.font)
+                .text_size(style.size)
                 .text_color(rgb(INK3()))
                 .child(
                     "drag a row to a lane · ↵ add at playhead · double-click plays in screen · \
                      right-click the dot to re-ink a source (rare — lives out of the way)",
-                ),
-        )
+                )
+        })
 }
 
 /// The Clip tab: the four verbs DESIGN §5 names, as ghosts, over whichever
@@ -534,12 +560,14 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
                 // A plate, not bare space: DESIGN §11's "states" checklist --
                 // nothing picked reads as a hint, not as a hole in the panel.
                 .when(none_open, |d| {
+                    let style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
                     d.child(
                         div()
                             .rounded(px(2.))
                             .bg(rgb(DARK_CANVAS()))
                             .p(px(8.))
-                            .text_size(px(10.5))
+                            .font(style.font)
+                            .text_size(style.size)
                             .text_color(rgb(INK3()))
                             .child("pick a verb above"),
                     )
