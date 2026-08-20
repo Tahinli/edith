@@ -1811,6 +1811,26 @@ fn a_saved_seam_survives_a_reload() {
     assert_eq!(loaded.get(Split::Bench), None);
 }
 
+/// The guard [`crate::split_drag_owes_save`] runs at the moment a drag ends
+/// with no further pointer event ever coming (`Player::drag_left_window`,
+/// wired to a live `MouseExitEvent` a `TestAppContext`-less test binary
+/// cannot raise -- see `tests/media.rs`'s own note on the same limit, and
+/// the harness drive `D2` in this session's report for the wiring itself).
+/// What *is* checkable here without a window: exactly the two persisted
+/// seams owe that save, the same set `Split::PERSISTED` already names, and a
+/// drag that never started (`None`) owes nothing.
+#[test]
+fn only_the_two_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
+    use crate::{Split, player::timeline_edit::split_drag_owes_save};
+
+    assert!(split_drag_owes_save(Some(Split::Dock)));
+    assert!(split_drag_owes_save(Some(Split::Bench)));
+    assert!(!split_drag_owes_save(Some(Split::Library)));
+    assert!(!split_drag_owes_save(Some(Split::Inspector)));
+    assert!(!split_drag_owes_save(Some(Split::Timeline)));
+    assert!(!split_drag_owes_save(None));
+}
+
 /// A missing file leaves every region at its default -- the silent fallback
 /// `load_stance_splits`'s doc comment promises.
 #[test]

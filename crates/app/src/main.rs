@@ -72,7 +72,7 @@ use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, Corners, CursorStyle, Div,
     DragMoveEvent, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage, ScrollDelta,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, RenderImage, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, SharedString, Size, Stateful, TextAlign, TitlebarOptions,
     Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, relative, rgb, rgba,
     size,
