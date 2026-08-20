@@ -28,6 +28,7 @@ use crate::demux::{Codec, Demuxer, VideoMeta};
 use crate::eq::EqParams;
 use crate::project::{Clip, Edge, Lane, LaneKind, Project, Rate, Source, Span, Speed, SubClip};
 use crate::scale::{Composer, FitPolicy};
+use crate::transform::TransformParams;
 
 /// How long the feeder waits out a full ring. The ring holds a second, so this
 /// only has to be short next to that; it costs one wakeup per 10 ms of audio.
@@ -510,6 +511,7 @@ impl PlaybackSession {
             0,
             u32::MAX,
             ColorParams::default(),
+            TransformParams::default(),
             Composer::passthrough(),
             // The default rendition: a file just opened is a project nobody has
             // picked one for, exactly as it is a project nobody has graded.
@@ -738,6 +740,7 @@ impl PlaybackSession {
             0,
             span.map_or(1, |s| s.len),
             ColorParams::default(),
+            TransformParams::default(),
             Composer::passthrough(),
         )?;
         Ok(Self {
@@ -870,6 +873,7 @@ impl PlaybackSession {
                     0,
                     1,
                     ColorParams::default(),
+                    TransformParams::default(),
                     Composer::passthrough(),
                 )?;
                 (meta, stream)
@@ -879,6 +883,7 @@ impl PlaybackSession {
                 0,
                 u32::MAX,
                 ColorParams::default(),
+                TransformParams::default(),
                 Composer::passthrough(),
                 // The saved rendition, from the document rather than from the
                 // project (which is built below): this placeholder is what the
@@ -1603,6 +1608,10 @@ impl PlaybackSession {
                         .composite_color_at(start)
                         .copied()
                         .unwrap_or_default(),
+                    self.project
+                        .composite_transform_at(start)
+                        .copied()
+                        .unwrap_or_default(),
                     Composer::new(
                         self.meta.width,
                         self.meta.height,
@@ -1646,6 +1655,11 @@ impl PlaybackSession {
                     .composite_color_at(start)
                     .copied()
                     .unwrap_or_default();
+                let transform = self
+                    .project
+                    .composite_transform_at(start)
+                    .copied()
+                    .unwrap_or_default();
                 // ...and the canvas it is placed on: the project's resolution
                 // and this clip's own fit policy, constant across the span for
                 // the reason the grade is. Built where it is handed over rather
@@ -1684,6 +1698,7 @@ impl PlaybackSession {
                     start_frame,
                     end_frame,
                     color,
+                    transform,
                     canvas(),
                     tone,
                     decode_speed,
@@ -1698,6 +1713,7 @@ impl PlaybackSession {
                     start_frame,
                     end_frame,
                     color,
+                    transform,
                     canvas(),
                     tone,
                     decode_speed,
@@ -3578,6 +3594,7 @@ fn matches_timeline(
         0,
         0,
         ColorParams::default(),
+        TransformParams::default(),
         Composer::passthrough(),
         // A zero-length range decodes nothing, so no table is built and the
         // rendition cannot matter here.
