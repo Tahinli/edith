@@ -214,7 +214,7 @@ pub(crate) fn drag_scrim(cx: &mut Context<Player>) -> Div {
 /// stop following the hand on the first move. `stop_propagation` so the press
 /// never reaches the region under it -- a seam over the timeline must not scrub.
 pub(crate) fn divider(split: Split, cx: &mut Context<Player>) -> Div {
-    let across = matches!(split, Split::Timeline);
+    let across = matches!(split, Split::Timeline | Split::Bench);
     div()
         .flex_none()
         .when(across, |d| d.h(px(SPLIT_W)).w_full().cursor_row_resize())
