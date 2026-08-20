@@ -27,6 +27,10 @@ pub(crate) const TRANSFORM_BANDS: [(&str, f32, f32); 8] = [
 /// one row would be numbers nothing on screen answers to.
 pub(crate) const ROTATE_BAND: usize = 3;
 
+/// Which band is scale: the one control on the card whose unit is a
+/// multiplier (`×`) rather than a percent of frame or a degree.
+pub(crate) const SCALE_BAND: usize = 2;
+
 /// A press of a nudge key on every band but rotation: a fortieth-ish of a
 /// band's range, [`crate::color_ui::COLOR_STEP`]'s own reason. A drag lands on
 /// the same grid ([`Player::drag_transform`]).
