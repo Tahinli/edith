@@ -173,7 +173,7 @@ fn cut_readout(player: &Player) -> impl IntoElement {
 /// instead of `bench_stance`'s per-lane pixel scale -- the cheapest honest
 /// whole-film trace this app can draw without a new decode pass. Splice
 /// ticks (video-lane clip boundaries) still mark cut points on top of it.
-fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+fn contact_strip(player: &Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     let duration = player.drawn_duration();
     let view = player.view();
     let (left_frac, width_frac) = if duration > 0. {
@@ -230,9 +230,17 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         .h(px(28.))
         .cursor_pointer()
         .tooltip(|_, cx| {
-            cx.new(|_| Tip("Contact strip — click jumps, drag pans the bench".into()))
+            cx.new(|_| Tip("Contact strip — drag scrubs the playhead, click jumps; drag the bracket's grips to pan the bench".into()))
                 .into()
         })
+        // Division of the plain drag (MOCK-SPEC "Contact strip", task's own
+        // instruction to decide honestly): a person reaches for this strip to
+        // move through the FILM far more often than to slide the bench's own
+        // viewport window, so the strip's own drag now scrubs the playhead
+        // continuously -- press-and-move is not just a jump on release. The
+        // bracket keeps panning, but only from its own grip notches
+        // (`viewport_bracket` below), which `stop_propagation` on their own
+        // press so a pan-start never also fires a scrub-jump underneath it.
         .on_mouse_down(
             MouseButton::Left,
             cx.listener({
@@ -243,30 +251,43 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                         let frac = frac_along(event.position.x, bounds.get());
                         this.seek(f64::from(frac) * duration, cx);
                     }
-                    PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
                 }
             }),
         )
-        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-            let Some(last_x) = PAN_ANCHOR.with(Cell::get) else {
-                return;
-            };
-            match event.pressed_button {
-                Some(MouseButton::Left) => {
-                    let bounds = STRIP_BOUNDS.with(Rc::clone).get();
-                    let w = f32::from(bounds.size.width).max(1.);
-                    let dx = f32::from(event.position.x) - last_x;
-                    let duration = this.drawn_duration();
-                    if duration > 0. {
-                        let delta = f64::from(dx / w) * duration;
-                        let span = this.view().span();
-                        let max_start = (duration - span).max(0.);
-                        this.scale.start = (this.scale.start + delta).clamp(0., max_start);
-                    }
-                    PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
-                    cx.notify();
+        .on_mouse_move(cx.listener({
+            let bounds = strip_bounds.clone();
+            move |this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    PAN_ANCHOR.with(|a| a.set(None));
+                    return;
                 }
-                _ => PAN_ANCHOR.with(|a| a.set(None)),
+                match PAN_ANCHOR.with(Cell::get) {
+                    // A pan is live (started on the bracket's own grips): slide
+                    // the bench viewport instead of the playhead.
+                    Some(last_x) => {
+                        let b = STRIP_BOUNDS.with(Rc::clone).get();
+                        let w = f32::from(b.size.width).max(1.);
+                        let dx = f32::from(event.position.x) - last_x;
+                        let duration = this.drawn_duration();
+                        if duration > 0. {
+                            let delta = f64::from(dx / w) * duration;
+                            let span = this.view().span();
+                            let max_start = (duration - span).max(0.);
+                            this.scale.start = (this.scale.start + delta).clamp(0., max_start);
+                        }
+                        PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
+                    }
+                    // No pan armed: the plain drag scrubs, continuously
+                    // reseeking to wherever the hand is along the strip.
+                    None => {
+                        let duration = this.drawn_duration();
+                        if duration > 0. {
+                            let frac = frac_along(event.position.x, bounds.get());
+                            this.seek(f64::from(frac) * duration, cx);
+                        }
+                    }
+                }
+                cx.notify();
             }
         }))
         .on_mouse_up(
@@ -323,42 +344,63 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                 .border_l_1()
                 .border_r_1()
                 .border_color(rgb(INK1()))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .w(px(2.))
-                        .h(px(6.))
-                        .bg(rgb(INK1())),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .bottom_0()
-                        .w(px(2.))
-                        .h(px(6.))
-                        .bg(rgb(INK1())),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .w(px(2.))
-                        .h(px(6.))
-                        .bg(rgb(INK1())),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .bottom_0()
-                        .w(px(2.))
-                        .h(px(6.))
-                        .bg(rgb(INK1())),
-                ),
+                .child(grip("stance-strip-grip-lt", true, true))
+                .child(grip("stance-strip-grip-lb", true, false))
+                .child(grip("stance-strip-grip-rt", false, true))
+                .child(grip("stance-strip-grip-rb", false, false)),
+        )
+        // The lamp-white playhead marker: this is what turns the strip from
+        // a trace into a slider with a handle (task's own wording) -- the
+        // one 1px line on the whole band that names *this* film moment,
+        // drawn last so it always sits above the trace and the bracket.
+        .when(duration > 0., |el| {
+            let frac = ((position / duration).clamp(0., 1.)) as f32;
+            el.child(
+                div()
+                    .id("stance-strip-playhead")
+                    .absolute()
+                    .left(relative(frac))
+                    .top_0()
+                    .h_full()
+                    .w(px(1.))
+                    .bg(rgb(LAMP_WHITE())),
+            )
+        })
+}
+
+/// One grip notch on the viewport bracket (MOCK-SPEC "grip notches"): the
+/// only part of the contact strip that pans the bench window rather than
+/// scrubbing the playhead (see [`contact_strip`]'s own doc on that split).
+/// `stop_propagation` on its own press so starting a pan here never also
+/// fires the strip's scrub-jump underneath it.
+fn grip(id: &'static str, left: bool, top: bool) -> impl IntoElement {
+    div()
+        .id(id)
+        .absolute()
+        .when(left, |d| d.left(px(-3.)))
+        .when(!left, |d| d.right(px(-3.)))
+        .when(top, |d| d.top_0())
+        .when(!top, |d| d.bottom_0())
+        .w(px(8.))
+        .h(px(10.))
+        .cursor_col_resize()
+        .child(
+            div()
+                .absolute()
+                .when(left, |d| d.left(px(3.)))
+                .when(!left, |d| d.right(px(3.)))
+                .when(top, |d| d.top_0())
+                .when(!top, |d| d.bottom_0())
+                .w(px(2.))
+                .h(px(6.))
+                .bg(rgb(INK1())),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            move |event: &MouseDownEvent, _, cx| {
+                PAN_ANCHOR.with(|a| a.set(Some(f32::from(event.position.x))));
+                cx.stop_propagation();
+            },
         )
 }
 
@@ -480,6 +522,6 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                 )),
         )
         .child(cut_readout(player))
-        .child(contact_strip(player, cx))
+        .child(contact_strip(player, position, cx))
         .child(export_chip(player, cx))
 }
