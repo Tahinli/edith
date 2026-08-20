@@ -220,7 +220,18 @@ fn source_row(player: &Player, i: usize, row: &Row, placed: usize, picked: bool,
         .py(px(4.))
         .rounded(px(3.))
         .when(!usable, |d| d.opacity(0.5))
-        .when(picked, |d| d.bg(rgb(DARK_RAISED())))
+        // FAULT 3: this used to be `bg(DARK_RAISED())`, pixel-identical to
+        // the row's own `hover` fill below -- a picked row and a merely
+        // hovered one painted the same, so the editor could not see what was
+        // selected. DESIGN §4's ring (1px `ink1`) is the one that fits here,
+        // not §2's complement-leaning ink: §2's rule is about a mark drawn
+        // *over a source's own extracted film ink* (the bench clip's ring,
+        // already `ink1` in `bench_stance.rs`, sits on a source-tinted trace
+        // it must stay legible against regardless of hue) -- a dock row
+        // carries no film ink of its own to complement, it is a plain list
+        // line, so the general focus/selection ring applies, the same one
+        // the bench already uses for the same job.
+        .when(picked, |d| d.border_1().border_color(rgb(INK1())))
         .when(usable, |d| {
             d.cursor_pointer()
                 .hover(|s| s.bg(rgb(DARK_RAISED())))

@@ -134,10 +134,16 @@ fn cut_readout(player: &Player) -> impl IntoElement {
         .flex_none()
         .flex()
         .items_center()
-        .px(px(8.))
-        .py(px(4.))
-        .rounded(px(2.))
-        .bg(rgb(DARK_CANVAS()))
+        // FAULT 1a: this used to fill+round a `DARK_CANVAS` rectangle over
+        // the band's own `DARK_PANEL` ground -- a second hard-edged plate
+        // that read as a chip beside Export, the room's one bordered
+        // commitment (DESIGN §4). A readout is still a plate in the
+        // language's own words, but this band already has one (Export); the
+        // fix is to drop the competing fill, not add a second box the
+        // Export chip has to compete with. Values stay in `ink2`, the
+        // separators in `ink3` -- the readout is still legible sitting
+        // straight on the band ground.
+        .px(px(4.))
         .font(style.font)
         .text_size(style.size)
         .child(val(odometer))

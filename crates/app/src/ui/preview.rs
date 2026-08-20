@@ -1,14 +1,23 @@
 //! The picture: what is drawn over it and what is read off it.
 
 use crate::*;
+use crate::ui::type_scale::{self, Typeset};
 use std::path::{Path, PathBuf};
 
 impl Player {
     /// The one thing that says a preview is up rather than the timeline: a
     /// banner over the top of the picture, and a click of its own -- the
     /// keyboard has `esc`, and a hand with only a mouse needs a way out too.
+    ///
+    /// Legacy-only now (DEFECT 2, MOCK-SPEC.md): this is a full-width band
+    /// drawn *on* the frame, which DESIGN §5 forbids for the darkroom
+    /// ("nothing else over the picture, ever"). [`Player::preview_plate`] is
+    /// the darkroom's own restyle of the same information, built as a flex
+    /// sibling so the picture's own box shrinks for it rather than being
+    /// painted over -- the same fix `two_up`'s doc comment describes for the
+    /// OUT|IN plates. `OLD_GUI=1` keeps drawing this banner unchanged.
     pub(crate) fn preview_badge(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        self.preview_session.is_some().then(|| {
+        (!self.darkroom && self.preview_session.is_some()).then(|| {
             div()
                 .absolute()
                 .top_0()
@@ -33,6 +42,68 @@ impl Player {
                         .hover(|s| s.bg(rgb(BG_HOVER())))
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
                         .child("Stop (esc)"),
+                )
+        })
+    }
+
+    /// The darkroom's own preview indicator (DEFECT 2, MOCK-SPEC.md): a
+    /// plate (canvas-on-panel, §4), mono for what the film says, and a ghost
+    /// `Stop` wearing its `esc` chord rather than the legacy bordered
+    /// button -- no fill, no border, hover lifts one step like every other
+    /// ghost in the room.
+    ///
+    /// corner-cut: built and unit-shaped but **not yet mounted** -- it needs
+    /// to sit as a flex sibling of the picture inside `ui::stance::screen`
+    /// (the box `two_up`'s own doc comment already fixed this exact way for
+    /// the OUT|IN plates), which is `stance.rs`, out of this task's file
+    /// ownership while another builder has it open concurrently. `#[allow
+    /// It is mounted in `ui::stance::screen` as a flex sibling below the
+    /// picture's own child, the way `two_up` is, so the frame's box shrinks to
+    /// make room rather than being drawn over.
+    pub(crate) fn preview_plate(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        (self.darkroom && self.preview_session.is_some()).then(|| {
+            div()
+                .id("preview-plate")
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.))
+                .px(px(10.))
+                .py(px(4.))
+                .rounded(px(2.))
+                .bg(rgb(DARK_PANEL()))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK2()))
+                .child("PREVIEW — not on the timeline")
+                .child(
+                    // Ghost Stop: glyph over its chord, no border, no fill
+                    // at rest -- DESIGN §4's grammar, the same shape the
+                    // spine's own commands use.
+                    div()
+                        .id("preview-stop")
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(DARK_RAISED())))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_preview(cx)))
+                        .child(div().text_color(rgb(INK2())).child("Stop"))
+                        .child(
+                            div()
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                                .child("esc"),
+                        ),
                 )
         })
     }

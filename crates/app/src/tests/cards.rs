@@ -3,6 +3,39 @@
 
 use super::*;
 
+/// FAULT 2's general shape (not just the source dot's menu): `overlaid()`
+/// refuses every key while `context_menu`/`library_menu`/`picker` is `Some`,
+/// so each of the three needs *both* a place to paint in the stance and a way
+/// for any key to clear it -- otherwise the state `overlaid()` names becomes
+/// an invisible, unrecoverable modal the moment something sets it. A live
+/// harness proved the bug (right-click the source dot, every key but escape
+/// went dead); this pins the fix as a standing structural rule rather than a
+/// one-off repro, the same way `the_darkroom_path_never_lets_a_notice_surface_reach_the_picture`
+/// pins its own render-order fault.
+#[test]
+fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
+    let stance = src_text("ui/stance.rs");
+    let render_body = &stance[stance.find("pub(crate) fn render(").expect("the stance's entry point")..];
+    for menu in ["context_card(", "library_card(", "picker_card("] {
+        assert!(
+            render_body.contains(menu),
+            "ui::stance::render never mounts Player::{menu} -- overlaid() can refuse \
+             every key for a menu the room never draws"
+        );
+    }
+    let guard_at = stance
+        .find("if this.rebinding.is_some() || this.overlaid() {")
+        .expect("the stance's modal guard");
+    let guard = &stance[guard_at..guard_at + 1600];
+    for field in ["this.context_menu = None", "this.library_menu = None", "this.picker = None"] {
+        assert!(
+            guard.contains(field),
+            "the overlaid()/rebinding branch no longer clears {field} on every key -- \
+             a menu can go modal and unrecoverable again (FAULT 2)"
+        );
+    }
+}
+
 #[test]
 fn a_bare_escape_leaves_player_fullscreen_before_anything_under_it() {
     // Fires while the picture-only layout is up, on the same bare escape

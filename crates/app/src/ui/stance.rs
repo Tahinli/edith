@@ -331,6 +331,9 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
                 .child(bounds_probe(PICTURE_BOUNDS.with(Rc::clone))),
         )
         .children(two_up)
+        // The preview's own plate, a flex sibling for the same reason two_up is
+        // one: drawn inside the picture it would cover the frame.
+        .children(player.preview_plate(cx))
 }
 
 /// Fixed-height strip under the screen: timecode leads, ghost transport, cut
@@ -339,8 +342,11 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
 /// click live in [`crate::ui::timeband_stance`] now, the same split
 /// `spine_stance`/`bench_stance`/`dock_stance` already make for their
 /// regions.
-fn time_band(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
-    let position = player.active_session().map_or(0., PlaybackSession::now);
+fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
+    // The position comes from `render`, the same one the screen and the ledger
+    // read. Asking `active_session` here instead read the PREVIEW's clock while
+    // a preview was up, so the hero timecode and the ledger's position -- two
+    // readouts of one truth -- disagreed on screen.
     div()
         .id("stance-time-band")
         .flex_none()
@@ -531,6 +537,19 @@ pub(crate) fn render(
             if event.is_held && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl)) {
                 return;
             }
+            // The recovery notice reads a key as more than "answered" (legacy
+            // `render.rs`'s own rule): `enter` loads the sidecar it named, any
+            // other key declines it. Asked before the generic dismiss below
+            // shares the door with it, not instead of it -- the darkroom
+            // notice bar advertised "enter recovers it, any other key keeps
+            // this" with no listener behind it until now (DESIGN §4).
+            if this.recovery_sidecar.is_some() {
+                if key == "enter" {
+                    this.recover_from_sidecar(cx);
+                } else if let Some(sidecar) = this.recovery_sidecar.take() {
+                    Player::discard_sidecar(&sidecar);
+                }
+            }
             if this.dismiss_notice() {
                 cx.notify();
             }
@@ -542,6 +561,41 @@ pub(crate) fn render(
             if key == "?" && !ctrl {
                 if !this.keys_open {
                     this.show_actions(cx);
+                }
+                cx.notify();
+                return;
+            }
+            // The dock's Sources filter (MOCK-SPEC "Dock" §2), the same door
+            // legacy `render.rs` gives it: owns the keyboard only while it
+            // was clicked into (`dock_stance.rs` sets `dock_filter_edit` on
+            // that click regardless of which tree is drawing the row), a
+            // letter typed anywhere else in the room keeps meaning whatever
+            // the spine says it means.
+            if this.dock_filter_edit {
+                if key == "escape" || key == "enter" {
+                    this.dock_filter_edit = false;
+                } else if key == "backspace" {
+                    this.dock_filter.pop();
+                } else if let Some(c) = typed(key) {
+                    this.dock_filter.push(c);
+                }
+                cx.notify();
+                return;
+            }
+            // `↵` adds the picked source at the playhead (MOCK-SPEC "Dock"
+            // hint paragraph, gesture 2; `dock_stance.rs`'s own hint promised
+            // this and nothing answered it -- FAULT 1). Live only where a row
+            // is actually picked, so a bare enter elsewhere still means
+            // whatever it means below. `insert_source` already refuses
+            // visibly on its own ("NOTHING ADDED -- ...") when the span is
+            // occupied, so there is nothing further to paint here.
+            if key == "enter"
+                && this.dock_src_active
+                && this.selected_asset.is_some()
+                && this.exporting().is_none()
+            {
+                if let Some((path, stream)) = this.selected_asset.clone() {
+                    this.insert_source(&path, stream, None, None, cx);
                 }
                 cx.notify();
                 return;
@@ -562,7 +616,29 @@ pub(crate) fn render(
                     this.rebinding = None;
                     this.close_card();
                 }
+                // FAULT 2, general shape: `context_menu`/`library_menu`/
+                // `picker` are three of the four reasons `overlaid()` refuses
+                // every key, and none of the three is in `close_card`'s own
+                // list (`modal()` never counted them) -- left uncleared, any
+                // one of them left the room an invisible, permanent modal
+                // that only escape even tried to leave, and closed nothing.
+                // Any key answers a menu, the same rule the legacy tree's own
+                // clip_menu/row_menu/list chain follows (`render.rs`): this is
+                // the fix for "no state may make the room modal without
+                // showing anything", not only the source-dot's menu.
+                this.context_menu = None;
+                this.library_menu = None;
+                this.picker = None;
                 cx.notify();
+                return;
+            }
+            // The innermost thing left once no menu or card is up: a preview
+            // takes the picture over the screen, and escape is its own way
+            // out -- the chord `preview.rs`'s "Stop (esc)" bar already
+            // advertised, dead until now (FAULT 3) because only the legacy
+            // tree's handler answered it.
+            if key == ESCAPE && !ctrl && this.preview_session.is_some() {
+                this.close_preview(cx);
                 return;
             }
             if let Some(action) = this.keymap.lookup(key, ctrl) {
@@ -599,20 +675,33 @@ pub(crate) fn render(
                 .flex()
                 .flex_col()
                 .child(screen(player, position, window, cx))
-                .child(time_band(player, cx))
+                .child(time_band(player, position, cx))
                 .child(bench(player, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.front().cloned(), |el, n| {
                     el.child(notice_plate(n))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
+                // The two menus (DESIGN §9: "verbs of the thing under the
+                // cursor", plate styling, the same scrim-and-row component
+                // the legacy tree already uses -- `library.rs`'s own doc
+                // comment: "Built like `Player::context_card` ... because it
+                // is the same menu on the other panel") and the open list a
+                // picker sets: none of the three had a home in the stance,
+                // so `overlaid()` refused every key over them for nothing
+                // ever drawn (FAULT 2). `render.rs`'s children order is kept
+                // -- clip menu, then library menu, then the open list last so
+                // it floats over whichever row opened it.
+                .children(player.context_card(window_size, cx))
+                .children(player.library_card(window_size, cx))
                 // The export card and its running-progress sheet, mounted
                 // over the whole room exactly as the legacy tree mounts them
                 // (`render.rs`) -- the fix for the shipped "Export does
                 // nothing" defect: the chip/chord open `export_open`, this is
                 // what draws it once open.
                 .children(player.export_card(window_size, cx))
-                .children(player.export_progress_card(cx)),
+                .children(player.export_progress_card(cx))
+                .children(player.picker_card(window_size, cx)),
         )
         .child(dock(player, window_h, cx))
 }

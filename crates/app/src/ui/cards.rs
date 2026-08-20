@@ -1,6 +1,7 @@
 //! The property cards -- docked into the inspector, or floated when modal.
 
 use crate::*;
+use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 
 impl Player {
@@ -24,14 +25,38 @@ impl Player {
         &self,
         viewport: Size<Pixels>,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    ) -> Option<AnyElement> {
         if !self.export_open {
             return None;
         }
         // The cap is what keeps the card inside the smallest window; a taller
         // one gets a taller list rather than a scroll past empty space, and the
         // card is still only as tall as the rows it has.
-        let rows_h = (f32::from(viewport.height) - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H);
+        // DEFECT 1 (MOCK-SPEC.md / DESIGN §4): the darkroom draws this same
+        // card in its own language -- plate surface, mono for what the film
+        // says, ghost rows, one bordered chip for the commit action -- while
+        // the legacy tree (`OLD_GUI=1`) keeps the rounded sheet verbatim.
+        // Branched here rather than in a second function so the ~350 lines
+        // of row-building *logic* below (which preset is picked, which
+        // format is refused, what a click does) stay written once; only the
+        // few tokens a paint reads differ.
+        let dark = self.darkroom;
+        let rows_h = match dark {
+            // The corner plate sits over the bench+ledger footprint (§11
+            // check 6), which is a fraction of the window a centred modal
+            // was sized against -- a fixed, smaller cap rather than
+            // `viewport.height`-derived room the plate does not have.
+            true => (EXPORT_ROWS_H / 2.).max(4. * KEYS_ROW_H),
+            false => (f32::from(viewport.height) - EXPORT_FIXED_H - 24.).max(EXPORT_ROWS_H),
+        };
+        let ink_secondary = if dark { INK3() } else { FG_SECONDARY() };
+        let ink_primary = if dark { INK1() } else { FG_PRIMARY() };
+        let bg_hover = if dark { DARK_RAISED() } else { BG_HOVER() };
+        let bg_selected = if dark { DARK_RAISED() } else { BG_SELECTED() };
+        // Archivo for what the row *says as a verb* (its label), mono for
+        // what the film says through it (its detail/key) -- DESIGN §3.
+        let font_label = dark.then(|| type_scale::label(11., gpui::FontWeight::MEDIUM).font);
+        let font_mono = dark.then(|| type_scale::mono(11., gpui::FontWeight::MEDIUM).font);
         let row = |id: (&'static str, usize)| {
             div()
                 .id(id)
@@ -55,9 +80,9 @@ impl Player {
         // an inapplicable item in the clip menu is: it still says its piece.
         let live = |d: Stateful<Div>, enabled: bool| {
             d.when(!enabled, |d| {
-                d.cursor_not_allowed().text_color(rgb(FG_SECONDARY()))
+                d.cursor_not_allowed().text_color(rgb(ink_secondary))
             })
-            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(BG_HOVER()))))
+            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgb(bg_hover))))
         };
         // A row as this card writes them: the mark saying which one is picked,
         // the key that picks it, its name, and what the choice means. The mark
@@ -74,11 +99,11 @@ impl Player {
             // dim ink is only 3.3:1 -- the row it lands on lifts it (WCAG
             // 1.4.3, and the fit test pins both numbers).
             let ink = match picked {
-                true => FG_PRIMARY(),
-                false => FG_SECONDARY(),
+                true => ink_primary,
+                false => ink_secondary,
             };
             live(row(id), enabled)
-                .when(picked, |d| d.bg(rgb(BG_SELECTED())))
+                .when(picked, |d| d.bg(rgb(bg_selected)))
                 .child(
                     div()
                         .flex()
@@ -94,9 +119,14 @@ impl Player {
                                 .w(px(EXPORT_KEY_W))
                                 .text_size(px(11.))
                                 .text_color(rgb(ink))
+                                .when_some(font_mono.clone(), |d, f| d.font(f))
                                 .child(SharedString::from(key.to_string())),
                         )
-                        .child(label),
+                        .child(
+                            div()
+                                .when_some(font_label.clone(), |d, f| d.font(f))
+                                .child(label),
+                        ),
                 )
                 // Wraps rather than runs off the row: a refusal is the longest
                 // thing in this column and the half of it past the edge is the
@@ -107,6 +137,7 @@ impl Player {
                         .flex_shrink()
                         .text_size(px(11.))
                         .text_color(rgb(ink))
+                        .when_some(font_mono.clone(), |d, f| d.font(f))
                         .child(detail),
                 )
         };
@@ -116,7 +147,8 @@ impl Player {
                 .px(px(6.))
                 .pt(px(4.))
                 .text_size(px(10.))
-                .text_color(rgb(FG_SECONDARY()))
+                .text_color(rgb(ink_secondary))
+                .when_some(font_label.clone(), |d, f| d.font(f))
                 .child(text)
                 .into_any_element()
         };
@@ -472,7 +504,8 @@ impl Player {
                     .px(px(6.))
                     .py(px(2.))
                     .text_size(px(11.))
-                    .text_color(rgb(FG_SECONDARY()))
+                    .text_color(rgb(ink_secondary))
+                    .when_some(font_mono.clone(), |d, f| d.font(f))
                     .child(format!("cannot write: {}", refusals.join(" · ")))
                     .into_any_element(),
             );
@@ -492,7 +525,8 @@ impl Player {
                 .px(px(6.))
                 .py(px(2.))
                 .text_size(px(11.))
-                .text_color(rgb(FG_SECONDARY()))
+                .text_color(rgb(ink_secondary))
+                .when_some(font_mono.clone(), |d, f| d.font(f))
                 .child(text)
                 .into_any_element()
         };
@@ -559,6 +593,176 @@ impl Player {
             }
             None => "Export".into(),
         };
+        let status_line = match (&self.mbps_edit, self.notices.front()) {
+            // A field being typed into says so here as well as in its row:
+            // this line is outside the scrolling list and on screen at every
+            // window size, and at 360 px the custom row itself can be below
+            // the fold -- a number typed where it cannot be seen is the
+            // blind capture this field replaced.
+            (Some(edit), _) => SharedString::from(format!("Custom bitrate {}", edit.detail())),
+            (None, Some(notice)) => notice.clone(),
+            // `g`/`r` only do anything once Advanced is open -- they moved
+            // off the front pane with the rows they reshape -- so a shut
+            // pane advertises `s` instead of a pair of keys with nothing on
+            // screen for them to touch.
+            (None, None) => match self.export_advanced_open {
+                true => "the keys are on the rows · enter exports · \
+                         a click away or esc closes · g/r change the layout"
+                    .into(),
+                false => "the keys are on the rows · enter exports · \
+                         a click away or esc closes · s for Advanced"
+                    .into(),
+            },
+        };
+        if dark {
+            // DEFECT 1: the darkroom's own language, not the legacy sheet --
+            // a plate (canvas-on-panel, §4), positioned over the bench+
+            // ledger footprint it can sit over rather than centred over the
+            // whole window (§11 check 6: the picture stays uncovered). The
+            // click-catcher behind it is `size_full` so a click anywhere
+            // still closes the card exactly as the legacy scrim's does, but
+            // paints nothing (`SCRIM()` is deliberately not applied here) --
+            // an invisible catcher changes zero picture pixels while a
+            // dimming one would still tint the screen it must never cover.
+            return Some(
+                div()
+                    .id("export-click-catcher")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .items_end()
+                    .justify_end()
+                    .p(px(12.))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.close_card();
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id("export-plate")
+                            .w(px(EXPORT_W.min(340.)))
+                            .max_h(px(4. * KEYS_ROW_H + rows_h + 90.))
+                            .on_mouse_down(MouseButton::Left, swallow)
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .p(px(10.))
+                            .rounded(px(6.))
+                            .bg(rgb(DARK_PANEL()))
+                            .border_1()
+                            .border_color(rgba(DARK_SEAM()))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .type_style(type_scale::head())
+                                    .text_color(rgb(INK3()))
+                                    .child("EXPORT"),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(INK3()))
+                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .child(status_line),
+                            )
+                            .child(
+                                div()
+                                    .id("export-rows")
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .max_h(px(rows_h))
+                                    .overflow_y_scroll()
+                                    .children(list),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .text_color(rgb(INK2()))
+                                    .child(head),
+                            )
+                            .children(self.range.map(|(start, end)| {
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .text_color(rgb(INK3()))
+                                    .child(format!(
+                                        "RANGE {}\u{2013}{} ({})",
+                                        timecode(f64::from(start) / self.fps, self.fps),
+                                        timecode(f64::from(end) / self.fps, self.fps),
+                                        frames_timecode(end - start, self.fps),
+                                    ))
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .type_style(type_scale::mono(10.5, gpui::FontWeight::MEDIUM))
+                                    .text_color(rgb(INK3()))
+                                    .child(tail),
+                            )
+                            // §4: "the single bordered chip in the whole
+                            // room" -- ghosts everywhere else in this card,
+                            // one border here, wearing its chord live off
+                            // the keymap so a rebind cannot leave it stale.
+                            .child(
+                                div()
+                                    .id("export-confirm")
+                                    .mt(px(4.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(6.))
+                                    .h(px(CONTROL_H))
+                                    .px(px(10.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(rgb(match blocked.is_some() {
+                                        true => INK4(),
+                                        false => INK2(),
+                                    }))
+                                    .when(blocked.is_none(), |d| d.cursor_pointer())
+                                    .when(blocked.is_some(), |d| d.cursor_not_allowed())
+                                    .hover(|s| s.bg(rgb(DARK_RAISED())))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.start_export(cx)
+                                    }))
+                                    .type_style(type_scale::label(11., gpui::FontWeight::MEDIUM))
+                                    .text_color(rgb(match blocked.is_some() {
+                                        true => INK4(),
+                                        false => INK1(),
+                                    }))
+                                    .child(action)
+                                    .when(blocked.is_none(), |d| {
+                                        d.child(
+                                            div()
+                                                .type_style(type_scale::mono(
+                                                    9.5,
+                                                    gpui::FontWeight::MEDIUM,
+                                                ))
+                                                .text_color(rgb(INK3()))
+                                                .child(self.keymap.chord(ActionId::Export)),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
         Some(
             scrim()
                 .flex()
@@ -596,32 +800,7 @@ impl Player {
                                 .px(px(6.))
                                 .text_size(px(11.))
                                 .text_color(rgb(FG_SECONDARY()))
-                                .child(match (&self.mbps_edit, self.notices.front()) {
-                                    // A field being typed into says so here as
-                                    // well as in its row: this line is outside
-                                    // the scrolling list and on screen at every
-                                    // window size, and at 360 px the custom row
-                                    // itself can be below the fold -- a number
-                                    // typed where it cannot be seen is the
-                                    // blind capture this field replaced.
-                                    (Some(edit), _) => {
-                                        SharedString::from(format!("Custom bitrate {}", edit.detail()))
-                                    }
-                                    (None, Some(notice)) => notice.clone(),
-                                    // `g`/`r` only do anything once Advanced is
-                                    // open -- they moved off the front pane with
-                                    // the rows they reshape -- so a shut pane
-                                    // advertises `s` instead of a pair of keys
-                                    // with nothing on screen for them to touch.
-                                    (None, None) => match self.export_advanced_open {
-                                        true => "the keys are on the rows · enter exports · \
-                                                 a click away or esc closes · g/r change the layout"
-                                            .into(),
-                                        false => "the keys are on the rows · enter exports · \
-                                                 a click away or esc closes · s for Advanced"
-                                            .into(),
-                                    },
-                                }),
+                                .child(status_line),
                         )
                         // Capped and scrolling like the keybindings list: the
                         // rows are more than a 360 px window has room for, and
@@ -684,7 +863,8 @@ impl Player {
                                 )
                                 .child(action),
                         ),
-                ),
+                )
+                .into_any_element(),
         )
     }
 
