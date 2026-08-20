@@ -142,7 +142,7 @@ impl RowItem {
 /// action a stroke already reaches -- the menu is a second way *to* the actions
 /// and never a second version of them -- so both the label and the hint come
 /// out of the keymap registry and the two can never disagree.
-pub(crate) const MENU_ITEMS: [ActionId; 15] = [
+pub(crate) const MENU_ITEMS: [ActionId; 16] = [
     ActionId::Cut,
     // The clipboard pair, which had no door but a chord: copy takes the clip the
     // menu names, and paste is the timeline's rather than this clip's -- the
@@ -165,6 +165,7 @@ pub(crate) const MENU_ITEMS: [ActionId; 15] = [
     // whichever half was clicked.
     ActionId::Dissolve,
     ActionId::Color,
+    ActionId::Transform,
     ActionId::Fit,
     ActionId::ToggleMute,
 ];
