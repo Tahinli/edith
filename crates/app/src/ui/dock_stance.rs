@@ -83,7 +83,7 @@ fn ghost_verb(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let enabled = player.enable(action, None);
-    let key = player.keymap.display(action);
+    let key = player.keymap.chord(action);
     let say: SharedString = match enabled.why() {
         Some(why) => format!("{key} — {why}"),
         None => format!("{key} — {hint}"),
