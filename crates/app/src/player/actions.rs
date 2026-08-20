@@ -127,6 +127,8 @@ impl Player {
             // The chooser the palette's own button opens: a file's tracks into
             // the list, the file itself joining nothing.
             ActionId::ImportSubtitles => self.pick_and_add_subtitles(cx),
+            ActionId::AddFiles => self.pick_and_import(cx),
+            ActionId::PasteFilePath => self.paste_file_path(cx),
             ActionId::ToggleMute => self.set_volume(|volume| volume.muted = !volume.muted, cx),
             ActionId::VolumeUp => self.set_volume(|volume| volume.step(true), cx),
             ActionId::VolumeDown => self.set_volume(|volume| volume.step(false), cx),
