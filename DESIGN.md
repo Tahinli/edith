@@ -178,6 +178,31 @@ capability is genuinely absent — otherwise it is a bug, not a message. A verb 
 - **`?` held** dims the room one fill step and surfaces chords *in place* beside their controls;
   release restores. No modal cheat-sheet; learning stays geographic. The film keeps playing.
 
+  **Amendment (2026-08-20), explicit per this section's own rule:** the geographic reading above
+  is only partly built and edith currently ships the fallback instead — named here rather than
+  silently violated.
+
+  Fifteen of the keymap's 71 actions already have a geographic home in the darkroom stance today,
+  and every one of those wears its chord **permanently**, not gated on `?` (spine glyphs, the
+  time band's transport and Export chip, the dock's four Clip verbs) — a stronger reading of "the
+  UI *is* the shortcut sheet" (§4) than "surfaces on hold" asks for, so nothing further was owed
+  those fifteen. The other 56 actions (`,` `.` `[` `]` shuttle strides, marks, clipboard, delete,
+  lift/detach/group/regroup, fit/resolution/zoom, subtitle add/style, silence, project cards,
+  etc.) have **no widget anywhere in the room** — burst-use surfaces (screen, bench, time band)
+  are the checklist's most expensive land (§11.1), and giving each of the 56 a geographic
+  placement is that many individual placement decisions across the bench, time band and dock, not
+  one fix. Until that lands, `?` held keeps opening `ui::stance::keys_overlay`: a single scrolling
+  plate (plate styling per §4, positioned over the bench+ledger footprint so it never reaches the
+  screen — §11.6's occlusion check holds) listing every action by [`keymap::Category`]. It is a
+  cheat-sheet, and it is modal for as long as the key is held; both are accepted here rather than
+  hidden.
+
+  Ceiling to close this amendment: walk the 56 down to zero by giving each a home next to the
+  control it already has no visual presence beside (marks and clipboard on the time band's cut
+  readout row; lift/detach/group/regroup as bench lane-head ghosts; fit/resolution/zoom on the
+  screen's own corner; subtitle/silence/project verbs into the dock next to the tab they already
+  belong to) — at which point the plate deletes and `?` held becomes pure dim, no list.
+
 ## 10. The joy layer
 
 Game-feel, not gamification. All specs ≤150ms, ease-out, tied to real actions, honor
