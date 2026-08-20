@@ -166,7 +166,7 @@ fn a_search_leaves_the_rows_it_names_under_their_own_headings() {
     );
     // The card's own door is on the card, by name and by stroke.
     assert_eq!(
-        acts(&keys_filter("f1", &keymap)),
+        acts(&keys_filter("?", &keymap)),
         vec![ActionId::ShowActions]
     );
     assert_eq!(

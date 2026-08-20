@@ -1143,11 +1143,12 @@ impl Keymap {
                 // key stays the one people look for -- the modifier is what
                 // makes it an intention ([`crate::cancels_export`]).
                 b(ActionId::CancelExport, "escape", true),
-                // The help key, where every program's list of what it can do
-                // has always been. Free -- gpui names it "f1"
-                // (platform.rs:880, the keysym's own name lowercased) -- and
-                // not a letter, so it takes nothing away from the clip keys.
-                b(ActionId::ShowActions, "f1", false),
+                // The help key (DESIGN.md §9): held, it opens the keys
+                // overlay; released, it closes -- the room's own `on_key_up`
+                // (`ui/stance.rs`) is what makes that a hold and not a latch.
+                // Its own key, not `shift+/`: gpui reports a shifted symbol as
+                // the glyph itself, so `"?"` is what a stroke of it reports.
+                b(ActionId::ShowActions, "?", false),
                 // "w" is free entirely, bare and ctrl both -- nothing else in
                 // this table answers to it.
                 b(ActionId::Screenshot, "w", false),
@@ -1435,7 +1436,7 @@ mod tests {
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
         assert_eq!(k.lookup("p", true), Some(ActionId::ToggleProxies));
         assert_eq!(k.lookup("o", true), Some(ActionId::ToggleAutoProxies));
-        assert_eq!(k.lookup("f1", false), Some(ActionId::ShowActions));
+        assert_eq!(k.lookup("?", false), Some(ActionId::ShowActions));
         assert_eq!(k.lookup("h", true), Some(ActionId::Theme));
         assert_eq!(k.lookup("space", false), Some(ActionId::Play));
         // The seek keys: bare arrows a frame, ctrl arrows a second, and the two
@@ -1705,7 +1706,7 @@ mod tests {
         // The label is the editor's column, and never the file's word for it.
         assert_eq!(ActionId::CancelExport.label(), "Cancel export");
         assert_eq!(k.display(ActionId::ToggleSnap), "n");
-        assert_eq!(k.display(ActionId::ShowActions), "f1");
+        assert_eq!(k.display(ActionId::ShowActions), "?");
         assert_eq!(k.display(ActionId::ToggleSubtitles), "t");
         assert_eq!(k.display(ActionId::ZoomIn), "ctrl+=");
     }
