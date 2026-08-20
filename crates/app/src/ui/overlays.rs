@@ -559,7 +559,13 @@ impl Player {
                 };
                 rows.push(
                     row(rows.len())
-                        .child(label)
+                        // Truncated and shrinkable: a long label ("Transform —
+                        // position, scale, rotation, crop") used to run the
+                        // hint column clean off the fixed-width menu instead
+                        // of sharing the row with it, which is why Transform
+                        // showed no stroke while a short label like Colour's
+                        // did.
+                        .child(div().min_w(px(0.)).flex_shrink().truncate().child(label))
                         .child(match refusal.why() {
                             // One truncated line, like the details side: a
                             // reason that wrapped would make the card taller
@@ -571,6 +577,7 @@ impl Player {
                                 .text_color(rgb(FG_SECONDARY()))
                                 .child(why),
                             None => div()
+                                .flex_shrink_0()
                                 .text_color(rgb(FG_SECONDARY()))
                                 .child(self.keymap.display(action)),
                         })
