@@ -260,7 +260,7 @@ fn a_project_keeps_its_subtitles_across_a_save() {
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 16\n"), "{text}");
+    assert!(text.starts_with("edith 20\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the reference is written relative, and no cue is: {text}"
@@ -1251,7 +1251,7 @@ fn subtitle_lanes_and_their_captions_survive_a_save() {
     let project = dir.join("cut.edith");
     session.save_project(&project).expect("save");
     let text = std::fs::read_to_string(&project).expect("read the project back");
-    assert!(text.starts_with("edith 16\n"), "{text}");
+    assert!(text.starts_with("edith 20\n"), "{text}");
     assert!(
         text.contains("\nsub 1 10 45 0 500000 1500000\n"),
         "the placement is one line: where it sits, how long, whose words, and \
@@ -1317,7 +1317,7 @@ fn a_version_14_project_keeps_its_palette_and_places_nothing() {
     let now = dir.join("new.edith");
     loaded.save_project(&now).expect("save");
     let text = std::fs::read_to_string(&now).expect("read back");
-    assert!(text.starts_with("edith 16\n"), "{text}");
+    assert!(text.starts_with("edith 20\n"), "{text}");
     assert!(
         text.contains("\nsubtitle - test_subs.srt\n"),
         "the row survives the migration: {text}"

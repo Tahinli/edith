@@ -291,7 +291,7 @@ fn a_version_1_project_loads_fully_grouped_and_saves_as_version_7() {
     let v2 = dir.join("new.edith");
     loaded.save_project(&v2).expect("save");
     let text = std::fs::read_to_string(&v2).expect("read back");
-    assert!(text.starts_with("edith 16\n"), "{text}");
+    assert!(text.starts_with("edith 20\n"), "{text}");
     assert!(
         text.contains("\nresolution 1280 720\n"),
         "a project with no resolution of its own is saved at source 0's: {text}"
