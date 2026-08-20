@@ -423,12 +423,19 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
     // first tick at or after the bed's left edge to the bed's right edge.
     // Guarded on `pps > 0` -- a zero scale (no session yet) has no interval
     // that ever advances past the bed's own width, which would loop forever.
+    // FAULT 4: the playhead timecode plate is pinned at `left_0`..`PLATE_W`
+    // over the ruler (DESIGN §5), so a tick whose label would land under it
+    // is suppressed here rather than drawn and overlapped -- the plate
+    // already owns that lane.
     let mut ticks = Vec::new();
     if scale.pps > 0. {
         let interval = tick_interval(scale.pps);
         let mut t = (scale.start / interval).ceil() * interval;
         while scale.px_at(t) <= bed_w {
-            ticks.push((scale.px_at(t).max(0.), tick_mmss(t)));
+            let x = scale.px_at(t).max(0.);
+            if x >= PLATE_W {
+                ticks.push((x, tick_mmss(t)));
+            }
             t += interval;
         }
     }
