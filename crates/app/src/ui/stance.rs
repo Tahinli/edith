@@ -596,6 +596,30 @@ fn dock(player: &Player, dock_w: f32, window_h: Pixels, cx: &mut Context<Player>
         .child(dock_stance::render(player, dock_w, window_h, cx))
 }
 
+/// A zero-size element whose only job is `window.on_mouse_event`'s door:
+/// `Interactivity`'s fluent `on_mouse_*` builders (the ones `render`'s root
+/// div uses for the drag itself, just below) have no `MouseExitEvent` case,
+/// so this is the lowest rung that reaches it -- registered fresh every
+/// frame, the same way `canvas()` is already used elsewhere in this crate
+/// for paint-time access `div()` does not expose. See
+/// [`Player::drag_left_window`] for why this event, and not a release, is
+/// what a seam drag ending outside the window is saved on.
+fn mouse_exit_listener(cx: &mut Context<Player>) -> impl IntoElement {
+    let player = cx.entity();
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            window.on_mouse_event(move |_: &MouseExitEvent, phase, _window, cx| {
+                if phase == gpui::DispatchPhase::Bubble {
+                    player.update(cx, |this, cx| this.drag_left_window(cx));
+                }
+            });
+        },
+    )
+    .absolute()
+    .size(px(0.))
+}
+
 /// The whole stance: spine, screen, time band, bench, ledger, dock, in the
 /// order DESIGN §5 draws them, over the same key handler the legacy tree
 /// uses (DESIGN §12 step 3): the darkroom draws its own regions but answers
@@ -769,6 +793,7 @@ pub(crate) fn render(
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
+        .child(mouse_exit_listener(cx))
         .child(spine(player, cx))
         .child(
             div()
