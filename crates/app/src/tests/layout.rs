@@ -1817,6 +1817,35 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
     );
 }
 
+/// The previous test asserted lane ROWS fit the bench column -- not that a
+/// lane's own CONTENT fits its row, which is how the defect it fixed
+/// survived it: at the old `LANE_MIN_H` of `18.` both lanes fit the bench
+/// exactly while V1's status dot silently overflowed into A1's row (masked)
+/// and A1's overflowed into the ledger (visible, since A1 has no next row).
+/// This binary carries no `TestAppContext` to mount a real `lane_row` and
+/// read its painted bounds back, so this recomputes the label's own line
+/// box from the constants `lane_row` actually draws with (gpui's default
+/// `TextStyle::line_height` is the golden ratio, not 1x the font size --
+/// see `LANE_MIN_H`'s own doc comment) rather than a literal, so a future
+/// shrink of `LANE_MIN_H` or growth of the label size fails this instead of
+/// silently clipping the last lane again.
+#[test]
+fn a_lane_row_fits_what_its_own_head_draws() {
+    use crate::ui::bench_stance::{LANE_DOT_D, LANE_HEAD_GAP, LANE_MIN_H};
+    use crate::ui::type_scale::CHORD_METADATA_MIN_PX;
+
+    let label_line_h = (CHORD_METADATA_MIN_PX * 1.618_034).round();
+    let content = label_line_h + LANE_HEAD_GAP + LANE_DOT_D;
+    assert!(
+        LANE_MIN_H >= content,
+        "LANE_MIN_H ({LANE_MIN_H}) is shorter than what a lane head actually \
+         draws ({content}px: {label_line_h}px label line box + \
+         {LANE_HEAD_GAP}px gap + {LANE_DOT_D}px dot) -- the status dot \
+         would spill past the row, invisible until it is the last lane \
+         with no next row to spill into"
+    );
+}
+
 /// The notice plate's own anchor ([`crate::ui::stance::notice_bottom_offset`])
 /// keeps it off the bench, at *any* bench height -- not merely the floor --
 /// because its bottom offset always lands at or above the bench's own top
