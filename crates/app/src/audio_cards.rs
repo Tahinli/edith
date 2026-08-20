@@ -119,6 +119,21 @@ pub(crate) const EQ_FREQ_HIGH: f32 = 20_000.;
 /// and short enough that the card still fits a 360 px window.
 pub(crate) const EQ_GRAPH_H: f32 = 132.;
 
+/// The curve box maximized: 1 dB and a semitone-ish band of frequency both
+/// read as more pixels than the docked floor spends on them -- the same
+/// curve, the same ±12 dB axis and the same 20 Hz-20 kHz sweep, just spread
+/// over more of the vertical resolution a maximized card borrows from the
+/// bench/ledger rows below the picture ([`crate::ui::stance::below_picture_floor`]).
+pub(crate) const EQ_GRAPH_MAX_H: f32 = 320.;
+
+/// The graph's own height for the card's current size: the docked floor, or
+/// the maximized card's own taller box -- never a CSS scale of the same
+/// pixels, an actually taller curve with more room per decibel and per
+/// decade.
+pub(crate) fn eq_graph_h(maximized: bool) -> f32 {
+    if maximized { EQ_GRAPH_MAX_H } else { EQ_GRAPH_H }
+}
+
 /// How wide the equalizer card is allowed to get. It is the one card that is a
 /// *graph*: every pixel across is frequency resolution, and at the 320 px the
 /// other cards use, a third of an octave was a couple of pixels. Past this the

@@ -51,13 +51,56 @@ fn dark_row_value(text: impl Into<SharedString>) -> Div {
 /// directly); now it rides a `?` glyph beside the head and only shows on
 /// hover, the same hover-only convention [`dock_stance::ghost_verb`]
 /// already uses for a verb's own description.
-fn dark_card_head(verb: &str, meta: Option<SharedString>, help: Option<SharedString>) -> Div {
+/// `maximize` is `None` for the one card this head builds that is not one of
+/// the seven param cards (the export progress sheet): everything else passes
+/// `Some(self.card_maximized)` and gets the affordance this session's
+/// complaint asked for -- worn on the head (DESIGN.md:91's "chord is worn"),
+/// so it never was a keyboard-only option (the repeated "some options are
+/// only reachable via keyboard shortcut" complaint). A double-click anywhere
+/// on the head does the same thing the glyph's click and the `m` chord do
+/// ([`Player::toggle_maximize`]) -- mouse and key reach the same switch.
+fn dark_card_head(
+    verb: &str,
+    meta: Option<SharedString>,
+    help: Option<SharedString>,
+    maximize: Option<bool>,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     div()
+        .id("card-head")
         .flex_none()
         .px(px(6.))
         .flex()
         .items_baseline()
         .gap(px(6.))
+        .when(maximize.is_some(), |d| {
+            d.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    if event.click_count >= 2 {
+                        this.toggle_maximize();
+                        cx.notify();
+                    }
+                }),
+            )
+        })
+        .children(maximize.map(|max| {
+            div()
+                .id("card-head-maximize")
+                .flex_none()
+                .cursor_pointer()
+                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .text_color(rgb(INK3()))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.toggle_maximize();
+                    cx.notify();
+                }))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| OverlayTip(if max { "m -- back to the room".into() } else { "m -- fills the room".into() }))
+                        .into()
+                })
+                .child(if max { "▣ m" } else { "⤢ m" })
+        }))
         .child(
             div()
                 .type_style(type_scale::head())
@@ -1094,7 +1137,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Exporting", None, None)))
+                        .when(dark, |d| d.child(dark_card_head("Exporting", None, None, None, cx)))
                         .when(!dark, |d| d.child(div().flex_none().px(px(6.)).child("Exporting")))
                         // The bar itself: the same number as the percentage
                         // below it, and it only ever moves forward -- the
@@ -1335,7 +1378,7 @@ impl Player {
             .id("eq-graph")
             .relative()
             .flex_none()
-            .h(px(EQ_GRAPH_H))
+            .h(px(eq_graph_h(dark && self.card_maximized)))
             .rounded(px(3.))
             .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
             .cursor_pointer()
@@ -1468,6 +1511,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1486,7 +1530,7 @@ impl Player {
                         // of the window. The two cards beside it are built this
                         // way for the same reason.
                         .w_full()
-                        .max_w(px(eq_card_w(f32::from(viewport.width))))
+                        .max_w(px(eq_card_w(f32::from(viewport.width), self.card_maximized)))
                         // And a cap the other way, for the same reason the width
                         // has one: the card is docked in a column now, and at the
                         // 360 px floor it is taller than that column -- its title
@@ -1519,7 +1563,9 @@ impl Player {
                                     d.child(dark_card_head(
                                         "Equalizer",
                                         Some(format!("{} clip {}", lane.label(), idx + 1).into()),
-                                        Some("drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()),
+                                        Some("drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum, m fills the room; a click away or esc closes".into()),
+                                        Some(self.card_maximized),
+                                        cx,
                                     ))
                                 })
                                 .when(!dark, |d| {
@@ -1871,7 +1917,7 @@ impl Player {
     /// the decoder is grading with, never a copy that could drift from it. The
     /// graph above them is counted off the frame that came *back* through that
     /// grade ([`histogram`]), so pulling exposure tilts it while the hand moves.
-    pub(crate) fn color_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn color_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.color_open?;
         let params = self.color_params();
         let dark = self.darkroom;
@@ -1970,6 +2016,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1982,7 +2029,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(COLOR_W))
+                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -1992,7 +2039,7 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Colour", Some(head_meta.clone()), Some(help_text.into())))
+                            d.child(dark_card_head("Colour", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2062,7 +2109,7 @@ impl Player {
     /// The transform card: [`color_card`](Self::color_card)'s own shape, one
     /// row per [`TRANSFORM_BANDS`] entry instead of four, and no histogram --
     /// there is nothing here a graded frame would tilt.
-    pub(crate) fn transform_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn transform_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.transform_open?;
         let params = self.transform_params();
         let dark = self.darkroom;
@@ -2152,6 +2199,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2163,7 +2211,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(TRANSFORM_W))
+                        .max_w(px(card_max_w(TRANSFORM_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2173,7 +2221,7 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Transform", Some(head_meta.clone()), Some(help_text.into())))
+                            d.child(dark_card_head("Transform", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2236,7 +2284,7 @@ impl Player {
     ///
     /// Honest about what it does: the sound is *resampled*, so the pitch goes up
     /// with the rate, which is what the tape in the title means.
-    pub(crate) fn speed_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn speed_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.speed_open?;
         let speed = self.card_speed();
         let session = self.session.as_ref()?;
@@ -2290,6 +2338,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2302,7 +2351,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(COLOR_W))
+                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2312,7 +2361,7 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()), Some(help_text.into())))
+                            d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
@@ -2401,7 +2450,7 @@ impl Player {
     /// move it too. The rows scroll rather than the card growing past the
     /// window -- a timeline may hold more tracks than a 360 px window has room
     /// for faders.
-    pub(crate) fn mix_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn mix_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.mix_open {
             return None;
         }
@@ -2523,6 +2572,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2535,7 +2585,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(COLOR_W))
+                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .max_h(px(360. - 24.))
                         .flex()
@@ -2545,7 +2595,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| d.child(dark_card_head("Mix", None, Some(help_text.into()))))
+                        .when(dark, |d| d.child(dark_card_head("Mix", None, Some(help_text.into()), Some(self.card_maximized), cx)))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2598,7 +2648,7 @@ impl Player {
     /// card's shape for the same reason: app-global, kept in a file beside
     /// the theme, and drawn straight off `self.sub_text` / `self.sub_family`
     /// so a change is on the cue underneath before the card is closed.
-    pub(crate) fn subtitle_style_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn subtitle_style_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if !self.subtitle_style_open {
             return None;
         }
@@ -2727,6 +2777,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2738,7 +2789,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(COLOR_W))
+                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .max_h(px(360. - 24.))
                         .flex()
@@ -2749,7 +2800,7 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Subtitle style", None, Some(help_text.into())))
+                            d.child(dark_card_head("Subtitle style", None, Some(help_text.into()), Some(self.card_maximized), cx))
                         })
                         .when(!dark, |d| {
                             d.child(
@@ -2791,7 +2842,7 @@ impl Player {
     /// *about* the timeline -- the marks under it are the whole preview -- so
     /// the bed stays readable and the card sits up in the picture area rather
     /// than over the lanes.
-    pub(crate) fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    pub(crate) fn silence_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let dark = self.darkroom;
         let cfg = self.silence;
@@ -2971,6 +3022,7 @@ impl Player {
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
                 .bg(rgba(SCRIM_LIGHT()))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
                 // Click away closes it, as on every card here -- and the marks
                 // go with it, which is what makes this one a call and not a flag.
                 .on_mouse_down(
@@ -2984,7 +3036,7 @@ impl Player {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(COLOR_W))
+                        .max_w(px(card_max_w(COLOR_W, self.card_maximized, f32::from(viewport.width))))
                         .on_mouse_down(MouseButton::Left, swallow)
                         .flex()
                         .flex_col()
@@ -2994,7 +3046,7 @@ impl Player {
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .when(dark, |d| {
-                            d.child(dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into())))
+                            d.child(dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
                         })
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
