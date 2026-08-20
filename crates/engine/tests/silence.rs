@@ -36,8 +36,8 @@ fn fixture() -> Project {
 /// is one no save could load: this is that check, through the same door a load
 /// takes.
 fn loadable(project: &Project) {
-    let (sources, lanes, eq, color) = project.without_orphan_sources();
-    Project::from_parts(sources, lanes, eq, color).expect("the lanes still load");
+    let (sources, lanes, eq, color, transform) = project.without_orphan_sources();
+    Project::from_parts(sources, lanes, eq, color, transform).expect("the lanes still load");
 }
 
 fn spans(project: &Project) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
@@ -150,6 +150,7 @@ fn speed_mode_refuses_a_clip_that_laps_over_a_silence() {
         color: None,
         fit: Default::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     assert!(p.place(lane, 40, broll));
     let before = spans(&p);
@@ -188,6 +189,7 @@ fn whole(source: usize, frames: u32) -> Clip {
         color: None,
         fit: Default::default(),
         speed: Speed::NORMAL,
+        transform: None,
     }
 }
 
@@ -370,7 +372,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
     // same dialect it always was -- no wire change went with this feature.
     let dir = Scratch::dir("edith-silence");
     let file = dir.join("cut.edith");
-    let (sources, lanes, eq, color) = p.without_orphan_sources();
+    let (sources, lanes, eq, color, transform) = p.without_orphan_sources();
     engine::edith::save(
         &file,
         &sources,
@@ -380,6 +382,7 @@ fn scanning_a_clip_and_cutting_what_it_finds() {
         p.subtitles(),
         &eq,
         &color,
+        &transform,
         (1920, 1080),
         None,
         p.tone(),

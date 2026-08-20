@@ -76,6 +76,7 @@ fn clip(start: u32, in_frame: u32, out_frame: u32) -> Clip {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::Fit,
         speed: Speed::NORMAL,
     }
