@@ -855,9 +855,10 @@ impl Player {
     /// card it opens with no timeline required and nothing to refuse.
     /// Opens the settings page (PROJECT rows beside EDITOR rows,
     /// `ui::settings_stance`): the one door for "edit project and editor
-    /// settings" -- always answerable, since the oracle treats it like
-    /// `Theme` (`oracle.rs`), and refused only while an export is running,
-    /// same as every other card here.
+    /// settings" -- refused while an export is running, same as every other
+    /// card here, since the exporting card owns this same modal slot
+    /// (`oracle.rs` agrees: `ActionId::Settings` is `No` there too, for the
+    /// same reason).
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         if self.exporting().is_some() {
             return;

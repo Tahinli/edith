@@ -799,6 +799,10 @@ fn main() {
     // The subtitle style the last session picked, same silence on a missing
     // or unreadable file.
     let (sub_family, sub_text) = load_subtitle_style();
+    // The auto-proxies default the last session left the switch at, before
+    // any project's own line ([`engine::edith::Document::auto_proxy`])
+    // overrides it the moment one opens.
+    let auto_proxies_on = player::library::load_auto_proxies_pref();
     // Nothing named on the command line is read here. The first file makes the
     // timeline -- a `.edith` restores a whole one, anything else *is* one --
     // and the rest are imports like any other: rows in the library, dragged
@@ -873,7 +877,7 @@ fn main() {
                     // What a session comes up at, so the first one opened is
                     // pushed the values it already holds.
                     proxies_on: false,
-                    auto_proxies_on: true,
+                    auto_proxies_on,
                     // Only ever used with a timeline; 30 keeps the empty
                     // timecode reading in frames rather than in NaN.
                     fps: 30.,
