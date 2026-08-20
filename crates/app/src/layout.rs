@@ -445,9 +445,13 @@ pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
 /// gap). Below this the `bench-lanes` column asks for more height than
 /// `bench-content`'s flex_1 gives it, and since that column scrolls rather
 /// than clips visibly, the shortfall comes off the bottom row's own pixels
-/// unscrolled -- A1's clip-bar border and status dot, first. At the old
-/// literal `80.` the shortfall was `82. - 80. == 2.`, the exact ~2px clip
-/// this floor now closes.
+/// unscrolled -- A1's clip-bar border and status dot, first. `LANE_MIN_H`
+/// itself is now derived from what a lane head actually draws (its own
+/// doc comment), not a number copied from nowhere: an earlier floor of
+/// `82.` used a `LANE_MIN_H` of `18.` that fit only the lane label and let
+/// every lane's status dot overflow into the row beneath it, invisible
+/// everywhere but the last lane, which has no next row to spill into and
+/// clipped straight into the ledger instead.
 pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
     + crate::ui::bench_stance::RULER_H
     + crate::ui::bench_stance::ROW_GAP
