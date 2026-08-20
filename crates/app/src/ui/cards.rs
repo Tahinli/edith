@@ -76,7 +76,7 @@ fn dark_card_head(verb: &str, meta: Option<SharedString>, help: Option<SharedStr
                 .flex_none()
                 .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
                 .text_color(rgb(INK3()))
-                .tooltip(move |_, cx| cx.new(|_| Tip(h.clone())).into())
+                .tooltip(move |_, cx| cx.new(|_| OverlayTip(h.clone())).into())
                 .child("?")
         }))
 }
