@@ -66,6 +66,7 @@ fn clip(start: u32, source: usize, frames: u32) -> Clip {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn project(audio: Vec<Clip>) -> Project {
             (LaneKind::Video, vec![clip(0, 0, frames)]),
             (LaneKind::Audio, audio),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -243,6 +245,7 @@ fn a_lane_is_equalized_before_the_mix_and_never_after_it() {
             (LaneKind::Audio, vec![clip(0, 0, 30)]),
             (LaneKind::Audio, vec![clip(0, 0, 30)]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )

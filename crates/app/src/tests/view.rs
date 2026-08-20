@@ -157,6 +157,7 @@ fn the_marks_are_every_lane_the_playhead_and_the_start() {
         link,
         eq: None,
         color: None,
+        transform: None,
         fit: Default::default(),
         speed: Default::default(),
     };

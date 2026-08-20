@@ -245,6 +245,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
@@ -255,6 +256,7 @@ fn the_mp4_copy_follows_the_lane_that_holds_the_sound() {
             (LaneKind::Audio, Vec::new()),
             (LaneKind::Audio, vec![clip]),
         ],
+        vec![],
         vec![],
         vec![],
     )
@@ -309,14 +311,15 @@ fn two_audio_lanes_are_summed() {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
     let a2 = project.add_lane(LaneKind::Audio);
     assert!(project.place(a2, TOP_IN, doubled), "place the second lane");
-    let (sources, lanes, eq, color) = project.without_orphan_sources();
+    let (sources, lanes, eq, color, transform) = project.without_orphan_sources();
     assert_eq!(lanes.len(), 3, "V1, A1 and the new A2");
-    let project = Project::from_parts(sources, lanes, eq, color).expect("valid parts");
+    let project = Project::from_parts(sources, lanes, eq, color, transform).expect("valid parts");
 
     let (meta, _) = engine::demux::Demuxer::open(&asset("test_av.mp4")).unwrap();
     let wav = |name: &str, project: Project| {
@@ -505,6 +508,7 @@ fn a_subtitle_lane_is_a_peer_and_every_media_path_refuses_it() {
     let refused = Project::from_parts(
         vec![Source::new(asset("test_av.mp4"), 0)],
         vec![(LaneKind::Subtitle, vec![clip])],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
