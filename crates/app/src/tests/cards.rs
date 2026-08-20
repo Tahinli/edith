@@ -37,6 +37,64 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
 }
 
 #[test]
+fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
+    // Every field/method `Player::modal()` reads, pulled from its own body
+    // rather than hand-copied -- a hand-copied list is exactly the shape
+    // that let three cards go modal with nothing mounted (GAP 2): the field
+    // was in `modal()` and nowhere in this test.
+    let modal_body = fn_body("modal");
+    let mut fields = Vec::new();
+    for chunk in modal_body.split("self.").skip(1) {
+        let name: String = chunk
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !fields.contains(&name) {
+            fields.push(name);
+        }
+    }
+    assert!(fields.len() >= 9, "modal()'s own field list looks too short to have been parsed: {fields:?}");
+    // The mounted-surface function each field's own card draws, by the
+    // convention the param cards already follow (`x_open` -> `x_card(` --
+    // `Player::eq_card`/`color_card`/... in `ui/cards.rs`). `keys_open` and
+    // `export_open`/`exporting` don't follow that convention (the keys
+    // overlay isn't a "card", export pairs with the running-export sheet),
+    // so they're named explicitly. Anything else unmapped panics loudly --
+    // the point is that a ninth card has to earn a line here, not just a
+    // mount, or this test cannot see it.
+    let mount_for = |field: &str| -> &'static str {
+        match field {
+            "keys_open" => "keys_overlay(",
+            "export_open" => "export_card(",
+            "exporting" => "export_progress_card(",
+            "eq_open" => "eq_card(",
+            "color_open" => "color_card(",
+            "transform_open" => "transform_card(",
+            "speed_open" => "speed_card(",
+            "silence_open" => "silence_card(",
+            "mix_open" => "mix_card(",
+            "subtitle_style_open" => "subtitle_style_card(",
+            other => panic!(
+                "Player::modal() now reads `self.{other}` with no entry in this test's \
+                 mount_for map -- add one naming the function that mounts its surface in \
+                 the darkroom (ui/stance.rs or ui/dock_stance.rs), or the room can go modal \
+                 over it with nothing drawn (the silence/mix/subtitle-style bug, GAP 2)."
+            ),
+        }
+    };
+    let haystack = format!("{}\n{}", src_text("ui/stance.rs"), src_text("ui/dock_stance.rs"));
+    for field in &fields {
+        let mount = mount_for(field);
+        assert!(
+            haystack.contains(mount),
+            "Player::modal()'s `self.{field}` makes overlaid() true, but the darkroom never \
+             mounts `{mount}` in ui/stance.rs or ui/dock_stance.rs -- pressing its key opens \
+             an invisible modal (GAP 2)."
+        );
+    }
+}
+
+#[test]
 fn a_bare_escape_leaves_player_fullscreen_before_anything_under_it() {
     // Fires while the picture-only layout is up, on the same bare escape
     // every menu and preview close on -- and only that key: a chord, or an

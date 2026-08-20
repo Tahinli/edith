@@ -45,7 +45,19 @@ thread_local! {
 /// `action` through [`Player::act`] the same way `stance::ghost` (spine) and
 /// `spine_stance`'s own ghost already do, `id` making the three transport
 /// ghosts distinct elements gpui can track.
-fn ghost(id: &'static str, player: &Player, glyph: &str, action: ActionId, cx: &mut Context<Player>) -> impl IntoElement {
+/// `active` (added alongside the volume/loop cluster this task adds) tints
+/// the glyph `ink1` instead of `ink2` -- the same on/off convention
+/// `spine_stance::glyph` already uses for loop-trim -- so a toggle sitting
+/// in this band (`Loop`, `ToggleMute`) can show its own state without a
+/// second widget shape.
+fn ghost(
+    id: &'static str,
+    player: &Player,
+    glyph: impl Into<SharedString>,
+    action: ActionId,
+    active: bool,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let glyph_style = label(type_scale::HERO_TIMECODE_PX, FontWeight::MEDIUM);
     // The chord names a key, so DESIGN §3's mono rule ("if a string is about
     // ... a key, it is mono") applies here same as everywhere else in the band.
@@ -63,8 +75,8 @@ fn ghost(id: &'static str, player: &Player, glyph: &str, action: ActionId, cx: &
         }))
         .font(glyph_style.font)
         .text_size(glyph_style.size)
-        .text_color(rgb(INK2()))
-        .child(glyph.to_string())
+        .text_color(rgb(if active { INK1() } else { INK2() }))
+        .child(glyph.into())
         .child(
             div()
                 .font(chord_style.font)
@@ -504,6 +516,7 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     player,
                     "◀◀",
                     ActionId::JumpBack,
+                    false,
                     cx,
                 ))
                 .child(ghost(
@@ -511,6 +524,7 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     player,
                     if player.transport().is_playing() { "❚❚" } else { "▶" },
                     ActionId::Play,
+                    false,
                     cx,
                 ))
                 .child(ghost(
@@ -518,10 +532,96 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
                     player,
                     "▶▶",
                     ActionId::JumpForward,
+                    false,
+                    cx,
+                ))
+                // Loop (homeless per this task's audit): the playback-loop
+                // toggle -- burst-use during editing per the charter's own
+                // classification -- earns the transport cluster it plays
+                // alongside, not the CUT group's `LoopTrim` two files over
+                // (a different verb already drawn on the spine, "↻" taken).
+                // "∞" reads as "keeps going" without borrowing that glyph.
+                .child(ghost(
+                    "stance-tb-loop",
+                    player,
+                    "∞",
+                    ActionId::Loop,
+                    player.loop_on,
                     cx,
                 )),
         )
+        // The audio-monitoring cluster (homeless per this task's audit):
+        // ToggleMute/VolumeUp/VolumeDown, burst-use per the charter, placed
+        // beside the transport it plays with rather than the spine (the
+        // rail is already tightened, and this is a play-time concern, same
+        // land as J/spc/L above it). The level itself is the mute button's
+        // own label (legacy `toolbar.rs`'s own convention: an "×" prefix
+        // marks muted rather than a second colour), so one click toggles
+        // mute and the two ghosts flanking it nudge the level -- three
+        // homeless actions sharing one cluster rather than three unrelated
+        // rows.
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(ghost("stance-tb-vol-down", player, "−", ActionId::VolumeDown, false, cx))
+                .child(ghost(
+                    "stance-tb-mute",
+                    player,
+                    if player.volume.muted {
+                        format!("× {}%", player.volume.percent())
+                    } else {
+                        format!("{}%", player.volume.percent())
+                    },
+                    ActionId::ToggleMute,
+                    player.volume.muted,
+                    cx,
+                ))
+                .child(ghost("stance-tb-vol-up", player, "+", ActionId::VolumeUp, false, cx)),
+        )
         .child(cut_readout(player))
         .child(contact_strip(player, position, cx))
+        .child(save_verb(player, cx))
         .child(export_chip(player, cx))
+}
+
+/// `Save` (homeless per this task's audit): not boxed -- DESIGN §4 reserves
+/// the room's one border for the commit-class Export beside it -- but filed
+/// right next to it anyway. `keymap.rs`'s own `Category::File` already
+/// files Save beside Export and Screenshot on the strength of what each one
+/// writes, and the ledger this task named as Save's natural home
+/// (`name.edith · saved`/`unsaved`) lives in `stance.rs`, a concurrent
+/// builder's file this task does not touch -- so the verb lands here
+/// instead, a ghost sharing the export chip's own end-of-band land rather
+/// than competing with the ledger strip below it for the same state.
+fn save_verb(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
+    div()
+        .id("stance-tb-save")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .cursor_pointer()
+        .hover(|s| s.text_color(rgb(INK1())))
+        .text_color(rgb(INK2()))
+        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.act(ActionId::Save, window, cx);
+        }))
+        .child(
+            div()
+                .font(label_style.font)
+                .text_size(label_style.size)
+                .child("Save"),
+        )
+        .child(
+            div()
+                .font(chord_style.font)
+                .text_size(chord_style.size)
+                .text_color(rgb(INK3()))
+                .child(player.keymap.chord(ActionId::Save)),
+        )
 }

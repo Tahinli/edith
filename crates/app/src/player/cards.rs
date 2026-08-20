@@ -1464,4 +1464,200 @@ impl Player {
             })
             .map_or(0, |(i, _)| i)
     }
+
+    /// Every param card's own key branch (EQ, Colour, Transform, Speed,
+    /// Silence, Mix, Subtitle style), factored out of the legacy tree's
+    /// `render.rs` handler so a second stance (`ui/stance.rs`) can drive the
+    /// same cards without a second, divergent copy of this logic -- the
+    /// defect class DESIGN §6's "drag while playing... `r` resets" was
+    /// missing from the darkroom for. Returns `true` when a card was open
+    /// and ate the key, the caller's cue to `cx.notify()` and stop exactly
+    /// where each of these branches used to `return` inline.
+    pub(crate) fn param_card_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        if self.eq_open.is_some() {
+            if key == ESCAPE {
+                // Nothing to undo: every change is already at the clip, and
+                // undo is undo's own key.
+                self.eq_open = None;
+                self.eq_dragging = false;
+            } else if key == "up" {
+                self.nudge_band(|b| b.gain_db += EQ_STEP, cx);
+            } else if key == "down" {
+                self.nudge_band(|b| b.gain_db -= EQ_STEP, cx);
+            } else if key == "left" && shift {
+                self.nudge_band(|b| b.q /= EQ_Q_STEP, cx);
+            } else if key == "right" && shift {
+                self.nudge_band(|b| b.q *= EQ_Q_STEP, cx);
+            } else if key == "left" {
+                self.nudge_band(|b| b.freq_hz /= EQ_FREQ_STEP, cx);
+            } else if key == "right" {
+                self.nudge_band(|b| b.freq_hz *= EQ_FREQ_STEP, cx);
+            } else if key == "r" {
+                for band in &mut self.eq_params.bands {
+                    band.gain_db = 0.;
+                }
+                self.commit_eq(cx);
+            } else if key == "f" {
+                // This one band back to flat, which is the undo of one hand
+                // movement -- `r` is the undo of the whole card.
+                self.nudge_band(|b| b.gain_db = 0., cx);
+            } else if key == "a" {
+                self.add_band(cx);
+            } else if key == "x" {
+                self.remove_band(cx);
+            } else if key == "s" {
+                // The analyser off and on. Nothing is committed: it is what
+                // the card *shows*, so it survives no further than this
+                // window.
+                self.eq_spectrum = !self.eq_spectrum;
+            } else if let Ok(digit) = key.parse::<usize>() {
+                // As the keys are laid out: 1-9 then 0 for the tenth, which
+                // is the cap ([`EQ_BANDS_MAX`]). A digit past the last band
+                // picks nothing rather than panics.
+                let band = match digit {
+                    0 => EQ_BANDS_MAX - 1,
+                    n => n - 1,
+                };
+                if band < self.eq_params.bands.len() {
+                    self.eq_band = band;
+                }
+            }
+            return true;
+        }
+        // The colour card owns the keyboard the same way the export card
+        // does, and its keys mean nothing outside it: the arrows pick a
+        // slider and move it, and `r` takes the grade off. Not keymap
+        // bindings for exactly that reason -- see `FIXED`, where the keys
+        // menu still lists them.
+        if self.color_open.is_some() {
+            match color_key(key) {
+                Some(ColorKey::Close) => {
+                    self.color_open = None;
+                    self.color_dragging = false;
+                }
+                Some(ColorKey::Band(step)) => {
+                    self.color_band = (self.color_band + step) % COLOR_BANDS.len();
+                }
+                Some(ColorKey::Nudge(steps)) => self.nudge_color(steps, cx),
+                Some(ColorKey::Reset) => {
+                    self.set_color(ColorParams::default(), cx);
+                }
+                None => {}
+            }
+            return true;
+        }
+        // The transform card, the same way again: the arrows pick a slider
+        // and move it, and `r` puts the placement back to identity.
+        // Card-local, [`ActionId::Color`]'s own reason (see `FIXED`, where
+        // the keys menu still lists them).
+        if self.transform_open.is_some() {
+            let n = TRANSFORM_BANDS.len();
+            if key == ESCAPE {
+                self.transform_open = None;
+                self.transform_dragging = false;
+            } else if key == "down" {
+                self.transform_band = (self.transform_band + 1) % n;
+            } else if key == "up" {
+                self.transform_band = (self.transform_band + n - 1) % n;
+            } else if key == "right" {
+                self.nudge_transform(1., cx);
+            } else if key == "left" {
+                self.nudge_transform(-1., cx);
+            } else if key == "r" {
+                self.set_transform(TransformParams::default(), cx);
+            }
+            return true;
+        }
+        // The speed card, the same way again: its arrows move the rate and
+        // `r` puts it back to real time, and neither means anything outside
+        // the card -- so neither is a binding (see `FIXED`, where the keys
+        // menu still lists them).
+        if self.speed_open.is_some() {
+            match color_key(key) {
+                Some(ColorKey::Close) => {
+                    self.speed_open = None;
+                    self.speed_dragging = false;
+                }
+                // The card has one value, so the pair that picks a slider on
+                // the colour card moves this one by a whole preset's worth
+                // instead of a step.
+                Some(ColorKey::Band(step)) => self.nudge_speed(if step == 1 { -2 } else { 2 }, cx),
+                Some(ColorKey::Nudge(steps)) => self.nudge_speed(steps as i32, cx),
+                Some(ColorKey::Reset) => self.set_speed(Speed::NORMAL, cx),
+                None => {}
+            }
+            return true;
+        }
+        // The silence card, the same way again: the arrows pick one of its
+        // rows and move it, and its two apply keys are the two things it can
+        // do to the timeline. Card-local, every one of them -- and listed in
+        // the keys menu (keymap.rs `FIXED`), because a key that cuts forty
+        // places at once is not a secret.
+        if self.silence_open.is_some() {
+            if key == ESCAPE {
+                // Nothing to undo: a preview is not an edit.
+                self.close_silence();
+            } else if key == "down" {
+                self.silence_field = (self.silence_field + 1) % SILENCE_ROWS;
+            } else if key == "up" {
+                self.silence_field = (self.silence_field + SILENCE_ROWS - 1) % SILENCE_ROWS;
+            } else if key == "right" {
+                self.nudge_silence(1);
+            } else if key == "left" {
+                self.nudge_silence(-1);
+            } else if key == "enter" {
+                self.cut_silences(cx);
+            } else if key == "f" {
+                self.speed_silences(cx);
+            }
+            return true;
+        }
+        // The mix card, the same way again: up/down pick a row -- a track's
+        // fader, the limiter's ceiling or its switch -- and left/right move
+        // it, held or pressed. Card-local like the four above it.
+        if self.mix_open {
+            let rows = self.mix_lanes().len() + MIX_MASTER_ROWS;
+            if key == ESCAPE {
+                self.mix_open = false;
+            } else if key == "down" {
+                self.mix_field = (self.mix_field + 1) % rows;
+            } else if key == "up" {
+                self.mix_field = (self.mix_field + rows - 1) % rows;
+            } else if key == "right" {
+                self.nudge_mix(1, cx);
+            } else if key == "left" {
+                self.nudge_mix(-1, cx);
+            }
+            return true;
+        }
+        // The subtitle style card, the same way again: row 0 is the size
+        // stepper (left/right moves it, held or pressed, the mix card's
+        // rule) and every row after it a family in `subtitle_fonts` --
+        // up/down walk the whole list and `enter` picks the one the arrows
+        // are on, since a hand with no mouse still has to be able to leave
+        // the platform default.
+        if self.subtitle_style_open {
+            // Row 0 is the size stepper, row 1 the platform default, and
+            // every row after it a family in `subtitle_fonts`.
+            let rows = 2 + self.subtitle_fonts.len();
+            if key == ESCAPE {
+                self.subtitle_style_open = false;
+            } else if key == "down" {
+                self.subtitle_style_field = (self.subtitle_style_field + 1) % rows;
+            } else if key == "up" {
+                self.subtitle_style_field = (self.subtitle_style_field + rows - 1) % rows;
+            } else if key == "right" {
+                self.nudge_sub_size(1, cx);
+            } else if key == "left" {
+                self.nudge_sub_size(-1, cx);
+            } else if key == "enter" && self.subtitle_style_field == 1 {
+                self.set_sub_family(None, cx);
+            } else if key == "enter" && self.subtitle_style_field > 1 {
+                let family = self.subtitle_fonts[self.subtitle_style_field - 2].clone();
+                self.set_sub_family(Some(family), cx);
+            }
+            return true;
+        }
+        false
+    }
 }
