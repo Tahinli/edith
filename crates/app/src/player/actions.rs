@@ -162,13 +162,20 @@ impl Player {
             ActionId::CancelExport => {}
             ActionId::ShowActions => self.show_actions(cx),
             ActionId::Screenshot => self.take_screenshot(cx),
-            // Cut machinery (DESIGN.md §6): keymap.rs/oracle.rs plumbing only
-            // so far -- a later task wires these to real behaviour.
-            ActionId::WalkCutNext
-            | ActionId::WalkCutPrev
-            | ActionId::TrimIn
-            | ActionId::TrimOut
-            | ActionId::LoopTrim => {}
+            // Cut machinery (DESIGN.md §6): the subject cut is the marked
+            // clip ([`Selection::anchor`]) -- the oracle already refused
+            // every one of these with nothing marked, so an anchor is here
+            // to read.
+            ActionId::WalkCutNext => self.walk_cut(true, cx),
+            ActionId::WalkCutPrev => self.walk_cut(false, cx),
+            // `[` `]` close in on the clip like the brackets they are: `[`
+            // trims a frame off the head, `]` a frame off the tail -- no-aim,
+            // frame detents, clamped to the room the engine already answers
+            // ([`nudge_edge`]), which is what makes them work at any zoom
+            // down to a 4px clip with nothing to click.
+            ActionId::TrimIn => self.nudge_cut(Edge::Start, 1, cx),
+            ActionId::TrimOut => self.nudge_cut(Edge::End, -1, cx),
+            ActionId::LoopTrim => self.toggle_loop_trim(cx),
         }
     }
 
@@ -449,6 +456,98 @@ impl Player {
         let at = frame_at(session.now(), self.fps);
         let start = self.range.map_or(at, |(s, _)| s);
         self.range = Some(ordered_range(start, at));
+        cx.notify();
+    }
+
+    /// The odometer (DESIGN.md §6, `,` `.`): the subject cut steps to its
+    /// neighbour along its own lane, [`walk_shift`](Player) striding ten
+    /// instead of one, clamped rather than wrapping at either end
+    /// ([`walk_cut`]). The playhead follows it there, which is what puts the
+    /// screen at rest on the new cut for the two-up to draw.
+    pub(crate) fn walk_cut(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let clips = session.lane_clips(lane);
+        let stride = if self.walk_shift { 10 } else { 1 };
+        let next = walk_cut(idx, clips.len(), forward, stride);
+        let at = clips.get(next).map(|c| f64::from(c.start) / self.fps);
+        self.select((lane, next), cx);
+        if let Some(at) = at {
+            self.seek(at, cx);
+        }
+    }
+
+    /// The subject cut's own span, `[start, end)` in timeline frames --
+    /// what loop-trim loops and what the odometer's readout counts against.
+    pub(crate) fn cut_span(&self, lane: Lane, idx: usize) -> Option<(u32, u32)> {
+        self.session
+            .as_ref()?
+            .lane_clips(lane)
+            .get(idx)
+            .map(|c| (c.start, c.end()))
+    }
+
+    /// The no-aim trim (DESIGN.md §6, `[` `]`): one frame detent off the
+    /// subject cut's chosen edge, clamped to the room the engine already
+    /// answers ([`nudge_edge`]) -- the same wall a pointer drag is clamped
+    /// to, so no aim and no hit-testing are needed at any zoom.
+    pub(crate) fn nudge_cut(&mut self, edge: Edge, dir: i32, cx: &mut Context<Self>) {
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Some((lo, hi)) = session.trim_room(lane, idx, edge) else {
+            return;
+        };
+        let Some(current) = session.lane_clips(lane).get(idx).map(|c| match edge {
+            Edge::Start => c.start,
+            Edge::End => c.end(),
+        }) else {
+            return;
+        };
+        let to = nudge_edge(current, dir, lo, hi);
+        self.mark_dirty();
+        let trimmed = self
+            .session
+            .as_mut()
+            .is_some_and(|s| s.trim_clip(lane, idx, edge, to));
+        if trimmed {
+            self.reset_after_reseek();
+            // Loop-trim follows the edge it is trimming: the whole point of
+            // the mode is hearing the cut as it moves.
+            if self.loop_trim.is_some() {
+                self.loop_trim = self.cut_span(lane, idx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Loop-trim (DESIGN.md §6, `/`): loops the transport around the subject
+    /// cut's own span while `[`/`]` move its edges -- the modernized Avid
+    /// trim mode. Off again drops the window and leaves playback running,
+    /// exactly as it was found.
+    pub(crate) fn toggle_loop_trim(&mut self, cx: &mut Context<Self>) {
+        if self.loop_trim.take().is_some() {
+            self.notify_user("LOOP-TRIM OFF".into());
+            cx.notify();
+            return;
+        }
+        let Some((lane, idx)) = self.selected.anchor() else {
+            return;
+        };
+        self.loop_trim = self.cut_span(lane, idx);
+        if self.loop_trim.is_some() {
+            self.notify_user("LOOP-TRIM ON — looping the subject cut while you trim".into());
+            if let Some(session) = self.active_session_mut() {
+                session.play();
+            }
+        }
         cx.notify();
     }
 

@@ -46,6 +46,17 @@ impl Player {
         let Some(session) = self.preview_session.as_mut().or(self.session.as_mut()) else {
             return;
         };
+        // Loop-trim (DESIGN.md §6): the transport is kept inside the subject
+        // cut's own span while the mode is on, so a trim can be heard and
+        // seen without a manual replay after every nudge. Checked off the
+        // engine's own clock, not a frame counter this pump keeps -- the
+        // same `now()` [`Player::step`] reads.
+        if session.is_playing()
+            && should_loop_restart(frame_at(session.now(), fps), self.loop_trim)
+        {
+            let start = self.loop_trim.map_or(0, |(lo, _)| lo);
+            session.seek(f64::from(start) / fps);
+        }
         // Whether the span now decoding has yet to hand over a picture, read
         // *before* the drain: the frame the drain is about to take is the one
         // that ends the prime, and its own lateness -- however long the span's

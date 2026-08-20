@@ -310,6 +310,92 @@ impl Player {
         }
     }
 
+    /// Two-up OUT|IN judging (DESIGN.md §6): drawn over the screen only when
+    /// the playhead rests exactly on one edge of the subject cut -- the
+    /// outgoing clip's tail beside the incoming one's head, whichever edge
+    /// the playhead is on. `None` off a cut, off the darkroom path, or with
+    /// nothing marked, so the legacy picture and a mid-clip darkroom picture
+    /// both draw untouched.
+    ///
+    /// corner-cut: each side names its neighbour (source, timecode) on a
+    /// plate rather than decoding its edge frame into a second picture --
+    /// the pixel-accurate two-up wants a frame read off the *other* clip's
+    /// span while the shown picture is the marked one's, which is a second
+    /// decode this step does not open. Upgrade path: a still pulled from the
+    /// neighbour's edge frame ([`engine::PlaybackSession::video_source_frame_at`]
+    /// is the same lookup [`Player::live_decode`] already makes) in place of
+    /// the plate's text.
+    pub(crate) fn two_up(&self) -> Option<impl IntoElement> {
+        if !self.darkroom {
+            return None;
+        }
+        let (lane, idx) = self.selected.anchor()?;
+        let session = self.session.as_ref()?;
+        let clips = session.lane_clips(lane);
+        let clip = clips.get(idx)?;
+        let now = frame_at(session.now(), self.fps);
+        let name_of = |source: usize| {
+            session
+                .sources()
+                .get(source)
+                .map_or_else(|| "?".to_string(), |s| file_name(&s.path))
+        };
+        // Which edge, if either, the playhead is resting on -- the one
+        // question "at rest on a cut" is.
+        let (out_label, in_label) = if now == clip.start {
+            let out = idx
+                .checked_sub(1)
+                .and_then(|i| clips.get(i))
+                .map_or("— nothing before it".to_string(), |c| {
+                    format!("{} @{}", name_of(c.source), c.end())
+                });
+            (out, format!("{} @{}", name_of(clip.source), clip.start))
+        } else if now == clip.end() {
+            let inn = clips
+                .get(idx + 1)
+                .map_or("— nothing after it".to_string(), |c| {
+                    format!("{} @{}", name_of(c.source), c.start)
+                });
+            (format!("{} @{}", name_of(clip.source), clip.end()), inn)
+        } else {
+            return None;
+        };
+        let plate = |label: &str, text: String| {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .p(px(8.))
+                .bg(rgb(DARK_CANVAS()))
+                .rounded(px(2.))
+                .child(
+                    div()
+                        .text_size(px(9.))
+                        .text_color(rgb(INK3()))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(INK1()))
+                        .child(text),
+                )
+        };
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .gap(px(1.))
+                .p(px(8.))
+                .child(plate("OUT", out_label))
+                .child(plate("IN", in_label)),
+        )
+    }
+
     /// What is decoding the picture right now, for the transport line: the
     /// backend is the running worker's own (it is written where a hardware
     /// session falls back to software, so this follows reality), and the codec

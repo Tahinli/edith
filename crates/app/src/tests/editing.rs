@@ -2062,3 +2062,43 @@ fn a_fade_drag_converts_pixels_to_frames_at_the_beds_scale() {
     assert_eq!(fade_delta_frames(40., 0., 25.), 0);
     assert_eq!(fade_delta_frames(40., -1., 25.), 0);
 }
+
+/// The cut odometer (DESIGN.md §6): `,` `.` walk it one cut at a time, shift
+/// strides ten, and either end holds rather than wrapping.
+#[test]
+fn walk_cut_strides_and_clamps_at_either_end() {
+    use crate::timeline_math::walk_cut;
+    assert_eq!(walk_cut(3, 10, true, 1), 4);
+    assert_eq!(walk_cut(3, 10, false, 1), 2);
+    assert_eq!(walk_cut(3, 10, true, 10), 9, "clamps at the last cut");
+    assert_eq!(walk_cut(3, 10, false, 10), 0, "clamps at the first cut");
+    assert_eq!(walk_cut(9, 10, true, 1), 9, "already at the end holds");
+    assert_eq!(walk_cut(0, 10, false, 1), 0, "already at the start holds");
+    // No cuts at all: nothing to land on.
+    assert_eq!(walk_cut(0, 0, true, 1), 0);
+}
+
+/// The no-aim trim (DESIGN.md §6): a frame detent clamped to the room the
+/// engine already answered, in either direction, and never past it.
+#[test]
+fn nudge_edge_moves_one_frame_and_clamps_to_the_room() {
+    use crate::timeline_math::nudge_edge;
+    assert_eq!(nudge_edge(50, 1, 0, 100), 51);
+    assert_eq!(nudge_edge(50, -1, 0, 100), 49);
+    assert_eq!(nudge_edge(0, -1, 0, 100), 0, "the room's own floor holds");
+    assert_eq!(nudge_edge(100, 1, 0, 100), 100, "the room's own ceiling holds");
+    // A 4px-wide clip's room can be one frame wide: still clamps, never
+    // panics on the narrow end.
+    assert_eq!(nudge_edge(5, 1, 5, 5), 5);
+}
+
+/// Loop-trim's restart (DESIGN.md §6): only once the window's far edge is
+/// reached, and never with the mode off.
+#[test]
+fn should_loop_restart_only_at_the_windows_far_edge() {
+    use crate::timeline_math::should_loop_restart;
+    assert!(!should_loop_restart(40, Some((30, 60))));
+    assert!(should_loop_restart(60, Some((30, 60))));
+    assert!(should_loop_restart(61, Some((30, 60))), "past it restarts too");
+    assert!(!should_loop_restart(60, None), "loop-trim off restarts nothing");
+}

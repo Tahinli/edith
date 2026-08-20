@@ -1743,7 +1743,10 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
     // them in it too, or the geometry above is dead prose.
     let render_body =
         &stance[stance.find("pub(crate) fn render(").expect("the stance's entry point")..];
-    let calls = ["spine()", "screen()", "time_band()", "bench()", "ledger()", "dock()"];
+    // Open paren only, no close: DESIGN §12 steps 3 and 4 hand most of the
+    // regions player/window state to read, so their call sites carry
+    // arguments now. Order is what this asserts, not arity.
+    let calls = ["spine(", "screen(", "time_band(", "bench(", "ledger(", "dock("];
     let composed: Vec<usize> = calls
         .iter()
         .map(|c| {

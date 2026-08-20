@@ -8,6 +8,7 @@
 //! later steps in DESIGN §12's package attach.
 
 use crate::*;
+use crate::ui::dock_stance;
 
 /// Left rail, full height (DESIGN §5).
 const SPINE_W: f32 = 56.;
@@ -33,9 +34,34 @@ fn section_head(label: &str) -> impl IntoElement {
         .child(label.to_uppercase())
 }
 
-/// The spine: 56px, left, full height. Every command as ghost glyph + chord
-/// lands here later, grouped by task frequency (DESIGN §5).
-fn spine() -> impl IntoElement {
+/// A ghost command (DESIGN §4): borderless glyph (`ink2`) + dim chord
+/// (`ink3`), read live off the keymap so a rebind can never leave the spine
+/// showing a stroke that no longer fires it.
+fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(2.))
+        .py(px(6.))
+        .rounded(px(3.))
+        .text_size(px(13.))
+        .text_color(rgb(INK2()))
+        .child(glyph.to_string())
+        .child(
+            div()
+                .text_size(px(9.5))
+                .text_color(rgb(INK3()))
+                .child(player.keymap.display(action)),
+        )
+}
+
+/// The spine: 56px, left, full height. Every command as ghost glyph + chord,
+/// grouped by task frequency (DESIGN §5) -- transport first (every second),
+/// then the cut machinery (DESIGN §6, every cut), then the split and the one
+/// boxed exception is left to the time band, which is where Export lives.
+fn spine(player: &Player) -> impl IntoElement {
     div()
         .id("stance-spine")
         .flex_none()
@@ -48,30 +74,53 @@ fn spine() -> impl IntoElement {
         .flex_col()
         .items_center()
         .py(px(8.))
+        .gap(px(4.))
         .child(section_head("spine"))
-        // hook: §12 step 3 -- ghost glyph + chord per command, task-frequency order.
+        .child(ghost(player, "▶", ActionId::Play))
+        .child(ghost(player, "‹", ActionId::WalkCutPrev))
+        .child(ghost(player, "›", ActionId::WalkCutNext))
+        .child(ghost(player, "[", ActionId::TrimIn))
+        .child(ghost(player, "]", ActionId::TrimOut))
+        .child(ghost(player, "↻", ActionId::LoopTrim))
+        .child(ghost(player, "✂", ActionId::Cut))
 }
 
 /// The picture region: top of the centre column, takes the remaining space,
-/// never occluded (DESIGN §5).
-fn screen() -> impl IntoElement {
+/// never occluded (DESIGN §5). Reuses [`Player::picture_area`] rather than a
+/// second image element -- the darkroom draws the same picture the legacy
+/// tree does -- and layers the two-up OUT|IN judging over it at rest on a
+/// cut (DESIGN §6).
+fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-screen")
         .flex_1()
         .min_h(px(0.))
+        .relative()
         // §4: room chrome takes 0 radius.
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(section_head("screen"))
-        // hook: §12 step 3 -- the picture, and two-up OUT|IN judging at rest on a cut.
+        .child(player.picture_area(position, window, cx))
+        .children(player.two_up())
 }
 
 /// Fixed-height strip under the screen: timecode leads, ghost transport, cut
 /// readout, the contact strip, boxed Export at the end (DESIGN §5).
-fn time_band() -> impl IntoElement {
+fn time_band(player: &Player) -> impl IntoElement {
+    let position = player.active_session().map_or(0., PlaybackSession::now);
+    let tc = timecode(position, player.active_fps());
+    // The odometer (DESIGN §6): the subject cut's own place among its
+    // lane's, or an empty readout with nothing marked -- a plate that reads
+    // blank rather than one that lies about a cut zero.
+    let readout = player
+        .selected
+        .anchor()
+        .and_then(|(lane, idx)| {
+            player
+                .session
+                .as_ref()
+                .map(|s| format!("{}/{}", idx + 1, s.lane_clips(lane).len()))
+        })
+        .unwrap_or_else(|| "—/—".to_string());
     div()
         .id("stance-time-band")
         .flex_none()
@@ -81,9 +130,46 @@ fn time_band() -> impl IntoElement {
         .border_color(rgb(DARK_SEAM()))
         .flex()
         .items_center()
+        .gap(px(16.))
         .px(px(12.))
-        .child(section_head("time band"))
-        // hook: §12 step 3 -- timecode, ghost transport, cut readout, contact strip, Export.
+        // The most-read element anchors its region (DESIGN §5): the
+        // timecode leads, 13px hero, 700, colons in `ink3`.
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(rgb(INK1()))
+                .child(tc),
+        )
+        .child(ghost(player, if player.transport().is_playing() { "❚❚" } else { "▶" }, ActionId::Play))
+        // The cut readout: a plate, mono, the odometer DESIGN §6 asks for.
+        .child(
+            div()
+                .flex_none()
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(2.))
+                .bg(rgb(DARK_CANVAS()))
+                .text_size(px(10.5))
+                .text_color(rgb(INK1()))
+                .child(readout),
+        )
+        .child(div().flex_1())
+        // Boxed Export: the one bordered control on the surface (DESIGN §4).
+        .child(
+            div()
+                .id("stance-export")
+                .flex_none()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(rgb(DARK_HAIRLINE()))
+                .bg(rgb(DARK_RAISED()))
+                .text_size(px(10.5))
+                .text_color(rgb(INK1()))
+                .cursor_pointer()
+                .child(format!("Export ({})", player.keymap.display(ActionId::Export))),
+        )
 }
 
 /// Lanes, under the time band. `canvas` is the bench background too (DESIGN
@@ -122,22 +208,10 @@ fn ledger() -> impl IntoElement {
         // hook: §12 step 7 -- project identity/state, last action, export progress, notices.
 }
 
-/// One tab of the dock's Src/Clip pair -- a plate (2px radius), `ink1` when
-/// active and `ink2` at rest, never a hue (DESIGN §4).
-fn dock_tab(label: &str, active: bool) -> impl IntoElement {
-    div()
-        .flex_1()
-        .rounded(px(2.))
-        .py(px(6.))
-        .text_size(px(10.5))
-        .text_color(rgb(if active { INK1() } else { INK2() }))
-        .bg(rgb(if active { DARK_RAISED() } else { DARK_PANEL() }))
-        .child(label.to_string())
-}
-
 /// The dock: the only side panel, right, fixed width, carrying the Src/Clip
-/// tab pair (DESIGN §5).
-fn dock() -> impl IntoElement {
+/// tab pair (DESIGN §5). The frame is drawn here; `dock_stance.rs` owns the
+/// tab row and both tabs' content (DESIGN §12 step 4).
+fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-dock")
         .flex_none()
@@ -148,38 +222,43 @@ fn dock() -> impl IntoElement {
         .border_color(rgb(DARK_SEAM()))
         .flex()
         .flex_col()
-        .child(
-            div()
-                .id("stance-dock-tabs")
-                .flex_none()
-                .flex()
-                .gap(px(4.))
-                .p(px(8.))
-                .border_b_1()
-                .border_color(rgb(DARK_HAIRLINE()))
-                .child(dock_tab("Src", true))
-                .child(dock_tab("Clip", false)),
-        )
-        .child(section_head("dock"))
-        // hook: §12 step 4 -- Sources assembly (filter, usage chips, import) / Clip verbs
-        // (Speed / Colour / Transform / EQ as ghost verbs over param rows).
+        .child(dock_stance::render(player, DOCK_W, window_h, cx))
 }
 
 /// The whole stance: spine, screen, time band, bench, ledger, dock, in the
-/// order DESIGN §5 draws them. `player` and the window/context pair are
-/// unread by this skeleton -- later steps in the §12 package are what fill
-/// each region from live state (cut position, dock tab, lane contents).
+/// order DESIGN §5 draws them, over the same key handler the legacy tree
+/// uses (DESIGN §12 step 3): the darkroom draws its own regions but answers
+/// to the one keymap, `shift` threaded through for the odometer's stride
+/// ([`Player::walk_shift`]) since [`ActionId`] carries no modifier of its
+/// own.
 pub(crate) fn render(
-    _player: &mut Player,
-    _window: &mut Window,
-    _cx: &mut Context<Player>,
+    player: &mut Player,
+    window: &mut Window,
+    cx: &mut Context<Player>,
 ) -> impl IntoElement {
+    let window_h = window.viewport_size().height;
+    let position = player.playhead(player.drawn_duration());
     div()
         .id("stance-room")
+        .track_focus(&player.focus)
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            let key = event.keystroke.key.as_str();
+            let ctrl = event.keystroke.modifiers.control;
+            if event.is_held && !repeats(this.repeat_scope(), key, this.keymap.lookup(key, ctrl)) {
+                return;
+            }
+            if this.dismiss_notice() {
+                cx.notify();
+            }
+            this.walk_shift = event.keystroke.modifiers.shift;
+            if let Some(action) = this.keymap.lookup(key, ctrl) {
+                this.act(action, window, cx);
+            }
+        }))
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
-        .child(spine())
+        .child(spine(player))
         .child(
             div()
                 .id("stance-centre")
@@ -187,10 +266,10 @@ pub(crate) fn render(
                 .min_w(px(0.))
                 .flex()
                 .flex_col()
-                .child(screen())
-                .child(time_band())
+                .child(screen(player, position, window, cx))
+                .child(time_band(player))
                 .child(bench())
                 .child(ledger()),
         )
-        .child(dock())
+        .child(dock(player, window_h, cx))
 }
