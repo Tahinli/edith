@@ -2,6 +2,7 @@
 //! colour and speed bars, the silence scan, the choices and the export.
 
 use super::*;
+use std::sync::atomic::Ordering;
 
 /// FAULT 2's general shape (not just the source dot's menu): `overlaid()`
 /// refuses every key while `context_menu`/`library_menu`/`picker` is `Some`,
@@ -1673,4 +1674,46 @@ fn every_card_opener_closes_every_other_card_through_one_path() {
              colour, and both stayed up)"
         );
     }
+}
+
+/// Regression: a builder moved every card's how-to prose off the card body
+/// onto a `?` glyph tooltip on the card head (`dark_card_head`), to answer
+/// the complaint that the body read "like a terminal screen". But `Tip`
+/// stands aside for *every* tooltip while `OVERLAID` is set, and a card
+/// being open is exactly what sets `OVERLAID` -- so the `?`'s own help could
+/// never paint while the card that owns it was on screen (driven proof:
+/// dwelling the pointer on it for 5-6s at four coordinates changed zero
+/// pixels). `OverlayTip`/`tip_may_paint` is the fix: a tip anchored on the
+/// overlay itself is exempt. This pins both halves so an eighth card can't
+/// reintroduce either half of the bug.
+#[test]
+fn a_cards_own_help_paints_while_the_card_is_open_but_the_ui_under_it_stays_quiet() {
+    OVERLAID.store(true, Ordering::Relaxed);
+    assert!(
+        tip_may_paint(true),
+        "a tip anchored on the overlay itself (a card head's own `?`) must \
+         still paint while its own card is open, or the help nobody wanted \
+         permanent becomes help nobody can ever read"
+    );
+    assert!(
+        !tip_may_paint(false),
+        "a tip on the *underlying* UI must still stand aside while a card/menu \
+         is up over it -- OVERLAID's original purpose, which the overlay \
+         exemption must not weaken"
+    );
+    OVERLAID.store(false, Ordering::Relaxed);
+    assert!(tip_may_paint(false), "with nothing overlaid, an ordinary tip paints too");
+
+    // Structural half: every card routes its head through `dark_card_head`,
+    // so checking its one help-tooltip call site covers all seven cards (and
+    // any future eighth) at once -- it must build an `OverlayTip`, not a
+    // plain `Tip`, or this whole fix is undone by construction.
+    let cards_src = src_text("ui/cards.rs");
+    let head_fn_at = cards_src.find("fn dark_card_head(").expect("dark_card_head");
+    let head_fn = &cards_src[head_fn_at..head_fn_at + 1200];
+    assert!(
+        head_fn.contains("OverlayTip(h.clone())"),
+        "dark_card_head's own `?` tooltip no longer builds an OverlayTip -- the \
+         card-head help is unreadable again while its card is open"
+    );
 }
