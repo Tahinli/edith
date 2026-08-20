@@ -1795,11 +1795,12 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
     );
 
     // The flag has to reach it, or the skeleton is dead code behind a door
-    // nobody opens.
+    // nobody opens. Darkroom is the default room now (`OLD_GUI=1` is the
+    // opt-out) -- `Player::darkroom` is still the field render.rs reads.
     let render_rs = src_text("render.rs");
     assert!(
         render_rs.contains("if self.darkroom") && render_rs.contains("ui::stance::render("),
-        "EDITH_DARKROOM never reaches ui::stance::render"
+        "Player::darkroom never reaches ui::stance::render"
     );
 }
 

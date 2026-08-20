@@ -28,7 +28,6 @@
 //! answer for.
 
 use crate::*;
-use crate::ui::widgets::waveform;
 
 /// The pinned ruler's own height, above the lane stack.
 const RULER_H: f32 = 10.;
@@ -60,6 +59,26 @@ enum Tier {
     SpineTrace,
     /// Sliver fill + splice gaps: film scale.
     Sliver,
+}
+
+/// `MM:SS` for a clip's own readout -- the bench talks in the film's units,
+/// not in seconds with a decimal point.
+fn mmss(secs: f64) -> String {
+    let s = secs.max(0.).round() as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// A clip's thumbnail, filling its box. `Cover` rather than `Contain`: a clip
+/// is a strip of film, so it crops rather than letterboxing inside a lane.
+fn cover_image(image: std::sync::Arc<gpui::RenderImage>) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let fitted = gpui::ObjectFit::Cover.get_bounds(bounds, image.size(0));
+            let _ = window.paint_image(fitted, Corners::default(), image, 0, false);
+        },
+    )
+    .size_full()
 }
 
 fn tier(span: f32) -> Tier {
@@ -103,12 +122,17 @@ fn clip_box(
     let left = scale.px_at(start);
     let on = marked((lane, idx), clip.link, picks, pick_links);
     let t = tier(span);
-    let label = player.sources().get(clip.source).map(|s| file_name(&s.path));
+    let source = player.sources().get(clip.source);
+    let label = source.map(|s| file_name(&s.path));
     let audio = lane.kind == LaneKind::Audio;
-    let wave = player
-        .sources()
-        .get(clip.source)
-        .and_then(|s| player.waves.get(&(s.path.clone(), s.audio_stream)))
+    let wave = source.and_then(|s| player.waves.get(&(s.path.clone(), s.audio_stream))).cloned();
+    // hook: §12 step 5 -- per-source film ink attaches here, replacing
+    // `source_tint` (library_meta.rs's own placeholder wheel, index-keyed and
+    // already different per source) with the source's own quantized hue.
+    let ink = source_tint(clip.source);
+    let thumb = (!audio)
+        .then(|| source.and_then(|s| player.thumbs.get(&s.path)))
+        .flatten()
         .cloned();
     let has_trace = t != Tier::Sliver;
     let has_spine = t != Tier::Sliver;
@@ -116,6 +140,21 @@ fn clip_box(
     let has_chip = t == Tier::Full && !clip.speed.is_normal();
     let (in_frame, out_frame) = (f64::from(clip.in_frame) / player.fps, f64::from(clip.out_frame) / player.fps);
     let speed = clip.speed;
+    // Right-aligned readout: the trim delta off the source's full length when
+    // this clip is shorter than the file it was cut from, else the plain
+    // duration (DESIGN §5). corner-cut: reads only against the *source's* full
+    // length, not the subject cut's own out/in marks the time band's readout
+    // means (§12's cut object has no per-edge history at this layer) --
+    // ceiling is wiring this to the same cut state once the time band exposes
+    // it, rather than a second reading of "trim" here.
+    let full_frames = source.map(|s| player.session.as_ref().map_or(0, |sess| sess.file_frames(&s.path)));
+    let readout = match full_frames {
+        Some(full) if full > clip.frames() => {
+            let delta = f64::from(full - clip.frames()) / player.fps;
+            format!("−{}", mmss(delta))
+        }
+        _ => format!("{len:.1}s"),
+    };
     div()
         .id(("bench-clip", lane.ord * 1000 + lane.kind as usize * 100 + idx))
         .absolute()
@@ -138,7 +177,7 @@ fn clip_box(
                 this.pick((lane, idx), event.modifiers.control, cx);
             }),
         )
-        // Ink spine: 3px left edge, the placeholder ink until §12 step 5.
+        // Ink spine: 3px left edge, the source's own ink (hook above).
         .when(has_spine, |d| {
             d.child(
                 div()
@@ -147,11 +186,12 @@ fn clip_box(
                     .top_0()
                     .h_full()
                     .w(px(3.))
-                    .bg(rgb(INK2())),
+                    .bg(rgb(ink)),
             )
         })
-        // Trace: real waveform for audio, a flat placeholder body for video
-        // (thumbnails are §12 step 5's, same hook).
+        // Trace: real waveform for audio, a real decoded thumbnail for video
+        // (falling back to a flat placeholder body while it loads or if the
+        // file never yields one).
         .when(has_trace && audio, |d| {
             d.children(wave.and_then(|w| match w {
                 Wave::Peaks(peaks) => Some(
@@ -161,7 +201,7 @@ fn clip_box(
                         .right_0()
                         .top_0()
                         .bottom_0()
-                        .child(waveform(peaks, in_frame, out_frame)),
+                        .child(waveform_ink(peaks, in_frame, out_frame, ink)),
                 ),
                 _ => None,
             }))
@@ -174,32 +214,50 @@ fn clip_box(
                     .right_0()
                     .top(px(2.))
                     .bottom(px(2.))
-                    .bg(rgb(INK4())),
+                    .overflow_hidden()
+                    .bg(rgb(INK4()))
+                    .when_some(thumb, |d, thumb| match thumb {
+                        Thumb::Ready(image) => d.child(cover_image(image)),
+                        _ => d,
+                    }),
             )
         })
-        // Name plate: DESIGN §4's plate (canvas-on-panel), mono label.
-        .when_some(label.filter(|_| has_label), |d, label| {
+        // Name plate + trim/duration readout: one strip, DESIGN §4's plate
+        // (canvas-on-panel), sat at the clip's top-left/top-right per the mock
+        // rather than the name alone hanging below the box.
+        .when(has_label, |d| {
             d.child(
                 div()
                     .absolute()
                     .left(px(3.))
                     .right_0()
-                    .bottom_0()
+                    .top_0()
                     .h(px(13.))
                     .px(px(3.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(4.))
                     .bg(rgba(DARK_SEAM()))
-                    .truncate()
-                    .text_size(px(9.5))
-                    .text_color(rgb(INK1()))
-                    .child(label),
+                    .when_some(label, |d, label| {
+                        d.child(div().min_w(px(0.)).truncate().text_size(px(9.5)).text_color(rgb(INK1())).child(label))
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(9.))
+                            .text_color(rgb(INK3()))
+                            .child(readout),
+                    ),
             )
         })
-        // Speed chip: dropped first in the ladder.
+        // Speed chip: dropped first in the ladder, tucked in the bottom-right
+        // corner so it never fights the name/readout strip above.
         .when(has_chip, |d| {
             d.child(
                 div()
                     .absolute()
-                    .top_0()
+                    .bottom_0()
                     .right_0()
                     .px(px(3.))
                     .bg(rgb(DARK_RAISED()))

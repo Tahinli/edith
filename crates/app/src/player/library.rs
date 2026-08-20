@@ -172,6 +172,7 @@ impl Player {
         self.speed_open = None;
         self.close_silence();
         self.waves.clear();
+        self.thumbs.clear();
         self.streams.clear();
         self.bitrates.clear();
         self.sizes.clear();
@@ -1035,6 +1036,31 @@ impl Player {
             .ok();
         })
         .detach();
+    }
+
+    /// The dock's "Paste path" verb (MOCK-SPEC "Dock" IMPORT section): reads
+    /// whatever text sits on the OS clipboard and imports it the same way a
+    /// drop or the Import button would, if it names a file that exists.
+    /// `gpui::App::read_from_clipboard` already covers this -- no new
+    /// dependency for what is otherwise a clipboard read and the existing
+    /// [`Player::import`] door.
+    pub(crate) fn paste_file_path(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.notify_user("PASTE PATH — nothing on the clipboard".into());
+            cx.notify();
+            return;
+        };
+        let text = text.trim().trim_matches(['"', '\'']);
+        let path = std::path::PathBuf::from(text);
+        if !path.is_file() {
+            self.notify_user(format!("PASTE PATH — not a file: {text}").into());
+            cx.notify();
+            return;
+        }
+        self.import(&path, cx);
     }
 
     /// The `+ S` button and its key: asks the desktop for a file and takes the

@@ -6,6 +6,14 @@ use crate::*;
 /// is given. Peaks are the source's whole envelope; `from`/`to` are the source
 /// seconds this clip plays, so a cut clip shows its own stretch of the file.
 pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl IntoElement {
+    waveform_ink(peaks, from, to, FG_SECONDARY())
+}
+
+/// As [`waveform`], but in a caller-picked ink rather than the fixed
+/// secondary foreground -- the darkroom bench's own audio clips draw their
+/// envelope in the source's ink (DESIGN §5), which the legacy timeline never
+/// needed a colour for.
+pub(crate) fn waveform_ink(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64, ink: u32) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -28,7 +36,7 @@ pub(crate) fn waveform(peaks: Arc<Vec<(f32, f32)>>, from: f64, to: f64) -> impl 
             let mut path = PathBuilder::fill();
             path.add_polygon(&points, true);
             if let Ok(path) = path.build() {
-                window.paint_path(path, rgb(FG_SECONDARY()));
+                window.paint_path(path, rgb(ink));
             }
         },
     )
