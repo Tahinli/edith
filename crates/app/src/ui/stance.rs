@@ -36,11 +36,18 @@ pub(crate) const LEDGER_H: f32 = 28.;
 /// role [`BENCH_H`] plays for the bench.
 pub(crate) const DOCK_W: f32 = 280.;
 /// What [`bench`] spends above `bench_stance::render`'s own content: the
-/// section head (`type_scale::head`, 10px Archivo) plus its `py(4.)` top and
-/// bottom padding. Named and `pub(crate)` rather than the `- 20.` it used to
-/// be inlined as, so `layout::BENCH_MIN_H` can add it into its own
-/// derivation instead of guessing it back out.
-pub(crate) const BENCH_CHROME_H: f32 = 20.;
+/// `bench` div's own `.border_t_1()` (1px) + its `py(4.)` top padding +
+/// the section head's real line box -- `type_scale::head()` sizes text at
+/// `SECTION_HEAD_PX` (10) but never calls `.line_height()`, so gpui's
+/// default `TextStyle::line_height` (the golden ratio, `gpui::phi()` ==
+/// `1.618034`, not 1x the font size) is what it actually draws:
+/// `round(10. * 1.618034)` = `round(16.18034)` = `16`. A driven pass found
+/// this constant undercounting that line box as a bare `10`, one of the two
+/// causes of `layout::BENCH_MIN_H`'s third clip (see its own doc comment for
+/// the other). `1 + 4 + 16` = `21`. Named and `pub(crate)` rather than the
+/// `- 20.` it used to be inlined as, so `layout::BENCH_MIN_H` can add it
+/// into its own derivation instead of guessing it back out.
+pub(crate) const BENCH_CHROME_H: f32 = 21.;
 
 /// The lowest a menu's top edge may sit and still land inside the
 /// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
