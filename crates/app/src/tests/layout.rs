@@ -1711,3 +1711,57 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
         );
     }
 }
+
+/// DESIGN.md §12 step 2: the stance skeleton draws its six regions -- spine,
+/// screen, time band, bench, ledger, dock -- in the order §5's diagram lays
+/// them out, and `Player::render` actually reaches it when the flag is on.
+#[test]
+fn the_stance_renders_its_six_regions_in_the_documented_order() {
+    let stance = src_text("ui/stance.rs");
+    let order = [
+        "stance-spine",
+        "stance-screen",
+        "stance-time-band",
+        "stance-bench",
+        "stance-ledger",
+        "stance-dock",
+    ];
+    let defined: Vec<usize> = order
+        .iter()
+        .map(|id| {
+            stance
+                .find(&format!("\"{id}\""))
+                .unwrap_or_else(|| panic!("no {id} region in the stance"))
+        })
+        .collect();
+    assert!(
+        defined.windows(2).all(|w| w[0] < w[1]),
+        "the six regions are not defined in DESIGN §5's order: {defined:?}"
+    );
+
+    // Defined in order is not composed in order -- `render()` has to call
+    // them in it too, or the geometry above is dead prose.
+    let render_body =
+        &stance[stance.find("pub(crate) fn render(").expect("the stance's entry point")..];
+    let calls = ["spine()", "screen()", "time_band()", "bench()", "ledger()", "dock()"];
+    let composed: Vec<usize> = calls
+        .iter()
+        .map(|c| {
+            render_body
+                .find(c)
+                .unwrap_or_else(|| panic!("render() never calls {c}"))
+        })
+        .collect();
+    assert!(
+        composed.windows(2).all(|w| w[0] < w[1]),
+        "render() does not compose the six regions in DESIGN §5's order: {composed:?}"
+    );
+
+    // The flag has to reach it, or the skeleton is dead code behind a door
+    // nobody opens.
+    let render_rs = src_text("render.rs");
+    assert!(
+        render_rs.contains("if self.darkroom") && render_rs.contains("ui::stance::render("),
+        "EDITH_DARKROOM never reaches ui::stance::render"
+    );
+}
