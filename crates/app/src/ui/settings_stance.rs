@@ -59,6 +59,21 @@ fn row(
     player: &Player,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    row_ink(id, label_text, value, hint, player, on_click, INK1())
+}
+
+/// [`row`] with the value's ink chosen by the caller -- [`INK4`] for a value
+/// that is not really a value yet (nothing to show until a project opens),
+/// so it reads as absent rather than as a fifth real setting.
+fn row_ink(
+    id: &'static str,
+    label_text: &'static str,
+    value: impl Into<SharedString>,
+    hint: &'static str,
+    player: &Player,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    value_ink: u32,
+) -> impl IntoElement {
     let value: SharedString = value.into();
     let hint: SharedString = hint.into();
     let label_style = type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
@@ -90,7 +105,7 @@ fn row(
                 .flex_none()
                 .font(value_style.font)
                 .text_size(value_style.size)
-                .text_color(rgb(INK1()))
+                .text_color(rgb(value_ink))
                 .child(value),
         )
 }
@@ -100,23 +115,30 @@ fn row(
 /// [`inspector.rs`]'s own four-plus-Mix list, ported rather than
 /// reimplemented (same `Pick`/`open_mix` doors).
 fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    // corner-cut: no genuine default resolution or fps exists before either
+    // a project opens or a pick is made, so the empty state is a bare dash
+    // in INK4 -- quieter than a real value, never a noun that reads as one
+    // (the "Size"/"Rate"/"HDR" placeholders this row used to fall back to).
     let resolution = player.session.as_ref().map(PlaybackSession::resolution);
-    let res_val = match resolution.or(player.pending_settings.0) {
-        Some((_, h)) => format!("{h}p"),
-        None => "Size".to_string(),
+    let (res_val, res_ink) = match resolution.or(player.pending_settings.0) {
+        Some((_, h)) => (format!("{h}p"), INK1()),
+        None => ("—".to_string(), INK4()),
     };
-    let fps_val = match (player.session.is_some(), player.pending_settings.1) {
-        (true, _) => format!("{} fps", fps_label(player.fps)),
-        (false, Some(fps)) => format!("{} fps", fps_label(fps)),
-        (false, None) => "Rate".to_string(),
+    let (fps_val, fps_ink) = match (player.session.is_some(), player.pending_settings.1) {
+        (true, _) => (format!("{} fps", fps_label(player.fps)), INK1()),
+        (false, Some(fps)) => (format!("{} fps", fps_label(fps)), INK1()),
+        (false, None) => ("—".to_string(), INK4()),
     };
+    // Sample rate keeps its "Source" fallback: unlike resolution/fps it
+    // states a real behaviour (derives from the first audio source) rather
+    // than standing in for a value with nothing behind it.
     let rate_val = match player.session.as_ref().map_or(player.pending_settings.2, |s| s.sample_rate()) {
         Some(rate) => format!("{rate} Hz"),
         None => "Source".to_string(),
     };
-    let tone_val = match &player.session {
-        Some(session) => format!("HDR {}", tone_label(session.tone())),
-        None => "HDR".to_string(),
+    let (tone_val, tone_ink) = match &player.session {
+        Some(session) => (format!("HDR {}", tone_label(session.tone())), INK1()),
+        None => ("—".to_string(), INK4()),
     };
     div()
         .flex_none()
@@ -124,21 +146,23 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         .flex_col()
         .gap(px(2.))
         .child(section_head("PROJECT · stored in the .edith file"))
-        .child(row(
+        .child(row_ink(
             "settings-resolution",
             "Resolution",
             res_val,
             "the canvas every clip is composed onto, and the size the export comes out at",
             player,
             cx.listener(|this, event: &ClickEvent, _, cx| this.open_picker(Pick::Resolution, event.position(), cx)),
+            res_ink,
         ))
-        .child(row(
+        .child(row_ink(
             "settings-fps",
             "Frame rate",
             fps_val,
             "the rate the whole timeline is cut and written at",
             player,
             cx.listener(|this, event: &ClickEvent, _, cx| this.open_picker(Pick::Fps, event.position(), cx)),
+            fps_ink,
         ))
         .child(row(
             "settings-sample-rate",
@@ -151,13 +175,14 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
         // hook: the mastering-display target (a monitor peak-nits fact, not
         // yet in `inspector.rs`'s own project section) is this row's pair --
         // another builder's row, plugged in right here once it exists.
-        .child(row(
+        .child(row_ink(
             "settings-tonemap",
             "HDR tonemap",
             tone_val,
             "which rendition HDR media is watched in; SDR media is untouched",
             player,
             cx.listener(|this, event: &ClickEvent, _, cx| this.open_picker(Pick::Tone, event.position(), cx)),
+            tone_ink,
         ))
         .child(row(
             "settings-mix",
