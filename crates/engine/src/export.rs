@@ -82,6 +82,7 @@ use crate::project::{Lane, LaneKind, Project, Rate};
 use crate::scale::{blend_i420, Composer};
 use crate::subtitle::{Cue, SubtitleTrack};
 use crate::tonemap::{self, ToneMapper};
+use crate::transform::TransformParams;
 
 /// Progress is reported in permille: an atomic integer the render loop can read
 /// without a lock, fine enough for any progress bar.
@@ -1083,8 +1084,10 @@ struct Dissolve<'a> {
     mapper: Option<&'a ToneMapper>,
     remap: Option<(Matrix, Matrix)>,
     grade: Option<crate::color::ColorParams>,
+    transform: TransformParams,
     canvas: Composer,
     graded: (Vec<u8>, Vec<u8>, Vec<u8>),
+    transformed: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 /// The track's cues where the *exported* timeline puts them, which is the only
@@ -1639,6 +1642,14 @@ impl CopyPlan {
             // through. `None` and the identity are the same untouched picture.
             if project
                 .composite_color_at(span.start)
+                .is_some_and(|params| !params.is_identity())
+            {
+                return None;
+            }
+            // A moved, scaled, rotated or cropped clip is a different picture
+            // than the source's own packets, exactly as a grade is.
+            if project
+                .composite_transform_at(span.start)
                 .is_some_and(|params| !params.is_identity())
             {
                 return None;
@@ -2537,6 +2548,9 @@ fn run(
                     && project
                         .composite_color_at(span.start)
                         .is_none_or(|params| params.is_identity())
+                    && project
+                        .composite_transform_at(span.start)
+                        .is_none_or(|params| params.is_identity())
                     && dissolve.is_none();
                 let want = untouched.then(|| encoder.dma_want(meta)).flatten();
                 // Opened at the file's own frame, which is the only place the
@@ -2566,7 +2580,12 @@ fn run(
         // is touched. Scratch outside the frame loop: it is refilled per frame
         // and its allocation survives the whole span.
         let grade = project.composite_color_at(span.start).copied();
+        let transform = project
+            .composite_transform_at(span.start)
+            .copied()
+            .unwrap_or_default();
         let mut graded = (Vec::new(), Vec::new(), Vec::new());
+        let mut transformed = (Vec::new(), Vec::new(), Vec::new());
         // ...and the canvas it is placed on, which is where a source of another
         // resolution becomes a picture at the project's. The same `Composer`
         // playback composes with, given the same policy, so an export is what
@@ -2595,12 +2614,17 @@ fn run(
                     mapper: b_mapper,
                     remap: b_remap,
                     grade: project.composite_color_at(b_start).copied(),
+                    transform: project
+                        .composite_transform_at(b_start)
+                        .copied()
+                        .unwrap_or_default(),
                     canvas: Composer::new(
                         meta.width,
                         meta.height,
                         project.composite_fit_at(b_start),
                     ),
                     graded: (Vec::new(), Vec::new(), Vec::new()),
+                    transformed: (Vec::new(), Vec::new(), Vec::new()),
                 })
             })
             .transpose()?;
@@ -2688,9 +2712,11 @@ fn run(
                     width,
                     height,
                     grade,
+                    transform,
                     remap,
                     mapper,
                     &mut graded,
+                    &mut transformed,
                     &mut canvas,
                 )),
             };
@@ -2718,8 +2744,9 @@ fn run(
                             }
                             Some(Frame::Pixels(by, bu, bv, bw, bh)) => {
                                 let (by, bu, bv, _, _) = place_picture(
-                                    by, bu, bv, bw, bh, d.grade, d.remap, d.mapper,
-                                    &mut d.graded, &mut d.canvas,
+                                    by, bu, bv, bw, bh, d.grade, d.transform, d.remap,
+                                    d.mapper, &mut d.graded, &mut d.transformed,
+                                    &mut d.canvas,
                                 );
                                 let idx_in_window = done_here + r - d.tail_start;
                                 let t = dissolve_weight(idx_in_window, d.window);
@@ -2854,9 +2881,11 @@ fn place_picture<'a>(
     width: u32,
     height: u32,
     grade: Option<crate::color::ColorParams>,
+    transform: TransformParams,
     remap: Option<(Matrix, Matrix)>,
     mapper: Option<&ToneMapper>,
     graded: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
+    transformed: &'a mut (Vec<u8>, Vec<u8>, Vec<u8>),
     canvas: &'a mut Composer,
 ) -> (&'a [u8], &'a [u8], &'a [u8], u32, u32) {
     // The planes are borrowed from the decoder (and `Black::picture` hands the
@@ -2891,7 +2920,13 @@ fn place_picture<'a>(
     };
     // Grade first, place second: the grade is the clip's own pixels and the
     // bars around them are not the clip (see `scale::Composer`).
-    canvas.place(y, u, v, width, height)
+    if transform.is_identity() {
+        canvas.place(y, u, v, width, height)
+    } else {
+        let (py, pu, pv, w, h) = canvas.place_transformed(y, u, v, width, height, &transform);
+        *transformed = (py, pu, pv);
+        (&transformed.0[..], &transformed.1[..], &transformed.2[..], w, h)
+    }
 }
 
 /// Which matrix pair a span's samples are rewritten by on the way into a file
