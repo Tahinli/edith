@@ -226,6 +226,20 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             player,
             cx,
         ))
+        // VIEW group, added this task: ZoomIn/ZoomOut/ZoomFit (keymap.rs) had
+        // real, already-working handlers (`Player::zoom`/`zoom_fit`, wired
+        // into the legacy `ui/toolbar.rs`) but no home anywhere in the
+        // darkroom -- a DESIGN §9 "nothing lives only on a key" violation.
+        // Placed between CUT and TRACK per §11 check 1 (task frequency):
+        // reading the timeline at a different scale happens many times a
+        // session (more than the once-per-project lane add below it), but
+        // less than walking/trimming cuts above it.
+        .child(group_head("view"))
+        .child(pair(
+            glyph("spine-zoom-out", "−", ActionId::ZoomOut, false, player, cx),
+            glyph("spine-zoom-in", "+", ActionId::ZoomIn, false, player, cx),
+        ))
+        .child(glyph("spine-zoom-fit", "⊡", ActionId::ZoomFit, false, player, cx))
         .child(group_head("track"))
         .child(glyph("spine-add-video", "+V", ActionId::AddVideoLane, false, player, cx))
         .child(glyph("spine-add-audio", "+A", ActionId::AddAudioLane, false, player, cx))

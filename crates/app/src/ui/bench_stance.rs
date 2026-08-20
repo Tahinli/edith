@@ -18,17 +18,29 @@
 //! trace, name plate, splice gaps) and the width ladder that degrades it
 //! (DESIGN §7) -- neither existed on the legacy timeline in this shape.
 //!
-//! Not reused, deferred: `ClipDrag` (moving a placed clip to another lane by
-//! hand), the mouse edge-trim strips, fades/dissolve glyphs and the lane
-//! header reorder drag. The cut grammar (`,` `.` `[` `]` `/` `s`) never needs
-//! any of them -- `nudge_cut` and friends act on `Player::selected` directly,
-//! with no element under the pointer required -- so they are out of this
-//! slice's reach; `Player::pick` (click-select) and the asset drop (place)
-//! are the two pointer gestures the charter actually asked this surface to
-//! answer for.
+//! Now also reused: `ClipDrag` (moving a placed clip along its lane and onto
+//! another, `Player::dragged`/`Player::move_clip`), the mouse edge-trim
+//! strips (`Player::start_trim`/`trims(span)`, the same minimum-width rule
+//! the legacy strips use), `Player::timeline_wheel` (ctrl+wheel zooms about
+//! the pointer, a bare wheel scrolls the bed -- the same mapping on the
+//! ruler and on every bed) and `LaneDrag`/`Player::reorder_lane` (drag a
+//! track head onto another to swap their order). `Player::drag_move`/
+//! `Player::drag_release`, wired once on the window's own root
+//! (`render.rs`), already carry a trim or a scroll off the 6px strip that
+//! started it, for the darkroom tree exactly as for the legacy one -- no
+//! root wiring lives here.
+//!
+//! Still deferred: fades/dissolve glyphs, and the lane header's own
+//! drop-line cue (the legacy `LaneDrop` preview) -- a plain drag_over
+//! highlight stands in for it here, since the cue itself is display-only and
+//! `reorder_lane` at the release does not need it.
+//!
+//! `nudge_cut` and friends still act on `Player::selected` directly, with no
+//! element under the pointer required, and stay untouched by any of this.
 
 use crate::*;
 use crate::ui::type_scale::{self, Typeset};
+use crate::ui::widgets::*;
 
 /// The pinned ruler's own height, above the lane stack -- tall enough for a
 /// tick line plus a mono `MM:SS` label under it (DESIGN §5's "tick marks with
@@ -149,6 +161,11 @@ fn clip_box(
     pick_links: &[Option<u32>],
     cx: &mut Context<Player>,
 ) -> impl IntoElement + use<> {
+    // The placed clip, for the drag payload -- and the clip as an in-flight
+    // edge trim is showing it, for the box (`Player::trimmed`, the same
+    // split `ui/timeline.rs`'s own clip box makes).
+    let placed = *clip;
+    let clip = &player.trimmed(lane, idx, placed);
     let (start, len) = (
         f64::from(clip.start) / player.fps,
         f64::from(clip.frames()) / player.fps,
@@ -191,6 +208,9 @@ fn clip_box(
         }
         _ => format!("{len:.1}s"),
     };
+    // For the drag ghost and the fallback label both -- kept before `label`
+    // is consumed by the name plate below.
+    let ghost: SharedString = label.clone().unwrap_or_else(|| lane.label()).into();
     div()
         .id(("bench-clip", lane.ord * 1000 + lane.kind as usize * 100 + idx))
         .absolute()
@@ -212,6 +232,44 @@ fn clip_box(
             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 this.pick((lane, idx), event.modifiers.control, cx);
             }),
+        )
+        // Dragged, it moves: to the frame and the lane it is let go over
+        // (`Player::move_clip`, `ClipDrag`) -- the same payload and the same
+        // ghost tooltip `ui/timeline.rs`'s own clip box drags.
+        .on_drag(ClipDrag { lane, idx, clip: placed }, {
+            let ghost = ghost.clone();
+            move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+        })
+        // The two edge strips a drag lengthens or shortens the clip by
+        // (`Player::start_trim`), gated on the same `trims(span)` floor the
+        // legacy strips use -- a clip too narrow to aim at keeps its whole
+        // padded box as a body to select and drag by instead (the `[`/`]`
+        // chords still trim it either way).
+        .children(
+            [Edge::Start, Edge::End]
+                .into_iter()
+                .filter(|_| trims(span))
+                .map(|edge| {
+                    let mut zone = div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w(px(EDGE_W))
+                        .occlude()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .hover(|s| s.bg(rgb(INK1())))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.start_trim(lane, idx, edge, event.modifiers.control, cx);
+                            }),
+                        );
+                    zone = match edge {
+                        Edge::Start => zone.left_0(),
+                        Edge::End => zone.right_0(),
+                    };
+                    zone
+                }),
         )
         // Ink spine: 3px left edge, the source's own ink (hook above).
         .when(has_spine, |d| {
@@ -354,14 +412,25 @@ fn lane_row(
     let dot = clips
         .first()
         .map_or_else(INK4, |clip| source_tint(clip.source));
+    let head_ghost: SharedString = lane.label().into();
     div()
         .id(("bench-lane", lane.ord * 10 + lane.kind as usize))
         .flex_none()
         .h(px(h))
         .flex()
+        // Dragged, the whole track moves in the stack (`LaneDrag`,
+        // `Player::reorder_lane`) -- let go anywhere along the row, not just
+        // over the head column, since a slot is what is being aimed at.
+        // corner-cut: no drop-line cue (module doc) -- a plain highlight
+        // while the pointer is over the row stands in for it.
+        .drag_over::<LaneDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+        .on_drop(cx.listener(move |this, drag: &LaneDrag, _, cx| {
+            this.reorder_lane(drag.0, lane, cx);
+        }))
         .child(
             // Pinned track head.
             div()
+                .id(("bench-lane-head", lane.ord * 10 + lane.kind as usize))
                 .flex_none()
                 .w(px(HEAD_W))
                 .h_full()
@@ -371,6 +440,10 @@ fn lane_row(
                 .justify_center()
                 .gap(px(2.))
                 .bg(rgb(DARK_PANEL()))
+                .cursor(CursorStyle::OpenHand)
+                .on_drag(LaneDrag(lane), move |_, _, _, cx| {
+                    cx.new(|_| Tip(head_ghost.clone()))
+                })
                 // MOCK-SPEC.md "Bench": "V1, A1 in mono".
                 .type_style(type_scale::mono(
                     type_scale::CHORD_METADATA_MIN_PX,
@@ -382,7 +455,8 @@ fn lane_row(
         )
         .child(
             // The bed: a drop target for the Sources tab (`AssetDrag`,
-            // reused from `ui/timeline.rs`) and every clip on it.
+            // reused from `ui/timeline.rs`), a placed clip (`ClipDrag`) and
+            // every clip on it.
             div()
                 .id(("bench-bed", lane.ord * 10 + lane.kind as usize))
                 .relative()
@@ -396,6 +470,22 @@ fn lane_row(
                 .on_drop(cx.listener(move |this, drag: &AssetDrag, window, cx| {
                     let at = this.place_frame(window.mouse_position().x).0;
                     this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
+                }))
+                .drag_over::<ClipDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+                .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
+                    let Some(idx) = this.dragged(drag) else {
+                        return;
+                    };
+                    this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
+                }))
+                // The wheel, matched to the legacy timeline's own mapping:
+                // ctrl+wheel zooms about the pointer, a bare wheel scrolls
+                // the bed along the film (`Player::timeline_wheel`). Stopped
+                // here so gpui's own overflow scroll on the lane column
+                // (`bench-lanes`) never answers the same notch a second time.
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.timeline_wheel(event, cx);
                 }))
                 .children(boxes),
         )
@@ -471,6 +561,13 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                         this.scrub_to(event.position.x, true, cx);
                     }),
                 )
+                // Ctrl+wheel zooms about the pointer, a bare one scrolls the
+                // bed along -- the same mapping every bed below gives, and
+                // the legacy ruler's own (`ui/timeline.rs`'s
+                // `on_scroll_wheel` at its ruler strip).
+                .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    this.timeline_wheel(event, cx);
+                }))
                 .children(ticks.into_iter().map(|(x, label)| {
                     div()
                         .absolute()
