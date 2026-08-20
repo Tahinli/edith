@@ -4,6 +4,133 @@ use crate::*;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
 
+/// DESIGN §3/§4 atoms shared by every param/setting card below (colour,
+/// transform, speed, EQ, silence, mix, subtitle style): what a row's label
+/// and value paint as once `self.darkroom` is on, so the seven card bodies
+/// each pick tokens rather than reimplement the same font/colour swap seven
+/// times (`export_card`'s own `dark`-branch technique, one level up).
+///
+/// A row label is what the room says about the control -- Archivo, §3's
+/// 10.5px row size, `ink2` at rest / `ink1` picked (no permanent pill: the
+/// picked state is a 1px `ink1` rule, §4's focus ring, not a fill).
+fn dark_row_label(text: impl Into<SharedString>, picked: bool) -> Div {
+    div()
+        .type_style(type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .text_color(rgb(if picked { INK1() } else { INK2() }))
+        .child(text.into())
+}
+
+/// A row's value -- what the film/the setting *says*, mono per §3.
+fn dark_row_value(text: impl Into<SharedString>) -> Div {
+    div()
+        .type_style(type_scale::mono(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .text_color(rgb(INK1()))
+        .child(text.into())
+}
+
+/// A card's own head line: the verb in Archivo (§3 section-head casing) and,
+/// where there is one, the clip it names in mono beside it -- "which clip"
+/// is metadata about the footage, not the room's own voice.
+fn dark_card_head(verb: &str, meta: Option<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .flex()
+        .items_baseline()
+        .gap(px(6.))
+        .child(
+            div()
+                .type_style(type_scale::head())
+                .text_color(rgb(INK3()))
+                .child(verb.to_uppercase()),
+        )
+        .children(meta.map(|m| {
+            div()
+                .type_style(type_scale::mono(type_scale::CHORD_METADATA_MAX_PX, gpui::FontWeight::MEDIUM))
+                .text_color(rgb(INK3()))
+                .child(m)
+        }))
+}
+
+/// The help/status line under a card's head: what the keys do, which is
+/// metadata about the room's controls -- mono, §3.
+fn dark_help(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .type_style(type_scale::mono(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+        .text_color(rgb(INK3()))
+        .child(text.into())
+}
+
+/// A ghost action row (DESIGN §4): borderless label + its chord, never a
+/// filled box -- the shape every card's Reset/Flatten/Add/Remove/toggle
+/// button takes now that "boxes are commitments" and Export is the one box
+/// in the room. `active` is a toggle's own held-on state (EQ's spectrum
+/// switch), not hover -- it keeps the fill and brightens the ink the same
+/// way a picked param row's ring does.
+/// The mix/silence/subtitle-size shape's own nudge glyph: ghost, not the
+/// filled pill it used to be a permanent box -- resting bare, one fill step
+/// on hover/press, same grammar as [`dark_ghost_button`] at a stepper's size.
+fn dark_step_glyph(
+    id: impl Into<gpui::ElementId>,
+    plus: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .flex_none()
+        .w(px(HIT_MIN))
+        .h(px(KEYS_ROW_H))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(DARK_RAISED())))
+        .on_click(on_click)
+        .child(dark_row_value(if plus { "+" } else { "−" }))
+}
+
+fn dark_ghost_button(
+    id: impl Into<gpui::ElementId>,
+    text: impl Into<SharedString>,
+    chord: &str,
+    active: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .flex_1()
+        .flex()
+        .h(px(CONTROL_H))
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .rounded(px(3.))
+        .when(active, |d| d.bg(rgb(DARK_RAISED())))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(DARK_RAISED())))
+        .on_click(on_click)
+        .child(
+            div()
+                .type_style(type_scale::label(type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM))
+                .text_color(rgb(if active { INK1() } else { INK2() }))
+                .child(text.into()),
+        )
+        .when(!chord.is_empty(), |d| {
+            d.child(
+                div()
+                    .type_style(type_scale::mono(
+                        type_scale::CHORD_METADATA_MIN_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK3()))
+                    .child(chord.to_string()),
+            )
+        })
+}
+
 impl Player {
     /// What an export is going to be, before there is one: the codec, the box
     /// it goes into, the bitrate, where it lands -- and, above the button, the
@@ -1555,6 +1682,7 @@ impl Player {
     pub(crate) fn color_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.color_open?;
         let params = self.color_params();
+        let dark = self.darkroom;
         let rows: Vec<_> = COLOR_BANDS
             .iter()
             .enumerate()
@@ -1572,13 +1700,24 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .cursor_pointer()
-                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    // Darkroom: no permanent pill under a label -- the picked
+                    // row is a 1px `ink1` rule (§4's focus ring), never a fill.
+                    // Hover is the one fill step §4 allows.
+                    .when(dark && picked, |d| d.border_l_2().border_color(rgb(INK1())))
+                    .when(!dark && picked, |d| d.bg(rgb(BG_SELECTED())))
+                    .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.color_band = i;
                         cx.notify();
                     }))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .when(dark, |d| d.child(dark_row_label(label, picked)))
+                            .when(!dark, |d| d.child(label)),
+                    )
                     .child(
                         // The bar is 4 px to look at and a whole row to hit
                         // (WCAG 2.5.8), the same split the ruler makes between
@@ -1608,7 +1747,7 @@ impl Player {
                                     .w_full()
                                     .h(px(4.))
                                     .rounded(px(2.))
-                                    .bg(rgb(BG_PANEL()))
+                                    .bg(rgb(if dark { DARK_PANEL() } else { BG_PANEL() }))
                                     .child(
                                         div()
                                             .h_full()
@@ -1621,12 +1760,18 @@ impl Player {
                     .child(
                         div()
                             .w(px(44.))
-                            .text_size(px(11.))
-                            .text_color(rgb(FG_SECONDARY()))
-                            .child(format!("{value:.2}")),
+                            .when(dark, |d| d.child(dark_row_value(format!("{value:.2}"))))
+                            .when(!dark, |d| {
+                                d.text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(format!("{value:.2}"))
+                            }),
                     )
             })
             .collect();
+        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
+        let help_text =
+            "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — a click away or esc closes";
         Some(
             drag_scrim(cx)
                 .flex()
@@ -1652,22 +1797,27 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(div().flex_none().px(px(6.)).child(format!(
-                            "Colour — {} clip {}",
-                            lane.label(),
-                            idx + 1
-                        )))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "drag a bar, or ↑↓ picks one and ←→ moves it, r resets — a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Colour", Some(head_meta.clone()))))
+                        .when(!dark, |d| {
+                            d.child(div().flex_none().px(px(6.)).child(format!(
+                                "Colour — {} clip {}",
+                                lane.label(),
+                                idx + 1
+                            )))
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         // The frame as it is being graded, over the controls
                         // grading it: the three lines are what the picture is
                         // made of, and every sample of a drag reseeks, so they
@@ -1677,28 +1827,41 @@ impl Player {
                                 .flex_none()
                                 .h(px(HIST_H))
                                 .rounded(px(3.))
-                                .bg(rgb(BG_HOVER_DIM()))
+                                .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
                                 .relative()
                                 .child(hist_curves(self.histogram)),
                         )
                         .children(rows)
-                        .child(
-                            div()
-                                .id("color-reset")
-                                .mt(px(4.))
-                                .flex()
-                                .h(px(CONTROL_H))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(rgb(BG_SELECTED()))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        .when(dark, |d| {
+                            d.child(dark_ghost_button(
+                                "color-reset",
+                                "Reset",
+                                "r",
+                                false,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.set_color(ColorParams::default(), cx);
-                                }))
-                                .child("Reset"),
-                        ),
+                                }),
+                            ))
+                        })
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .id("color-reset")
+                                    .mt(px(4.))
+                                    .flex()
+                                    .h(px(CONTROL_H))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(BG_SELECTED()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.set_color(ColorParams::default(), cx);
+                                    }))
+                                    .child("Reset"),
+                            )
+                        }),
                 ),
         )
     }
@@ -1709,6 +1872,7 @@ impl Player {
     pub(crate) fn transform_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.transform_open?;
         let params = self.transform_params();
+        let dark = self.darkroom;
         let rows: Vec<_> = TRANSFORM_BANDS
             .iter()
             .enumerate()
@@ -1726,13 +1890,21 @@ impl Player {
                     .px(px(6.))
                     .rounded(px(3.))
                     .cursor_pointer()
-                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .when(dark && picked, |d| d.border_l_2().border_color(rgb(INK1())))
+                    .when(!dark && picked, |d| d.bg(rgb(BG_SELECTED())))
+                    .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.transform_band = i;
                         cx.notify();
                     }))
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .when(dark, |d| d.child(dark_row_label(label, picked)))
+                            .when(!dark, |d| d.child(label)),
+                    )
                     .child(
                         div()
                             .id(("transform-bar", i))
@@ -1757,7 +1929,7 @@ impl Player {
                                     .w_full()
                                     .h(px(4.))
                                     .rounded(px(2.))
-                                    .bg(rgb(BG_PANEL()))
+                                    .bg(rgb(if dark { DARK_PANEL() } else { BG_PANEL() }))
                                     .child(
                                         div()
                                             .h_full()
@@ -1768,17 +1940,25 @@ impl Player {
                             ),
                     )
                     .child(
-                        div()
-                            .w(px(44.))
-                            .text_size(px(11.))
-                            .text_color(rgb(FG_SECONDARY()))
-                            .child(match i == ROTATE_BAND {
+                        div().w(px(44.)).when(dark, |d| {
+                            d.child(dark_row_value(match i == ROTATE_BAND {
                                 true => format!("{value:.0}°"),
                                 false => format!("{value:.2}"),
-                            }),
+                            }))
+                        }).when(!dark, |d| {
+                            d.text_size(px(11.))
+                                .text_color(rgb(FG_SECONDARY()))
+                                .child(match i == ROTATE_BAND {
+                                    true => format!("{value:.0}°"),
+                                    false => format!("{value:.2}"),
+                                })
+                        }),
                     )
             })
             .collect();
+        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
+        let help_text = "drag a bar, or ↑↓ picks one and ←→ moves it (rotation steps \
+                     by 90°), r resets — a click away or esc closes";
         Some(
             drag_scrim(cx)
                 .flex()
@@ -1803,41 +1983,58 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(div().flex_none().px(px(6.)).child(format!(
-                            "Transform — {} clip {}",
-                            lane.label(),
-                            idx + 1
-                        )))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "drag a bar, or ↑↓ picks one and ←→ moves it (rotation steps \
-                                     by 90°), r resets — a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Transform", Some(head_meta.clone()))))
+                        .when(!dark, |d| {
+                            d.child(div().flex_none().px(px(6.)).child(format!(
+                                "Transform — {} clip {}",
+                                lane.label(),
+                                idx + 1
+                            )))
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         .children(rows)
-                        .child(
-                            div()
-                                .id("transform-reset")
-                                .mt(px(4.))
-                                .flex()
-                                .h(px(CONTROL_H))
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(rgb(BG_SELECTED()))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        .when(dark, |d| {
+                            d.child(dark_ghost_button(
+                                "transform-reset",
+                                "Reset",
+                                "r",
+                                false,
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.set_transform(TransformParams::default(), cx);
-                                }))
-                                .child("Reset"),
-                        ),
+                                }),
+                            ))
+                        })
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .id("transform-reset")
+                                    .mt(px(4.))
+                                    .flex()
+                                    .h(px(CONTROL_H))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(rgb(BG_SELECTED()))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.set_transform(TransformParams::default(), cx);
+                                    }))
+                                    .child("Reset"),
+                            )
+                        }),
                 ),
         )
     }
@@ -1856,6 +2053,7 @@ impl Player {
         let speed = self.card_speed();
         let session = self.session.as_ref()?;
         let clip = session.lane_clips(lane).get(idx).copied()?;
+        let dark = self.darkroom;
         let lo = f32::from(Speed::MIN.permille());
         let hi = f32::from(Speed::MAX.permille());
         let frac = ((f32::from(speed.permille()) - lo) / (hi - lo)).clamp(0., 1.);
@@ -1863,6 +2061,7 @@ impl Player {
             .into_iter()
             .map(|permille| {
                 let at = Speed::from_permille(permille);
+                let picked = at == speed;
                 div()
                     .id(("speed-preset", usize::from(permille)))
                     .flex_1()
@@ -1871,18 +2070,32 @@ impl Player {
                     .items_center()
                     .justify_center()
                     .rounded(px(3.))
-                    .bg(rgb(match at == speed {
-                        true => BG_SELECTED(),
-                        false => BG_PANEL(),
-                    }))
+                    .when(dark && picked, |d| d.bg(rgb(DARK_RAISED())))
+                    .when(!dark, |d| {
+                        d.bg(rgb(match picked {
+                            true => BG_SELECTED(),
+                            false => BG_PANEL(),
+                        }))
+                    })
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.set_speed(at, cx);
                     }))
-                    .child(format!("{at}"))
+                    .when(dark, |d| d.child(dark_row_value(format!("{at}"))))
+                    .when(!dark, |d| d.child(format!("{at}")))
             })
             .collect();
+        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
+        let help_text =
+            "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes";
+        let tail_text: SharedString = format!(
+            "{speed} — {} source frames over {} on the timeline ({})",
+            clip.len(),
+            clip.frames(),
+            frames_timecode(clip.frames(), self.fps)
+        )
+        .into();
         Some(
             drag_scrim(cx)
                 .flex()
@@ -1908,22 +2121,27 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(div().flex_none().px(px(6.)).child(format!(
-                            "Speed (tape) — {} clip {}",
-                            lane.label(),
-                            idx + 1
-                        )))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "drag the bar or ←→ moves it, r is 1.00x — the pitch moves with the rate; a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Speed (tape)", Some(head_meta.clone()))))
+                        .when(!dark, |d| {
+                            d.child(div().flex_none().px(px(6.)).child(format!(
+                                "Speed (tape) — {} clip {}",
+                                lane.label(),
+                                idx + 1
+                            )))
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         .child(
                             // 4 px to look at and a whole row to hit (WCAG
                             // 2.5.8), the split the colour sliders and the ruler
@@ -1949,7 +2167,7 @@ impl Player {
                                         .w_full()
                                         .h(px(4.))
                                         .rounded(px(2.))
-                                        .bg(rgb(BG_PANEL()))
+                                        .bg(rgb(if dark { DARK_PANEL() } else { BG_PANEL() }))
                                         .child(
                                             div()
                                                 .h_full()
@@ -1960,22 +2178,20 @@ impl Player {
                                 ),
                         )
                         .child(div().flex().gap(px(4.)).children(presets))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                // What the choice *is*, in the numbers the
-                                // timeline is measured in: the source range
-                                // never moves, the room it takes does.
-                                .child(format!(
-                                    "{speed} — {} source frames over {} on the timeline ({})",
-                                    clip.len(),
-                                    clip.frames(),
-                                    frames_timecode(clip.frames(), self.fps)
-                                )),
-                        ),
+                        .when(dark, |d| d.child(dark_help(tail_text.clone())))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    // What the choice *is*, in the numbers the
+                                    // timeline is measured in: the source range
+                                    // never moves, the room it takes does.
+                                    .child(tail_text),
+                            )
+                        }),
                 ),
         )
     }
@@ -2000,6 +2216,7 @@ impl Player {
         if !self.mix_open {
             return None;
         }
+        let dark = self.darkroom;
         let session = self.session.as_ref();
         let lanes = self.mix_lanes();
         let limiter = session.map_or_else(Limiter::default, PlaybackSession::limiter);
@@ -2027,6 +2244,7 @@ impl Player {
             .into_iter()
             .enumerate()
             .map(|(n, (label, value))| {
+                let picked = n == self.mix_field;
                 div()
                     .id(("mix-row", n))
                     .flex()
@@ -2036,51 +2254,80 @@ impl Player {
                     .justify_between()
                     .px(px(6.))
                     .rounded(px(3.))
-                    .bg(rgb(match n == self.mix_field {
-                        true => BG_SELECTED(),
-                        false => BG_PANEL(),
-                    }))
+                    .when(dark && picked, |d| d.border_l_2().border_color(rgb(INK1())))
+                    .when(!dark, |d| {
+                        d.bg(rgb(match picked {
+                            true => BG_SELECTED(),
+                            false => BG_PANEL(),
+                        }))
+                    })
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.mix_field = n;
                         cx.notify();
                     }))
-                    .child(div().text_color(rgb(FG_SECONDARY())).child(label))
+                    .child(
+                        div()
+                            .when(dark, |d| d.child(dark_row_label(label.clone(), picked)))
+                            .when(!dark, |d| d.text_color(rgb(FG_SECONDARY())).child(label)),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .child(value)
+                            .when(dark, |d| d.child(dark_row_value(value.clone())))
+                            .when(!dark, |d| d.child(value))
                             .children([-1, 1].map(|steps: i32| {
-                                div()
-                                    .id(("mix-step", n * 2 + usize::from(steps > 0)))
-                                    .flex_none()
-                                    .w(px(HIT_MIN))
-                                    .h(px(KEYS_ROW_H))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(3.))
-                                    .bg(rgb(BG_PANEL()))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER())))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        // Picked as well as moved, the silence
-                                        // card's rule: the row a press lands on
-                                        // is the row the arrows carry on from.
-                                        this.mix_field = n;
-                                        this.nudge_mix(steps, cx);
-                                    }))
-                                    .child(match steps > 0 {
-                                        true => "+",
-                                        false => "−",
-                                    })
+                                let id = ("mix-step", n * 2 + usize::from(steps > 0));
+                                match dark {
+                                    true => dark_step_glyph(
+                                        id,
+                                        steps > 0,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.mix_field = n;
+                                            this.nudge_mix(steps, cx);
+                                        }),
+                                    )
+                                    .into_any_element(),
+                                    false => div()
+                                        .id(id)
+                                        .flex_none()
+                                        .w(px(HIT_MIN))
+                                        .h(px(KEYS_ROW_H))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(BG_PANEL()))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            // Picked as well as moved, the silence
+                                            // card's rule: the row a press lands on
+                                            // is the row the arrows carry on from.
+                                            this.mix_field = n;
+                                            this.nudge_mix(steps, cx);
+                                        }))
+                                        .child(match steps > 0 {
+                                            true => "+",
+                                            false => "−",
+                                        })
+                                        .into_any_element(),
+                                }
                             })),
                     )
             })
             .collect();
+        let help_text = "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; a click away or esc closes";
+        let tail_text = match limiter.on {
+            true => format!(
+                "the mix is held under {:+.0} dBFS — quieter passages are untouched",
+                limiter.ceiling_db
+            ),
+            false => "the limiter is out of circuit — a hot mix clips at full scale".to_string(),
+        };
         Some(
             scrim()
                 .flex()
@@ -2107,23 +2354,28 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .child("Mix — track volumes and the master limiter"),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — a track fader moves everything on that track; a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Mix", None)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .child("Mix — track volumes and the master limiter"),
+                            )
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         .child(
                             div()
                                 .id("mix-rows")
@@ -2133,23 +2385,20 @@ impl Player {
                                 .overflow_y_scroll()
                                 .children(rows),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                // What the choice *is*: the limiter's own line,
-                                // because "on" alone says nothing about what it
-                                // does to a mix that never reaches the ceiling.
-                                .child(match limiter.on {
-                                    true => format!(
-                                        "the mix is held under {:+.0} dBFS — quieter passages are untouched",
-                                        limiter.ceiling_db
-                                    ),
-                                    false => "the limiter is out of circuit — a hot mix clips at full scale".to_string(),
-                                }),
-                        ),
+                        .when(dark, |d| d.child(dark_help(tail_text.clone())))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    // What the choice *is*: the limiter's own line,
+                                    // because "on" alone says nothing about what it
+                                    // does to a mix that never reaches the ceiling.
+                                    .child(tail_text),
+                            )
+                        }),
                 ),
         )
     }
