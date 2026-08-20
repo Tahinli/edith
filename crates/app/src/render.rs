@@ -189,7 +189,15 @@ impl Render for Player {
             self.panned = false;
         }
 
-        div()
+        // DESIGN.md §12 step 2: the stance skeleton behind `EDITH_DARKROOM`.
+        // `.into_any_element()` on both arms is the one thing this branch
+        // costs the legacy tree below -- an `impl IntoElement` return can
+        // only be one concrete type, and the two trees are not the same one.
+        if self.darkroom {
+            return ui::stance::render(self, window, cx).into_any_element();
+        }
+
+        (div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
@@ -807,6 +815,7 @@ impl Render for Player {
             .children(self.export_progress_card(cx))
             // Last, so it floats over whatever opened it -- an inspector row or
             // a clip menu -- rather than under it.
-            .children(self.picker_card(window.viewport_size(), cx))
+            .children(self.picker_card(window.viewport_size(), cx)))
+        .into_any_element()
     }
 }

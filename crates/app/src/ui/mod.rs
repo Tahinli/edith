@@ -8,6 +8,7 @@ pub mod inspector;
 pub mod library;
 pub mod overlays;
 pub mod preview;
+pub mod stance;
 pub mod theme;
 pub mod timeline;
 pub mod toolbar;
