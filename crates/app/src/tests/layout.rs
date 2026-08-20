@@ -1736,6 +1736,252 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
     );
 }
 
+/// The darkroom's own two seams (`Split::Dock`, `Split::Bench`): a hand may
+/// not drag either past its floor or its ceiling, the same promise
+/// [`a_dragged_divider_stops_before_either_panel_disappears`] makes for the
+/// legacy three.
+#[test]
+fn the_darkroom_seams_stop_before_either_side_disappears() {
+    use crate::ui::theme::INSPECTOR_MIN_W;
+    use crate::{BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size};
+    use gpui::{point, px, size};
+
+    let window = size(px(1280.), px(720.));
+    // Untouched, each answers its own stance default.
+    assert_eq!(
+        split_size(Split::Dock, None, 2, window, false),
+        crate::ui::stance::DOCK_W
+    );
+    assert_eq!(
+        split_size(Split::Bench, None, 2, window, false),
+        crate::ui::stance::BENCH_H
+    );
+    // Dragged, it is what the hand asked for...
+    assert_eq!(split_size(Split::Dock, Some(400.), 2, window, false), 400.);
+    assert_eq!(split_size(Split::Bench, Some(300.), 2, window, false), 300.);
+    // ...and never past the floor...
+    assert_eq!(
+        split_size(Split::Dock, Some(0.), 2, window, false),
+        INSPECTOR_MIN_W
+    );
+    assert_eq!(
+        split_size(Split::Bench, Some(0.), 2, window, false),
+        BENCH_MIN_H
+    );
+    // ...nor the ceiling. The bench's is not a window-share one -- it leaves
+    // the screen and time band a fixed 160px, [`split_bounds`]'s own reason.
+    assert_eq!(
+        split_size(Split::Dock, Some(9000.), 2, window, false),
+        1280. * SIDE_MAX_FRAC
+    );
+    let (_, bench_max) = split_bounds(Split::Bench, 2, window, false);
+    assert_eq!(
+        split_size(Split::Bench, Some(9000.), 2, window, false),
+        bench_max
+    );
+    assert!(bench_max < 720.);
+    // The pointer turned into a size, half a strip off for the same reason
+    // the legacy seams read it that way.
+    assert_eq!(
+        split_drag_size(Split::Dock, point(px(1000.), px(400.)), window),
+        280. - SPLIT_W / 2.
+    );
+    assert_eq!(
+        split_drag_size(Split::Bench, point(px(300.), px(500.)), window),
+        220. - crate::ui::stance::LEDGER_H - SPLIT_W / 2.
+    );
+}
+
+/// At the bench's floor, both default lanes' rows actually fit inside the
+/// `bench-lanes` column `bench_stance::render` gives them -- not just each
+/// row's own clamped height, but their *sum plus the gap between them*,
+/// since `bench-lanes` scrolls rather than clipping visibly and a sum that
+/// overruns the column loses its bottom row's pixels off-screen, unscrolled
+/// (this session's F1: the A1 lane's clip-bar border and status dot, cut by
+/// ~2px at the old `BENCH_MIN_H = 80.`).
+#[test]
+fn both_default_lanes_fit_the_bench_at_its_floor() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H, row_h};
+    use crate::ui::stance::BENCH_CHROME_H;
+
+    let box_h = BENCH_MIN_H - BENCH_CHROME_H;
+    let avail = box_h - RULER_H - ROW_GAP;
+    let h = row_h(2, avail);
+    // Not an exact `LANE_MIN_H` any more: `BENCH_MIN_H` now carries one spare
+    // row (`layout::LEDGER_SEAM_CLEARANCE`) so the last lane's own last pixel
+    // never shares a row with the ledger's border, which lands here as
+    // `avail` being a touch over the two-rows-plus-gap tight fit.
+    assert!(h >= LANE_MIN_H, "the floor should give both lanes at least their own minimum ({h} < {LANE_MIN_H})");
+    let content = 2. * h + ROW_GAP;
+    assert!(
+        content <= avail + 1e-4,
+        "the two lane rows ({content}px) overrun the column ({avail}px) -- \
+         the bottom lane's pixels get cut, unscrolled"
+    );
+}
+
+/// `BENCH_CHROME_H` on its own: the previous test's `box_h = BENCH_MIN_H -
+/// BENCH_CHROME_H` line trusts `BENCH_CHROME_H` to already be correct, so it
+/// cannot catch `BENCH_CHROME_H` itself drifting -- which is exactly how the
+/// third clip (this session's) survived it: the constant undercounted the
+/// section head's real line box by 1px and this test's predecessor never
+/// looked. Recomputes what `ui::stance::bench` actually draws above
+/// `bench_stance::render`'s content -- the div's own `.border_t_1()` (1px)
+/// + its `py(4.)` top padding + the section head's real line box at gpui's
+/// golden-ratio line-height, not the label's bare font size (the same trap
+/// `a_lane_row_fits_what_its_own_head_draws` already checks for the lane
+/// heads) -- and then checks the *whole* stack -- chrome, ruler, both gaps,
+/// both lanes, and the clear row the ledger's own fixed-position border
+/// needs (`LEDGER_SEAM_CLEARANCE`, not exported, so this recomputes it as
+/// `BENCH_MIN_H` minus every other named term) -- fits inside `BENCH_MIN_H`
+/// with nothing left over uncounted. This binary carries no `TestAppContext`
+/// to mount `ui::stance::bench` and `ui::stance::ledger` for real and read
+/// painted bounds back, so it stays geometry-only, same as its neighbours.
+#[test]
+fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
+    use crate::ui::stance::BENCH_CHROME_H;
+    use crate::ui::type_scale::SECTION_HEAD_PX;
+
+    const BENCH_BORDER_T: f32 = 1.;
+    const BENCH_PY_TOP: f32 = 4.;
+    let section_head_line_h = (SECTION_HEAD_PX * 1.618_034).round();
+    let real_chrome = BENCH_BORDER_T + BENCH_PY_TOP + section_head_line_h;
+    assert_eq!(
+        BENCH_CHROME_H, real_chrome,
+        "BENCH_CHROME_H ({BENCH_CHROME_H}) does not match what `stance::bench` \
+         actually draws above the content ({real_chrome}px: {BENCH_BORDER_T}px \
+         border + {BENCH_PY_TOP}px padding + {section_head_line_h}px label line \
+         box) -- bench_stance::render gets handed the wrong box_h and lays its \
+         rows out past its own real space"
+    );
+
+    // The ledger's own fixed-position border needs one more clear row below
+    // the last lane, on top of chrome + ruler + both gaps + both lanes --
+    // recomputed here rather than importing the private
+    // `layout::LEDGER_SEAM_CLEARANCE`, so this test fails if that term is
+    // ever silently dropped from `BENCH_MIN_H`'s own sum.
+    let content_need = real_chrome + RULER_H + ROW_GAP + 2. * LANE_MIN_H + ROW_GAP;
+    let ledger_seam_clearance = BENCH_MIN_H - content_need;
+    assert!(
+        ledger_seam_clearance >= 1. - 1e-4,
+        "BENCH_MIN_H ({BENCH_MIN_H}) leaves only {ledger_seam_clearance}px \
+         between the last lane row and the ledger's own top border -- driven \
+         at exactly the content's need (0px clearance) the border still won \
+         the shared pixel and clipped the last lane's status dot"
+    );
+}
+
+/// The previous test asserted lane ROWS fit the bench column -- not that a
+/// lane's own CONTENT fits its row, which is how the defect it fixed
+/// survived it: at the old `LANE_MIN_H` of `18.` both lanes fit the bench
+/// exactly while V1's status dot silently overflowed into A1's row (masked)
+/// and A1's overflowed into the ledger (visible, since A1 has no next row).
+/// This binary carries no `TestAppContext` to mount a real `lane_row` and
+/// read its painted bounds back, so this recomputes the label's own line
+/// box from the constants `lane_row` actually draws with (gpui's default
+/// `TextStyle::line_height` is the golden ratio, not 1x the font size --
+/// see `LANE_MIN_H`'s own doc comment) rather than a literal, so a future
+/// shrink of `LANE_MIN_H` or growth of the label size fails this instead of
+/// silently clipping the last lane again.
+#[test]
+fn a_lane_row_fits_what_its_own_head_draws() {
+    use crate::ui::bench_stance::{LANE_DOT_D, LANE_HEAD_GAP, LANE_MIN_H};
+    use crate::ui::type_scale::CHORD_METADATA_MIN_PX;
+
+    let label_line_h = (CHORD_METADATA_MIN_PX * 1.618_034).round();
+    let content = label_line_h + LANE_HEAD_GAP + LANE_DOT_D;
+    assert!(
+        LANE_MIN_H >= content,
+        "LANE_MIN_H ({LANE_MIN_H}) is shorter than what a lane head actually \
+         draws ({content}px: {label_line_h}px label line box + \
+         {LANE_HEAD_GAP}px gap + {LANE_DOT_D}px dot) -- the status dot \
+         would spill past the row, invisible until it is the last lane \
+         with no next row to spill into"
+    );
+}
+
+/// The notice plate's own anchor ([`crate::ui::stance::notice_bottom_offset`])
+/// keeps it off the bench, at *any* bench height -- not merely the floor --
+/// because its bottom offset always lands at or above the bench's own top
+/// edge. `Player`'s live tree has no `TestAppContext` in this binary to mount
+/// a real `notice_plate` in and read its painted bounds back, so this checks
+/// the pure geometry the anchor is built from instead (F2: previously the
+/// plate sat at a fixed `LEDGER_H + 6.` off the ledger and covered the
+/// V1/A1 lane chips whenever the bench was short enough for the plate's own
+/// height to reach past it).
+#[test]
+fn the_notice_plate_cannot_reach_the_bench_at_any_height() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::stance::{BENCH_H, LEDGER_H, notice_bottom_offset};
+
+    for bench_h in [BENCH_MIN_H, BENCH_H, 400.] {
+        let notice_bottom = notice_bottom_offset(bench_h);
+        // The bench sits directly above the ledger in the centre column, so
+        // its own top edge (measured the same way, from the column's foot)
+        // is exactly `LEDGER_H + bench_h`.
+        let bench_top = LEDGER_H + bench_h;
+        assert!(
+            notice_bottom >= bench_top,
+            "notice bottom {notice_bottom} sits below the bench's top {bench_top} \
+             at bench_h={bench_h} -- the plate can cover a lane row"
+        );
+    }
+}
+
+/// A round trip through the file: what is saved is what the next load reads
+/// back, one seam touched and the other left at its default -- a scratch
+/// path, not the real config, the same isolation `keymap::tests`' own
+/// `load_from`/`save_to` already takes.
+#[test]
+fn a_saved_seam_survives_a_reload() {
+    use crate::{Split, Splits, load_stance_splits_from, save_stance_splits_to};
+
+    let dir = engine::scratch::Scratch::dir("edith-stance-splits");
+    let path = dir.join("stance-splits");
+
+    let mut splits = Splits::default();
+    splits.set(Split::Dock, 333.);
+    save_stance_splits_to(&splits, &path);
+    let loaded = load_stance_splits_from(&path);
+    assert_eq!(loaded.get(Split::Dock), Some(333.));
+    assert_eq!(loaded.get(Split::Bench), None);
+}
+
+/// The guard [`crate::split_drag_owes_save`] runs at the moment a drag ends
+/// with no further pointer event ever coming (`Player::drag_left_window`,
+/// wired to a live `MouseExitEvent` a `TestAppContext`-less test binary
+/// cannot raise -- see `tests/media.rs`'s own note on the same limit, and
+/// the harness drive `D2` in this session's report for the wiring itself).
+/// What *is* checkable here without a window: exactly the two persisted
+/// seams owe that save, the same set `Split::PERSISTED` already names, and a
+/// drag that never started (`None`) owes nothing.
+#[test]
+fn only_the_two_persisted_seams_owe_a_save_when_a_drag_loses_the_window() {
+    use crate::{Split, player::timeline_edit::split_drag_owes_save};
+
+    assert!(split_drag_owes_save(Some(Split::Dock)));
+    assert!(split_drag_owes_save(Some(Split::Bench)));
+    assert!(!split_drag_owes_save(Some(Split::Library)));
+    assert!(!split_drag_owes_save(Some(Split::Inspector)));
+    assert!(!split_drag_owes_save(Some(Split::Timeline)));
+    assert!(!split_drag_owes_save(None));
+}
+
+/// A missing file leaves every region at its default -- the silent fallback
+/// `load_stance_splits`'s doc comment promises.
+#[test]
+fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
+    use crate::{Split, load_stance_splits_from};
+
+    let dir = engine::scratch::Scratch::dir("edith-stance-splits-missing");
+    let splits = load_stance_splits_from(&dir.join("nothing-here"));
+    assert_eq!(splits.get(Split::Dock), None);
+    assert_eq!(splits.get(Split::Bench), None);
+}
+
 /// Every seam in the main layout has a handle on it, and every region draws
 /// itself at the size that handle sets: a region still measuring itself off the
 /// window's own share is a panel whose divider moves nothing.
@@ -1745,6 +1991,13 @@ fn every_seam_in_the_layout_has_a_divider_on_it() {
     for split in ["Split::Library", "Split::Inspector", "Split::Timeline"] {
         assert!(
             render.contains(&format!("divider({split}")),
+            "{split} has no divider to drag"
+        );
+    }
+    let stance = src_text("ui/stance.rs");
+    for split in ["Split::Dock", "Split::Bench"] {
+        assert!(
+            stance.contains(&format!("divider({split}")),
             "{split} has no divider to drag"
         );
     }
