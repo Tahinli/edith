@@ -18,8 +18,10 @@ use crate::ui::type_scale::{self, Typeset};
 /// Left rail, full height (DESIGN §5).
 const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
-/// strip, Export -- all placeholder at this step.
-const TIME_BAND_H: f32 = 88.;
+/// strip, Export -- all placeholder at this step. Kept `pub(crate)` for
+/// `layout::split_bounds`'s bench ceiling, the same one-door reason
+/// [`LEDGER_H`] already is.
+pub(crate) const TIME_BAND_H: f32 = 88.;
 /// The bench's untouched height -- [`Split::Bench`]'s own default, read by
 /// `layout::split_size` the same way the legacy tree's `library_w`/
 /// `inspector_w` feed `Split::Library`/`Split::Inspector`. A hand on the

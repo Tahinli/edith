@@ -1743,9 +1743,7 @@ fn a_dragged_divider_stops_before_either_panel_disappears() {
 #[test]
 fn the_darkroom_seams_stop_before_either_side_disappears() {
     use crate::ui::theme::INSPECTOR_MIN_W;
-    use crate::{
-        BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, TIMELINE_MAX_SHARE, split_drag_size, split_size,
-    };
+    use crate::{BENCH_MIN_H, SIDE_MAX_FRAC, SPLIT_W, Split, split_bounds, split_drag_size, split_size};
     use gpui::{point, px, size};
 
     let window = size(px(1280.), px(720.));
@@ -1770,15 +1768,18 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
         split_size(Split::Bench, Some(0.), 2, window, false),
         BENCH_MIN_H
     );
-    // ...nor the ceiling.
+    // ...nor the ceiling. The bench's is not a window-share one -- it leaves
+    // the screen and time band a fixed 160px, [`split_bounds`]'s own reason.
     assert_eq!(
         split_size(Split::Dock, Some(9000.), 2, window, false),
         1280. * SIDE_MAX_FRAC
     );
+    let (_, bench_max) = split_bounds(Split::Bench, 2, window, false);
     assert_eq!(
         split_size(Split::Bench, Some(9000.), 2, window, false),
-        720. * TIMELINE_MAX_SHARE
+        bench_max
     );
+    assert!(bench_max < 720.);
     // The pointer turned into a size, half a strip off for the same reason
     // the legacy seams read it that way.
     assert_eq!(
@@ -1789,6 +1790,37 @@ fn the_darkroom_seams_stop_before_either_side_disappears() {
         split_drag_size(Split::Bench, point(px(300.), px(500.)), window),
         220. - crate::ui::stance::LEDGER_H - SPLIT_W / 2.
     );
+}
+
+/// A round trip through the file: what is saved is what the next load reads
+/// back, one seam touched and the other left at its default -- a scratch
+/// path, not the real config, the same isolation `keymap::tests`' own
+/// `load_from`/`save_to` already takes.
+#[test]
+fn a_saved_seam_survives_a_reload() {
+    use crate::{Split, Splits, load_stance_splits_from, save_stance_splits_to};
+
+    let dir = engine::scratch::Scratch::dir("edith-stance-splits");
+    let path = dir.join("stance-splits");
+
+    let mut splits = Splits::default();
+    splits.set(Split::Dock, 333.);
+    save_stance_splits_to(&splits, &path);
+    let loaded = load_stance_splits_from(&path);
+    assert_eq!(loaded.get(Split::Dock), Some(333.));
+    assert_eq!(loaded.get(Split::Bench), None);
+}
+
+/// A missing file leaves every region at its default -- the silent fallback
+/// `load_stance_splits`'s doc comment promises.
+#[test]
+fn a_missing_stance_splits_file_leaves_every_region_at_its_default() {
+    use crate::{Split, load_stance_splits_from};
+
+    let dir = engine::scratch::Scratch::dir("edith-stance-splits-missing");
+    let splits = load_stance_splits_from(&dir.join("nothing-here"));
+    assert_eq!(splits.get(Split::Dock), None);
+    assert_eq!(splits.get(Split::Bench), None);
 }
 
 /// Every seam in the main layout has a handle on it, and every region draws
