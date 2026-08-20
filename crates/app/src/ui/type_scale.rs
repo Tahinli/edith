@@ -27,7 +27,7 @@
 // crate's only caller of the public API is `main.rs`'s `register`.
 #![allow(dead_code)]
 
-use gpui::{App, Font, FontFeatures, FontWeight, Pixels, SharedString, font, px};
+use gpui::{App, Font, FontFeatures, FontWeight, Pixels, SharedString, Styled, font, px};
 use std::borrow::Cow;
 
 /// Archivo: labels, verbs, section heads.
@@ -112,6 +112,18 @@ pub fn mono(size_px: f32, weight: FontWeight) -> TypeStyle {
 pub fn head() -> TypeStyle {
     label(SECTION_HEAD_PX, FontWeight::BOLD)
 }
+
+/// Applies a [`TypeStyle`] to any styled element in one call --
+/// `div().type_style(mono(9.5, FontWeight::MEDIUM))` instead of the
+/// `.font(style.font).text_size(style.size)` pair spelled out at every call
+/// site. Blanket-implemented over `Styled` so every element in the room gets
+/// it for free.
+pub trait Typeset: Styled + Sized {
+    fn type_style(self, style: TypeStyle) -> Self {
+        self.font(style.font).text_size(style.size)
+    }
+}
+impl<T: Styled> Typeset for T {}
 
 /// One face's worth of TTFs to embed, `(bytes, name)` for the doc comment
 /// above `register` to explain if a load ever fails.

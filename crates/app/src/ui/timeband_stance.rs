@@ -8,9 +8,12 @@
 //! (MOCK-SPEC.md) reads closer to ~20px. Kept at 13px here -- the binding
 //! contract's own number, already what `stance.rs::time_band()` shipped --
 //! rather than silently picking the mock's, and named here per this task's
-//! own instruction to say so when the two disagree.
+//! own instruction to say so when the two disagree. Every size in this
+//! module now comes from `ui::type_scale` (role, not a bare `px()` literal).
 
 use crate::*;
+use crate::ui::type_scale::{self, label, mono};
+use gpui::FontWeight;
 
 thread_local! {
     // corner-cut: every other drag surface in this codebase (the bench
@@ -30,18 +33,24 @@ thread_local! {
 /// fires it -- the same shape `stance::ghost` draws for the spine, kept local
 /// here so this module owns its own region end to end.
 fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
+    let glyph_style = label(type_scale::HERO_TIMECODE_PX, FontWeight::MEDIUM);
+    // The chord names a key, so DESIGN §3's mono rule ("if a string is about
+    // ... a key, it is mono") applies here same as everywhere else in the band.
+    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     div()
         .flex_none()
         .flex()
         .flex_col()
         .items_center()
         .gap(px(1.))
-        .text_size(px(13.))
+        .font(glyph_style.font)
+        .text_size(glyph_style.size)
         .text_color(rgb(INK2()))
         .child(glyph.to_string())
         .child(
             div()
-                .text_size(px(9.))
+                .font(chord_style.font)
+                .text_size(chord_style.size)
                 .text_color(rgb(INK3()))
                 .child(player.keymap.display(action)),
         )
@@ -52,10 +61,12 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
 /// rather than painted whole, so the colons can read a shade quieter than
 /// the numbers either side of them.
 fn hero_timecode(tc: &str) -> impl IntoElement {
+    let style = mono(type_scale::HERO_TIMECODE_PX, FontWeight::BOLD);
     div()
         .flex_none()
         .flex()
-        .text_size(px(13.))
+        .font(style.font)
+        .text_size(style.size)
         .children(tc.chars().map(|c| {
             let ink = if c == ':' { INK3() } else { INK1() };
             div().text_color(rgb(ink)).child(c.to_string())
@@ -99,6 +110,7 @@ fn cut_readout(player: &Player) -> impl IntoElement {
         ))
     });
     let roll_on = player.loop_trim.is_some();
+    let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
     div()
         .id("stance-cut-readout")
         .flex_none()
@@ -108,7 +120,8 @@ fn cut_readout(player: &Player) -> impl IntoElement {
         .py(px(4.))
         .rounded(px(2.))
         .bg(rgb(DARK_CANVAS()))
-        .text_size(px(10.5))
+        .font(style.font)
+        .text_size(style.size)
         .child(val(odometer))
         .when_some(deltas, |el, (in_d, out_d)| {
             el.child(sep())
@@ -278,16 +291,20 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
 /// by [`super::stance::render`] the same way the keys overlay is.
 fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     let exporting = player.exporting().is_some();
+    let label_style = label(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+    let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     div()
         .id("stance-export")
         .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.))
         .px(px(10.))
         .py(px(6.))
         .rounded(px(3.))
         .border_1()
         .border_color(rgb(DARK_HAIRLINE()))
         .bg(rgb(DARK_RAISED()))
-        .text_size(px(10.5))
         .text_color(rgb(INK1()))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(DARK_PANEL())))
@@ -299,11 +316,19 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
             }
             cx.notify();
         }))
-        .child(format!(
-            "{}  {}",
-            if exporting { "Exporting" } else { "Export" },
-            player.keymap.display(ActionId::Export)
-        ))
+        .child(
+            div()
+                .font(label_style.font)
+                .text_size(label_style.size)
+                .child(if exporting { "Exporting" } else { "Export" }),
+        )
+        .child(
+            div()
+                .font(chord_style.font)
+                .text_size(chord_style.size)
+                .text_color(rgb(INK3()))
+                .child(player.keymap.display(ActionId::Export)),
+        )
 }
 
 /// The whole band, left to right per MOCK-SPEC: hero timecode, ghost
@@ -312,8 +337,14 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player>) -> impl IntoElement {
     let tc = timecode(position, player.active_fps());
     div()
-        .id("stance-time-band")
-        .flex_none()
+        .id("stance-time-band-row")
+        // FAULT 1 fix: this div used to be `flex_none`, which sized it to its
+        // own content inside `stance.rs::time_band()`'s row -- leaving the
+        // contact strip's `flex_1` nothing to grow into (its "free space" was
+        // zero, since the parent itself never claimed the band's full width).
+        // `flex_1` here is what actually lets the strip fill the band.
+        .flex_1()
+        .min_w(px(0.))
         .h_full()
         .flex()
         .items_center()

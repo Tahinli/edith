@@ -3,29 +3,26 @@
 //! not the flat ungrouped list of glyph-beside-chord rows the shipped room
 //! drew. `stance.rs::spine()` keeps the panel frame (width, surface,
 //! border); this module owns the rows inside it.
-//!
-//! corner-cut: sizes below are plain `px()` literals matching DESIGN §3's
-//! scale (13px glyph, 9.5px chord, 9px head) rather than calls into a
-//! `ui::type_scale` API -- that module had not landed in this tree at the
-//! time this was written. Ceiling: swap these three constants for its
-//! tokens once it lands; nothing else here would change.
 
 use crate::*;
+use crate::ui::type_scale::{self, Typeset};
 
+/// The glyph icon itself: DESIGN §3 names no separate role for it, so this
+/// keeps the size the module has always drawn it at (13px, the same number
+/// as the hero timecode by coincidence, not by role) and routes only the
+/// font family through [`type_scale`] (Archivo -- the glyph is a verb, the
+/// room's voice, not something the film says).
 const GLYPH_SIZE: f32 = 13.;
-const CHORD_SIZE: f32 = 9.5;
-const HEAD_SIZE: f32 = 9.;
 
-/// A group head: 9px uppercase Archivo 700(-weight token, same as every
-/// other section head in the stance) in `ink3`, +0.14em tracking (DESIGN
-/// §3) -- reused as its own small fn rather than `stance::section_head`
+/// A group head: 9px uppercase Archivo 700 in `ink3`, +0.14em tracking
+/// (DESIGN §3) -- reused as its own small fn rather than `stance::section_head`
 /// because that one is private to its module and carries a different
 /// vertical rhythm (a region label, not a spine group head).
 fn group_head(label: &str) -> impl IntoElement {
     div()
         .flex_none()
-        .pt(px(6.))
-        .text_size(px(HEAD_SIZE))
+        .pt(px(10.))
+        .type_style(type_scale::head())
         .text_color(rgb(INK3()))
         .child(label.to_uppercase())
 }
@@ -46,12 +43,17 @@ fn glyph(
     cx: &mut Context<Player>,
 ) -> impl IntoElement + use<> {
     let enabled = player.enable(action, None);
-    let key = player.keymap.display(action);
+    // The badge shows the primary chord only (FAULT 1: a chord badge is a
+    // compact token, not a sentence); the tooltip keeps every stroke an
+    // action answers to, and the keys overlay ([`crate::ui::stance`]) is
+    // still where the full truth lives.
+    let full = player.keymap.display(action);
     let say: SharedString = match enabled.why() {
-        Some(why) => format!("{key} — {why}"),
-        None => format!("{key} — {}", action.label()),
+        Some(why) => format!("{full} — {why}"),
+        None => format!("{full} — {}", action.label()),
     }
     .into();
+    let compact = player.keymap.chord(action);
     let on = enabled.yes();
     div()
         .id(id)
@@ -59,9 +61,9 @@ fn glyph(
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(2.))
+        .gap(px(1.))
         .px(px(4.))
-        .py(px(4.))
+        .py(px(2.))
         .rounded(px(3.))
         .when(active, |d| d.bg(rgb(DARK_RAISED())))
         .tooltip(move |_, cx| cx.new(|_| Tip(say.clone())).into())
@@ -75,15 +77,18 @@ fn glyph(
         })
         .child(
             div()
-                .text_size(px(GLYPH_SIZE))
+                .type_style(type_scale::label(GLYPH_SIZE, gpui::FontWeight::MEDIUM))
                 .text_color(rgb(if active { INK1() } else { INK2() }))
                 .child(glyph),
         )
         .child(
             div()
-                .text_size(px(CHORD_SIZE))
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK3()))
-                .child(key),
+                .child(compact),
         )
 }
 
@@ -96,7 +101,7 @@ fn pair(left: impl IntoElement, right: impl IntoElement) -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .gap(px(10.))
+        .gap(px(6.))
         .child(left)
         .child(right)
 }
@@ -123,7 +128,10 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
         .flex()
         .flex_col()
         .items_center()
-        .gap(px(10.))
+        // FAULT 2: rows close under their group head, real space (the group
+        // head's own `pt`) only between one group and the next -- not one
+        // uniform gap stretching every row down the window.
+        .gap(px(2.))
         .overflow_y_scroll()
         .child(group_head("edit"))
         .child(glyph("spine-split", "||", ActionId::Cut, false, player, cx))

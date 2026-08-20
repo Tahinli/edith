@@ -28,6 +28,7 @@
 //! answer for.
 
 use crate::*;
+use crate::ui::type_scale::{self, Typeset};
 
 /// The pinned ruler's own height, above the lane stack -- tall enough for a
 /// tick line plus a mono `MM:SS` label under it (DESIGN §5's "tick marks with
@@ -275,12 +276,22 @@ fn clip_box(
                     .gap(px(4.))
                     .bg(rgba(DARK_SEAM()))
                     .when_some(label, |d, label| {
-                        d.child(div().min_w(px(0.)).truncate().text_size(px(9.5)).text_color(rgb(INK1())).child(label))
+                        d.child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK1()))
+                                .child(label),
+                        )
                     })
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(9.))
+                            .type_style(type_scale::mono(9., gpui::FontWeight::MEDIUM))
                             .text_color(rgb(INK3()))
                             .child(readout),
                     ),
@@ -296,7 +307,7 @@ fn clip_box(
                     .right_0()
                     .px(px(3.))
                     .bg(rgb(DARK_RAISED()))
-                    .text_size(px(9.))
+                    .type_style(type_scale::mono(9., gpui::FontWeight::MEDIUM))
                     .text_color(rgb(INK2()))
                     .child(format!("{speed}")),
             )
@@ -360,7 +371,11 @@ fn lane_row(
                 .justify_center()
                 .gap(px(2.))
                 .bg(rgb(DARK_PANEL()))
-                .text_size(px(9.5))
+                // MOCK-SPEC.md "Bench": "V1, A1 in mono".
+                .type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
                 .text_color(rgb(INK2()))
                 .child(lane.label())
                 .child(div().flex_none().w(px(4.)).h(px(4.)).rounded(px(2.)).bg(rgb(dot))),
@@ -462,7 +477,10 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                                 .child(div().w(px(1.)).h(px(4.)).bg(rgb(INK3())))
                                 .child(
                                     div()
-                                        .text_size(px(8.))
+                                        .type_style(type_scale::mono(
+                                            type_scale::FLOOR_PX,
+                                            gpui::FontWeight::MEDIUM,
+                                        ))
                                         .text_color(rgb(INK3()))
                                         .child(label),
                                 ),
@@ -492,7 +510,10 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                         .items_center()
                         .px(px(4.))
                         .bg(rgb(DARK_CANVAS()))
-                        .text_size(px(10.))
+                        .type_style(type_scale::mono(
+                            type_scale::CHORD_METADATA_MAX_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
                         .text_color(rgb(INK1()))
                         .child(playhead_tc),
                 ),
