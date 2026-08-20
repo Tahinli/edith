@@ -45,7 +45,7 @@ use crate::ui::widgets::*;
 /// The pinned ruler's own height, above the lane stack -- tall enough for a
 /// tick line plus a mono `MM:SS` label under it (DESIGN §5's "tick marks with
 /// mono ink3 timecodes").
-const RULER_H: f32 = 22.;
+pub(crate) const RULER_H: f32 = 22.;
 /// The stops a tick interval is picked from (DESIGN §5, the previous
 /// builder's own note): the smallest one whose pixel width at the current
 /// zoom still clears [`TICK_MIN_PX`].
@@ -62,12 +62,12 @@ const PLATE_W: f32 = 74.;
 /// the legacy timeline's `HEADER_W` since a darkroom lane carries no mix/eye
 /// button yet (deferred with the rest of the header's verbs).
 const HEAD_W: f32 = 28.;
-const ROW_GAP: f32 = 2.;
+pub(crate) const ROW_GAP: f32 = 2.;
 /// DESIGN §7: lanes compress evenly up to this many rows before the column
 /// scrolls behind the pinned ruler and heads instead of compressing further.
 const LANES_COMPRESS: usize = 5;
 const LANE_FULL_H: f32 = 40.;
-const LANE_MIN_H: f32 = 18.;
+pub(crate) const LANE_MIN_H: f32 = 18.;
 
 /// One clip's degradation tier (DESIGN §7), picked off the clip's own worth
 /// in pixels (`span`, unclamped) rather than its drawn floor
@@ -141,7 +141,7 @@ fn tier(span: f32) -> Tier {
 
 /// The lane stack's own height budget, split evenly across up to
 /// [`LANES_COMPRESS`] rows before the column scrolls instead (DESIGN §7).
-fn row_h(lanes: usize, box_h: f32) -> f32 {
+pub(crate) fn row_h(lanes: usize, box_h: f32) -> f32 {
     let n = lanes.clamp(1, LANES_COMPRESS) as f32;
     ((box_h - (n - 1.) * ROW_GAP) / n).clamp(LANE_MIN_H, LANE_FULL_H)
 }

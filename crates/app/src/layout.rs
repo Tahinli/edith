@@ -432,11 +432,27 @@ pub(crate) const SIDE_MAX_FRAC: f32 = 1. / 3.;
 /// timeline is asking on purpose, and the picture still keeps most of a third.
 pub(crate) const TIMELINE_MAX_SHARE: f32 = 0.7;
 
-/// The least the darkroom's bench may be dragged to: driven and measured
-/// against a real project -- below this the V1 lane's own chip clips and
-/// the A1 lane drops off the bench entirely, which a floor exists to make
-/// unreachable.
-pub(crate) const BENCH_MIN_H: f32 = 80.;
+/// The least the darkroom's bench may be dragged to: derived, not measured,
+/// from the same stack `ui::stance::bench` and `ui::bench_stance::render`
+/// actually build, top to bottom --
+/// [`crate::ui::stance::BENCH_CHROME_H`] (the "bench" section head and its
+/// padding) + [`crate::ui::bench_stance::RULER_H`] (the pinned ruler) +
+/// [`crate::ui::bench_stance::ROW_GAP`] (the gap `bench-content`'s flex
+/// column puts between the ruler and the lane column) + two lane rows at
+/// [`crate::ui::bench_stance::LANE_MIN_H`] each (the darkroom's own floor of
+/// two lanes -- V1, A1, `bench_stance::render`'s own no-session fallback)
+/// + one more `ROW_GAP` between those two rows (`bench-lanes`'s own flex
+/// gap). Below this the `bench-lanes` column asks for more height than
+/// `bench-content`'s flex_1 gives it, and since that column scrolls rather
+/// than clips visibly, the shortfall comes off the bottom row's own pixels
+/// unscrolled -- A1's clip-bar border and status dot, first. At the old
+/// literal `80.` the shortfall was `82. - 80. == 2.`, the exact ~2px clip
+/// this floor now closes.
+pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
+    + crate::ui::bench_stance::RULER_H
+    + crate::ui::bench_stance::ROW_GAP
+    + 2. * crate::ui::bench_stance::LANE_MIN_H
+    + crate::ui::bench_stance::ROW_GAP;
 
 /// What a hand has done to the three seams: the size it dragged each panel to,
 /// or `None` where nobody has touched one and the window's own share still
