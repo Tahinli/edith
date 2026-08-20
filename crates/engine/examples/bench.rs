@@ -872,6 +872,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
         color: None,
         fit: engine::scale::FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     // The sound, where it was asked for, is the same clip on an audio lane:
     // the very window the picture covers, so the two passes measure one export.
@@ -883,6 +884,7 @@ fn export_bench(path: &Path, seat: &str, out_dir: &Path) {
     let project = match Project::from_parts(
         vec![Source::new(path, stream)],
         lanes,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     ) {
