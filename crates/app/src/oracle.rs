@@ -263,6 +263,8 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         // three above it refuse an empty mark.
         ActionId::WalkCutNext
         | ActionId::WalkCutPrev
+        | ActionId::WalkCutNext10
+        | ActionId::WalkCutPrev10
         | ActionId::TrimIn
         | ActionId::TrimOut
         | ActionId::LoopTrim

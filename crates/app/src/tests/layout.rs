@@ -57,6 +57,40 @@ fn no_colour_is_written_outside_the_theme() {
     assert!(stray.is_empty(), "colour written outside the theme: {stray:?}");
 }
 
+/// The literal-grep above is blind to a hue arriving through a theme
+/// *constant*: `DARK_SEAM` carried `rgba(0,0,0,.7)` (`0xRRGGBBAA`) into
+/// `rgb()`, which reads the alpha byte as blue -- 2436 blue pixels in a
+/// darkroom screenshot, on a call site that never once wrote `0x` itself.
+/// So this scan reads the theme's own encoding: every constant whose low
+/// byte is not `ff` (i.e. `0xRRGGBBAA` with a real alpha) is alpha-carrying,
+/// and an alpha-carrying role may only ever be handed to `rgba(`, never
+/// `rgb(`.
+#[test]
+fn an_alpha_carrying_role_never_reaches_rgb() {
+    let theme = src_text("ui/theme.rs");
+    let alpha_roles: Vec<&str> = theme
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let l = l.strip_prefix("pub const ")?;
+            let (name, rest) = l.split_once(':')?;
+            let hex = rest.trim().strip_prefix("u32 = 0x")?;
+            let hex = hex.trim_end_matches(';');
+            (hex.len() == 8 && !hex.ends_with("ff")).then_some(name.trim())
+        })
+        .collect();
+    assert!(alpha_roles.len() >= 8, "the theme's alpha-carrying roles moved; this scan is blind");
+
+    let source = ui_source();
+    let mut misuses = Vec::new();
+    for role in &alpha_roles {
+        if source.contains(&format!("rgb({role}(")) {
+            misuses.push(*role);
+        }
+    }
+    assert!(misuses.is_empty(), "alpha-carrying role(s) reaching rgb() instead of rgba(): {misuses:?}");
+}
+
 /// "It scrolls" is not "it can be found": at the 640x360 floor the timeline
 /// takes its share and no more, so a third track is behind a scroll -- and
 /// the line that says so has to keep telling the truth *while* the column is

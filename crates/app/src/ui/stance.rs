@@ -69,7 +69,7 @@ fn spine(player: &Player) -> impl IntoElement {
         .h_full()
         .bg(rgb(DARK_PANEL()))
         .border_r_1()
-        .border_color(rgb(DARK_SEAM()))
+        .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
         .items_center()
@@ -127,7 +127,7 @@ fn time_band(player: &Player) -> impl IntoElement {
         .h(px(TIME_BAND_H))
         .bg(rgb(DARK_PANEL()))
         .border_t_1()
-        .border_color(rgb(DARK_SEAM()))
+        .border_color(rgba(DARK_SEAM()))
         .flex()
         .items_center()
         .gap(px(16.))
@@ -183,7 +183,7 @@ fn bench() -> impl IntoElement {
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
         .border_t_1()
-        .border_color(rgb(DARK_SEAM()))
+        .border_color(rgba(DARK_SEAM()))
         .flex()
         .items_center()
         .px(px(12.))
@@ -200,7 +200,7 @@ fn ledger() -> impl IntoElement {
         .h(px(LEDGER_H))
         .bg(rgb(DARK_PANEL()))
         .border_t_1()
-        .border_color(rgb(DARK_SEAM()))
+        .border_color(rgba(DARK_SEAM()))
         .flex()
         .items_center()
         .px(px(12.))
@@ -219,7 +219,7 @@ fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl Int
         .h_full()
         .bg(rgb(DARK_PANEL()))
         .border_l_1()
-        .border_color(rgb(DARK_SEAM()))
+        .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
         .child(dock_stance::render(player, DOCK_W, window_h, cx))
@@ -228,9 +228,7 @@ fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl Int
 /// The whole stance: spine, screen, time band, bench, ledger, dock, in the
 /// order DESIGN §5 draws them, over the same key handler the legacy tree
 /// uses (DESIGN §12 step 3): the darkroom draws its own regions but answers
-/// to the one keymap, `shift` threaded through for the odometer's stride
-/// ([`Player::walk_shift`]) since [`ActionId`] carries no modifier of its
-/// own.
+/// to the one keymap.
 pub(crate) fn render(
     player: &mut Player,
     window: &mut Window,
@@ -250,8 +248,34 @@ pub(crate) fn render(
             if this.dismiss_notice() {
                 cx.notify();
             }
-            this.walk_shift = event.keystroke.modifiers.shift;
+            // Same modal guard the legacy handler's rebinding/keys_open/
+            // export_open/exporting/colour/transform/speed/EQ/silence/mix/
+            // subtitle-style/menu chain (`render.rs`) amounts to, read as
+            // one bool instead of re-copied field by field: while a card, a
+            // rebind capture, or a menu owns the keyboard, the darkroom
+            // stance yields to it exactly as the legacy tree does. This is
+            // the fix for the stance's `Home`-inside-the-Colour-card
+            // misfire.
+            if this.rebinding.is_some() || this.overlaid() {
+                // Escape is every card's own way out (`Player::close_card`,
+                // the same list `overlaid`/`modal` read) -- blocking every
+                // key while a card is open must not also lock the card open.
+                if key == ESCAPE {
+                    this.rebinding = None;
+                    this.close_card();
+                }
+                cx.notify();
+                return;
+            }
             if let Some(action) = this.keymap.lookup(key, ctrl) {
+                // hook: §12 step 7 -- the keys overlay and the export card
+                // (and the notice plates that would announce an export's
+                // progress) have no stance surface yet, so the two actions
+                // that only ever show up there are suppressed here rather
+                // than left to open a card nothing on screen can draw.
+                if matches!(action, ActionId::ShowActions | ActionId::Export) {
+                    return;
+                }
                 this.act(action, window, cx);
             }
         }))
