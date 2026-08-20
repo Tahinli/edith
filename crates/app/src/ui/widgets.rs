@@ -268,6 +268,32 @@ pub(crate) fn separator() -> impl IntoElement {
 /// sixteenth would be forgotten.
 pub(crate) static OVERLAID: AtomicBool = AtomicBool::new(false);
 
+/// Whether a tip is cleared to paint: an ordinary tip stands aside whenever
+/// `OVERLAID` is set (a card/menu is up over the underlying UI it belongs
+/// to), but a tip *anchored on the overlay itself* -- the `?` glyph on a
+/// card's own head, say -- was never the case `OVERLAID` meant to catch, so
+/// it paints regardless. One predicate, so [`Tip`] and [`OverlayTip`] can't
+/// drift apart on what "overlaid" is supposed to mean.
+pub(crate) fn tip_may_paint(anchored_on_overlay: bool) -> bool {
+    anchored_on_overlay || !OVERLAID.load(Ordering::Relaxed)
+}
+
+/// DESIGN §4: "Notices, menus, chips, cues, and tooltips are all the same
+/// plate" -- canvas-on-panel, 2px radius, the room's own type
+/// (`ui::type_scale`), not a bordered box in an ad hoc size.
+fn tip_plate(text: &SharedString) -> Div {
+    let style = crate::ui::type_scale::label(crate::ui::type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
+    div()
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(2.))
+        .bg(rgb(DARK_CANVAS()))
+        .font(style.font)
+        .text_size(style.size)
+        .text_color(rgb(INK1()))
+        .child(text.clone())
+}
+
 /// A tooltip is a view in gpui and nothing smaller, so this is the smallest one
 /// that carries a line of text. It paints outside the window's element tree and
 /// therefore owns its colours.
@@ -277,27 +303,28 @@ impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         // A card or a menu is up: nothing. A line of text over the items of the
         // menu that just opened under the pointer is the card being painted
-        // over by the window it covers.
-        if OVERLAID.load(Ordering::Relaxed) {
+        // over by the window it covers. (This struct is every tooltip on the
+        // *underlying* UI -- grepped: `timeline.rs`, `library.rs`,
+        // `overlays.rs`, `spine_stance.rs`, `dock_stance.rs`,
+        // `timeband_stance.rs`, `preview.rs`, here -- so the fix belongs here
+        // once, not per call site.)
+        if !tip_may_paint(false) {
             return div();
         }
-        // DESIGN §4: "Notices, menus, chips, cues, and tooltips are all the
-        // same plate" -- canvas-on-panel, 2px radius, the room's own type
-        // (`ui::type_scale`), not a bordered box in an ad hoc size. This one
-        // struct is every tooltip in the app (grepped: `timeline.rs`,
-        // `library.rs`, `overlays.rs`, `spine_stance.rs`, `dock_stance.rs`,
-        // `timeband_stance.rs`, `preview.rs`, here), so the fix belongs here
-        // once, not per call site.
-        let style = crate::ui::type_scale::label(crate::ui::type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
-        div()
-            .px(px(8.))
-            .py(px(4.))
-            .rounded(px(2.))
-            .bg(rgb(DARK_CANVAS()))
-            .font(style.font)
-            .text_size(style.size)
-            .text_color(rgb(INK1()))
-            .child(self.0.clone())
+        tip_plate(&self.0)
+    }
+}
+
+/// A tip anchored on the overlay itself -- a card's own `?` glyph, drawn on
+/// its own card head. `OVERLAID` exists to hide a [`Tip`] on the UI *under*
+/// a card while the card sits over it; a tip painted on the card is not
+/// that case, so it is exempt (`tip_may_paint(true)` is always `true`).
+/// Everything else about it is [`Tip`]'s own plate.
+pub(crate) struct OverlayTip(pub(crate) SharedString);
+
+impl Render for OverlayTip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        tip_plate(&self.0)
     }
 }
 
