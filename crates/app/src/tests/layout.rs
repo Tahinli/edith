@@ -1802,3 +1802,38 @@ fn the_stance_renders_its_six_regions_in_the_documented_order() {
         "EDITH_DARKROOM never reaches ui::stance::render"
     );
 }
+
+/// The picture is letterboxed, never stretched: both the picture region and
+/// the subtitle picture overlay paint through [`letterboxed_image`] (the
+/// `canvas()` element that hands `ObjectFit::Contain::get_bounds` a real
+/// resolved size) rather than a plain `img().object_fit(...)`, which reads
+/// right by hand but never gets a fitted box from taffy in this pin -- see
+/// `render.rs`'s own doc comment on the function for the measured dead end.
+/// A regression back to `img(...).object_fit(` in either caller is the
+/// stretch-to-fill bug returning silently.
+#[test]
+fn the_picture_letterboxes_through_a_canvas_never_a_plain_img_object_fit() {
+    let render_rs = src_text("render.rs");
+    assert!(
+        render_rs.contains("pub(crate) fn letterboxed_image"),
+        "the letterbox helper moved or was renamed"
+    );
+    assert!(
+        render_rs.contains("ObjectFit::Contain.get_bounds(bounds, image.size(0))"),
+        "letterboxed_image no longer computes the Contain rect by hand"
+    );
+    for (file, needle) in [
+        ("render.rs", "letterboxed_image(i)"),
+        ("ui/preview.rs", "letterboxed_image(image)"),
+    ] {
+        let text = src_text(file);
+        assert!(
+            text.contains(needle),
+            "{file} no longer paints through letterboxed_image"
+        );
+        assert!(
+            !text.contains(".object_fit(gpui::ObjectFit::Contain)"),
+            "{file} reintroduced the stretched img().object_fit(Contain) dead end"
+        );
+    }
+}

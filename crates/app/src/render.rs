@@ -13,6 +13,58 @@ pub(crate) fn escape_leaves_player_fullscreen(key: &str, ctrl: bool, player_full
     key == ESCAPE && !ctrl && player_fullscreen
 }
 
+/// The frame `image`, letterboxed/pillarboxed into whatever box it is given,
+/// filling that box on its own axis and leaving the other bare -- the bare
+/// strip is the box's own background (`BG_CANVAS`), never painted here, which
+/// is why every caller sits this on a div already carrying that colour.
+///
+/// `Img::object_fit(Contain)` reads right (verified by hand against
+/// `ObjectFit::Contain::get_bounds`) but only when taffy has already given the
+/// element a real size to fit *into* -- and for a plain `img()` with both axes
+/// `Auto` (`size_full()`/`max_w_full().max_h_full()` both resolve that way in
+/// this pin), it resolves to the image's own native size first and object-fit
+/// never gets a box smaller than the frame to shrink into, so the frame reads
+/// through un-fitted. A `canvas()` element carries no such precompute -- its
+/// `request_layout` is a plain `Style` read, so it is sized by its parent
+/// exactly as a `div()` would be -- and its `paint` callback is handed the
+/// real resolved `bounds`, which is all `Contain::get_bounds` needs.
+///
+/// `.absolute()` with all four insets zero, not `.size_full()` in flex flow:
+/// a flex item under `justify_center()`/`items_center()` (see `picture_area`
+/// below) never resolves a percentage cross-axis size for a plain-`Style`
+/// element like `canvas()`, which is a taffy circularity and not this
+/// element's own bug (confirmed live: bounds handed to `paint` came back
+/// `944px x 0px`, main axis right, cross axis collapsed). An absolutely
+/// positioned box is sized against its containing block directly instead --
+/// the nearest `.relative()` ancestor, which every caller here already sits
+/// this on -- so it never asks taffy's flex algorithm for a cross-axis size
+/// at all.
+///
+/// That containing block still has to have a real size of its own, though:
+/// gpui's default `display` is `Block` (`Style::default()`), not `Flex`, and
+/// a `Block` box with height `auto` is sized by its *normal-flow* children --
+/// an `.absolute()` one, this, takes no part in that (confirmed live: with
+/// the box lacking its own `.flex()`, this canvas's own bounds came back
+/// `944px x 0px` even though its containing block, measured independently,
+/// was a real `944px x 335px`). Every `.relative()` ancestor this sits on
+/// must also be `.flex()` (see `ui::stance::screen`'s `stance-picture`) for
+/// exactly this reason.
+pub(crate) fn letterboxed_image(image: Arc<RenderImage>) -> impl IntoElement + Styled {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let fitted = gpui::ObjectFit::Contain.get_bounds(bounds, image.size(0));
+            let _ = window.paint_image(fitted, Corners::default(), image, 0, false);
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .left_0()
+    .right_0()
+    .size_full()
+}
+
 impl Player {
     /// The picture region alone: the image, the subtitle cue plate, the
     /// preview badge and the three transient bars over its bottom edge.
@@ -41,12 +93,7 @@ impl Player {
             .children(
                 self.image
                     .clone()
-                    .map(|i| {
-                        img(i)
-                            .size_full()
-                            .object_fit(gpui::ObjectFit::Contain)
-                            .into_any_element()
-                    })
+                    .map(|i| letterboxed_image(i).into_any_element())
                     // With no file open the letterbox is the whole region,
                     // and a black rectangle says only that something is
                     // broken -- so it says what it wants instead. The window
