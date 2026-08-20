@@ -1518,9 +1518,16 @@ impl Player {
             match event.pressed_button {
                 Some(MouseButton::Left) => self.drag_split(split, event.position, window, cx),
                 // Released outside the window: the up below never came, so this
-                // is where the gesture ends. Nothing is owed -- every move has
-                // already been written.
-                _ => self.split_drag = None,
+                // is where the gesture ends. The size is already written to
+                // `self.splits`, but the darkroom's two persisted seams still
+                // owe the save `drag_release` would have paid -- without it
+                // the drag holds for the session and reverts on restart.
+                _ => {
+                    self.split_drag = None;
+                    if matches!(split, Split::Dock | Split::Bench) {
+                        save_stance_splits(&self.splits);
+                    }
+                }
             }
             return;
         }
@@ -1725,8 +1732,21 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let viewport = window.viewport_size();
+        let raw = split_drag_size(split, at, viewport);
+        // Clamped here, through the same door [`Player::split_px`] draws
+        // through, at the one place a hand's pick ever reaches
+        // `self.splits` -- so what a later save writes to disk is never a
+        // number the seam itself would have refused to draw at. A floor
+        // enforced only on read still leaves a `bench=-1` line in the file.
+        let lanes = self
+            .session
+            .as_ref()
+            .map_or(2, |session| session.lanes().len());
+        let view = self.view();
+        let scroll = view.duration > view.span();
         self.splits
-            .set(split, split_drag_size(split, at, window.viewport_size()));
+            .set(split, split_size(split, Some(raw), lanes, viewport, scroll));
         cx.notify();
     }
 }
