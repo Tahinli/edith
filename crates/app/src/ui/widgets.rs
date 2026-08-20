@@ -281,15 +281,22 @@ impl Render for Tip {
         if OVERLAID.load(Ordering::Relaxed) {
             return div();
         }
+        // DESIGN §4: "Notices, menus, chips, cues, and tooltips are all the
+        // same plate" -- canvas-on-panel, 2px radius, the room's own type
+        // (`ui::type_scale`), not a bordered box in an ad hoc size. This one
+        // struct is every tooltip in the app (grepped: `timeline.rs`,
+        // `library.rs`, `overlays.rs`, `spine_stance.rs`, `dock_stance.rs`,
+        // `timeband_stance.rs`, `preview.rs`, here), so the fix belongs here
+        // once, not per call site.
+        let style = crate::ui::type_scale::label(crate::ui::type_scale::LABEL_ROW_PX, gpui::FontWeight::MEDIUM);
         div()
-            .px(px(6.))
-            .py(px(3.))
-            .rounded(px(3.))
-            .border_1()
-            .border_color(rgb(BG_RAISED()))
-            .bg(rgb(BG_PANEL()))
-            .text_color(rgb(FG_PRIMARY()))
-            .text_size(px(12.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(2.))
+            .bg(rgb(DARK_CANVAS()))
+            .font(style.font)
+            .text_size(style.size)
+            .text_color(rgb(INK1()))
             .child(self.0.clone())
     }
 }
