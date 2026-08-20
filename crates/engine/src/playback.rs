@@ -1881,6 +1881,11 @@ impl PlaybackSession {
             .composite_color_at(b_start)
             .copied()
             .unwrap_or_default();
+        let transform = self
+            .project
+            .composite_transform_at(b_start)
+            .copied()
+            .unwrap_or_default();
         let canvas = Composer::new(
             self.meta.width,
             self.meta.height,
@@ -1892,6 +1897,7 @@ impl PlaybackSession {
             start_frame,
             end_frame,
             color,
+            transform,
             canvas,
             tone,
             Speed::NORMAL,
