@@ -36,13 +36,21 @@ pub const ARCHIVO: &str = "Archivo";
 pub const SPLINE_SANS_MONO: &str = "Spline Sans Mono";
 
 /// DESIGN §3's scale, named so a call site reads the role, not a number.
-pub const HERO_TIMECODE_PX: f32 = 13.;
-pub const LABEL_ROW_PX: f32 = 10.5;
-pub const CHORD_METADATA_MAX_PX: f32 = 10.;
-pub const CHORD_METADATA_MIN_PX: f32 = 9.5;
-pub const SECTION_HEAD_PX: f32 = 9.;
+///
+/// Landed at a conservative +2px bump over the original half-pixel scale
+/// (13/10.5/10-9.5/9/8 -> 15/13/12-11/10/9), chosen over a fuller
+/// "readable at arm's length" candidate (18/15/14-13/12/10) to keep the
+/// fixed-width dock/bench card labels clear of the truncation ladder
+/// (DESIGN §7). To try the fuller scale, swap these six values for
+/// 18./15./14./13./12./10. and update `the_scale_matches_design_3` (and
+/// DESIGN.md §3) to match.
+pub const HERO_TIMECODE_PX: f32 = 15.;
+pub const LABEL_ROW_PX: f32 = 13.;
+pub const CHORD_METADATA_MAX_PX: f32 = 12.;
+pub const CHORD_METADATA_MIN_PX: f32 = 11.;
+pub const SECTION_HEAD_PX: f32 = 10.;
 /// The floor DESIGN §3 sets: nothing in the room reads smaller than this.
-pub const FLOOR_PX: f32 = 8.;
+pub const FLOOR_PX: f32 = 9.;
 
 /// A family, weight and size together -- what a call site needs to paint
 /// text with `.font(style.font).text_size(style.size)`, and nothing it has
@@ -173,15 +181,32 @@ mod tests {
     use gpui::FontStyle;
 
     /// The scale never drifts below DESIGN §3's floor, and role sizes match
-    /// the numbers §3 names -- a call site changing `13.` to `12.` for the
+    /// the numbers §3 names -- a call site changing `15.` to `14.` for the
     /// hero timecode is the design contract silently moving.
+    ///
+    /// Sizes are all whole pixels (raised from the original 13/10.5/9.5-10/9/8
+    /// scale, which put glyph baselines on half-pixel rows and left body text
+    /// too small for crisp greyscale AA -- a pixel scan through "SPINE" at
+    /// the old 9px section-head size showed 5-6 intermediate grey levels per
+    /// stroke instead of a hard 1-2px edge). No fractional size is allowed
+    /// back into this scale.
     #[test]
     fn the_scale_matches_design_3() {
-        assert_eq!(HERO_TIMECODE_PX, 13.);
-        assert_eq!(LABEL_ROW_PX, 10.5);
-        assert!((9.5..=10.).contains(&CHORD_METADATA_MIN_PX));
-        assert_eq!(SECTION_HEAD_PX, 9.);
-        assert_eq!(FLOOR_PX, 8.);
+        assert_eq!(HERO_TIMECODE_PX, 15.);
+        assert_eq!(LABEL_ROW_PX, 13.);
+        assert!((11. ..=12.).contains(&CHORD_METADATA_MIN_PX));
+        assert_eq!(SECTION_HEAD_PX, 10.);
+        assert_eq!(FLOOR_PX, 9.);
+        for size in [
+            HERO_TIMECODE_PX,
+            LABEL_ROW_PX,
+            CHORD_METADATA_MAX_PX,
+            CHORD_METADATA_MIN_PX,
+            SECTION_HEAD_PX,
+            FLOOR_PX,
+        ] {
+            assert_eq!(size.fract(), 0., "{size} is not a whole pixel");
+        }
         for size in [
             HERO_TIMECODE_PX,
             LABEL_ROW_PX,
@@ -210,9 +235,9 @@ mod tests {
     }
 
     /// `head()` is exactly what DESIGN §3 names for section heads: Archivo,
-    /// 700, 9px.
+    /// 700, `SECTION_HEAD_PX`.
     #[test]
-    fn head_is_archivo_bold_9px() {
+    fn head_is_archivo_bold_at_section_head_size() {
         let h = head();
         assert_eq!(h.font.family.as_ref(), ARCHIVO);
         assert_eq!(h.font.weight, FontWeight::BOLD);
