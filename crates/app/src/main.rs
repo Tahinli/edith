@@ -912,7 +912,7 @@ fn main() {
                     hw_caps: None,
                     clipboard: None,
                     scrubbing: false,
-                    splits: Splits::default(),
+                    splits: load_stance_splits(),
                     split_drag: None,
                     trim: None,
                     fade_drag: None,

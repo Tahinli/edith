@@ -20,16 +20,19 @@ const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
 /// strip, Export -- all placeholder at this step.
 const TIME_BAND_H: f32 = 88.;
-/// corner-cut: a fixed share of the window rather than one measured against
-/// the picture's own room, matching the placeholder every other stance
-/// region still carries at this step. Ceiling: fold into the same split the
-/// legacy timeline's `Split::Timeline` answers once the stance grows a
-/// resizable seam of its own.
-const BENCH_H: f32 = 200.;
-/// Thin strip at the foot of the centre column.
-const LEDGER_H: f32 = 28.;
-/// Right side panel, fixed width, carrying the Src/Clip tab pair.
-const DOCK_W: f32 = 280.;
+/// The bench's untouched height -- [`Split::Bench`]'s own default, read by
+/// `layout::split_size` the same way the legacy tree's `library_w`/
+/// `inspector_w` feed `Split::Library`/`Split::Inspector`. A hand on the
+/// seam above it overrides this; nothing else does.
+pub(crate) const BENCH_H: f32 = 200.;
+/// Thin strip at the foot of the centre column. Read by `layout`'s
+/// `Split::Bench` drag formula (the seam sits above the fixed ledger, so a
+/// drag has to leave room for it) -- kept `pub(crate)` for that one door
+/// rather than a second copy of the number.
+pub(crate) const LEDGER_H: f32 = 28.;
+/// The dock's untouched width -- [`Split::Dock`]'s own default, the same
+/// role [`BENCH_H`] plays for the bench.
+pub(crate) const DOCK_W: f32 = 280.;
 
 /// The lowest a menu's top edge may sit and still land inside the
 /// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
@@ -37,9 +40,12 @@ const DOCK_W: f32 = 280.;
 /// the picture just because the pointer is there. `overlays.rs`/`library.rs`
 /// clamp their `menu.at.y` against this before handing it to `menu_at`, only
 /// in the darkroom stance -- the legacy tree has no fixed screen/time-band
-/// split for this to mean anything against, and must not move.
-pub(crate) fn below_picture_floor(viewport_h: f32) -> f32 {
-    (viewport_h - TIME_BAND_H - BENCH_H - LEDGER_H).max(0.)
+/// split for this to mean anything against, and must not move. `bench_h` is
+/// the live, possibly hand-dragged `Split::Bench` height (`Player::split_px`)
+/// rather than the fixed [`BENCH_H`] default, so a widened bench clamps the
+/// menu against the room actually left, not the room it started with.
+pub(crate) fn below_picture_floor(viewport_h: f32, bench_h: f32) -> f32 {
+    (viewport_h - TIME_BAND_H - bench_h - LEDGER_H).max(0.)
 }
 
 /// The floor-clamped placement for every scrolling menu (clip context menu,
@@ -59,11 +65,12 @@ pub(crate) fn menu_floor(
     at: Point<Pixels>,
     viewport: Size<Pixels>,
     darkroom: bool,
+    bench_h: f32,
 ) -> (Point<Pixels>, Size<Pixels>) {
     if !darkroom {
         return (at, viewport);
     }
-    let floor = below_picture_floor(f32::from(viewport.height));
+    let floor = below_picture_floor(f32::from(viewport.height), bench_h);
     let at = point(at.x, px(f32::from(at.y).max(floor)));
     let room = size(viewport.width, px(f32::from(viewport.height) - floor));
     (at, room)
@@ -83,8 +90,8 @@ mod menu_floor_tests {
     #[test]
     fn a_menu_taller_than_the_footprint_stays_pinned_to_the_floor_not_walked_back_over_it() {
         let viewport = size(px(1280.), px(720.));
-        let floor = below_picture_floor(f32::from(viewport.height));
-        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, true);
+        let floor = below_picture_floor(f32::from(viewport.height), BENCH_H);
+        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, true, BENCH_H);
         assert_eq!(f32::from(at.y), floor);
         // 396px of rows (the charter's measured menu height) does not fit in
         // the 316px footprint room, so it must be capped to it, not the
@@ -425,11 +432,14 @@ fn time_band(player: &mut Player, position: f64, cx: &mut Context<Player>) -> im
 
 /// Lanes, under the time band. `canvas` is the bench background too (DESIGN
 /// §2's token table), so it shares its surface with the screen above it.
-fn bench(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
+/// Height comes from [`Player::split_px`] now, not the fixed [`BENCH_H`]:
+/// the seam [`crate::ui::stance::render`] mounts above this region is what
+/// answers "ui fields are not stretchable" for the bench.
+fn bench(player: &mut Player, bench_h: f32, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-bench")
         .flex_none()
-        .h(px(BENCH_H))
+        .h(px(bench_h))
         // §4: lanes take 0 radius.
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
@@ -440,7 +450,7 @@ fn bench(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
         .px(px(12.))
         .py(px(4.))
         .child(section_head("bench"))
-        .child(bench_stance::render(player, BENCH_H - 20., cx))
+        .child(bench_stance::render(player, bench_h - 20., cx))
 }
 
 /// Which of the three §8 severities a notice's own words carry. Reuses
@@ -567,18 +577,21 @@ fn ledger(player: &Player, position: f64) -> impl IntoElement {
 /// The dock: the only side panel, right, fixed width, carrying the Src/Clip
 /// tab pair (DESIGN §5). The frame is drawn here; `dock_stance.rs` owns the
 /// tab row and both tabs' content (DESIGN §12 step 4).
-fn dock(player: &Player, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
+/// Width comes from [`Player::split_px`] now, not the fixed [`DOCK_W`]: the
+/// seam [`crate::ui::stance::render`] mounts to its left is what answers
+/// "ui fields are not stretchable" for the dock.
+fn dock(player: &Player, dock_w: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-dock")
         .flex_none()
-        .w(px(DOCK_W))
+        .w(px(dock_w))
         .h_full()
         .bg(rgb(DARK_PANEL()))
         .border_l_1()
         .border_color(rgba(DARK_SEAM()))
         .flex()
         .flex_col()
-        .child(dock_stance::render(player, DOCK_W, window_h, cx))
+        .child(dock_stance::render(player, dock_w, window_h, cx))
 }
 
 /// The whole stance: spine, screen, time band, bench, ledger, dock, in the
@@ -593,6 +606,12 @@ pub(crate) fn render(
     let window_size = window.viewport_size();
     let window_h = window_size.height;
     let position = player.playhead(player.drawn_duration());
+    // The two seams a hand may drag (`Split::Dock`, `Split::Bench`): read
+    // through the same door every legacy region measures itself by
+    // ([`Player::split_px`]), so a dragged size and a drawn one cannot
+    // disagree here either.
+    let dock_w = player.split_px(Split::Dock, window_size);
+    let bench_h = player.split_px(Split::Bench, window_size);
     div()
         .id("stance-room")
         .track_focus(&player.focus)
@@ -739,6 +758,12 @@ pub(crate) fn render(
                 cx.notify();
             }
         }))
+        // The seam drag is tracked on the root, same reason the legacy
+        // ruler-scrub is (render.rs): the pointer outruns the 6px divider
+        // hitbox on the first move, so only the whole-window root keeps
+        // hearing it once a `Split::Dock`/`Split::Bench` drag has started.
+        .on_mouse_move(cx.listener(Player::drag_move))
+        .on_mouse_up(MouseButton::Left, cx.listener(Player::drag_release))
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
@@ -753,7 +778,8 @@ pub(crate) fn render(
                 .flex_col()
                 .child(screen(player, position, window, cx))
                 .child(time_band(player, position, cx))
-                .child(bench(player, cx))
+                .child(divider(Split::Bench, cx))
+                .child(bench(player, bench_h, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.front().cloned(), |el, n| {
                     el.child(notice_plate(n))
@@ -780,5 +806,6 @@ pub(crate) fn render(
                 .children(player.export_progress_card(cx))
                 .children(player.picker_card(window_size, cx)),
         )
-        .child(dock(player, window_h, cx))
+        .child(divider(Split::Dock, cx))
+        .child(dock(player, dock_w, window_h, cx))
 }
