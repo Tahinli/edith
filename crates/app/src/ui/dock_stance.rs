@@ -525,7 +525,17 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
 /// whatever that card already does; nothing about the gesture is reimplemented
 /// here.
 fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Context<Player>) -> impl IntoElement {
-    let _ = width;
+    // The room actually given here, not the window's: `eq_card_w`/
+    // `card_max_w` are asked "how wide may I draw" and answered with the
+    // *whole viewport's* width when handed `window_size` verbatim -- but this
+    // tab is a ~280-390px strip inside the dock, not the window, so a card
+    // capped at up to 720px overflowed past the window's own right edge
+    // (`20k` rendered as `20`, the `Spectrum on s` button cut mid-glyph).
+    // Height stays the window's: none of the un-maximized cards' own
+    // arithmetic uses it (`below_picture_floor` only fires once maximized,
+    // and a maximized card is mounted at `ui::stance::render` instead, never
+    // through this `room`).
+    let room = Size::new(px(width), window_size.height);
     let none_open = player.eq_open.is_none()
         && player.color_open.is_none()
         && player.transform_open.is_none()
@@ -618,19 +628,31 @@ fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Con
                 .min_h(px(0.))
                 .px(px(8.))
                 .pb(px(8.))
-                .children(player.eq_card(window_size, cx))
-                .children(player.color_card(window_size, cx))
-                .children(player.transform_card(window_size, cx))
-                .children(player.speed_card(window_size, cx))
-                .children(player.silence_card(window_size, cx))
-                .children(player.mix_card(window_size, cx))
-                // Subtitle style has no verb row of its own here (see the
-                // comment above the ghost verbs) but its card still has to
-                // be mounted somewhere in the darkroom or its chord (`y`)
-                // opens an invisible modal (GAP 2) -- this is that mount,
-                // painted in the Clip tab like the six cards beside it until
-                // the subtitle lane grows the header that is its real home.
-                .children(player.subtitle_style_card(window_size, cx))
+                // Maximized is mounted at the window root instead
+                // (`ui::stance::render`'s `stance-centre`), not here: this
+                // column is a ~280-390px strip, and an absolutely-positioned
+                // child is sized against its *immediate* parent regardless of
+                // any `.relative()` marker -- so a maximized card asking for
+                // window-sized room while still parented here cannot get it,
+                // it only gets pushed around inside this narrow, short box
+                // (the "maximize shrinks the card" defect). Un-maximized, the
+                // seven cards below stay docked here exactly as before.
+                .when(!player.card_maximized, |d| {
+                    d.children(player.eq_card(room, cx))
+                        .children(player.color_card(room, cx))
+                        .children(player.transform_card(room, cx))
+                        .children(player.speed_card(room, cx))
+                        .children(player.silence_card(room, cx))
+                        .children(player.mix_card(room, cx))
+                        // Subtitle style has no verb row of its own here (see
+                        // the comment above the ghost verbs) but its card
+                        // still has to be mounted somewhere in the darkroom
+                        // or its chord (`y`) opens an invisible modal (GAP
+                        // 2) -- this is that mount, painted in the Clip tab
+                        // like the six cards beside it until the subtitle
+                        // lane grows the header that is its real home.
+                        .children(player.subtitle_style_card(room, cx))
+                })
                 // A plate, not bare space: DESIGN §11's "states" checklist --
                 // nothing picked reads as a hint, not as a hole in the panel.
                 .when(none_open, |d| {

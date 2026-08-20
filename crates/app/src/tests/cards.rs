@@ -1756,6 +1756,72 @@ fn maximizing_a_card_grows_its_box_without_moving_where_a_value_sits_in_it() {
     assert_eq!(eq_y(0.), eq_y(0.));
 }
 
+/// The regression the previous test could not see: `eq_card_w`/`eq_graph_h`
+/// growing with `maximized` proved nothing about where the box that receives
+/// those numbers actually sits. It sat inside `dock_stance.rs`'s
+/// "dock-clip-rows" -- a ~280-390px, less-than-window-tall strip -- and an
+/// absolutely-positioned child is sized against its own *immediate* parent
+/// regardless of any `.relative()` marker upstream, so `below_picture_floor`
+/// (a window-space y) landed inside that short box and shoved the card to a
+/// ~120px sliver at the bottom. Every one of `eq_card_w`/`card_max_w`'s own
+/// unit tests stayed green throughout, because none of them knew a
+/// containing box existed at all -- the same class of gap as `canvas()`
+/// silently rendering black under a `Block` parent.
+///
+/// This binary has no `TestAppContext` to mount `dock_stance::clip_tab` /
+/// `ui::stance::render` for real and read painted rects back, so it cannot
+/// see the div nesting itself -- only driving the app and screenshotting it
+/// proves the fix actually lands on screen (this is that admission, not a
+/// substitute for it). What this test *can* pin down in pure values is the
+/// room each mount site is fed after the fix: [`dock_stance`]'s un-maximized
+/// mount is handed the dock's own real width (not the window's, the "480 in
+/// 280" shape of the width-clip bug), and a maximized card is handed
+/// `stance-centre`'s width -- the window minus the spine and the dock it
+/// escaped -- which must come out *larger*, not smaller, than the docked
+/// room it replaces. A future change that re-nests the maximize mount back
+/// inside the dock, or hands it the dock's width again, fails this.
+#[test]
+fn a_maximized_cards_room_is_bigger_than_the_docked_rooms_not_smaller() {
+    use crate::layout::{Split, split_size};
+    use crate::SPLIT_W;
+
+    // Mirrors `ui/stance.rs`'s private `SPINE_W` (56.) and `layout::SPLIT_W`
+    // (the one divider between `stance-centre` and the dock): recomputed
+    // rather than imported, same as this test file's other private-constant
+    // checks, so a change to either number is felt here too.
+    const SPINE_W: f32 = 56.;
+
+    for window_w in [960., 1280., 1920.] {
+        let window = size(px(window_w), px(720.));
+        // `split_size`'s own default/floor/ceiling for the dock, with no
+        // hand having dragged the seam -- the exact width `dock_stance.rs`
+        // now feeds its un-maximized cards as their "room".
+        let dock_w = split_size(Split::Dock, None, 2, window, false);
+        let docked_room_w = dock_w;
+        let maximized_room_w = window_w - SPINE_W - SPLIT_W - dock_w;
+
+        assert!(
+            maximized_room_w > docked_room_w,
+            "at a {window_w}px window a maximized card's room ({maximized_room_w}px, \
+             stance-centre) is not wider than the docked room it escaped \
+             ({docked_room_w}px, dock-clip-rows) -- maximize would be making \
+             the card smaller again"
+        );
+        assert!(
+            maximized_room_w <= window_w,
+            "a maximized card's room ({maximized_room_w}px) exceeds the whole \
+             window ({window_w}px) -- it is being measured in the wrong space"
+        );
+        // The concrete pixel gain a driving agent should actually see: the
+        // EQ graph's own width formula, fed each mount's real room.
+        assert!(
+            eq_card_w(maximized_room_w, true) > eq_card_w(docked_room_w, false),
+            "maximizing the EQ card at a {window_w}px window does not grow \
+             eq_card_w's output"
+        );
+    }
+}
+
 /// DESIGN's "a maximized scrim covers only the bench/ledger/time-band band,
 /// never the picture": the floor a maximized card's `.top()` is pinned to
 /// must leave exactly the picture's own height above it, for any bench

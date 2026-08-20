@@ -863,7 +863,28 @@ pub(crate) fn render(
                 // what draws it once open.
                 .children(player.export_card(window_size, cx))
                 .children(player.export_progress_card(cx))
-                .children(player.picker_card(window_size, cx)),
+                .children(player.picker_card(window_size, cx))
+                // A maximized clip param card (EQ/Colour/Transform/Speed/
+                // Silence/Mix/Subtitle style) escapes the dock to mount here
+                // instead, the same window-space `stance-centre` context
+                // every card above already renders in -- `below_picture_floor`
+                // is a window coordinate, and `dock_stance.rs`'s
+                // "dock-clip-rows" is a ~280-390px strip whose own box is the
+                // containing block for anything absolutely positioned inside
+                // it, `.relative()` or not, so a card asking for the room
+                // below the picture cannot get it there. Un-maximized, the
+                // same seven functions stay mounted in the dock
+                // (`dock_stance::clip_tab`'s own `.when(!card_maximized, ...)`
+                // guard keeps this from ever double-mounting one).
+                .when(player.card_maximized, |el| {
+                    el.children(player.eq_card(window_size, cx))
+                        .children(player.color_card(window_size, cx))
+                        .children(player.transform_card(window_size, cx))
+                        .children(player.speed_card(window_size, cx))
+                        .children(player.silence_card(window_size, cx))
+                        .children(player.mix_card(window_size, cx))
+                        .children(player.subtitle_style_card(window_size, cx))
+                }),
         )
         .child(divider(Split::Dock, cx))
         .child(dock(player, dock_w, window_size, cx))
