@@ -476,6 +476,29 @@ impl Render for Player {
                     cx.notify();
                     return;
                 }
+                // The transform card, the same way again: the arrows pick a
+                // slider and move it, and `r` puts the placement back to
+                // identity. Card-local, [`ActionId::Color`]'s own reason (see
+                // `FIXED`, where the keys menu still lists them).
+                if this.transform_open.is_some() {
+                    let n = TRANSFORM_BANDS.len();
+                    if key == ESCAPE {
+                        this.transform_open = None;
+                        this.transform_dragging = false;
+                    } else if key == "down" {
+                        this.transform_band = (this.transform_band + 1) % n;
+                    } else if key == "up" {
+                        this.transform_band = (this.transform_band + n - 1) % n;
+                    } else if key == "right" {
+                        this.nudge_transform(1., cx);
+                    } else if key == "left" {
+                        this.nudge_transform(-1., cx);
+                    } else if key == "r" {
+                        this.set_transform(TransformParams::default(), cx);
+                    }
+                    cx.notify();
+                    return;
+                }
                 // The speed card, the same way again: its arrows move the rate
                 // and `r` puts it back to real time, and neither means anything
                 // outside the card -- so neither is a binding (see `FIXED`,

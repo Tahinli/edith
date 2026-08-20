@@ -383,6 +383,132 @@ impl Player {
         }
     }
 
+    /// Opens the transform card on the clip a placement would go on --
+    /// [`open_color`](Self::open_color)'s own rule, since it targets the same
+    /// clip a grade would.
+    pub(crate) fn open_transform(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        let Some(session) = &self.session else {
+            self.notify_user("no timeline to place — open a file first".into());
+            cx.notify();
+            return;
+        };
+        let target = match self.selected.anchor() {
+            Some((lane, idx)) if lane.kind == LaneKind::Subtitle => {
+                match caption_media_half(session, (lane, idx), LaneKind::Video) {
+                    Some(half) => Some(half),
+                    None => {
+                        self.notify_user(
+                            "NOTHING TO PLACE — a caption has no picture; group it with a clip \
+                             first (ctrl-click both, then Group)"
+                                .into(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            Some((lane, _)) if lane.kind == LaneKind::Audio => session.video_clip_at(session.now()),
+            other => other.or_else(|| session.video_clip_at(session.now())),
+        };
+        match target {
+            Some(clip) => {
+                self.transform_open = Some(clip);
+                self.transform_band = 0;
+                self.transform_dragging = false;
+                self.pending_transform = None;
+                self.keys_open = false;
+                self.export_open = false;
+                self.context_menu = None;
+            }
+            None => self.notify_user("no clip under the playhead to place".into()),
+        }
+        cx.notify();
+    }
+
+    /// What the card's clip is placed by right now -- [`color_params`](Self::color_params)'s
+    /// own rule.
+    pub(crate) fn transform_params(&self) -> TransformParams {
+        if let Some(params) = self.pending_transform {
+            return params;
+        }
+        self.transform_open
+            .zip(self.session.as_ref())
+            .and_then(|((lane, idx), session)| session.transform_of(lane, idx).copied())
+            .unwrap_or_default()
+    }
+
+    /// Puts `params` on the card's clip, or takes the placement off when they
+    /// are the identity -- [`set_color`](Self::set_color)'s own rule.
+    pub(crate) fn set_transform(&mut self, params: TransformParams, cx: &mut Context<Self>) {
+        self.write_transform(params, false, cx);
+    }
+
+    /// Both writes: `live` is the one that takes no undo step, which is what
+    /// every sample *inside* a drag goes through --
+    /// [`write_color`](Self::write_color)'s own rule.
+    pub(crate) fn write_transform(&mut self, params: TransformParams, live: bool, cx: &mut Context<Self>) {
+        self.pending_transform = None;
+        let Some((lane, idx)) = self.transform_open else {
+            return;
+        };
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let placement = Some(params).filter(|p| !p.is_identity());
+        let took = match live {
+            true => session.set_transform_live(lane, idx, placement),
+            false => session.set_transform(lane, idx, placement),
+        };
+        if took {
+            self.mark_dirty();
+            self.reset_after_reseek();
+        }
+        cx.notify();
+    }
+
+    /// Moves the picked slider by `steps` -- [`nudge_color`](Self::nudge_color)'s
+    /// own rule, except rotation wraps into its range on
+    /// [`transform_snap`] instead of clamping.
+    pub(crate) fn nudge_transform(&mut self, steps: f32, cx: &mut Context<Self>) {
+        let mut params = self.transform_params();
+        let (_, low, high) = TRANSFORM_BANDS[self.transform_band];
+        let step = if self.transform_band == ROTATE_BAND {
+            ROTATE_STEP
+        } else {
+            TRANSFORM_STEP
+        };
+        let value = transform_band_mut(&mut params, self.transform_band);
+        let raw = *value + steps * step;
+        *value = if self.transform_band == ROTATE_BAND {
+            transform_snap(self.transform_band, raw)
+        } else {
+            raw.clamp(low, high)
+        };
+        self.set_transform(params, cx);
+    }
+
+    /// Where the pointer sits along a slider, as that band's value --
+    /// [`drag_color`](Self::drag_color)'s own rule.
+    pub(crate) fn drag_transform(&mut self, x: Pixels, first: bool, cx: &mut Context<Self>) {
+        let (_, low, high) = TRANSFORM_BANDS[self.transform_band];
+        let along = frac_along(x, self.transform_bars[self.transform_band].get());
+        let value = transform_snap(self.transform_band, low + along * (high - low));
+        let mut params = self.transform_params();
+        let at = transform_band_mut(&mut params, self.transform_band);
+        if *at == value && !first {
+            return;
+        }
+        *at = value;
+        let busy = self.seek_since.is_some();
+        match stash_or_write(&mut self.pending_transform, params, first, busy) {
+            Some(params) => self.write_transform(params, !first, cx),
+            None => cx.notify(),
+        }
+    }
+
     /// Opens the speed card on the clip whose rate is to change: the selected
     /// one, or -- with nothing selected -- the clip the picture is coming from,
     /// which is what a person means by "this shot". Either half of a take will
@@ -1132,6 +1258,7 @@ impl Player {
             || self.export_open
             || self.eq_open.is_some()
             || self.color_open.is_some()
+            || self.transform_open.is_some()
             || self.speed_open.is_some()
             || self.silence_open.is_some()
             || self.mix_open
@@ -1159,6 +1286,7 @@ impl Player {
         self.eq_open = None;
         self.eq_dragging = false;
         self.color_open = None;
+        self.transform_open = None;
         self.speed_open = None;
         // Marks and a running scan go with this one, which is why it is a call
         // and not an assignment ([`Player::close_silence`]).

@@ -81,6 +81,7 @@ impl Player {
             })
             .children(self.eq_card(room, cx))
             .children(self.color_card(cx))
+            .children(self.transform_card(cx))
             .children(self.speed_card(cx))
             .children(self.silence_card(cx))
             .children(self.mix_card(cx))
