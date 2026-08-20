@@ -165,14 +165,24 @@ impl Player {
             // otherwise repaint at vsync forever. Held clear for as long as the
             // state does, not just on the crossing: nothing else is coming.
             self.seek_since = None;
-            if crosses_into_loop(was, Transport::Ended, self.loop_on) {
+            // A loop-trim window whose far edge *is* the film's last frame
+            // reaches Ended the same tick it would have reached the window's
+            // own edge, so the top-of-function restart above never gets the
+            // chance -- `is_playing()` there is already false by the time
+            // this branch runs. Folded into the same crossing the
+            // whole-timeline loop already used, so that race has nothing
+            // left to win: reaching the end while *either* loop is armed
+            // restarts rather than halts, regardless of which one owns it.
+            let armed = self.loop_on || self.loop_trim.is_some();
+            if crosses_into_loop(was, Transport::Ended, armed) {
                 // The same door the restart button and key use
                 // ([`Player::toggle_or_restart`]), minus the `cx` that door
                 // spends only on a repaint -- the pump is already inside one.
                 // One seam of a one-frame seam: the restart is a fresh seek
                 // and its reopen, not a gapless splice.
+                let start = loop_restart_frame(self.loop_on, self.loop_trim).unwrap_or(0);
                 if let Some(session) = self.active_session_mut() {
-                    session.seek(0.);
+                    session.seek(f64::from(start) / fps);
                 }
                 self.reset_after_reseek();
                 if let Some(session) = self.active_session_mut() {
@@ -450,5 +460,55 @@ mod tests {
         assert!(!crosses_into_loop(Transport::Playing, Transport::Ended, false));
         assert!(!crosses_into_loop(Transport::Ended, Transport::Ended, true));
         assert!(!crosses_into_loop(Transport::Ended, Transport::Playing, true));
+    }
+
+    /// `loop_restart_frame` picks the seek target the crossing above plays
+    /// from: the trim window's near edge when one is armed (it wins over the
+    /// whole-timeline loop when both happen to be set), the top of the
+    /// timeline for the whole-timeline loop alone, and no restart at all
+    /// with neither armed.
+    #[test]
+    fn loop_restart_frame_prefers_the_trim_window_then_the_whole_timeline_then_nothing() {
+        assert_eq!(loop_restart_frame(false, Some((30, 60))), Some(30));
+        assert_eq!(
+            loop_restart_frame(true, Some((30, 60))),
+            Some(30),
+            "the trim window wins over the whole-timeline loop"
+        );
+        assert_eq!(loop_restart_frame(true, None), Some(0));
+        assert_eq!(loop_restart_frame(false, None), None);
+    }
+
+    /// The bug this session fixed: a loop-trim window whose far edge (60)
+    /// *is* the film's own last frame reaches `Ended` the same tick the
+    /// window's own edge would have restarted it, so `is_playing()` --
+    /// gating the top-of-`pump` restart -- can already be false by the time
+    /// that check runs. The crossing below must fire from `loop_trim` alone,
+    /// with `loop_on` off, and it must resume at the window's own start
+    /// (30), not the top of the timeline: reaching the end while a loop is
+    /// armed restarts, it never silently halts.
+    #[test]
+    fn a_loop_trim_window_ending_at_the_films_last_frame_restarts_on_ended() {
+        let loop_on = false;
+        let loop_trim = Some((30, 60));
+        let armed = loop_on || loop_trim.is_some();
+        assert!(armed, "loop_trim alone must arm the crossing");
+        assert!(crosses_into_loop(Transport::Playing, Transport::Ended, armed));
+        assert_eq!(loop_restart_frame(loop_on, loop_trim), Some(30));
+    }
+
+    /// A loop window sitting entirely before the film's end never reaches
+    /// `Ended` at all -- the top-of-`pump` restart (`should_loop_restart`,
+    /// gated on `is_playing()`) fires first, on the ordinary tick the
+    /// playhead crosses the window's far edge, exactly as
+    /// `should_loop_restart_only_at_the_windows_far_edge`
+    /// (`tests::editing`) already covers. This crossing helper only ever
+    /// applies to the end-of-film case above.
+    #[test]
+    fn a_mid_timeline_loop_window_never_needs_the_ended_crossing() {
+        use crate::timeline_math::should_loop_restart;
+        // Well short of the film's own end: the ordinary restart already
+        // fires at frame 60 without the transport ever reaching Ended.
+        assert!(should_loop_restart(60, Some((30, 60))));
     }
 }

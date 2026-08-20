@@ -362,6 +362,20 @@ pub(crate) fn should_loop_restart(frame: u32, window: Option<(u32, u32)>) -> boo
     window.is_some_and(|(_, hi)| frame >= hi)
 }
 
+/// Where a play resumes from on crossing into [`Transport::Ended`]
+/// (`Player::pump`): the loop-trim window's own near edge when one is armed,
+/// *even when its far edge is the film's own last frame* -- half of all cuts
+/// in a two-clip film sit on the final clip (DESIGN.md §6), so that coincidence
+/// is not an edge case and must not read as "reached the end, stop". Falls
+/// back to the whole-timeline loop's top, and `None` -- neither armed --
+/// restarts nothing, which is the halt this crossing otherwise means.
+pub(crate) fn loop_restart_frame(loop_on: bool, loop_trim: Option<(u32, u32)>) -> Option<u32> {
+    match loop_trim {
+        Some((lo, _)) => Some(lo),
+        None => loop_on.then_some(0),
+    }
+}
+
 /// How many timeline frames a stretch of a subtitle track is worth: the one
 /// conversion between the two clocks a caption has -- microseconds for its
 /// words, frames for where it sits -- and the app-side twin of the engine's own

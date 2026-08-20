@@ -87,18 +87,22 @@ fn ghost_dual(player: &Player, glyph: &str, action: ActionId, stride: ActionId) 
         )
 }
 
-/// The keys overlay (DESIGN §9, §12 step 7): every bound command as one
-/// chord-and-label row, plate-styled per §4 ("readouts are plates"), shown
-/// while [`Player::keys_open`] is set (the same field/guard the legacy
-/// modal already used -- `Player::show_actions` sets it, `Player::close_card`
-/// clears it on `esc`, both already wired through the darkroom's key
-/// handler below).
+/// The keys overlay (DESIGN §9, §12 step 7): every bound command, sectioned
+/// by [`keymap::Category`] exactly as the legacy actions card files them
+/// ([`keys_rows`]) -- reusing that registry-driven order is what makes an
+/// action added anywhere land here without a second list to forget. Held
+/// open by `?` -- [`crate::ui::stance::render`]'s own `on_key_down` opens it
+/// on the press (bypassing the modal `overlaid()` guard, which would
+/// otherwise swallow the second `?` down while the first is still up) and
+/// its `on_key_up` closes it on release, so this is the room dimming one
+/// fill step for as long as the key is held, never a latch (DESIGN §9: "no
+/// modal cheat-sheet").
 ///
 /// corner-cut: DESIGN §9 wants chords surfaced *in place beside their
-/// controls* across every region, dimming the room one fill step; this is
-/// one list plate instead, anchored over the bench/ledger footprint so it
-/// never reaches the screen. Ceiling: DESIGN §12 step 7's full geographic
-/// pass (each region draws its own rows when `keys_open`).
+/// controls* across every region; this is one scrolling list plate instead,
+/// anchored over the bench/ledger footprint so it never reaches the screen.
+/// Ceiling: DESIGN §12 step 7's full geographic pass (each region draws its
+/// own rows while held).
 fn keys_overlay(player: &Player) -> impl IntoElement {
     div()
         .id("stance-keys-overlay")
@@ -111,10 +115,11 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
         .flex()
         .child(
             div()
+                .id("stance-keys-list")
                 .m_auto()
-                .max_h(px(BENCH_H + LEDGER_H - 16.))
-                .max_w(px(420.))
-                .overflow_hidden()
+                .h(px(BENCH_H + LEDGER_H - 16.))
+                .w(px(460.))
+                .overflow_y_scroll()
                 .p(px(10.))
                 .rounded(px(4.))
                 .bg(rgb(DARK_PANEL()))
@@ -123,15 +128,34 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
                 .flex()
                 .flex_col()
                 .gap(px(3.))
-                .child(section_head("all commands · esc to close"))
-                .children(player.keymap.entries().iter().map(|b| {
-                    div()
+                .child(section_head("all commands · hold ? · release to close"))
+                .children(keys_rows().into_iter().map(|row| match row {
+                    KeyRow::Head(category) => div()
+                        .flex_none()
+                        .pt(px(4.))
+                        .text_size(px(9.))
+                        .text_color(rgb(INK3()))
+                        .child(category.label().to_uppercase())
+                        .into_any_element(),
+                    KeyRow::Act(action) => div()
                         .flex()
                         .justify_between()
                         .gap(px(12.))
                         .text_size(px(9.5))
-                        .child(div().text_color(rgb(INK2())).child(b.action.label()))
-                        .child(div().text_color(rgb(INK3())).child(b.chord.pretty()))
+                        .child(div().text_color(rgb(INK2())).child(action.label()))
+                        .child(div().text_color(rgb(INK3())).child(player.keymap.display(action)))
+                        .into_any_element(),
+                    KeyRow::Fixed(i) => {
+                        let f = &keymap::FIXED[i];
+                        div()
+                            .flex()
+                            .justify_between()
+                            .gap(px(12.))
+                            .text_size(px(9.5))
+                            .child(div().text_color(rgb(INK2())).child(f.label))
+                            .child(div().text_color(rgb(INK3())).child(f.chord.clone()))
+                            .into_any_element()
+                    }
                 })),
         )
 }
@@ -285,9 +309,70 @@ fn bench(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
         .child(bench_stance::render(player, BENCH_H - 20., cx))
 }
 
+/// Which of the three §8 severities a notice's own words carry. Reuses
+/// [`notice_tone`] (the legacy bar's own classification, by word) rather than
+/// a second heuristic, and folds its four-way answer onto the darkroom's
+/// three tokens: `STATUS_ERROR`/`STATUS_WARNING` are the same constants as
+/// `NOTICE_DECIDE`/`NOTICE_LOOK` already (`ui/theme.rs`'s `darkroom` module
+/// aliases them both ways), so the two failure/refusal tones fold straight
+/// across and everything else -- success included -- reads as *told you*.
+fn notice_severity(message: &str) -> u32 {
+    let tone = notice_tone(message);
+    if tone == STATUS_ERROR() {
+        NOTICE_DECIDE()
+    } else if tone == STATUS_WARNING() {
+        NOTICE_LOOK()
+    } else {
+        NOTICE_TELL()
+    }
+}
+
+/// A notice plate (DESIGN §8): one at a time, rising above the ledger, its
+/// severity a 3px left spine rather than a colour flood. Fed by the same
+/// [`Player::notify_user`]/`notices` queue the legacy bar reads
+/// ([`Player::notice_bar`]) -- no second notice channel. Dismissal is
+/// already wired: [`render`]'s `on_key_down` calls `dismiss_notice()` on
+/// every stroke, the same door the legacy handler uses.
+///
+/// corner-cut: amber's "carries a jump action" is not wired -- the queue
+/// only ever held plain text, no structured jump target, in either the
+/// legacy bar or here. Ceiling: give `notify_user` an optional jump payload
+/// once a call site actually has one to carry.
+fn notice_plate(message: SharedString) -> impl IntoElement {
+    div()
+        .id("stance-notice")
+        .absolute()
+        .bottom(px(LEDGER_H + 6.))
+        .left(px(12.))
+        .max_w(px(360.))
+        .flex()
+        .items_center()
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(2.))
+        .bg(rgb(DARK_PANEL()))
+        // The severity spine (DESIGN §8): a 3px left border, coloured, same
+        // shape as the legacy notice bar's own tone stripe (`notice_bar`).
+        .border_l(px(3.))
+        .border_color(rgb(notice_severity(&message)))
+        .text_size(px(10.))
+        .text_color(rgb(INK1()))
+        .child(message)
+}
+
 /// Thin strip at the bottom of the centre column: project identity, last
 /// action, export progress, position. Notices rise from here (DESIGN §5, §8).
-fn ledger() -> impl IntoElement {
+fn ledger(player: &Player, position: f64) -> impl IntoElement {
+    let name = match player.project_path.as_os_str().is_empty() {
+        true => "untitled".to_string(),
+        false => file_name(&player.project_path),
+    };
+    let identity = format!("{name} · {}", if player.autosave_dirty { "unsaved" } else { "saved" });
+    let last_action = player.notices.back().cloned().unwrap_or_else(|| "—".into());
+    let export = player
+        .exporting()
+        .map(|h| format!("EXPORTING {:.0}%", h.progress() * 100.));
+    let tc = timecode(position, player.active_fps());
     div()
         .id("stance-ledger")
         .flex_none()
@@ -297,9 +382,21 @@ fn ledger() -> impl IntoElement {
         .border_color(rgba(DARK_SEAM()))
         .flex()
         .items_center()
+        .gap(px(14.))
         .px(px(12.))
         .child(section_head("ledger"))
-        // hook: §12 step 7 -- project identity/state, last action, export progress, notices.
+        .child(div().text_size(px(9.5)).text_color(rgb(INK1())).child(identity))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_size(px(9.5))
+                .text_color(rgb(INK3()))
+                .child(last_action),
+        )
+        .children(export.map(|e| div().text_size(px(9.5)).text_color(rgb(INK2())).child(e)))
+        .child(div().flex_none().text_size(px(9.5)).text_color(rgb(INK2())).child(tc))
 }
 
 /// The dock: the only side panel, right, fixed width, carrying the Src/Clip
@@ -342,6 +439,18 @@ pub(crate) fn render(
             if this.dismiss_notice() {
                 cx.notify();
             }
+            // DESIGN §9: "`?` held ... surfaces chords ... release restores.
+            // No modal cheat-sheet." Opened here, ahead of the modal guard
+            // below (which would otherwise swallow a second `?` down once
+            // `keys_open` is already true) -- `on_key_up` is the only thing
+            // that closes it, so there is no latch to fall through to.
+            if key == "?" && !ctrl {
+                if !this.keys_open {
+                    this.show_actions(cx);
+                }
+                cx.notify();
+                return;
+            }
             // Same modal guard the legacy handler's rebinding/keys_open/
             // export_open/exporting/colour/transform/speed/EQ/silence/mix/
             // subtitle-style/menu chain (`render.rs`) amounts to, read as
@@ -373,6 +482,16 @@ pub(crate) fn render(
                 this.act(action, window, cx);
             }
         }))
+        // The release half of the `?` hold above: whatever opened it, this is
+        // the one thing that closes it -- there is nothing else in the
+        // darkroom that sets `keys_open` true, so this cannot close a card
+        // `?` did not open.
+        .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| {
+            if event.keystroke.key.as_str() == "?" {
+                this.keys_open = false;
+                cx.notify();
+            }
+        }))
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
@@ -388,7 +507,10 @@ pub(crate) fn render(
                 .child(screen(player, position, window, cx))
                 .child(time_band(player))
                 .child(bench(player, cx))
-                .child(ledger())
+                .child(ledger(player, position))
+                .when_some(player.notices.front().cloned(), |el, n| {
+                    el.child(notice_plate(n))
+                })
                 .when(player.keys_open, |el| el.child(keys_overlay(player))),
         )
         .child(dock(player, window_h, cx))
