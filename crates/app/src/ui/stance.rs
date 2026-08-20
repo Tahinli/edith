@@ -8,6 +8,7 @@
 //! later steps in DESIGN §12's package attach.
 
 use crate::*;
+use crate::ui::bench_stance;
 use crate::ui::dock_stance;
 
 /// Left rail, full height (DESIGN §5).
@@ -15,10 +16,12 @@ const SPINE_W: f32 = 56.;
 /// Fixed strip under the screen: timecode, transport, cut readout, contact
 /// strip, Export -- all placeholder at this step.
 const TIME_BAND_H: f32 = 88.;
-/// corner-cut: the lane bed has no lanes to size itself against yet, so this
-/// is a placeholder height rather than a measured one. Ceiling: replaced by
-/// the real lane stack's own height once DESIGN §12 step 4 fills the bench.
-const BENCH_H: f32 = 160.;
+/// corner-cut: a fixed share of the window rather than one measured against
+/// the picture's own room, matching the placeholder every other stance
+/// region still carries at this step. Ceiling: fold into the same split the
+/// legacy timeline's `Split::Timeline` answers once the stance grows a
+/// resizable seam of its own.
+const BENCH_H: f32 = 200.;
 /// Thin strip at the foot of the centre column.
 const LEDGER_H: f32 = 28.;
 /// Right side panel, fixed width, carrying the Src/Clip tab pair.
@@ -174,7 +177,7 @@ fn time_band(player: &Player) -> impl IntoElement {
 
 /// Lanes, under the time band. `canvas` is the bench background too (DESIGN
 /// §2's token table), so it shares its surface with the screen above it.
-fn bench() -> impl IntoElement {
+fn bench(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-bench")
         .flex_none()
@@ -185,10 +188,11 @@ fn bench() -> impl IntoElement {
         .border_t_1()
         .border_color(rgba(DARK_SEAM()))
         .flex()
-        .items_center()
+        .flex_col()
         .px(px(12.))
+        .py(px(4.))
         .child(section_head("bench"))
-        // hook: §12 step 4 -- lanes V/A/S; ink spine + thumbnails/waveform + name plate + splice gaps.
+        .child(bench_stance::render(player, BENCH_H - 20., cx))
 }
 
 /// Thin strip at the bottom of the centre column: project identity, last
@@ -292,7 +296,7 @@ pub(crate) fn render(
                 .flex_col()
                 .child(screen(player, position, window, cx))
                 .child(time_band(player))
-                .child(bench())
+                .child(bench(player, cx))
                 .child(ledger()),
         )
         .child(dock(player, window_h, cx))
