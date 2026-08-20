@@ -244,6 +244,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
         link: Some(source as u32),
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
@@ -257,6 +258,7 @@ fn exports_at_the_project_resolution_with_the_watched_geometry() {
             (engine::project::LaneKind::Video, clips.clone()),
             (engine::project::LaneKind::Audio, clips),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -329,6 +331,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
         link: Some(0),
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
     };
@@ -344,6 +347,7 @@ fn exports_the_audio_stream_the_timeline_plays() {
             (engine::project::LaneKind::Video, vec![whole]),
             (engine::project::LaneKind::Audio, vec![whole]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )

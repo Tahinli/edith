@@ -811,6 +811,7 @@ fn a_drop_moves_the_clip_that_was_picked_up_not_its_old_index() {
         link: None,
         eq: None,
         color: None,
+        transform: None,
         fit: FitPolicy::Fit,
         speed: Speed::NORMAL,
     };

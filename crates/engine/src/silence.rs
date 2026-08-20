@@ -305,6 +305,7 @@ mod tests {
             link: None,
             eq: None,
             color: None,
+            transform: None,
             fit: FitPolicy::default(),
             speed,
         }
