@@ -89,6 +89,45 @@ impl Player {
             })
             .detach();
         }
+        // The bench's poster frame per file (`Thumb`, DESIGN §5's "real
+        // thumbnails across video clips"): one representative frame, decoded
+        // off the render thread like the peaks above through the same
+        // single-frame door `engine::decode::DecodeSession::open_range`
+        // already opens for a poster frame -- no second decode path invented.
+        // Filtered to files with a picture at all: an audio-only source has
+        // no frame to ask for, so it never enters this map (mirroring `Wave`'s
+        // own `Silent`, but as an absence rather than a state).
+        for path in unseen_paths(session.sources(), &self.thumbs)
+            .into_iter()
+            .filter(|p| !engine::is_audio(p))
+        {
+            self.thumbs.insert(path.clone(), Thumb::Loading);
+            let decoded = cx.background_executor().spawn({
+                let path = path.clone();
+                async move {
+                    let (_, rx, _cancel) =
+                        engine::decode::DecodeSession::open_range(&path, 0, 1).ok()?;
+                    let frame = rx.recv().ok()?;
+                    let buf = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra)?;
+                    Some(std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(buf)])))
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let decoded = decoded.await;
+                this.update(cx, |this, cx| {
+                    this.thumbs.insert(
+                        path,
+                        match decoded {
+                            Some(image) => Thumb::Ready(image),
+                            None => Thumb::Failed,
+                        },
+                    );
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         // Which decoder each file will run on, for the row that says so before
         // a frame of it plays. Off the render thread like the streams above: a
         // stream the plugin takes costs one VA-API init (~90 ms) to answer.

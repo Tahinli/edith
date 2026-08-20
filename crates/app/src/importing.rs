@@ -62,6 +62,21 @@ pub(crate) enum Wave {
     Peaks(Arc<Vec<(f32, f32)>>),
 }
 
+/// The bench's own version of [`Wave`] for the picture instead of the sound: one
+/// representative decoded frame per file, kept and reused across every clip cut
+/// from it (DESIGN.md §5's "real thumbnails across video clips", §12 step 5 --
+/// this is the frame, not the ink; the ink comes from [`crate::source_tint`]
+/// until real extraction lands). Audio-only files never enter this map (see
+/// `cache_media`'s filter), so `Silent` has no counterpart here.
+#[derive(Clone)]
+pub(crate) enum Thumb {
+    /// Asked for; the decode is running on a background thread.
+    Loading,
+    /// The decode failed or the file turned out to carry no picture after all.
+    Failed,
+    Ready(Arc<gpui::RenderImage>),
+}
+
 /// What a source's stand-in is up to ([`engine::proxy`]). Kept per file and
 /// filled like every other library fact -- presence means "asked", so a repaint
 /// mid-encode cannot start a second one.
