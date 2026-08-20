@@ -92,6 +92,7 @@ fn project(video: &Path, sound: &Path, sound_in: u32) -> Project {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     // The sound is source **0** on purpose: the timeline takes its rate and its
     // width from the first source that has any, so a project whose first source
@@ -107,6 +108,7 @@ fn project(video: &Path, sound: &Path, sound_in: u32) -> Project {
                 vec![clip(0, sound_in * 24, sound_in * 24 + 24)],
             ),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -436,6 +438,7 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     // The sound is source 0, for the reason [`project`] gives: the timeline
     // takes its rate and its width from the first source that has any.
@@ -445,6 +448,7 @@ fn a_copied_picture_names_the_sound_it_was_written_with() {
             (LaneKind::Video, vec![clip(1, frames)]),
             (LaneKind::Audio, vec![clip(0, frames)]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )

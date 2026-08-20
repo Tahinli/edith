@@ -1352,4 +1352,151 @@ mod tests {
         let (y1, _, _) = blend_i420((&a.0, &a.1, &a.2), (&b.0, &b.1, &b.2), 1.0);
         assert_eq!(y1, b.0);
     }
+
+    /// The crop fractions cut a rect out of a 100x100 source at the very
+    /// pixels the maths says, chroma-grid aligned like every other rect here.
+    #[test]
+    fn crop_rect_math() {
+        let t = TransformParams {
+            crop_l: 0.1,
+            crop_r: 0.2,
+            crop_t: 0.0,
+            crop_b: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            crop_rect(100, 100, &t),
+            Rect { x: 10, y: 0, w: 70, h: 100 },
+            "10% off the left, 20% off the right, nothing off top or bottom"
+        );
+        // Opposing crops clamp to 0.5 a side rather than meeting or crossing.
+        let extreme = TransformParams {
+            crop_l: 0.9,
+            crop_r: 0.9,
+            ..Default::default()
+        };
+        let r = crop_rect(100, 100, &extreme);
+        assert!(r.w >= 2, "the smallest surviving rect is one chroma sample");
+        // A zero-sized source has nothing to crop.
+        assert_eq!(crop_rect(0, 100, &TransformParams::default()), Rect { x: 0, y: 0, w: 0, h: 0 });
+    }
+
+    /// A placement moved by `pos_x`/`pos_y` (canvas fractions about its own
+    /// centre) and resized by `scale`, both about that same centre.
+    #[test]
+    fn transformed_dst_rect_at_pos_and_scale() {
+        let dst = Rect { x: 0, y: 0, w: 100, h: 100 };
+        // Moved a quarter of the canvas to the right, untouched vertically.
+        let moved = TransformParams {
+            pos_x: 0.25,
+            ..Default::default()
+        };
+        assert_eq!(
+            transformed_dst_rect(dst, &moved, 200, 200),
+            Rect { x: 50, y: 0, w: 100, h: 100 },
+            "25% of a 200-wide canvas is 50 pixels, about the placement's own centre"
+        );
+        // Doubled in place: the centre stays, the box fills the canvas.
+        let grown = TransformParams {
+            scale: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            transformed_dst_rect(dst, &grown, 200, 200),
+            Rect { x: 0, y: 0, w: 200, h: 200 },
+            "a 100x100 box doubled about its own centre on a 200x200 canvas fills it"
+        );
+    }
+
+    /// [`nearest_90_steps`] rounds to the closest quarter turn and folds a
+    /// non-finite value to the identity.
+    #[test]
+    fn nearest_90_steps_rounds_and_wraps() {
+        assert_eq!(nearest_90_steps(0.0), 0);
+        assert_eq!(nearest_90_steps(89.0), 1);
+        assert_eq!(nearest_90_steps(91.0), 1);
+        assert_eq!(nearest_90_steps(180.0), 2);
+        assert_eq!(nearest_90_steps(-90.0), 3);
+        assert_eq!(nearest_90_steps(360.0 + 90.0), 1);
+        assert_eq!(nearest_90_steps(f32::NAN), 0);
+    }
+
+    /// A marked corner pixel lands where a clockwise quarter turn puts it:
+    /// top-left to top-right at 90 degrees, to bottom-right at 180, to
+    /// bottom-left at 270 -- and the plane's own shape swaps at 90 and 270
+    /// and stays put at 180.
+    #[test]
+    fn rotate_i420_90s_places_a_marked_pixel() {
+        let (w, h) = (4usize, 3usize);
+        let mut y = vec![0u8; w * h];
+        y[0] = 99; // (x=0, y=0), the top-left corner.
+        let (u, v) = (vec![128u8; 2 * 2], vec![128u8; 2 * 2]);
+
+        let mark_at = |plane: &[u8], w: u32, x: u32, y: u32| plane[(y * w + x) as usize];
+
+        let (ry, _, _, rw, rh) = rotate_i420_90s(&y, &u, &v, w as u32, h as u32, 1);
+        assert_eq!((rw, rh), (h as u32, w as u32), "dims swap at 90 degrees");
+        assert_eq!(mark_at(&ry, rw, rw - 1, 0), 99, "top-left moves to top-right");
+
+        let (ry, _, _, rw, rh) = rotate_i420_90s(&y, &u, &v, w as u32, h as u32, 2);
+        assert_eq!((rw, rh), (w as u32, h as u32), "dims stay put at 180 degrees");
+        assert_eq!(
+            mark_at(&ry, rw, rw - 1, rh - 1),
+            99,
+            "top-left moves to bottom-right"
+        );
+
+        let (ry, _, _, rw, rh) = rotate_i420_90s(&y, &u, &v, w as u32, h as u32, 3);
+        assert_eq!((rw, rh), (h as u32, w as u32), "dims swap at 270 degrees");
+        assert_eq!(
+            mark_at(&ry, rw, 0, rh - 1),
+            99,
+            "top-left moves to bottom-left"
+        );
+
+        // Zero steps, and four of them, are both the identity.
+        let (ry, ru, rv, rw, rh) = rotate_i420_90s(&y, &u, &v, w as u32, h as u32, 0);
+        assert_eq!((ry, ru, rv, rw, rh), (y.clone(), u.clone(), v.clone(), w as u32, h as u32));
+        let (ry, _, _, rw, rh) = rotate_i420_90s(&y, &u, &v, w as u32, h as u32, 4);
+        assert_eq!((ry, rw, rh), (y, w as u32, h as u32), "four quarter turns is the identity");
+    }
+
+    /// [`Composer::place_transformed`] at compose level: a picture placed with
+    /// a `pos_x` offset lands its marked pixel shifted by exactly that many
+    /// canvas pixels, with black everywhere else.
+    #[test]
+    fn place_transformed_shifts_a_marked_pixel() {
+        let (src_w, src_h) = (64u32, 64u32);
+        let (y, u, v) = (
+            vec![200u8; (src_w * src_h) as usize],
+            vec![NEUTRAL_C; ((src_w / 2) * (src_h / 2)) as usize],
+            vec![NEUTRAL_C; ((src_w / 2) * (src_h / 2)) as usize],
+        );
+        let mut canvas = Composer::new(src_w, src_h, FitPolicy::Fit);
+        // Identity: a pass-through-shaped placement, fills the whole canvas.
+        let (iy, _, _, iw, ih) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &TransformParams::default());
+        assert_eq!((iw, ih), (src_w, src_h));
+        assert!(iy.iter().all(|&p| p == 200), "identity fills the canvas");
+
+        // Moved a quarter of the canvas to the right: the left half is black,
+        // the right half (minus the strip pushed off the edge) is the picture.
+        let moved = TransformParams {
+            pos_x: 0.25,
+            ..Default::default()
+        };
+        let (my, _, _, mw, mh) = canvas.place_transformed(&y, &u, &v, src_w, src_h, &moved);
+        assert_eq!((mw, mh), (src_w, src_h), "canvas size never changes");
+        let shift = (f64::from(src_w) * 0.25).round() as usize;
+        for row in 0..mh as usize {
+            let r = &my[row * mw as usize..][..mw as usize];
+            assert!(
+                r[..shift].iter().all(|&p| p == BLACK_Y),
+                "row {row}: black ahead of the shifted picture"
+            );
+            assert!(
+                r[shift..].iter().all(|&p| p == 200),
+                "row {row}: the picture fills the rest, shifted right"
+            );
+        }
+    }
 }
