@@ -903,7 +903,8 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         let allowed = action == ActionId::CancelExport
             || action == ActionId::Theme
             || action == ActionId::Fullscreen
-            || action == ActionId::SubtitleStyle;
+            || action == ActionId::SubtitleStyle
+            || action == ActionId::Settings;
         assert_eq!(
             whole(action, busy).yes(),
             allowed,

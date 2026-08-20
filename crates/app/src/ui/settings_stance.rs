@@ -5,9 +5,14 @@
 //! - PROJECT: anything that changes the rendered output or is stored in the
 //!   `.edith` file -- resolution, fps, sample-rate, the HDR tonemap, the mix.
 //! - EDITOR: anything about this machine, this person, this window --
-//!   proxies/auto-proxies (this window's decode/import policy) and the
-//!   subtitle font (a reading preference, kept in `~/.config/edith` like the
-//!   theme beside it, per [`crate::load_subtitle_style`]).
+//!   proxies/auto-proxies (this window's decode/import policy, mirrored into
+//!   the project like the resolution row above it once one is open --
+//!   [`engine::PlaybackSession::set_proxies`] -- but with a window-level
+//!   default, `false`/`true`, that answers before any project is, exactly as
+//!   [`inspector.rs`]'s own legacy row already does) and the subtitle font
+//!   (a reading preference, kept in `~/.config/edith` like the theme beside
+//!   it, per [`crate::load_subtitle_style`], and never written into a
+//!   project at all).
 //!
 //! Every row here reuses an opener or a picker this editor already has
 //! ([`Player::open_picker`], [`Player::open_mix`], [`Player::open_subtitle_style`],
@@ -165,7 +170,10 @@ fn project_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElemen
 }
 
 /// EDITOR: this window's own decode/import policy and this person's own
-/// reading preference -- never written into the `.edith` file.
+/// reading preference. The subtitle font never touches the `.edith` file;
+/// the proxy switches do mirror into it once a project is open (they are
+/// project state too), but default from the window rather than a project
+/// pick, which is what keeps them answerable with nothing open.
 fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .flex_none()
