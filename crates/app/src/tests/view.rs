@@ -410,6 +410,7 @@ fn no_stroke_is_missing_from_the_keys_menu() {
         let pretty = keymap::Chord {
             key: key.to_string(),
             ctrl: false,
+            shift: false,
         }
         .pretty();
         keymap.lookup(key, false).is_some() || keymap::FIXED.iter().any(|f| f.chord == pretty)

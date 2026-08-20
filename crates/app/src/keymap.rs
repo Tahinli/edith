@@ -80,6 +80,11 @@ actions! {
     /// by what they are for.
     PrevSyncPoint,
     NextSyncPoint,
+    /// Walks to the next cut (DESIGN.md §6): the odometer the cut readout
+    /// counts against. Shift strides ten cuts instead of one.
+    WalkCutNext,
+    /// The pair's other half, one cut earlier. Shift strides ten.
+    WalkCutPrev,
     /// Marks the playhead as an export's in point. The out point wraps around
     /// it if the mark lands past the current out ([`ordered_range`]).
     SetIn,
@@ -138,6 +143,17 @@ actions! {
     /// two adjacent clips picked on one lane, or a single pick faded into the
     /// clip right after it.
     Crossfade,
+    /// No-aim trim of the subject cut's in point, frame detents, at any zoom
+    /// (DESIGN.md §6), on its designed bare `[`. [`ActionId::SelectPrev`]
+    /// moved to shift+[ to free it -- see keymap.rs's own defaults.
+    TrimIn,
+    /// The pair's other half, the subject cut's out point, on its designed
+    /// bare `]` -- [`ActionId::SelectNext`] moved to shift+] for the same
+    /// reason.
+    TrimOut,
+    /// Loop-trim: loops around the subject cut while trimming it (DESIGN.md
+    /// §6, "the modernized Avid trim mode").
+    LoopTrim,
     /// Dissolves the selected video clip into its neighbour
     /// ([`Project::set_transition_out`]): two adjacent clips picked on one
     /// lane, or a single pick dissolved into the clip right after it. A
@@ -192,6 +208,8 @@ impl ActionId {
             ActionId::GoEnd => "Go to the last frame",
             ActionId::PrevSyncPoint => "Previous sync point (a cut here is copied, not re-encoded)",
             ActionId::NextSyncPoint => "Next sync point (a cut here is copied, not re-encoded)",
+            ActionId::WalkCutNext => "Walk to the next cut (shift: ten cuts)",
+            ActionId::WalkCutPrev => "Walk to the previous cut (shift: ten cuts)",
             ActionId::SetIn => "Mark in (export range)",
             ActionId::SetOut => "Mark out (export range)",
             ActionId::ClearRange => "Clear the export range",
@@ -235,6 +253,9 @@ impl ActionId {
             ActionId::Speed => "Speed (tape)…",
             ActionId::Silence => "Silences: cut or speed up…",
             ActionId::Crossfade => "Crossfade into the next clip",
+            ActionId::TrimIn => "Trim the subject cut's in point",
+            ActionId::TrimOut => "Trim the subject cut's out point",
+            ActionId::LoopTrim => "Loop-trim the subject cut",
             ActionId::Dissolve => "Dissolve into the next clip",
             ActionId::Mix => "Mix: track volumes and the limiter…",
             ActionId::ToggleSnap => "Snap on / off (edges, the playhead, the start)",
@@ -264,6 +285,8 @@ impl ActionId {
             ActionId::GoEnd => "go-end",
             ActionId::PrevSyncPoint => "prev-sync-point",
             ActionId::NextSyncPoint => "next-sync-point",
+            ActionId::WalkCutNext => "walk-cut-next",
+            ActionId::WalkCutPrev => "walk-cut-prev",
             ActionId::SetIn => "set-in",
             ActionId::SetOut => "set-out",
             ActionId::ClearRange => "clear-range",
@@ -304,6 +327,9 @@ impl ActionId {
             ActionId::Speed => "speed",
             ActionId::Silence => "silence",
             ActionId::Crossfade => "crossfade",
+            ActionId::TrimIn => "trim-in",
+            ActionId::TrimOut => "trim-out",
+            ActionId::LoopTrim => "loop-trim",
             ActionId::Dissolve => "dissolve",
             ActionId::Mix => "mix",
             ActionId::ToggleSnap => "toggle-snap",
@@ -338,6 +364,8 @@ impl ActionId {
             | ActionId::GoEnd
             | ActionId::PrevSyncPoint
             | ActionId::NextSyncPoint
+            | ActionId::WalkCutNext
+            | ActionId::WalkCutPrev
             | ActionId::SetIn
             | ActionId::SetOut
             | ActionId::ClearRange => Category::Playback,
@@ -361,6 +389,9 @@ impl ActionId {
             // above it, opened on whichever half was picked.
             | ActionId::Silence
             | ActionId::Crossfade
+            | ActionId::TrimIn
+            | ActionId::TrimOut
+            | ActionId::LoopTrim
             | ActionId::Dissolve => Category::Clips,
             // The project's own picture size is not a clip's business, and not
             // a file operation either: it is what the viewer is looking at.
@@ -765,23 +796,27 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(||
     ]
 });
 
-/// A stroke as the key handler sees it: gpui's key name plus the one modifier
-/// this editor binds. Nothing else is a chord here -- shift and alt are part of
-/// the key name gpui reports, and a second modifier would need the file format
-/// to grow before it could be spelled.
+/// A stroke as the key handler sees it: gpui's key name plus the two
+/// modifiers this editor binds. Nothing else is a chord here -- alt is part
+/// of the key name gpui reports, and a third modifier would need the file
+/// format to grow before it could be spelled.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Chord {
     pub key: String,
     pub ctrl: bool,
+    pub shift: bool,
 }
 
 impl Chord {
-    /// The file's spelling, and the only one [`parse`] accepts back.
+    /// The file's spelling, and the only one [`parse`] accepts back. Ctrl
+    /// always comes before shift, so a chord round-trips through one spelling
+    /// and not two.
     fn text(&self) -> String {
-        if self.ctrl {
-            format!("ctrl+{}", self.key)
-        } else {
-            self.key.clone()
+        match (self.ctrl, self.shift) {
+            (true, true) => format!("ctrl+shift+{}", self.key),
+            (true, false) => format!("ctrl+{}", self.key),
+            (false, true) => format!("shift+{}", self.key),
+            (false, false) => self.key.clone(),
         }
     }
 
@@ -795,10 +830,11 @@ impl Chord {
         } else {
             &self.key
         };
-        if self.ctrl {
-            format!("ctrl+{key}")
-        } else {
-            key.to_string()
+        match (self.ctrl, self.shift) {
+            (true, true) => format!("ctrl+shift+{key}"),
+            (true, false) => format!("ctrl+{key}"),
+            (false, true) => format!("shift+{key}"),
+            (false, false) => key.to_string(),
         }
     }
 
@@ -812,14 +848,18 @@ impl Chord {
         Chord::parse(&self.text(), 0).is_ok_and(|round_trip| round_trip == *self)
     }
 
-    /// Strict: exactly one optional `ctrl+` and then a key gpui could have
-    /// reported. A spelling this cannot emit back unchanged is refused rather
-    /// than normalised, because the round-trip is what makes the file editable
-    /// by hand at all.
+    /// Strict: exactly one optional `ctrl+`, then one optional `shift+`, then
+    /// a key gpui could have reported. A spelling this cannot emit back
+    /// unchanged is refused rather than normalised, because the round-trip is
+    /// what makes the file editable by hand at all.
     fn parse(text: &str, n: usize) -> Result<Self, String> {
-        let (ctrl, key) = match text.strip_prefix("ctrl+") {
-            Some(key) => (true, key),
+        let (ctrl, rest) = match text.strip_prefix("ctrl+") {
+            Some(rest) => (true, rest),
             None => (false, text),
+        };
+        let (shift, key) = match rest.strip_prefix("shift+") {
+            Some(key) => (true, key),
+            None => (false, rest),
         };
         if key.is_empty()
             || key.contains(' ')
@@ -831,6 +871,7 @@ impl Chord {
         Ok(Chord {
             key: key.to_string(),
             ctrl,
+            shift,
         })
     }
 }
@@ -860,6 +901,15 @@ impl Keymap {
             chord: Chord {
                 key: key.to_string(),
                 ctrl,
+                shift: false,
+            },
+        };
+        let bshift = |action, key: &str| Binding {
+            action,
+            chord: Chord {
+                key: key.to_string(),
+                ctrl: false,
+                shift: true,
             },
         };
         Keymap {
@@ -887,6 +937,12 @@ impl Keymap {
                 // step through the same timeline by the source's own grid.
                 b(ActionId::PrevSyncPoint, "[", true),
                 b(ActionId::NextSyncPoint, "]", true),
+                // The cut odometer (DESIGN.md §6): bare walks one cut, shift
+                // strides ten. Both were free.
+                b(ActionId::WalkCutNext, ".", false),
+                bshift(ActionId::WalkCutNext, "."),
+                b(ActionId::WalkCutPrev, ",", false),
+                bshift(ActionId::WalkCutPrev, ","),
                 // The mark pair, on the letters every editor already means them
                 // by: bare, since a mark is set as often as a step and nothing
                 // else in this table answers to either.
@@ -915,10 +971,13 @@ impl Keymap {
                 // means by "move on to the next thing", and the two brackets
                 // are the pair either side of it in the lane -- shift+tab is
                 // the obvious partner and is unspellable here, since a chord
-                // carries only ctrl and `parse` refuses an uppercase key.
+                // carries only ctrl and `parse` refuses an uppercase key. Bare
+                // brackets are DESIGN.md §6's own trim pair now, so selection
+                // takes the shifted chord: same two keys, the modifier telling
+                // "walk the lane" apart from "trim the cut".
                 b(ActionId::Select, "tab", false),
-                b(ActionId::SelectNext, "]", false),
-                b(ActionId::SelectPrev, "[", false),
+                bshift(ActionId::SelectNext, "]"),
+                bshift(ActionId::SelectPrev, "["),
                 // Select-all, on the chord every editor and every text field
                 // already means it by -- which is why the audio-lane removal
                 // below had to move off ctrl+a: a stroke that universal was
@@ -1004,6 +1063,16 @@ impl Keymap {
                 // ctrl its own room now that plain "f" is the mix card's own
                 // (below) -- the same letter, the modifier telling them apart.
                 b(ActionId::Crossfade, "f", true),
+                // DESIGN.md §6's own chords: bare `[` `]` are the no-aim trim
+                // pair. SelectPrev/SelectNext moved to shift+[ shift+] above
+                // to make room -- the bare bracket trims the subject cut,
+                // the shifted one walks the selection past it, so the family
+                // reads as one idea under one pair of keys.
+                b(ActionId::TrimIn, "[", false),
+                b(ActionId::TrimOut, "]", false),
+                // Loop-trim (DESIGN.md §6, "the modernized Avid trim mode"):
+                // bare "/" was free.
+                b(ActionId::LoopTrim, "/", false),
                 // Dissolve takes ctrl+x: the join it draws on the timeline is
                 // an X (widgets.rs, dissolve_glyph) -- "d" itself is taken
                 // both plain (Detach) and, in the keymap's own rebind test,
@@ -1066,9 +1135,18 @@ impl Keymap {
     /// What a stroke means, if anything. `key` is gpui's key name and `ctrl` its
     /// control modifier -- the pair the key handler already matches on.
     pub fn lookup(&self, key: &str, ctrl: bool) -> Option<ActionId> {
+        self.lookup_shifted(key, ctrl, false)
+    }
+
+    /// [`Keymap::lookup`] plus the shift modifier, for a stroke like
+    /// `shift+.` (the cut odometer's stride-ten). The key handler does not
+    /// pass shift yet -- that is the dispatch task's wiring, not this one's --
+    /// so every current caller goes through the two-argument [`Keymap::lookup`]
+    /// above and only ever reaches an unshifted chord.
+    pub fn lookup_shifted(&self, key: &str, ctrl: bool, shift: bool) -> Option<ActionId> {
         self.bindings
             .iter()
-            .find(|b| b.chord.ctrl == ctrl && b.chord.key == key)
+            .find(|b| b.chord.ctrl == ctrl && b.chord.shift == shift && b.chord.key == key)
             .map(|b| b.action)
     }
 
@@ -1308,6 +1386,7 @@ mod tests {
         Chord {
             key: key.to_string(),
             ctrl,
+            shift: false,
         }
     }
 
@@ -1322,7 +1401,22 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 64);
+        assert_eq!(k.entries().len(), 71);
+        // The cut odometer: bare walks one, shift strides ten.
+        assert_eq!(k.lookup(".", false), Some(ActionId::WalkCutNext));
+        assert_eq!(k.lookup(",", false), Some(ActionId::WalkCutPrev));
+        assert_eq!(k.lookup("/", false), Some(ActionId::LoopTrim));
+        assert_eq!(
+            k.lookup_shifted(".", false, true),
+            Some(ActionId::WalkCutNext)
+        );
+        assert_eq!(
+            k.lookup_shifted(",", false, true),
+            Some(ActionId::WalkCutPrev)
+        );
+        // The trim pair, on its designed bare brackets (DESIGN.md §6).
+        assert_eq!(k.lookup("[", false), Some(ActionId::TrimIn));
+        assert_eq!(k.lookup("]", false), Some(ActionId::TrimOut));
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));
@@ -1344,8 +1438,14 @@ mod tests {
         // the sync points a cut has to land on to be copied.
         assert_eq!(k.lookup("[", true), Some(ActionId::PrevSyncPoint));
         assert_eq!(k.lookup("]", true), Some(ActionId::NextSyncPoint));
-        assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
-        assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
+        assert_eq!(
+            k.lookup_shifted("]", false, true),
+            Some(ActionId::SelectNext)
+        );
+        assert_eq!(
+            k.lookup_shifted("[", false, true),
+            Some(ActionId::SelectPrev)
+        );
         assert_eq!(k.lookup("i", false), Some(ActionId::SetIn));
         assert_eq!(k.lookup("o", false), Some(ActionId::SetOut));
         assert_eq!(k.lookup("u", true), Some(ActionId::ClearRange));
@@ -1360,8 +1460,14 @@ mod tests {
         assert_eq!(k.lookup("g", true), Some(ActionId::Group));
         // The keyboard's way onto a clip, and the pair that walks the lane.
         assert_eq!(k.lookup("tab", false), Some(ActionId::Select));
-        assert_eq!(k.lookup("]", false), Some(ActionId::SelectNext));
-        assert_eq!(k.lookup("[", false), Some(ActionId::SelectPrev));
+        assert_eq!(
+            k.lookup_shifted("]", false, true),
+            Some(ActionId::SelectNext)
+        );
+        assert_eq!(
+            k.lookup_shifted("[", false, true),
+            Some(ActionId::SelectPrev)
+        );
         assert_eq!(k.lookup("x", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("delete", false), Some(ActionId::Delete));
         assert_eq!(k.lookup("l", false), Some(ActionId::Lift));
@@ -1569,12 +1675,16 @@ mod tests {
         assert_eq!(k.display(ActionId::Undo), "ctrl+z");
         assert_eq!(k.lookup("z", false), None);
         // The action keeps its place in the display order, and the file keeps
-        // reading in that order too.
-        let order: Vec<_> = k.entries().iter().map(|b| b.action).collect();
-        assert_eq!(order, ActionId::ALL.to_vec());
+        // reading in that order too. Deduped, because WalkCutNext/WalkCutPrev
+        // still carry their own two default chords each (untouched by this
+        // test's rebinds) and so appear twice running.
+        let mut order: Vec<_> = k.entries().iter().map(|b| b.action).collect();
+        order.dedup();
+        assert_eq!(order, ActionId::ALL);
         assert_eq!(emit(&k), emit(&whole(&emit(&k))));
-        // Every action is now single-bound, so the file is one line each.
-        assert_eq!(k.entries().len(), ActionId::ALL.len());
+        // Every action is single-bound except WalkCutNext/WalkCutPrev, still
+        // two chords each -- one line per action, plus those two extras.
+        assert_eq!(k.entries().len(), ActionId::ALL.len() + 2);
     }
 
     #[test]
