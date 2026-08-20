@@ -73,6 +73,7 @@ fn mixed_project() -> Project {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     Project::from_parts(
         vec![
@@ -98,10 +99,12 @@ fn mixed_project() -> Project {
                     color: None,
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
+                    transform: None,
                 }],
             ),
             (LaneKind::Audio, vec![clip(0, 0), clip(60, 1)]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -345,6 +348,7 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     // Two seconds of each at the project's own 30 fps: a still has no length of
     // its own and the song is longer than what is placed.
@@ -354,6 +358,7 @@ fn a_still_and_a_song_export_as_an_mp4_with_sound() {
             (LaneKind::Video, vec![clip(0, 60)]),
             (LaneKind::Audio, vec![clip(1, 60)]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -412,6 +417,7 @@ fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     let four = || {
         Project::from_parts(
@@ -425,7 +431,8 @@ fn a_fader_is_one_tracks_own_and_the_limiter_holds_the_sum() {
             ],
             Vec::new(),
             Vec::new(),
-        )
+        Vec::new(),
+    )
         .expect("one second on four audio tracks")
     };
     let write = |project: Project, name: &str| {
@@ -651,6 +658,7 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                     color: None,
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
+                    transform: None,
                 }],
             ),
             (
@@ -668,9 +676,11 @@ fn the_sound_is_written_at_the_rate_that_was_asked_for() {
                     color: None,
                     fit: FitPolicy::default(),
                     speed: Speed::NORMAL,
+                    transform: None,
                 }],
             ),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -726,6 +736,7 @@ fn a_silent_clip_exports_as_silence_over_its_own_span() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     let project = Project::from_parts(
         vec![
@@ -737,6 +748,7 @@ fn a_silent_clip_exports_as_silence_over_its_own_span() {
             (LaneKind::Video, vec![clip(0, 0), clip(30, 1), clip(60, 0)]),
             (LaneKind::Audio, vec![clip(0, 0), clip(30, 1), clip(60, 0)]),
         ],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -821,8 +833,10 @@ fn a_51_ac3_source_round_trips_through_a_wav() {
                 color: None,
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
+                transform: None,
             }],
         )],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -951,8 +965,10 @@ fn a_mono_timeline_exports_as_dual_mono_ogg() {
                 color: None,
                 fit: FitPolicy::default(),
                 speed: Speed::NORMAL,
+                transform: None,
             }],
         )],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
