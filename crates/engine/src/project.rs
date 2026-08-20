@@ -5330,6 +5330,15 @@ mod tests {
         }
     }
 
+    /// A recognisable placement, `n` telling two of them apart -- [`grade_at`]'s
+    /// twin for the transform table.
+    fn transform_at(n: u32) -> TransformParams {
+        TransformParams {
+            pos_x: f64::from(n) as f32 * 0.05,
+            ..Default::default()
+        }
+    }
+
     /// The `V1`, `A1` lane list a two-lane load hands [`Project::from_parts`].
     fn two(video: Vec<Clip>, audio: Vec<Clip>) -> Vec<(LaneKind, Vec<Clip>)> {
         vec![(LaneKind::Video, video), (LaneKind::Audio, audio)]
@@ -8104,6 +8113,125 @@ mod tests {
         assert_eq!((lanes[0].1[0].eq, lanes[0].1[0].color), (Some(0), Some(0)));
     }
 
+    /// [`a_colour_follows_the_clip_through_split_copy_and_undo`]'s twin: a
+    /// placement is the clip's, through every edit that copies one.
+    #[test]
+    fn a_transform_follows_the_clip_through_split_copy_and_undo() {
+        let mut p = three();
+        assert!(
+            p.transform_of(Lane::V1, 0).is_none(),
+            "a fresh clip is untransformed"
+        );
+        assert!(p.set_transform(Lane::V1, 0, Some(transform_at(2))));
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(2)));
+        assert!(
+            p.transform_of(Lane::A1, 0).is_none(),
+            "one clip, not the lane below"
+        );
+        assert!(
+            p.color_of(Lane::V1, 0).is_none(),
+            "and a placement is not a grade"
+        );
+
+        // Cutting a transformed clip must not transform half of it: both
+        // halves inherit.
+        assert!(p.split(1));
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(2)));
+        assert_eq!(p.transform_of(Lane::V1, 1), Some(&transform_at(2)));
+        assert!(
+            p.transform_of(Lane::V1, 2).is_none(),
+            "the clip after it is untransformed"
+        );
+
+        // A clipboard copy carries it -- onto another lane, at that.
+        let copied = p.lane(Lane::V1)[1];
+        assert!(p.place(Lane::A1, 20, copied));
+        assert_eq!(p.transform_of(Lane::A1, 4), Some(&transform_at(2)));
+        assert!(p.undo());
+        assert_eq!(p.lane(Lane::A1).len(), 4, "the placement came back off");
+
+        // ...and a change to one is one undo step, in both directions.
+        assert!(p.set_transform(Lane::V1, 0, Some(transform_at(5))));
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(5)));
+        assert!(p.undo());
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(2)));
+        assert!(
+            p.set_transform(Lane::V1, 0, None),
+            "and taking it off is an edit"
+        );
+        assert!(p.transform_of(Lane::V1, 0).is_none());
+        assert!(p.undo());
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(2)));
+
+        // Two refusals, neither of which costs an undo step.
+        let nan = TransformParams {
+            scale: f32::NAN,
+            ..transform_at(1)
+        };
+        assert!(
+            !p.set_transform(Lane::V1, 99, Some(transform_at(1))),
+            "no clip there"
+        );
+        assert!(
+            !p.set_transform(Lane::V1, 0, Some(nan)),
+            "not a finite value"
+        );
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(2)));
+        assert!(p.undo());
+        assert_eq!(
+            p.lane(Lane::V1).len(),
+            3,
+            "one step back is before the split"
+        );
+        assert!(p.undo());
+        assert!(
+            p.transform_of(Lane::V1, 0).is_none(),
+            "and the next is before the placement: the refusals pushed none"
+        );
+    }
+
+    /// The transform table is append-only within a session, exactly as the eq
+    /// and colour ones are -- and a save is where an undone placement goes.
+    #[test]
+    fn an_undone_transform_is_pruned_when_the_project_is_saved() {
+        let mut p = three();
+        assert!(p.set_transform(Lane::V1, 0, Some(transform_at(1))));
+        assert!(p.set_transform(Lane::V1, 0, Some(transform_at(2))));
+        assert!(p.undo(), "back to the first placement");
+        assert_eq!(p.transform_of(Lane::V1, 0), Some(&transform_at(1)));
+
+        let (_, lanes, _, _, transform) = p.without_orphan_sources();
+        assert_eq!(
+            transform,
+            vec![transform_at(1)],
+            "what nothing plays is not written"
+        );
+        assert_eq!(
+            lanes[0].1[0].transform,
+            Some(0),
+            "and the survivor renumbers"
+        );
+        assert_eq!(lanes[0].1[1].transform, None);
+
+        // One placement on three clips is one entry: settings that are equal
+        // share.
+        assert!(p.set_transform(Lane::V1, 1, Some(transform_at(1))));
+        assert!(p.set_transform(Lane::A1, 2, Some(transform_at(1))));
+        let (_, lanes, _, _, transform) = p.without_orphan_sources();
+        assert_eq!(transform.len(), 1, "equal placements share their entry");
+        assert_eq!(lanes[1].1[2].transform, Some(0));
+        reloads(&p, "a transform that outlived an undo");
+
+        // A grade and a placement on one clip are two independent tables.
+        assert!(p.set_color(Lane::V1, 0, Some(grade_at(3))));
+        let (_, lanes, _, color, transform) = p.without_orphan_sources();
+        assert_eq!((color.len(), transform.len()), (1, 1));
+        assert_eq!(
+            (lanes[0].1[0].color, lanes[0].1[0].transform),
+            (Some(0), Some(0))
+        );
+    }
+
     /// Not a claim about correctness but about cost: a clip is copied on every
     /// paste, every undo snapshot and every lane clone, so its size is worth
     /// knowing. The eq index fit the padding a `Copy` clip already had; the
@@ -8763,8 +8891,8 @@ mod tests {
     /// handed back to the constructor a load goes through -- every lane of them,
     /// and the reloaded timeline has to be the same lanes in the same order.
     fn reloads(p: &Project, what: &str) {
-        let (sources, lanes, eq, color, _transform) = p.clone().without_orphan_sources();
-        match Project::from_parts(sources, lanes, eq, color, Vec::new()) {
+        let (sources, lanes, eq, color, transform) = p.clone().without_orphan_sources();
+        match Project::from_parts(sources, lanes, eq, color, transform) {
             Err(e) => panic!("{what}: saved but would not load: {e}\n{:?}", p.lanes),
             Ok(back) => {
                 assert_eq!(back.lanes(), p.lanes(), "{what}: the lane list changed");
@@ -8800,6 +8928,22 @@ mod tests {
                         .collect()
                 };
                 assert_eq!(colors(&back), colors(p), "{what}: the colours changed");
+                // ...and the transform table, by the same claim again.
+                let transforms = |p: &Project| -> Vec<Vec<Option<TransformParams>>> {
+                    p.lanes()
+                        .into_iter()
+                        .map(|l| {
+                            (0..p.lane(l).len())
+                                .map(|i| p.transform_of(l, i).copied())
+                                .collect()
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    transforms(&back),
+                    transforms(p),
+                    "{what}: the transforms changed"
+                );
             }
         }
     }
