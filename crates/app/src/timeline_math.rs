@@ -331,6 +331,37 @@ pub(crate) fn trimmed_clip(clip: Clip, edge: Edge, to: u32, still: bool) -> Clip
     }
 }
 
+/// The cut odometer's own arithmetic (DESIGN.md §6): where `,` `.` land from
+/// `idx`, `stride` cuts forward or back among `len` of them. Clamped rather
+/// than wrapping -- an odometer that wraps at the last cut reads as landing
+/// back at the first, which is not "next" -- so a walk already at either end
+/// simply holds there, the way [`Player::step`]'s own ends do.
+pub(crate) fn walk_cut(idx: usize, len: usize, forward: bool, stride: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let delta = stride.min(len - 1) as isize;
+    let at = if forward { idx as isize + delta } else { idx as isize - delta };
+    at.clamp(0, len as isize - 1) as usize
+}
+
+/// The no-aim trim's own arithmetic (DESIGN.md §6): `current` moved `dir`
+/// frames (usually ±1, a held key's ratchet) and clamped into the room
+/// [`engine::PlaybackSession::trim_room`] already answered -- the same wall a
+/// pointer drag is clamped to, so a keyboard trim can never draw an edge the
+/// engine would refuse.
+pub(crate) fn nudge_edge(current: u32, dir: i32, lo: u32, hi: u32) -> u32 {
+    (i64::from(current) + i64::from(dir)).clamp(i64::from(lo), i64::from(hi)) as u32
+}
+
+/// Whether a loop-trim window ([`ActionId::LoopTrim`]) has been played out to
+/// its far edge and wants restarting at its near one: pure so the pump's own
+/// tick ([`Player::pump`]) is one `if` over a fact this decides. `None` --
+/// loop-trim off -- never restarts anything.
+pub(crate) fn should_loop_restart(frame: u32, window: Option<(u32, u32)>) -> bool {
+    window.is_some_and(|(_, hi)| frame >= hi)
+}
+
 /// How many timeline frames a stretch of a subtitle track is worth: the one
 /// conversion between the two clocks a caption has -- microseconds for its
 /// words, frames for where it sits -- and the app-side twin of the engine's own

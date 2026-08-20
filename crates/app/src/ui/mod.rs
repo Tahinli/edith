@@ -4,6 +4,7 @@
 //! which is why a colour or a rule fixed in one place kept surviving in the
 //! next: there was no seam to sweep. The seams are the regions themselves.
 pub mod cards;
+pub mod dock_stance;
 pub mod inspector;
 pub mod library;
 pub mod overlays;
