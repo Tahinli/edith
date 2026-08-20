@@ -2,7 +2,7 @@
 
 use crate::*;
 use crate::ui::widgets::*;
-use crate::ui::stance::below_picture_floor;
+use crate::ui::stance::menu_floor;
 use crate::ui::type_scale::{self, Typeset};
 
 impl Player {
@@ -662,16 +662,16 @@ impl Player {
         // The height the card is *placed* by and the height its list is drawn
         // to are one number: placed by a taller one, the card would hang off the
         // window's floor -- the very thing the clamp is for.
-        let list_h = menu_rows_h(rows.len(), viewport);
         // §5/§11 check 6: the picture is never covered. A right-click high on
         // the window would otherwise hang the menu at the pointer, straight
         // over the screen -- clamped below it into the bench/ledger/dock
         // footprint instead, darkroom only (the legacy tree has no such
-        // fixed split to clamp against).
-        let mut at = menu.at;
-        if self.darkroom {
-            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
-        }
+        // fixed split to clamp against). The list is sized against that same
+        // footprint (`room`), not the whole window, so a menu taller than
+        // the footprint scrolls inside its own plate instead of walking its
+        // clamped top edge back up over the picture ([`menu_floor`]).
+        let (at, room) = menu_floor(menu.at, viewport, self.darkroom);
+        let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source
             .map(|source| source.path.display().to_string())
@@ -832,11 +832,8 @@ impl Player {
             .collect();
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
-        let list_h = menu_rows_h(rows.len(), viewport);
-        let mut at = picker.at;
-        if darkroom {
-            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
-        }
+        let (at, room) = menu_floor(picker.at, viewport, darkroom);
+        let list_h = menu_rows_h(rows.len(), room);
         let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         Some(
             scrim()

@@ -42,6 +42,60 @@ pub(crate) fn below_picture_floor(viewport_h: f32) -> f32 {
     (viewport_h - TIME_BAND_H - BENCH_H - LEDGER_H).max(0.)
 }
 
+/// The floor-clamped placement for every scrolling menu (clip context menu,
+/// picker, library menu): the anchor pulled down to [`below_picture_floor`]
+/// *and* the room its list may fill capped to what is actually left between
+/// that floor and the window's bottom edge -- not the whole viewport. Passing
+/// the untouched viewport to `menu_rows_h` let a menu taller than the
+/// bench/ledger/dock footprint size itself against the full window, and then
+/// `menu_at`'s own bottom-edge clamp (`v.min(room - size)`) pulled the
+/// already-floored top edge back up over the picture to make it fit -- the
+/// menu-occlusion defect this exists to close. Sizing the list against the
+/// room *below the floor* instead means it never needs more than that room,
+/// so `menu_at` never has a reason to walk it back up; a list still taller
+/// than the room scrolls inside its own plate, same as the keys overlay.
+/// Darkroom only -- the legacy tree has no fixed split to clamp against.
+pub(crate) fn menu_floor(
+    at: Point<Pixels>,
+    viewport: Size<Pixels>,
+    darkroom: bool,
+) -> (Point<Pixels>, Size<Pixels>) {
+    if !darkroom {
+        return (at, viewport);
+    }
+    let floor = below_picture_floor(f32::from(viewport.height));
+    let at = point(at.x, px(f32::from(at.y).max(floor)));
+    let room = size(viewport.width, px(f32::from(viewport.height) - floor));
+    (at, room)
+}
+
+#[cfg(test)]
+mod menu_floor_tests {
+    use super::*;
+
+    /// The defect measured live: a 396px-tall menu anchored high in a 720px
+    /// window used to size itself against the full window (720), so
+    /// `menu_at`'s bottom clamp walked its floored top edge back up to
+    /// 720-396=324 -- 10px above the picture's own floor (404 at this
+    /// window height: 720-88-200-28). The room handed to the list sizer must
+    /// now be capped to the footprint (316px here), so the placed top edge
+    /// never leaves the floor.
+    #[test]
+    fn a_menu_taller_than_the_footprint_stays_pinned_to_the_floor_not_walked_back_over_it() {
+        let viewport = size(px(1280.), px(720.));
+        let floor = below_picture_floor(f32::from(viewport.height));
+        let (at, room) = menu_floor(point(px(300.), px(20.)), viewport, true);
+        assert_eq!(f32::from(at.y), floor);
+        // 396px of rows (the charter's measured menu height) does not fit in
+        // the 316px footprint room, so it must be capped to it, not the
+        // window's 720.
+        let list_h = (396f32).min(f32::from(room.height));
+        assert!(list_h <= f32::from(room.height));
+        let (_, y) = crate::oracle::menu_at(at, viewport, list_h);
+        assert_eq!(y, floor, "the top edge must not be walked back above the floor");
+    }
+}
+
 thread_local! {
     // FAULT 3: the picture region's own laid-out box, measured each frame by
     // a [`bounds_probe`] the same shape `timeband_stance`'s contact strip
