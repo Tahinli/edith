@@ -966,10 +966,12 @@ fn a_fade_in_reaches_the_exported_audio() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     let project = Project::from_parts(
         vec![Source::new(src.to_path_buf(), 0)],
         vec![(LaneKind::Audio, vec![clip])],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
@@ -1049,6 +1051,7 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
         color: None,
         fit: FitPolicy::default(),
         speed: Speed::NORMAL,
+        transform: None,
     };
     // The clip split at 1.5 s (45 frames @ 30 fps) into two adjacent halves,
     // exactly what `Project::split` leaves behind.
@@ -1058,6 +1061,7 @@ fn a_split_and_crossfaded_clip_has_no_muted_interior() {
             LaneKind::Audio,
             vec![clip(0, 0, 45), clip(45, 45, 90)],
         )],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     )
