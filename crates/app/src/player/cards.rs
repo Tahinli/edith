@@ -1283,6 +1283,17 @@ impl Player {
         self.subtitle_style_open = false;
     }
 
+    /// The one switch every param card's expand affordance and its `m`
+    /// chord both flip (`dark_card_head`, [`Player::param_card_key`]):
+    /// whichever card is open trades its usual capped, floating size for the
+    /// bench/ledger rows' own room, in place -- layout only, no value on the
+    /// card changes. Persisted like the dock tab pick so a maximized EQ is
+    /// still maximized after the room closes and reopens.
+    pub(crate) fn toggle_maximize(&mut self) {
+        self.card_maximized = !self.card_maximized;
+        ui::dock_stance::save_maximized(self.card_maximized);
+    }
+
     /// Opens the equalizer on the selected clip. Audio only, and it says so
     /// rather than opening a card of bands that would reach nothing: a video
     /// clip carries no sound of its own here (the sound is the audio lane's),
@@ -1459,8 +1470,32 @@ impl Player {
     /// and ate the key, the caller's cue to `cx.notify()` and stop exactly
     /// where each of these branches used to `return` inline.
     pub(crate) fn param_card_key(&mut self, key: &str, shift: bool, cx: &mut Context<Self>) -> bool {
+        // The one chord every param card answers to, wherever the pointer
+        // toggle sits in `dark_card_head` -- mouse and key reach the same
+        // switch (DESIGN's repeated "some options are only reachable via
+        // keyboard shortcut" complaint). Checked once, ahead of the seven
+        // card-local branches below, because it means the same thing in all
+        // of them: none of the seven uses bare "m" for anything else.
+        if key == "m"
+            && (self.eq_open.is_some()
+                || self.color_open.is_some()
+                || self.transform_open.is_some()
+                || self.speed_open.is_some()
+                || self.silence_open.is_some()
+                || self.mix_open
+                || self.subtitle_style_open)
+        {
+            self.toggle_maximize();
+            return true;
+        }
         if self.eq_open.is_some() {
             if key == ESCAPE {
+                // Maximized comes off before the card does -- "esc always
+                // retreats" one step at a time (DESIGN.md:146).
+                if self.card_maximized {
+                    self.toggle_maximize();
+                    return true;
+                }
                 // Nothing to undo: every change is already at the clip, and
                 // undo is undo's own key.
                 self.eq_open = None;
@@ -1516,6 +1551,7 @@ impl Player {
         // menu still lists them.
         if self.color_open.is_some() {
             match color_key(key) {
+                Some(ColorKey::Close) if self.card_maximized => self.toggle_maximize(),
                 Some(ColorKey::Close) => {
                     self.color_open = None;
                     self.color_dragging = false;
@@ -1537,7 +1573,9 @@ impl Player {
         // the keys menu still lists them).
         if self.transform_open.is_some() {
             let n = TRANSFORM_BANDS.len();
-            if key == ESCAPE {
+            if key == ESCAPE && self.card_maximized {
+                self.toggle_maximize();
+            } else if key == ESCAPE {
                 self.transform_open = None;
                 self.transform_dragging = false;
             } else if key == "down" {
@@ -1559,6 +1597,7 @@ impl Player {
         // menu still lists them).
         if self.speed_open.is_some() {
             match color_key(key) {
+                Some(ColorKey::Close) if self.card_maximized => self.toggle_maximize(),
                 Some(ColorKey::Close) => {
                     self.speed_open = None;
                     self.speed_dragging = false;
@@ -1579,7 +1618,9 @@ impl Player {
         // the keys menu (keymap.rs `FIXED`), because a key that cuts forty
         // places at once is not a secret.
         if self.silence_open.is_some() {
-            if key == ESCAPE {
+            if key == ESCAPE && self.card_maximized {
+                self.toggle_maximize();
+            } else if key == ESCAPE {
                 // Nothing to undo: a preview is not an edit.
                 self.close_silence();
             } else if key == "down" {
@@ -1602,7 +1643,9 @@ impl Player {
         // it, held or pressed. Card-local like the four above it.
         if self.mix_open {
             let rows = self.mix_lanes().len() + MIX_MASTER_ROWS;
-            if key == ESCAPE {
+            if key == ESCAPE && self.card_maximized {
+                self.toggle_maximize();
+            } else if key == ESCAPE {
                 self.mix_open = false;
             } else if key == "down" {
                 self.mix_field = (self.mix_field + 1) % rows;
@@ -1625,7 +1668,9 @@ impl Player {
             // Row 0 is the size stepper, row 1 the platform default, and
             // every row after it a family in `subtitle_fonts`.
             let rows = 2 + self.subtitle_fonts.len();
-            if key == ESCAPE {
+            if key == ESCAPE && self.card_maximized {
+                self.toggle_maximize();
+            } else if key == ESCAPE {
                 self.subtitle_style_open = false;
             } else if key == "down" {
                 self.subtitle_style_field = (self.subtitle_style_field + 1) % rows;
