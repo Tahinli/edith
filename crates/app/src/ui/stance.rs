@@ -31,6 +31,17 @@ const LEDGER_H: f32 = 28.;
 /// Right side panel, fixed width, carrying the Src/Clip tab pair.
 const DOCK_W: f32 = 280.;
 
+/// The lowest a menu's top edge may sit and still land inside the
+/// bench/ledger/dock footprint below the screen (DESIGN §5, §9, §11 check 6):
+/// a right-click near the top of the window must not walk the menu up over
+/// the picture just because the pointer is there. `overlays.rs`/`library.rs`
+/// clamp their `menu.at.y` against this before handing it to `menu_at`, only
+/// in the darkroom stance -- the legacy tree has no fixed screen/time-band
+/// split for this to mean anything against, and must not move.
+pub(crate) fn below_picture_floor(viewport_h: f32) -> f32 {
+    (viewport_h - TIME_BAND_H - BENCH_H - LEDGER_H).max(0.)
+}
+
 thread_local! {
     // FAULT 3: the picture region's own laid-out box, measured each frame by
     // a [`bounds_probe`] the same shape `timeband_stance`'s contact strip

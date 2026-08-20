@@ -2,6 +2,8 @@
 
 use crate::*;
 use crate::ui::widgets::*;
+use crate::ui::stance::below_picture_floor;
+use crate::ui::type_scale::{self, Typeset};
 
 impl Player {
     /// The running import holds its own bar above the notice's, for the notice
@@ -478,7 +480,13 @@ impl Player {
         let clip = session.lane_clips(menu.lane).get(menu.idx).copied();
         let source = clip.and_then(|clip| session.sources().get(clip.source).cloned());
         let secs = |frames: u32| timecode(f64::from(frames) / self.fps, self.fps);
-        let row = |n: usize| {
+        // DESIGN §9/§3: a menu row is a plate row, Archivo at the room's
+        // 10.5px row size -- `ink2`, dimmed to `ink3` on the disabled ones
+        // below by the same `.opacity` every row already carried. Gated on
+        // `self.darkroom` so `OLD_GUI=1` keeps its own unstyled rows exactly
+        // as they draw today.
+        let darkroom = self.darkroom;
+        let row = move |n: usize| {
             div()
                 .id(("menu", n))
                 .flex()
@@ -490,6 +498,26 @@ impl Player {
                 .gap(px(12.))
                 .px(px(6.))
                 .rounded(px(3.))
+                .when(darkroom, |d| {
+                    d.type_style(type_scale::label(
+                        type_scale::LABEL_ROW_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
+                    .text_color(rgb(INK2()))
+                })
+        };
+        // The chord/metadata half of a row: mono, `ink3`, DESIGN §3's
+        // 9.5-10px band -- every value that is data about the film rather
+        // than a room verb goes through this rather than the row's ambient
+        // Archivo.
+        let chord_style = |d: Div| -> Div {
+            d.when(darkroom, |d| {
+                d.type_style(type_scale::mono(
+                    type_scale::CHORD_METADATA_MIN_PX,
+                    gpui::FontWeight::MEDIUM,
+                ))
+                .text_color(rgb(INK3()))
+            })
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         if let (true, Some((clip, source))) = (menu.details, clip.zip(source.clone())) {
@@ -520,7 +548,7 @@ impl Player {
                 rows.push(
                     row(rows.len())
                         .child(label)
-                        .child(
+                        .child(chord_style(
                             div()
                                 .min_w(px(0.))
                                 .truncate()
@@ -528,9 +556,9 @@ impl Player {
                                 // pair is 25 characters and has to fit beside
                                 // its label inside `MENU_W`.
                                 .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(value),
+                                .text_color(rgb(FG_SECONDARY())),
                         )
+                        .child(value))
                         .into_any_element(),
                 );
             }
@@ -570,15 +598,18 @@ impl Player {
                             // One truncated line, like the details side: a
                             // reason that wrapped would make the card taller
                             // than the height `menu_at` placed it by.
-                            Some(why) => div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(why),
-                            None => div()
-                                .flex_shrink_0()
-                                .text_color(rgb(FG_SECONDARY()))
+                            Some(why) => chord_style(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY())),
+                            )
+                            .child(why),
+                            // Every command wears its chord (DESIGN §4): mono,
+                            // `ink3`, the same face the spine badges and the
+                            // keys overlay already read theirs in.
+                            None => chord_style(div().flex_shrink_0().text_color(rgb(FG_SECONDARY())))
                                 .child(self.keymap.display(action)),
                         })
                         .when(!enabled, |d| d.opacity(0.4).cursor_not_allowed())
@@ -624,7 +655,7 @@ impl Player {
                     .child("Properties")
                     // No stroke reaches this one, and a blank column would read
                     // as one that was forgotten.
-                    .child(div().text_color(rgb(FG_SECONDARY())).child("…"))
+                    .child(chord_style(div().text_color(rgb(FG_SECONDARY()))).child("…"))
                     .into_any_element()
             }));
         }
@@ -632,7 +663,16 @@ impl Player {
         // to are one number: placed by a taller one, the card would hang off the
         // window's floor -- the very thing the clamp is for.
         let list_h = menu_rows_h(rows.len(), viewport);
-        let (x, y) = menu_at(menu.at, viewport, MENU_PAD * 2. + list_h);
+        // §5/§11 check 6: the picture is never covered. A right-click high on
+        // the window would otherwise hang the menu at the pointer, straight
+        // over the screen -- clamped below it into the bench/ledger/dock
+        // footprint instead, darkroom only (the legacy tree has no such
+        // fixed split to clamp against).
+        let mut at = menu.at;
+        if self.darkroom {
+            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
+        }
+        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         let full: SharedString = source
             .map(|source| source.path.display().to_string())
             .unwrap_or_default()
@@ -716,6 +756,7 @@ impl Player {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let picker = self.picker?;
+        let darkroom = self.darkroom;
         let rows: Vec<AnyElement> = self
             .choices(picker.of)
             .into_iter()
@@ -733,6 +774,13 @@ impl Player {
                     .gap(px(12.))
                     .px(px(6.))
                     .rounded(px(3.))
+                    .when(darkroom, |d| {
+                        d.type_style(type_scale::label(
+                            type_scale::LABEL_ROW_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
+                        .text_color(rgb(INK2()))
+                    })
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(BG_HOVER())))
                     // The mark is a glyph as well as a highlight, like the
@@ -768,6 +816,12 @@ impl Player {
                                 true => FG_PRIMARY(),
                                 false => FG_SECONDARY(),
                             }))
+                            .when(darkroom, |d| {
+                                d.type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                            })
                             .child(detail),
                     )
                     .on_click(
@@ -779,7 +833,11 @@ impl Player {
         // The window's own room, and the list scrolls only where the window has
         // none -- the clip menu's rule, one function for both.
         let list_h = menu_rows_h(rows.len(), viewport);
-        let (x, y) = menu_at(picker.at, viewport, MENU_PAD * 2. + list_h);
+        let mut at = picker.at;
+        if darkroom {
+            at.y = px(f32::from(at.y).max(below_picture_floor(f32::from(viewport.height))));
+        }
+        let (x, y) = menu_at(at, viewport, MENU_PAD * 2. + list_h);
         Some(
             scrim()
                 // Click away closes it, either button, swallowed so nothing
