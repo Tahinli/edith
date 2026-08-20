@@ -1009,6 +1009,7 @@ impl Player {
     /// chord as well ([`cancels_export`]).
     pub(crate) fn export_progress_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let export = self.exporting()?;
+        let dark = self.darkroom;
         let progress = export.progress().clamp(0., 1.);
         let elapsed = self
             .export_started
@@ -1026,15 +1027,23 @@ impl Player {
             [one] => file_name(&one.path),
             [first, rest @ ..] => format!("{} +{} more", file_name(&first.path), rest.len()),
         };
-        let note = |text: SharedString| {
-            div()
+        let note = |text: SharedString| match dark {
+            true => dark_help(text).into_any_element(),
+            false => div()
                 .flex_none()
                 .px(px(6.))
                 .text_size(px(11.))
                 .text_color(rgb(FG_SECONDARY()))
                 .child(text)
+                .into_any_element(),
         };
         let armed = self.cancel_armed;
+        let percent_line: SharedString = format!(
+            "{}% · {} elapsed · {left}",
+            (progress * 100.) as u32,
+            clock(elapsed),
+        )
+        .into();
         Some(
             scrim()
                 .flex()
@@ -1054,8 +1063,10 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(div().flex_none().px(px(6.)).child("Exporting"))
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Exporting", None)))
+                        .when(!dark, |d| d.child(div().flex_none().px(px(6.)).child("Exporting")))
                         // The bar itself: the same number as the percentage
                         // below it, and it only ever moves forward -- the
                         // worker's progress is a monotone `fetch_max`.
@@ -1065,7 +1076,7 @@ impl Player {
                                 .mx(px(6.))
                                 .h(px(6.))
                                 .rounded(px(3.))
-                                .bg(rgb(BG_PANEL()))
+                                .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_PANEL() }))
                                 .child(
                                     div()
                                         .h_full()
@@ -1074,13 +1085,16 @@ impl Player {
                                         .bg(rgb(STATUS_PROGRESS())),
                                 ),
                         )
-                        .child(div().flex_none().px(px(6.)).text_size(px(11.)).child(
-                            SharedString::from(format!(
-                                "{}% · {} elapsed · {left}",
-                                (progress * 100.) as u32,
-                                clock(elapsed),
-                            )),
-                        ))
+                        .when(dark, |d| d.child(dark_row_value(percent_line.clone())))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .child(percent_line.clone()),
+                            )
+                        })
                         // The row that was picked, then the seats the worker
                         // actually opened -- so a fallback to the software
                         // encoder shows here rather than being invisible.
@@ -1118,7 +1132,19 @@ impl Player {
                                 .flex()
                                 .gap(px(6.))
                                 .justify_end()
-                                .when(armed, |d| {
+                                .when(armed && dark, |d| {
+                                    d.child(dark_ghost_button(
+                                        "export-keep",
+                                        "Keep exporting",
+                                        "",
+                                        true,
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.cancel_armed = false;
+                                            cx.notify();
+                                        }),
+                                    ))
+                                })
+                                .when(armed && !dark, |d| {
                                     d.child(control(
                                         "export-keep",
                                         140.,
@@ -1133,27 +1159,44 @@ impl Player {
                                         }),
                                     ))
                                 })
-                                .child(control(
-                                    "export-cancel",
-                                    140.,
-                                    BG_RAISED(),
-                                    None,
-                                    "Cancel export",
-                                    match armed {
-                                        true => "stops the worker and deletes the part file"
-                                            .to_string(),
-                                        false => "asks first -- one press only offers the choice"
-                                            .to_string(),
-                                    },
-                                    true,
-                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        match this.cancel_armed {
-                                            true => this.cancel_export(),
-                                            false => this.cancel_armed = true,
-                                        }
-                                        cx.notify();
-                                    }),
-                                )),
+                                .when(dark, |d| {
+                                    d.child(dark_ghost_button(
+                                        "export-cancel",
+                                        "Cancel export",
+                                        "",
+                                        armed,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            match this.cancel_armed {
+                                                true => this.cancel_export(),
+                                                false => this.cancel_armed = true,
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ))
+                                })
+                                .when(!dark, |d| {
+                                    d.child(control(
+                                        "export-cancel",
+                                        140.,
+                                        BG_RAISED(),
+                                        None,
+                                        "Cancel export",
+                                        match armed {
+                                            true => "stops the worker and deletes the part file"
+                                                .to_string(),
+                                            false => "asks first -- one press only offers the choice"
+                                                .to_string(),
+                                        },
+                                        true,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            match this.cancel_armed {
+                                                true => this.cancel_export(),
+                                                false => this.cancel_armed = true,
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ))
+                                }),
                         ),
                 ),
         )
@@ -1213,6 +1256,7 @@ impl Player {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let (lane, idx) = self.eq_open?;
+        let dark = self.darkroom;
         // The rate the engine filters this timeline at, so the drawn curve is
         // the one those coefficients make -- near the top of the axis a 44.1 kHz
         // clip and a 48 kHz one are not the same shape.
@@ -1247,9 +1291,11 @@ impl Player {
                     .w(px(EQ_HANDLE))
                     .h(px(EQ_HANDLE))
                     .rounded(px(EQ_HANDLE / 2.))
-                    .bg(rgb(match i == self.eq_band {
-                        true => ACCENT_PRIMARY(),
-                        false => FG_SECONDARY(),
+                    .bg(rgb(match (dark, i == self.eq_band) {
+                        (true, true) => INK1(),
+                        (true, false) => INK3(),
+                        (false, true) => ACCENT_PRIMARY(),
+                        (false, false) => FG_SECONDARY(),
                     }))
             })
             .collect();
@@ -1262,7 +1308,7 @@ impl Player {
             .flex_none()
             .h(px(EQ_GRAPH_H))
             .rounded(px(3.))
-            .bg(rgb(BG_HOVER_DIM()))
+            .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER_DIM() }))
             .cursor_pointer()
             // The press picks the band under it *and* is already the first
             // sample of the drag, so a plain click sets a value. A second click
@@ -1297,7 +1343,7 @@ impl Player {
                             .left(relative(eq_x(*freq)))
                             .w(px(1.))
                             .h_full()
-                            .bg(rgb(EQ_GRID()))
+                            .bg(rgb(if dark { DARK_HAIRLINE() } else { EQ_GRID() }))
                     })
                     .collect::<Vec<_>>(),
             )
@@ -1309,14 +1355,22 @@ impl Player {
                     .top(relative(eq_y(db)))
                     .w_full()
                     .h(px(1.))
-                    .bg(rgb(EQ_GRID()))
+                    .bg(rgb(if dark { DARK_HAIRLINE() } else { EQ_GRID() }))
                     .child(
                         div()
                             .absolute()
                             .left(px(4.))
                             .top(px(-11.))
-                            .text_size(px(9.))
-                            .text_color(rgb(FG_SECONDARY()))
+                            .when(dark, |d| {
+                                d.type_style(type_scale::mono(
+                                    type_scale::CHORD_METADATA_MIN_PX,
+                                    gpui::FontWeight::MEDIUM,
+                                ))
+                                .text_color(rgb(INK3()))
+                            })
+                            .when(!dark, |d| {
+                                d.text_size(px(9.)).text_color(rgb(FG_SECONDARY()))
+                            })
                             .child(format!("{db:+.0}")),
                     )
             }))
@@ -1327,7 +1381,7 @@ impl Player {
                     .top(relative(0.5))
                     .w_full()
                     .h(px(1.))
-                    .bg(rgb(BG_HOVER())),
+                    .bg(rgb(if dark { DARK_HAIRLINE() } else { BG_HOVER() })),
             )
             .child(eq_curve(self.eq_params.clone(), sample_rate))
             .children(handles)
@@ -1341,8 +1395,14 @@ impl Player {
                     .bottom(px(1.))
                     .w(px(24.))
                     .text_align(TextAlign::Center)
-                    .text_size(px(9.))
-                    .text_color(rgb(FG_SECONDARY()))
+                    .when(dark, |d| {
+                        d.type_style(type_scale::mono(
+                            type_scale::CHORD_METADATA_MIN_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
+                        .text_color(rgb(INK3()))
+                    })
+                    .when(!dark, |d| d.text_size(px(9.)).text_color(rgb(FG_SECONDARY())))
                     .child(label)
             }))
             .child(
@@ -1350,8 +1410,14 @@ impl Player {
                     .absolute()
                     .top(px(2.))
                     .left(px(4.))
-                    .text_size(px(9.))
-                    .text_color(rgb(FG_SECONDARY()))
+                    .when(dark, |d| {
+                        d.type_style(type_scale::mono(
+                            type_scale::CHORD_METADATA_MIN_PX,
+                            gpui::FontWeight::MEDIUM,
+                        ))
+                        .text_color(rgb(INK3()))
+                    })
+                    .when(!dark, |d| d.text_size(px(9.)).text_color(rgb(FG_SECONDARY())))
                     .child(format!("+{EQ_GAIN_LIMIT:.0} dB")),
             );
         // The bottom of the axis is not named: -12 dB would land in the same
@@ -1404,7 +1470,8 @@ impl Player {
                         .gap(px(2.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
                         .child(
                             div()
                                 .id("eq-card-rows")
@@ -1419,21 +1486,36 @@ impl Player {
                                 .gap(px(2.))
                                 // Which clip, because the card is modal and the lane it
                                 // was opened from is behind a scrim by the time it is up.
-                                .child(div().flex_none().px(px(6.)).child(format!(
-                                    "Equalizer — {} clip {}",
-                                    lane.label(),
-                                    idx + 1
-                                )))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .px(px(6.))
-                                        .text_size(px(11.))
-                                        .text_color(rgb(FG_SECONDARY()))
-                                        .child(self.notices.front().cloned().unwrap_or_else(|| {
-                                            "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
-                                        })),
-                                )
+                                .when(dark, |d| {
+                                    d.child(dark_card_head(
+                                        "Equalizer",
+                                        Some(format!("{} clip {}", lane.label(), idx + 1).into()),
+                                    ))
+                                })
+                                .when(!dark, |d| {
+                                    d.child(div().flex_none().px(px(6.)).child(format!(
+                                        "Equalizer — {} clip {}",
+                                        lane.label(),
+                                        idx + 1
+                                    )))
+                                })
+                                .when(dark, |d| {
+                                    d.child(dark_help(self.notices.front().cloned().unwrap_or_else(|| {
+                                        "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
+                                    })))
+                                })
+                                .when(!dark, |d| {
+                                    d.child(
+                                        div()
+                                            .flex_none()
+                                            .px(px(6.))
+                                            .text_size(px(11.))
+                                            .text_color(rgb(FG_SECONDARY()))
+                                            .child(self.notices.front().cloned().unwrap_or_else(|| {
+                                                "drag a handle, or a digit picks a band — ←→ moves it, ↑↓ its gain, shift+←→ its width; a adds, x removes, f flattens it, r all, s spectrum; a click away or esc closes".into()
+                                            })),
+                                    )
+                                })
                                 .child(graph)
                                 // Which band the keyboard is holding and every number it
                                 // is set to, each with the pair of buttons that moves it:
@@ -1452,98 +1534,163 @@ impl Player {
                                         // by its key alone.
                                         .flex_wrap()
                                         .gap(px(4.))
-                                        .child(
-                                            div()
-                                                .id("eq-reset")
-                                                .flex()
-                                                .flex_1()
-                                                .h(px(CONTROL_H))
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded(px(3.))
-                                                .bg(rgb(BG_SELECTED()))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        .when(dark, |d| {
+                                            d.child(dark_ghost_button(
+                                                "eq-reset",
+                                                "Flatten all",
+                                                "r",
+                                                false,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     for band in &mut this.eq_params.bands {
                                                         band.gain_db = 0.;
                                                     }
                                                     this.commit_eq(cx);
-                                                }))
-                                                .child("Flatten all"),
-                                        )
+                                                }),
+                                            ))
+                                        })
+                                        .when(!dark, |d| {
+                                            d.child(
+                                                div()
+                                                    .id("eq-reset")
+                                                    .flex()
+                                                    .flex_1()
+                                                    .h(px(CONTROL_H))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(BG_SELECTED()))
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        for band in &mut this.eq_params.bands {
+                                                            band.gain_db = 0.;
+                                                        }
+                                                        this.commit_eq(cx);
+                                                    }))
+                                                    .child("Flatten all"),
+                                            )
+                                        })
                                         // The two that change how many bands there are.
                                         // The engine takes any cascade -- the count was
                                         // only ever fixed because this card had no way
                                         // to say otherwise.
-                                        .child(
-                                            div()
-                                                .id("eq-add")
-                                                .flex()
-                                                .flex_1()
-                                                .h(px(CONTROL_H))
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded(px(3.))
-                                                .bg(rgb(BG_PANEL()))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        .when(dark, |d| {
+                                            d.child(dark_ghost_button(
+                                                "eq-add",
+                                                "Add band",
+                                                "a",
+                                                false,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     this.add_band(cx)
-                                                }))
-                                                .child("Add band"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("eq-remove")
-                                                .flex()
-                                                .flex_1()
-                                                .h(px(CONTROL_H))
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded(px(3.))
-                                                .bg(rgb(BG_PANEL()))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                }),
+                                            ))
+                                        })
+                                        .when(!dark, |d| {
+                                            d.child(
+                                                div()
+                                                    .id("eq-add")
+                                                    .flex()
+                                                    .flex_1()
+                                                    .h(px(CONTROL_H))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(BG_PANEL()))
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        this.add_band(cx)
+                                                    }))
+                                                    .child("Add band"),
+                                            )
+                                        })
+                                        .when(dark, |d| {
+                                            d.child(dark_ghost_button(
+                                                "eq-remove",
+                                                "Remove band",
+                                                "x",
+                                                false,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
                                                     this.remove_band(cx)
-                                                }))
-                                                .child("Remove band"),
-                                        )
+                                                }),
+                                            ))
+                                        })
+                                        .when(!dark, |d| {
+                                            d.child(
+                                                div()
+                                                    .id("eq-remove")
+                                                    .flex()
+                                                    .flex_1()
+                                                    .h(px(CONTROL_H))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(BG_PANEL()))
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        this.remove_band(cx)
+                                                    }))
+                                                    .child("Remove band"),
+                                            )
+                                        })
                                         // The analyser's switch, next to the one other
                                         // button the card has: `s` does the same, and a
                                         // toggle only a keystroke can reach is one most
                                         // people never find.
-                                        .child(
-                                            div()
-                                                .id("eq-spectrum")
-                                                .flex()
-                                                .flex_1()
-                                                .h(px(CONTROL_H))
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded(px(3.))
-                                                .bg(rgb(match self.eq_spectrum {
-                                                    true => BG_SELECTED(),
-                                                    false => BG_HOVER_DIM(),
-                                                }))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(BG_HOVER())))
-                                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                    this.eq_spectrum = !this.eq_spectrum;
-                                                    cx.notify();
-                                                }))
-                                                .child(match self.eq_spectrum {
+                                        .when(dark, |d| {
+                                            d.child(dark_ghost_button(
+                                                "eq-spectrum",
+                                                match self.eq_spectrum {
                                                     true => "Spectrum on",
                                                     false => "Spectrum off",
+                                                },
+                                                "s",
+                                                self.eq_spectrum,
+                                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                    this.eq_spectrum = !this.eq_spectrum;
+                                                    cx.notify();
                                                 }),
-                                        ),
+                                            ))
+                                        })
+                                        .when(!dark, |d| {
+                                            d.child(
+                                                div()
+                                                    .id("eq-spectrum")
+                                                    .flex()
+                                                    .flex_1()
+                                                    .h(px(CONTROL_H))
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(match self.eq_spectrum {
+                                                        true => BG_SELECTED(),
+                                                        false => BG_HOVER_DIM(),
+                                                    }))
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                        this.eq_spectrum = !this.eq_spectrum;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(match self.eq_spectrum {
+                                                        true => "Spectrum on",
+                                                        false => "Spectrum off",
+                                                    }),
+                                            )
+                                        }),
                                 ),
                         )
                         // The column's own line, on the card that needs it for
                         // the column's reason: a row nobody knows is under the
                         // fold is a row that is not there.
-                        .when(can_scroll, |d| {
+                        .when(can_scroll && dark, |d| {
+                            d.child(dark_help(match below > 1. {
+                                true => "more below — scroll the card",
+                                false => "the end — scroll up for the rest",
+                            }))
+                        })
+                        .when(can_scroll && !dark, |d| {
                             d.child(
                                 div()
                                     .flex_none()
@@ -1573,6 +1720,7 @@ impl Player {
     /// value a hand on the pointer cannot reach at all, which is the same reason
     /// [`Player::mbps_steppers`] exists.
     pub(crate) fn eq_numbers(&self, picked: Option<&Band>, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = self.darkroom;
         let row = div()
             .flex_none()
             .flex()
@@ -1583,29 +1731,37 @@ impl Player {
             .items_center()
             .gap(px(10.))
             .px(px(6.))
-            .text_size(px(11.));
+            .when(!dark, |d| d.text_size(px(11.)));
         let Some(band) = picked.copied() else {
-            return row.child("no bands — a adds one");
+            return match dark {
+                true => row.child(dark_help("no bands — a adds one")),
+                false => row.child("no bands — a adds one"),
+            };
         };
         let step = |id: &'static str,
                     label: &'static str,
                     change: fn(&mut Band),
                     cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .flex()
-                .w(px(HIT_MIN))
-                .h(px(HIT_MIN))
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .bg(rgb(BG_PANEL()))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER())))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.nudge_band(change, cx)
-                }))
-                .child(label)
+            let on_click = cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.nudge_band(change, cx)
+            });
+            match dark {
+                true => dark_step_glyph(id, label == "+", on_click).into_any_element(),
+                false => div()
+                    .id(id)
+                    .flex()
+                    .w(px(HIT_MIN))
+                    .h(px(HIT_MIN))
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(rgb(BG_PANEL()))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .on_click(on_click)
+                    .child(label)
+                    .into_any_element(),
+            }
         };
         let number = |value: String,
                       ids: (&'static str, &'static str),
@@ -1615,15 +1771,23 @@ impl Player {
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .child(div().child(value))
+                .child(match dark {
+                    true => dark_row_value(value).into_any_element(),
+                    false => div().child(value).into_any_element(),
+                })
                 .child(step(ids.0, "−", by.0, cx))
                 .child(step(ids.1, "+", by.1, cx))
         };
-        row.child(format!(
-            "Band {} of {}",
-            self.eq_band + 1,
-            self.eq_params.bands.len()
-        ))
+        row.child(match dark {
+            true => dark_help(format!(
+                "Band {} of {}",
+                self.eq_band + 1,
+                self.eq_params.bands.len()
+            ))
+            .into_any_element(),
+            false => format!("Band {} of {}", self.eq_band + 1, self.eq_params.bands.len())
+                .into_any_element(),
+        })
         .child(number(
             band_label(&band),
             ("eq-freq-down", "eq-freq-up"),
@@ -2414,6 +2578,8 @@ impl Player {
         if !self.subtitle_style_open {
             return None;
         }
+        let dark = self.darkroom;
+        let size_picked = self.subtitle_style_field == 0;
         let size_row = div()
             .id("subtitle-size-row")
             .flex()
@@ -2423,40 +2589,62 @@ impl Player {
             .justify_between()
             .px(px(6.))
             .rounded(px(3.))
-            .bg(rgb(match self.subtitle_style_field == 0 {
-                true => BG_SELECTED(),
-                false => BG_PANEL(),
-            }))
-            .child(div().text_color(rgb(FG_SECONDARY())).child("Size"))
+            .when(dark && size_picked, |d| d.border_l_2().border_color(rgb(INK1())))
+            .when(!dark, |d| {
+                d.bg(rgb(match size_picked {
+                    true => BG_SELECTED(),
+                    false => BG_PANEL(),
+                }))
+            })
+            .child(
+                div()
+                    .when(dark, |d| d.child(dark_row_label("Size", size_picked)))
+                    .when(!dark, |d| d.text_color(rgb(FG_SECONDARY())).child("Size")),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(4.))
-                    .child(format!("{:.0}px", self.sub_text))
+                    .when(dark, |d| d.child(dark_row_value(format!("{:.0}px", self.sub_text))))
+                    .when(!dark, |d| d.child(format!("{:.0}px", self.sub_text)))
                     .children([-1, 1].map(|steps: i32| {
-                        div()
-                            .id(("subtitle-size-step", usize::from(steps > 0)))
-                            .flex_none()
-                            .w(px(HIT_MIN))
-                            .h(px(KEYS_ROW_H))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.))
-                            .bg(rgb(BG_PANEL()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(BG_HOVER())))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.subtitle_style_field = 0;
-                                this.nudge_sub_size(steps, cx);
-                            }))
-                            .child(match steps > 0 {
-                                true => "+",
-                                false => "−",
-                            })
+                        let id = ("subtitle-size-step", usize::from(steps > 0));
+                        match dark {
+                            true => dark_step_glyph(
+                                id,
+                                steps > 0,
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.subtitle_style_field = 0;
+                                    this.nudge_sub_size(steps, cx);
+                                }),
+                            )
+                            .into_any_element(),
+                            false => div()
+                                .id(id)
+                                .flex_none()
+                                .w(px(HIT_MIN))
+                                .h(px(KEYS_ROW_H))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(rgb(BG_PANEL()))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.subtitle_style_field = 0;
+                                    this.nudge_sub_size(steps, cx);
+                                }))
+                                .child(match steps > 0 {
+                                    true => "+",
+                                    false => "−",
+                                })
+                                .into_any_element(),
+                        }
                     })),
             );
+        let default_picked = self.subtitle_style_field == 1;
         let default_row = div()
             .id("subtitle-family-row-default")
             .flex()
@@ -2465,17 +2653,23 @@ impl Player {
             .items_center()
             .px(px(6.))
             .rounded(px(3.))
-            .bg(rgb(match self.subtitle_style_field == 1 {
-                true => BG_SELECTED(),
-                false => BG_PANEL(),
-            }))
+            .when(dark && default_picked, |d| d.border_l_2().border_color(rgb(INK1())))
+            .when(!dark, |d| {
+                d.bg(rgb(match default_picked {
+                    true => BG_SELECTED(),
+                    false => BG_PANEL(),
+                }))
+            })
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(BG_HOVER())))
+            .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.set_sub_family(None, cx);
             }))
-            .child("System default");
+            .when(dark, |d| d.child(dark_row_label("System default", default_picked)))
+            .when(!dark, |d| d.child("System default"));
         let family_rows = self.subtitle_fonts.iter().enumerate().map(|(n, name)| {
+            let picked = self.subtitle_style_field == n + 2
+                || self.sub_family.as_deref() == Some(name.as_str());
             div()
                 .id(("subtitle-family-row", n))
                 .flex()
@@ -2484,22 +2678,25 @@ impl Player {
                 .items_center()
                 .px(px(6.))
                 .rounded(px(3.))
-                .bg(rgb(
-                    match (self.subtitle_style_field == n + 2, self.sub_family.as_deref() == Some(name.as_str())) {
-                        (true, _) | (false, true) => BG_SELECTED(),
-                        _ => BG_PANEL(),
-                    },
-                ))
+                .when(dark && picked, |d| d.border_l_2().border_color(rgb(INK1())))
+                .when(!dark, |d| {
+                    d.bg(rgb(match picked {
+                        true => BG_SELECTED(),
+                        false => BG_PANEL(),
+                    }))
+                })
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER())))
+                .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                 .on_click(cx.listener({
                     let name = name.clone();
                     move |this, _: &ClickEvent, _, cx| {
                         this.set_sub_family(Some(name.clone()), cx);
                     }
                 }))
-                .child(name.clone())
+                .when(dark, |d| d.child(dark_row_label(name.clone(), picked)))
+                .when(!dark, |d| d.child(name.clone()))
         });
+        let help_text = "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes";
         Some(
             scrim()
                 .flex()
@@ -2525,23 +2722,28 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .child("Subtitle style — font and size of the cue plate"),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Subtitle style", None)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .child("Subtitle style — font and size of the cue plate"),
+                            )
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         .child(size_row)
                         .child(
                             div()
@@ -2566,6 +2768,7 @@ impl Player {
     /// than over the lanes.
     pub(crate) fn silence_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
+        let dark = self.darkroom;
         let cfg = self.silence;
         // The unit is a label, never a conversion: the threshold is a level
         // below full scale whichever of the two the row says (`silence_dbfs`).
@@ -2617,6 +2820,7 @@ impl Player {
             .into_iter()
             .enumerate()
             .map(|(n, (label, value))| {
+                let picked = n == self.silence_field;
                 div()
                     .id(("silence-row", n))
                     .flex()
@@ -2625,17 +2829,24 @@ impl Player {
                     .justify_between()
                     .px(px(6.))
                     .rounded(px(3.))
-                    .bg(rgb(match n == self.silence_field {
-                        true => BG_SELECTED(),
-                        false => BG_PANEL(),
-                    }))
+                    .when(dark && picked, |d| d.border_l_2().border_color(rgb(INK1())))
+                    .when(!dark, |d| {
+                        d.bg(rgb(match picked {
+                            true => BG_SELECTED(),
+                            false => BG_PANEL(),
+                        }))
+                    })
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .hover(|s| s.bg(rgb(if dark { DARK_RAISED() } else { BG_HOVER() })))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.silence_field = n;
                         cx.notify();
                     }))
-                    .child(div().text_color(rgb(FG_SECONDARY())).child(label))
+                    .child(
+                        div()
+                            .when(dark, |d| d.child(dark_row_label(label, picked)))
+                            .when(!dark, |d| d.text_color(rgb(FG_SECONDARY())).child(label)),
+                    )
                     // The value and the two steps that move it. Every other
                     // card has something to drag or press; this one had the
                     // arrow keys and nothing else, so a row was a setting a
@@ -2647,32 +2858,47 @@ impl Player {
                             .flex()
                             .items_center()
                             .gap(px(4.))
-                            .child(value)
+                            .when(dark, |d| d.child(dark_row_value(value.clone())))
+                            .when(!dark, |d| d.child(value))
                             .children([-1, 1].map(|steps: i32| {
-                                div()
-                                    .id(("silence-step", n * 2 + usize::from(steps > 0)))
-                                    .flex_none()
-                                    .w(px(HIT_MIN))
-                                    .h(px(KEYS_ROW_H))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(3.))
-                                    .bg(rgb(BG_PANEL()))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(BG_HOVER())))
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        // Picked as well as moved: the row a
-                                        // press lands on is the row the arrows
-                                        // carry on from.
-                                        this.silence_field = n;
-                                        this.nudge_silence(steps);
-                                        cx.notify();
-                                    }))
-                                    .child(match steps > 0 {
-                                        true => "+",
-                                        false => "−",
-                                    })
+                                let id = ("silence-step", n * 2 + usize::from(steps > 0));
+                                match dark {
+                                    true => dark_step_glyph(
+                                        id,
+                                        steps > 0,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.silence_field = n;
+                                            this.nudge_silence(steps);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .into_any_element(),
+                                    false => div()
+                                        .id(id)
+                                        .flex_none()
+                                        .w(px(HIT_MIN))
+                                        .h(px(KEYS_ROW_H))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.))
+                                        .bg(rgb(BG_PANEL()))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(BG_HOVER())))
+                                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            // Picked as well as moved: the row a
+                                            // press lands on is the row the arrows
+                                            // carry on from.
+                                            this.silence_field = n;
+                                            this.nudge_silence(steps);
+                                            cx.notify();
+                                        }))
+                                        .child(match steps > 0 {
+                                            true => "+",
+                                            false => "−",
+                                        })
+                                        .into_any_element(),
+                                }
                             })),
                     )
             })
@@ -2680,23 +2906,37 @@ impl Player {
         // The two buttons the ask names, side by side: a mode toggle would hide
         // one of them behind the other, and there are only two.
         let button = |n: usize, text: String, act: fn(&mut Self, &mut Context<Self>)| {
-            div()
-                .id(("silence-apply", n))
-                .flex_1()
-                .flex()
-                .min_h(px(KEYS_ROW_H))
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .bg(rgb(match found {
-                    0 => BG_PANEL(),
-                    _ => BG_SELECTED(),
-                }))
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER())))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| act(this, cx)))
-                .child(text)
+            let enabled = found != 0;
+            match dark {
+                true => dark_ghost_button(
+                    ("silence-apply", n),
+                    text,
+                    "",
+                    enabled,
+                    cx.listener(move |this, _: &ClickEvent, _, cx| act(this, cx)),
+                )
+                .into_any_element(),
+                false => div()
+                    .id(("silence-apply", n))
+                    .flex_1()
+                    .flex()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .bg(rgb(match found {
+                        0 => BG_PANEL(),
+                        _ => BG_SELECTED(),
+                    }))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| act(this, cx)))
+                    .child(text)
+                    .into_any_element(),
+            }
         };
+        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
+        let help_text = "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes";
         Some(
             scrim()
                 .flex()
@@ -2726,33 +2966,41 @@ impl Player {
                         .gap(px(6.))
                         .p(px(12.))
                         .rounded(px(6.))
-                        .bg(rgb(BG_RAISED()))
-                        .child(div().flex_none().px(px(6.)).child(format!(
-                            "Silences — {} clip {}",
-                            lane.label(),
-                            idx + 1
-                        )))
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_size(px(11.))
-                                .text_color(rgb(FG_SECONDARY()))
-                                .child(
-                                    "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes",
-                                ),
-                        )
+                        .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
+                        .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
+                        .when(dark, |d| d.child(dark_card_head("Silences", Some(head_meta.clone()))))
+                        .when(!dark, |d| {
+                            d.child(div().flex_none().px(px(6.)).child(format!(
+                                "Silences — {} clip {}",
+                                lane.label(),
+                                idx + 1
+                            )))
+                        })
+                        .when(dark, |d| d.child(dark_help(help_text)))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(FG_SECONDARY()))
+                                    .child(help_text),
+                            )
+                        })
                         .children(rows)
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(px(6.))
-                                .text_color(rgb(match (&self.silence_scan, found) {
-                                    (None, 1..) => ACCENT_PRIMARY(),
-                                    _ => FG_SECONDARY(),
-                                }))
-                                .child(status),
-                        )
+                        .when(dark, |d| d.child(dark_help(status.clone())))
+                        .when(!dark, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.))
+                                    .text_color(rgb(match (&self.silence_scan, found) {
+                                        (None, 1..) => ACCENT_PRIMARY(),
+                                        _ => FG_SECONDARY(),
+                                    }))
+                                    .child(status),
+                            )
+                        })
                         .child(div().flex().gap(px(4.)).children([
                             button(0, "Cut them out (enter)".into(), Self::cut_silences),
                             button(
