@@ -180,7 +180,7 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
         .flex()
         .flex_col()
         .gap(px(2.))
-        .child(section_head("EDITOR · kept in ~/.config/edith"))
+        .child(section_head("EDITOR · this machine, this window"))
         .child(row(
             "settings-proxies",
             "Proxies",
@@ -188,7 +188,7 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
                 true => format!("On{}", player.proxy_tail()),
                 false => "Off".to_string(),
             },
-            "cuts on small stand-ins of the big films; the sound and every export stay the film's own",
+            "cuts on small stand-ins of the big films; the sound and every export stay the film's own -- default kept in ~/.config/edith, the pick for an open project in its own .edith",
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_proxies(cx)),
         ))
@@ -196,7 +196,7 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
             "settings-auto-proxies",
             "Auto proxies",
             if player.auto_proxies_on { "On" } else { "Off" },
-            "makes a stand-in for every big film as it is imported",
+            "makes a stand-in for every big film as it is imported -- default kept in ~/.config/edith, the pick for an open project in its own .edith",
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_auto_proxies(cx)),
         ))
@@ -204,7 +204,7 @@ fn editor_section(player: &Player, cx: &mut Context<Player>) -> impl IntoElement
             "settings-subtitle-style",
             "Subtitle font",
             "Font…",
-            "the cue plate's own font and size",
+            "the cue plate's own font and size -- kept in ~/.config/edith, never in a project",
             player,
             cx.listener(|this, _: &ClickEvent, _, cx| this.open_subtitle_style(cx)),
         ))

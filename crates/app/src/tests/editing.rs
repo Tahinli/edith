@@ -899,12 +899,15 @@ fn the_clip_menu_dims_what_the_playhead_is_not_on_and_stays_in_the_window() {
         // word to the user's own config file, which is why it is one of the
         // actions besides the cancel that stay live here. Fullscreen is the
         // same kind of thing: the platform's own window toggle, touching no
-        // edit list either.
+        // edit list either. Settings is NOT among them, on purpose: it opens
+        // the same modal slot the exporting card is already standing in
+        // (`Player::open_settings`), so a permission granted here would be
+        // one nobody could ever act on -- driven and confirmed: both the `,`
+        // chord and the spine glyph leave the exporting card on screen.
         let allowed = action == ActionId::CancelExport
             || action == ActionId::Theme
             || action == ActionId::Fullscreen
-            || action == ActionId::SubtitleStyle
-            || action == ActionId::Settings;
+            || action == ActionId::SubtitleStyle;
         assert_eq!(
             whole(action, busy).yes(),
             allowed,

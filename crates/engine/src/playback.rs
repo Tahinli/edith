@@ -4514,3 +4514,4 @@ mod tests {
         assert_eq!(next.index, first.index, "paused: same timeline position before and after");
     }
 }
+
