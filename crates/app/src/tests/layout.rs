@@ -1889,3 +1889,36 @@ fn the_darkroom_path_never_lets_a_notice_surface_reach_the_picture() {
          the darkroom stance would paint it over the picture again"
     );
 }
+
+/// DESIGN §5/§11 check 6, the fourth occlusion defect (notice bar, export
+/// card, preview badge, now menus): every floating menu that can open above
+/// the picture -- the clip context menu, the picker, the library menu -- must
+/// size its scrolling list against `stance::menu_floor`'s room, not the raw
+/// window. Sizing against the whole viewport is exactly the bug that shipped:
+/// a menu taller than the bench/ledger/dock footprint got clamped by
+/// `menu_at`'s own bottom-edge fit back up over the picture, because nothing
+/// had told the list it only had the footprint to grow into. This pins the
+/// general rule so the next surface someone floats -- a fourth menu, a fifth
+/// occlusion -- cannot silently reintroduce `menu_rows_h(rows.len(),
+/// viewport)` in its place.
+#[test]
+fn every_darkroom_menu_sizes_its_list_against_the_floor_room_not_the_raw_viewport() {
+    for file in ["ui/overlays.rs", "ui/library.rs"] {
+        let text = src_text(file);
+        assert!(
+            !text.contains("menu_rows_h(rows.len(), viewport)"),
+            "{file} sizes a menu's list against the raw viewport again -- \
+             route it through stance::menu_floor's room instead, or a tall \
+             menu will climb back over the picture"
+        );
+        let floors = text.matches("menu_floor(").count();
+        let sizings = text.matches("menu_rows_h(rows.len(),").count();
+        assert_eq!(
+            floors, sizings,
+            "{file} has a menu list-sizing call not paired with a menu_floor \
+             call -- every darkroom menu must clamp both its anchor and its \
+             list room together"
+        );
+        assert!(sizings > 0, "{file} no longer opens any menu -- update this guard");
+    }
+}
