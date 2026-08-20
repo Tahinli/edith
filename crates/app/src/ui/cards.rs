@@ -59,13 +59,19 @@ fn dark_row_value(text: impl Into<SharedString>) -> Div {
 /// only reachable via keyboard shortcut" complaint). A double-click anywhere
 /// on the head does the same thing the glyph's click and the `m` chord do
 /// ([`Player::toggle_maximize`]) -- mouse and key reach the same switch.
+// `+ use<>` (edition 2024 precise capturing): without it, the elided
+// lifetime on `cx` would be captured into the returned opaque type by
+// default, so a hoisted `let head = dark.then(|| dark_card_head(..., cx));`
+// would keep `cx` borrowed until `head` is finally consumed -- fighting
+// every other `cx.listener(...)` call built in between, which is exactly
+// the E0500/E0501 chain this card's own hoist is here to avoid.
 fn dark_card_head(
     verb: &str,
     meta: Option<SharedString>,
     help: Option<SharedString>,
     maximize: Option<bool>,
     cx: &mut Context<Player>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     div()
         .id("card-head")
         .flex_none()
@@ -1511,7 +1517,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2016,7 +2022,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2199,7 +2205,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2338,7 +2344,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2572,7 +2578,7 @@ impl Player {
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2653,6 +2659,8 @@ impl Player {
             return None;
         }
         let dark = self.darkroom;
+        let help_text = "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes";
+        let head = dark.then(|| dark_card_head("Subtitle style", None, Some(help_text.into()), Some(self.card_maximized), cx));
         let size_picked = self.subtitle_style_field == 0;
         let size_row = div()
             .id("subtitle-size-row")
@@ -2770,14 +2778,13 @@ impl Player {
                 .when(dark, |d| d.child(dark_row_label(name.clone(), picked)))
                 .when(!dark, |d| d.child(name.clone()))
         });
-        let help_text = "− and + move the size, or ↑↓ picks a row and ←→ moves it (held or pressed); a family row picks it outright — a click away or esc closes";
         Some(
             scrim()
                 .flex()
                 .justify_center()
                 .items_center()
                 .bg(rgba(SCRIM()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -2799,9 +2806,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| {
-                            d.child(dark_card_head("Subtitle style", None, Some(help_text.into()), Some(self.card_maximized), cx))
-                        })
+                        .when(dark, move |d| d.child(head.unwrap()))
                         .when(!dark, |d| {
                             d.child(
                                 div()
@@ -2845,6 +2850,9 @@ impl Player {
     pub(crate) fn silence_card(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (lane, idx) = self.silence_open?;
         let dark = self.darkroom;
+        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
+        let help_text = "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes";
+        let head = dark.then(|| dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx));
         let cfg = self.silence;
         // The unit is a label, never a conversion: the threshold is a level
         // below full scale whichever of the two the row says (`silence_dbfs`).
@@ -3011,8 +3019,6 @@ impl Player {
                     .into_any_element(),
             }
         };
-        let head_meta: SharedString = format!("{} clip {}", lane.label(), idx + 1).into();
-        let help_text = "− and + move a setting, or ↑↓ picks one and ←→ moves it (hold to run it) — the marks on the lane are what would go; a click away or esc closes";
         Some(
             scrim()
                 .flex()
@@ -3022,7 +3028,7 @@ impl Player {
                 // Light enough to read the lanes and the marks on them through:
                 // the preview is the point of this card.
                 .bg(rgba(SCRIM_LIGHT()))
-                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height)))))
+                .when(self.card_maximized, |d| d.top(px(crate::ui::stance::below_picture_floor(f32::from(viewport.height), self.split_px(Split::Bench, viewport)))))
                 // Click away closes it, as on every card here -- and the marks
                 // go with it, which is what makes this one a call and not a flag.
                 .on_mouse_down(
@@ -3045,9 +3051,7 @@ impl Player {
                         .rounded(px(6.))
                         .bg(rgb(if dark { DARK_PANEL() } else { BG_RAISED() }))
                         .when(dark, |d| d.border_1().border_color(rgba(DARK_SEAM())))
-                        .when(dark, |d| {
-                            d.child(dark_card_head("Silences", Some(head_meta.clone()), Some(help_text.into()), Some(self.card_maximized), cx))
-                        })
+                        .when(dark, move |d| d.child(head.unwrap()))
                         .when(!dark, |d| {
                             d.child(div().flex_none().px(px(6.)).child(format!(
                                 "Silences — {} clip {}",
