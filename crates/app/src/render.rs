@@ -17,8 +17,10 @@ impl Player {
     /// The picture region alone: the image, the subtitle cue plate, the
     /// preview badge and the three transient bars over its bottom edge.
     /// Its own method so player fullscreen ([`Player::act`]) can stand it up
-    /// as the window's only child without a second copy of what it draws.
-    fn picture_area(
+    /// as the window's only child without a second copy of what it draws --
+    /// and so the darkroom's own screen region (DESIGN.md §5,
+    /// `ui::stance::screen`) draws the same picture rather than a second one.
+    pub(crate) fn picture_area(
         &mut self,
         position: f64,
         window: &mut Window,
