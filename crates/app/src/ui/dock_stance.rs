@@ -1,6 +1,15 @@
 //! The dock's own content: the Sources/Clip tab pair and what each shows
 //! (DESIGN.md §5, §12 step 4). `stance.rs::dock()` owns the panel's frame
 //! (width, surfaces, border); this module owns what fills it.
+//!
+//! The Sources tab used to be `Player::library` verbatim -- the legacy
+//! panel's pill tabs, Media/Audio/Text row, filled Import button and amber
+//! accent, wearing the darkroom surfaces only because its tokens happened to
+//! alias into them. The user named that: "this place is not fitting design
+//! language. it's same as our original." This module now builds the tab
+//! fresh, off MOCK-SPEC.md's "Dock" section -- `library.rs`/`library_meta.rs`
+//! still supply the row facts ([`library_rows`], [`source_tint`],
+//! [`clip_middle`]...), only the anatomy around them is new.
 
 use crate::*;
 
@@ -31,6 +40,30 @@ fn save(src_active: bool) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(path, if src_active { "Src\n" } else { "Clip\n" });
+}
+
+/// The Sources tab's four sort chips (MOCK-SPEC "Dock" §3). `Recent` is the
+/// library's own arrival order -- the only order this editor tracks without
+/// a fourth field to keep it in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum DockSort {
+    #[default]
+    Recent,
+    Name,
+    Usage,
+    Unused,
+}
+
+impl DockSort {
+    const ALL: [DockSort; 4] = [DockSort::Recent, DockSort::Name, DockSort::Usage, DockSort::Unused];
+    fn label(self) -> &'static str {
+        match self {
+            DockSort::Recent => "Recent",
+            DockSort::Name => "Name",
+            DockSort::Usage => "Usage",
+            DockSort::Unused => "Unused",
+        }
+    }
 }
 
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
@@ -83,39 +116,378 @@ fn ghost_verb(
         )
 }
 
-/// One tab glyph of the Src/Clip pair: a plate (2px radius per §4), `ink1` +
-/// `raised` fill when it is the showing tab, `ink2` at rest.
-fn dock_tab(id: &'static str, label: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
+/// A row in the IMPORT section: a ghost verb that has no [`ActionId`] of its
+/// own to read a chord off. `Add files`/`Paste path` have no keymap binding
+/// -- nearly every ctrl+letter in this editor's table is already spoken for
+/// (`git grep '", true)'` in `keymap.rs` turns up every letter but a handful),
+/// and giving either one a fresh global chord is a keymap-wide decision --
+/// which strokes move, which don't -- outside one dock diff. The verb still
+/// works by click; the chord badge is honest about there being none rather
+/// than inventing one MOCK-SPEC's `^o`/`^v` never actually bind to.
+///
+/// corner-cut: no chord. Ceiling: a keymap diff that clears two ctrl slots
+/// (or two bare ones -- neither Import nor "paste a path" has ever had a key
+/// in this editor) and threads `ActionId`s for both through `oracle::enable`
+/// and `Player::act`, at which point this calls [`ghost_verb`] instead.
+fn import_verb(
+    id: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    on: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .h(px(CONTROL_H))
+        .px(px(8.))
+        .rounded(px(3.))
+        .text_color(rgb(INK2()))
+        .tooltip(move |_, cx| cx.new(|_| Tip(hint.into())).into())
+        .when(!on, |d| d.opacity(0.4).cursor_not_allowed())
+        .when(on, |d| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                .on_click(on_click)
+        })
+        .child(label)
+        .child(div().flex_none().text_size(px(9.5)).text_color(rgb(INK3())).child("—"))
+}
+
+/// One tab of the Src/Clip pair (MOCK-SPEC "Dock": no pill, no fill, no
+/// rounded button -- a 1px `ink1` top rule and `ink1` text mark the showing
+/// tab; the resting one is `ink3`). `chord` is decorative, not bound: tab
+/// switching has no gesture named in the charter's four, so it is drawn but
+/// not wired to a global key, exactly `import_verb`'s reasoning above.
+fn dock_tab(id: &'static str, label: &'static str, chord: &'static str, active: bool, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id(id)
         .flex_1()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(2.))
-        .py(px(6.))
+        .gap(px(4.))
+        .pt(px(6.))
+        .pb(px(6.))
+        .when(active, |d| d.border_t_1().border_color(rgb(INK1())))
         .text_size(px(10.5))
-        .text_color(rgb(if active { INK1() } else { INK2() }))
-        .when(active, |d| d.bg(rgb(DARK_RAISED())))
+        .text_color(rgb(if active { INK1() } else { INK3() }))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(DARK_RAISED())))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.dock_src_active = label == "Src";
+            this.dock_src_active = label == "SOURCES";
             save(this.dock_src_active);
             cx.notify();
         }))
-        .child(label)
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(rgb(if active { INK1() } else { INK3() }))
+                .child(label),
+        )
+        .child(div().text_color(rgb(INK3())).child(chord))
 }
 
-/// The Sources tab: [`Player::library`] verbatim -- filter tabs, usage
-/// (proxy/preview) chips, Import, drag, Add at playhead -- restyled for free,
-/// because its rows already paint through the theme tokens `library.rs`
-/// shares with this stance (`BG_PANEL` etc. alias to the Darkroom substrate
-/// under `PaletteId::Darkroom`). No ink/re-inking control lives in it (DESIGN
-/// §2's demotion rule): `library.rs` never put one on a row to begin with, so
-/// there is nothing here to strip.
-fn sources_tab(player: &Player, width: f32, cx: &mut Context<Player>) -> impl IntoElement {
-    player.library(width, cx)
+/// A 9px uppercase Archivo section head, `ink3` (DESIGN §3).
+fn section_head(text: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .text_size(px(9.))
+        .text_color(rgb(INK3()))
+        .child(text.into())
+}
+
+/// Every lane a source plays on right now, as its own `V1`/`A1` labels
+/// (MOCK-SPEC "Dock" §4's usage line), plus how many clips altogether --
+/// [`Player::row_ctx`]'s `placed` count, the same number the library card's
+/// Remove refusal reads.
+fn usage_line(player: &Player, source_idx: usize, placed: usize) -> String {
+    if placed == 0 {
+        return "unused".to_string();
+    }
+    let lanes: Vec<String> = player.session.as_ref().map_or_else(Vec::new, |session| {
+        session
+            .lanes()
+            .into_iter()
+            .filter(|lane| session.lane_clips(*lane).iter().any(|c| c.source == source_idx))
+            .map(Lane::label)
+            .collect()
+    });
+    format!("{} · {placed} use{}", lanes.join(" "), if placed == 1 { "" } else { "s" })
+}
+
+/// One source row, two lines (MOCK-SPEC "Dock" §4): an ink dot, the name in
+/// mono `ink1` -- readable, complete, ellipsized at the end rather than
+/// clipped mid-glyph or faded -- and right-aligned usage; under it, the
+/// codec/length/decoder line in mono `ink3`. Drag (gesture 1), `↵` (gesture
+/// 2, wired in `render.rs`'s key handler since a row takes no keyboard focus
+/// of its own), double-click (gesture 3) and right-click the dot (gesture 4)
+/// all live here.
+fn source_row(player: &Player, i: usize, row: &Row, placed: usize, picked: bool, cx: &mut Context<Player>) -> impl IntoElement {
+    let usable = row.unusable.is_none();
+    let name: SharedString = row.name.clone().into();
+    let under: String = match &row.unusable {
+        Some(why) => why.clone(),
+        None => join_detail(&row.detail, &timecode(f64::from(row.frames) / player.fps, player.fps)),
+    };
+    let usage = usage_line(player, row.tint, placed);
+    let (path, stream) = (row.path.clone(), row.stream);
+    let dragged = (path.clone(), stream);
+    let dot_path = path.clone();
+    let ghost = name.clone();
+    div()
+        .id(("dock-source", i))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(3.))
+        .when(!usable, |d| d.opacity(0.5))
+        .when(picked, |d| d.bg(rgb(DARK_RAISED())))
+        .when(usable, |d| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(DARK_RAISED())))
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    this.selected_asset = Some((path.clone(), stream));
+                    // Gesture 3: a second click in the same spot plays the
+                    // source in the screen, the way `library.rs`'s preview
+                    // triangle already does -- `open_preview` is the one
+                    // door either takes.
+                    if event.click_count() >= 2 {
+                        this.open_preview(&path, stream, cx);
+                    }
+                    cx.notify();
+                }))
+                // Gesture 1: the row is a drag source exactly as
+                // `library.rs`'s row is -- same payload, same ghost tip --
+                // and the bench's `AssetDrag` drop target already accepts it
+                // (`ui/bench_stance.rs`'s bed). The bug the user hit ("can't
+                // drag media in timeline") was the dock showing the *legacy*
+                // panel, which the darkroom bench was never wired against;
+                // this row is the darkroom's own half of that pairing.
+                .on_drag(AssetDrag(dragged.0, dragged.1), move |_, _, _, cx| {
+                    cx.new(|_| Tip(ghost.clone()))
+                })
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .id(("dock-source-dot", i))
+                        .flex_none()
+                        .w(px(8.))
+                        .h(px(8.))
+                        .rounded(px(4.))
+                        .bg(rgb(source_tint(row.tint)))
+                        .when(usable, |d| {
+                            d.on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    // Gesture 4, and DESIGN §2's demotion rule at
+                                    // once: re-inking lives nowhere but here.
+                                    // The library's own right-click menu is the
+                                    // affordance this opens -- DESIGN §12 step 5
+                                    // allows a stub where extraction-by-hue isn't
+                                    // built yet, as long as the menu appears; it
+                                    // does, over the same file this dot names.
+                                    cx.stop_propagation();
+                                    this.selected_asset = Some((dot_path.clone(), stream));
+                                    this.library_menu = Some(LibraryMenu {
+                                        path: dot_path.clone(),
+                                        stream,
+                                        at: event.position,
+                                        details: false,
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(10.5))
+                        .text_color(rgb(INK1()))
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.5))
+                        .text_color(rgb(INK3()))
+                        .child(usage),
+                ),
+        )
+        .child(
+            div()
+                .pl(px(14.))
+                .truncate()
+                .text_size(px(9.5))
+                .text_color(rgb(INK3()))
+                .child(under),
+        )
+}
+
+/// The Sources tab, built off MOCK-SPEC.md's "Dock" section: count line,
+/// filter, sort chips, rows, IMPORT, hint -- none of it the legacy
+/// Media/Audio/Text panel `library.rs` draws. That panel's row facts
+/// ([`library_rows`]) are still what every row here is built from.
+fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
+    let sources = player.session.as_ref().map_or(&[][..], PlaybackSession::sources);
+    let meta = player.session.as_ref().map(PlaybackSession::meta);
+    let all_rows: Vec<Row> = library_rows(sources, &player.streams, &player.decoders, player.timeline_audio(), |path| {
+        player.session.as_ref().map_or(0, |session| session.file_frames(path))
+    });
+    let _ = meta;
+    let unused_count = all_rows
+        .iter()
+        .filter(|row| player.row_ctx(&row.path, row.stream).placed == 0)
+        .count();
+    let filter = player.dock_filter.to_lowercase();
+    let mut rows: Vec<(Row, usize)> = all_rows
+        .into_iter()
+        .map(|row| {
+            let placed = player.row_ctx(&row.path, row.stream).placed;
+            (row, placed)
+        })
+        .filter(|(row, placed)| {
+            filter.is_empty()
+                || row.name.to_lowercase().contains(&filter)
+                || row.detail.to_lowercase().contains(&filter)
+                || ("unused".contains(&filter) && *placed == 0)
+        })
+        .collect();
+    match player.dock_sort {
+        DockSort::Recent => {}
+        DockSort::Name => rows.sort_by(|(a, _), (b, _)| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        DockSort::Usage => rows.sort_by(|(_, a), (_, b)| b.cmp(a)),
+        DockSort::Unused => rows.sort_by_key(|(_, placed)| *placed > 0),
+    }
+    let total = rows.len();
+    let filter_text: SharedString = player.dock_filter.clone().into();
+    div()
+        .id("dock-sources")
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .p(px(8.))
+        .overflow_y_scroll()
+        .child(section_head(format!("SOURCES · {total} · {unused_count} UNUSED")))
+        .child(
+            div()
+                .id("dock-filter")
+                .flex_none()
+                .cursor_text()
+                .text_size(px(10.))
+                .text_color(rgb(if player.dock_filter_edit { INK1() } else { INK3() }))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.dock_filter_edit = true;
+                    cx.notify();
+                }))
+                .child(match player.dock_filter.is_empty() {
+                    true => "⌕ type to filter — name, codec, unused…".to_string(),
+                    false => format!("⌕ {filter_text}"),
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .gap(px(4.))
+                .children(DockSort::ALL.map(|sort| {
+                    let on = sort == player.dock_sort;
+                    div()
+                        .id(("dock-sort", sort as usize))
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(3.))
+                        .text_size(px(9.5))
+                        .when(on, |d| d.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                        .when(!on, |d| d.text_color(rgb(INK3())))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(DARK_RAISED())))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.dock_sort = sort;
+                            cx.notify();
+                        }))
+                        .child(sort.label())
+                })),
+        )
+        .child(
+            div()
+                .id("dock-source-rows")
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .overflow_y_scroll()
+                .when(rows.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(INK3()))
+                            .child(match player.dock_filter.is_empty() {
+                                true => "No sources yet — Add files, or drop one on the window".to_string(),
+                                false => "nothing matches the filter".to_string(),
+                            }),
+                    )
+                })
+                .children({
+                    let elements: Vec<_> = rows
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (row, placed))| {
+                            let picked = player.selected_asset.as_ref().is_some_and(|p| *p == (row.path.clone(), row.stream));
+                            source_row(player, i, row, *placed, picked, cx).into_any_element()
+                        })
+                        .collect();
+                    elements
+                }),
+        )
+        .child(section_head("IMPORT"))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .child(import_verb(
+                    "dock-import-files",
+                    "Add files",
+                    "adds a file to this list — or drop one on the window",
+                    player.exporting().is_none(),
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.pick_and_import(cx)),
+                ))
+                .child(import_verb(
+                    "dock-paste-path",
+                    "Paste path",
+                    "imports the file named on the clipboard",
+                    player.exporting().is_none(),
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.paste_file_path(cx)),
+                )),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(9.))
+                .text_color(rgb(INK3()))
+                .child(
+                    "drag a row to a lane · ↵ add at playhead · double-click plays in screen · \
+                     right-click the dot to re-ink a source (rare — lives out of the way)",
+                ),
+        )
 }
 
 /// The Clip tab: the four verbs DESIGN §5 names, as ghosts, over whichever
@@ -219,8 +591,8 @@ fn clip_tab(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Play
 /// to, is the first region asked to give up its width entirely (a step
 /// `layout.rs`'s split budget already owns for the legacy inspector/library
 /// pair). What degrades *inside* fixed width is the two tabs' own content:
-/// Sources hands off to `library.rs`'s own row anatomy and ladder; Clip's
-/// param rows are whatever their card already draws at this width.
+/// Sources scrolls its own row list; Clip's param rows are whatever their
+/// card already draws at this width.
 pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Context<Player>) -> impl IntoElement {
     let src_active = player.dock_src_active;
     div()
@@ -235,14 +607,14 @@ pub(crate) fn render(player: &Player, width: f32, window_h: Pixels, cx: &mut Con
                 .flex_none()
                 .flex()
                 .gap(px(4.))
-                .p(px(8.))
+                .px(px(8.))
                 .border_b_1()
                 .border_color(rgb(DARK_HAIRLINE()))
-                .child(dock_tab("dock-tab-src", "Src", src_active, cx))
-                .child(dock_tab("dock-tab-clip", "Clip", !src_active, cx)),
+                .child(dock_tab("dock-tab-src", "SOURCES", "L", src_active, cx))
+                .child(dock_tab("dock-tab-clip", "CLIP", "I", !src_active, cx)),
         )
         .child(match src_active {
-            true => sources_tab(player, width, cx).into_any_element(),
+            true => sources_tab(player, cx).into_any_element(),
             false => clip_tab(player, width, window_h, cx).into_any_element(),
         })
 }

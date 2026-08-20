@@ -1,6 +1,7 @@
-//! DESIGN.md §5 -- the stance: fixed geography behind `EDITH_DARKROOM`, drawn
-//! whole here rather than folded into the legacy four-region tree so the two
-//! can be told apart, and swapped, with a single `if` in `render.rs`.
+//! DESIGN.md §5 -- the stance: fixed geography, drawn by default now
+//! (`OLD_GUI=1` opts back into the legacy four-region tree), whole here
+//! rather than folded into that tree so the two can be told apart, and
+//! swapped, with a single `if` in `render.rs`.
 //!
 //! This step lays out the six regions and nothing else: correct geometry,
 //! correct surfaces, a section-head label per region. No content, no
@@ -10,6 +11,8 @@
 use crate::*;
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
+use crate::ui::timeband_stance;
+use crate::ui::spine_stance;
 
 /// Left rail, full height (DESIGN §5).
 const SPINE_W: f32 = 56.;
@@ -57,33 +60,6 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
                 .text_size(px(9.5))
                 .text_color(rgb(INK3()))
                 .child(player.keymap.display(action)),
-        )
-}
-
-/// A ghost command whose stride-10 sibling is the same command at a
-/// different scale (DESIGN §4): one glyph, both chords shown beside each
-/// other rather than a second glyph -- the cheap fix VIOLATION 1 asked for,
-/// reusing the ghost grammar instead of a new widget.
-fn ghost_dual(player: &Player, glyph: &str, action: ActionId, stride: ActionId) -> impl IntoElement {
-    div()
-        .flex_none()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(2.))
-        .py(px(6.))
-        .rounded(px(3.))
-        .text_size(px(13.))
-        .text_color(rgb(INK2()))
-        .child(glyph.to_string())
-        .child(
-            div()
-                .flex()
-                .gap(px(4.))
-                .text_size(px(9.5))
-                .text_color(rgb(INK3()))
-                .child(player.keymap.display(action))
-                .child(player.keymap.display(stride)),
         )
 }
 
@@ -163,11 +139,12 @@ fn keys_overlay(player: &Player) -> impl IntoElement {
         )
 }
 
-/// The spine: 56px, left, full height. Every command as ghost glyph + chord,
-/// grouped by task frequency (DESIGN §5) -- transport first (every second),
-/// then the cut machinery (DESIGN §6, every cut), then the split and the one
-/// boxed exception is left to the time band, which is where Export lives.
-fn spine(player: &Player) -> impl IntoElement {
+/// The spine: 56px, left, full height. Frame only -- grouped rows, task
+/// frequency, glyph-over-chord grammar and every click all live in
+/// [`crate::ui::spine_stance`] now (MOCK-SPEC.md "Spine"); this fn keeps
+/// the panel's own surface and the `?` row, which stays part of the frame
+/// since it opens [`keys_overlay`] right here rather than through `act`.
+fn spine(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     div()
         .id("stance-spine")
         .flex_none()
@@ -182,15 +159,7 @@ fn spine(player: &Player) -> impl IntoElement {
         .py(px(8.))
         .gap(px(4.))
         .child(section_head("spine"))
-        .child(ghost(player, "▶", ActionId::Play))
-        .child(ghost_dual(player, "‹", ActionId::WalkCutPrev, ActionId::WalkCutPrev10))
-        .child(ghost_dual(player, "›", ActionId::WalkCutNext, ActionId::WalkCutNext10))
-        .child(ghost(player, "{", ActionId::SelectPrev))
-        .child(ghost(player, "}", ActionId::SelectNext))
-        .child(ghost(player, "[", ActionId::TrimIn))
-        .child(ghost(player, "]", ActionId::TrimOut))
-        .child(ghost(player, "↻", ActionId::LoopTrim))
-        .child(ghost(player, "✂", ActionId::Cut))
+        .child(spine_stance::render(player, cx))
         .child(ghost(player, "?", ActionId::ShowActions))
 }
 
@@ -225,23 +194,13 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
 }
 
 /// Fixed-height strip under the screen: timecode leads, ghost transport, cut
-/// readout, the contact strip, boxed Export at the end (DESIGN §5).
-fn time_band(player: &Player) -> impl IntoElement {
+/// readout, the contact strip, boxed Export at the end (DESIGN §5,
+/// MOCK-SPEC.md "Time band"). Frame only -- every row and the Export chip's
+/// click live in [`crate::ui::timeband_stance`] now, the same split
+/// `spine_stance`/`bench_stance`/`dock_stance` already make for their
+/// regions.
+fn time_band(player: &mut Player, cx: &mut Context<Player>) -> impl IntoElement {
     let position = player.active_session().map_or(0., PlaybackSession::now);
-    let tc = timecode(position, player.active_fps());
-    // The odometer (DESIGN §6): the subject cut's own place among its
-    // lane's, or an empty readout with nothing marked -- a plate that reads
-    // blank rather than one that lies about a cut zero.
-    let readout = player
-        .selected
-        .anchor()
-        .and_then(|(lane, idx)| {
-            player
-                .session
-                .as_ref()
-                .map(|s| format!("{}/{}", idx + 1, s.lane_clips(lane).len()))
-        })
-        .unwrap_or_else(|| "—/—".to_string());
     div()
         .id("stance-time-band")
         .flex_none()
@@ -250,47 +209,7 @@ fn time_band(player: &Player) -> impl IntoElement {
         .border_t_1()
         .border_color(rgba(DARK_SEAM()))
         .flex()
-        .items_center()
-        .gap(px(16.))
-        .px(px(12.))
-        // The most-read element anchors its region (DESIGN §5): the
-        // timecode leads, 13px hero, 700, colons in `ink3`.
-        .child(
-            div()
-                .text_size(px(13.))
-                .text_color(rgb(INK1()))
-                .child(tc),
-        )
-        .child(ghost(player, if player.transport().is_playing() { "❚❚" } else { "▶" }, ActionId::Play))
-        // The cut readout: a plate, mono, the odometer DESIGN §6 asks for.
-        .child(
-            div()
-                .flex_none()
-                .px(px(8.))
-                .py(px(4.))
-                .rounded(px(2.))
-                .bg(rgb(DARK_CANVAS()))
-                .text_size(px(10.5))
-                .text_color(rgb(INK1()))
-                .child(readout),
-        )
-        .child(div().flex_1())
-        // Boxed Export: the one bordered control on the surface (DESIGN §4).
-        .child(
-            div()
-                .id("stance-export")
-                .flex_none()
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(3.))
-                .border_1()
-                .border_color(rgb(DARK_HAIRLINE()))
-                .bg(rgb(DARK_RAISED()))
-                .text_size(px(10.5))
-                .text_color(rgb(INK1()))
-                .cursor_pointer()
-                .child(format!("Export ({})", player.keymap.display(ActionId::Export))),
-        )
+        .child(timeband_stance::render(player, position, cx))
 }
 
 /// Lanes, under the time band. `canvas` is the bench background too (DESIGN
@@ -429,7 +348,8 @@ pub(crate) fn render(
     window: &mut Window,
     cx: &mut Context<Player>,
 ) -> impl IntoElement {
-    let window_h = window.viewport_size().height;
+    let window_size = window.viewport_size();
+    let window_h = window_size.height;
     let position = player.playhead(player.drawn_duration());
     div()
         .id("stance-room")
@@ -475,14 +395,13 @@ pub(crate) fn render(
                 return;
             }
             if let Some(action) = this.keymap.lookup(key, ctrl) {
-                // hook: §12 step 7 -- the export card (and the notice plates
-                // that would announce an export's progress) has no stance
-                // surface yet, so it is suppressed here rather than left to
-                // open a card nothing on screen can draw. `ShowActions` now
-                // has one ([`keys_overlay`]) so it is no longer on this list.
-                if action == ActionId::Export {
-                    return;
-                }
+                // `ActionId::Export` used to be suppressed here because the
+                // darkroom drew no export surface for the card to land on
+                // (DESIGN §12 step 7's own hook). It has one now
+                // ([`timeband_stance::export_chip`] opens it, `render`
+                // below mounts [`Player::export_card`]/`export_progress_card`
+                // exactly where the legacy tree does), so `^e` dispatches
+                // like every other action.
                 this.act(action, window, cx);
             }
         }))
@@ -499,7 +418,7 @@ pub(crate) fn render(
         .size_full()
         .flex()
         .bg(rgb(DARK_CANVAS()))
-        .child(spine(player))
+        .child(spine(player, cx))
         .child(
             div()
                 .id("stance-centre")
@@ -509,13 +428,20 @@ pub(crate) fn render(
                 .flex()
                 .flex_col()
                 .child(screen(player, position, window, cx))
-                .child(time_band(player))
+                .child(time_band(player, cx))
                 .child(bench(player, cx))
                 .child(ledger(player, position))
                 .when_some(player.notices.front().cloned(), |el, n| {
                     el.child(notice_plate(n))
                 })
-                .when(player.keys_open, |el| el.child(keys_overlay(player))),
+                .when(player.keys_open, |el| el.child(keys_overlay(player)))
+                // The export card and its running-progress sheet, mounted
+                // over the whole room exactly as the legacy tree mounts them
+                // (`render.rs`) -- the fix for the shipped "Export does
+                // nothing" defect: the chip/chord open `export_open`, this is
+                // what draws it once open.
+                .children(player.export_card(window_size, cx))
+                .children(player.export_progress_card(cx)),
         )
         .child(dock(player, window_h, cx))
 }

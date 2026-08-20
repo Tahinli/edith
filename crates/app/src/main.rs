@@ -223,11 +223,24 @@ struct Player {
     /// (`ui::dock_stance::load`/`save`) so "a room reopens exactly as left"
     /// survives a quit and relaunch, not just this window.
     pub(crate) dock_src_active: bool,
+    /// The Sources tab's own filter text (darkroom dock, MOCK-SPEC "Dock" §2)
+    /// and whether it is the thing typed strokes go to right now -- the same
+    /// capture-flag shape `keys_search`/`keys_open` already use, so a letter
+    /// filters the list instead of firing a spine action while the box is
+    /// focused, and does nothing to the keymap once it is not.
+    pub(crate) dock_filter: String,
+    pub(crate) dock_filter_edit: bool,
+    /// Which of the four sort chips is showing (MOCK-SPEC "Dock" §3).
+    pub(crate) dock_sort: ui::dock_stance::DockSort,
     /// What is known about each source's audio, taken once and kept. Keyed on
     /// the path *and stream* -- two streams of one file are two envelopes -- and
     /// the key is inserted the moment the decode is *started*: presence means
     /// "asked", so a repaint mid-decode cannot ask again.
     waves: HashMap<(PathBuf, usize), Wave>,
+    /// The bench's poster frame per file ([`Thumb`]), filled like `waves` --
+    /// presence means "asked" -- one per file rather than one per clip, since
+    /// every clip cut from a file shares its picture.
+    thumbs: HashMap<PathBuf, Thumb>,
     /// What each source's stand-in is up to ([`engine::proxy`]), filled like
     /// `waves`: presence means "asked", so the encode is started once per file
     /// however many times the library is drawn. The switch that decides whether
@@ -765,7 +778,16 @@ fn main() {
     // DESIGN.md §1: "the room is the film's" -- darkroom mode owns the
     // palette outright, so the saved pick above is overridden the moment the
     // flag is read, once, before the first paint.
-    let darkroom = std::env::var("EDITH_DARKROOM").is_ok();
+    //
+    // Darkroom is the default room now (user order: "make darkroom default
+    // no need to pass environment"). `OLD_GUI=1` (any case) is the one door
+    // back into the legacy four-region tree -- `EDITH_DARKROOM` opted IN to
+    // the new room; this opts OUT of it, which is why the sense of the read
+    // below is inverted rather than the flag renamed in place.
+    let old_gui = std::env::vars()
+        .find(|(k, _)| k.eq_ignore_ascii_case("OLD_GUI"))
+        .is_some_and(|(_, v)| v.eq_ignore_ascii_case("1"));
+    let darkroom = !old_gui;
     if darkroom {
         ui::theme::set(ui::theme::PaletteId::Darkroom);
     }
@@ -794,6 +816,10 @@ fn main() {
         .map_or_else(|| NO_FILE.into(), |arg| file_name(arg).into());
 
     Application::new().run(move |cx: &mut App| {
+        // Bundled Archivo / Spline Sans Mono, before the first paint --
+        // DESIGN §3's two faces, embedded so no build depends on the host
+        // having them installed (see `ui::type_scale`'s doc comment).
+        ui::type_scale::register(cx);
         // 720p: the picture's own size is not known yet -- knowing it is the
         // twelve seconds this window exists to be up during -- and a window
         // that resized itself under a hand already dragging it would be worse
@@ -871,7 +897,11 @@ fn main() {
                     selected_asset: None,
                     library_tab: LibraryTab::Media,
                     dock_src_active: ui::dock_stance::load(),
+                    dock_filter: String::new(),
+                    dock_filter_edit: false,
+                    dock_sort: ui::dock_stance::DockSort::Recent,
                     waves: HashMap::new(),
+                    thumbs: HashMap::new(),
                     proxies: HashMap::new(),
                     streams: HashMap::new(),
                     bitrates: HashMap::new(),

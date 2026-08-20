@@ -245,7 +245,8 @@ impl Render for Player {
             self.panned = false;
         }
 
-        // DESIGN.md §12 step 2: the stance skeleton behind `EDITH_DARKROOM`.
+        // DESIGN.md §12 step 2: the stance skeleton, on by default now
+        // (`OLD_GUI=1` opts back into the tree below).
         // `.into_any_element()` on both arms is the one thing this branch
         // costs the legacy tree below -- an `impl IntoElement` return can
         // only be one concrete type, and the two trees are not the same one.
@@ -349,6 +350,33 @@ impl Render for Player {
                     } else if let Some(c) = typed(key) {
                         this.keys_search.push(c);
                         this.scroll_keys(None);
+                    }
+                    cx.notify();
+                    return;
+                }
+                // The dock's Sources filter (MOCK-SPEC "Dock" §2): owns the
+                // keyboard only while it was clicked into, exactly the
+                // `keys_search` shape above -- a letter typed anywhere else in
+                // the room still means what the spine says it means.
+                if this.dock_filter_edit {
+                    if key == "escape" || key == "enter" {
+                        this.dock_filter_edit = false;
+                    } else if key == "backspace" {
+                        this.dock_filter.pop();
+                    } else if let Some(c) = typed(key) {
+                        this.dock_filter.push(c);
+                    }
+                    cx.notify();
+                    return;
+                }
+                // `↵` adds the picked source at the playhead (MOCK-SPEC "Dock"
+                // hint paragraph, gesture 2) -- the keyboard door beside the
+                // legacy "Add at playhead" button's pointer one, live only
+                // where a row is actually picked so a bare enter elsewhere
+                // keeps meaning whatever it already means below.
+                if key == "enter" && this.dock_src_active && this.selected_asset.is_some() && this.exporting().is_none() {
+                    if let Some((path, stream)) = this.selected_asset.clone() {
+                        this.insert_source(&path, stream, None, None, cx);
                     }
                     cx.notify();
                     return;
