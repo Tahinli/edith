@@ -840,9 +840,15 @@ fn span_worker(
 
 /// How long a parked worker keeps its hardware session before closing it. Long
 /// enough that a seek, a scrub step and a clip boundary all find the decoder
-/// where they left it; short enough that a session left alone is not holding
-/// libva when the process exits.
-const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// where they left it -- and long enough for the think-time between two
+/// samples of a live slider drag (a colour or transform card nudge), which
+/// reseeks the very same worker and paid the *closed* half of this window
+/// every time a person paused a beat to look before nudging again: a session
+/// found the hardware gone and rebuilt it (measured seconds on a big file)
+/// for what should have cost one `hw.seek`. Short enough that a session left
+/// alone for real (the window switched away from, a scrub that stopped) is
+/// not holding libva when the process exits.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// How many pictures in a row a worker may drop for being late before it hands
 /// one over regardless. The policy needs a floor of its own: a machine that
