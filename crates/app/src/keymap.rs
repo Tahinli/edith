@@ -106,6 +106,10 @@ actions! {
     Delete,
     Lift,
     Color,
+    /// Where a clip sits, how big and which way up
+    /// ([`crate::transform_ui::TRANSFORM_BANDS`]) -- the geometry twin of
+    /// [`ActionId::Color`], filed right beside it.
+    Transform,
     Fit,
     Resolution,
     ZoomIn,
@@ -209,6 +213,7 @@ impl ActionId {
             ActionId::Delete => "Delete",
             ActionId::Lift => "Lift (leave a gap)",
             ActionId::Color => "Colour…",
+            ActionId::Transform => "Transform — position, scale, rotation, crop",
             ActionId::Fit => "Fit policy: fit → fill → stretch → centre",
             ActionId::Resolution => "Project resolution: source → 2160p → 1080p → 720p → 480p",
             ActionId::ZoomIn => "Zoom in on the timeline (around the playhead)",
@@ -277,6 +282,7 @@ impl ActionId {
             ActionId::Delete => "delete",
             ActionId::Lift => "lift",
             ActionId::Color => "color",
+            ActionId::Transform => "transform",
             ActionId::Fit => "fit",
             ActionId::Resolution => "resolution",
             ActionId::ZoomIn => "zoom-in",
@@ -344,6 +350,7 @@ impl ActionId {
             | ActionId::Delete
             | ActionId::Lift
             | ActionId::Color
+            | ActionId::Transform
             | ActionId::Fit
             // A rate is the clip's, not the sound's: it re-times the picture
             // and the sound together, and the card opens on whichever half was
@@ -520,7 +527,7 @@ fn preset_chord() -> String {
         .join(" / ")
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 32]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -718,6 +725,27 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 32]> = std::sync::LazyLock::new(||
             category: Category::Clips,
             reach: Reach::Click("color-reset"),
         },
+        // The transform card's own three, the same shape as the colour card's:
+        // up/down pick a band (position, scale, rotate, crop), left/right move
+        // it, and `r` resets to identity.
+        Fixed {
+            chord: "↑ / ↓".into(),
+            label: "Pick a transform band",
+            category: Category::Clips,
+            reach: Reach::Click("transform-row"),
+        },
+        Fixed {
+            chord: "← / →".into(),
+            label: "Move the picked transform band",
+            category: Category::Clips,
+            reach: Reach::Click("transform-bar"),
+        },
+        Fixed {
+            chord: "r".into(),
+            label: "Take the transform off the clip",
+            category: Category::Clips,
+            reach: Reach::Click("transform-reset"),
+        },
         // The silence card's two apply keys. Card-local like every stroke above --
         // they mean nothing while it is closed -- but the card is the one place in
         // this editor where a key rewrites forty places at once, so both of them
@@ -903,6 +931,10 @@ impl Keymap {
                 // k: free, next to nothing that edits, and one press like the
                 // rest of the clip keys.
                 b(ActionId::Color, "k", false),
+                // The placement card takes the ctrl chord of the grade's own
+                // key: the two sit beside each other on a clip and neither
+                // steals a bare letter that already means something else.
+                b(ActionId::Transform, "k", true),
                 // The fit policy is a clip key like the grade beside it: "p" for
                 // policy, free, and one press like the rest of them. The project
                 // resolution is not a clip key and takes a ctrl chord, next to
@@ -1290,7 +1322,7 @@ mod tests {
     #[test]
     fn every_default_stroke_reaches_its_action() {
         let k = Keymap::defaults();
-        assert_eq!(k.entries().len(), 63);
+        assert_eq!(k.entries().len(), 64);
         assert_eq!(k.lookup("f11", false), Some(ActionId::Fullscreen));
         assert_eq!(k.lookup("w", false), Some(ActionId::Screenshot));
         assert_eq!(k.lookup("y", false), Some(ActionId::SubtitleStyle));

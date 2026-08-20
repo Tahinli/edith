@@ -101,6 +101,7 @@ impl Player {
             ActionId::Delete => self.delete_selected(cx),
             ActionId::Lift => self.lift_selected(cx),
             ActionId::Color => self.open_color(cx),
+            ActionId::Transform => self.open_transform(cx),
             ActionId::Fit => self.cycle_fit(cx),
             ActionId::Resolution => self.cycle_resolution(cx),
             // The playhead is what a key zoom is aimed at: it is the one place
@@ -377,6 +378,7 @@ impl Player {
             Repeat::Nothing
         } else if self.eq_open.is_some()
             || self.color_open.is_some()
+            || self.transform_open.is_some()
             || self.speed_open.is_some()
             || self.silence_open.is_some()
             || self.mix_open

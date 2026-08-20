@@ -1523,6 +1523,145 @@ impl Player {
         )
     }
 
+    /// The transform card: [`color_card`](Self::color_card)'s own shape, one
+    /// row per [`TRANSFORM_BANDS`] entry instead of four, and no histogram --
+    /// there is nothing here a graded frame would tilt.
+    pub(crate) fn transform_card(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (lane, idx) = self.transform_open?;
+        let params = self.transform_params();
+        let rows: Vec<_> = TRANSFORM_BANDS
+            .iter()
+            .enumerate()
+            .map(|(i, &(label, low, high))| {
+                let mut read = params;
+                let value = *transform_band_mut(&mut read, i);
+                let frac = ((value - low) / (high - low)).clamp(0., 1.);
+                let picked = i == self.transform_band;
+                div()
+                    .id(("transform-row", i))
+                    .flex()
+                    .min_h(px(KEYS_ROW_H))
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .cursor_pointer()
+                    .when(picked, |d| d.bg(rgb(BG_SELECTED())))
+                    .hover(|s| s.bg(rgb(BG_HOVER())))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.transform_band = i;
+                        cx.notify();
+                    }))
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                    .child(
+                        div()
+                            .id(("transform-bar", i))
+                            .relative()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .max_w(px(TRANSFORM_BAR_W))
+                            .h(px(KEYS_ROW_H))
+                            .flex()
+                            .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.transform_band = i;
+                                    this.transform_dragging = true;
+                                    this.drag_transform(event.position.x, true, cx);
+                                }),
+                            )
+                            .child(bounds_probe(self.transform_bars[i].clone()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(4.))
+                                    .rounded(px(2.))
+                                    .bg(rgb(BG_PANEL()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(frac))
+                                            .rounded(px(2.))
+                                            .bg(rgb(ACCENT_PRIMARY())),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .text_size(px(11.))
+                            .text_color(rgb(FG_SECONDARY()))
+                            .child(match i == ROTATE_BAND {
+                                true => format!("{value:.0}°"),
+                                false => format!("{value:.2}"),
+                            }),
+                    )
+            })
+            .collect();
+        Some(
+            drag_scrim(cx)
+                .flex()
+                .justify_center()
+                .items_center()
+                .bg(rgba(SCRIM()))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_card();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(TRANSFORM_W))
+                        .on_mouse_down(MouseButton::Left, swallow)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .p(px(12.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG_RAISED()))
+                        .child(div().flex_none().px(px(6.)).child(format!(
+                            "Transform — {} clip {}",
+                            lane.label(),
+                            idx + 1
+                        )))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(6.))
+                                .text_size(px(11.))
+                                .text_color(rgb(FG_SECONDARY()))
+                                .child(
+                                    "drag a bar, or ↑↓ picks one and ←→ moves it (rotation steps \
+                                     by 90°), r resets — a click away or esc closes",
+                                ),
+                        )
+                        .children(rows)
+                        .child(
+                            div()
+                                .id("transform-reset")
+                                .mt(px(4.))
+                                .flex()
+                                .h(px(CONTROL_H))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.))
+                                .bg(rgb(BG_SELECTED()))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(BG_HOVER())))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.set_transform(TransformParams::default(), cx);
+                                }))
+                                .child("Reset"),
+                        ),
+                ),
+        )
+    }
+
     /// The speed card: one bar from a quarter speed to four times it, the rates
     /// people name as buttons under it, and the clip's new length in frames --
     /// which is the number a person is actually choosing. Built like the colour

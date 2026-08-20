@@ -17,6 +17,7 @@ mod oracle;
 mod render;
 mod subs;
 mod timeline_math;
+mod transform_ui;
 mod transport;
 mod viewport;
 
@@ -37,6 +38,7 @@ pub(crate) use notices::*;
 pub(crate) use oracle::*;
 pub(crate) use subs::*;
 pub(crate) use timeline_math::*;
+pub(crate) use transform_ui::*;
 pub(crate) use transport::*;
 pub(crate) use viewport::*;
 
@@ -62,6 +64,7 @@ use engine::limiter::Limiter;
 use engine::project::{Edge, Lane, LaneKind, Source, Speed, SubClip};
 use engine::scale::FitPolicy;
 use engine::tonemap::Preset;
+use engine::transform::TransformParams;
 use engine::{Clip, Codec, ExportHandle, Frame, MediaBitrate, PlaybackSession};
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, Div, DragMoveEvent,
@@ -663,6 +666,23 @@ struct Player {
     /// stands, and never lost -- the frame that lands writes it, and so does the
     /// release.
     pending_color: Option<ColorParams>,
+    /// The transform card is up on this clip -- the lane it is on and its
+    /// index there, exactly as the colour card's handle is. `None` when it is
+    /// closed: the placement itself is the project's.
+    transform_open: Option<(Lane, usize)>,
+    /// Which of the card's eight sliders the arrow keys and a drag move. The
+    /// card's own focus, since nothing in it takes gpui's (ledger:182).
+    transform_band: usize,
+    /// A slider is being dragged. Tracked on the root like the colour card's,
+    /// for the same reason: a 4 px bar is left by the pointer on the first
+    /// move and its own listeners then stop firing.
+    transform_dragging: bool,
+    /// Each slider's box, recorded at prepaint -- [`Self::color_bars`]' own
+    /// reason, one per band.
+    transform_bars: [Rc<Cell<Bounds<Pixels>>>; TRANSFORM_BANDS.len()],
+    /// The placement the hand is on, held back because the worker still owes a
+    /// frame -- [`Self::pending_color`]'s own reason.
+    pending_transform: Option<TransformParams>,
     /// The frame on screen counted into `HIST_BINS` bins per channel -- the
     /// *graded* frame, because the grade is applied in the decode worker and
     /// what arrives here is already through it. Refilled by every pumped frame,
@@ -910,6 +930,11 @@ fn main() {
                     color_dragging: false,
                     color_bars: std::array::from_fn(|_| Rc::default()),
                     pending_color: None,
+                    transform_open: None,
+                    transform_band: 0,
+                    transform_dragging: false,
+                    transform_bars: std::array::from_fn(|_| Rc::default()),
+                    pending_transform: None,
                     // Empty until the first frame is pumped, which draws as a
                     // flat line rather than as a shape nothing measured.
                     histogram: [[0; HIST_BINS]; 3],
