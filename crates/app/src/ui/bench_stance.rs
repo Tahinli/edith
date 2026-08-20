@@ -67,7 +67,29 @@ pub(crate) const ROW_GAP: f32 = 2.;
 /// scrolls behind the pinned ruler and heads instead of compressing further.
 const LANES_COMPRESS: usize = 5;
 const LANE_FULL_H: f32 = 40.;
-pub(crate) const LANE_MIN_H: f32 = 18.;
+/// The gap `lane_row`'s pinned head column puts between the lane label and
+/// its status dot (its own `.gap(px(...))`), named so [`LANE_MIN_H`]'s
+/// derivation below doesn't repeat the literal blind.
+pub(crate) const LANE_HEAD_GAP: f32 = 2.;
+/// The status dot's own diameter (`lane_row`'s "Pinned track head" child,
+/// its own `.w(px(...)).h(px(...))`).
+pub(crate) const LANE_DOT_D: f32 = 4.;
+/// The lane label's own line box at [`type_scale::CHORD_METADATA_MIN_PX`]:
+/// gpui's default `TextStyle::line_height` is not 1x the font size but the
+/// golden ratio (`gpui::phi()` == `relative(1.618034)`), and `lane_row`
+/// never calls `.line_height()` on the head label to override it -- so this
+/// is what the label really occupies, not its glyph height.
+/// round(12. * 1.618034) would be wrong here: the head uses
+/// `CHORD_METADATA_MIN_PX` (11.), so round(11. * 1.618034) = round(17.798)
+/// = 18.
+const LANE_LABEL_LINE_H: f32 = 18.;
+/// The least a lane row may be: what its own head actually draws, not a
+/// number copied from nowhere. The old `18.` fit only the label's line box
+/// and let every lane's status dot overflow into the row beneath it --
+/// invisible everywhere but the last lane, which has no next row to spill
+/// into and clipped straight into the ledger instead (adversarial pass on
+/// the `BENCH_MIN_H = 82` floor).
+pub(crate) const LANE_MIN_H: f32 = LANE_LABEL_LINE_H + LANE_HEAD_GAP + LANE_DOT_D;
 
 /// One clip's degradation tier (DESIGN §7), picked off the clip's own worth
 /// in pixels (`span`, unclamped) rather than its drawn floor
@@ -596,7 +618,7 @@ fn lane_row(
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .gap(px(2.))
+                .gap(px(LANE_HEAD_GAP))
                 .bg(rgb(DARK_PANEL()))
                 .cursor(CursorStyle::OpenHand)
                 .on_drag(LaneDrag(lane), move |_, _, _, cx| {
@@ -609,7 +631,14 @@ fn lane_row(
                 ))
                 .text_color(rgb(INK2()))
                 .child(lane.label())
-                .child(div().flex_none().w(px(4.)).h(px(4.)).rounded(px(2.)).bg(rgb(dot))),
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(LANE_DOT_D))
+                        .h(px(LANE_DOT_D))
+                        .rounded(px(LANE_DOT_D / 2.))
+                        .bg(rgb(dot)),
+                ),
         )
         .child(
             // The bed: a drop target for the Sources tab (`AssetDrag`,
