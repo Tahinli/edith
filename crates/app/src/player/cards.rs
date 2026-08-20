@@ -853,6 +853,22 @@ impl Player {
     /// Nothing here is a clip's or even the project's -- it never reaches the
     /// export, which never burns a cue into the picture -- so like the mix
     /// card it opens with no timeline required and nothing to refuse.
+    /// Opens the settings page (PROJECT rows beside EDITOR rows,
+    /// `ui::settings_stance`): the one door for "edit project and editor
+    /// settings" -- always answerable, since the oracle treats it like
+    /// `Theme` (`oracle.rs`), and refused only while an export is running,
+    /// same as every other card here.
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.exporting().is_some() {
+            return;
+        }
+        // One card at a time -- `close_card`'s own rule.
+        self.close_card();
+        self.settings_open = true;
+        self.context_menu = None;
+        cx.notify();
+    }
+
     pub(crate) fn open_subtitle_style(&mut self, cx: &mut Context<Self>) {
         // One card at a time -- `close_card`'s own rule.
         self.close_card();
@@ -1241,6 +1257,7 @@ impl Player {
 
     pub(crate) fn modal(&self) -> bool {
         self.keys_open
+            || self.settings_open
             || self.export_open
             || self.eq_open.is_some()
             || self.color_open.is_some()
@@ -1262,6 +1279,7 @@ impl Player {
     /// "the" card and closing all of them are the same act.
     pub(crate) fn close_card(&mut self) {
         self.keys_open = false;
+        self.settings_open = false;
         self.keys_search.clear();
         self.rebinding = None;
         self.export_open = false;

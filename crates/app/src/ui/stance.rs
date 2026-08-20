@@ -11,6 +11,7 @@
 use crate::*;
 use crate::ui::bench_stance;
 use crate::ui::dock_stance;
+use crate::ui::settings_stance;
 use crate::ui::timeband_stance;
 use crate::ui::spine_stance;
 use crate::ui::type_scale::{self, Typeset};
@@ -759,6 +760,7 @@ pub(crate) fn render(
                     el.child(notice_plate(n))
                 })
                 .when(player.keys_open, |el| el.child(keys_overlay(player)))
+                .when(player.settings_open, |el| el.child(settings_stance::render(player, cx)))
                 // The two menus (DESIGN §9: "verbs of the thing under the
                 // cursor", plate styling, the same scrim-and-row component
                 // the legacy tree already uses -- `library.rs`'s own doc
