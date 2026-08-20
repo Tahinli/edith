@@ -187,7 +187,7 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
         },
         // A grade is a picture setting and an audio clip has no picture. A fit
         // policy is a picture setting for the same reason.
-        ActionId::Color | ActionId::Fit => match ctx.clip {
+        ActionId::Color | ActionId::Fit | ActionId::Transform => match ctx.clip {
             Some((_, lane)) if lane.kind != LaneKind::Video => Enable::Hidden("this clip is sound"),
             _ => Enable::Yes,
         },

@@ -51,7 +51,10 @@ pub(crate) fn transform_snap(band: usize, value: f32) -> f32 {
     if band == ROTATE_BAND {
         let span = high - low + ROTATE_STEP; // one turn: 0..360
         let wrapped = (value - low).rem_euclid(span);
-        low + (wrapped / ROTATE_STEP).round() * ROTATE_STEP
+        // The round can land exactly on `span` (315 rounds up to the 360 that
+        // never appears in the range) which needs one more wrap back to 0,
+        // not a clamp to a fourth stop past 270 -- `ROTATE_BAND`'s reason.
+        low + ((wrapped / ROTATE_STEP).round() * ROTATE_STEP).rem_euclid(span)
     } else {
         ((value / TRANSFORM_STEP).round() * TRANSFORM_STEP).clamp(low, high)
     }
@@ -91,8 +94,9 @@ mod tests {
         assert_eq!(transform_snap(ROTATE_BAND, 46.0), 90.0);
         assert_eq!(transform_snap(ROTATE_BAND, 270.0), 270.0);
         // Past the last stop wraps back to the first, not clamps to the last.
+        // -45 is the same angle as 315 mod 360, so it lands on the same stop.
         assert_eq!(transform_snap(ROTATE_BAND, 315.0), 0.0);
-        assert_eq!(transform_snap(ROTATE_BAND, -45.0), 270.0);
+        assert_eq!(transform_snap(ROTATE_BAND, -45.0), 0.0);
     }
 
     #[test]

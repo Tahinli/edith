@@ -527,7 +527,7 @@ fn preset_chord() -> String {
         .join(" / ")
 }
 
-pub static FIXED: std::sync::LazyLock<[Fixed; 32]> = std::sync::LazyLock::new(|| {
+pub static FIXED: std::sync::LazyLock<[Fixed; 35]> = std::sync::LazyLock::new(|| {
     [
         // Not a chord at all but a way of pressing one, and the only place the
         // editor can say so: holding a key that moves a *value* runs it, and
@@ -724,6 +724,27 @@ pub static FIXED: std::sync::LazyLock<[Fixed; 32]> = std::sync::LazyLock::new(||
             label: "Take the colour grade off the clip",
             category: Category::Clips,
             reach: Reach::Click("color-reset"),
+        },
+        // The transform card's own three, the same shape as the colour card's:
+        // up/down pick a band (position, scale, rotate, crop), left/right move
+        // it, and `r` resets to identity.
+        Fixed {
+            chord: "↑ / ↓".into(),
+            label: "Pick a transform band",
+            category: Category::Clips,
+            reach: Reach::Click("transform-row"),
+        },
+        Fixed {
+            chord: "← / →".into(),
+            label: "Move the picked transform band",
+            category: Category::Clips,
+            reach: Reach::Click("transform-bar"),
+        },
+        Fixed {
+            chord: "r".into(),
+            label: "Take the transform off the clip",
+            category: Category::Clips,
+            reach: Reach::Click("transform-reset"),
         },
         // The silence card's two apply keys. Card-local like every stroke above --
         // they mean nothing while it is closed -- but the card is the one place in
