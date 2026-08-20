@@ -1808,12 +1808,69 @@ fn both_default_lanes_fit_the_bench_at_its_floor() {
     let box_h = BENCH_MIN_H - BENCH_CHROME_H;
     let avail = box_h - RULER_H - ROW_GAP;
     let h = row_h(2, avail);
-    assert_eq!(h, LANE_MIN_H, "the floor should give both lanes exactly their own minimum -- no more, no less");
+    // Not an exact `LANE_MIN_H` any more: `BENCH_MIN_H` now carries one spare
+    // row (`layout::LEDGER_SEAM_CLEARANCE`) so the last lane's own last pixel
+    // never shares a row with the ledger's border, which lands here as
+    // `avail` being a touch over the two-rows-plus-gap tight fit.
+    assert!(h >= LANE_MIN_H, "the floor should give both lanes at least their own minimum ({h} < {LANE_MIN_H})");
     let content = 2. * h + ROW_GAP;
     assert!(
         content <= avail + 1e-4,
         "the two lane rows ({content}px) overrun the column ({avail}px) -- \
          the bottom lane's pixels get cut, unscrolled"
+    );
+}
+
+/// `BENCH_CHROME_H` on its own: the previous test's `box_h = BENCH_MIN_H -
+/// BENCH_CHROME_H` line trusts `BENCH_CHROME_H` to already be correct, so it
+/// cannot catch `BENCH_CHROME_H` itself drifting -- which is exactly how the
+/// third clip (this session's) survived it: the constant undercounted the
+/// section head's real line box by 1px and this test's predecessor never
+/// looked. Recomputes what `ui::stance::bench` actually draws above
+/// `bench_stance::render`'s content -- the div's own `.border_t_1()` (1px)
+/// + its `py(4.)` top padding + the section head's real line box at gpui's
+/// golden-ratio line-height, not the label's bare font size (the same trap
+/// `a_lane_row_fits_what_its_own_head_draws` already checks for the lane
+/// heads) -- and then checks the *whole* stack -- chrome, ruler, both gaps,
+/// both lanes, and the clear row the ledger's own fixed-position border
+/// needs (`LEDGER_SEAM_CLEARANCE`, not exported, so this recomputes it as
+/// `BENCH_MIN_H` minus every other named term) -- fits inside `BENCH_MIN_H`
+/// with nothing left over uncounted. This binary carries no `TestAppContext`
+/// to mount `ui::stance::bench` and `ui::stance::ledger` for real and read
+/// painted bounds back, so it stays geometry-only, same as its neighbours.
+#[test]
+fn the_whole_bench_stack_fits_its_own_floor_with_the_ledger_seam_clear() {
+    use crate::BENCH_MIN_H;
+    use crate::ui::bench_stance::{LANE_MIN_H, ROW_GAP, RULER_H};
+    use crate::ui::stance::BENCH_CHROME_H;
+    use crate::ui::type_scale::SECTION_HEAD_PX;
+
+    const BENCH_BORDER_T: f32 = 1.;
+    const BENCH_PY_TOP: f32 = 4.;
+    let section_head_line_h = (SECTION_HEAD_PX * 1.618_034).round();
+    let real_chrome = BENCH_BORDER_T + BENCH_PY_TOP + section_head_line_h;
+    assert_eq!(
+        BENCH_CHROME_H, real_chrome,
+        "BENCH_CHROME_H ({BENCH_CHROME_H}) does not match what `stance::bench` \
+         actually draws above the content ({real_chrome}px: {BENCH_BORDER_T}px \
+         border + {BENCH_PY_TOP}px padding + {section_head_line_h}px label line \
+         box) -- bench_stance::render gets handed the wrong box_h and lays its \
+         rows out past its own real space"
+    );
+
+    // The ledger's own fixed-position border needs one more clear row below
+    // the last lane, on top of chrome + ruler + both gaps + both lanes --
+    // recomputed here rather than importing the private
+    // `layout::LEDGER_SEAM_CLEARANCE`, so this test fails if that term is
+    // ever silently dropped from `BENCH_MIN_H`'s own sum.
+    let content_need = real_chrome + RULER_H + ROW_GAP + 2. * LANE_MIN_H + ROW_GAP;
+    let ledger_seam_clearance = BENCH_MIN_H - content_need;
+    assert!(
+        ledger_seam_clearance >= 1. - 1e-4,
+        "BENCH_MIN_H ({BENCH_MIN_H}) leaves only {ledger_seam_clearance}px \
+         between the last lane row and the ledger's own top border -- driven \
+         at exactly the content's need (0px clearance) the border still won \
+         the shared pixel and clipped the last lane's status dot"
     );
 }
 
