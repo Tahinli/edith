@@ -629,6 +629,20 @@ fn lane_row(
                     let at = this.place_frame(window.mouse_position().x).0;
                     this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                 }))
+                // The landing shadow (`Player::preview_ghost_asset`, the same
+                // setter `ui/timeline.rs`'s own bed calls) -- guarded on the
+                // pointer actually being inside this bed's own bounds, since
+                // `on_drag_move` fires on every painted element of the drag's
+                // type, not just the one under the pointer.
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let path = event.drag(cx).0.clone();
+                        this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
+                    },
+                ))
                 .drag_over::<ClipDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
                     let Some(idx) = this.dragged(drag) else {
@@ -636,6 +650,15 @@ fn lane_row(
                     };
                     this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                 }))
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let drag = *event.drag(cx);
+                        this.preview_ghost(&drag, lane, event.event.position.x, cx);
+                    },
+                ))
                 // A caption already on a lane moves along it, or onto another
                 // subtitle track, exactly as a clip does (`Player::move_sub`,
                 // the same call `ui/timeline.rs`'s own bed makes).
@@ -643,6 +666,25 @@ fn lane_row(
                 .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
                     this.move_sub(drag, lane, window.mouse_position().x, cx);
                 }))
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let drag = *event.drag(cx);
+                        this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
+                    },
+                ))
+                .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<SubPick>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        let track = event.drag(cx).0;
+                        this.preview_ghost_pick(track, lane, event.event.position.x, cx);
+                    },
+                ))
                 // The wheel, matched to the legacy timeline's own mapping:
                 // ctrl+wheel zooms about the pointer, a bare wheel scrolls
                 // the bed along the film (`Player::timeline_wheel`). Stopped
@@ -653,7 +695,52 @@ fn lane_row(
                     this.timeline_wheel(event, cx);
                 }))
                 .children(boxes)
-                .children(sub_boxes),
+                .children(sub_boxes)
+                // The shadow of the row in flight (`Player::ghost`, set by
+                // the `on_drag_move` handlers above) -- the same box
+                // `ui/timeline.rs`'s own bed draws, only while a drag of its
+                // kind is actually live (`App::has_active_drag`: gpui drops a
+                // drag without telling anyone) and only on the one lane the
+                // pointer is over.
+                .children(
+                    player
+                        .ghost
+                        .filter(|g| g.lane == lane && cx.has_active_drag())
+                        .map(|g| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(scale.px_at(f64::from(g.start) / player.fps)))
+                                .w(px(scale
+                                    .width_px(f64::from(g.frames) / player.fps)
+                                    .max(GHOST_MIN)))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(rgb(if g.refused { DROP_REFUSE() } else { INK1() }))
+                                .bg(rgba(
+                                    ((if g.refused { DROP_REFUSE() } else { g.tint }) << 8)
+                                        | GHOST_ALPHA,
+                                ))
+                        }),
+                )
+                // Where it would land, drawn on every lane so a clip lining
+                // up with a take one track over can be seen to line up with
+                // it -- the same cue `ui/timeline.rs` draws.
+                .children(
+                    player
+                        .snap_cue
+                        .filter(|_| player.trim.is_some() || cx.has_active_drag())
+                        .map(|frame| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .left(px(scale.px_at(f64::from(frame) / player.fps)))
+                                .w(px(1.))
+                                .bg(rgb(INK1()))
+                        }),
+                ),
         )
 }
 
