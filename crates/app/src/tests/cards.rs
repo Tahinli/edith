@@ -75,6 +75,7 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
             "silence_open" => "silence_card(",
             "mix_open" => "mix_card(",
             "subtitle_style_open" => "subtitle_style_card(",
+            "settings_open" => "settings_stance::render(",
             other => panic!(
                 "Player::modal() now reads `self.{other}` with no entry in this test's \
                  mount_for map -- add one naming the function that mounts its surface in \
