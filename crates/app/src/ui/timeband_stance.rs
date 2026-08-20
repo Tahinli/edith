@@ -32,17 +32,35 @@ thread_local! {
 /// so a rebind can never leave the band showing a stroke that no longer
 /// fires it -- the same shape `stance::ghost` draws for the spine, kept local
 /// here so this module owns its own region end to end.
-fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
+///
+/// FAULT 2 fix: this used to read [`Keymap::display`], the full-sentence
+/// form (`ctrl+left`) meant for the keys overlay's own list -- MOCK-SPEC's
+/// band wants the compact badge (`J`, `spc`, `L`) the spine already reads
+/// via [`Keymap::chord`] (`stance::ghost`). Switched to `chord` here so every
+/// badge in the band matches that same compact grammar.
+///
+/// Also FAULT 2: this glyph drew no `on_click` at all -- a badge that names
+/// a stroke but does not fire it on a click is the same "glyph, badge and
+/// what fires must agree" defect the chord text was, so it now dispatches
+/// `action` through [`Player::act`] the same way `stance::ghost` (spine) and
+/// `spine_stance`'s own ghost already do, `id` making the three transport
+/// ghosts distinct elements gpui can track.
+fn ghost(id: &'static str, player: &Player, glyph: &str, action: ActionId, cx: &mut Context<Player>) -> impl IntoElement {
     let glyph_style = label(type_scale::HERO_TIMECODE_PX, FontWeight::MEDIUM);
     // The chord names a key, so DESIGN §3's mono rule ("if a string is about
     // ... a key, it is mono") applies here same as everywhere else in the band.
     let chord_style = mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
     div()
+        .id(id)
         .flex_none()
         .flex()
         .flex_col()
         .items_center()
         .gap(px(1.))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.act(action, window, cx);
+        }))
         .font(glyph_style.font)
         .text_size(glyph_style.size)
         .text_color(rgb(INK2()))
@@ -52,7 +70,7 @@ fn ghost(player: &Player, glyph: &str, action: ActionId) -> impl IntoElement {
                 .font(chord_style.font)
                 .text_size(chord_style.size)
                 .text_color(rgb(INK3()))
-                .child(player.keymap.display(action)),
+                .child(player.keymap.chord(action)),
         )
 }
 
@@ -142,12 +160,13 @@ fn cut_readout(player: &Player) -> impl IntoElement {
 /// where the bench's own window sits. Click jumps the playhead; drag pans
 /// the bench window.
 ///
-/// hook: the trace itself is splice positions (real clip boundaries, from
-/// [`PlaybackSession::lanes`]/`lane_clips` -- data the app already has), not
-/// a motion or audio trace -- that needs a per-frame decode of the whole
-/// film this task did not budget for. What would make it real: a cached
-/// low-res luma/RMS pass over each source at import, sampled here instead of
-/// clip boundaries.
+/// The trace is real audio, not a placeholder: [`Player::waves`] already
+/// caches each source's peaks for the bench's own waveform clips
+/// ([`bench_stance`]'s `clip_box`), so every audio-lane clip draws its own
+/// stretch of that same envelope here, positioned by its timeline fraction
+/// instead of `bench_stance`'s per-lane pixel scale -- the cheapest honest
+/// whole-film trace this app can draw without a new decode pass. Splice
+/// ticks (video-lane clip boundaries) still mark cut points on top of it.
 fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
     let duration = player.drawn_duration();
     let view = player.view();
@@ -160,6 +179,7 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         (0., 1.)
     };
     let fps = player.active_fps();
+    let frac = |f: u32| ((f64::from(f) / fps) / duration).clamp(0., 1.) as f32;
     let ticks: Vec<f32> = player
         .session
         .as_ref()
@@ -173,8 +193,28 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
         .unwrap_or_default()
         .into_iter()
         .filter(|_| duration > 0.)
-        .map(|f| ((f64::from(f) / fps) / duration).clamp(0., 1.) as f32)
+        .map(frac)
         .collect();
+    let traces: Vec<(f32, f32, Arc<Vec<(f32, f32)>>, f64, f64, u32)> = player
+        .session
+        .as_ref()
+        .filter(|_| duration > 0.)
+        .map(|s| {
+            s.lanes()
+                .into_iter()
+                .filter(|l| l.kind == LaneKind::Audio)
+                .flat_map(|l| s.lane_clips(l).to_vec())
+                .filter_map(|clip| {
+                    let source = player.sources().get(clip.source)?;
+                    let Wave::Peaks(peaks) = player.waves.get(&(source.path.clone(), source.audio_stream))?.clone() else {
+                        return None;
+                    };
+                    let (in_f, out_f) = (f64::from(clip.in_frame) / fps, f64::from(clip.out_frame) / fps);
+                    Some((frac(clip.start), frac(clip.end()), peaks, in_f, out_f, source_tint(clip.source)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let strip_bounds = STRIP_BOUNDS.with(Rc::clone);
     div()
         .id("stance-contact-strip")
@@ -228,7 +268,8 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
             cx.listener(|_, _, _, _| PAN_ANCHOR.with(|a| a.set(None))),
         )
         .child(bounds_probe(strip_bounds))
-        // The baseline trace (see the `hook:` above).
+        // Baseline: a quiet hairline under the real traces below it, so an
+        // audio-free stretch of film still reads as film rather than gap.
         .child(
             div()
                 .absolute()
@@ -238,18 +279,34 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                 .h(px(2.))
                 .bg(rgb(DARK_HAIRLINE())),
         )
+        // The real trace: each audio-lane clip's own envelope, in the
+        // source's ink, positioned by timeline fraction (see the fn doc
+        // above) -- the whole-film minimap MOCK-SPEC asks for, not a
+        // placeholder line.
+        .children(traces.into_iter().map(|(from, to, peaks, in_f, out_f, ink)| {
+            div()
+                .absolute()
+                .left(relative(from))
+                .top(px(4.))
+                .bottom(px(4.))
+                .w(relative((to - from).max(0.002)))
+                .child(waveform_ink(peaks, in_f, out_f, ink))
+        }))
         .children(ticks.into_iter().map(|frac| {
             div()
                 .absolute()
                 .left(relative(frac))
-                .top(px(9.))
+                .top(px(2.))
                 .w(px(1.))
-                .h(px(10.))
+                .h(px(24.))
                 .bg(rgb(LAMP_WHITE()))
         }))
-        // The viewport bracket: the bench window's own span, with grip
-        // notches at each edge (MOCK-SPEC: "1px viewport bracket (with grip
-        // notches)").
+        // The viewport bracket (MOCK-SPEC: "1px viewport bracket (with grip
+        // notches)"): FAULT 1's box fix -- DESIGN §4 reserves the full
+        // bordered rectangle for the room's one commit chip (Export), so this
+        // draws only the two edges (left/right verticals + corner notches),
+        // never a closed box, and stays visually distinct from the trace it
+        // sits over (ink1 lines/notches vs the trace's film ink fills).
         .child(
             div()
                 .absolute()
@@ -257,12 +314,31 @@ fn contact_strip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement 
                 .top_0()
                 .h_full()
                 .w(relative(width_frac.max(0.01)))
-                .border_1()
+                .border_l_1()
+                .border_r_1()
                 .border_color(rgb(INK1()))
                 .child(
                     div()
                         .absolute()
                         .left_0()
+                        .top_0()
+                        .w(px(2.))
+                        .h(px(6.))
+                        .bg(rgb(INK1())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .h(px(6.))
+                        .bg(rgb(INK1())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right_0()
                         .top_0()
                         .w(px(2.))
                         .h(px(6.))
@@ -327,7 +403,9 @@ fn export_chip(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .font(chord_style.font)
                 .text_size(chord_style.size)
                 .text_color(rgb(INK3()))
-                .child(player.keymap.display(ActionId::Export)),
+                // FAULT 2: compact badge everywhere in the band, same fix as
+                // `ghost` above (`Export  ^e`, not `Export  ctrl+e`).
+                .child(player.keymap.chord(ActionId::Export)),
         )
 }
 
@@ -353,19 +431,47 @@ pub(crate) fn render(player: &mut Player, position: f64, cx: &mut Context<Player
         // The most-read element anchors its region (DESIGN §5): the
         // timecode leads.
         .child(hero_timecode(&tc))
+        // FAULT 2, the J/K/L question: MOCK-SPEC reads this row's chords as
+        // `J`/`spc`/`L`, which DESIGN §6 names as the shuttle. No shuttle
+        // action exists anywhere in this codebase (grepped -- `keymap.rs`,
+        // `player/actions.rs`, the engine: nothing), and `j`/`k`/`l` are
+        // already bound to Speed/Color/Lift (`keymap.rs`'s Clip-verb group),
+        // not to this row -- rebinding them here would silently steal those,
+        // and `keymap.rs` is not this task's file to make that call in. So
+        // the glyphs below stay wired to what actually exists and already
+        // fires correctly (`JumpBack`/`Play`/`JumpForward`, real one-second
+        // stepping): each badge now reads that action's own compact chord
+        // (`^←`/`spc`/`^→`) instead of the mismatched mock label, which is
+        // what keeps glyph, badge and action honestly in agreement per this
+        // task's own rule -- the mock's `J`/`L` reading stays unimplemented
+        // and is named here rather than faked.
         .child(
             div()
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap(px(10.))
-                .child(ghost(player, "◀◀", ActionId::JumpBack))
                 .child(ghost(
+                    "stance-tb-jumpback",
+                    player,
+                    "◀◀",
+                    ActionId::JumpBack,
+                    cx,
+                ))
+                .child(ghost(
+                    "stance-tb-play",
                     player,
                     if player.transport().is_playing() { "❚❚" } else { "▶" },
                     ActionId::Play,
+                    cx,
                 ))
-                .child(ghost(player, "▶▶", ActionId::JumpForward)),
+                .child(ghost(
+                    "stance-tb-jumpforward",
+                    player,
+                    "▶▶",
+                    ActionId::JumpForward,
+                    cx,
+                )),
         )
         .child(cut_readout(player))
         .child(contact_strip(player, cx))

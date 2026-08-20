@@ -31,6 +31,93 @@ const LEDGER_H: f32 = 28.;
 /// Right side panel, fixed width, carrying the Src/Clip tab pair.
 const DOCK_W: f32 = 280.;
 
+thread_local! {
+    // FAULT 3: the picture region's own laid-out box, measured each frame by
+    // a [`bounds_probe`] the same shape `timeband_stance`'s contact strip
+    // keeps (`STRIP_BOUNDS`) -- the scale plate needs the box the picture was
+    // fitted into, which nothing upstream of paint knows.
+    static PICTURE_BOUNDS: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
+}
+
+/// The pure half of [`picture_scale`]: given a box and the image's native
+/// size, its `Contain` fit factor -- gpui's own tested `get_bounds` math
+/// ([`letterboxed_image`] fits the picture the same way), not a ratio
+/// reimplemented here. Split out from `picture_scale` so this arithmetic has
+/// a runnable check with no `Player`/window to stand up.
+fn fit_scale(bounds: Bounds<Pixels>, native: gpui::Size<gpui::DevicePixels>) -> Option<f32> {
+    if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) || native.width.0 <= 0 || native.height.0 <= 0 {
+        return None;
+    }
+    let fitted = gpui::ObjectFit::Contain.get_bounds(bounds, native);
+    Some(f32::from(fitted.size.width) / native.width.0 as f32)
+}
+
+/// The picture's own fit factor against its native size, read off the last
+/// frame's measured box (see [`PICTURE_BOUNDS`]). `None` with nothing open
+/// or before the first paint has measured anything.
+fn picture_scale(player: &Player) -> Option<f32> {
+    let image = player.image.clone()?;
+    fit_scale(PICTURE_BOUNDS.with(Rc::clone).get(), image.size(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 400x100 source fit into a 200x100 box: width-bound (bounds_ratio
+    /// 2 < image_ratio 4), so the picture lands at half its native width --
+    /// the number the scale plate would read as `scale 0.50`.
+    #[test]
+    fn the_scale_plate_reads_contains_own_fit_factor() {
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(200.), px(100.)),
+        };
+        let native = size(gpui::DevicePixels(400), gpui::DevicePixels(100));
+        assert!((fit_scale(bounds, native).unwrap() - 0.5).abs() < 0.001);
+    }
+
+    /// A degenerate (zero-size) box never divides by zero -- it says "no
+    /// reading yet" instead of NaN or a panic, the same guard every other
+    /// `bounds_probe`-fed measurement in this file makes before its first
+    /// paint.
+    #[test]
+    fn an_unmeasured_box_reads_no_scale_rather_than_nan() {
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(0.), px(0.)),
+        };
+        let native = size(gpui::DevicePixels(400), gpui::DevicePixels(100));
+        assert_eq!(fit_scale(bounds, native), None);
+    }
+}
+
+/// The scale plate (MOCK-SPEC.md "Screen": `scale 1.12`, label `ink3`, value
+/// in ink): a readout, so a plate (DESIGN §4), never a chip. Lives in the
+/// screen region's own margin row above the picture -- a flex sibling, not
+/// an overlay, so it can never cover a picture pixel (§11 check 6) whatever
+/// the source's aspect ratio does to the letterbox.
+fn scale_plate(player: &Player) -> impl IntoElement {
+    let value = picture_scale(player)
+        .map(|s| format!("{s:.2}"))
+        .unwrap_or_else(|| "--".to_string());
+    let style = type_scale::mono(type_scale::CHORD_METADATA_MIN_PX, gpui::FontWeight::MEDIUM);
+    div()
+        .id("stance-scale-plate")
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(2.))
+        .bg(rgb(DARK_CANVAS()))
+        .font(style.font)
+        .text_size(style.size)
+        .child(div().text_color(rgb(INK3())).child("scale"))
+        .child(div().text_color(rgb(INK1())).child(value))
+}
+
 /// A section head: 9px, uppercase, `ink3` -- DESIGN §3's scale for the label
 /// that names a region before anything else lives in it.
 fn section_head(label: &str) -> impl IntoElement {
@@ -220,6 +307,19 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
         // §4: room chrome takes 0 radius.
         .rounded(px(0.))
         .bg(rgb(DARK_CANVAS()))
+        // FAULT 3: the scale plate's own margin row, above the picture --
+        // a flex sibling shrinks the picture's `flex_1` to make room for it
+        // exactly as `two_up` already does below, so it is never drawn over
+        // real picture pixels.
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .justify_end()
+                .px(px(6.))
+                .pt(px(4.))
+                .child(scale_plate(player)),
+        )
         .child(
             div()
                 .id("stance-picture")
@@ -227,7 +327,8 @@ fn screen(player: &mut Player, position: f64, window: &mut Window, cx: &mut Cont
                 .min_h(px(0.))
                 .flex()
                 .relative()
-                .child(player.picture_area(position, window, cx)),
+                .child(player.picture_area(position, window, cx))
+                .child(bounds_probe(PICTURE_BOUNDS.with(Rc::clone))),
         )
         .children(two_up)
 }
