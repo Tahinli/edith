@@ -270,15 +270,16 @@ impl Player {
         };
         match target {
             Some(clip) => {
+                // One card at a time: `close_card` is the single list of
+                // every flag that means "a card is up", so opening this one
+                // starts by closing all of them.
+                self.close_card();
                 self.color_open = Some(clip);
                 self.color_band = 0;
                 self.color_dragging = false;
                 // A sample the last card held back belongs to the clip it was
                 // dragged on, and this may be another one.
                 self.pending_color = None;
-                // One card at a time, the rule both the others already follow.
-                self.keys_open = false;
-                self.export_open = false;
                 self.context_menu = None;
             }
             None => self.notify_user("no clip under the playhead to grade".into()),
@@ -415,12 +416,12 @@ impl Player {
         };
         match target {
             Some(clip) => {
+                // One card at a time -- `close_card`'s own rule.
+                self.close_card();
                 self.transform_open = Some(clip);
                 self.transform_band = 0;
                 self.transform_dragging = false;
                 self.pending_transform = None;
-                self.keys_open = false;
-                self.export_open = false;
                 self.context_menu = None;
             }
             None => self.notify_user("no clip under the playhead to place".into()),
@@ -550,16 +551,12 @@ impl Player {
         };
         match anchor {
             Some(clip) => {
+                // One card at a time -- `close_card`'s own rule.
+                self.close_card();
                 self.speed_open = Some(clip);
                 self.speed_dragging = false;
                 // The colour card's rule: a held sample is the last clip's.
                 self.pending_speed = None;
-                // One card at a time, the rule the other four follow.
-                self.keys_open = false;
-                self.export_open = false;
-                self.eq_open = None;
-                self.color_open = None;
-                self.close_silence();
                 self.context_menu = None;
             }
             None => self.notify_user("no clip under the playhead to re-time".into()),
@@ -735,14 +732,14 @@ impl Player {
                     cx.notify();
                     return;
                 }
+                // One card at a time -- `close_card`'s own rule. This clears
+                // `silence_open` too when the same clip is reopened; the
+                // marks it drops come back below from the levels cache
+                // (`scan_plan`/`silence_cached`), which `close_card` never
+                // touches.
+                self.close_card();
                 self.silence_open = Some((lane, idx));
                 self.silence_field = 0;
-                // One card at a time, the rule the other four follow.
-                self.keys_open = false;
-                self.export_open = false;
-                self.eq_open = None;
-                self.color_open = None;
-                self.speed_open = None;
                 self.context_menu = None;
                 // The clip's own range, not the file's: the scan reads what this
                 // clip plays and nothing else, so a take cut in half costs half
@@ -784,17 +781,12 @@ impl Player {
         if self.exporting().is_some() {
             return;
         }
+        // One card at a time -- `close_card`'s own rule.
+        self.close_card();
         self.mix_open = true;
         self.mix_field = lane
             .and_then(|lane| self.mix_lanes().iter().position(|&l| l == lane))
             .unwrap_or(0);
-        // One card at a time, the rule the other five follow.
-        self.keys_open = false;
-        self.export_open = false;
-        self.eq_open = None;
-        self.color_open = None;
-        self.speed_open = None;
-        self.close_silence();
         self.context_menu = None;
         cx.notify();
     }
@@ -862,17 +854,11 @@ impl Player {
     /// export, which never burns a cue into the picture -- so like the mix
     /// card it opens with no timeline required and nothing to refuse.
     pub(crate) fn open_subtitle_style(&mut self, cx: &mut Context<Self>) {
+        // One card at a time -- `close_card`'s own rule.
+        self.close_card();
         self.subtitle_fonts = cx.text_system().all_font_names();
         self.subtitle_style_open = true;
         self.subtitle_style_field = 0;
-        // One card at a time, the rule the other five follow.
-        self.keys_open = false;
-        self.export_open = false;
-        self.eq_open = None;
-        self.color_open = None;
-        self.speed_open = None;
-        self.mix_open = false;
-        self.close_silence();
         self.context_menu = None;
         cx.notify();
     }
@@ -1342,12 +1328,11 @@ impl Player {
             .eq_of(lane, idx)
             .cloned()
             .unwrap_or_else(EqParams::default_layout);
+        // One card at a time -- `close_card`'s own rule.
+        self.close_card();
         self.eq_band = 0;
         self.eq_dragging = false;
         self.eq_open = Some((lane, idx));
-        // One card at a time, the rule the other two already follow.
-        self.keys_open = false;
-        self.export_open = false;
         self.context_menu = None;
         cx.notify();
     }
