@@ -322,10 +322,11 @@ pub(crate) const TIMELINE_FIXED_H: f32 = 16. + 18. + 8. + RULER_HIT_H + 8. + 4.;
 /// hand it to the lane column as a bonus at exactly the zoom where the hand is
 /// least expecting the bed to move.
 pub(crate) fn timeline_fixed_h(scroll: bool) -> f32 {
-    TIMELINE_FIXED_H + match scroll {
-        true => 8. + SCROLL_HIT,
-        false => 0.,
-    }
+    TIMELINE_FIXED_H
+        + match scroll {
+            true => 8. + SCROLL_HIT,
+            false => 0.,
+        }
 }
 
 /// The most of a short window the timeline may take, sized so the seam's own
@@ -471,11 +472,9 @@ const LEDGER_SEAM_CLEARANCE: f32 = 1.;
 /// lane, which has no next row to spill into and clipped straight into the
 /// ledger instead.
 ///
-/// A third driven pass at the next floor (`94.`, `BENCH_CHROME_H` still
-/// undercounted at `20.`) clipped A1's dot again, by one row -- two 1px
-/// causes stacked, not one 2px guess: `BENCH_CHROME_H`'s own undercount
-/// (`20.` vs its real `21.`) and this term, `LEDGER_SEAM_CLEARANCE`, which
-/// the formula never carried at all. `21 + 22 + 2 + 48 + 2 + 1` = `96.`.
+/// With the 18/15/14-13/12/10px type scale, the same derivation uses a 24px
+/// chrome block and two 27px lane floors:
+/// `24 + 22 + 2 + 54 + 2 + 1` = `105.`.
 pub(crate) const BENCH_MIN_H: f32 = crate::ui::stance::BENCH_CHROME_H
     + crate::ui::bench_stance::RULER_H
     + crate::ui::bench_stance::ROW_GAP
@@ -539,8 +538,12 @@ pub(crate) fn load_stance_splits_from(path: &std::path::Path) -> Splits {
     let mut splits = Splits::default();
     if let Ok(text) = std::fs::read_to_string(path) {
         for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else { continue };
-            let Ok(px) = value.trim().parse::<f32>() else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(px) = value.trim().parse::<f32>() else {
+                continue;
+            };
             let Some(split) = Split::PERSISTED.into_iter().find(|s| s.key() == key) else {
                 continue;
             };
@@ -561,7 +564,11 @@ pub(crate) fn save_stance_splits(splits: &Splits) {
 pub(crate) fn save_stance_splits_to(splits: &Splits, path: &std::path::Path) {
     let text: String = Split::PERSISTED
         .into_iter()
-        .filter_map(|split| splits.get(split).map(|px| format!("{}={px}\n", split.key())))
+        .filter_map(|split| {
+            splits
+                .get(split)
+                .map(|px| format!("{}={px}\n", split.key()))
+        })
         .collect();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

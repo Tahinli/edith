@@ -38,9 +38,9 @@
 //! `nudge_cut` and friends still act on `Player::selected` directly, with no
 //! element under the pointer required, and stay untouched by any of this.
 
-use crate::*;
 use crate::ui::type_scale::{self, Typeset};
 use crate::ui::widgets::*;
+use crate::*;
 
 /// The pinned ruler's own height, above the lane stack -- tall enough for a
 /// tick line plus a mono `MM:SS` label under it (DESIGN §5's "tick marks with
@@ -53,11 +53,15 @@ const TICK_STOPS: [f64; 13] = [
     0.5, 1., 2., 5., 10., 15., 30., 60., 120., 300., 600., 1800., 3600.,
 ];
 /// The floor a tick's pixel spacing must clear before its label is legible
-/// mono text at 8px.
+/// mono text at 10px.
 const TICK_MIN_PX: f64 = 64.;
-/// The playhead timecode plate's own width, wide enough for `HH:MM:SS:FF`
-/// mono at 10px plus the plate's padding.
-const PLATE_W: f32 = 74.;
+/// The playhead timecode plate's own width: eleven mono characters at the
+/// 14px readout role plus its horizontal padding and a 1px rounding guard,
+/// derived from the shared list-character calibration so the plate grows with
+/// its type scale.
+const PLATE_W: f32 = 11. * crate::layout::LIST_CHAR_W / type_scale::CHORD_METADATA_MIN_PX
+    * type_scale::CHORD_METADATA_MAX_PX
+    + 9.;
 /// The pinned track-head column, DESIGN §5's "track heads" -- narrower than
 /// the legacy timeline's `HEADER_W` since a darkroom lane carries no mix/eye
 /// button yet (deferred with the rest of the header's verbs).
@@ -79,10 +83,8 @@ pub(crate) const LANE_DOT_D: f32 = 4.;
 /// golden ratio (`gpui::phi()` == `relative(1.618034)`), and `lane_row`
 /// never calls `.line_height()` on the head label to override it -- so this
 /// is what the label really occupies, not its glyph height.
-/// round(12. * 1.618034) would be wrong here: the head uses
-/// `CHORD_METADATA_MIN_PX` (11.), so round(11. * 1.618034) = round(17.798)
-/// = 18.
-const LANE_LABEL_LINE_H: f32 = 18.;
+/// `round(13. * 1.618034) = 21`.
+const LANE_LABEL_LINE_H: f32 = 21.;
 /// The least a lane row may be: what its own head actually draws, not a
 /// number copied from nowhere. The old `18.` fit only the label's line box
 /// and let every lane's status dot overflow into the row beneath it --
@@ -200,7 +202,9 @@ fn clip_box(
     let source = player.sources().get(clip.source);
     let label = source.map(|s| file_name(&s.path));
     let audio = lane.kind == LaneKind::Audio;
-    let wave = source.and_then(|s| player.waves.get(&(s.path.clone(), s.audio_stream))).cloned();
+    let wave = source
+        .and_then(|s| player.waves.get(&(s.path.clone(), s.audio_stream)))
+        .cloned();
     // hook: §12 step 5 -- per-source film ink attaches here, replacing
     // `source_tint` (library_meta.rs's own placeholder wheel, index-keyed and
     // already different per source) with the source's own quantized hue.
@@ -213,7 +217,10 @@ fn clip_box(
     let has_spine = t != Tier::Sliver;
     let has_label = matches!(t, Tier::Full | Tier::NoChip);
     let has_chip = t == Tier::Full && !clip.speed.is_normal();
-    let (in_frame, out_frame) = (f64::from(clip.in_frame) / player.fps, f64::from(clip.out_frame) / player.fps);
+    let (in_frame, out_frame) = (
+        f64::from(clip.in_frame) / player.fps,
+        f64::from(clip.out_frame) / player.fps,
+    );
     let speed = clip.speed;
     // Right-aligned readout: the trim delta off the source's full length when
     // this clip is shorter than the file it was cut from, else the plain
@@ -222,7 +229,12 @@ fn clip_box(
     // means (§12's cut object has no per-edge history at this layer) --
     // ceiling is wiring this to the same cut state once the time band exposes
     // it, rather than a second reading of "trim" here.
-    let full_frames = source.map(|s| player.session.as_ref().map_or(0, |sess| sess.file_frames(&s.path)));
+    let full_frames = source.map(|s| {
+        player
+            .session
+            .as_ref()
+            .map_or(0, |sess| sess.file_frames(&s.path))
+    });
     let readout = match full_frames {
         Some(full) if full > clip.frames() => {
             let delta = f64::from(full - clip.frames()) / player.fps;
@@ -234,7 +246,10 @@ fn clip_box(
     // is consumed by the name plate below.
     let ghost: SharedString = label.clone().unwrap_or_else(|| lane.label()).into();
     div()
-        .id(("bench-clip", lane.ord * 1000 + lane.kind as usize * 100 + idx))
+        .id((
+            "bench-clip",
+            lane.ord * 1000 + lane.kind as usize * 100 + idx,
+        ))
         .absolute()
         .top_0()
         .h_full()
@@ -270,10 +285,17 @@ fn clip_box(
         // Dragged, it moves: to the frame and the lane it is let go over
         // (`Player::move_clip`, `ClipDrag`) -- the same payload and the same
         // ghost tooltip `ui/timeline.rs`'s own clip box drags.
-        .on_drag(ClipDrag { lane, idx, clip: placed }, {
-            let ghost = ghost.clone();
-            move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
-        })
+        .on_drag(
+            ClipDrag {
+                lane,
+                idx,
+                clip: placed,
+            },
+            {
+                let ghost = ghost.clone();
+                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+            },
+        )
         // The two edge strips a drag lengthens or shortens the clip by
         // (`Player::start_trim`), gated on the same `trims(span)` floor the
         // legacy strips use -- a clip too narrow to aim at keeps its whole
@@ -330,17 +352,19 @@ fn clip_box(
         // (falling back to a flat placeholder body while it loads or if the
         // file never yields one).
         .when(has_trace && audio, |d| {
-            d.children(wave.and_then(|w| match w {
-                Wave::Peaks(peaks) => Some(
-                    div()
-                        .absolute()
-                        .left(px(3.))
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .child(waveform_ink(peaks, in_frame, out_frame, ink)),
-                ),
-                _ => None,
+            d.children(wave.and_then(|w| {
+                match w {
+                    Wave::Peaks(peaks) => Some(
+                        div()
+                            .absolute()
+                            .left(px(3.))
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .child(waveform_ink(peaks, in_frame, out_frame, ink)),
+                    ),
+                    _ => None,
+                }
             }))
         })
         .when(has_trace && !audio, |d| {
@@ -361,7 +385,8 @@ fn clip_box(
         })
         // Name plate + trim/duration readout: one strip, DESIGN §4's plate
         // (canvas-on-panel), sat at the clip's top-left/top-right per the mock
-        // rather than the name alone hanging below the box.
+        // rather than the name alone hanging below the box. Its 21px height is
+        // the metadata role's default phi() line box, not its 13px glyph size.
         .when(has_label, |d| {
             d.child(
                 div()
@@ -369,7 +394,7 @@ fn clip_box(
                     .left(px(3.))
                     .right_0()
                     .top_0()
-                    .h(px(13.))
+                    .h(px(LANE_LABEL_LINE_H))
                     .px(px(3.))
                     .flex()
                     .items_center()
@@ -392,7 +417,10 @@ fn clip_box(
                     .child(
                         div()
                             .flex_none()
-                            .type_style(type_scale::mono(9., gpui::FontWeight::MEDIUM))
+                            .type_style(type_scale::mono(
+                                type_scale::FLOOR_PX,
+                                gpui::FontWeight::MEDIUM,
+                            ))
                             .text_color(rgb(INK3()))
                             .child(readout),
                     ),
@@ -408,7 +436,10 @@ fn clip_box(
                     .right_0()
                     .px(px(3.))
                     .bg(rgb(DARK_RAISED()))
-                    .type_style(type_scale::mono(9., gpui::FontWeight::MEDIUM))
+                    .type_style(type_scale::mono(
+                        type_scale::FLOOR_PX,
+                        gpui::FontWeight::MEDIUM,
+                    ))
                     .text_color(rgb(INK2()))
                     .child(format!("{speed}")),
             )
@@ -458,7 +489,10 @@ fn sub_box(
     // (`PlaybackSession::sub_lane_cues`, the same map the export and the
     // picture's own plate go through).
     let cues: Vec<(f32, f32)> = player.session.as_ref().map_or_else(Vec::new, |s| {
-        s.sub_lane_cues(lane).iter().map(|cue| cue_box(scale, cue)).collect()
+        s.sub_lane_cues(lane)
+            .iter()
+            .map(|cue| cue_box(scale, cue))
+            .collect()
     });
     let label = player
         .session
@@ -490,10 +524,17 @@ fn sub_box(
                 this.open_menu(lane, idx, event.position, cx);
             }),
         )
-        .on_drag(SubDrag { lane, idx, sub: placed }, {
-            let ghost = ghost.clone();
-            move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
-        })
+        .on_drag(
+            SubDrag {
+                lane,
+                idx,
+                sub: placed,
+            },
+            {
+                let ghost = ghost.clone();
+                move |_, _, _, cx| cx.new(|_| Tip(ghost.clone()))
+            },
+        )
         // The same edge-trim strips a clip gets, on the same [`trims`] floor.
         .children(
             [Edge::Start, Edge::End]
@@ -681,15 +722,15 @@ fn lane_row(
                 // pointer actually being inside this bed's own bounds, since
                 // `on_drag_move` fires on every painted element of the drag's
                 // type, not just the one under the pointer.
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<AssetDrag>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
                             return;
                         }
                         let path = event.drag(cx).0.clone();
                         this.preview_ghost_asset(&path, lane, event.event.position.x, cx);
-                    },
-                ))
+                    }),
+                )
                 .drag_over::<ClipDrag>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
                 .on_drop(cx.listener(move |this, drag: &ClipDrag, window, cx| {
                     let Some(idx) = this.dragged(drag) else {
@@ -697,15 +738,15 @@ fn lane_row(
                     };
                     this.move_clip(drag.lane, idx, lane, window.mouse_position().x, cx)
                 }))
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<ClipDrag>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
                             return;
                         }
                         let drag = *event.drag(cx);
                         this.preview_ghost(&drag, lane, event.event.position.x, cx);
-                    },
-                ))
+                    }),
+                )
                 // A caption already on a lane moves along it, or onto another
                 // subtitle track, exactly as a clip does (`Player::move_sub`,
                 // the same call `ui/timeline.rs`'s own bed makes).
@@ -713,25 +754,25 @@ fn lane_row(
                 .on_drop(cx.listener(move |this, drag: &SubDrag, window, cx| {
                     this.move_sub(drag, lane, window.mouse_position().x, cx);
                 }))
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<SubDrag>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
                             return;
                         }
                         let drag = *event.drag(cx);
                         this.preview_ghost_sub(&drag, lane, event.event.position.x, cx);
-                    },
-                ))
+                    }),
+                )
                 .drag_over::<SubPick>(|d, _, _, _| d.bg(rgb(DARK_RAISED())))
-                .on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<SubPick>, _, cx| {
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<SubPick>, _, cx| {
                         if !event.bounds.contains(&event.event.position) {
                             return;
                         }
                         let track = event.drag(cx).0;
                         this.preview_ghost_pick(track, lane, event.event.position.x, cx);
-                    },
-                ))
+                    }),
+                )
                 // The wheel, matched to the legacy timeline's own mapping:
                 // ctrl+wheel zooms about the pointer, a bare wheel scrolls
                 // the bed along the film (`Player::timeline_wheel`). Stopped
@@ -793,7 +834,11 @@ fn lane_row(
 
 /// The bench's content: pinned ruler, pinned heads, lane stack -- compressed
 /// evenly to [`LANES_COMPRESS`] rows and then scrolling (DESIGN §7).
-pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) -> impl IntoElement {
+pub(crate) fn render(
+    player: &mut Player,
+    box_h: f32,
+    cx: &mut Context<Player>,
+) -> impl IntoElement {
     let lanes = player
         .session
         .as_ref()
@@ -869,26 +914,22 @@ pub(crate) fn render(player: &mut Player, box_h: f32, cx: &mut Context<Player>) 
                     this.timeline_wheel(event, cx);
                 }))
                 .children(ticks.into_iter().map(|(x, label)| {
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(x))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_start()
-                                .child(div().w(px(1.)).h(px(4.)).bg(rgb(INK3())))
-                                .child(
-                                    div()
-                                        .type_style(type_scale::mono(
-                                            type_scale::FLOOR_PX,
-                                            gpui::FontWeight::MEDIUM,
-                                        ))
-                                        .text_color(rgb(INK3()))
-                                        .child(label),
-                                ),
-                        )
+                    div().absolute().top_0().left(px(x)).child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .child(div().w(px(1.)).h(px(4.)).bg(rgb(INK3())))
+                            .child(
+                                div()
+                                    .type_style(type_scale::mono(
+                                        type_scale::FLOOR_PX,
+                                        gpui::FontWeight::MEDIUM,
+                                    ))
+                                    .text_color(rgb(INK3()))
+                                    .child(label),
+                            ),
+                    )
                 }))
                 .child(
                     div()
