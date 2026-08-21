@@ -619,6 +619,23 @@ fn clip_tab(player: &Player, width: f32, window_size: Size<Pixels>, cx: &mut Con
                     "track volumes and the limiter",
                     player,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.open_mix(None, cx)),
+                ))
+                // Fit: a cycle, not a card, so `active` is always false --
+                // there is no open state to hold it down for, only the click
+                // itself (same anatomy as `cycle_fit`'s own inspector.rs row,
+                // legacy's `crates/app/src/ui/inspector.rs:244-253`). It was
+                // reachable only by its chord or buried in the clip's
+                // right-click menu (`overlays.rs`'s `Pick::Fit`); this is its
+                // direct button, beside the other per-clip verbs it keeps
+                // company with.
+                .child(ghost_verb(
+                    "dock-verb-fit",
+                    "Fit",
+                    ActionId::Fit,
+                    false,
+                    "how this picture is placed on the project canvas",
+                    player,
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_fit(cx)),
                 )),
         )
         .child(
