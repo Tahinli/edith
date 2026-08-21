@@ -102,8 +102,19 @@ pub(crate) fn enable(action: ActionId, ctx: Ctx) -> Enable {
     // touching no timeline, live through an export the same way.
     // ...and the cue plate's own font and size: a reading preference like the
     // theme, never burned into an export, live the same way.
+    //
+    // Settings is not in this list, on purpose: it opens the same modal slot
+    // the exporting card owns (`Player::open_settings`, one card at a time),
+    // so a permission this oracle granted here would be a permission nobody
+    // could ever observe. It is refused below, with every other card.
     if action == ActionId::Theme || action == ActionId::Fullscreen || action == ActionId::SubtitleStyle {
         return Enable::Yes;
+    }
+    if action == ActionId::Settings {
+        return match ctx.exporting {
+            true => Enable::No("an export is running"),
+            false => Enable::Yes,
+        };
     }
     if action == ActionId::ShowActions {
         return match ctx.exporting {

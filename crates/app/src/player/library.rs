@@ -9,6 +9,69 @@ const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// periodic half of "debounced + periodic".
 const AUTOSAVE_PERIOD: Duration = Duration::from_secs(60);
 
+/// Where the auto-proxies *default* survives, beside the keybindings and the
+/// theme, same corner-cut persistence as [`crate::subs::subtitle_style_path`]:
+/// a torn write costs this one preference and nothing else.
+///
+/// This is the window's own answer, not the project's: a project that was
+/// saved with the switch set already carries its own line
+/// ([`engine::edith::Document::auto_proxy`]) and always wins once one is
+/// open ([`Player::install_project`]) -- this file is only ever read before
+/// that, which is what makes it the difference between "the switch reverts to
+/// On on every relaunch" and "the switch stayed how it was left".
+pub(crate) fn auto_proxies_pref_path() -> PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("auto-proxies")
+}
+
+/// `On` unless the file says `off`; missing, unreadable or garbled all read as
+/// `On`, the same default the field has always started at -- a preference
+/// file is not the user's work, so a bad one is worth no message at startup.
+pub(crate) fn load_auto_proxies_pref() -> bool {
+    match std::fs::read_to_string(auto_proxies_pref_path()) {
+        Ok(text) => text.trim() != "off",
+        Err(_) => true,
+    }
+}
+
+/// Writes the pick whole, the way [`crate::ui::theme::save`] writes the
+/// palette.
+pub(crate) fn save_auto_proxies_pref(on: bool) -> std::io::Result<()> {
+    let path = auto_proxies_pref_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, if on { "on\n" } else { "off\n" })
+}
+
+/// Where the Proxies *default* survives -- Proxies' own sibling of
+/// [`auto_proxies_pref_path`], same corner-cut persistence.
+///
+/// This is the window's own answer, not the project's: a project saved with
+/// the switch set carries its own line and always wins once one is open
+/// ([`Player::install_project`]) -- this file is only ever read before that.
+pub(crate) fn proxies_pref_path() -> PathBuf {
+    crate::keymap::Keymap::config_path().with_file_name("proxies")
+}
+
+/// `Off` unless the file says `on`; missing, unreadable or garbled all read as
+/// `Off`, the same default the field has always started at -- a preference
+/// file is not the user's work, so a bad one is worth no message at startup.
+pub(crate) fn load_proxies_pref() -> bool {
+    match std::fs::read_to_string(proxies_pref_path()) {
+        Ok(text) => text.trim() == "on",
+        Err(_) => false,
+    }
+}
+
+/// Writes the pick whole, the way [`save_auto_proxies_pref`] does.
+pub(crate) fn save_proxies_pref(on: bool) -> std::io::Result<()> {
+    let path = proxies_pref_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, if on { "on\n" } else { "off\n" })
+}
+
 impl Player {
     /// The one way a library row reaches the timeline: the Add button and a row
     /// dragged onto a lane both come here, so there is a single answer to what
@@ -738,6 +801,14 @@ impl Player {
             (true, n, m) => format!("PROXIES ON — cutting on {n}, {m} still being made"),
         };
         eprintln!("{text}");
+        // Kept for the next launch, not only the next project -- the same
+        // reason auto-proxies keeps one ([`save_auto_proxies_pref`]).
+        if let Err(e) = save_proxies_pref(on) {
+            let path = proxies_pref_path();
+            self.notify_user(
+                format!("PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+            );
+        }
         self.notify_user(text.into());
         // The switch reseeks the session, and the wait for that picture is what
         // this clears -- with nothing open there is no open to wait for, and a
@@ -770,6 +841,15 @@ impl Player {
             false => "AUTO PROXIES OFF — no import makes one; Proxies on is what asks for them",
         };
         eprintln!("{text}");
+        // Kept for the next launch, not only the next project -- a flip made
+        // with nothing open, or a project never saved after it, used to
+        // vanish the moment the window closed ([`load_auto_proxies_pref`]).
+        if let Err(e) = save_auto_proxies_pref(on) {
+            let path = auto_proxies_pref_path();
+            self.notify_user(
+                format!("AUTO PROXIES DEFAULT COULD NOT BE KEPT — {} — {e}", path.display()).into(),
+            );
+        }
         self.notify_user(text.into());
         cx.notify();
     }

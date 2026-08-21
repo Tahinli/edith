@@ -163,6 +163,7 @@ impl Player {
             // the key handler is what answers this one while there is.
             ActionId::CancelExport => {}
             ActionId::ShowActions => self.show_actions(cx),
+            ActionId::Settings => self.open_settings(cx),
             ActionId::Screenshot => self.take_screenshot(cx),
             // Cut machinery (DESIGN.md §6): the subject cut is the marked
             // clip ([`Selection::anchor`]) -- the oracle already refused

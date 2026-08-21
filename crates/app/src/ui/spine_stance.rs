@@ -312,5 +312,11 @@ pub(crate) fn render(player: &Player, cx: &mut Context<Player>) -> impl IntoElem
             glyph("spine-fullscreen", "FS", ActionId::Fullscreen, false, true, player, cx),
         ))
         .child(glyph("spine-screenshot", "Sh", ActionId::Screenshot, false, true, player, cx))
+        // The settings page's own visible door (user complaint: "some
+        // options are only reachable via keyboard shortcut") -- a chord
+        // alone is a defect class this room has hit repeatedly, so this
+        // glyph sits beside the other once-a-session ROOM acts even though
+        // its chord (`^,`) is a preference, not a mnemonic.
+        .child(glyph("spine-settings", "St", ActionId::Settings, player.settings_open, true, player, cx))
         .child(div().flex_1())
 }

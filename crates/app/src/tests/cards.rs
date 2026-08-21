@@ -25,7 +25,7 @@ fn no_overlaid_state_in_the_stance_goes_modal_without_painting_something() {
         );
     }
     let guard_at = stance
-        .find("if this.rebinding.is_some() || this.overlaid() {")
+        .find("if this.rebinding.is_some()\n                || this.card_open()")
         .expect("the stance's modal guard");
     let guard = &stance[guard_at..guard_at + 1600];
     for field in ["this.context_menu = None", "this.library_menu = None", "this.picker = None"] {
@@ -43,8 +43,15 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
     // rather than hand-copied -- a hand-copied list is exactly the shape
     // that let three cards go modal with nothing mounted (GAP 2): the field
     // was in `modal()` and nowhere in this test.
-    let modal_body = fn_body("modal");
-    let mut fields = Vec::new();
+    // `modal()` itself is now just `card_open() || exporting().is_some()`
+    // ([`Player::card_open`], split out so the darkroom's key guard can read
+    // "a card is open" without also reading "an export is running" -- see
+    // `ui::stance`'s guard and `an_export_alone_does_not_lock_the_stances_keyboard`
+    // below) -- so the card fields this test pins live in `card_open()` now,
+    // with `exporting` added by hand since `modal()`'s own body names it
+    // directly rather than through a field this splitter would find.
+    let modal_body = fn_body("card_open");
+    let mut fields = vec!["exporting".to_string()];
     for chunk in modal_body.split("self.").skip(1) {
         let name: String = chunk
             .chars()
@@ -75,6 +82,7 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
             "silence_open" => "silence_card(",
             "mix_open" => "mix_card(",
             "subtitle_style_open" => "subtitle_style_card(",
+            "settings_open" => "settings_stance::render(",
             other => panic!(
                 "Player::modal() now reads `self.{other}` with no entry in this test's \
                  mount_for map -- add one naming the function that mounts its surface in \
@@ -93,6 +101,47 @@ fn every_modal_field_has_a_mounted_surface_somewhere_in_the_darkroom() {
              an invisible modal (GAP 2)."
         );
     }
+}
+
+/// D2's class: an action refused while a modal is up used to be sworn to
+/// silence, because the stance's own key guard ate the keystroke before
+/// `enable()`/`act()` ever saw it -- driven live with `ctrl+,` mid-export
+/// (no card open, only `exporting()` true): no notice plate, ledger reading
+/// `—`. `ActionId::Settings`'s own refusal string (`oracle.rs`) was sound and
+/// simply never reachable.
+///
+/// The fix lives in the guard, not in Settings alone (the charter this test
+/// pins is explicit that a per-action patch would leave every *other* action
+/// refused during a bare export equally mute): [`Player::card_open`] is
+/// `modal()` with `exporting()` split out, and the stance's guard now reads
+/// `card_open()` -- never `overlaid()`/`modal()` directly, both of which
+/// still fold `exporting()` back in for the surfaces that are meant to keep
+/// blocking imports and edits during an export ([`Player::modal`]'s own
+/// doc comment). This is a source scan, the same kind the guard above it
+/// already is: this binary has no `TestAppContext` to actually press `ctrl+,`
+/// mid-export and read the notice plate back.
+#[test]
+fn the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked() {
+    let stance = src_text("ui/stance.rs");
+    let guard_at = stance
+        .find("if this.rebinding.is_some()\n                || this.card_open()")
+        .expect("the stance's modal guard moved -- update this test's search string");
+    let guard_line = &stance[guard_at..guard_at + 200];
+    assert!(
+        !guard_line.contains("overlaid()") && !guard_line.contains("this.modal()"),
+        "the stance's key guard reads overlaid()/modal() again, which folds `exporting()` \
+         back in and re-mutes every refusal an export-only moment should be able to speak (D2)"
+    );
+    // The split itself: card_open() must never grow an exporting read of its
+    // own, or the guard above -- which trusts card_open() to mean "an actual
+    // card/menu/rebind owns the keyboard" -- silently regains the same mute.
+    let card_open_body = fn_body("card_open");
+    assert!(
+        !card_open_body.contains("exporting"),
+        "Player::card_open() now reads `exporting` -- that reintroduces the swallow \
+         `the_stances_key_guard_does_not_swallow_a_bare_export_before_the_oracle_is_asked` \
+         exists to keep out; `modal()` is where `exporting()` belongs"
+    );
 }
 
 #[test]
