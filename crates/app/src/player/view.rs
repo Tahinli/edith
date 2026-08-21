@@ -405,9 +405,10 @@ impl Player {
                 let anchor = px_along(event.position.x, self.ruler.get());
                 self.zoom(factor, Some(anchor), cx);
             }
-            // Up is back towards the head of the timeline, the way a wheel up
-            // is back towards the top of a page.
-            false => self.scroll_view(-d.signum(), cx),
+            // Up runs forward along the film. A page's wheel-up goes back
+            // toward its top, but a timeline is not a page: the wheel pushes
+            // the film past the playhead, so up is later. (User, 2026-08-21.)
+            false => self.scroll_view(d.signum(), cx),
         }
     }
 }
