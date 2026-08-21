@@ -95,6 +95,7 @@ impl DockSort {
     }
 }
 
+
 /// A ghost verb (DESIGN §4): borderless glyph/label in `ink2`, its chord in
 /// `ink3` beside it, read live off the keymap so it can never drift from the
 /// key that does the same thing. Hover is one fill step and an ink brighten;
@@ -261,7 +262,50 @@ fn source_row(
     let dragged = (path.clone(), stream);
     let dot_path = path.clone();
     let menu_path = path.clone();
+    let add_path = path.clone();
+    let proxy_path = path.clone();
     let ghost = name.clone();
+    let can_insert = usable && player.session.is_some() && player.exporting().is_none();
+    let (proxy_glyph, proxy_on, proxy_progress, proxy_waiting, proxy_tip) =
+        match player.proxies.get(&row.path) {
+            Some(Proxy::Ready) => (
+                "●",
+                true,
+                None,
+                false,
+                format!("Stand-in ON for {} — click to delete it", row.name),
+            ),
+            Some(Proxy::Making(job)) => (
+                "■",
+                true,
+                Some(job.progress()),
+                false,
+                format!("Stop making the stand-in for {}", row.name),
+            ),
+            Some(Proxy::Cancelling(_)) => (
+                "■",
+                true,
+                None,
+                true,
+                format!("Stopping the stand-in for {}…", row.name),
+            ),
+            Some(Proxy::Asked) => (
+                "○",
+                false,
+                None,
+                true,
+                format!("Preparing the stand-in for {}…", row.name),
+            ),
+            _ => (
+                "○",
+                false,
+                None,
+                false,
+                format!("Stand-in OFF for {} — click to make one", row.name),
+            ),
+        };
+    let proxy_stops = proxy_glyph == "■";
+    let proxy_tip: SharedString = proxy_tip.into();
     div()
         .id(("dock-source", i))
         .flex_none()
@@ -387,6 +431,107 @@ fn source_row(
                         .text_size(style.size)
                         .text_color(rgb(INK3()))
                         .child(usage)
+                })
+                .when(usable, |d| {
+                    d.child({
+                        let label_style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
+                        let chord_style =
+                            mono(type_scale::CHORD_METADATA_MIN_PX, FontWeight::MEDIUM);
+                        div()
+                            .id(("dock-add-at-playhead", i))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .px(px(4.))
+                            .py(px(2.))
+                            .rounded(px(3.))
+                            .when(!can_insert, |d| d.opacity(0.4).cursor_not_allowed())
+                            .when(can_insert, |d| {
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.insert_source(
+                                                &add_path,
+                                                stream,
+                                                None,
+                                                None,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        },
+                                    ))
+                            })
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| {
+                                    Tip(
+                                        "Add at playhead — ↵ does the same after selecting this source"
+                                            .into(),
+                                    )
+                                })
+                                .into()
+                            })
+                            .child(
+                                div()
+                                    .font(label_style.font)
+                                    .text_size(label_style.size)
+                                    .text_color(rgb(INK2()))
+                                    .child("Add"),
+                            )
+                            .child(
+                                div()
+                                    .font(chord_style.font)
+                                    .text_size(chord_style.size)
+                                    .text_color(rgb(INK3()))
+                                    .child("↵"),
+                            )
+                    })
+                    .child({
+                        let style = mono(type_scale::LABEL_ROW_PX, FontWeight::MEDIUM);
+                        div()
+                            .id(("dock-proxy-toggle", i))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(2.))
+                            .px(px(4.))
+                            .py(px(2.))
+                            .rounded(px(3.))
+                            .when(proxy_on, |d| d.bg(rgb(DARK_RAISED())))
+                            .when(proxy_waiting, |d| d.opacity(0.55))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                            .tooltip(move |_, cx| cx.new(|_| Tip(proxy_tip.clone())).into())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_proxy(&proxy_path, proxy_stops, cx);
+                            }))
+                            .child(
+                                div()
+                                    .font(style.font)
+                                    .text_size(style.size)
+                                    .text_color(rgb(if proxy_on { INK1() } else { INK3() }))
+                                    .child(proxy_glyph),
+                            )
+                            .children(proxy_progress.map(|progress| {
+                                div()
+                                    .flex_none()
+                                    .w(px(20.))
+                                    .h(px(2.))
+                                    .rounded(px(1.))
+                                    .bg(rgb(DARK_HAIRLINE()))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(px(20. * progress.clamp(0., 1.)))
+                                            .rounded(px(1.))
+                                            .bg(rgb(INK2())),
+                                    )
+                            }))
+                    })
                 }),
         )
         .child({
@@ -410,7 +555,6 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .session
         .as_ref()
         .map_or(&[][..], PlaybackSession::sources);
-    let meta = player.session.as_ref().map(PlaybackSession::meta);
     let all_rows: Vec<Row> = library_rows(
         sources,
         &player.streams,
@@ -423,14 +567,10 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 .map_or(0, |session| session.file_frames(path))
         },
     );
-    let _ = meta;
-    let unused_count = all_rows
-        .iter()
-        .filter(|row| player.row_ctx(&row.path, row.stream).placed == 0)
-        .count();
     let filter = player.dock_filter.to_lowercase();
     let mut rows: Vec<(Row, usize)> = all_rows
         .into_iter()
+        .filter(|row| player.library_tab.holds(&row.path))
         .map(|row| {
             let placed = player.row_ctx(&row.path, row.stream).placed;
             (row, placed)
@@ -442,6 +582,10 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                 || ("unused".contains(&filter) && *placed == 0)
         })
         .collect();
+    let unused_count = rows
+        .iter()
+        .filter(|(_, placed)| *placed == 0)
+        .count();
     match player.dock_sort {
         DockSort::Recent => {}
         DockSort::Name => {
@@ -462,7 +606,8 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
         .p(px(8.))
         .overflow_y_scroll()
         .child(section_head(format!(
-            "SOURCES · {total} · {unused_count} UNUSED"
+            "{} · {total} · {unused_count} UNUSED",
+            player.library_tab.label().to_uppercase()
         )))
         .child({
             let style = mono(type_scale::CHORD_METADATA_MAX_PX, FontWeight::MEDIUM);
@@ -486,6 +631,33 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                     false => format!("⌕ {filter_text}"),
                 })
         })
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .gap(px(4.))
+                .children(LIBRARY_TABS.map(|tab| {
+                    let on = tab == player.library_tab;
+                    let style = label(type_scale::FLOOR_PX, FontWeight::MEDIUM);
+                    div()
+                        .id(("dock-source-filter", tab as usize))
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(3.))
+                        .font(style.font)
+                        .text_size(style.size)
+                        .when(on, |d| d.bg(rgb(DARK_RAISED())).text_color(rgb(INK1())))
+                        .when(!on, |d| d.text_color(rgb(INK3())))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(DARK_RAISED())))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.library_tab = tab;
+                            cx.notify();
+                        }))
+                        .child(tab.label())
+                })),
+        )
         .child(
             div()
                 .flex_none()
@@ -530,8 +702,10 @@ fn sources_tab(player: &Player, cx: &mut Context<Player>) -> impl IntoElement {
                             .text_size(style.size)
                             .text_color(rgb(INK3()))
                             .child(match player.dock_filter.is_empty() {
-                                true => "No sources yet — Add files, or drop one on the window"
-                                    .to_string(),
+                                true if player.library_tab == LibraryTab::Text => {
+                                    "No subtitle sources yet — Import subtitles".to_string()
+                                }
+                                true => player.library_tab.empty().to_string(),
                                 false => "nothing matches the filter".to_string(),
                             }),
                     )
