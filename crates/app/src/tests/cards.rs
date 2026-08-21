@@ -1770,6 +1770,39 @@ fn a_cards_own_help_paints_while_the_card_is_open_but_the_ui_under_it_stays_quie
     );
 }
 
+/// Structural guard only: this binary has no `TestAppContext`, so it cannot
+/// mount the card, aim at its hint, wheel it, or read painted movement. A
+/// driving pass must still prove a wheel over the hint changes card pixels.
+/// This pins the declaration-level invariant that the EQ card's outer
+/// container, which also owns the hint sibling, owns `eq_scroll`; putting the
+/// handle back on `eq-card-rows` recreates that hint's dead zone.
+#[test]
+fn eq_cards_scroll_handle_belongs_to_the_container_that_also_holds_its_hint() {
+    let card = fn_body("eq_card");
+    let card_at = card.find(".id(\"eq-card\")").expect("EQ card container");
+    let rows_at = card.find(".id(\"eq-card-rows\")").expect("EQ card rows");
+    let container = &card[card_at..rows_at];
+
+    assert!(
+        container.contains(".overflow_y_scroll()")
+            && container.contains(".track_scroll(&self.eq_scroll)"),
+        "eq_scroll must belong to eq-card, the container that also holds the \
+         below-fold hint, rather than a body-only child"
+    );
+
+    let rows = &card[rows_at..];
+    assert!(
+        !rows.contains(".track_scroll(&self.eq_scroll)"),
+        "eq-card-rows owns eq_scroll again -- its sibling hint becomes a \
+         wheel dead zone"
+    );
+    assert!(
+        rows.contains("more below — scroll the card"),
+        "the below-fold hint disappeared; this guard must cover the child it \
+         keeps in the card's wheel surface"
+    );
+}
+
 /// "Maximize a card in place" changes size only, never the relative
 /// semantics a value is drawn against: `eq_x`/`eq_y` map into `0..1` of
 /// whatever box they are given, so a wider/taller EQ card is genuinely more
