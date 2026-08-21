@@ -658,6 +658,24 @@ fn lane_row(
                     let at = this.place_frame(window.mouse_position().x).0;
                     this.insert_source(&drag.0.clone(), drag.1, Some(lane), Some(at), cx)
                 }))
+                // Right-click on empty bed space: the "Close Gap" door. A
+                // clip's own right-click handler (`clip_box`/`sub_box`) never
+                // stops propagation, so this fires on that press too --
+                // harmlessly, since `gap_at` answers `None` for a frame a
+                // clip already covers and this listener does nothing then,
+                // leaving the clip's own menu exactly as it set it.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        let Some(session) = this.session.as_ref() else {
+                            return;
+                        };
+                        let frame = this.frame_under(event.position.x);
+                        if let Some((start, frames)) = session.gap_at(lane, frame) {
+                            this.open_gap_menu(lane, start, frames, event.position, cx);
+                        }
+                    }),
+                )
                 // The landing shadow (`Player::preview_ghost_asset`, the same
                 // setter `ui/timeline.rs`'s own bed calls) -- guarded on the
                 // pointer actually being inside this bed's own bounds, since

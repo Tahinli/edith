@@ -2028,6 +2028,13 @@ impl PlaybackSession {
         self.project.lane(lane)
     }
 
+    /// The empty stretch of `lane` covering `frame`, or `None` when `frame`
+    /// is inside a clip or past the last one ([`Project::gap_at`]). What a
+    /// right-click on empty bench space asks before offering to close it.
+    pub fn gap_at(&self, lane: Lane, frame: u32) -> Option<(u32, u32)> {
+        self.project.gap_at(lane, frame)
+    }
+
     /// Every lane's handle, in display order -- what a front-end lays out top to
     /// bottom, and the list [`add_lane`](Self::add_lane) grows.
     pub fn lanes(&self) -> Vec<Lane> {
